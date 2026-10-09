@@ -16,6 +16,10 @@ fn refresh_config(server: &str) -> McpServerRefreshConfig {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "hold the second refresh lock to verify a cancelled atomic batch releases its first lock without committing"
+)]
 async fn atomic_mcp_refresh_commits_without_thread_submissions() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;

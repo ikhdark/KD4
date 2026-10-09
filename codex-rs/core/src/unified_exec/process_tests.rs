@@ -11,7 +11,6 @@ use super::head_tail_buffer::HeadTailBuffer;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
 use super::process_manager::PendingProcessRegistration;
-use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -705,6 +704,10 @@ fn hold_artifact_lock(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold the artifact owner locked to prove queued deadline handback never waits on storage"
+)]
 async fn queued_deadline_handback_does_not_wait_for_artifact_or_send_input() {
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);

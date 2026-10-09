@@ -95,6 +95,45 @@ fn semnav_nested_generics_python_and_duplicate_impls_stay_unambiguous() {
 }
 
 #[tokio::test]
+async fn semnav_module_paths_follow_inline_overrides_and_recover_original_outline() {
+    // Independent oracle: rustc --emit=dep-info selects these directories,
+    // including the non-mod.rs stem being replaced only at the first inline path.
+    for (file, source, expected) in [
+        ("lib.rs", "#[path=\"chosen\"] mod inline { mod child; #[path=\"explicit.rs\"] mod named; }", "chosen"),
+        ("parent.rs", "#[path=\"chosen\"] mod inline { mod child; #[path=\"explicit.rs\"] mod named; }", "chosen"),
+        ("parent.rs", "mod outer { #[path=\"chosen\"] mod inline { mod child; #[path=\"explicit.rs\"] mod named; } }", "parent/outer/chosen"),
+        ("lib.rs", "mod r#type { mod child; #[path=\"explicit.rs\"] mod named; }", "type"),
+        ("parent.rs", "mod inline { mod child; #[path=\"explicit.rs\"] mod named; }", "parent/inline"),
+    ] {
+        for script in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(file);
+            std::fs::write(&path, source).unwrap();
+            let mut call = invocation(&path, json!([{"kind":"section","id":"outline"}]), false).await;
+            if script { call.source = ToolCallSource::CodeMode {cell_id:"semnav-paths".into(), parent_call_id:None,
+                runtime_tool_call_id:"semnav-paths".into(), nested_deadline:None, cancellation_cause:None}; }
+            let result = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+            assert_eq!(result["complete"], true);
+            let items = result["results"][0]["value"]["details"]["items"].as_array().unwrap();
+            let child = items.iter().find(|item| item["name"] == "child").unwrap();
+            let named = items.iter().find(|item| item["name"] == "named").unwrap();
+            let base = expected.split('/').fold(dir.path().to_path_buf(), |base, component| base.join(component));
+            assert_eq!(child["linked_path_candidates"], json!([base.join("child.rs"), base.join("child").join("mod.rs")]));
+            assert_eq!(named["linked_path"], json!(base.join("explicit.rs")));
+            assert!(named.get("linked_path_candidates").is_none());
+            // Paths are candidates, not filesystem reads or existence claims.
+            assert!(!base.exists());
+            std::fs::write(&path, "mod changed;").unwrap();
+            call.payload = ToolPayload::Function {arguments:json!({"artifact_id":result["artifact_id"],
+                "selectors":[{"kind":"section","id":"outline"}]}).to_string()};
+            let recovered = ReadToolOutputHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+            assert_eq!(recovered["canonical_sha256"], result["source_sha256"]);
+            assert_eq!(recovered["results"][0]["value"], result["results"][0]["value"]);
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "opt-in matched navigation wall-clock benchmark; no model latency simulation"]
 #[expect(clippy::print_stdout, reason = "report measured navigation latency and call counts")]
 async fn semnav_batched_definition_impl_and_caller_benchmark() {

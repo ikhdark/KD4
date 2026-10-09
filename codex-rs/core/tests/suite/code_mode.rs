@@ -2000,8 +2000,10 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case("calendar timezone option 99"; "capability query")]
+#[test_case::test_case("+source:mcp__codex_apps__calendar_c529dda749f0 _timezone_o_25fdf15747c7 unavailable_tool"; "partial scoped names")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools() -> Result<()> {
+async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools(query: &str) -> Result<()> {
     require_network!();
 
     let server = responses::start_mock_server().await;
@@ -2013,11 +2015,24 @@ async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools() -
             ev_custom_tool_call(
                 "call-1",
                 "exec",
-                r#"
+                &r#"
+const query = "calendar timezone option 99";
 const search = await tools.tool_search({
-  query: "calendar timezone option 99",
+  query,
   limit: 8,
 });
+if (query.startsWith("+source:")) {
+  if (JSON.stringify(search.unmatched_identifiers) !== '["unavailable_tool"]') {
+    throw new Error("partial lookup must report the unavailable name");
+  }
+  const names = search.tools.flatMap(ns => ns.tools?.map(tool => tool.name) ?? []);
+  if (names.length !== 1 || names[0] !== "_timezone_o_25fdf15747c7") {
+    throw new Error("partial lookup must return only the available exact contract");
+  }
+  if (resolve_tool("unavailable_tool") !== undefined) {
+    throw new Error("missing tools must not become callable");
+  }
+}
 const patch = await resolve_tool("apply_patch");
 if (patch.name !== "apply_patch" || typeof tools.apply_patch !== "function") {
   throw new Error("nested apply_patch must remain callable");
@@ -2044,7 +2059,7 @@ if (!tool) {
     text: result.content?.[0]?.text ?? "",
   }));
 }
-"#,
+"#.replace("\"calendar timezone option 99\"", &serde_json::to_string(query)?),
             ),
             ev_completed("resp-1"),
         ]),
@@ -2088,12 +2103,14 @@ if (!tool) {
             config.model_catalog = Some(model_catalog);
         });
     let test = builder.build(&server).await?;
+    let started = std::time::Instant::now();
     test.submit_turn_with_approval_and_permission_profile(
         "inspect tools in code mode only",
         AskForApproval::OnRequest,
         PermissionProfile::Disabled,
     )
     .await?;
+    eprintln!("discovery through complete turn: {:?}; query: {query}", started.elapsed());
 
     let first_body = resp_mock.single_request().body_json();
     assert_eq!(
@@ -2715,7 +2732,7 @@ await new Promise(() => {});
     let output = text_item(&items, 1);
     assert!(output.contains('…'), "{output}");
     assert!(
-        codex_utils_output_truncation::approx_token_count(&output) <= 5,
+        codex_utils_output_truncation::approx_token_count(output) <= 5,
         "{output}"
     );
     assert!(!output.contains("0123456789012345678901234567890123456789"));

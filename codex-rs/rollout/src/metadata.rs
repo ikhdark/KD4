@@ -250,26 +250,26 @@ impl RolloutMetadataAccumulator {
             self.metadata = Some(builder.build(default_provider));
             self.reducer = Some(ThreadMetadataRolloutReducer::default());
         }
-        if let RolloutItem::SessionMeta(meta_line) = &item {
-            if !self.saw_first_session_meta {
-                self.saw_first_session_meta = true;
-                if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
-                    self.parent_thread_id = builder.parent_thread_id;
-                    let mut canonical = builder.build(default_provider);
-                    if let Some(projected) = self.metadata.take() {
-                        // Before the first SessionMeta, only these non-setting
-                        // fields can change. The reducer retains settings in order.
-                        canonical.title = projected.title;
-                        canonical.preview = projected.preview;
-                        canonical.first_user_message = projected.first_user_message;
-                        canonical.tokens_used = projected.tokens_used;
-                        if self.persisted_recency_at {
-                            canonical.recency_at = projected.recency_at;
-                        }
+        if let RolloutItem::SessionMeta(meta_line) = &item
+            && !self.saw_first_session_meta
+        {
+            self.saw_first_session_meta = true;
+            if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
+                self.parent_thread_id = builder.parent_thread_id;
+                let mut canonical = builder.build(default_provider);
+                if let Some(projected) = self.metadata.take() {
+                    // Before the first SessionMeta, only these non-setting
+                    // fields can change. The reducer retains settings in order.
+                    canonical.title = projected.title;
+                    canonical.preview = projected.preview;
+                    canonical.first_user_message = projected.first_user_message;
+                    canonical.tokens_used = projected.tokens_used;
+                    if self.persisted_recency_at {
+                        canonical.recency_at = projected.recency_at;
                     }
-                    self.metadata = Some(canonical);
-                    self.has_metadata_builder = true;
                 }
+                self.metadata = Some(canonical);
+                self.has_metadata_builder = true;
             }
         }
         if codex_state::latest_rollout_recency_at(std::slice::from_ref(&item)).is_some() {

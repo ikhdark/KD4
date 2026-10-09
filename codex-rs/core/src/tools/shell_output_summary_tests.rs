@@ -382,7 +382,7 @@ fn compiler_json_uses_complete_stdout_and_keeps_stderr_independent() {
     let mixed = format!("{}{}{}", &stdout[..split], stderr, &stdout[split..]);
     let mut output = ExecToolCallOutput {
         exit_code: 1,
-        stdout: StreamOutput::new(stdout.clone()),
+        stdout: StreamOutput::new(stdout),
         stderr: StreamOutput::new(stderr.to_string()),
         aggregated_output: StreamOutput::new(mixed.clone()),
         ..Default::default()

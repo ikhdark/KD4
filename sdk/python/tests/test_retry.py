@@ -104,7 +104,9 @@ def test_retry_stops_at_attempt_limit(monkeypatch: pytest.MonkeyPatch, max_attem
 
     monkeypatch.setattr("openai_codex.retry.time.sleep", sleeps.append)
     with pytest.raises(ServerBusyError) as caught:
-        retry_on_overload(overloaded, max_attempts=max_attempts, initial_delay_s=0.25, jitter_ratio=0)
+        retry_on_overload(
+            overloaded, max_attempts=max_attempts, initial_delay_s=0.25, jitter_ratio=0
+        )
     assert caught.value is error
     assert attempts == max_attempts
     assert sleeps == ([] if max_attempts == 1 else [0.25, 0.5])

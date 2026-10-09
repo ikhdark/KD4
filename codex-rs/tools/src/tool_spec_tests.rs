@@ -29,9 +29,9 @@ fn canonical_contracts_and_wire_bytes_preserve_only_semantic_order() {
         json!({"type":["null","string"]}));
     assert_eq!(a.callable_contract(), b.callable_contract());
     assert_eq!(serde_json::to_vec(&a).unwrap(), serde_json::to_vec(&b).unwrap());
-    assert_eq!(serde_json::to_vec(&[a.clone()]).unwrap(),
-        serde_json::to_vec(&create_tools_json_for_responses_api(&[b.clone()]).unwrap()).unwrap());
-    let mut changed = b.clone();
+    assert_eq!(serde_json::to_vec(std::slice::from_ref(&a)).unwrap(),
+        serde_json::to_vec(&create_tools_json_for_responses_api(std::slice::from_ref(&b)).unwrap()).unwrap());
+    let mut changed = b;
     let ToolSpec::Function(tool) = &mut changed else { unreachable!() };
     tool.output_schema = Some(json!({"type":"boolean"}).into());
     assert_ne!(a.callable_contract(), changed.callable_contract());

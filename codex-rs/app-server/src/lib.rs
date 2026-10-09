@@ -8,6 +8,7 @@ use codex_config::NoopThreadConfigLoader;
 use codex_config::thread_config_loader_for_endpoint;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
+use codex_login::AuthConfig;
 use codex_login::AuthManager;
 use codex_login::default_client::set_default_client_residency_requirement;
 #[cfg(debug_assertions)]
@@ -175,6 +176,24 @@ async fn install_config_loaders_from_config(
         config.http_client_factory(),
     );
     auth_manager
+}
+
+async fn finish_startup_config_loaders(
+    config_manager: &ConfigManager,
+    config: &Config,
+    bootstrap: Option<(Config, Arc<AuthManager>)>,
+) -> Arc<AuthManager> {
+    if let Some((previous, auth_manager)) = bootstrap
+        && AuthConfig::from_config(&previous) == AuthConfig::from_config(config)
+        && previous.experimental_thread_config_endpoint == config.experimental_thread_config_endpoint
+    {
+        // The managed-config pass already consumed these loaders. Keep its completed
+        // bundle and auth owner rather than reloading credentials and spawning another
+        // startup fetch/refresher. This handoff exists only during process startup;
+        // account changes still explicitly replace the loaders.
+        return auth_manager;
+    }
+    install_config_loaders_from_config(config_manager, config).await
 }
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
@@ -553,12 +572,13 @@ pub async fn run_main(
         Arc::new(NoopThreadConfigLoader),
     );
     let mut config_warnings = Vec::new();
-    match config_manager
+    let bootstrap = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
         Ok(config) => {
-            let _ = install_config_loaders_from_config(&config_manager, &config).await;
+            let auth_manager = install_config_loaders_from_config(&config_manager, &config).await;
+            Some((config, auth_manager))
         }
         Err(err) => {
             warn!(
@@ -569,6 +589,7 @@ pub async fn run_main(
             // defaults. The effective startup config still installs loader handles before
             // request processing starts, so a preload failure does not leave the manager
             // permanently on the bootstrap no-op loaders.
+            None
         }
     };
     let (config, auth_manager) = match config_manager
@@ -576,7 +597,8 @@ pub async fn run_main(
         .await
     {
         Ok(config) => {
-            let auth_manager = install_config_loaders_from_config(&config_manager, &config).await;
+            let auth_manager =
+                finish_startup_config_loaders(&config_manager, &config, bootstrap).await;
             (config, auth_manager)
         }
         Err(err) => {
@@ -584,6 +606,7 @@ pub async fn run_main(
                 return Err(err);
             }
 
+            drop(bootstrap);
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
             let default_config = config_manager.load_default_config().await.map_err(|e| {
@@ -1513,6 +1536,9 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
         | AppServerTransport::Off => AppServerRpcTransport::Websocket,
     }
 }
+
+#[cfg(test)]
+mod startup_config_tests;
 
 #[cfg(test)]
 mod tests {

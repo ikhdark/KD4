@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import math
 import os
 from pathlib import Path
 import shutil
@@ -598,6 +599,8 @@ def max_total_target_bytes_from_args(args: argparse.Namespace) -> int | None:
 
 def positive_float(value: str) -> float:
     parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be > 0")
     return parsed

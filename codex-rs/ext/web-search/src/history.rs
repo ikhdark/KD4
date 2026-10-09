@@ -133,12 +133,11 @@ fn bounded_message(item: &ResponseItem, budget: usize) -> Option<ResponseItem> {
                 ContentItem::OutputText { text }
             });
         }
-        if limit < total_text_bytes {
-            if let Some(ContentItem::InputText { text } | ContentItem::OutputText { text }) =
+        if limit < total_text_bytes
+            && let Some(ContentItem::InputText { text } | ContentItem::OutputText { text }) =
                 content.last_mut()
-            {
-                text.push_str(OMITTED);
-            }
+        {
+            text.push_str(OMITTED);
         }
         ResponseItem::Message {
             id: None,
@@ -150,7 +149,7 @@ fn bounded_message(item: &ResponseItem, budget: usize) -> Option<ResponseItem> {
     };
     if total_text_bytes <= budget {
         let complete = make(total_text_bytes);
-        if serde_json::to_vec(&complete).ok()?.len() + 1 <= budget {
+        if serde_json::to_vec(&complete).ok()?.len() < budget {
             return Some(complete);
         }
     }
@@ -160,7 +159,7 @@ fn bounded_message(item: &ResponseItem, budget: usize) -> Option<ResponseItem> {
     while low < high {
         let mid = low.midpoint(high) + 1;
         let message = make(mid);
-        if serde_json::to_vec(&message).ok()?.len() + 1 <= budget {
+        if serde_json::to_vec(&message).ok()?.len() < budget {
             low = mid;
             best = Some(message);
         } else {

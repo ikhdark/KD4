@@ -24,13 +24,20 @@ const LOCAL_SKILL_MARKER: &str = "LOCAL_SKILL_BODY_MARKER";
 #[tokio::test]
 async fn selected_executor_root_exposes_plugin_skill() -> Result<()> {
     let server = responses::start_mock_server().await;
-    let response_mock = responses::mount_sse_once(
+    let response_mock = responses::mount_sse_sequence(
         &server,
-        responses::sse(vec![
-            responses::ev_response_created("resp-selected"),
-            responses::ev_assistant_message("msg-selected", "Done"),
-            responses::ev_completed("resp-selected"),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-ambiguous"),
+                responses::ev_assistant_message("msg-ambiguous", "Select a skill locator"),
+                responses::ev_completed("resp-ambiguous"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-selected"),
+                responses::ev_assistant_message("msg-selected", "Done"),
+                responses::ev_completed("resp-selected"),
+            ]),
+        ],
     )
     .await;
 
@@ -109,7 +116,7 @@ stream_max_retries = 0
 
     let request_id = app_server
         .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             input: vec![UserInput::Text {
                 text: format!("Use ${SKILL_NAME}"),
                 text_elements: Vec::new(),
@@ -129,6 +136,48 @@ stream_max_retries = 0
     .await??;
 
     let request = response_mock.single_request();
+    assert!(
+        request
+            .message_input_texts("user")
+            .iter()
+            .all(|text| !text.starts_with("<skill>")),
+        "a name shared by host and executor skills must not select either authority"
+    );
+    let skill_path = skill_dir.join("SKILL.md").to_string_lossy().replace('\\', "/");
+    let locator = format!("skill://demo-plugin@1/{}", skill_path.trim_start_matches('/'));
+    assert!(
+        request
+            .message_input_texts("user")
+            .into_iter()
+            .chain(request.message_input_texts("developer"))
+            .any(|text| text.contains(&locator)),
+        "the executor catalog must advertise its disambiguating locator"
+    );
+
+    let request_id = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![UserInput::Text {
+                text: format!("Use [${SKILL_NAME}]({locator})"),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = response_mock.requests();
+    assert_eq!(2, requests.len());
+    let request = requests.last().expect("explicit skill turn request");
     let skill_fragments = request
         .message_input_texts("user")
         .into_iter()

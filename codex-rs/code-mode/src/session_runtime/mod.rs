@@ -47,6 +47,10 @@ use crate::runtime::stored_value_limit_message;
 use crate::runtime::stored_values_with_writes_within_limits;
 
 type RuntimeEventFuture = Pin<Box<dyn Future<Output = Result<CellEvent, Error>> + Send + 'static>>;
+type CachedToolCatalog = (
+    Arc<[codex_code_mode_protocol::ToolDefinition]>,
+    Arc<crate::runtime::EnabledToolCatalog>,
+);
 const TERMINAL_CELL_CACHE_CAPACITY: usize = 256;
 /// Output retained for re-observing delivered terminal events, matching the
 /// session's stored-value budget. Oversized events spill to owned temporary files.
@@ -242,7 +246,7 @@ struct Inner<D: SessionRuntimeDelegate> {
     cells: Mutex<HashMap<CellId, CellHandle>>,
     terminal_cells: StdMutex<TerminalCellCache>,
     replay_bytes: Arc<Semaphore>,
-    catalog: StdMutex<Option<(Arc<[codex_code_mode_protocol::ToolDefinition]>, Arc<crate::runtime::EnabledToolCatalog>)>>,
+    catalog: StdMutex<Option<CachedToolCatalog>>,
     active_cell_permits: Arc<Semaphore>,
     active_cell_capacity: usize,
     cell_tasks: TaskTracker,
@@ -493,6 +497,10 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         Ok(None)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "admission excludes restore until the value snapshot and active-cell permit are acquired; it is released before native startup"
+    )]
     async fn start_cell(
         &self,
         cell_id: CellId,
@@ -666,6 +674,10 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the values guard is explicitly dropped before staging and publication awaits, then reacquired for atomic value/receipt commit; reassignment confuses lexical await analysis"
+    )]
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, StoredValue>,
@@ -736,8 +748,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         let conflicting_read = conflicts.values().any(|(read, _)| *read);
         let event = if conflicting_write || conflicting_read {
             let mut event = storage_failure_event(event, "code-mode store conflict: another cell changed a read or written key; no stored values from this cell were committed. Nested tool effects may already have occurred; do not replay the cell blindly.".into());
-            if let CellEvent::Completed { error_text: Some(error), .. } = &mut event {
-                let mut receipt: serde_json::Value = serde_json::from_str(error).expect("commit failure JSON");
+            if let CellEvent::Completed { error_text: Some(error), .. } = &mut event
+                && let Ok(mut receipt) = serde_json::from_str::<JsonValue>(error)
+            {
                 receipt["conflicting_keys"] = serde_json::json!(conflicts.iter().take(16).map(|(key, (read, write))| {
                     serde_json::json!({"key": key.chars().take(128).collect::<String>(),
                         "key_truncated": key.chars().count() > 128, "read": read, "write": write})
@@ -852,13 +865,13 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
     async fn closed(&self, mut event: Option<CellEvent>) {
         // Nested callbacks have settled before this hook. Retain cancellation
         // evidence, but snapshot only committed values, never this cell's writes.
-        if let Some(CellEvent::Terminated { .. }) = &event
+        if let Some(terminal @ CellEvent::Terminated { .. }) = &event
             && let Some(durable) = self.inner.durable_state.get().cloned()
         {
             let inner = Arc::clone(&self.inner);
             let call_id = self.parent_tool_call_id.clone();
             let cell_id = self.cell_id.to_string();
-            let terminal = event.clone().expect("terminal receipt");
+            let terminal = terminal.clone();
             let publication = tokio::spawn(async move {
                 let gate = Arc::clone(&inner.commit_gate).lock_owned().await;
                 let values = inner.stored_values.lock().await.clone();

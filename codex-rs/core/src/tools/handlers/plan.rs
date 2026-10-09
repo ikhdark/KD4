@@ -184,6 +184,7 @@ impl ToolExecutor<ToolInvocation> for PlanHandler {
 }
 
 impl PlanHandler {
+    #[expect(clippy::await_holding_invalid_type, reason = "session-local publication gate must order durable persistence, state commit, and client events; releasing it early can reorder plan revisions")]
     async fn handle_call(
         &self,
         invocation: ToolInvocation,

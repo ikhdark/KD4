@@ -11,11 +11,14 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Child;
-use std::process::ChildStdin;
-use std::process::ChildStdout;
-use std::process::Command;
-use std::process::Stdio;
+#[cfg(not(windows))]
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(windows)]
+use std::fs::File as ChildStdin;
+#[cfg(windows)]
+use std::fs::File as ChildStdout;
+#[cfg(windows)]
+use windows_process::Child;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::LazyLock;
@@ -28,6 +31,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
+#[cfg(windows)]
+mod windows_process;
 const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CACHED_SYNTAX_BYTES: usize = 64 * 1024;
 const MAX_CACHED_SYNTAX_ENTRIES: usize = 32;
@@ -196,9 +201,7 @@ pub fn powershell_command_has_syntax_error(command: &[String]) -> bool {
 /// Bounded diagnostics from the same cached parse used for admission. `None`
 /// means no positive syntax-error report, not proof that execution is safe.
 pub fn powershell_command_syntax_error(command: &[String]) -> Option<String> {
-    let Some((executable, args)) = command.split_first() else {
-        return None;
-    };
+    let (executable, args) = command.split_first()?;
     let PowershellInvocation::InlineCommand { script, .. } = parse_powershell_invocation(args) else {
         return None;
     };
@@ -442,6 +445,9 @@ impl PowershellParserProcess {
                 "trusted PowerShell parser host has no parent directory",
             )
         })?;
+        #[cfg(windows)]
+        let child = windows_process::spawn(&trusted_executable, trusted_working_directory)?;
+        #[cfg(not(windows))]
         let child = Command::new(&trusted_executable)
             .args([
                 "-NoLogo",
@@ -550,11 +556,8 @@ impl PowershellParserProcess {
                                     })
                             ))
                 })
+            && let Some(entry) = self.syntax_cache.remove(index)
         {
-            let entry = self
-                .syntax_cache
-                .remove(index)
-                .expect("cached syntax index");
             let outcome = entry.1.clone();
             self.syntax_cache.push_back(entry);
             return Ok(outcome);

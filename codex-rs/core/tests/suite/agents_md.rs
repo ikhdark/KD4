@@ -141,7 +141,7 @@ fn assert_instruction_replacement_once(
 ) {
     let initial = expected_provider_only_instruction_fragment(initial_contents);
     let replacement = expected_provider_only_replacement_fragment(replacement_contents);
-    assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
+    assert_eq!(instruction_fragments(&requests[0]), vec![initial]);
     assert_eq!(
         instruction_fragments(&requests[1]),
         vec![replacement.clone()]
@@ -829,7 +829,7 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
     let initial = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
-    assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
+    assert_eq!(instruction_fragments(&requests[0]), vec![initial]);
     assert!(instruction_fragments(&requests[1]).is_empty());
     assert!(instruction_fragments(&requests[2]).is_empty());
 

@@ -171,7 +171,7 @@ fn resolve_items(
                 }
                 item
             }
-            StructureSelector::Enclosing { line } => enclosing(&items, line)?,
+            StructureSelector::Enclosing { line } => enclosing(items, line)?,
             StructureSelector::Search { query, enclosing, case_insensitive, start_byte, max_results, context_lines } => {
                 // Matching, enclosing resolution, and fitting happen once in the
                 // snapshot owner, including subsequent immutable search pages.

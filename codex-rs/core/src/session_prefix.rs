@@ -1,5 +1,9 @@
 use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::InterAgentCommunication;
+use sha2::Digest;
+use sha2::Sha256;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
@@ -49,6 +53,43 @@ fn format_bounded_subagent_error_notification(agent_reference: &str, error: &str
             / message_tokens;
         error_budget = next_budget.min(error_budget.saturating_sub(1));
     }
+}
+
+/// Runtime error completions are idempotent within a producer attempt. Reuse
+/// mailbox admission's bounded, resume-seeded ID deduplication before history
+/// insertion. Ordinary messages and successful answers remain distinct.
+pub(crate) fn inter_agent_completion_communication(
+    task_name: AgentPath,
+    sender: AgentPath,
+    sender_thread_id: ThreadId,
+    status: &AgentStatus,
+    receipt: Option<&str>,
+) -> Option<InterAgentCommunication> {
+    let message = format_inter_agent_completion_message(
+        task_name.clone(), sender.clone(), status, receipt,
+    )?;
+    let mut communication = InterAgentCommunication::new(
+        sender, task_name, Vec::new(), message, false,
+    );
+    if let AgentStatus::Errored(error) = status {
+        let mut digest = Sha256::new();
+        // Hash the full error, not its bounded display. Length framing avoids
+        // ambiguous concatenations; the receipt distinguishes explicit retries.
+        for part in [
+            sender_thread_id.to_string().as_str(),
+            communication.author.as_str(),
+            communication.recipient.as_str(),
+            receipt.unwrap_or_default(),
+            error.as_str(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part.as_bytes());
+        }
+        communication.id = Some(codex_protocol::ResponseItemId::from_server(format!(
+            "agent-error-{:x}", digest.finalize(),
+        )));
+    }
+    Some(communication)
 }
 
 pub(crate) fn format_inter_agent_completion_message(

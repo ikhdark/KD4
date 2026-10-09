@@ -64,7 +64,7 @@ pub(crate) fn report(name: &str, samples: &[f64]) {
         use std::io::Write;
         let path = std::path::PathBuf::from(directory).join(format!("{name}.json"));
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).unwrap();
-        write!(file, "{value}\n").unwrap();
+        writeln!(file, "{value}").unwrap();
     }
 }
 

@@ -235,6 +235,10 @@ pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
     if tool_name.namespace.is_none() && normalized == raw {
         return raw;
     }
+    #[expect(
+        clippy::expect_used,
+        reason = "ToolName derives Serialize over String and Option<String>; preserve its exact JSON bytes for dispatch identity"
+    )]
     let identity = serde_json::to_vec(tool_name).expect("tool identity serializes");
     format!("{normalized}__{:x}", sha2::Sha256::digest(identity))
 }

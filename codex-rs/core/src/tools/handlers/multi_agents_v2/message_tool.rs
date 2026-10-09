@@ -10,6 +10,8 @@ use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::handlers::multi_agents_spec::create_followup_task_tool;
 use crate::tools::handlers::multi_agents_spec::create_send_message_tool;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
+use codex_agent_task_store::AttemptState;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_tools::ToolSpec;
 use std::sync::Arc;
@@ -193,6 +195,7 @@ pub(crate) async fn handle_message_string_tool(
         step_context,
         call_id,
         source,
+        cancellation_token,
         ..
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
@@ -215,6 +218,40 @@ pub(crate) async fn handle_message_string_tool(
     let receiver_agent_path = receiver_agent.agent_path.clone().ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;
+    if mode == MessageDeliveryMode::TriggerTurn {
+        let coordinator = session.services.agent_control.task_coordinator();
+        if let Some(binding) = coordinator
+            .binding_for_agent_path(&receiver_agent_path)
+            .filter(|binding| {
+                binding.thread_id.as_deref() == Some(receiver_thread_id.to_string().as_str())
+            })
+        {
+            // Check durable state before loading or waking the child. Turn preparation
+            // still checks again: an active attempt can seal after this read.
+            let authorization = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "Follow-up task cancelled before delivery".to_string(),
+                    ));
+                }
+                result = coordinator.get_agent_task_authorization(binding.assignment_id) => {
+                    result.map_err(|error| FunctionCallError::RespondToModel(
+                        task_store_error_detail("followup_task", error),
+                    ))?
+                }
+            };
+            if authorization.admission_origin == AssignmentAdmissionOrigin::Typed
+                && (authorization.current_attempt.attempt_id != binding.attempt_id
+                    || authorization.current_attempt.state != AttemptState::Active)
+            {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "typed assignment {} has no active bound attempt; recover its retained receipt with get_agent_task, or explicitly admit new work before requesting another turn",
+                    binding.assignment_id
+                )));
+            }
+        }
+    }
     let resume_config = build_agent_resume_config(turn.as_ref())?;
     session
         .services

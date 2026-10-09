@@ -436,7 +436,7 @@ impl ExecCommandHandler {
             original_invocation,
             &original_resolved_command.safety_command,
             original_resolved_command.preflight_shell_type,
-            if environment_is_remote { None } else { native_cwd.as_ref().map(|cwd| cwd.as_path()) },
+            if environment_is_remote { None } else { native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path) },
         )
         .await
         .map_err(|issue| {
@@ -445,6 +445,16 @@ impl ExecCommandHandler {
             ))
         })?;
         let repaired = preflight.repaired();
+        let full_suite = if turn.config.features.enabled(Feature::Kd4Runtime) {
+            crate::tools::handlers::command_preflight::check_full_suite_command(
+                &original_resolved_command.safety_command,
+                original_resolved_command.preflight_shell_type,
+            )
+            .await
+            .map_err(FunctionCallError::RespondToModel)?
+        } else {
+            false
+        };
         let repair_notice = {
             let mut notices = args.argument_notices.clone();
             notices.extend(preflight.model_notice());
@@ -472,7 +482,7 @@ impl ExecCommandHandler {
         let validation_analysis = crate::validation::resolve_command_validation_with_shell(
             &command_invocation,
             resolved_command.preflight_shell_type,
-            if environment_is_remote { None } else { native_cwd.as_ref().map(|cwd| cwd.as_path()) },
+            if environment_is_remote { None } else { native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path) },
             args.validation.clone(),
         );
         let search_analysis = async {
@@ -536,7 +546,7 @@ impl ExecCommandHandler {
         let (mut validation, search_narrowing, inspection_command) =
             tokio::join!(validation_analysis, search_analysis, safety_analysis);
         args.apply_validation_observation_policy(
-            validation.as_ref().is_some_and(|validation| validation.is_validation()),
+            validation.as_ref().is_some_and(crate::validation::CommandValidation::is_validation),
         );
         let validation_launch = !direct_runtime
             && (validation.is_some()
@@ -730,7 +740,7 @@ impl ExecCommandHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
         }
         let validation_attempt = validation_launch;
-        if validation.as_ref().is_some_and(|validation| validation.is_validation())
+        if validation.as_ref().is_some_and(crate::validation::CommandValidation::is_validation)
             && let Some((process_id, execution_id)) = session.services.command_execution
                 .identical_running_process(&attempt_key).await
             && let Some(response) = manager.reuse_running_validation(
@@ -740,7 +750,10 @@ impl ExecCommandHandler {
             return Ok(boxed_tool_output(response));
         }
         // Validation shares ordinary attempt accounting. Only input-state
-        // determined failures are replayed; a failing test remains rerunnable.
+        // determined failures are replayed; focused failing tests remain rerunnable.
+        turn.full_suite_budget
+            .admit(full_suite)
+            .map_err(FunctionCallError::RespondToModel)?;
         if let Err(blocked) = session
                 .services
                 .command_execution

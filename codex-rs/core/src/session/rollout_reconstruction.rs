@@ -796,13 +796,12 @@ impl Session {
                             call_id, output, ..
                         } = response_item
                         && update_plan_call_ids.contains(call_id.as_str())
+                        && let Some(response) = crate::plan_store::plan_response_from_tool_output(output)
                     {
-                        if let Some(response) = crate::plan_store::plan_response_from_tool_output(output) {
-                            active_segment.plan = Some(response.current_plan);
-                            // Active projections must not eclipse the full
-                            // durable snapshot earlier in this same turn.
-                            active_segment.plan_lineage = response.lineage_complete.then_some(response.lineage);
-                        }
+                        active_segment.plan = Some(response.current_plan);
+                        // Active projections must not eclipse the full
+                        // durable snapshot earlier in this same turn.
+                        active_segment.plan_lineage = response.lineage_complete.then_some(response.lineage);
                     }
                 }
                 RolloutItem::InterAgentCommunication(_) => {

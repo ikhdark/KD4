@@ -4,6 +4,99 @@ use std::time::Duration;
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn unavailable_retention_index_scans_exact_usage_and_fails_closed() {
+    for reconciling in [false, true] {
+        for protected in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("tool-output");
+            let directory = root.join("thread");
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+            std::fs::write(&path, b"abc").unwrap();
+            std::fs::write(logical_segment_path(&path, 1), b"1234567").unwrap();
+            std::fs::write(logical_metadata_path(&path), b"12345").unwrap();
+            if protected {
+                std::fs::write(active_tool_history_protection_path(&path), ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES).unwrap();
+            }
+            let _permit = retention_sweep_permit_for_directory(&directory).await.unwrap();
+            let token = capture_retention_token(&directory);
+            {
+                let mut registry = lock_retention_registry();
+                registry.roots.get_mut(&token.root).unwrap().mode = if reconciling {
+                    RetentionRootMode::Reconciling { invalidated: false }
+                } else {
+                    RetentionRootMode::Dirty
+                };
+            }
+            // Count all family bytes locally, but protected bytes are exempt globally.
+            let usage = retention_usage_locked_blocking(&directory);
+            assert_eq!(usage.thread_bytes, 3 + 7 + 5);
+            assert_eq!(usage.global_bytes, if protected { 0 } else { 3 + 7 + 5 });
+
+            // Neither a missing thread directory nor an unreadable protection
+            // marker may be mistaken for free space.
+            assert_eq!(retention_usage_locked_blocking(&root.join("missing")).thread_bytes, u64::MAX);
+            let marker = active_tool_history_protection_path(&path);
+            if protected {
+                std::fs::remove_file(&marker).unwrap();
+            }
+            std::fs::create_dir(&marker).unwrap();
+            assert_eq!(retention_usage_locked_blocking(&directory).global_bytes, u64::MAX);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn context_retention_survives_invalidated_reconciliation_without_ignoring_quota() {
+    for full in [false, true] {
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let home = session.codex_home().await;
+        let thread = session.thread_id().to_string();
+        let directory = home.join("tool-output").join(&thread);
+        std::fs::create_dir_all(&directory).unwrap();
+        let root = tool_output_root_for_directory(&directory);
+        let path = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+        std::fs::File::create(&path).unwrap().set_len(if full {
+            MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+        } else { 3 }).unwrap();
+        std::fs::write(active_tool_history_protection_path(&path), ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES).unwrap();
+        assert_eq!(force_retention_reconciliation_for_test(&root).await, RetentionModeKind::Indexed);
+        let stale = capture_retention_token(&directory);
+        reject_stale_delta(&stale);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        set_reconciliation_barrier(&root, Arc::clone(&barrier));
+        let items = serde_json::json!([{"artifact_id":"original", "bytes":42}]);
+        let retaining = {
+            let session = Arc::clone(&session);
+            let items = items.clone();
+            tokio::spawn(async move { session.retain_context_source("artifact_directory", items).await })
+        };
+        barrier.wait().await;
+        // A late publisher invalidates the candidate while the real commit
+        // owns the retention permit. It must scan, not wait for reconciliation.
+        assert!(retention_registry_mutex_is_available_for_test());
+        reject_stale_delta(&stale);
+        barrier.wait().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), retaining)
+            .await.expect("retention must settle without a reconciliation retry loop").unwrap();
+        assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Dirty);
+        if full {
+            assert!(result.unwrap_err().to_string().contains("context was not admitted"));
+        } else {
+            let recovery = result.expect("dirty index must not reject available capacity");
+            let recovered = read_exact_tool_output_artifact(home.as_path(), &thread,
+                recovery["artifact_id"].as_str().unwrap()).await.unwrap();
+            let recovered: serde_json::Value = serde_json::from_slice(&recovered).unwrap();
+            assert_eq!(recovered["items"], items);
+        }
+        assert!(path.exists(), "protected history must survive both outcomes");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn scan_only_retention_counts_segment_and_metadata_bytes() {
     for global in [false, true] {
         for protected in [false, true] {
@@ -716,7 +809,7 @@ fn shared_search_hydration_rejects_missing_tiny_or_non_saving_evidence() {
         &mut reference.clone()
     ));
     // Byte size alone is not a token-saving guarantee, even for a valid match.
-    let mut expensive_reference = reference.clone();
+    let mut expensive_reference = reference;
     expensive_reference["selector"] = serde_json::json!("extra selection metadata ".repeat(100));
     let unchanged = expensive_reference.clone();
     assert!(!share_search_hydration(
@@ -2997,13 +3090,16 @@ async fn streaming_output_gap_retains_suffix_and_marks_capture_incomplete() {
         writer.write_chunk(Some(&state), &suffix).await;
         writer.write_chunk(Some(&state), b"final suffix").await;
         writer.finish(Some(&state)).await;
-        let artifact = state.lock().await;
-        let RawOutputArtifact::Stored { path, truncated, .. } = &*artifact else { panic!("stored suffix"); };
-        assert!(*truncated);
+        let (path, rendered) = {
+            let artifact = state.lock().await;
+            let RawOutputArtifact::Stored { path, truncated, .. } = &*artifact else { panic!("stored suffix"); };
+            assert!(*truncated);
+            (path.clone(), artifact.render_for_model())
+        };
         let bytes = tokio::fs::read(path).await.unwrap();
         assert!(bytes.starts_with(b"\n[output gap:"));
         assert!(bytes.ends_with(b"final suffix"));
-        assert!(artifact.render_for_model().contains("incomplete capture"));
+        assert!(rendered.contains("incomplete capture"));
     }
 }
 

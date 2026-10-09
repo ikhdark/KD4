@@ -85,8 +85,11 @@ class Codex:
         try:
             self._client.start()
             self._init = validate_initialize_metadata(self._client.initialize())
-        except Exception:
-            self._client.close()
+        except BaseException:
+            try:
+                self._client.close()
+            except BaseException:
+                pass  # Preserve the initialization failure, including interruptions.
             raise
 
     def __enter__(self) -> "Codex":
@@ -317,7 +320,10 @@ class AsyncCodex:
                 self._init = validate_initialize_metadata(payload)
                 self._initialized = True
             except BaseException:
-                await self._client.close()
+                try:
+                    await self._client.close()
+                except BaseException:
+                    pass  # Cleanup must not replace the original initialization failure.
                 self._init = None
                 self._initialized = False
                 raise

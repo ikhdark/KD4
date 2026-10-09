@@ -1072,6 +1072,9 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 - While the subagent is running in the background, do meaningful work immediately and communicate before touching the same contract surface.
 - Do not repeatedly wait by reflex.
 - When a delegated coding task returns, review the agent's changes in the shared workspace, then refine them as needed.
+- Read every returned report in full, recovering omitted portions from retained output. Account for every substantive finding, including read-only reviews: implement and verify it, reject it with evidence, identify it as outside the user's scope, or keep it unresolved with a next action or blocker. Investigate unresolved in-scope findings before finalizing; partial fixes or an honest disclaimer do not discharge obtainable work. Respect review-only/no-write scope and do not blindly implement recommendations.
+
+- When implementation is authorized, implement verified, applicable, in-scope suggestions and validate the resulting behavior through affected consumers. Do not stop at acknowledging them, listing them in a plan, or describing future work; do not ask for renewed permission to perform already-authorized changes. If current behavior already satisfies a suggestion, record the evidence instead of making unnecessary edits.
 
 ### Parallel delegation patterns
 - Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
@@ -1101,6 +1104,10 @@ The spawned agent receives a durable task binding. Explicitly typed agents canno
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 Spawn only when the active multi-agent mode authorizes it.
 Before delegating, identify useful work to do locally. Keep immediately blocking work local, give each agent a clear scope, and avoid duplicating delegated work. Review and integrate returned changes before treating the subtask as complete.
+Read every returned report in full, recovering omitted portions from retained output. Account for every substantive finding, including read-only reviews: implement and verify it, reject it with evidence, identify it as outside the user's scope, or keep it unresolved with a next action or blocker. Investigate unresolved in-scope findings before finalizing; partial fixes or an honest disclaimer do not discharge obtainable work. Respect review-only/no-write scope and do not blindly implement recommendations.
+When implementation is authorized, implement verified, applicable, in-scope suggestions and validate the resulting behavior through affected consumers. Do not stop at acknowledging them, listing them in a plan, or describing future work; do not ask for renewed permission to perform already-authorized changes. If current behavior already satisfies a suggestion, record the evidence instead of making unnecessary edits.
+Launch authorized independent assignments in the same batch rather than awaiting each spawn in a loop. In exec, use Promise.allSettled for a bounded batch and retain every success and failure before proceeding; a failed sibling does not authorize respawning successful agents.
+Sequence only real dependencies or shared-resource conflicts. Do not add a model round merely to acknowledge a completed agent; integrate its result with the next substantive step or final response.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
 Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted with a repository-wide diagnostic claim; exactly one is required. Both forms are durably admitted, record overlap without rejecting it, and return an `assignment_id`. Typed assignments require an explicit built-in `agent_type`: `architect`, `explorer`, `worker`, `reviewer`, `verifier`, or `integrator`.

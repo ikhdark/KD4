@@ -78,6 +78,7 @@ impl CompletedSnapshotEvent {
 }
 
 impl DurableState {
+    #[cfg(test)]
     pub(super) fn open(path: PathBuf) -> Result<(Self, HashMap<String, StoredValue>), String> {
         Self::open_with_values(path, HashMap::new(), 1)
     }

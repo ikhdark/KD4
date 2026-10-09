@@ -489,7 +489,16 @@ pub(super) fn list_keys_callback(
     keys.sort();
     let more = keys.len() > limit as usize;
     keys.truncate(limit as usize);
-    let result = serde_json::json!({"next_after": if more { keys.last().cloned() } else { None }, "keys": keys});
+    // Use admission's cached byte counts, including display recipes. Recovery
+    // must not deserialize every retained result just to discover its cost.
+    // Align sizes with keys instead of duplicating potentially large key text.
+    let entry_bytes = keys.iter().map(|key| state.stored_values[key].bytes).collect::<Vec<_>>();
+    let result = serde_json::json!({
+        "next_after": if more { keys.last().cloned() } else { None }, "keys": keys,
+        "entry_bytes": entry_bytes,
+        "usage": {"entries": state.stored_values.len(), "bytes": state.total_stored_value_bytes,
+            "entry_limit": MAX_SESSION_STORED_VALUES, "byte_limit": MAX_SESSION_STORED_VALUE_BYTES},
+    });
     if let Some(value) = super::value::serialized_json_to_v8(scope, &result.to_string()) {
         retval.set(value);
     }

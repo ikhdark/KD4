@@ -827,6 +827,7 @@ struct WorkspaceProjectionKey {
     origin_call: Option<(String, String)>,
     recovery: bool,
     output_sha256: String,
+    include_historical_payloads: bool,
 }
 
 #[derive(Debug)]
@@ -1193,7 +1194,7 @@ fn factor_workspace_notices(mut notices: Vec<serde_json::Value>) -> serde_json::
     }).collect::<Vec<_>>();
     let mut observations = Vec::new();
     for (index, shared) in metadata.iter().enumerate() {
-        if shared.as_object().is_none_or(|fields| fields.is_empty())
+        if shared.as_object().is_none_or(serde_json::Map::is_empty)
             || metadata.iter().filter(|value| *value == shared).count() < 2 { continue; }
         let group = observations.iter().position(|value| value == shared).unwrap_or_else(|| {
             observations.push(shared.clone()); observations.len() - 1
@@ -2152,6 +2153,7 @@ impl ToolHistoryState {
             &mut checked,
             workspace_identity,
             Some(git_workspace),
+            /*include_historical_payloads*/ false,
         );
         let checked = checked.into_shared();
         let workspace_unchanged = Arc::ptr_eq(canonical, &checked);
@@ -2373,6 +2375,36 @@ impl ToolHistoryState {
         }) || !self.workspace_evidence_requirements(items).is_empty()
     }
 
+    pub(crate) fn can_use_root_only_workspace_identity(&self, items: &[ResponseItem]) -> bool {
+        // is_current ignores Git digests when an observation has path watches.
+        // Keep legacy, missing and partially scoped evidence on the full-capture
+        // path, including nested results and recovered artifact origins.
+        let requirements = self.workspace_evidence_requirements(items);
+        let covered = |observation: &WorkspaceEvidenceObservation| {
+            // An explicitly unavailable, unscoped observation stays unknown
+            // for every current identity. Scanning cannot improve its proof;
+            // retain normal projection/invalidation without requiring digests.
+            if observation.source_dependencies.is_empty()
+                && observation.revision.as_ref().is_some_and(|identity| identity.unavailable)
+            {
+                return true;
+            }
+            observation.revision.as_ref().is_some_and(|identity| {
+                !identity.unavailable && identity.repository_root.is_some()
+            }) && !observation.source_dependencies.is_empty()
+                && observation.source_path_observations.len() == observation.source_dependencies.len()
+                && observation.source_path_observations.iter()
+                    .map(SourcePathChangeObservation::source_dependency)
+                    .collect::<BTreeSet<_>>() == observation.source_dependencies
+        };
+        !requirements.is_empty() && requirements.iter().all(|(call_id, origin)| {
+            self.workspace_evidence.get(origin).is_some_and(&covered)
+                && self.code_mode_nested_evidence.get(call_id).is_none_or(|nested| {
+                    nested.values().all(|result| covered(&result.observation))
+                })
+        })
+    }
+
     fn project_inner(
         &self,
         items: Arc<[ResponseItem]>,
@@ -2391,6 +2423,7 @@ impl ToolHistoryState {
                 &mut projected,
                 workspace_identity,
                 git_workspace,
+                /*include_historical_payloads*/ true,
             );
         }
         let tool_search_arguments = projected
@@ -3190,15 +3223,14 @@ impl ToolHistoryState {
             let has_controls = canonical_textual_output_identity(&items[index.0])
                 .and_then(|(_, output)| tool_output_controls(&output))
                 .is_some_and(|controls| tool_controls_need_continuation(&controls));
-            if cost > available && newest_unconsumed_image.as_ref() != Some(&call_id) {
-                if let Some((receipt, receipt_cost)) = receipt
-                    && (receipt_cost <= available || has_controls)
-                    && let Some((_, body)) =
-                        textual_output_body_mut(&mut items.make_owned()[index.0])
-                {
-                    replace_model_visible_output_text(body, receipt);
-                    cost = receipt_cost;
-                }
+            if cost > available && newest_unconsumed_image.as_ref() != Some(&call_id)
+                && let Some((receipt, receipt_cost)) = receipt
+                && (receipt_cost <= available || has_controls)
+                && let Some((_, body)) =
+                    textual_output_body_mut(&mut items.make_owned()[index.0])
+            {
+                replace_model_visible_output_text(body, receipt);
+                cost = receipt_cost;
             }
             if cost <= remaining || has_controls || newest_unconsumed_image.as_ref() == Some(&call_id) {
                 remaining = remaining.saturating_sub(cost);
@@ -3307,7 +3339,11 @@ impl ToolHistoryState {
         items: &mut ProjectedResponseItems,
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: Option<&GitWorkspaceCache>,
+        include_historical_payloads: bool,
     ) {
+        // Sampling keeps the original tool messages and only appends notices.
+        // Do not copy, tokenize, serialize and reparse payloads that its consumer
+        // immediately removes. Replacement projections still need those bytes.
         let requirements = self.workspace_evidence_requirements(items);
         let calls = items.iter().filter_map(|item| match item {
             ResponseItem::FunctionCall { name, arguments, call_id, .. }
@@ -3352,6 +3388,7 @@ impl ToolHistoryState {
                         origin_call: calls.get(origin_call_id).cloned(),
                         recovery: calls.get(call_id).is_some_and(|(name, _)| name == "read_tool_output"),
                         output_sha256: sha256(output.as_bytes()),
+                        include_historical_payloads,
                     };
                     if let Some(entry) = cache.get_mut(call_id).filter(|entry| entry.key == key) {
                         #[cfg(test)]
@@ -3451,9 +3488,11 @@ impl ToolHistoryState {
                         .map(|(index, result)| {
                             let mut row = serde_json::json!({
                                 "call_id": result.observation.call_id,
-                                "output": result.output,
                                 "workspace_evidence_freshness": "current",
                             });
+                            if include_historical_payloads {
+                                row["output"] = serde_json::json!(result.output);
+                            }
                             if index < 8 {
                                 let scope = result.observation.dependency_notice(&result.output, workspace_identity, git_workspace);
                                 current_scope_bytes += scope.to_string().len();
@@ -3487,9 +3526,11 @@ impl ToolHistoryState {
                     "workspace_evidence_freshness": if known_source_change { "changed" } else { "unknown" },
                     "valid_for_current_workspace": false,
                     "observed_revision": observation.and_then(|observation| observation.revision.as_ref()),
-                    "current_revision": workspace_identity,
                     "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                 });
+                if include_historical_payloads {
+                    notice["current_revision"] = serde_json::json!(workspace_identity);
+                }
                 // Preserve useful history only when its captured bytes are
                 // verified. A missing observation or output mismatch cannot
                 // authenticate even a historical summary.
@@ -3517,7 +3558,7 @@ impl ToolHistoryState {
                         notice["stale_nested_results"] = scopes.into();
                     }
                 }
-                if origin_call_id == call_id && observation.is_some() && output_matches {
+                if include_historical_payloads && origin_call_id == call_id && observation.is_some() && output_matches {
                     notice["historical_digest"] = serde_json::json!(
                         truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS)
                     );
@@ -3525,7 +3566,9 @@ impl ToolHistoryState {
                 if response_item_output_success(item) == Some(false)
                     || observation.is_some_and(|observation| !observation.successful)
                 {
-                    notice["historical_output"] = serde_json::json!(output);
+                    if include_historical_payloads {
+                        notice["historical_output"] = serde_json::json!(output);
+                    }
                     notice["failure_applicability"] = serde_json::json!(
                         "The captured failure is preserved exactly; its current applicability is unverified. This does not establish that the failure was resolved or remains a current blocker."
                     );
@@ -3550,7 +3593,9 @@ impl ToolHistoryState {
                     // this bounded excerpt. Freshness controls current proof, not access
                     // to historical bytes requested explicitly by the model.
                     notice["historical_authenticity"] = serde_json::json!("authenticated");
-                    notice["historical_output"] = serde_json::json!(output);
+                    if include_historical_payloads {
+                        notice["historical_output"] = serde_json::json!(output);
+                    }
                 }
                 if let Some((name, arguments)) = items.iter().find_map(|item| match item {
                     ResponseItem::FunctionCall {
@@ -3579,7 +3624,8 @@ impl ToolHistoryState {
                 // Invalidating source evidence must not erase process controls
                 // or artifact recovery. These are historical command receipts,
                 // not claims that the old workspace evidence is still current.
-                if let Some((_, receipt)) = output
+                if include_historical_payloads
+                    && let Some((_, receipt)) = output
                     .rsplit_once("Nested command states (independent of script completion):\n")
                     && let Ok(states) = serde_json::from_str::<Vec<serde_json::Value>>(receipt)
                 {
@@ -4270,6 +4316,7 @@ impl ToolHistoryLoadOutcome {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn load_tool_history_state(
     codex_home: &std::path::Path,
     thread_id: &str,
@@ -5484,9 +5531,7 @@ fn admission_priority(candidate: &ToolHistoryCandidate, output: &str) -> u8 {
         2
     } else if !candidate.successful {
         0
-    } else if candidate.semantic_class.contains("validation") {
-        1
-    } else if matches!(
+    } else if candidate.semantic_class.contains("validation") || matches!(
         candidate.semantic_class.as_str(),
         "tool_failure" | "tool_timeout"
     ) || output.contains("\"outcome\":\"failure\"")
@@ -5634,6 +5679,10 @@ pub(crate) fn tool_search_receipt_item(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "receipt identity serializes only strings, integers, booleans and JSON values into an infallible Vec sink; a fallback hash would alias distinct receipts"
+)]
 pub(crate) fn tool_search_receipt_id(
     call_id: &str,
     status: &str,

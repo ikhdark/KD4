@@ -148,7 +148,7 @@ impl PlanLineage {
         for step in &plan.plan {
             let id = self.step_id(&step.step);
             if id == plan_step_id(&step.step)
-                && self.step_requirements.get(&id).is_some_and(|ids| ids == &[id.clone()])
+                && self.step_requirements.get(&id).is_some_and(|ids| ids == std::slice::from_ref(&id))
                 && references.get(id.as_str()) == Some(&1)
                 && self.requirements.get(&id).is_some_and(|requirement| {
                     requirement.text == step.step && requirement.status == step.status
@@ -291,6 +291,7 @@ impl PlanLineage {
         }
         for (id, (completed, in_progress, same_text, renamed_completion)) in states {
             if !completed { self.resolved_requirements.remove(&id); }
+            #[expect(clippy::expect_used, reason = "states contains only existing requirements; the map is unchanged while aggregating")]
             let requirement = self.requirements.get_mut(&id).expect("known requirement");
             requirement.status = if completed && (same_text || self.resolved_requirements.contains(&id)) {
                 requirement.superseded_reason = None;
@@ -481,7 +482,9 @@ pub(crate) fn checklist_completion_authority() -> String {
 }
 
 pub(crate) fn plan_revision(plan: Option<&UpdatePlanArgs>) -> String {
-    format!("{:x}", Sha256::digest(serde_json::to_vec(&plan).expect("plan serializes")))
+    #[expect(clippy::expect_used, reason = "plan serialization contains only strings, vectors, options and unit enums")]
+    let bytes = serde_json::to_vec(&plan).expect("plan serializes");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub(crate) fn plan_revision_with_lineage(
@@ -491,7 +494,9 @@ pub(crate) fn plan_revision_with_lineage(
     if lineage.is_empty() || *lineage == PlanLineage::from_plan(plan) {
         return plan_revision(plan);
     }
-    format!("{:x}", Sha256::digest(serde_json::to_vec(&(plan, lineage)).expect("plan serializes")))
+    #[expect(clippy::expect_used, reason = "plan and lineage use derived JSON-compatible fields and string-keyed maps")]
+    let bytes = serde_json::to_vec(&(plan, lineage)).expect("plan serializes");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub(crate) fn plan_step_id(step: &str) -> String {
@@ -741,7 +746,7 @@ impl PlanStore {
             && scope_change_instructions.is_empty() && workflow.is_none()
             && status_next.as_ref().is_some_and(|next| guard.plan.as_ref() == Some(next))
         {
-            let update = PlanStoreUpdate { current: status_next.expect("status update"),
+            let update = PlanStoreUpdate { current: status_next.ok_or("missing unchanged status update")?,
                 effect: PlanUpdateEffect::NoOp, lineage: guard.lineage.clone() };
             return Ok(StagedPlanUpdate { current: guard, next: None, update });
         }
@@ -810,7 +815,8 @@ impl PlanStore {
                 return Err(format!("complete the descendant checklist before resolving {id}; no changes were made"));
             }
             lineage.resolved_requirements.insert(id.clone());
-            let requirement = lineage.requirements.get_mut(&id).expect("known requirement");
+            let requirement = lineage.requirements.get_mut(&id)
+                .ok_or_else(|| format!("resolve names unknown requirement {id}; no changes were made"))?;
             requirement.status = StepStatus::Completed;
             requirement.superseded_reason = None;
             lineage.accepted_supersessions.remove(&id);
@@ -870,8 +876,7 @@ impl PlanStore {
         // proves an index refers to the plan the caller read.
         if !revision_checked && updates.iter().any(|update| update.index.is_some()) {
             return Err(format!(
-                "index-based status updates require expected_revision; current revision is {}. Use step_id to address steps without a revision. No changes were made.",
-                revision
+                "index-based status updates require expected_revision; current revision is {revision}. Use step_id to address steps without a revision. No changes were made."
             ));
         }
         let mut seen = HashSet::new();
@@ -1622,7 +1627,7 @@ mod tests {
         let step = |text: &str, status, continues: &[&str]| PlanStepArg {
             step: text.into(),
             status,
-            continues: continues.iter().map(|id| id.to_string()).collect(),
+            continues: continues.iter().map(ToString::to_string).collect(),
         };
         let revise = |plan, superseded: Vec<(&str, &str)>, explanation: Option<&str>| PlanToolArgs {
             plan: Some(plan),

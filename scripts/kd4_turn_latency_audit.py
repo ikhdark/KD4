@@ -1171,38 +1171,58 @@ def _apply_detailed_tool_timing(
         if not records or not details:
             continue
 
-        detail_by_execution = {
-            str(call.get("executionId")): call
-            for call in details
-            if call.get("executionId") not in (None, "")
-        }
+        details_by_execution: dict[str, list[int]] = collections.defaultdict(list)
+        for index, call in enumerate(details):
+            if call.get("executionId") not in (None, ""):
+                details_by_execution[str(call["executionId"])].append(index)
+        record_execution_counts = collections.Counter(
+            str(record["executionId"])
+            for record in records
+            if record.get("executionId") not in (None, "")
+        )
         remaining_records = []
-        matched_detail_ids: set[int] = set()
+        ambiguous_records = []
+        excluded_detail_indexes: set[int] = set()
         for record in records:
             execution_id = record.get("executionId")
-            call = (
-                detail_by_execution.get(str(execution_id))
+            indexes = (
+                details_by_execution.get(str(execution_id), [])
                 if execution_id not in (None, "")
-                else None
+                else []
             )
-            if call is None:
+            if execution_id not in (None, "") and (
+                record_execution_counts[str(execution_id)] > 1 or len(indexes) > 1
+            ):
+                # A repeated identity cannot establish a one-to-one match.
+                # Keep its details out of fallback matching as well, so an
+                # anonymous record cannot inherit the colliding measurement.
+                ambiguous_records.append(record)
+                excluded_detail_indexes.update(indexes)
+                continue
+            if not indexes:
                 remaining_records.append(record)
                 continue
-            apply(call_key, record, call, "execution_id")
-            matched_detail_ids.add(id(call))
+            index = indexes[0]
+            apply(call_key, record, details[index], "execution_id")
+            excluded_detail_indexes.add(index)
         remaining_details = [
-            call for call in details if id(call) not in matched_detail_ids
+            call for index, call in enumerate(details)
+            if index not in excluded_detail_indexes
         ]
 
+        ambiguous_group = bool(ambiguous_records)
         if len(remaining_records) == len(remaining_details) == 1:
             apply(call_key, remaining_records[0], remaining_details[0], "unambiguous")
         elif remaining_records and len(remaining_records) == len(remaining_details):
             for record, call in zip(remaining_records, remaining_details, strict=True):
                 apply(call_key, record, call, "ordered")
         elif remaining_records or remaining_details:
+            ambiguous_group = True
+            ambiguous_records.extend(remaining_records)
+        if ambiguous_group:
             stats["ambiguousGroups"] += 1
-            stats["ambiguousRecords"] += len(remaining_records)
-            for record in remaining_records:
+            stats["ambiguousRecords"] += len(ambiguous_records)
+            for record in ambiguous_records:
                 record["detailedTimingAmbiguous"] = True
 
     return dict(stats)

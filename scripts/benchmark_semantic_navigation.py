@@ -19,13 +19,14 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import unquote, urlsplit
 
 
 SOURCE = """pub struct Value;
 pub trait Execute { fn execute(&self); }
 impl Execute for Value { fn execute(&self) { target(); } }
 pub fn target() {}
-pub fn caller(value: &Value) { target(); value.execute(); }
+pub fn caller(value: &Value) { let _ = "λ😀"; target(); target(); value.execute(); }
 pub fn dependent(value: Value) -> Value { value }
 pub mod shadow { pub fn target() {} }
 """
@@ -116,9 +117,57 @@ class Lsp:
             self.stderr.close()
 
 
-def location_lines(result):
-    return sorted({entry.get("targetSelectionRange", entry.get("range"))["start"]["line"]
-                   for entry in (result if isinstance(result, list) else [result]) if entry})
+def source_range(line, word, occurrence=0):
+    """Fixture-derived UTF-16 coordinates, independent of server responses."""
+    text = SOURCE.splitlines()[line]
+    start = -1
+    for _ in range(occurrence + 1):
+        start = text.index(word, start + 1)
+    character = len(text[:start].encode("utf-16-le")) // 2
+    return {"start": {"line": line, "character": character},
+            "end": {"line": line, "character": character + len(word.encode("utf-16-le")) // 2}}
+
+
+def range_key(value):
+    return tuple(value[edge][coordinate] for edge in ["start", "end"] for coordinate in ["line", "character"])
+
+
+def location_key(uri, span):
+    parsed = urlsplit(uri)
+    return (parsed.scheme, parsed.netloc, os.path.normcase(unquote(parsed.path)), *range_key(span))
+
+
+def locations(result):
+    # Keep multiplicity: a set of line numbers hides missing same-line references,
+    # wrong files/columns, and duplicate results.
+    return sorted(location_key(entry.get("targetUri", entry.get("uri")),
+                               entry.get("targetSelectionRange", entry.get("selectionRange", entry.get("range"))))
+                  for entry in (result if isinstance(result, list) else [result]) if entry)
+
+
+def navigation_checks(uri, results, incoming, outgoing):
+    def expected(*spans):
+        return sorted(location_key(uri, source_range(*span)) for span in spans)
+
+    def edges(rows, direction):
+        return sorted((locations([row[direction]])[0], sorted(range_key(span) for span in row["fromRanges"]))
+                      for row in rows)
+
+    def edge(target, *calls):
+        return (location_key(uri, source_range(*target)), sorted(range_key(source_range(*call)) for call in calls))
+
+    return [
+        locations(results[0]) == expected((3, "target")),
+        locations(results[1]) == expected((2, "target"), (4, "target", 0), (4, "target", 1)),
+        locations(results[2]) == expected((2, "Value")),
+        locations(results[3]) == expected((0, "Value")),
+        locations(results[4]) == expected((3, "target")),
+        locations(results[5]) == expected((4, "caller")),
+        edges(incoming, "from") == sorted([edge((2, "execute"), (2, "target")),
+                                          edge((4, "caller"), (4, "target", 0), (4, "target", 1))]),
+        edges(outgoing, "to") == sorted([edge((2, "execute"), (4, "execute")),
+                                        edge((3, "target"), (4, "target", 0), (4, "target", 1))]),
+    ]
 
 
 def benchmark(executable, iterations, timeout):
@@ -147,10 +196,9 @@ def benchmark(executable, iterations, timeout):
             cold_ms = (time.perf_counter() - started) * 1000
             client.send("textDocument/didOpen", {"textDocument": {
                 "uri": source.as_uri(), "languageId": "rust", "version": 1, "text": SOURCE}}, request=False)
-            lines = SOURCE.splitlines()
             def position(line, word):
                 return {"textDocument": {"uri": source.as_uri()},
-                        "position": {"line": line, "character": lines[line].index(word)}}
+                        "position": source_range(line, word)["start"]}
             queries = [
                 ("textDocument/definition", position(4, "target")),
                 ("textDocument/references", {**position(3, "target"), "context": {"includeDeclaration": False}}),
@@ -169,14 +217,17 @@ def benchmark(executable, iterations, timeout):
                         results = [client.result(identity) for identity in ids]
                     else:
                         results = [client.result(client.send(method, params)) for method, params in queries]
-                    incoming = client.result(client.send("callHierarchy/incomingCalls", {"item": results[4][0]}))
-                    outgoing = client.result(client.send("callHierarchy/outgoingCalls", {"item": results[5][0]}))
+                    dependent = [("callHierarchy/incomingCalls", {"item": results[4][0]}),
+                                 ("callHierarchy/outgoingCalls", {"item": results[5][0]})]
+                    if batched:
+                        ids = [client.send(method, params) for method, params in dependent]
+                        incoming, outgoing = [client.result(identity) for identity in ids]
+                    else:
+                        incoming, outgoing = [client.result(client.send(method, params)) for method, params in dependent]
                     measured_ms = (time.perf_counter() - start) * 1000
-                    checks = [location_lines(results[0]) == [3], location_lines(results[1]) == [2, 4],
-                              location_lines(results[2]) == [2], location_lines(results[3]) == [0],
-                              sorted(entry["from"]["name"] for entry in incoming) == ["caller", "execute"],
-                              sorted(entry["to"]["name"] for entry in outgoing) == ["execute", "target"]]
+                    checks = navigation_checks(source.as_uri(), results, incoming, outgoing)
                     observations.append({"iteration": iteration, "batched": batched, "wall_ms": measured_ms,
+                                         "rpc_calls": 8, "dependency_stages": 2 if batched else 8,
                                          "checks": checks, "results": results, "incoming": incoming, "outgoing": outgoing})
             return {"fixture_sha256": hashlib.sha256(SOURCE.encode()).hexdigest(), "cold_start_ms": cold_ms,
                     "observations": observations, "transcript": client.transcript}
@@ -207,10 +258,11 @@ def main():
     summary = {"report": str(args.output.resolve()), "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(),
                "version": report["version"], "cold_start_ms": report["cold_start_ms"],
                "accuracy": {"passed": sum(sum(row["checks"]) for row in report["observations"]),
-                            "total": len(report["observations"]) * 6},
+                            "total": sum(len(row["checks"]) for row in report["observations"])},
                "warm_median_ms": {str(batched): statistics.median(row["wall_ms"] for row in report["observations"] if row["batched"] == batched)
                                   for batched in [False, True]},
                "rpc_calls_per_iteration": 8, "model_calls": 0,
+               "dependency_stages": {"serial": 8, "batched": 2},
                "limits": "Isolated no-dependency fixture; no workspace-wide indexing, macro, build-script, or live-model benchmark."}
     print(json.dumps(summary, indent=2))
     return 0 if summary["accuracy"]["passed"] == summary["accuracy"]["total"] else 1

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Run root package maintenance commands from one maintained target list."""
+"""Run root package maintenance commands from one maintained target list.
+
+test-python --json emits one aggregate result across the scripts and Harbor
+interpreters; test-body hashes are observations, not reusable validation proof.
+audit-scripts --oracles adds static Python assertion advisories (also with
+--quick). Oracle findings never become hard failures, even with --strict.
+"""
 
 from __future__ import annotations
 
@@ -22,8 +28,10 @@ from shutil import which
 from typing import Callable, Sequence
 
 try:
+    from scripts.benchmark_agents import harbor_python
     from scripts.process_owner import OwnedThreadPoolExecutor, run_owned
 except ModuleNotFoundError:
+    from benchmark_agents import harbor_python
     from process_owner import OwnedThreadPoolExecutor, run_owned
 
 
@@ -66,6 +74,8 @@ SCRIPT_KIND_BY_SUFFIX = {
 }
 SCRIPT_CANDIDATE_SUFFIXES = frozenset((*SCRIPT_KIND_BY_SUFFIX, ".bat", ".cmd", ".ts"))
 SCRIPT_LINE_ADVISORY_THRESHOLD = 1_000
+JSON_WORKER_MAX_BYTES = 16 * 1024 * 1024
+ORACLE_TIMEOUT_SECONDS = 30
 SCRIPT_AUDIT_PACKAGE_COMMAND = (
     "node scripts/run-python.js scripts/root_maintenance.py audit-scripts"
 )
@@ -768,11 +778,13 @@ def script_audit_context_issues() -> list[str]:
 
 
 def script_audit_findings(
-    *, kind_by_target: dict[str, str] | None = None
+    *, kind_by_target: dict[str, str] | None = None,
+    oracle_sources: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     advisories: list[str] = []
     content_hashes: dict[str, list[str]] = {}
+    oracle_bytes = 0
     kind_by_target = script_kind_map() if kind_by_target is None else kind_by_target
 
     for target in script_source_targets():
@@ -812,6 +824,12 @@ def script_audit_findings(
             errors.append(f"trailing whitespace in {target} at line(s) {sample}")
 
         if kind == "python":
+            if oracle_sources is not None and (
+                oracle_bytes + len(data) <= JSON_WORKER_MAX_BYTES
+                and len(oracle_sources) < 10_000
+            ):
+                oracle_sources[target] = text
+                oracle_bytes += len(data)
             try:
                 ast.parse(text, filename=target)
             except SyntaxError as exc:
@@ -896,10 +914,9 @@ def script_audit_commands(
                     (
                         *uv_prefix,
                         "python",
-                        "-m",
-                        "unittest",
-                        *selected_tests,
-                        "-v",
+                        "scripts/root_maintenance.py",
+                        "test-python",
+                        *(arg for target in selected_tests for arg in ("--module", target)),
                     ),
                 )
 
@@ -1021,9 +1038,12 @@ def _run_syntax_check(command: Sequence[str], output) -> int:
 
 
 def _audit_command_results(commands):
-    for independent, group in groupby(commands, key=_is_syntax_check):
+    def can_overlap_parsers(item):
+        return _is_syntax_check(item) or item[0] in {"Python format", "Python lint"}
+
+    for independent, group in groupby(commands, key=can_overlap_parsers):
         batch = list(group)
-        if not independent:
+        if not independent or not any(_is_syntax_check(item) for item in batch):
             for label, command in batch:
                 print(f"[RUN] {label}", flush=True)
                 try:
@@ -1033,29 +1053,129 @@ def _audit_command_results(commands):
                     returncode = 127
                 yield label, returncode
             continue
-        # Bounded parser-only fanout, with the slow PowerShell groups admitted
-        # first by the owning command list. Never overlap a serial command.
+        # uv checks share one worker: environment/cache synchronization must
+        # stay serial, but it need not delay independent parser processes.
+        # Tests and unknown commands remain barriers. Admit the Python chain
+        # and slow PowerShell groups first, with at most four active children.
         # File-backed output avoids interleaved diagnostics or an unbounded
         # memory buffer. Keep every child and log alive through ordered delivery.
         with ExitStack() as stack:
             logs = [stack.enter_context(tempfile.TemporaryFile()) for _ in batch]
-            with OwnedThreadPoolExecutor(max_workers=min(4, len(batch))) as executor:
-                futures = []
-                for (label, command), output in zip(batch, logs):
-                    print(f"[RUN] {label}", flush=True)
-                    futures.append(executor.submit(_run_syntax_check, command, output))
-                for (label, _command), future, output in zip(batch, futures, logs):
-                    returncode = future.result()
-                    output.seek(0)
-                    # Decode across chunk boundaries, including split UTF-8.
-                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
-                    while chunk := output.read(64 * 1024):
-                        print(decoder.decode(chunk), end="", flush=True)
-                    print(decoder.decode(b"", final=True), end="", flush=True)
-                    yield label, returncode
+            groups = [[i] for i, item in enumerate(batch) if _is_syntax_check(item)]
+            python_checks = [i for i, item in enumerate(batch) if not _is_syntax_check(item)]
+            if python_checks:
+                groups.insert(0, python_checks)
+
+            def run_group(indices):
+                return {i: _run_syntax_check(batch[i][1], logs[i]) for i in indices}
+
+            delivered = set()
+
+            def deliver_log(i):
+                if i in delivered:
+                    return
+                delivered.add(i)
+                output = logs[i]
+                output.seek(0)
+                # Decode across chunk boundaries, including split UTF-8.
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                while chunk := output.read(64 * 1024):
+                    print(decoder.decode(chunk), end="", flush=True)
+                print(decoder.decode(b"", final=True), end="", flush=True)
+
+            try:
+                with OwnedThreadPoolExecutor(max_workers=min(4, len(groups))) as executor:
+                    for label, _command in batch:
+                        print(f"[RUN] {label}", flush=True)
+                    futures = {}
+                    for indices in groups:
+                        future = executor.submit(run_group, indices)
+                        for i in indices:
+                            futures[i] = future
+                    for i, (label, _command) in enumerate(batch):
+                        returncode = futures[i].result()[i]
+                        deliver_log(i)
+                        yield label, returncode
+            finally:
+                # The owned pool cancels/joins before logs close, including on
+                # generator.close(). Preserve every started child's diagnostics
+                # without replaying already delivered output or masking failure.
+                for i in range(len(batch)):
+                    deliver_log(i)
 
 
-def run_script_audit(*, include_tests: bool, strict: bool) -> int:
+def _run_json_worker(command, *, request=None, timeout=None):
+    """Own one child and retain its complete stdout before parsing a bounded report."""
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout:
+        if request is not None:
+            payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+            if len(payload) > JSON_WORKER_MAX_BYTES:
+                raise ValueError("JSON worker request exceeds the 16 MiB limit")
+            stdin.write(payload)
+            stdin.seek(0)
+        executable = which(command[0]) or command[0]
+        result = run_owned(
+            [executable, *command[1:]], cwd=REPO_ROOT, timeout=timeout,
+            stdin=stdin, stdout=stdout,
+        )
+        if stdout.seek(0, os.SEEK_END) > JSON_WORKER_MAX_BYTES:
+            raise ValueError("JSON worker report exceeds the 16 MiB limit; result unverified")
+        stdout.seek(0)
+        return result.returncode, json.load(stdout)
+
+
+def _print_oracle_advisories(sources: dict[str, str], expected: set[str]) -> None:
+    print("[ORACLE] Advisory only: static input snapshot, not test execution or coverage proof.")
+    try:
+        if set(sources) != expected:
+            raise ValueError("incomplete Python input snapshot (unreadable input or source budget exceeded)")
+        if not sources:
+            raise ValueError("no Python sources selected")
+        code, report = _run_json_worker(
+            [sys.executable, "-I", "-B", str(SCRIPTS_ROOT / "python_test_oracles.py")],
+            request={"sources": sources}, timeout=ORACLE_TIMEOUT_SECONDS,
+        )
+        if code != 0:
+            raise ValueError(f"oracle worker exited {code}")
+        if not isinstance(report, dict) or report.get("schema_version") != 1 or any(
+            not isinstance(report.get(key), list)
+            for key in ("diagnostics", "unknown", "limitations")
+        ) or any(type(report.get(key)) is not bool for key in ("parse_complete", "analysis_complete")):
+            raise ValueError("invalid oracle report")
+        if report.get("language") != "python" or report.get("advisory_only") is not True or report["analysis_complete"]:
+            raise ValueError("oracle report must describe incomplete advisory-only Python analysis")
+        if any(
+            not isinstance(item, dict) or not isinstance(item.get("path"), str)
+            or not isinstance(item.get("reason"), str)
+            for item in [*report["diagnostics"], *report["unknown"]]
+        ) or not all(isinstance(item, str) for item in report["limitations"]):
+            raise ValueError("invalid oracle diagnostic or limitation")
+        # Compare the exact UTF-8 input bytes, not mtimes or a cached receipt.
+        # New/unselected files are outside this explicitly named input snapshot.
+        changed = [
+            target for target, text in sources.items()
+            if (REPO_ROOT / target).read_bytes() != text.encode("utf-8")
+        ]
+        if changed:
+            raise ValueError("source changed during oracle analysis: " + ", ".join(changed))
+    except (OSError, ValueError, subprocess.SubprocessError, TimeoutError) as error:
+        print(f"[ORACLE ADVISORY] Analysis unverified: {error}", flush=True)
+        return
+    print(
+        f"[ORACLE] {len(sources)} unchanged input(s); "
+        f"{len(report['diagnostics'])} finding(s); {len(report['unknown'])} unresolved item(s); "
+        f"parse_complete={report['parse_complete']}; analysis_complete={report['analysis_complete']}.",
+        flush=True,
+    )
+    for diagnostic in report["diagnostics"]:
+        print("[ORACLE ADVISORY] " + json.dumps(diagnostic, sort_keys=True), flush=True)
+    for unknown in report["unknown"]:
+        print("[ORACLE UNKNOWN] " + json.dumps(unknown, sort_keys=True), flush=True)
+    for limitation in report["limitations"]:
+        print(f"[ORACLE LIMITATION] {limitation}", flush=True)
+
+
+def run_script_audit(*, include_tests: bool, strict: bool, oracles: bool = False) -> int:
     audit_targets = script_source_targets()
     kind_by_target = script_kind_map()
     inventory: dict[str, int] = {}
@@ -1073,8 +1193,17 @@ def run_script_audit(*, include_tests: bool, strict: bool) -> int:
         print("Mode: quick (full script unit tests skipped)", flush=True)
 
     errors = script_audit_context_issues()
-    hygiene_errors, advisories = script_audit_findings(kind_by_target=kind_by_target)
+    oracle_sources: dict[str, str] = {}
+    hygiene_errors, advisories = script_audit_findings(
+        kind_by_target=kind_by_target,
+        **({"oracle_sources": oracle_sources} if oracles else {}),
+    )
     errors.extend(hygiene_errors)
+    if oracles:
+        _print_oracle_advisories(
+            oracle_sources,
+            {target for target in audit_targets if kind_by_target.get(target) == "python"},
+        )
     test_targets = script_audit_test_targets() if include_tests else []
     commands, missing_tools = script_audit_commands(
         include_tests=include_tests,
@@ -1132,6 +1261,85 @@ def run(command: Sequence[str]) -> int:
         return 127
 
 
+def _emit_python_test_report(environments, errors) -> int:
+    reports = [environment["report"] for environment in environments]
+    complete = bool(reports) and not errors and all(report["complete"] for report in reports)
+    successful = complete and all(report["successful"] for report in reports)
+    print(json.dumps({
+        "schema_version": 1, "runner": "root_maintenance.unittest",
+        "complete": complete, "successful": successful,
+        "tests_run": sum(report["tests_run"] for report in reports),
+        "environments": environments, "errors": errors,
+        "content_identity_scope": "authored_test_body_observation_only",
+        "reusable_validation_receipt": False,
+    }, sort_keys=True))
+    return 0 if successful else 2 if errors else 1
+
+
+def _run_python_tests_json(ordinary_targets, harbor_targets) -> int:
+    try:
+        from scripts.unittest_json import validate_report
+    except ModuleNotFoundError:
+        from unittest_json import validate_report
+
+    environments, errors = [], []
+    seen_names: set[str] = set()
+    for name, targets in (("scripts", ordinary_targets), ("harbor", harbor_targets)):
+        if not targets:
+            continue
+        try:
+            prefix = [*UV_RUN_SCRIPTS, "python"] if name == "scripts" else [str(harbor_python())]
+            code, report = _run_json_worker([
+                *prefix, "-B", str(SCRIPTS_ROOT / "unittest_json.py"), *targets,
+            ])
+            validate_report(report)
+            if (code == 0) != (report["complete"] and report["successful"]):
+                raise ValueError(f"exit status {code} disagrees with worker report")
+            if report["selection"]["requested"] != list(targets):
+                raise ValueError("worker report does not match requested selection")
+            names = set(report["selection"]["names"])
+            if seen_names & names:
+                raise ValueError("duplicate test identities across interpreter groups")
+            seen_names.update(names)
+            environments.append({"environment": name, "targets": list(targets),
+                                 "exit_code": code, "report": report})
+        except (OSError, ValueError, subprocess.SubprocessError, TimeoutError) as error:
+            message = f"{name} Python test result unverified: {error}"
+            print(message, file=sys.stderr)
+            errors.append(message)
+    if not ordinary_targets and not harbor_targets:
+        errors.append("No matching Python tests selected; zero tests is not a successful result.")
+    return _emit_python_test_report(environments, errors)
+
+
+def run_python_tests(targets: Sequence[str], *, json_output: bool = False) -> int:
+    # Harbor's adapter tests need its separately managed, pinned environment.
+    # Keep them in full/changed selections without importing Harbor into the
+    # lightweight maintenance environment or silently skipping missing tooling.
+    harbor_module = "scripts.test_harbor_windows_codex"
+    harbor_targets = [
+        target for target in targets
+        if target == harbor_module or target.startswith(harbor_module + ".")
+    ]
+    ordinary_targets = [target for target in targets if target not in harbor_targets]
+    if json_output:
+        return _run_python_tests_json(ordinary_targets, harbor_targets)
+    result = 0
+    if ordinary_targets:
+        result = run([
+            *UV_RUN_SCRIPTS, "python", "-m", "unittest", *ordinary_targets, "-v",
+        ])
+    if harbor_targets:
+        try:
+            python = harbor_python()
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(f"Could not run Harbor script tests: {error}", file=sys.stderr)
+            return result or 2
+        harbor_result = run([str(python), "-m", "unittest", *harbor_targets, "-v"])
+        result = result or harbor_result
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run root package maintenance commands.",
@@ -1150,6 +1358,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     python_test = subparsers.add_parser("test-python")
+    python_test.add_argument(
+        "--json", action="store_true",
+        help="Emit one structured result across interpreters; reject zero tests. Test diagnostics go to stderr.",
+    )
     python_test.add_argument(
         "--module",
         action="append",
@@ -1179,6 +1391,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat optimization advisories such as large or syntax-only scripts as failures.",
     )
+    script_audit.add_argument(
+        "--oracles", action="store_true",
+        help="Add static Python assertion advisories; never promoted by --strict and never proof of test coverage.",
+    )
     return parser
 
 
@@ -1205,6 +1421,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "test-python":
         changed_paths = resolved_changed_paths(args.changed)
         if changed_paths is None:
+            if args.json:
+                return _emit_python_test_report([], ["Changed-path discovery failed; selection unverified."])
             return 2
         targets = (
             python_test_targets(args.module, changed_paths)
@@ -1223,25 +1441,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 + ", ".join(uncovered),
                 file=sys.stderr,
             )
+            if args.json:
+                return _emit_python_test_report([], ["No focused test route for " + ", ".join(uncovered)])
             return 2
         if not targets:
+            if args.json:
+                return run_python_tests([], json_output=True)
             print("No matching changed Python test modules to run.")
             return 0
-        return run(
-            [
-                *UV_RUN_SCRIPTS,
-                "python",
-                "-m",
-                "unittest",
-                *targets,
-                "-v",
-            ]
-        )
+        if args.json:
+            return run_python_tests(targets, json_output=True)
+        return run_python_tests(targets)
 
     if args.command == "audit-scripts":
         return run_script_audit(
             include_tests=not args.quick,
             strict=args.strict,
+            oracles=args.oracles,
         )
 
     raise AssertionError(f"unhandled command: {args.command}")

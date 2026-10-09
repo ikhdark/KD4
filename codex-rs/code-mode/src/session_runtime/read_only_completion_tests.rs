@@ -74,6 +74,10 @@ async fn read_only_completion_contention_probe() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "holding both transaction locks proves read-only completion does not wait for either lock"
+)]
 async fn read_only_completion_does_not_wait_on_unrelated_transaction() {
     let runtime = SessionRuntime::new(Arc::new(ReadOnlyDelegate));
     let host = host(&runtime);
@@ -125,6 +129,10 @@ async fn read_only_completion_still_rejects_cancellation() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "polling while holding the transaction gate proves durable completion waits for publication ownership"
+)]
 async fn durable_read_only_completion_still_owns_publication() {
     let runtime = SessionRuntime::new(Arc::new(ReadOnlyDelegate));
     let directory = tempfile::tempdir().unwrap();

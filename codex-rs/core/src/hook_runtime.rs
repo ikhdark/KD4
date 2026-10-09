@@ -1253,7 +1253,7 @@ mod tests {
         let b = item("B", "msg_startup_context_0");
         let other = item("A", "msg_startup_context_1");
         assert_eq!(dedupe_existing_developer_contexts(&[a.clone(), b, other], vec![a.clone()]), vec![a.clone()]);
-        assert!(dedupe_existing_developer_contexts(&[a.clone()], vec![a]).is_empty());
+        assert!(dedupe_existing_developer_contexts(std::slice::from_ref(&a), vec![a.clone()]).is_empty());
     }
 
     #[test]

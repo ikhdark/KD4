@@ -153,7 +153,6 @@ objc2-foundation = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-codex-mcp = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 codex-utils-pty = { workspace = true }
 assert_matches = { workspace = true }

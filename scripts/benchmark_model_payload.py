@@ -105,13 +105,66 @@ def receive(ws, request, expected, timeout):
 def summarize(results):
     groups = {}
     for row in results:
-        groups.setdefault((row["scenario"], row["variant"], row["phase"]), []).append(row)
+        # Requested priority is not proof of delivered priority. Never pool
+        # different returned tiers (or models/efforts) into one latency median.
+        cohort = tuple(row.get(k) for k in (
+            "returned_model", "returned_effort", "returned_service_tier"))
+        groups.setdefault((row["scenario"], row["variant"], row["phase"], *cohort), []).append(row)
     return [{"scenario": key[0], "variant": key[1], "phase": key[2], "n": len(rows),
+             **{k: v for k, v in zip(("returned_model", "returned_effort", "returned_service_tier"),
+                                     key[3:]) if v is not None},
              "correct": sum(r["correct"] for r in rows),
              **{k: statistics.median(r[k] for r in rows if r[k] is not None)
                 for k in ("wire_bytes", "serialization_ms", "send_ms", "ttft_ms",
                           "wall_ms", "post_first_text_ms", "input_tokens", "cached_tokens")
                 if any(r[k] is not None for r in rows)}} for key, rows in groups.items()]
+
+
+def paired_summary(results):
+    """Compare matched successful requests, not differences of group medians.
+
+    Unknown/mismatched provider cohorts and incomplete/duplicate pairs cannot
+    establish a latency improvement. Keep their exclusion counts observable.
+    """
+    pairs = {}
+    for row in results:
+        pairs.setdefault((row["scenario"], row["phase"], row["pair"]), []).append(row)
+    groups, excluded = {}, {}
+    variants = {"deduplicate": ("repeated", "unique"), "inherit": ("full", "delta")}
+    cohort_fields = ("returned_model", "returned_effort", "returned_service_tier")
+    for (scenario, phase, _), rows in pairs.items():
+        names = variants.get(scenario)
+        if names is None or len(rows) != 2 or {r["variant"] for r in rows} != set(names):
+            reason = "incomplete_or_duplicate_pair"
+        elif not all(r["correct"] for r in rows):
+            reason = "incorrect_answer"
+        else:
+            before, after = (next(r for r in rows if r["variant"] == name) for name in names)
+            cohort = tuple(before.get(k) for k in cohort_fields)
+            if None in cohort or cohort != tuple(after.get(k) for k in cohort_fields):
+                reason = "unknown_or_mismatched_provider_cohort"
+            else:
+                metrics = groups.setdefault((scenario, phase, *cohort), {})
+                for metric in ("ttft_ms", "wall_ms"):
+                    if before.get(metric) is not None and after.get(metric) is not None:
+                        metrics.setdefault(metric, []).append(after[metric] - before[metric])
+                        if all(r.get("connection_setup_ms") is not None for r in (before, after)):
+                            # Connection setup is outside receive()'s request clock.
+                            delta = (after[metric] + after["connection_setup_ms"]
+                                     - before[metric] - before["connection_setup_ms"])
+                            metrics.setdefault("setup_inclusive_" + metric, []).append(delta)
+                continue
+        excluded[reason] = excluded.get(reason, 0) + 1
+    return {
+        "interpretation": "candidate minus baseline; negative is faster; small synthetic sample, not native harness speedup",
+        "excluded_pairs": excluded,
+        "groups": [{"scenario": key[0], "phase": key[1], **dict(zip(cohort_fields, key[2:])),
+                    "metrics": {metric: {"n": len(deltas), "median_delta_ms": statistics.median(deltas),
+                                          "min_delta_ms": min(deltas), "max_delta_ms": max(deltas),
+                                          "candidate_faster_pairs": sum(delta < 0 for delta in deltas)}
+                                for metric, deltas in metrics.items()}}
+                   for key, metrics in groups.items()],
+    }
 
 
 def main():
@@ -188,7 +241,8 @@ def main():
         payload = {"scope": "synthetic provider probe; not native harness speedup",
                    "settings": settings, "pairs": args.pairs, "rows": args.rows,
                    "total_wall_ms": (time.perf_counter() - started) * 1000,
-                   "results": results, "summary": summarize(results), "error": error,
+                   "results": results, "summary": summarize(results),
+                   "paired_summary": paired_summary(results), "error": error,
                    "limitations": ["send time is local socket handoff, not network transit",
                                    "TTFT includes network, queueing, prefill and hidden reasoning",
                                    "post-first-text includes generation and stream delivery",

@@ -25,9 +25,8 @@ const SERVER_NAME: &str = "test-streamable-http-oauth-refresh";
 const REFRESH_TOKEN: &str = "valid-refresh-token";
 const REFRESHED_ACCESS_TOKEN: &str = "refreshed-access-token";
 
-/// Concurrent operations inside the refresh window share one token-endpoint call.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::Result<()> {
+async fn oauth_client_fixture()
+-> anyhow::Result<(MockServer, TempDir, Arc<RmcpClient>, OAuthPersistor)> {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/.well-known/oauth-authorization-server/mcp"))
@@ -46,7 +45,6 @@ async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::
             "expires_in": 7200,
             "refresh_token": REFRESH_TOKEN,
         })))
-        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -149,6 +147,13 @@ async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::
         };
         oauth.clone()
     };
+    Ok((server, codex_home, Arc::new(client), oauth))
+}
+
+/// Concurrent operations inside the refresh window share one token-endpoint call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::Result<()> {
+    let (server, _home, client, oauth) = oauth_client_fixture().await?;
     oauth
         .set_remaining_lifetime_for_test(Duration::from_secs(29))
         .await?;
@@ -159,6 +164,13 @@ async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::
     first?;
     second?;
     let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/oauth/token")
+            .count(),
+        1
+    );
     let tool_requests: Vec<_> = requests
         .iter()
         .filter(|request| {
@@ -176,5 +188,91 @@ async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::
         );
     }
     server.verify().await;
+    Ok(())
+}
+
+/// A tools/list that already reached the server must not join another request's
+/// refresh merely to sample credentials for persistence. Exercise the real
+/// transport, result delivery and file store, not just the mutex helper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_operation_does_not_wait_for_another_refresh() -> anyhow::Result<()> {
+    let (server, home, client, oauth) = oauth_client_fixture().await?;
+    let first_received = Arc::new(tokio::sync::Notify::new());
+    let refresh_received = Arc::new(tokio::sync::Notify::new());
+    let first_signal = Arc::clone(&first_received);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_string_contains("tools/list"))
+        .respond_with(move |request: &Request| {
+            first_signal.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "jsonrpc": "2.0", "id": request.body_json::<Value>().unwrap()["id"],
+                    "result": { "tools": [] },
+                }))
+                .set_delay(Duration::from_millis(100))
+        })
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    let refresh_signal = Arc::clone(&refresh_received);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(move |_: &Request| {
+            refresh_signal.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "access_token": REFRESHED_ACCESS_TOKEN, "token_type": "Bearer",
+                    "expires_in": 7200, "refresh_token": REFRESH_TOKEN,
+                }))
+                .set_delay(Duration::from_millis(1500))
+        })
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    let first = async {
+        let result = client.list_tools(None, Some(Duration::from_secs(5))).await;
+        let elapsed = started.elapsed();
+        let refresh_started = refresh_received.notified().now_or_never().is_some();
+        (result, elapsed, refresh_started)
+    };
+    let second = async {
+        tokio::time::timeout(Duration::from_secs(5), first_received.notified()).await?;
+        oauth
+            .set_remaining_lifetime_for_test(Duration::from_secs(29))
+            .await?;
+        client.list_tools(None, Some(Duration::from_secs(5))).await
+    };
+    let ((first_result, first_elapsed, refresh_started), second_result) =
+        tokio::join!(first, second);
+    first_result?;
+    second_result?;
+    assert!(
+        refresh_started,
+        "the fixture must overlap the completed call with a refresh"
+    );
+    let persisted = crate::load_oauth_tokens(
+        home.path(),
+        SERVER_NAME,
+        &format!("{}/mcp", server.uri()),
+        OAuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?
+    .expect("refreshed credentials must be durable");
+    assert_eq!(
+        persisted.token_response.0.access_token().secret(),
+        REFRESHED_ACCESS_TOKEN
+    );
+    server.verify().await;
+    eprintln!(
+        "completed MCP operation: first={first_elapsed:?}; refresh_delay=1500ms; requests=2; refreshes=1"
+    );
+    assert!(
+        first_elapsed < Duration::from_millis(800),
+        "a completed operation waited for unrelated authentication: {first_elapsed:?}"
+    );
     Ok(())
 }

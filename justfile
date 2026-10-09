@@ -262,28 +262,40 @@ test-fast *args:
 # No background resumption is scheduled. Cold overflow remains opt-in.
 
 # Run a named core target in the shared core lane; finish the whole selection.
+[script("python")]
 [windows]
 core-test target *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ core_test_lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _core-test-reserved local "{{ target }}" --no-fail-fast @forwarded_args; exit $LASTEXITCODE
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "local", sys.argv[1], "--no-fail-fast", *sys.argv[2:]]))
 
 # Fast local loop for a named core target: finish the selection, no retries.
+[script("python")]
 [windows]
 core-test-fast target *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ core_test_lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _core-test-reserved fast "{{ target }}" @forwarded_args; exit $LASTEXITCODE
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
 
 # Opt-in symbol-free builds; keep separate artifacts for a fair dev/dev-small comparison.
+[script("python")]
 [windows]
 core-test-small target *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane core-tests-small --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _core-test-small-reserved "{{ target }}" @forwarded_args; exit $LASTEXITCODE
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "core-tests-small", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-small-reserved", *sys.argv[1:]]))
 
 [windows]
 _core-test-small-reserved target *args:
     $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir --cargo-profile dev-small run-target --profile fast "{{ target }}" @forwarded_args; exit $LASTEXITCODE
 
 # Run a named core target in a lane of its own, apart from the shared core lane.
+[script("python")]
 [windows]
 core-test-lane target *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ target }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _core-test-reserved fast "{{ target }}" @forwarded_args; exit $LASTEXITCODE
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", sys.argv[1], "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
 
 [windows]
 _core-test-reserved profile target *args:
@@ -292,9 +304,12 @@ _core-test-reserved profile target *args:
 # Run gates together, sharing helper builds, overlapping tests, and one nextest
 # invocation per package and helper set. Every declared step must select and
 # complete exactly its declared test IDs in its own test binary.
+[script("python")]
 [windows]
 core-gate +gates:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ core_test_lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _core-gate-reserved @forwarded_args; exit $LASTEXITCODE
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-gate-reserved", *sys.argv[1:]]))
 
 [windows]
 _core-gate-reserved +gates:
@@ -307,23 +322,35 @@ test-slow-boundaries:
 
 # List the named core targets and gates.
 [no-cd]
+[script("python")]
 core-test-list:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" list-targets
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["list-targets"], program=r"{{ python }}"))
 
 # Show the resolved selection, helper builds, and commands for a target or gate.
 [no-cd]
+[script("python")]
 core-test-plan name:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" plan "{{ name }}"
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["plan", *sys.argv[1:]], program=r"{{ python }}"))
 
 # List the gates whose declared tests live in the modules owning changed Rust files.
 [no-cd]
+[script("python")]
 core-test-gates-for +paths:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" gates-for {{ paths }}
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["gates-for", *sys.argv[1:]], program=r"{{ python }}"))
 
 # Validate the manifest against `cargo metadata --no-deps` without building tests.
 [no-cd]
+[script("python")]
 core-test-manifest-check:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" check-manifest
+    import runpy, sys
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["check-manifest"], program=r"{{ python }}"))
 
 # Isolated non-incremental experiment; this also changes the target directory.
 [windows]

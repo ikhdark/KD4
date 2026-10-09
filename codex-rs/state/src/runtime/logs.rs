@@ -1499,7 +1499,7 @@ mod tests {
             };
             for module in [false, true] {
                 let mut query = LogQuery::default();
-                let values = filters.iter().map(|value| value.to_string()).collect();
+                let values = filters.iter().map(ToString::to_string).collect();
                 if module {
                     query.module_like = values;
                 } else {

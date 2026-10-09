@@ -4474,6 +4474,114 @@ fn write_apply_patch_models_cache(codex_home: &Path) -> Result<String> {
 }
 
 // Helper to create a config.toml pointing at the mock model server.
+#[tokio::test]
+async fn thread_queue_releases_accepted_input_while_turn_is_running() -> Result<()> {
+    use codex_app_server_protocol::ThreadHistoryMode;
+
+    async fn queue_request(
+        mcp: &mut TestAppServer,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        let id = mcp.send_raw_request(method, Some(params)).await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(id)),
+        ).await??;
+        Ok(response.result)
+    }
+
+    // The local store supports Legacy; paginated record recognition is unit-tested.
+    let server = responses::start_mock_server().await;
+    let captured = responses::mount_sse_sequence(&server, vec![
+        create_request_user_input_sse_response("queued-question")?,
+        create_final_assistant_message_sse_response("First done")?,
+        create_final_assistant_message_sse_response("Follow-up done")?,
+    ]).await;
+    let codex_home = TempDir::new()?;
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        codex_home.path(), &server.uri(), &server.uri(),
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build().await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let id = mcp.send_thread_start_request_with_auto_env(ThreadStartParams {
+        model: Some("mock-model".into()),
+        history_mode: Some(ThreadHistoryMode::Legacy),
+        ..Default::default()
+    }).await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(id)),
+    ).await??;
+    let thread_id = to_response::<ThreadStartResponse>(response)?.thread.id;
+    let params = json!({
+        "threadId": thread_id,
+        "clientUserMessageId": "queued-first",
+        "input": [{"type": "text", "text": "first queued prompt", "text_elements": []}],
+    });
+    let first = queue_request(&mut mcp, "thread/queue/add", params.clone()).await?;
+    let first_id = first["queuedSubmission"]["id"].as_str().context("queued id")?;
+    // The unanswered question keeps the turn running indefinitely. Queue
+    // ownership must transfer without waiting for model/turn completion.
+    let question = timeout(DEFAULT_READ_TIMEOUT, mcp.read_stream_until_request_message()).await??;
+    let ServerRequest::ToolRequestUserInput { request_id, .. } = question else {
+        anyhow::bail!("expected pending question, got {question:?}");
+    };
+    // Add, start, then persisted-input handoff each notify the client. No
+    // queue RPC below may perform recovery on behalf of the listener.
+    for _ in 0..3 {
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/queue/changed"),
+        ).await??;
+    }
+    assert_eq!(captured.requests().len(), 1);
+    let listed = queue_request(&mut mcp, "thread/queue/list", json!({"threadId": thread_id})).await?;
+    assert_eq!(listed["data"], json!([]), "accepted input must leave the queue while running");
+    let deleted = queue_request(&mut mcp, "thread/queue/delete", json!({
+        "threadId": thread_id, "queuedSubmissionId": first_id,
+    })).await?;
+    assert_eq!(deleted["deleted"], false, "accepted input is already consumed, not still starting");
+    assert_eq!(queue_request(&mut mcp, "thread/queue/add", params).await?, first);
+
+    let second = queue_request(&mut mcp, "thread/queue/add", json!({
+        "threadId": thread_id,
+        "clientUserMessageId": "queued-second",
+        "input": [{"type": "text", "text": "next prompt", "text_elements": []}],
+    })).await?;
+    let second_id = second["queuedSubmission"]["id"].as_str().context("second queued id")?;
+    let updated_input = json!([{"type": "text", "text": "edited follow-up", "text_elements": []}]);
+    let updated = queue_request(&mut mcp, "thread/queue/update", json!({
+        "threadId": thread_id, "queuedSubmissionId": second_id, "input": updated_input,
+    })).await?;
+    assert_eq!(updated["queuedSubmission"]["input"], updated_input);
+    let listed = queue_request(&mut mcp, "thread/queue/list", json!({"threadId": thread_id})).await?;
+    assert_eq!(listed["data"], json!([updated["queuedSubmission"]]));
+    assert_eq!(captured.requests().len(), 1, "a waiting follow-up must not overlap the active turn");
+
+    mcp.send_response(request_id, json!({"answers": {"confirm_path": {"answers": ["yes"]}}})).await?;
+    for _ in 0..2 {
+        let notification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        ).await??;
+        let completed: TurnCompletedNotification = serde_json::from_value(
+            notification.params.context("completion params")?,
+        )?;
+        assert_eq!(completed.thread_id, thread_id);
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+    }
+    let listed = queue_request(&mut mcp, "thread/queue/list", json!({"threadId": thread_id})).await?;
+    assert_eq!(listed["data"], json!([]));
+    let requests = captured.requests();
+    assert_eq!(requests.len(), 3, "accepted client retries must not replay the first prompt");
+    assert!(requests[2].message_input_texts("user").join("\n").contains("edited follow-up"));
+    Ok(())
+}
+
 fn create_config_toml(
     codex_home: &Path,
     server_uri: &str,

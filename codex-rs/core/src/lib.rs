@@ -92,7 +92,6 @@ pub(crate) use skills::collect_explicit_skill_mentions;
 pub(crate) use skills::default_skill_metadata_budget;
 pub(crate) use skills::injection;
 pub(crate) use skills::maybe_emit_implicit_skill_invocation;
-pub(crate) use skills::plan_skill_injections;
 pub(crate) use skills::skills_load_input_from_config;
 mod stream_events_utils;
 pub use stream_events_utils::image_generation_artifact_path;

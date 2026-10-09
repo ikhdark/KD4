@@ -324,9 +324,14 @@ mod tests {
         assert!(description.contains("Search only if local discovery fails"));
         assert!(description.contains("execute those arguments in the same cell"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
-        assert!(description.contains(
-            "When `tool_search` is advertised, use it to activate tools that are not yet listed."
-        ));
+        assert!(description.contains("Omission from this description does not require activation"));
+        assert!(description.contains("not to re-enable a known callable"));
+        assert!(description.contains("not a names-only discovery round"));
+        assert!(description.contains("resolve and invoke without printing the schema again"));
+        assert!(description.contains("resolve needed `activated_omitted_tools` contracts in the same cell"));
+        assert!(description.contains("Do not infer arguments from a name"));
+        assert!(description.contains("capability-change notice"));
+        assert!(description.contains("otherwise emit the contract for model review"));
         assert!(
             description.len() < 10_000,
             "compact exec prompt unexpectedly expanded to {} bytes",

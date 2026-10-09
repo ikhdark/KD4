@@ -41,7 +41,6 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
-use std::collections::HashSet;
 #[cfg(test)]
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
@@ -1271,6 +1270,7 @@ async fn drain_recovery_snapshot_with_byte_limit(
     }
 }
 
+#[cfg(test)]
 async fn drain_recovery_snapshot(
     snapshot: &std::sync::Arc<ToolOutputSnapshot>,
     selectors: Vec<ToolOutputSelector>,

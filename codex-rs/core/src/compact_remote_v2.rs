@@ -710,7 +710,7 @@ mod tests {
             ])).await;
             let mut client = session.services.model_client.new_session();
             run_remote_compaction_request_v2(
-                &session, &turn, &mut client, &Prompt::default(), &metadata,
+                &session, turn, &mut client, &Prompt::default(), &metadata,
                 &CompactionTraceContext::disabled(), &CancellationToken::new(),
             ).await?;
             assert_eq!(log.single_request().body_json().get("service_tier").and_then(serde_json::Value::as_str), expected);

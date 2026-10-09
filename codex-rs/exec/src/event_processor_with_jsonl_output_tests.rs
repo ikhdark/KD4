@@ -81,6 +81,16 @@ fn every_terminal_outcome_has_one_receipt_with_available_timing() {
     let value = serde_json::to_value(event).unwrap();
     assert!(value["timing"].is_null());
     assert!(value["usage"].is_null());
+    let terminal = events.last().unwrap();
+    let wire = serde_json::to_value(terminal).unwrap();
+    assert_eq!(wire, serde_json::json!({
+        "type": "turn.failed",
+        "error": { "message": "lost" },
+        "disposition": "transport_lost",
+        "usage": null,
+        "timing": null,
+    }));
+    assert_eq!(&serde_json::from_value::<ThreadEvent>(wire).unwrap(), terminal);
     assert!(processor.collect_event_stream_error("lost again".into()).is_empty());
 }
 
@@ -421,12 +431,12 @@ fn event_stream_error_emits_fatal_and_turn_terminal_events() {
                 }
             }),
             ThreadEvent::Error(error.clone()),
-            ThreadEvent::TurnFailed(TurnFailedEvent {
+            ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                 error,
                 disposition: crate::exec_events::TurnFailureDisposition::TransportLost,
                 usage: None,
                 timing: None,
-            }),
+            })),
         ]
     );
     assert_eq!(processor.final_message(), None);

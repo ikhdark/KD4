@@ -409,7 +409,7 @@ fn powershell_exec_and_safety_projections_encode_the_same_script() {
             let bytes = BASE64_STANDARD.decode(encoded).expect("base64 payload");
             assert_eq!(bytes.len() % 2, 0, "UTF-16LE must not have trailing bytes");
             let utf16 = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             assert_eq!(

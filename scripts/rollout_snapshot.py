@@ -50,7 +50,7 @@ def load_rollout_payload(path: Path, sha256: str, expected_bytes: int | None = N
     for root in roots:
         artifact = root / f"{sha256}.json"
         try:
-            metadata = artifact.lstat()
+            handle = _open_payload_binary(artifact)
             break
         except FileNotFoundError:
             continue
@@ -59,11 +59,12 @@ def load_rollout_payload(path: Path, sha256: str, expected_bytes: int | None = N
             f"rollout payload {sha256}.json not found in: "
             + ", ".join(str(root) for root in roots)
         )
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_PAYLOAD_BYTES:
-        raise ValueError(f"invalid rollout payload file: {artifact}")
-    if expected_bytes is not None and metadata.st_size != expected_bytes:
-        raise ValueError(f"rollout payload size mismatch: {artifact}")
-    with artifact.open("rb") as handle:
+    with handle:
+        metadata = os.fstat(handle.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_PAYLOAD_BYTES:
+            raise ValueError(f"invalid rollout payload file: {artifact}")
+        if expected_bytes is not None and metadata.st_size != expected_bytes:
+            raise ValueError(f"rollout payload size mismatch: {artifact}")
         data = handle.read(metadata.st_size + 1)
     if len(data) != metadata.st_size or hashlib.sha256(data).hexdigest() != sha256:
         raise ValueError(f"rollout payload checksum mismatch: {artifact}")
@@ -221,12 +222,29 @@ class RolloutSnapshot:
         }
 
 
-def _open_shared_binary(path: Path) -> BinaryIO:
+def _open_payload_binary(path: Path) -> BinaryIO:
+    """Pin the checked object without following a final-component link.
+
+    Nonblocking POSIX opens let fstat reject FIFOs without waiting for a writer.
+    Parent directories retain normal path traversal semantics.
+    """
+    if os.name == "nt":
+        return _open_shared_binary(path, reject_links=True)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_shared_binary(path: Path, *, reject_links: bool = False) -> BinaryIO:
     import ctypes
     import msvcrt
     from ctypes import wintypes
 
-    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
     create_file.argtypes = (
         wintypes.LPCWSTR,
         wintypes.DWORD,
@@ -242,6 +260,10 @@ def _open_shared_binary(path: Path) -> BinaryIO:
     share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
     open_existing = 3
     normal_attributes = 0x00000080
+    if reject_links:
+        # Open the reparse point itself, including directory reparse points,
+        # then inspect attributes on that same handle before exposing any bytes.
+        normal_attributes |= 0x00200000 | 0x02000000
     handle = create_file(
         str(path),
         generic_read,
@@ -255,11 +277,30 @@ def _open_shared_binary(path: Path) -> BinaryIO:
         raise ctypes.WinError(ctypes.get_last_error())
 
     try:
+        if reject_links:
+            class FileAttributeTagInfo(ctypes.Structure):
+                _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
+
+            get_info = kernel32.GetFileInformationByHandleEx
+            get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+            get_info.restype = wintypes.BOOL
+            info = FileAttributeTagInfo()
+            if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if info.attributes & 0x00000400:  # FILE_ATTRIBUTE_REPARSE_POINT
+                raise ValueError(f"invalid rollout payload file: {path}")
         fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
     except BaseException:
-        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        close_handle(handle)
         raise
-    return os.fdopen(fd, "rb")
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def existing_rollout_path(path: Path) -> Path:

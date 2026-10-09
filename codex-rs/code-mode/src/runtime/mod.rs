@@ -717,7 +717,7 @@ pub(crate) fn apply_stored_value_writes(
 
 pub(crate) fn stored_value_limit_message() -> String {
     format!(
-        "code mode session storage exceeds its limit of {MAX_SESSION_STORED_VALUES} entries or {MAX_SESSION_STORED_VALUE_BYTES} serialized bytes"
+        "code mode session storage exceeds its limit of {MAX_SESSION_STORED_VALUES} entries or {MAX_SESSION_STORED_VALUE_BYTES} serialized bytes. Inspect listKeys().usage and paged entry_bytes for charged bytes without loading values; retire only obsolete keys with deleteStored. Preserve completed results; do not rerun their producers."
     )
 }
 
@@ -811,10 +811,11 @@ fn run_runtime(
 
     let _ = event_tx.send(RuntimeEvent::Started);
 
-    let pending_promise = match {
+    let evaluation = {
         v8::scope!(let scope, scope);
         module_loader::evaluate_main_module(scope, &config.source)
-    } {
+    };
+    let pending_promise = match evaluation {
         Ok(pending_promise) => pending_promise,
         Err(error_text) => {
             capture_scope_send_error(scope, &event_tx, Some(error_text));

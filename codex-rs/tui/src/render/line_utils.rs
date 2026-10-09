@@ -38,18 +38,6 @@ pub fn push_owned_lines(src: Vec<Line<'_>>, out: &mut Vec<Line<'static>>) {
     out.extend(src.into_iter().map(line_into_static));
 }
 
-/// Consider a line blank if it has no spans or only spans whose contents are
-/// empty or consist solely of spaces (no tabs/newlines).
-#[cfg(test)]
-pub fn is_blank_line_spaces_only(line: &Line<'_>) -> bool {
-    if line.spans.is_empty() {
-        return true;
-    }
-    line.spans
-        .iter()
-        .all(|s| s.content.is_empty() || s.content.chars().all(|c| c == ' '))
-}
-
 /// Prefix each line with `initial_prefix` for the first line and
 /// `subsequent_prefix` for following lines. Returns a new Vec of owned lines.
 pub fn prefix_lines(

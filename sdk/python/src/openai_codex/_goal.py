@@ -1,11 +1,11 @@
 import asyncio
-import queue
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Awaitable, Callable, Iterator
 
+from ._limits import _NotificationQueue
 from .generated.notification_registry import notification_turn_id
 from .generated.v2_all import (
     ThreadGoalClearedNotification,
@@ -47,7 +47,9 @@ class _GoalOperationState:
     interrupt_requested: bool = False
     cleared: bool = False
     _condition: threading.Condition = field(default_factory=threading.Condition)
-    _notifications: queue.Queue[Notification | BaseException] = field(default_factory=queue.Queue)
+    _notifications: _NotificationQueue = field(
+        default_factory=lambda: _NotificationQueue(operation_deadline=True)
+    )
     _failure: BaseException | None = None
     _finished: bool = False
     _turn_routing_active: bool = False
@@ -148,7 +150,7 @@ class _GoalOperationState:
     def explicit_interrupt(self) -> bool:
         with self._condition:
             while self.interrupt_requested:
-                self._condition.wait()
+                self._wait_for_change()
             return self.interrupted
 
     def active_turn(self, *, after: str | None = None) -> str | None:
@@ -163,7 +165,18 @@ class _GoalOperationState:
                     return self.current_turn_id
                 if self.cleared or _terminal_goal_status(self.status):
                     return None
-                self._condition.wait()
+                self._wait_for_change()
+
+    def _wait_for_change(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+        deadline = self._notifications.deadline
+        remaining = (
+            self._notifications.timeout_s if deadline is None else deadline - time.monotonic()
+        )
+        if remaining <= 0:
+            raise TimeoutError("goal operation deadline exceeded")
+        self._condition.wait(remaining)
 
     def current_turn(self) -> str | None:
         """Return the current physical turn without waiting for rollover."""

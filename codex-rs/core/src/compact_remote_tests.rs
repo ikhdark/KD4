@@ -11,6 +11,7 @@ use pretty_assertions::assert_eq;
 // measures local preparation only, not provider latency or end-to-end turns.
 #[test]
 #[ignore]
+#[expect(clippy::print_stderr, reason = "This opt-in benchmark reports timing samples and their median")]
 fn benchmark_compaction_search_receipt() {
     let mut items = tool_search_group("benchmark");
     if let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] {

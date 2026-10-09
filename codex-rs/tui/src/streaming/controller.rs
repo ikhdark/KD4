@@ -943,6 +943,10 @@ mod tests {
     /// Local CPU/queue probe, not provider TTFT or an end-to-end benchmark.
     #[test]
     #[ignore = "manual narrow streaming latency benchmark"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the manually run latency probe reports its measured samples to the operator"
+    )]
     fn streaming_latency_probe() {
         use super::super::chunking::{AdaptiveChunkingPolicy, DrainPlan, QueueSnapshot};
         use std::fmt::Write as _;

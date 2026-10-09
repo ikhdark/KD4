@@ -617,6 +617,81 @@ fn system_proxy_resolution_is_single_flight() {
 }
 
 #[test]
+fn poisoned_system_proxy_cache_preserves_hits_and_accepts_new_decisions() {
+    let cache = Mutex::new(HashMap::new());
+    let resolution_lock = Mutex::new(());
+    let warm_url = "https://poisoned-cache.test/warm";
+    let cold_url = "https://poisoned-cache.test/cold";
+    let warm_origin = RequestOrigin::parse(warm_url).expect("valid request URL");
+    let cold_origin = RequestOrigin::parse(cold_url).expect("valid request URL");
+    let warm_decision = SystemProxyDecision::Proxy {
+        url: "http://proxy.test:8080".to_string(),
+    };
+    assert!(
+        std::panic::catch_unwind(|| {
+            let mut cache = cache.lock().expect("unpoisoned cache");
+            insert_system_proxy_cache_entry(
+                &mut cache,
+                &system_proxy_cache_key(warm_url),
+                warm_decision.clone(),
+                Instant::now(),
+            );
+            panic!("poison cache after publishing a valid entry");
+        })
+        .is_err()
+    );
+    assert!(cache.is_poisoned());
+    assert_eq!(
+        resolve_system_proxy_with(&cache, &resolution_lock, warm_url, &warm_origin, |_, _| {
+            panic!("poisoning must not discard a warm route")
+        }),
+        warm_decision
+    );
+    assert_eq!(
+        resolve_system_proxy_with(&cache, &resolution_lock, cold_url, &cold_origin, |_, _| {
+            SystemProxyDecision::Direct
+        }),
+        SystemProxyDecision::Direct
+    );
+    assert_eq!(
+        resolve_system_proxy_with(&cache, &resolution_lock, cold_url, &cold_origin, |_, _| {
+            panic!("a recovered cache must retain newly resolved routes")
+        }),
+        SystemProxyDecision::Direct
+    );
+}
+
+#[test]
+fn system_proxy_resolution_recovers_after_resolver_panics() {
+    let cache = Mutex::new(HashMap::new());
+    let resolution_lock = Mutex::new(());
+    let request_url = "https://poisoned-resolver.test/models";
+    let origin = RequestOrigin::parse(request_url).expect("valid request URL");
+    assert!(
+        std::panic::catch_unwind(|| {
+            resolve_system_proxy_with(&cache, &resolution_lock, request_url, &origin, |_, _| {
+                panic!("platform resolver panicked")
+            });
+        })
+        .is_err()
+    );
+    assert!(resolution_lock.is_poisoned());
+    assert!(!cache.is_poisoned(), "platform I/O must not hold the cache lock");
+    assert_eq!(
+        resolve_system_proxy_with(&cache, &resolution_lock, request_url, &origin, |_, _| {
+            SystemProxyDecision::Direct
+        }),
+        SystemProxyDecision::Direct
+    );
+    assert_eq!(
+        resolve_system_proxy_with(&cache, &resolution_lock, request_url, &origin, |_, _| {
+            panic!("retried resolver result must be cached")
+        }),
+        SystemProxyDecision::Direct
+    );
+}
+
+#[test]
 fn system_proxy_cache_reads_do_not_extend_expiry() {
     let mut cache = HashMap::new();
     let now = Instant::now();

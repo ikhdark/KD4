@@ -373,6 +373,16 @@ impl ShellCommandHandler {
             ))
         })?;
         let command_repaired = preflight.repaired();
+        let full_suite = if turn.config.features.enabled(Feature::Kd4Runtime) {
+            crate::tools::handlers::command_preflight::check_full_suite_command(
+                &original_safety_command,
+                original_shell_type,
+            )
+            .await
+            .map_err(FunctionCallError::RespondToModel)?
+        } else {
+            false
+        };
         let repair_notice = preflight.model_notice();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
@@ -515,6 +525,10 @@ impl ShellCommandHandler {
         } else {
             None
         };
+        // Reserve before any launch; failed/cancelled attempts do not restore it.
+        turn.full_suite_budget
+            .admit(full_suite)
+            .map_err(FunctionCallError::RespondToModel)?;
         let run_args = RunExecLikeArgs {
             max_output_tokens: params.max_output_tokens,
             validation,

@@ -1953,6 +1953,10 @@ impl SharedModelHttpClients {
         if let Some(index) = pools.iter().position(|(cached_factory, cached_headers, _)| {
             cached_factory == factory && cached_headers == &headers
         }) {
+            #[expect(
+                clippy::expect_used,
+                reason = "the index was selected from this deque while holding the same exclusive lock"
+            )]
             let entry = pools.remove(index).expect("matched pool exists");
             let pool = entry.2.clone();
             pools.push_back(entry);
@@ -2037,6 +2041,14 @@ impl WebsocketFallbackState {
 }
 
 impl WebsocketTransportCache {
+    fn record_success(&mut self, epoch: u64) {
+        // A completion from before a concurrent fallback must not erase that
+        // newer failure or re-enable a permanently disabled transport.
+        if self.epoch == epoch && !self.fallback.disabled {
+            self.fallback.last_transient_failure = None;
+        }
+    }
+
     fn publish_if_current(
         &mut self,
         permit: WebsocketCachePublicationPermit,
@@ -2151,7 +2163,8 @@ impl RequestRouteTelemetry {
 /// (auth, provider selection, thread id, and transport fallback state).
 ///
 /// WebSocket fallback is session-scoped. A transient failure uses HTTP for 60 seconds; a second
-/// failure within 30 minutes or a non-transient failure disables WebSockets for the session.
+/// failure within 30 minutes without an intervening successful request, or a non-transient
+/// failure, disables WebSockets for the session.
 ///
 /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
@@ -2687,6 +2700,10 @@ impl ModelClient {
         shared: Option<&SharedModelHttpClients>,
     ) -> Self {
         if let Some(shared) = shared {
+            #[expect(
+                clippy::expect_used,
+                reason = "this construction-only builder requires an unshared client; cloning before attachment violates its contract"
+            )]
             let state = Arc::get_mut(&mut self.state)
                 .expect("shared HTTP transports must be attached before cloning the model client");
             state.http_clients = shared.pool(
@@ -4462,6 +4479,7 @@ impl ModelClientSession {
                         Arc::clone(&self.client.state.provider),
                         attempt,
                         /*stream_throughput*/ None,
+                        /*websocket_success*/ None,
                     );
                     return Ok(stream);
                 }
@@ -4548,6 +4566,13 @@ impl ModelClientSession {
         // Before the request captures the turn-state token it would replay.
         self.replace_websocket_after_throughput_collapse();
         loop {
+            let websocket_epoch = self
+                .client
+                .state
+                .cached_websocket_transport
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .epoch;
             // `generate=false` warmup is transport setup rather than a sampling attempt.
             let attempt_clock = (!warmup).then(ModelAttemptClock::new);
             let prepared_attempt = if warmup {
@@ -5092,6 +5117,7 @@ impl ModelClientSession {
                 Arc::clone(&self.client.state.provider),
                 attempt,
                 Some(Arc::clone(&self.websocket_session.stream_throughput)),
+                (!warmup).then(|| (self.client.clone(), websocket_epoch)),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             self.websocket_session.last_response = None;
@@ -5591,6 +5617,7 @@ fn map_response_stream(
     provider: SharedModelProvider,
     attempt: Option<ModelAttemptState>,
     stream_throughput: Option<Arc<StdMutex<WebsocketStreamThroughput>>>,
+    websocket_success: Option<(ModelClient, u64)>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -5599,7 +5626,21 @@ fn map_response_stream(
     let api_stream = codex_api::ResponseStream {
         rx_event,
         upstream_request_id: None,
-    };
+    }
+    .inspect(move |event| {
+        // Opening a stream or receiving partial output is not a successful
+        // request. HTTP and connection-only warmup never clear WS failures.
+        if matches!(event, Ok(ResponseEvent::Completed { .. }))
+            && let Some((client, epoch)) = websocket_success.as_ref()
+        {
+            client
+                .state
+                .cached_websocket_transport
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_success(*epoch);
+        }
+    });
     map_response_events(
         upstream_request_id,
         api_stream,

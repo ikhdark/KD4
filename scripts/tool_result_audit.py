@@ -22,9 +22,11 @@ from pathlib import Path
 
 try:
     from scripts.atomic_json import write_stream_atomic
+    from scripts.kd4_first_useful_action_analysis import TerminalProfiles
     from scripts.rollout_snapshot import existing_rollout_path, hydrate_rollout_record, read_rollout_snapshot
 except ImportError:
     from atomic_json import write_stream_atomic
+    from kd4_first_useful_action_analysis import TerminalProfiles
     from rollout_snapshot import existing_rollout_path, hydrate_rollout_record, read_rollout_snapshot
 
 
@@ -122,8 +124,24 @@ def source_read_paths(source):
 
 
 def execution_timings(records):
-    """Merge checkpoint deltas by identity; terminal arrays remain authoritative."""
+    """Merge deltas, then apply only unambiguous terminal evidence."""
     turns = {}
+    terminals = TerminalProfiles()
+
+    def merge(turn, timing, line, terminal=False):
+        for field, identity in (("modelRequests", "samplingRequestId"), ("toolCalls", "callId")):
+            if field not in timing:
+                continue
+            if terminal:
+                turn[field] = {}
+                turn["terminal_fields"].append(field)
+            for item in timing[field]:
+                key = item.get(identity)
+                if key is None:
+                    raise ValueError(f"missing {identity} in timing record {line}")
+                previous = turn[field].setdefault(key, {})
+                previous.update({k: v for k, v in item.items() if v is not None})
+
     current = None
     for line, row, _ in records:
         payload = row.get("payload", {})
@@ -139,34 +157,33 @@ def execution_timings(records):
             timing = payload.get("timing") or {}
         else:
             continue
-        turn = turns.setdefault(turn_id, {
+        key = turn_id if turn_id is not None else ("record", line)
+        turn = turns.setdefault(key, {
             "turn_id": turn_id, "completed": False, "completion_record": None,
             "terminal_status": None, "terminal_record": None,
             "checkpoint_records": [], "modelRequests": {}, "toolCalls": {},
-            "terminal_fields": [],
+            "terminal_fields": [], "terminal_records": [],
+            "conflicting_terminal": False, "counters": {},
         })
         terminal = kind in TERMINAL_EVENTS
         if terminal:
-            turn["completed"] = kind == "task_complete"
-            turn["completion_record"] = line if turn["completed"] else None
-            turn["terminal_status"] = kind
-            turn["terminal_record"] = line
+            terminals.add(key, {"timing": payload.get("timing"), "status": kind, "line": line})
+            turn["terminal_records"].append(line)
         else:
             turn["checkpoint_records"].append(line)
-        for field, identity in (("modelRequests", "samplingRequestId"), ("toolCalls", "callId")):
-            if field not in timing or (not terminal and field in turn["terminal_fields"]):
-                continue
-            if terminal:
-                turn[field] = {}
-                if field not in turn["terminal_fields"]:
-                    turn["terminal_fields"].append(field)
-            for item in timing[field]:
-                # Never silently merge unrelated observations without identity.
-                key = item.get(identity)
-                if key is None:
-                    raise ValueError(f"missing {identity} in timing record {line}")
-                previous = turn[field].setdefault(key, {})
-                previous.update({k: v for k, v in item.items() if v is not None})
+            merge(turn, timing, line)
+    for key, terminal in terminals.records.items():
+        turn = turns[key]
+        if key in terminals.conflicts:
+            turn.update(conflicting_terminal=True, modelRequests={}, toolCalls={})
+            continue
+        turn["completed"] = terminal["status"] == "task_complete"
+        turn["completion_record"] = terminal["line"] if turn["completed"] else None
+        turn["terminal_status"] = terminal["status"]
+        turn["terminal_record"] = terminal["line"]
+        timing = terminal["timing"] or {}
+        turn["counters"] = timing.get("counters") or {}
+        merge(turn, timing, terminal["line"], terminal=True)
     return [{**turn, **{field: list(turn[field].values())
                        for field in ("modelRequests", "toolCalls")}}
             for turn in turns.values()]
@@ -183,6 +200,7 @@ def tool_call_trace(records):
     turn_id = None
     completed_turns = set()
     aborted_turns = set()
+    conflicting_turns = set()
     for line, row, _ in records:
         payload = row.get("payload", {})
         kind = payload.get("type")
@@ -203,12 +221,13 @@ def tool_call_trace(records):
                     "record": line, "bytes": len(body),
                     "sha256": hashlib.sha256(body).hexdigest(),
                 })
-        if kind == "task_complete":
-            completed = payload.get("turn_id", turn_id)
-            completed_turns.add(completed)
-        elif kind == "turn_aborted":
-            aborted_turns.add(payload.get("turn_id", turn_id))
     for turn in execution_timings(records):
+        if turn["conflicting_terminal"]:
+            conflicting_turns.add(turn["turn_id"])
+        elif turn["completed"]:
+            completed_turns.add(turn["turn_id"])
+        elif turn["terminal_status"] == "turn_aborted":
+            aborted_turns.add(turn["turn_id"])
         for timing in turn["toolCalls"]:
             timings[(turn["turn_id"], timing["callId"])] = timing
     for key, timing in timings.items():
@@ -246,6 +265,7 @@ def tool_call_trace(records):
             "completed_turns": len(completed_turns),
             "aborted_turns": len(aborted_turns),
             "terminal_turns": len(completed_turns | aborted_turns),
+            "conflicting_terminal_turn_ids": sorted(conflicting_turns, key=str),
             "calls_without_timing": [c["call_id"] for c in ordered if not c["timing_available"]],
             "outer_calls_without_output": [c["call_id"] for c in ordered if c["record"] is not None and not c["outputs"]],
             "orphan_output_records": [o["record"] for key, values in outputs.items()
@@ -484,19 +504,26 @@ def execution_context_audit(records):
                 "completion_record": timing["completion_record"],
                 "terminal_status": timing["terminal_status"],
                 "terminal_record": timing["terminal_record"],
-                "timing_source": "terminal" if "modelRequests" in timing["terminal_fields"] else "checkpoint",
+                "conflicting_terminal": timing["conflicting_terminal"],
+                "terminal_records": timing["terminal_records"],
+                "timing_source": "conflict" if timing["conflicting_terminal"] else "terminal" if "modelRequests" in timing["terminal_fields"] else "checkpoint",
                 "checkpoint_records": timing["checkpoint_records"],
                 "request_count": len(requests),
                 "rounds": rounds,
             }
         )
     completed = {t["turn_id"] for t in turns if t["completed"]}
+    conflicting = {t["turn_id"] for t in turns if t["conflicting_terminal"]}
     terminal = {t["turn_id"] for t in turns if t["terminal_status"] is not None}
     aborted = {t["turn_id"] for t in turns if t["terminal_status"] == "turn_aborted"}
     # Weighted only within the owning turn, not across compaction/turn boundaries.
     for turn_boundaries in request_boundaries_by_turn.values():
         turn_boundaries.sort()
     for output in outputs:
+        if output["turn_id"] in conflicting:
+            output["subsequent_requests_in_turn"] = None
+            output["raw_replay_estimated_tokens"] = None
+            continue
         turn_boundaries = request_boundaries_by_turn[output["turn_id"]]
         exposure = len(turn_boundaries) - bisect.bisect_right(
             turn_boundaries, output["record"]
@@ -533,6 +560,8 @@ def execution_context_audit(records):
                 else "matched" if len(differences) == len(fields)
                 else "partial_match"
             )
+    if conflicting:
+        reconciliation["status"] = "conflicting_terminal_evidence"
     return {
         "turns": turns,
         "coverage": {
@@ -541,7 +570,8 @@ def execution_context_audit(records):
             "completed_turns": len(completed),
             "aborted_turns": len(aborted),
             "terminal_turns": len(terminal),
-            "unfinished_turn_ids": sorted(started - terminal, key=str),
+            "unfinished_turn_ids": sorted(started - terminal - conflicting, key=str),
+            "conflicting_terminal_turn_ids": sorted(conflicting, key=str),
             "requests_with_usage": sum(
                 bool(r["provider_usage"]) for t in turns for r in t["rounds"]
             ),
@@ -577,6 +607,7 @@ def execution_context_audit(records):
             "Matching text blocks are byte-equal evidence, not proof they are semantically unnecessary or current.",
             "Repeated-block matching is budgeted; matching_blocks_coverage reports skipped candidate pairs. Repeated bytes are a lower bound when coverage is incomplete. Four-line indexing excludes only pairs that cannot meet the minimum block length.",
             "Terminal arrays take precedence; otherwise incremental checkpoints are merged by request/call identity, never summed as independent requests.",
+            "Conflicting terminal timing or status quarantines the entire turn's timing, usage, counters, and completion classification; direct dispatch/output records remain observations.",
             "Aborted turns are terminal, not successful completions; terminal status does not establish complete usage or resolved tools.",
             "Unfinished executions report observed usage only; requests without usage and uncheckpointed tail work are not assumed free or complete.",
             "Usage reconciliation compares request totals with the last cumulative token event; differences can reflect inherited usage or different capture horizons, not necessarily double counting.",
@@ -617,7 +648,6 @@ def audit(path):
     outputs = []
     manifests = collections.Counter()
     manifest_bytes = 0
-    timings = {}
     metadata = collections.Counter()
     repeated = {}
     artifact_cache = {}
@@ -627,8 +657,6 @@ def audit(path):
         if row["type"] == "tool_manifest":
             manifests[hashlib.sha256(encoded(payload)).hexdigest()] += 1
             manifest_bytes += wire_bytes
-        if kind in TERMINAL_EVENTS and payload.get("timing"):
-            timings[payload.get("turn_id", str(line))] = payload["timing"]
         if row["type"] != "response_item":
             continue
         if kind in {"function_call", "custom_tool_call"}:
@@ -795,7 +823,7 @@ def audit(path):
         )
         repeated.setdefault(digest, call_id)
     counters = collections.Counter()
-    for timing in timings.values():
+    for timing in execution_timings(records):
         for key, value in timing.get("counters", {}).items():
             if key.startswith(("toolOutput", "truncationInduced")) and isinstance(
                 value, int
@@ -933,6 +961,9 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
         unfinished = covered.get("unfinished_turn_ids")
         totals["sessions_without_turn_coverage"] += not bool(covered)
         totals["unfinished_turns"] += len(unfinished or [])
+        conflicts = covered.get("conflicting_terminal_turn_ids")
+        if conflicts is not None:
+            totals["conflicting_terminal_turns"] += len(conflicts)
         for field in ("completed_turns", "aborted_turns", "terminal_turns",
                       "requests_with_usage", "requests_without_usage"):
             if field in covered:
@@ -961,6 +992,7 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
             "aborted_turns": covered.get("aborted_turns"),
             "terminal_turns": covered.get("terminal_turns"),
             "unfinished_turns": len(unfinished) if unfinished is not None else None,
+            "conflicting_terminal_turns": len(conflicts) if conflicts is not None else None,
             "requests_with_usage": covered.get("requests_with_usage"),
             "requests_without_usage": covered.get("requests_without_usage"),
             "provider_input_tokens": usage.get("inputTokens"),
@@ -1010,7 +1042,7 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
             "sessions_with_counts": terminal_truncation_sessions,
             "tool_output_truncations": terminal_truncation.get("toolOutputTruncationCount"),
             "induced_continuations": terminal_truncation.get("truncationInducedContinuationCount"),
-            "scope": "Recorded terminal counters only; open turns and missing counters are not zero.",
+            "scope": "Unambiguous terminal counters; conflicts excluded. Open turns and missing counters are not zero.",
         },
         "provider_usage_totals": dict(provider),
         "provider_usage_reconciliation": dict(sorted(reconciliation_statuses.items())),
@@ -1019,11 +1051,13 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
         "follow_up_candidates": bounded(followups),
         "unavailable_artifact_references": bounded(unavailable),
         "limitations": [
-            "Provider usage totals count observed requests, including cached input; unfinished/pending requests remain incomplete. Other token estimates use ceil(bytes/4), not provider attribution.",
-            "Reconciliation status unavailable includes older ledgers. Different totals can reflect inherited usage or differing capture horizons; inspect each session's execution_context.",
+            "Provider usage includes cached input and observed requests only; unfinished usage is incomplete. Other tokens use ceil(bytes/4), not provider attribution.",
+            "Lexical markers, repeated text, duplicate calls/results, cache ratios and lower output volume do not establish avoidable work or preserved correctness; source/consumer review and matched outcomes are required.",
+            "Conflicting terminal versions are quarantined. Older ledgers lacking conflict coverage have unverified selection; replay cannot repair them.",
+            "Unavailable reconciliation includes older ledgers. Differences can reflect inherited usage or capture horizons; inspect execution_context.",
             "truncated_results is a legacy alias of truncation_marker_results: lexical matches including quoted source, not runtime truncations. Follow-ups are candidates, not causal or dispatch measurements.",
             "Unavailable references may be quoted or cross-session IDs, not lost artifacts.",
-            "repeated_block_bytes is a lower bound when repeated_block_omitted_pairs is nonzero; record and token coverage are unaffected by the text-matching budget.",
+            "repeated_block_bytes is a lower bound if repeated_block_omitted_pairs is nonzero; matching limits do not affect record/token coverage.",
             "Pointers address the hashed report snapshot; counts cover all records, displayed lists are bounded. Full limitations: /limitations.",
         ],
     }
@@ -1044,6 +1078,7 @@ def describe_contract():
             "/sessions/*/summary/truncated_results": "Legacy alias of truncation_marker_results; lexical output-marker matches, including quoted source, not measured truncations.",
             "/sessions/*/timing_counter_totals": "Recorded terminal-turn counters only; missing values and open turns are not zero.",
             "/sessions/*/execution_context/coverage": "Completed and aborted turns are terminal; unfinished_turn_ids excludes both. Terminal status does not prove usage or tool completeness. Older ledgers can lack terminal/aborted counts.",
+            "/sessions/*/execution_context/coverage/conflicting_terminal_turn_ids": "Turns with differing terminal timing or status; excluded from timing, usage, counter and terminal populations, not reclassified as unfinished.",
         },
         "record_fields": {
             "/sessions/*/results/*": {"line": "1-based source record", "call_id": "outer call ID"},
@@ -1133,6 +1168,7 @@ def main():
             "Lists/descriptions/metadata are classified only inside complete JSON packets. Textual lists are not classified.",
             "raw_tool_result_bytes is unknown unless independently instrumented; raw artifact evidence and aggregate canonical counters are not a substitute.",
             "The next call and shared Get-Content paths are follow-up candidates only, not proof that truncation caused a reread.",
+            "Lexical markers, repeated text, duplicate calls/results, cache ratios, and lower output volume do not prove avoidable work or preserved correctness; matched outcomes and source/consumer evidence are required.",
         ],
         "sessions": [audit(path) for path in args.paths],
     }

@@ -450,7 +450,7 @@ fn fork_turn_positions_use_canonical_agent_messages_and_delivery_metadata() {
 
 #[test]
 fn truncates_rollout_to_last_n_fork_turns_drops_startup_prefix_even_when_under_limit() {
-    let rollout = vec![
+    let rollout = [
         RolloutItem::ResponseItem(developer_msg("startup developer context")),
         RolloutItem::ResponseItem(user_msg("current task")),
         RolloutItem::ResponseItem(assistant_msg("answer")),

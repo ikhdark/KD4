@@ -225,6 +225,7 @@ impl PreparedPromptInput {
         self.fallback_items.shared()
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_unreplaced_items(&self) -> Arc<[ResponseItem]> {
         self.unreplaced_items.shared()
     }
@@ -811,6 +812,11 @@ impl ContextManager {
             .requires_workspace_evidence_validation(self.items.as_slice())
     }
 
+    pub(crate) fn can_use_root_only_workspace_identity(&self) -> bool {
+        self.tool_history
+            .can_use_root_only_workspace_identity(self.items.as_slice())
+    }
+
     pub(crate) fn prepare_for_sampling_prompt_with_workspace_freshness(
         self,
         input_modalities: &[InputModality],
@@ -1034,11 +1040,6 @@ impl ContextManager {
         replays: &crate::session::turn_execution::SessionPathReplays,
     ) {
         replays.rehydrate(self.raw_items(), &self.tool_history);
-    }
-
-    pub(crate) fn artifact_origin_call_id(&self, artifact_id: &str) -> Option<String> {
-        self.tool_history.checkpoint_evidence(artifact_id).ok()
-            .map(|candidate| candidate.call_id.clone())
     }
 
     #[cfg(test)]

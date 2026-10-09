@@ -239,35 +239,24 @@ impl ChatWidget {
         id: Uuid,
         result: Result<IdeContext, String>,
     ) {
-        if self
+        if let Some(request) = self
             .ide_context
             .status_request
-            .as_ref()
-            .is_some_and(|request| request.id == id)
+            .take_if(|request| request.id == id)
         {
-            let request = self
-                .ide_context
-                .status_request
-                .take()
-                .expect("matched request");
             if request.thread_id == self.thread_id() && request.cwd == self.config.cwd.as_path() {
                 self.add_ide_context_status_message(request.initial_enablement, result);
             }
             return;
         }
-        if !self
+        let Some(request) = self
             .ide_context
             .prompt_request
             .as_ref()
-            .is_some_and(|request| request.id == id)
-        {
+            .filter(|request| request.id == id)
+        else {
             return;
-        }
-        let request = self
-            .ide_context
-            .prompt_request
-            .as_ref()
-            .expect("matched request");
+        };
         if request.thread_id != self.thread_id() || request.cwd != self.config.cwd.as_path() {
             self.cancel_pending_ide_prompt();
             return;

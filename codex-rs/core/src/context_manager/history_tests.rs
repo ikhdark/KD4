@@ -4131,7 +4131,7 @@ fn tool_history_budget_compacts_unread_local_shell_pairs() {
                 continue;
             }
             let mut output_tokens = 0;
-            for (pair, call_id) in items.chunks_exact(2).zip(["older-shell", "newer-shell"]) {
+            for (pair, call_id) in items.as_chunks::<2>().0.iter().zip(["older-shell", "newer-shell"]) {
                 assert!(
                     matches!(&pair[0], ResponseItem::LocalShellCall { call_id: Some(id), .. } if id == call_id)
                 );

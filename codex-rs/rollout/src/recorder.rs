@@ -1044,7 +1044,7 @@ impl RolloutRecorder {
             .await
     }
 
-    /// Queue canonical items in writer order and return once the writer has accepted them.
+    /// Queue canonical items in writer order and return once the bounded queue owns them.
     /// A materialized rollout is appended to promptly afterwards, off the caller's path, so a
     /// turn that never reaches its terminal barrier still leaves its items on disk. A later
     /// persist/flush/shutdown command remains the write-completion barrier for the queued
@@ -1053,8 +1053,12 @@ impl RolloutRecorder {
         &self,
         items: &[RolloutItem],
     ) -> std::io::Result<()> {
-        self.record_canonical_items_with_flush(items, true, true)
-            .await
+        // Waiting for the consumer's acknowledgement also waits for its preceding
+        // disk write. Queue admission already transfers ownership and preserves
+        // ordering with barriers/shutdown under the enqueue gate. Reuse that path
+        // rather than serializing independent work behind slow storage. Neither
+        // form promises durability before an explicit barrier.
+        self.record_canonical_items(items).await
     }
 
     async fn record_canonical_items_with_flush(

@@ -1087,15 +1087,27 @@ impl ToolSearchHandler {
                 .filter(|term| term.contains('_') && !self.exact_name_index.contains_key(term))
                 .collect::<Vec<_>>()
         };
-        // Bare identities (including explicit multi-name requests) remain strict.
-        // Mixed capability queries may contain project/account/file identifiers.
+        // A partially available batch of names can return its exact members
+        // without making the model repeat each lookup. Missing names remain
+        // diagnostics, never fuzzy substitutes or activation candidates.
+        let partial_name_lookup = !missing_names.is_empty()
+            && key.query.split_whitespace().count() > 1
+            && query_terms.iter().all(|term| term.contains('_'))
+            && key.query.split_whitespace().any(|name| {
+                self.exact_name_index.get(name).is_some_and(|ids| ids.iter().any(|id| {
+                    matches_source(id.info(&self.search_infos), key.source.as_deref())
+                }))
+            });
+        // Wholly missing name lookups remain strict. Mixed capability queries
+        // may contain project/account/file identifiers.
         if !missing_names.is_empty()
+            && !partial_name_lookup
             && (key.query.split_whitespace().count() == 1
                 || query_terms.iter().all(|term| term.contains('_')))
         {
             return Err(FunctionCallError::RespondToModel(format!(
                 "No deferred tool by these exact names exists in the current inventory: {}. Use plain-language capability terms to search for alternatives.",
-                missing_names.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", "),
+                missing_names.iter().map(String::as_str).collect::<Vec<_>>().join(", "),
             )));
         }
         if self.search_infos.is_empty() {
@@ -1144,6 +1156,15 @@ impl ToolSearchHandler {
                 || self.search_index.postings.get(term).is_some_and(|postings|
                     postings.binary_search_by_key(id, |(candidate, _)| *candidate).is_ok())))
             .filter(|id| seen_exact.insert(*id)).collect::<Vec<_>>();
+        if partial_name_lookup {
+            let mut result = self.search_output_tools(
+                exact_matches.iter().copied(), Some(&key.query), limit, key.source.as_deref(),
+            )?;
+            result.unmatched_identifiers = missing_names;
+            let result = Arc::new(result);
+            self.cache_search_result(key, &result);
+            return Ok(result);
+        }
         if exact_matches.len() == 1 && limit == 1 {
             let mut result =
                 self.search_output_tools(exact_matches.iter().copied(), Some(&key.query), limit, key.source.as_deref())?;
@@ -1571,7 +1592,13 @@ fn validate_tool_search_query(
     let mut source = None;
     let mut terms = Vec::new();
     for term in query.split_whitespace() {
-        if let Some(identity) = term.strip_prefix("source:") {
+        // A source scope already requires exact membership. Accept the
+        // redundant required-term prefix without searching for `source` in
+        // provider metadata or silently dropping the requested boundary.
+        if let Some(identity) = term
+            .strip_prefix("source:")
+            .or_else(|| term.strip_prefix("+source:"))
+        {
             if identity.is_empty() || source.is_some() {
                 return Err(FunctionCallError::RespondToModel(
                     "Use at most one nonempty source:<canonical namespace> scope.".to_string(),
@@ -2024,7 +2051,7 @@ mod tests {
                     item, codex_protocol::models::ResponseItem::ToolSearchOutput { call_id: id, .. }
                         if id.as_deref() == Some(call_id.as_str())
                 )), "inspect actual committed completion, not an empty history");
-                let publications = history
+                let publication_count = history
                     .raw_items()
                     .iter()
                     .filter_map(|item| {
@@ -2042,9 +2069,9 @@ mod tests {
                             _ => None,
                         })
                     })
-                    .collect::<Vec<_>>();
+                    .count();
                 assert_eq!(
-                    publications.len(),
+                    publication_count,
                     0,
                     "schemas must remain in the callable catalog, not unbounded history"
                 );
@@ -2097,6 +2124,7 @@ mod tests {
 
 
     #[tokio::test]
+    #[expect(clippy::print_stderr, reason = "reports search/resolve/invoke wall time alongside the dispatch-count regression assertions")]
     async fn oversized_search_resolves_and_invokes_in_one_cell_without_schema_history() {
         struct Delegate {
             handler: ToolSearchHandler,
@@ -2617,6 +2645,28 @@ text('one-cell-complete');
     }
 
     #[test]
+    fn partial_name_discovery_returns_only_available_exact_members() {
+        let infos = vec![
+            search_info("Spawn an agent", None, "agents", "spawn_agent"),
+            search_info("Legacy spawn_agent send_message followup_task", None, "agents", "legacy"),
+            search_info("Send a message", None, "other", "send_message"),
+        ];
+        let handler = ToolSearchHandler::new(infos.clone());
+        let query = "+source:mcp__agents spawn_agent followup_task unavailable_tool";
+        let result = handler.search(query, 3).unwrap();
+        assert_eq!(result.activation_tools, vec![ToolName::namespaced("mcp__agents", "spawn_agent")]);
+        assert_eq!(result.unmatched_identifiers, ["followup_task", "unavailable_tool"]);
+        assert!(result.unactivated_matches.is_empty());
+        assert!(Arc::ptr_eq(&result, &handler.search(query, 3).unwrap()));
+        let scoped = handler.search("+source:mcp__agents spawn_agent send_message followup_task", 3).unwrap();
+        assert_eq!(scoped.activation_tools, result.activation_tools);
+        assert!(handler.search("followup_task unavailable_tool", 3).is_err());
+        assert!(handler.search("spawn_agent followup_task source:mcp__other", 3).is_err());
+        let changed = ToolSearchHandler::new(infos.into_iter().skip(1).collect());
+        assert!(changed.search(query, 3).is_err(), "removed capabilities must not survive via metadata or a previous handler's cache");
+    }
+
+    #[test]
     fn affordance_prohibitions_are_retrieval_only_not_activation_evidence() {
         let handler = ToolSearchHandler::new(vec![search_info(
             "Preview drafts; cannot send email. Read labels.", None, "mail", "preview")]);
@@ -2807,7 +2857,12 @@ text('one-cell-complete');
         assert!(Arc::ptr_eq(&mixed, &handler.search("archive messages project_alpha", 1).unwrap()));
         assert!(handler.search("invented_tool", 1).is_err());
         assert!(handler.search("mail.invented_tool", 1).is_err());
-        assert!(handler.search("archive_messages invented_tool", 2).is_err());
+        // Name-only batches preserve available exact tools and report unknown
+        // names without activating fuzzy substitutes, as the query spec requires.
+        let partial = handler.search("archive_messages invented_tool", 2).unwrap();
+        assert_eq!(partial.activation_tools, vec![ToolName::namespaced("mcp__mail", "archive_messages")]);
+        assert_eq!(partial.unmatched_identifiers, vec!["invented_tool"]);
+        assert!(partial.unactivated_matches.is_empty());
     }
 
     #[test]
@@ -3991,6 +4046,18 @@ text('one-cell-complete');
         assert!(handler.search("create source:mcp__alpha source:mcp__beta", 8).is_err());
         assert!(handler.search("create source:", 8).is_err());
         assert!(Arc::ptr_eq(&scoped, &handler.search("create calendar event source:mcp__alpha", 8).unwrap()));
+        assert!(Arc::ptr_eq(&scoped, &handler.search("+source:mcp__alpha create calendar event", 8).unwrap()));
+        assert!(handler.search("create +source:alpha", 8).is_err());
+        for query in [
+            "create +source:",
+            "+source:mcp__alpha",
+            "create +source:mcp__alpha source:mcp__beta",
+            "create source:mcp__alpha +source:mcp__alpha",
+            "create +source:mcp__alpha +source:mcp__beta",
+        ] {
+            assert!(handler.search(query, 8).is_err(), "{query}");
+        }
+        assert!(handler.search("create +unavailable +source:mcp__alpha", 8).unwrap().activation_tools.is_empty());
     }
 
     #[test]

@@ -1898,14 +1898,14 @@ fn turn_failure_prefers_structured_error_message() {
     assert_eq!(
         failed,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnFailed(TurnFailedEvent {
+            events: vec![ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                 error: ThreadErrorEvent {
                     message: "backend failed (request id abc)".to_string(),
                 },
                 disposition: codex_exec::TurnFailureDisposition::Failed,
                 usage: None,
                 timing: None,
-            })],
+            }))],
             status: CodexStatus::InitiateShutdown,
         }
     );
@@ -1969,14 +1969,14 @@ fn interrupted_turn_emits_turn_failed_terminal_event() {
     assert_eq!(
         collected,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnFailed(TurnFailedEvent {
+            events: vec![ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                 error: ThreadErrorEvent {
                     message: "turn interrupted".to_string(),
                 },
                 disposition: codex_exec::TurnFailureDisposition::Interrupted,
                 usage: None,
                 timing: None,
-            })],
+            }))],
             status: CodexStatus::InitiateShutdown,
         }
     );

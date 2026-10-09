@@ -15,7 +15,9 @@ class RustToolEnvTest(unittest.TestCase):
         self,
     ) -> None:
         env = {"CODEX_SCCACHE_CACHE_SIZE": "100G"}
-        which = lambda name: f"/tools/{name}"
+        def which(name):
+            return f"/tools/{name}"
+
         updates = rust_tool_env.local_rust_env(env, repo_root=Path.cwd(), which=which)
         self.assertEqual(updates["RUSTC_WRAPPER"], "/tools/sccache")
         self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "100G")

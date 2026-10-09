@@ -91,6 +91,9 @@ impl ScopedWorkspaceGate {
             {
                 let mut claims = self.claims.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Only this lease's Drop removes its claim, and the lease is
+                // still owned by this future until admission or cancellation.
+                #[expect(clippy::expect_used, reason = "the live lease exclusively owns claim removal")]
                 let index = claims.iter().position(|claim| {
                     Arc::ptr_eq(&claim.identity, &lease.identity)
                 }).expect("live admission owns its claim");

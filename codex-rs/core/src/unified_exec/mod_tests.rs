@@ -1501,6 +1501,10 @@ async fn unified_exec_noninteractive_bursts_finish_in_one_initial_call() -> anyh
 #[cfg(windows)]
 #[ignore = "latency benchmark"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::print_stderr,
+    reason = "This ignored latency benchmark intentionally reports comparative measurements"
+)]
 async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
 

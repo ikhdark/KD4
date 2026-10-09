@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import copy
+import itertools
 import json
 import tempfile
 import unittest
@@ -10,6 +12,85 @@ from scripts.tool_result_audit import audit, execution_context_audit, repeated_i
 
 
 class ToolResultAuditTest(unittest.TestCase):
+    def test_terminal_conflicts_quarantine_every_audit_consumer_in_all_orders(self):
+        from scripts.tool_result_audit import compact_report
+
+        timing = {
+            "modelRequests": [{"samplingRequestId": "r", "tokenUsage": {"inputTokens": 10}}],
+            "toolCalls": [{"callId": "c", "toolName": "exec", "totalDurationMs": 5}],
+            "counters": {"toolOutputTruncationCount": 2},
+        }
+        original = {"type": "task_complete", "turn_id": "t", "timing": timing}
+        alternatives = []
+        for field in ("status", "modelRequests", "toolCalls", "counters", "missing"):
+            alternative = copy.deepcopy(original)
+            if field == "status":
+                alternative["type"] = "turn_aborted"
+            elif field == "missing":
+                alternative.pop("timing")
+            elif field == "counters":
+                alternative["timing"][field]["toolOutputTruncationCount"] = 3
+            else:
+                alternative["timing"][field] = []
+            alternatives.append((field, alternative))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "conflicts.jsonl"
+            for field, alternative in alternatives:
+                for order in itertools.permutations((original, alternative, original)):
+                    with self.subTest(field=field, order=[p["type"] for p in order]):
+                        rows = [
+                            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t"}},
+                            {"type": "response_item", "payload": {"type": "function_call", "call_id": "c", "name": "exec"}},
+                            {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c", "output": "observed"}},
+                            {"type": "sampling_boundary", "payload": {"timing_checkpoint": {"turn_id": "t", "timing": timing}}},
+                            *({"type": "event_msg", "payload": payload} for payload in order),
+                            # Late checkpoints cannot restore quarantined metrics.
+                            {"type": "sampling_boundary", "payload": {"timing_checkpoint": {"turn_id": "t", "timing": timing}}},
+                            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "open"}},
+                        ]
+                        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                        session = audit(path)
+                        context = session["execution_context"]
+                        coverage = context["coverage"]
+                        self.assertEqual(coverage["conflicting_terminal_turn_ids"], ["t"])
+                        self.assertEqual(coverage["unfinished_turn_ids"], ["open"])
+                        for key in ("completed_turns", "aborted_turns", "terminal_turns", "requests_with_usage"):
+                            self.assertEqual(coverage[key], 0)
+                        self.assertEqual(context["provider_usage_totals"], {})
+                        self.assertEqual(context["provider_usage_reconciliation"]["status"], "conflicting_terminal_evidence")
+                        self.assertIsNone(context["tool_outputs"][0]["raw_replay_estimated_tokens"])
+                        self.assertEqual(context["turns"][0]["terminal_records"], [5, 6, 7])
+                        self.assertEqual(session["timing_counter_totals"], {})
+                        trace = session["tool_call_trace"]
+                        self.assertEqual(trace["coverage"]["conflicting_terminal_turn_ids"], ["t"])
+                        self.assertEqual(trace["coverage"]["terminal_turns"], 0)
+                        self.assertEqual(len(trace["calls"]), 1)
+                        self.assertFalse(trace["calls"][0]["timing_available"])
+                        summary = compact_report({"sessions": [session]}, path, "hash", 0)
+                        self.assertEqual(summary["totals"]["conflicting_terminal_turns"], 1)
+                        self.assertIsNone(summary["terminal_truncation"]["tool_output_truncations"])
+                        self.assertIn("do not establish avoidable work or preserved correctness", " ".join(summary["limitations"]))
+
+    def test_identical_terminals_are_counted_once_and_other_turns_survive_conflicts(self):
+        from scripts.tool_result_audit import execution_timings
+
+        rows = []
+        for turn, tokens in (("bad", 50), ("good", 7), ("bad", 60), ("good", 7)):
+            rows.append({"type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": turn, "timing": {
+                    "modelRequests": [{"samplingRequestId": turn, "tokenUsage": {"inputTokens": tokens}}],
+                    "counters": {"toolOutputTruncationCount": tokens},
+                },
+            }})
+        for sequence in (rows, list(reversed(rows))):
+            records = [(line, row, 0) for line, row in enumerate(sequence, 1)]
+            context = execution_context_audit(records)
+            self.assertEqual(context["provider_usage_totals"], {"inputTokens": 7})
+            self.assertEqual(context["coverage"]["completed_turns"], 1)
+            turns = {turn["turn_id"]: turn for turn in execution_timings(records)}
+            self.assertEqual(turns["bad"]["counters"], {})
+            self.assertEqual(turns["good"]["counters"], {"toolOutputTruncationCount": 7})
+
     def test_request_output_index_preserves_missing_and_reordered_boundaries(self):
         records = []
 

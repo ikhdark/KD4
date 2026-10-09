@@ -2998,34 +2998,52 @@ async fn thread_resume_keeps_in_flight_turn_active_until_input_resolves() -> Res
         anyhow::bail!("expected pending user input, got {question:?}");
     };
 
-    let resume_id = primary
-        .send_thread_resume_request(ThreadResumeParams {
-            thread_id: thread.id.clone(),
+    for overrides in [
+        ThreadResumeParams::default(),
+        ThreadResumeParams {
+            config: Some(std::collections::HashMap::from([(
+                "model".to_string(),
+                json!("not-the-running-model"),
+            )])),
+            base_instructions: Some("resume-only base instructions".to_string()),
+            developer_instructions: Some("resume-only developer instructions".to_string()),
             ..Default::default()
-        })
-        .await?;
-    let resume_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
-    )
-    .await??;
-    let ThreadResumeResponse {
-        thread: resumed_thread,
-        ..
-    } = to_response::<ThreadResumeResponse>(resume_resp)?;
-    assert_eq!(resumed_thread.id, thread.id);
-    let resumed_turn = resumed_thread
-        .turns
-        .iter()
-        .find(|turn| turn.id == active_turn.id)
-        .expect("resume must retain the active turn");
-    assert_eq!(resumed_turn.status, TurnStatus::InProgress);
-    let replayed = timeout(
-        DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_request_message(),
-    )
-    .await??;
-    assert_eq!(replayed, question);
+        },
+    ] {
+        let resume_id = primary
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread.id.clone(),
+                ..overrides
+            })
+            .await?;
+        let resume_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+        )
+        .await??;
+        let ThreadResumeResponse {
+            thread: resumed_thread,
+            model,
+            approval_policy,
+            ..
+        } = to_response::<ThreadResumeResponse>(resume_resp)?;
+        assert_eq!(resumed_thread.id, thread.id);
+        assert_eq!(resumed_thread.session_id, thread.session_id);
+        assert_eq!(model, "gpt-5.4");
+        assert_eq!(approval_policy, AskForApproval::OnRequest);
+        let resumed_turn = resumed_thread
+            .turns
+            .iter()
+            .find(|turn| turn.id == active_turn.id)
+            .expect("resume must retain the active turn");
+        assert_eq!(resumed_turn.status, TurnStatus::InProgress);
+        let replayed = timeout(
+            DEFAULT_READ_TIMEOUT,
+            primary.read_stream_until_request_message(),
+        )
+        .await??;
+        assert_eq!(replayed, question);
+    }
     primary
         .send_response(
             request_id.clone(),
@@ -3449,6 +3467,8 @@ async fn thread_resume_rejects_overrides_that_cannot_apply_to_a_running_thread()
             thread_id: thread.id.clone(),
             model: Some("not-the-running-model".to_string()),
             cwd: Some("/tmp".to_string()),
+            config: Some(std::collections::HashMap::new()),
+            developer_instructions: Some("resume-only developer instructions".to_string()),
             initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
                 limit: None,
                 sort_direction: None,
@@ -3542,35 +3562,57 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     .await??;
 
     // Rejoin the existing process; another TestAppServer would cold-resume.
-    let resume_id = primary
-        .send_thread_resume_request(ThreadResumeParams {
-            thread_id: thread.id.clone(),
-            exclude_turns: true,
-            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
-                limit: Some(1),
-                sort_direction: Some(SortDirection::Desc),
-                items_view: Some(TurnItemsView::NotLoaded),
-            }),
+    // Desktop can resend empty or populated config and instruction fields even
+    // while this connection is already subscribed to the idle thread.
+    for overrides in [
+        ThreadResumeParams::default(),
+        ThreadResumeParams {
+            config: Some(std::collections::HashMap::new()),
             ..Default::default()
-        })
-        .await?;
-    let resume_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
-    )
-    .await??;
-    let ThreadResumeResponse {
-        thread: resumed,
-        initial_turns_page,
-        ..
-    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+        },
+        ThreadResumeParams {
+            config: Some(std::collections::HashMap::from([(
+                "model".to_string(),
+                json!("not-the-running-model"),
+            )])),
+            base_instructions: Some("resume-only base instructions".to_string()),
+            developer_instructions: Some("resume-only developer instructions".to_string()),
+            ..Default::default()
+        },
+    ] {
+        let resume_id = primary
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread.id.clone(),
+                exclude_turns: true,
+                initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                    limit: Some(1),
+                    sort_direction: Some(SortDirection::Desc),
+                    items_view: Some(TurnItemsView::NotLoaded),
+                }),
+                ..overrides
+            })
+            .await?;
+        let resume_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+        )
+        .await??;
+        let ThreadResumeResponse {
+            thread: resumed,
+            model,
+            initial_turns_page,
+            ..
+        } = to_response::<ThreadResumeResponse>(resume_resp)?;
 
-    assert_eq!(resumed.id, thread.id);
-    assert_eq!(resumed.status, ThreadStatus::Idle);
-    assert!(resumed.turns.is_empty());
-    let initial_turns_page = initial_turns_page.expect("requested initial turns page");
-    assert_eq!(initial_turns_page.data.len(), 1);
-    assert!(initial_turns_page.data[0].items.is_empty());
+        assert_eq!(resumed.id, thread.id);
+        assert_eq!(resumed.session_id, thread.session_id);
+        assert_eq!(model, "gpt-5.4");
+        assert_eq!(resumed.status, ThreadStatus::Idle);
+        assert!(resumed.turns.is_empty());
+        let initial_turns_page = initial_turns_page.expect("requested initial turns page");
+        assert_eq!(initial_turns_page.data.len(), 1);
+        assert!(initial_turns_page.data[0].items.is_empty());
+    }
 
     Ok(())
 }

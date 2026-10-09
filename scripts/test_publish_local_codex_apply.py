@@ -174,6 +174,107 @@ Set-PSBreakpoint -Command Get-CachedLocalPublishFileSha256 -Action {{
         self.assertFalse((install / "codex.exe").exists())
         self.assertEqual(list(install.parent.glob(".install.bundle.*")), [])
 
+    def test_late_source_mutation_is_rejected_before_bundle_activation(self) -> None:
+        artifacts = (
+            ("codex", self.source_exe, Path("codex.exe")),
+            ("codeModeHost", self.source_code_mode_host, Path("codex-code-mode-host.exe")),
+            ("windowsSandboxSetup", self.source_windows_sandbox_setup,
+             Path("codex-resources/codex-windows-sandbox-setup.exe")),
+            ("commandRunner", self.source_command_runner,
+             Path("codex-resources/codex-command-runner.exe")),
+        )
+        for name, source, relative in artifacts:
+            for target_state in ("missing", "changed", "unchanged"):
+                with self.subTest(artifact=name, target_state=target_state), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    install = root / "install"
+                    before = {}
+                    if target_state != "missing":
+                        for _, artifact_source, artifact_relative in artifacts:
+                            target = install / artifact_relative
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            content = artifact_source.read_bytes() + b"old installed bytes"
+                            if target_state == "unchanged" and artifact_relative == relative:
+                                content = artifact_source.read_bytes()
+                            target.write_bytes(content)
+                            before[artifact_relative] = content
+                    manifest = self.write_source_bundle_manifest(self.source_exe)
+                    activated = root / "activated"
+                    original = source.read_bytes()
+                    # This hook runs after manifest/stamp freshness checks, just
+                    # before staging. Other artifacts still require publication
+                    # when the selected artifact initially matches its target.
+                    command = rf"""
+Set-PSBreakpoint -Command Initialize-CodexBackupRoot -Action {{
+    [IO.File]::AppendAllText({ps_single_quote(source)}, 'changed after verification')
+}} | Out-Null
+Set-PSBreakpoint -Command Activate-CodexRuntimeBundleTransaction -Action {{
+    [IO.File]::WriteAllText({ps_single_quote(activated)}, 'activated')
+}} | Out-Null
+& {ps_single_quote(SCRIPT)} -SkipBuild -FastProof -RepoRoot {ps_single_quote(self.repo_root)} `
+    -SourceBundleManifest {ps_single_quote(manifest)} -InstallDir {ps_single_quote(install)} `
+    -LocalCodexHome {ps_single_quote(root / 'home')} -BackupDir {ps_single_quote(root / 'backups')}
+"""
+                    try:
+                        result = subprocess.run(
+                            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                            env=clean_env(), capture_output=True, text=True,
+                            check=False, timeout=RUN_TIMEOUT_SECONDS,
+                        )
+                        self.assertEqual(source.read_bytes(), original + b"changed after verification")
+                    finally:
+                        source.write_bytes(original)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(
+                        f"Cannot stage runtime bundle: verified SHA-256 mismatch for {name}.",
+                        " ".join(result.stderr.split()),
+                    )
+                    self.assertFalse(activated.exists(), result.stdout)
+                    self.assertNotIn("postPublishVerify:", result.stdout)
+                    self.assertNotIn("publishCommitted: true", result.stdout)
+                    self.assertEqual(
+                        {path.relative_to(install): path.read_bytes()
+                         for path in install.rglob("*") if path.is_file()}, before,
+                    )
+                    if target_state == "missing":
+                        self.assertFalse(install.exists())
+                    else:
+                        self.assert_proof_value(
+                            result.stdout, f"{name}BinaryChanged",
+                            "false" if target_state == "unchanged" else "true",
+                        )
+                    self.assert_no_publish_temps(install)
+
+    def test_staging_requires_verified_artifact_digest(self) -> None:
+        for digest in (None, "", "not-a-sha256"):
+            with self.subTest(digest=digest), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                install = root / "install"
+                install.mkdir()
+                target = install / "codex.exe"
+                target.write_bytes(b"old")
+                expected = "" if digest is None else f"ExpectedSha256 = {ps_single_quote(digest)};"
+                command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$entry = [pscustomobject]@{{
+    Name = 'codex'; SourcePath = {ps_single_quote(self.source_exe)}; {expected}
+    TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(root / 'codex.bak')}
+    HadPreviousTarget = $true; Changed = $true
+}}
+New-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(root / '.install.codex-local-publish.transaction.json')} `
+    -InstallDir {ps_single_quote(install)} -Entries @($entry)
+"""
+                result = subprocess.run(
+                    [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                    env=clean_env(), capture_output=True, text=True,
+                    check=False, timeout=RUN_TIMEOUT_SECONDS,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("verified SHA-256 is missing or invalid for codex", " ".join(result.stderr.split()))
+                self.assertEqual(target.read_bytes(), b"old")
+                self.assertFalse((root / "codex.bak").exists())
+                self.assert_no_publish_temps(install)
+
     def test_audit_publish_stages_complete_bundle_before_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -188,8 +289,8 @@ Set-PSBreakpoint -Command Get-CachedLocalPublishFileSha256 -Action {{
             command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 $entries = @(
-    [pscustomobject]@{{ Name = 'codex'; SourcePath = {ps_single_quote(source)}; TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(temp_path / "codex.bak")}; HadPreviousTarget = $true; Changed = $true }}
-    [pscustomobject]@{{ Name = 'host'; SourcePath = {ps_single_quote(missing)}; TargetPath = {ps_single_quote(install_dir / "host.exe")}; BackupPath = {ps_single_quote(temp_path / "host.bak")}; HadPreviousTarget = $false; Changed = $true }}
+    [pscustomobject]@{{ Name = 'codex'; SourcePath = {ps_single_quote(source)}; ExpectedSha256 = '{hashlib.sha256(b"new").hexdigest()}'; TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(temp_path / "codex.bak")}; HadPreviousTarget = $true; Changed = $true }}
+    [pscustomobject]@{{ Name = 'host'; SourcePath = {ps_single_quote(missing)}; ExpectedSha256 = '{hashlib.sha256(b"host").hexdigest()}'; TargetPath = {ps_single_quote(install_dir / "host.exe")}; BackupPath = {ps_single_quote(temp_path / "host.bak")}; HadPreviousTarget = $false; Changed = $true }}
 )
 try {{
     New-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)} -InstallDir {ps_single_quote(install_dir)} -Entries $entries

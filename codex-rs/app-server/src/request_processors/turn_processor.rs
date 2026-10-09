@@ -540,8 +540,7 @@ impl TurnRequestProcessor {
             request_id,
             params,
             additional_context,
-            app_server_client_name,
-            app_server_client_version,
+            (app_server_client_name, app_server_client_version),
             /*supports_openai_form_elicitation*/ supports_openai_form_elicitation,
             None,
         )
@@ -571,8 +570,7 @@ impl TurnRequestProcessor {
             request_id,
             params,
             IndexMap::new(),
-            client_name,
-            client_version,
+            (client_name, client_version),
             supports_openai_form_elicitation,
             Some(turn_id),
         )
@@ -830,11 +828,11 @@ impl TurnRequestProcessor {
         request_id: ConnectionRequestId,
         params: TurnStartParams,
         additional_context: IndexMap<String, CoreAdditionalContextEntry>,
-        app_server_client_name: Option<String>,
-        app_server_client_version: Option<String>,
+        app_server_client_info: (Option<String>, Option<String>),
         supports_openai_form_elicitation: bool,
         reserved_turn_id: Option<String>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let (app_server_client_name, app_server_client_version) = app_server_client_info;
         let (thread_id, thread) = self.load_thread(&params.thread_id).await.inspect_err(|_| {
             self.track_error_response(&request_id, /*error_type*/ None);
         })?;

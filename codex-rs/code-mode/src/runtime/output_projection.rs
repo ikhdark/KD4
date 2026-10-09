@@ -13,6 +13,12 @@ const PROJECTOR: &str = r#"((isProxy) => {
   const NativeError = Error;
   const toBigInt = BigInt;
   const isSafeInteger = Number.isSafeInteger;
+  // Unsafe integer JSON lexemes require at least 16 decimal digits. A cheap
+  // conservative scan lets ordinary tool packets use native parsing without
+  // visiting every property in a reviver. Digits inside strings only cause a
+  // false positive and retain the exact-integer path.
+  const possibleUnsafeInteger = RegExp.prototype.exec.bind(/[0-9]{16}/);
+  const integerLexeme = RegExp.prototype.exec.bind(/^-?[0-9]+$/);
   const keys = Object.getOwnPropertyNames;
   const descriptor = Object.getOwnPropertyDescriptor;
   const prototype = Object.getPrototypeOf;
@@ -357,9 +363,12 @@ const PROJECTOR: &str = r#"((isProxy) => {
           omitted_entries: Math.max(0, names.filter(name => name !== 'length').length - entries.length)},
           (_key, item) => typeof item === 'bigint' ? {$bigint:item.toString()} : item);
       }
-      if (original === 'parse') return parse(value, (_key, item, context) =>
-        typeof item === 'number' && !isSafeInteger(item) &&
-        /^-?[0-9]+$/.test(context.source) ? toBigInt(context.source) : item);
+      if (original === 'parse') {
+        if (typeof value === 'string' && possibleUnsafeInteger(value) === null) return parse(value);
+        return parse(value, (_key, item, context) =>
+          typeof item === 'number' && !isSafeInteger(item) &&
+          integerLexeme(context.source) !== null ? toBigInt(context.source) : item);
+      }
       return stringify(value, (_key, item) => {
         if (typeof item !== 'bigint') return item;
         if (item < -9223372036854775808n || item > 18446744073709551615n)

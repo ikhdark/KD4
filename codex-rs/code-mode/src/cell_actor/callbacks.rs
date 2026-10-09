@@ -117,15 +117,18 @@ pub(super) fn spawn_tool<H: CellHost>(
         // Publish the same instant the wrapper enforces, so every stage before
         // observation is charged against one budget and a handler that can
         // yield cooperatively knows exactly how long it has.
-        invocation.deadline = (!timeout.is_zero()).then(|| std::time::Instant::now() + timeout);
+        let deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
+        invocation.deadline = deadline.map(tokio::time::Instant::into_std);
         let callback = AssertUnwindSafe(async move {
             tokio::select! {
                 response = host.invoke_tool(invocation, cancellation) => response,
                 _ = async {
-                    if timeout.is_zero() {
-                        std::future::pending::<()>().await;
+                    if let Some(deadline) = deadline {
+                        // Future construction and its first poll may consume
+                        // time. Never restart the already-published budget.
+                        tokio::time::sleep_until(deadline).await;
                     } else {
-                        tokio::time::sleep(timeout).await;
+                        std::future::pending::<()>().await;
                     }
                 } => {
                     // Record before signalling: an observer woken by the

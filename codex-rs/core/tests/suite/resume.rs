@@ -158,12 +158,27 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     codex.flush_rollout().await?;
+    let (persisted_items, _, parse_errors) =
+        codex_core::RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(parse_errors, 0);
+    let persisted_events = persisted_items
+        .into_iter()
+        .filter_map(|item| match item {
+            codex_protocol::protocol::RolloutItem::EventMsg(event) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let resumed = builder.resume(&server, home, rollout_path).await?;
     let initial_messages = resumed
         .session_configured
         .initial_messages
         .clone()
         .expect("expected initial messages to be present for resumed session");
+    assert_eq!(
+        serde_json::to_value(&initial_messages)?,
+        serde_json::to_value(&persisted_events)?,
+        "resume must preserve the flushed event history exactly"
+    );
     match initial_messages.as_slice() {
         [
             EventMsg::ThreadSettingsApplied(_),
@@ -172,23 +187,33 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
             EventMsg::AgentReasoning(reasoning),
             EventMsg::AgentReasoningRawContent(raw),
             EventMsg::ItemCompleted(canonical),
-            EventMsg::AgentMessage(assistant_message),
+            legacy_alias @ ..,
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
         ] => {
             assert_eq!(first_user.message, "Record reasoning messages");
             assert_eq!(reasoning.text, "Summarized step");
             assert_eq!(raw.text, "raw detail");
-            assert_eq!(assistant_message.message, "Completed reasoning turn");
             assert_eq!(canonical.turn_id, started.turn_id);
             let codex_protocol::items::TurnItem::AgentMessage(item) = &canonical.item else {
                 panic!("expected canonical assistant message: {canonical:?}");
             };
             assert_eq!(item.id, "msg-1");
-            assert_eq!(item.phase, assistant_message.phase);
+            assert_eq!(item.phase, None);
             assert!(
-                matches!(item.content.as_slice(), [codex_protocol::items::AgentMessageContent::Text { text }] if text == &assistant_message.message)
+                matches!(item.content.as_slice(), [codex_protocol::items::AgentMessageContent::Text { text }] if text == "Completed reasoning turn")
             );
+            // The recorder omits only immediately adjacent raw-rollout mirrors.
+            // A retained legacy alias must still match the canonical message;
+            // neither an extra alias nor another event may hide in this slot.
+            match legacy_alias {
+                [] => {}
+                [EventMsg::AgentMessage(alias)] => {
+                    assert_eq!(alias.message, "Completed reasoning turn");
+                    assert_eq!(alias.phase, item.phase);
+                }
+                other => panic!("unexpected events after canonical message: {other:#?}"),
+            }
             assert_eq!(completed.turn_id, started.turn_id);
             assert_eq!(
                 completed.last_agent_message.as_deref(),

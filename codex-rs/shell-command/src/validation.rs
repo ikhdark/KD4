@@ -319,10 +319,8 @@ fn split_script(script: &str, allow_pipelines: bool) -> Option<(Vec<&str>, bool)
             b'{' => closers.push(b'}'),
             // A stray closer stays literal; a mismatched one leaves the
             // command boundaries unknowable.
-            b')' | b'}' if !closers.is_empty() => {
-                if closers.pop() != Some(byte) {
-                    return None;
-                }
+            b')' | b'}' if !closers.is_empty() && closers.pop() != Some(byte) => {
+                return None;
             }
             _ => {}
         }

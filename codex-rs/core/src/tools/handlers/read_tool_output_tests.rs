@@ -218,8 +218,7 @@ async fn new_recovery_transaction_revalidates_same_length_modified_bytes() {
         &CancellationToken::new(),
     )
     .await
-    .err()
-    .expect("new calls must authenticate disk contents again");
+    .expect_err("new calls must authenticate disk contents again");
     assert_eq!(
         error,
         ReadToolOutputError::Io("artifact SHA identity does not match metadata".to_string())

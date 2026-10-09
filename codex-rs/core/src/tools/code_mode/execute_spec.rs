@@ -101,10 +101,12 @@ SOURCE: /[\s\S]+/
         assert_eq!(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL, 40_000);
         // Nested display results must still fit an unraised default cell, or
         // the cell projection would cut an already-cut result a second time.
-        assert!(
-            codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS
-                < codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
-        );
+        const {
+            assert!(
+                codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS
+                    < codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+            );
+        }
     }
 
     #[test]

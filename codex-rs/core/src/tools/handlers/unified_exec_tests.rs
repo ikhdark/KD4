@@ -824,6 +824,7 @@ async fn invocation_for_payload_without_sandbox(
 }
 
 #[tokio::test]
+#[expect(clippy::print_stderr, reason = "reports passive-poll timing and observation count without adding scheduler-sensitive timing assertions")]
 async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -2512,12 +2513,12 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
     std::fs::remove_file(&powershell_path)?;
     let missing = get_command(
         &args, Arc::new(default_user_shell()), true, false,
-    ).err().expect("a missing explicit shell must not fall back to another installation");
+    ).expect_err("a missing explicit shell must not fall back to another installation");
     assert!(missing.contains("stage=shell_metadata"), "{missing}");
     std::fs::create_dir(&powershell_path)?;
     let directory = get_command(
         &args, Arc::new(default_user_shell()), true, false,
-    ).err().expect("a directory cannot be used as the requested shell");
+    ).expect_err("a directory cannot be used as the requested shell");
     assert!(directory.contains("is not a file"), "{directory}");
     Ok(())
 }
@@ -3207,7 +3208,7 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
     assert_eq!(code_mode["output_complete"], false);
     assert!(!text.contains("stdin-notice-0128"));
     let response =
-        serde_json::to_value(&completed.to_response_item("notice-write_stdin", &payload))
+        serde_json::to_value(completed.to_response_item("notice-write_stdin", &payload))
             .expect("model response");
     let direct: serde_json::Value =
         serde_json::from_str(response["output"].as_str().expect("direct output"))

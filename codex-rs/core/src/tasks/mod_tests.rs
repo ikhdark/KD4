@@ -28,6 +28,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -289,6 +290,54 @@ impl SessionTask for QueuedToolResultTask {
 
 #[derive(Clone, Copy)]
 struct PanickingTask;
+
+#[derive(Clone, Copy)]
+enum FailureMode {
+    Fatal,
+    ReturnedError,
+    EmittedError,
+}
+
+struct FailureOnReleaseTask(CancellationToken, FailureMode);
+
+impl SessionTask for FailureOnReleaseTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.failure_before_input"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        session: Arc<crate::session::session::Session>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            self.0.cancelled().await;
+            let message = "failure requires explicit new admission".to_string();
+            match self.1 {
+                FailureMode::Fatal => Err(codex_protocol::error::CodexErr::Fatal(message)),
+                FailureMode::ReturnedError => {
+                    Err(codex_protocol::error::CodexErr::InvalidRequest(message))
+                }
+                FailureMode::EmittedError => {
+                    session.send_event(&ctx, EventMsg::Error(
+                        codex_protocol::error::CodexErr::Fatal(message).to_error_event(None),
+                    )).await;
+                    // The mid-turn compaction failure path returns Ok and defers input.
+                    Ok(super::TurnTaskResult {
+                        defer_pending_input: true,
+                        ..Default::default()
+                    })
+                }
+            }
+        })
+    }
+}
 
 impl SessionTask for PanickingTask {
     fn kind(&self) -> TaskKind {
@@ -802,6 +851,130 @@ async fn review_startup_failure_preserves_terminal_error_and_closes_review_mode(
     })
     .await
     .expect("failed review must publish a bounded terminal outcome");
+}
+
+#[tokio::test]
+async fn fatal_turn_preserves_pending_input_without_automatic_restart() {
+    assert_failed_turn_preserves_pending_input(FailureMode::Fatal).await;
+}
+
+#[tokio::test]
+async fn generic_error_preserves_pending_input_without_automatic_restart() {
+    assert_failed_turn_preserves_pending_input(FailureMode::ReturnedError).await;
+}
+
+#[tokio::test]
+async fn emitted_error_preserves_pending_input_without_automatic_restart() {
+    assert_failed_turn_preserves_pending_input(FailureMode::EmittedError).await;
+}
+
+async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
+    for fail_safe in [false, true] {
+        let (session, turn_context, events) = make_session_and_context_with_rx().await;
+        let release = CancellationToken::new();
+        session
+            .start_task(
+                Arc::clone(&turn_context),
+                Vec::new(),
+                FailureOnReleaseTask(release.clone(), mode),
+            )
+            .await;
+        let (turn_state, terminal) = {
+            let active = session.active_turn.lock().await;
+            let active = active.as_ref().expect("fatal task is waiting");
+            (Arc::clone(&active.turn_state), active.terminal.clone().unwrap())
+        };
+        let pending = vec![
+            TurnInput::InterAgentCommunication(
+                codex_protocol::protocol::InterAgentCommunication::new(
+                    codex_protocol::AgentPath::root(),
+                    codex_protocol::AgentPath::try_from("/root/worker").unwrap(),
+                    Vec::new(),
+                    "retain this follow-up".to_string(),
+                    true,
+                ),
+            ),
+            TurnInput::UserInput {
+                content: vec![codex_protocol::user_input::UserInput::Text {
+                    text: "retain steering too".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            },
+        ];
+        session.input_queue
+            .extend_pending_input_for_turn_state(turn_state.as_ref(), &pending)
+            .await.unwrap();
+        if fail_safe {
+            terminal.request_panic_after_terminal_publication();
+        }
+        release.cancel();
+        tokio::time::timeout(Duration::from_secs(5), terminal.wait_cleanup_completed())
+            .await.expect("fatal cleanup must settle without retrying input");
+
+        assert!(session.active_turn.lock().await.is_none(), "fatal input was retried");
+        assert!(!session.terminal_interaction_pending.load(Ordering::Acquire));
+        assert!(session.input_queue.has_pending_turn_start_work().await);
+        let mut completed = 0;
+        while let Ok(event) = events.try_recv() {
+            match event.msg {
+                EventMsg::TurnStarted(_) => panic!("unexpected automatic successor"),
+                EventMsg::TurnComplete(done) => {
+                    assert_eq!(done.turn_id, turn_context.sub_id);
+                    assert!(done.error.unwrap().message.contains("explicit new admission"));
+                    completed += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(completed, 1, "publish the original failure exactly once");
+
+        // This is not a session-wide latch: explicit admission still receives
+        // both recovered items in order, once, without discarding steering.
+        let next = session.new_default_turn_with_sub_id("explicit-follow-up".into()).await;
+        session.start_task(next, Vec::new(), FenceBlockingTask).await;
+        assert_eq!(session.input_queue.get_pending_input(&session.active_turn).await, pending);
+        assert!(session.input_queue.get_pending_input(&session.active_turn).await.is_empty());
+        session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    }
+}
+
+#[test]
+fn terminal_failures_suppress_pending_input_restart() {
+    use codex_protocol::error::CodexErr;
+    let completed = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn".into(),
+        last_agent_message: None,
+        surfaced_result: None,
+        error: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        timing: None,
+    });
+    let mut failed = completed.clone();
+    if let EventMsg::TurnComplete(event) = &mut failed {
+        event.error = Some(CodexErr::Fatal("failed compaction".into()).to_error_event(None));
+    }
+    for outcome in [
+        TurnTerminalOutcome::ReturnedError(CodexErr::Fatal("stop".into())),
+        TurnTerminalOutcome::ReturnedError(CodexErr::InternalServerError { retry_after: None }),
+        TurnTerminalOutcome::WorkerJoinFailed(super::WorkerJoinFailure::Panicked),
+        TurnTerminalOutcome::WorkerJoinFailed(super::WorkerJoinFailure::Cancelled),
+        TurnTerminalOutcome::Aborted(TurnAbortReason::InternalError),
+    ] {
+        assert!(!outcome.allows_pending_input_restart(Some(&completed)));
+        assert!(!outcome.allows_pending_input_restart(Some(&failed)));
+    }
+    for outcome in [
+        TurnTerminalOutcome::Completed { result: Default::default() },
+        TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted),
+        TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted),
+    ] {
+        assert!(outcome.allows_pending_input_restart(Some(&completed)));
+        assert!(!outcome.allows_pending_input_restart(Some(&failed)));
+        assert!(!outcome.allows_pending_input_restart(None));
+    }
 }
 
 #[tokio::test]

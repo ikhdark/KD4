@@ -120,13 +120,12 @@ impl WriteStdinHandler {
         // Legacy numeric-only handles are readable history, not live authority.
         // IDs are not reused inside a manager; the creation token additionally
         // prevents persisted values from controlling another runtime's process.
-        if args.incarnation.is_none()
-            || live_incarnation != args.incarnation
-        {
-            return Err(FunctionCallError::RespondToModel(
+        let incarnation = match args.incarnation {
+            Some(incarnation) if live_incarnation == Some(incarnation) => incarnation,
+            _ => return Err(FunctionCallError::RespondToModel(
                 "process handle is stale or lacks its creation identity; supply incarnation from the originating session_capabilities. No process was polled, written, or terminated.".into(),
-            ));
-        }
+            )),
+        };
         let wait_for_output = args.waits_for_output();
         if args.terminate && !args.chars.is_empty() {
             return Err(FunctionCallError::RespondToModel(
@@ -202,7 +201,7 @@ impl WriteStdinHandler {
                 if args.chars.is_empty() && !args.terminate =>
             {
                 if let Some(result) = session.services.command_execution
-                    .completed_process_result(process_id, args.incarnation.expect("authenticated process handle")).await
+                    .completed_process_result(process_id, incarnation).await
                 {
                     return Ok(boxed_tool_output(codex_tools::JsonToolOutput::new(result)));
                 }

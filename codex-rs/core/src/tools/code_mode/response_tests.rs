@@ -338,6 +338,7 @@ fn packet_output_text(output: &dyn ToolOutput) -> String {
 /// with a deterministic nested producer. Process startup is measured separately.
 #[tokio::test]
 #[ignore = "wall-clock benchmark; run explicitly without competing benchmarks"]
+#[expect(clippy::print_stdout, reason = "this opt-in benchmark emits its measured samples as JSON")]
 async fn benchmark_tool_execution_projection() {
     let runtime = PacketRuntime::new().await;
     for limit in [100, 10_000] {
@@ -508,6 +509,7 @@ async fn packet_retention_large_results_are_recoverable_at_exec_and_wait_boundar
 /// The serial fixture waits for the previous result before doing its own work.
 #[tokio::test]
 #[ignore = "wall-clock benchmark; run explicitly without competing benchmarks"]
+#[expect(clippy::print_stdout, reason = "this opt-in benchmark emits matched retention timing samples as JSON")]
 async fn benchmark_packet_retention_overlap() {
     let runtime = PacketRuntime::with_nested_tool("exec_command").await;
     for large in [false, true] {
@@ -1611,7 +1613,7 @@ fn verified_evidence_quoted_handles_do_not_replace_live_receipts() {
         serde_json::json!({"session_id":12, "execution_state":"exited", "session_capabilities":{"polling":true}}).to_string()] {
         assert!(!shows_session_handle(&visible, &state), "{visible}");
     }
-    assert!(shows_session_handle(&serde_json::json!({"results":[{"value":state.clone()}]}).to_string(), &state));
+    assert!(shows_session_handle(&serde_json::json!({"results":[{"value":state}]}).to_string(), &state));
 }
 
 #[test]

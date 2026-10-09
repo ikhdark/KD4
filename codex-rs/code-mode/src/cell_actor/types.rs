@@ -34,9 +34,8 @@ pub(crate) struct CellToolCall {
     pub(crate) input: Option<JsonValue>,
     pub(crate) timeout: std::time::Duration,
     pub(crate) buffered_output_bytes: usize,
-    /// Absolute instant the wrapper timeout fires, set by `spawn_tool` at the
-    /// point its own `sleep(timeout)` begins. `None` until then, so a handler
-    /// downstream never sees a deadline the wrapper is not actually enforcing.
+    /// Absolute instant enforced by the wrapper, set by `spawn_tool` before
+    /// constructing or polling the callback. `None` when timeouts are disabled.
     pub(crate) deadline: Option<std::time::Instant>,
 }
 
@@ -221,6 +220,7 @@ impl CellState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_completion(
         &self,
         event: CellEvent,

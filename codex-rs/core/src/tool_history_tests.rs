@@ -1,6 +1,122 @@
 use super::*;
 
 #[test]
+fn root_only_sampling_keeps_unscoped_unavailable_evidence_unknown() {
+    let output = text_output("poll", "retained process bytes".into());
+    let items: Arc<[ResponseItem]> = Arc::from([function_call("poll"), output.clone()]);
+    let mut unavailable = workspace_identity("unavailable");
+    unavailable.unavailable = true;
+    let observation = WorkspaceEvidenceObservation::from_response_item_with_freshness(
+        Some(unavailable), &output, BTreeSet::new(), false,
+    ).unwrap();
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(observation.clone());
+    assert!(state.can_use_root_only_workspace_identity(&items));
+    let restored: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(restored.can_use_root_only_workspace_identity(&items));
+    let current = workspace_identity("current");
+    for identity in [None, Some(&current)] {
+        let projected = restored.project_with_workspace_identity(Arc::clone(&items), identity);
+        let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
+        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(notice["historical_authenticity"], "authenticated");
+        assert_eq!(notice["valid_for_current_workspace"], false);
+    }
+
+    // Unknown outer provenance cannot hide a nested digest-based requirement.
+    let mut scoped = observation;
+    scoped.revision = Some(current);
+    scoped.source_dependencies.insert(SourceDependencyV1::new(Path::new("source.txt"), false));
+    state.code_mode_nested_evidence.insert("poll".into(), BTreeMap::from([
+        ("nested".into(), NestedWorkspaceEvidence {
+            observation: scoped.clone(), output: "nested bytes".into(),
+        }),
+    ]));
+    assert!(!state.can_use_root_only_workspace_identity(&items));
+    state.code_mode_nested_evidence.clear();
+    scoped.revision.as_mut().unwrap().unavailable = true;
+    state.workspace_evidence.insert("poll".into(), scoped);
+    assert!(!state.can_use_root_only_workspace_identity(&items),
+        "unavailable but scoped evidence retains the existing capture path");
+}
+
+#[tokio::test]
+async fn root_only_sampling_requires_complete_watcher_coverage() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.txt");
+    std::fs::write(&source, "before").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let watch = cache.begin_source_path_change_observation(root.path(), &source, false)
+        .await.unwrap();
+    let mut revision = workspace_identity("captured");
+    revision.repository_root = Some(root.path().to_string_lossy().into_owned());
+    let output = text_output("watched", "before".into());
+    let items: Arc<[ResponseItem]> = Arc::from([function_call("watched"), output.clone()]);
+    let observation = WorkspaceEvidenceObservation::from_response_item(
+        Some(revision.clone()), &output,
+        BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+    ).unwrap().with_source_path_observations(vec![watch]);
+    let mut state = ToolHistoryState::default();
+    assert!(!state.can_use_root_only_workspace_identity(&items), "missing observation");
+    state.register_workspace_evidence(observation.clone());
+    assert!(state.can_use_root_only_workspace_identity(&items));
+    let mut root_only = revision.clone();
+    root_only.head_identity = None;
+    root_only.index_identity = None;
+    root_only.worktree_identity = None;
+    root_only.path_fingerprints = None;
+    assert_eq!(state.project_with_workspace_cache(Arc::clone(&items), Some(&root_only), &cache).items, items);
+    let mut other_root = root_only.clone();
+    other_root.repository_root = Some("different-repository".into());
+    assert!(!observation.is_current(Some(&other_root), Some(&cache)));
+
+    // Restoring a ledger does not restore its original watch ownership.
+    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    let other_cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let restored_projection = restored.project_with_workspace_cache(Arc::clone(&items), Some(&root_only), &other_cache);
+    assert!(textual_output_identity(&restored_projection.items[1]).unwrap().1.contains("stale_workspace_evidence"));
+
+    // A complete outer observation must not hide an unscoped nested result.
+    let mut unscoped = observation.clone();
+    unscoped.source_path_observations.clear();
+    state.code_mode_nested_evidence.insert("watched".into(), BTreeMap::from([
+        ("nested".into(), NestedWorkspaceEvidence { observation: unscoped.clone(), output: "before".into() }),
+    ]));
+    assert!(!state.can_use_root_only_workspace_identity(&items));
+    state.code_mode_nested_evidence.clear();
+    state.workspace_evidence.insert("watched".into(), unscoped);
+    assert!(!state.can_use_root_only_workspace_identity(&items), "legacy digest-only evidence");
+    let mut partial = observation.clone();
+    partial.source_dependencies.insert(SourceDependencyV1::new(&root.path().join("other.txt"), false));
+    state.workspace_evidence.insert("watched".into(), partial);
+    assert!(!state.can_use_root_only_workspace_identity(&items), "partial watch coverage");
+    state.workspace_evidence.insert("watched".into(), observation.clone());
+
+    // Recovery must consult the retained origin even without its call in history.
+    state.artifact_call_ids.insert("artifact".into(), "watched".into());
+    let recovered = [ResponseItem::FunctionCall {
+        id: None, name: "read_tool_output".into(), namespace: None,
+        arguments: r#"{"artifact_id":"artifact"}"#.into(), call_id: "recovery".into(),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    assert!(state.can_use_root_only_workspace_identity(&recovered));
+    state.workspace_evidence.remove("watched");
+    assert!(!state.can_use_root_only_workspace_identity(&recovered));
+    state.workspace_evidence.insert("watched".into(), observation);
+
+    // Git digests never override a changed or lost dependency watch.
+    cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
+    let changed = state.project_with_workspace_cache(Arc::clone(&items), Some(&root_only), &cache);
+    let (_, text) = textual_output_identity(&changed.items[1]).unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap()["workspace_evidence_freshness"], "changed");
+    cache.note_host_workspace_mutation();
+    let unknown = state.project_with_workspace_cache(items, Some(&root_only), &cache);
+    let (_, text) = textual_output_identity(&unknown.items[1]).unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap()["workspace_evidence_freshness"], "unknown");
+}
+
+#[test]
 fn salience_receipt_spends_space_on_all_small_diagnostic_groups() {
     for decisive in 0..9 {
         let output = (0..9).map(|index| {
@@ -264,10 +380,10 @@ fn verified10_read_status_recovers_all_snapshots_and_disjoint_ranges() {
         entry.tool_identity = "read_file".into();
         state.register(entry);
     }
-    let report = state.read_status(&[path.clone()], Some("local"), &[]);
+    let report = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
     assert_eq!(report["paths"][0]["next_snapshot_offset"], 8);
     let query = ReadStatusQuery { snapshot_offset:8, ..Default::default() };
-    let tail = state.read_status_page(&[path.clone()], Some("local"), &[], &query);
+    let tail = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
     assert_eq!(tail["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
     let snapshot = &tail["paths"][0]["snapshots"][0];
     assert_eq!(report["paths"][0]["snapshots"][0]["source_sha256"], "hash-8");
@@ -275,14 +391,14 @@ fn verified10_read_status_recovers_all_snapshots_and_disjoint_ranges() {
     assert_eq!(snapshot["next_range_offset"], 64);
     let query = ReadStatusQuery { snapshot_id: snapshot["snapshot_id"].as_str().map(str::to_string),
         range_offset:64, ..Default::default() };
-    let tail_ranges = state.read_status_page(&[path.clone()], Some("local"), &[], &query);
+    let tail_ranges = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
     let tail_snapshot = &tail_ranges["paths"][0]["snapshots"][0];
     assert_eq!(tail_snapshot["obtained_ranges"].as_array().unwrap().len(), 6);
     assert_eq!(tail_snapshot["unread_ranges"].as_array().unwrap().len(), 6);
     assert!(tail_snapshot["next_range_offset"].is_null());
     for version in 0..9 {
         let query = ReadStatusQuery { source_sha256:Some(format!("hash-{version}")), ..Default::default() };
-        let selected = state.read_status_page(&[path.clone()], Some("local"), &[], &query);
+        let selected = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &query);
         assert_eq!(selected["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
     }
 }
@@ -304,11 +420,11 @@ fn read_status_prioritizes_observation_recency_and_selects_historical_hashes() {
     }
     let persisted = serde_json::to_value(&state).unwrap();
     let mut state: ToolHistoryState = serde_json::from_value(persisted.clone()).unwrap();
-    let latest = state.read_status(&[path.clone()], Some("local"), &[]);
+    let latest = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
     assert_eq!(latest["paths"][0]["snapshots"][0]["source_sha256"], "hash-11");
     assert_eq!(latest["paths"][0]["snapshots"][0]["freshness"], "invalidated");
     assert_eq!(latest["paths"][0]["omitted_snapshots"], 4);
-    let selected = state.read_status_page(&[path.clone()], Some("local"), &[], &ReadStatusQuery {
+    let selected = state.read_status_page(std::slice::from_ref(&path), Some("local"), &[], &ReadStatusQuery {
         source_sha256: Some("hash-00".into()), ..Default::default()
     });
     assert_eq!(selected["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
@@ -413,7 +529,7 @@ fn verified10_nested_read_coverage_survives_compaction_without_payload() {
     ToolHistoryMutation::RegisterArtifactOrigin { artifact_id:"source-snapshot".into(), call_id:"nested".into(),
         bytes:8_000, sha256:"hash".into() }.apply(&mut state);
     ToolHistoryMutation::RegisterCodeModeNestedEvidence { parent_call_id:"cell".into(), call_id:"nested".into(), output:pin.to_string() }.apply(&mut state);
-    let before = state.read_status(&[path.clone()], Some("local"), &[]);
+    let before = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
     assert_eq!(before["paths"][0]["snapshots"][0]["coverage"], "full");
     state.retain_for_history(&[text_output("compact", pin.to_string())]);
     let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
@@ -551,7 +667,7 @@ fn read_status_keeps_environments_and_legacy_observations_separate() {
         entry.tool_identity = "read_file".into();
         state.register(entry);
     }
-    let report = state.read_status(&[path.clone()], None, &[]);
+    let report = state.read_status(std::slice::from_ref(&path), None, &[]);
     let snapshots = report["paths"][0]["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 4);
     assert!(snapshots.iter().all(|row| row["coverage"] == "partial" && row["obtained_bytes"] == 5));
@@ -709,6 +825,7 @@ async fn admission_read_only_proof_rejects_shell_writes_and_unknown_commands() {
 
 /// Deterministic projection/recovery workload, not a model-latency benchmark.
 #[tokio::test]
+#[expect(clippy::print_stderr, reason = "this comparison intentionally reports projection and recovery measurements")]
 async fn long_session_prompt_pressure_comparison() {
     use crate::tools::command_output_artifact::ToolOutputSelector;
 
@@ -2020,6 +2137,86 @@ fn workspace_projection_cache_rechecks_output_and_read_arguments() {
 }
 
 #[test]
+fn sampling_freshness_omits_duplicate_payloads_without_poisoning_replacement_cache() {
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let before = workspace_identity("before");
+    let after = workspace_identity("after");
+    let nested_text = "current nested source: α → β";
+    let payload = format!(
+        "permission denied\n{nested_text}\nNested command states (independent of script completion):\n[{{\"session_id\":7}}]"
+    );
+    for name in ["functions.exec", "read_tool_output"] {
+        let mut output = text_output("parent", payload.clone());
+        if let ResponseItem::FunctionCallOutput { output, .. } = &mut output {
+            output.success = Some(name == "read_tool_output");
+        }
+        let canonical: Arc<[ResponseItem]> = Arc::from([
+            named_function_call("parent", name), output.clone(),
+        ]);
+        let mut state = ToolHistoryState::default();
+        state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+            Some(before.clone()), &output,
+            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-before/source.rs"), false)]),
+        ).unwrap());
+        state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+            Some(after.clone()), &text_output("nested", nested_text.into()),
+            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-after/current.rs"), false)]),
+        ).unwrap());
+        assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+            parent_call_id: "parent".into(), call_id: "nested".into(), output: nested_text.into(),
+        }.apply(&mut state));
+
+        let full = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
+        let (_, text) = textual_output_identity(&full.items[1]).unwrap();
+        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(notice["historical_output"], payload);
+        assert_eq!(notice["current_nested_results"][0]["output"], nested_text);
+        assert_eq!(notice["nested_commands"][0]["session_id"], 7);
+        assert_eq!(notice["current_revision"], serde_json::to_value(&after).unwrap());
+        assert!(notice.get("historical_digest").is_some());
+
+        // Reuse the same cache across both representations in both directions.
+        // Sampling must keep bytes in the original tool message, not its notice.
+        for _ in 0..2 {
+            let sampled = state.project_sampling_with_workspace_cache(
+                Arc::clone(&canonical), Some(&after), &cache,
+            );
+            assert!(sampled.items.starts_with(&canonical));
+            assert_eq!(sampled.items.len(), canonical.len() + 1);
+            let compact = {
+                let cached = state.workspace_projection_cache.lock().unwrap();
+                serde_json::from_str::<serde_json::Value>(
+                    cached["parent"].replacement.as_ref().unwrap(),
+                ).unwrap()
+            };
+            for field in ["historical_output", "historical_digest", "current_revision", "nested_commands"] {
+                assert!(compact.get(field).is_none(), "sampling must not construct {field}");
+            }
+            let mut expected_compact = notice.clone();
+            for field in ["historical_output", "historical_digest", "current_revision", "nested_commands"] {
+                expected_compact.as_object_mut().unwrap().remove(field);
+            }
+            for nested in expected_compact["current_nested_results"].as_array_mut().unwrap() {
+                nested.as_object_mut().unwrap().remove("output");
+            }
+            assert_eq!(compact, expected_compact,
+                "only fields already discarded by the sampling consumer may differ");
+            assert_eq!(compact["valid_for_current_workspace"], false);
+            assert_eq!(compact["historical_authenticity"], "authenticated");
+            assert_eq!(compact["current_nested_results"][0]["call_id"], "nested");
+            assert_eq!(compact["current_nested_results"][0]["workspace_evidence_freshness"], "current");
+            assert!(compact["current_nested_results"][0].get("output").is_none());
+            if name == "functions.exec" {
+                assert!(compact.get("failure_applicability").is_some());
+            }
+            let restored = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
+            assert_eq!(restored.items, full.items,
+                "sampling's smaller cache entry must not erase replacement/recovery payloads");
+        }
+    }
+}
+
+#[test]
 fn workspace_evidence_is_stale_in_a_different_repository() {
     let call_id = "call-1";
     let output = text_output(call_id, "git status output".to_string());
@@ -2133,7 +2330,7 @@ fn non_git_workspace_evidence_is_historical_after_external_edit() {
     std::fs::write(&path, "externally changed").unwrap();
     let current = state.project_with_workspace_identity(Arc::clone(&canonical), None);
     let (_, text) = textual_output_identity(&current.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(notice["reason_code"], "workspace_identity_unavailable");
     assert_eq!(notice["historical_digest"], "plain directory output");
     assert_eq!(notice["valid_for_current_workspace"], false);
@@ -2439,7 +2636,7 @@ fn workspace_error_outputs_preserve_diagnostics_with_historical_applicability() 
         Some(&workspace_identity("changed")),
     );
     let (_, text) = textual_output_identity(&projection.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(notice["historical_output"], "permission denied");
     assert_eq!(notice["valid_for_current_workspace"], false);
     assert!(notice["failure_applicability"].as_str().unwrap().contains("current applicability is unverified"));
@@ -2641,14 +2838,14 @@ async fn watcher_proof_retains_dependency_scoped_evidence_after_external_disjoin
     let stale = state.project_with_workspace_cache(Arc::clone(&canonical), Some(&changed), cache.as_ref());
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
     assert!(stale_output.contains("stale_workspace_evidence"));
-    let notice: serde_json::Value = serde_json::from_str(&stale_output).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
     assert_eq!(notice["workspace_evidence_freshness"], "changed");
     assert_eq!(notice["qualification"], "Observed dependency change");
     assert_eq!(notice["historical_authenticity"], "authenticated");
     cache.note_host_workspace_mutation();
     let unknown = state.project_with_workspace_cache(canonical, Some(&changed), cache.as_ref());
     let (_, output) = textual_output_identity(&unknown.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
     assert_eq!(notice["workspace_evidence_freshness"], "unknown");
     assert_eq!(notice["qualification"], "Currentness unknown; no dependency change established");
     assert_eq!(notice["historical_authenticity"], "authenticated");
@@ -5476,7 +5673,7 @@ async fn tool_history_ledger_load_distinguishes_absence_corruption_and_version_m
             found,
             supported: LEDGER_VERSION,
             ..
-        } if u64::from(found) == u64::from(LEDGER_VERSION.saturating_add(1))
+        } if found == u64::from(LEDGER_VERSION.saturating_add(1))
     ));
 }
 
@@ -6144,7 +6341,7 @@ fn root_source_dependencies_overlap_descendants_without_matching_relative_paths(
     }]);
     let mut state = ToolHistoryState::default();
     state.register(record);
-    assert_eq!(state.read_status(&[path.clone()], None, &[])["paths"][0]["status"], "observed");
+    assert_eq!(state.read_status(std::slice::from_ref(&path), None, &[])["paths"][0]["status"], "observed");
     assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([path.clone()])), None));
     assert!(!state.candidates["root-read"].source_dependencies_current);
     assert_eq!(state.read_status(&[path], None, &[])["paths"][0]["snapshots"][0]["freshness"], "invalidated");
@@ -6844,7 +7041,7 @@ fn untracked_exposure_preserves_fresh_failures_and_late_artifact_registration() 
         ordinal: 1,
     };
     let old = text_output("seen", "old detail ".repeat(220));
-    assert!(state.mark_consumed(&[old.clone()], generation.clone()));
+    assert!(state.mark_consumed(std::slice::from_ref(&old), generation.clone()));
     let detail = format!(
         "{}\nwrite failed: permission denied",
         "diagnostic ".repeat(160)
@@ -6875,7 +7072,7 @@ fn budget_receipts_distinguish_observed_and_unread_untracked_outputs() {
     let mut state = ToolHistoryState::default();
     let old = text_output("seen", "previous observation ".repeat(2_000));
     state.mark_consumed(
-        &[old.clone()],
+        std::slice::from_ref(&old),
         ModelGenerationId {
             turn_id: "turn".into(),
             ordinal: 1,
@@ -7362,7 +7559,7 @@ fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
                 state.phase_checkpoint_receipts(&["reviewed".into()]).unwrap()),
         }], phase:None, internal_chat_message_metadata_passthrough:None,
     };
-    let items = vec![function_call("generic"), text_output("generic", generic),
+    let items = [function_call("generic"), text_output("generic", generic),
         function_call("reviewed"), text_output("reviewed", fact.clone()), checkpoint,
         function_call("failure"), text_output("failure", failure.clone())];
     let mut history = crate::context_manager::ContextManager::new();
@@ -7371,8 +7568,8 @@ fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
     let prompt = history.for_compaction_prompt_with_completed_tool_projection(
         &[codex_protocol::openai_models::InputModality::Text], None);
     let outputs = prompt.iter().filter_map(canonical_textual_output_identity).collect::<BTreeMap<_, _>>();
-    assert_eq!(outputs.get("reviewed").map(|text| text.as_ref()), Some(fact.as_str()));
-    assert_eq!(outputs.get("failure").map(|text| text.as_ref()), Some(failure.as_str()));
+    assert_eq!(outputs.get("reviewed").map(std::convert::AsRef::as_ref), Some(fact.as_str()));
+    assert_eq!(outputs.get("failure").map(std::convert::AsRef::as_ref), Some(failure.as_str()));
     let tokens = prompt.iter().filter_map(canonical_textual_output_identity)
         .map(|(_, text)| approx_token_count(&text)).sum::<usize>();
     assert!(tokens <= 3000, "compaction reuses its existing allowance: {tokens}");
@@ -7510,13 +7707,13 @@ fn continuity_read_status_scopes_keep_legacy_recursive_and_precedence() {
         entry.source_dependencies = scope.into_iter().collect();
         state.register(entry);
     }
-    let expected = state.read_status(&[path.clone()], Some("local"), &[]);
+    let expected = state.read_status(std::slice::from_ref(&path), Some("local"), &[]);
     assert_eq!(expected["paths"][0]["snapshots"].as_array().unwrap().len(), 3);
     let mut unrelated = candidate("elsewhere", "{invalid JSON".into());
     unrelated.tool_identity = "read_file".into();
     unrelated.source_dependencies = BTreeSet::from([SourceDependencyV1::new(&other, false)]);
     state.register(unrelated);
-    assert_eq!(state.read_status(&[path.clone()], Some("local"), &[]), expected);
+    assert_eq!(state.read_status(std::slice::from_ref(&path), Some("local"), &[]), expected);
     let output = text_output("exact", serde_json::json!({"path":other}).to_string());
     state.workspace_evidence.insert("exact".into(), WorkspaceEvidenceObservation::from_response_item(
         None, &output, BTreeSet::from([SourceDependencyV1::new(&other, false)])).unwrap());

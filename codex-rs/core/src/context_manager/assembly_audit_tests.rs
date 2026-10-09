@@ -59,7 +59,7 @@ fn assembly_audit_missing_outputs_preserve_order_and_are_idempotent() {
     let mut items = vec![call(0), call(1), call(2)];
     ensure_call_outputs_present(&mut items);
     assert_eq!(items.len(), 6);
-    for (index, pair) in items.chunks_exact(2).enumerate() {
+    for (index, pair) in items.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(pair[0], call(index));
         assert!(matches!(&pair[1], ResponseItem::FunctionCallOutput { call_id, output, .. }
             if call_id == &format!("call-{index}") && output == &FunctionCallOutputPayload::from_text(MISSING_TOOL_RESULT.to_string())));

@@ -258,8 +258,10 @@ where
     Ok(true)
 }
 
+type RegisteredToolCatalog = (u64, Arc<[codex_code_mode_protocol::ToolDefinition]>);
+
 struct HostState {
-    catalogs: Mutex<HashMap<SessionId, (u64, Arc<[codex_code_mode_protocol::ToolDefinition]>)>>,
+    catalogs: Mutex<HashMap<SessionId, RegisteredToolCatalog>>,
     sessions: Mutex<HashMap<SessionId, Arc<InProcessCodeModeSession>>>,
     seen_session_ids: Mutex<SeenSessionIds>,
     requests: Mutex<RequestRegistry>,

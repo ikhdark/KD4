@@ -398,9 +398,14 @@ function Get-Command($Name) {
 }
 """
             (root / "scripts" / "just-shell.py").write_text(
-                "import runpy, sys\n"
+                "import runpy, sys, os, json\n"
                 f"adapter = runpy.run_path({str(REPO_ROOT / 'scripts' / 'just-shell.py')!r})\n"
-                f"raise SystemExit(adapter['run_powershell']({prefix!r} + sys.argv[1], "
+                "def run_python(script, arguments):\n"
+                " with open(os.environ['RECIPE_CALLS'], 'a', encoding='utf-8') as log:\n"
+                "  log.write(json.dumps({'program':'python', 'args':[script, *arguments], 'cwd':os.getcwd()})+'\\n')\n"
+                " return int(os.environ['RECIPE_CHILD_EXIT']) if os.environ['RECIPE_FAIL_PROGRAM']=='python' else 0\n"
+                "if __name__ == '__main__':\n"
+                f" raise SystemExit(adapter['run_powershell']({prefix!r} + sys.argv[1], "
                 "sys.argv[2], sys.argv[3:]))\n",
                 encoding="utf-8",
             )
@@ -2186,6 +2191,7 @@ function Get-Command($Name) {
                 "core-tests",
                 "--warm-wait-seconds",
                 "0",
+                "--",
                 "just",
                 "_core-gate-reserved",
                 "app-server-command-exec",
@@ -2484,12 +2490,12 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
 
     def test_gate_recipes_forward_all_requested_gates(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        for recipe, command in (
-            ("core-gate", "-- just _core-gate-reserved @forwarded_args"),
-            ("_core-gate-reserved", "run-gate @forwarded_args"),
+        for recipe, forwarding, command in (
+            ("core-gate", '*sys.argv[1:]', '"--", "just", "_core-gate-reserved", *sys.argv[1:]'),
+            ("_core-gate-reserved", "$forwarded_args = @($args | Select-Object -Skip 1)", "run-gate @forwarded_args"),
         ):
             body = justfile.split(f"\n{recipe} +gates:\n", 1)[1].split("\n\n", 1)[0]
-            self.assertIn("$forwarded_args = @($args | Select-Object -Skip 1)", body)
+            self.assertIn(forwarding, body)
             self.assertIn(command, body)
 
     def test_high_contention_just_recipes_use_cargo_lanes_on_windows(self) -> None:
@@ -2555,13 +2561,13 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         # lane first: a build sharing codex-rs/target would otherwise invalidate
         # the whole graph between runs.
         for recipe, reserved in (
-            ("core-test target *args:", "just _core-test-reserved local"),
-            ("core-test-fast target *args:", "just _core-test-reserved fast"),
-            ("core-test-lane target *args:", "just _core-test-reserved fast"),
-            ("core-gate +gates:", "just _core-gate-reserved"),
+            ("core-test target *args:", '"just", "_core-test-reserved", "local"'),
+            ("core-test-fast target *args:", '"just", "_core-test-reserved", "fast"'),
+            ("core-test-lane target *args:", '"just", "_core-test-reserved", "fast"'),
+            ("core-gate +gates:", '"just", "_core-gate-reserved"'),
         ):
             body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
-            self.assertIn('rust_build_status.py" run-lane --lane', body, recipe)
+            self.assertIn('rust_build_status.py", ["run-lane", "--lane",', body, recipe)
             self.assertIn(reserved, body, recipe)
             self.assertNotIn('rust_test_runner.py" run-', body, recipe)
 
@@ -2573,11 +2579,11 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             "core-gate +gates:",
         ):
             body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
-            self.assertIn('--lane "{{ core_test_lane }}"', body, recipe)
+            self.assertIn('"--lane", "{{ core_test_lane }}"', body, recipe)
         lane_body = justfile.split("\ncore-test-lane target *args:\n", 1)[1].split(
             "\n\n", 1
         )[0]
-        self.assertIn('--lane "{{ target }}"', lane_body)
+        self.assertIn('"--lane", sys.argv[1]', lane_body)
 
         # Each reserved body must consume the reservation instead of falling
         # back to the default target directory.
@@ -2655,17 +2661,19 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         self.assertEqual(
             checked,
             {
-                "core-test": 2,
-                "core-test-fast": 2,
-                "core-test-lane": 2,
-                "core-test-small": 2,
-                # A `+`/`*` variadic occupies no slot of its own.
-                "core-gate": 1,
                 "_core-test-reserved": 3,
                 "_core-test-small-reserved": 2,
                 "_core-gate-reserved": 1,
             },
         )
+        # Python script recipes receive only declared positional arguments,
+        # without the shell recipe-name slot. Real dispatch tests cover values.
+        for recipe in ("core-test-fast target *args:", "core-test-lane target *args:",
+                       "core-test-small target *args:", "core-gate +gates:"):
+            body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
+            self.assertIn("*sys.argv[1:]", body)
+        body = justfile.split("\ncore-test target *args:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('sys.argv[1], "--no-fail-fast", *sys.argv[2:]', body)
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

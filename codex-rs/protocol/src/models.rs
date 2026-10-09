@@ -2472,6 +2472,11 @@ mod tests {
             "start the known expensive validation before independent patch review",
             "cannot mutate validation inputs, contend for its resources",
             "prepare the conditional final report in that cell",
+            "Reuse an available callable and current schema; do not rediscover them",
+            "the authorized next call's arguments and postconditions are already known",
+            "resolve and invoke it in the same cell; stop on ambiguity",
+            "check its accepted result and emit the prepared answer in the same delivery cell",
+            "A rejected update requires reconciliation, not a success report",
             "Unexpected results or unresolved semantic questions still require interpretation",
             "a passing check alone never proves task completion",
         ] {

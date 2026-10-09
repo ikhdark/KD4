@@ -420,7 +420,6 @@ mod tests {
     use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
-    use std::path::PathBuf;
     use std::sync::Barrier;
     use tempfile::TempDir;
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;

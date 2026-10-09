@@ -548,9 +548,11 @@ fn resolve_system_proxy_with(
 ) -> SystemProxyDecision {
     let cache_key = system_proxy_cache_key(request_url);
     {
+        // Entries are self-contained; interrupted eviction or insertion leaves the
+        // remaining decisions valid, so poisoning need not disable proxy routing.
         let mut cache = cache
             .lock()
-            .expect("system proxy cache lock should not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(decision) =
             cached_system_proxy_decision_from_cache(&mut cache, &cache_key, Instant::now())
         {
@@ -560,13 +562,13 @@ fn resolve_system_proxy_with(
 
     // Serialize misses, not cache hits. Keep ownership through publication, and recheck
     // after waiting so competing callers still share a single platform lookup.
+    // This lock carries no state: a panicking resolver can safely be retried.
     let _resolution = resolution_lock
         .lock()
-        .expect("system proxy resolution lock should not be poisoned");
-    let mut decisions = match cache.lock() {
-        Ok(cache) => cache,
-        Err(error) => panic!("system proxy cache lock should not be poisoned: {error}"),
-    };
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut decisions = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(decision) =
         cached_system_proxy_decision_from_cache(&mut decisions, &cache_key, Instant::now())
     {
@@ -579,7 +581,7 @@ fn resolve_system_proxy_with(
     let decision = resolve_platform_system_proxy(request_url, origin);
     let mut cache = cache
         .lock()
-        .expect("system proxy cache lock should not be poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     insert_system_proxy_cache_entry(&mut cache, &cache_key, decision.clone(), Instant::now());
     decision
 }
@@ -621,7 +623,7 @@ fn cached_system_proxy_decision(request_url: &str) -> Option<SystemProxyDecision
     // avoids turning a warm hit into a miss queued behind a slow platform lookup.
     let mut cache = cache
         .lock()
-        .expect("system proxy cache lock should not be poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     cached_system_proxy_decision_from_cache(&mut cache, &key, Instant::now())
 }
 
@@ -640,10 +642,11 @@ fn cached_system_proxy_decision_from_cache(
 
 fn cache_system_proxy_decision(request_url: &str, decision: SystemProxyDecision) {
     let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut cache) = cache.lock() {
-        let cache_key = system_proxy_cache_key(request_url);
-        insert_system_proxy_cache_entry(&mut cache, &cache_key, decision, Instant::now());
-    }
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache_key = system_proxy_cache_key(request_url);
+    insert_system_proxy_cache_entry(&mut cache, &cache_key, decision, Instant::now());
 }
 
 /// Primes one proxy decision for cross-crate integration tests.

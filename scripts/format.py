@@ -14,15 +14,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.process_owner import (
+from scripts.process_owner import (  # noqa: E402 - direct script bootstrap above
     OwnedThreadPoolExecutor as ThreadPoolExecutor,
 )
-from scripts.process_owner import run_finite
-from scripts.root_maintenance import (
+from scripts.process_owner import run_finite  # noqa: E402
+from scripts.root_maintenance import (  # noqa: E402
     python_lint_targets,
     resolved_changed_paths,
 )
-from scripts.tool_versions import RUSTFMT_TOOLCHAIN
+from scripts.tool_versions import RUSTFMT_TOOLCHAIN  # noqa: E402
 
 PRETTIER_TARGETS = (
     "*.json",

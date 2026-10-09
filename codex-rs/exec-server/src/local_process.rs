@@ -1320,7 +1320,7 @@ mod tests {
             panic!("finished process metric should be a u64 sum");
         };
         assert_eq!(
-            sum.data_points().map(|point| point.value()).collect::<Vec<_>>(),
+            sum.data_points().map(opentelemetry_sdk::metrics::data::SumDataPoint::value).collect::<Vec<_>>(),
             vec![1],
         );
         let results = sum

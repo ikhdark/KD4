@@ -193,7 +193,7 @@ impl ResponsesInput {
         Self { prefix: prefix.into(), shared, contiguous: std::sync::OnceLock::new() }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &ResponseItem> + DoubleEndedIterator {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ResponseItem> {
         self.prefix.iter().chain(self.shared.iter())
     }
 

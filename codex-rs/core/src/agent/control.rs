@@ -12,7 +12,7 @@ use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::emit_subagent_session_started;
-use crate::session_prefix::format_inter_agent_completion_message;
+use crate::session_prefix::inter_agent_completion_communication;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
@@ -880,21 +880,15 @@ impl AgentControl {
                     "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
                     binding.assignment_id, binding.attempt_id,
                 ));
-                let Some(message) = format_inter_agent_completion_message(
-                    parent_agent_path.clone(),
-                    child_agent_path.clone(),
+                let Some(communication) = inter_agent_completion_communication(
+                    parent_agent_path,
+                    child_agent_path,
+                    child_thread_id,
                     &status,
                     receipt.as_deref(),
                 ) else {
                     return;
                 };
-                let communication = InterAgentCommunication::new(
-                    child_agent_path,
-                    parent_agent_path,
-                    Vec::new(),
-                    message,
-                    /*trigger_turn*/ false,
-                );
                 let context =
                     AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
                 let _ = control

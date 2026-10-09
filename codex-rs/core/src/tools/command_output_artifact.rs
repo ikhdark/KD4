@@ -116,10 +116,7 @@ pub(crate) enum ToolOutputSelector {
 
 impl ToolOutputSelector {
     pub(crate) fn is_search(&self) -> bool {
-        match self {
-            Self::Search { .. } => true,
-            _ => false,
-        }
+        matches!(self, Self::Search { .. })
     }
 }
 
@@ -2553,6 +2550,10 @@ fn selector_serialized_cost(value: &ToolOutputSelectorResult) -> SelectorPartCos
 }
 
 impl SelectorResponseCost {
+    #[expect(
+        clippy::expect_used,
+        reason = "empty-result envelopes serialize only strings, integer ranges, booleans and a fixed status enum to an in-memory string; fallback costs could admit oversized output"
+    )]
     fn new(metadata: &LogicalArtifactMetadata, previous: &[ToolOutputSelectorResult]) -> Self {
         let mut envelope = ReadToolOutputResult {
             artifact_id: metadata.artifact_id.clone(),
@@ -3656,6 +3657,7 @@ fn create_new_protection_marker(marker: &Path, contents: &[u8]) -> std::io::Resu
 
 
 /// Verifies an exact artifact without creating a retention protection marker.
+#[cfg(test)]
 pub(crate) async fn verify_tool_history_artifact(
     codex_home: &Path,
     thread_id: &str,
@@ -4008,6 +4010,7 @@ pub(crate) async fn reconcile_active_tool_history_artifact_protection(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn append_raw_output_artifact(
     artifact: &RawOutputArtifact,
     output: &[u8],
@@ -7460,13 +7463,13 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
                     thread_bytes: index.thread_totals(&directory).0,
                     global_bytes: index.unprotected_bytes,
                 }),
-                RetentionRootMode::Dirty | RetentionRootMode::Reconciling { .. } => {
-                    Some(RetentionUsage {
-                        thread_bytes: u64::MAX,
-                        global_bytes: u64::MAX,
-                    })
-                }
-                RetentionRootMode::ScanOnly { .. } => None,
+                // An unavailable index is not evidence of an exhausted quota.
+                // The caller holds the retention permit; scan outside the
+                // registry mutex, just as for scan-only roots. Real scan errors
+                // still fail closed below.
+                RetentionRootMode::Dirty
+                | RetentionRootMode::Reconciling { .. }
+                | RetentionRootMode::ScanOnly { .. } => None,
             })
     };
     if let Some(usage) = indexed_usage {

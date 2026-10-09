@@ -195,6 +195,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn available_catalog_preserves_host_identity_and_hides_prompt_hidden_skills() {
+        use codex_core_skills::SKILLS_INTRO_WITH_ABSOLUTE_PATHS;
+        use codex_extension_api::ContextualUserFragment;
+        use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG;
+        use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG;
+
+        let entry = |name: &str| {
+            SkillCatalogEntry::new(
+                crate::catalog::SkillPackageId(format!("host/{name}/SKILL.md")),
+                crate::catalog::SkillAuthority::new(SkillSourceKind::Host, "host"),
+                name,
+                "Demo skill.",
+                crate::catalog::SkillResourceId::new(format!("host/{name}/SKILL.md")),
+            )
+        };
+        let catalog = SkillCatalog {
+            entries: vec![entry("demo"), entry("hidden-skill").hidden_from_prompt()],
+            ..Default::default()
+        };
+        assert_eq!(
+            available_skills_fragment(&catalog).expect("catalog").render(),
+            format!(
+                "{EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills\n{SKILLS_INTRO_WITH_ABSOLUTE_PATHS}\n### Available skills\n- demo: Demo skill. (file: host/demo/SKILL.md)\n{EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG}"
+            )
+        );
+    }
+
+    #[test]
     fn provider_catalog_scopes_host_discovery_and_preserves_its_own_route() {
         use codex_extension_api::ContextualUserFragment;
 

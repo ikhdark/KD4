@@ -204,10 +204,11 @@ async fn slow_snapshot_io_does_not_hold_readers_or_hide_late_publication() {
                 event, None, state).await }
         });
         tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
-        let values = tokio::time::timeout(Duration::from_millis(100), runtime.inner.stored_values.lock()).await
-            .expect("filesystem must not lock shared values");
-        assert_eq!(values.contains_key("key"), publishing);
-        drop(values);
+        {
+            let values = tokio::time::timeout(Duration::from_millis(100), runtime.inner.stored_values.lock()).await
+                .expect("filesystem must not lock shared values");
+            assert_eq!(values.contains_key("key"), publishing);
+        }
         let termination = state.request_termination();
         let outcome = tokio::time::timeout(Duration::from_secs(2), commit).await.unwrap().unwrap();
         if publishing {
@@ -224,10 +225,12 @@ async fn slow_snapshot_io_does_not_hold_readers_or_hide_late_publication() {
         }
         release.send(()).unwrap();
         // The owned transaction retains this gate until all late I/O has settled.
-        let _settled = runtime.inner.commit_gate.lock().await;
-        let disk: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(disk["values"].get("key").is_some(), publishing,
-            "rejected staging cannot publish late; admitted publication remains real");
+        {
+            let _settled = runtime.inner.commit_gate.lock().await;
+            let disk: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(disk["values"].get("key").is_some(), publishing,
+                "rejected staging cannot publish late; admitted publication remains real");
+        }
         if publishing {
             let confirmed = runtime.begin_observe(&CellId::new("1"), ObserveMode::Decision)
                 .await.unwrap().event().await.unwrap();
@@ -573,10 +576,11 @@ async fn concurrent_store_conflict_preserves_winner_and_rejects_entire_write_set
             None,
             state,
         ).await;
-        let values = runtime.inner.stored_values.lock().await;
-        assert_eq!(values["key"].value.as_ref(), &JsonValue::from(winner));
-        assert!(!values.contains_key("other"));
-        drop(values);
+        {
+            let values = runtime.inner.stored_values.lock().await;
+            assert_eq!(values["key"].value.as_ref(), &JsonValue::from(winner));
+            assert!(!values.contains_key("other"));
+        }
         runtime.shutdown().await.unwrap();
     }
     // A cell can write a disjoint key while depending on a stale read, including
@@ -614,10 +618,11 @@ async fn concurrent_store_conflict_preserves_winner_and_rejects_entire_write_set
         ]));
         assert_eq!(receipt["external_effects_rolled_back"], false);
         assert_eq!(receipt["automatic_replay_allowed"], false);
-        let values = runtime.inner.stored_values.lock().await;
-        assert_eq!(values["input"].value.as_ref(), &JsonValue::from(1));
-        assert!(!values.contains_key("derived"), "stale reads cannot authorize derived writes");
-        drop(values);
+        {
+            let values = runtime.inner.stored_values.lock().await;
+            assert_eq!(values["input"].value.as_ref(), &JsonValue::from(1));
+            assert!(!values.contains_key("derived"), "stale reads cannot authorize derived writes");
+        }
         runtime.shutdown().await.unwrap();
     }
 }
@@ -749,12 +754,13 @@ async fn late_persistence_opt_in_runs_cell_without_replacing_live_state() {
         assert!(matches!(&content_items[1], OutputItem::Text { text } if text == "executed"));
         assert!(runtime.inner.durable_state.get().is_none());
         assert_eq!(path.exists(), !active_cell);
-        let values = runtime.inner.stored_values.lock().await;
-        assert_eq!(values["ran"].value.as_ref(), &JsonValue::Bool(true));
-        if !active_cell {
-            assert_eq!(values["existing"].value.as_ref(), &JsonValue::from("kept"));
+        {
+            let values = runtime.inner.stored_values.lock().await;
+            assert_eq!(values["ran"].value.as_ref(), &JsonValue::Bool(true));
+            if !active_cell {
+                assert_eq!(values["existing"].value.as_ref(), &JsonValue::from("kept"));
+            }
         }
-        drop(values);
         drop(permit);
         runtime.shutdown().await.unwrap();
     }

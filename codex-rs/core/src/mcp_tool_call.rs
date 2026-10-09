@@ -595,8 +595,6 @@ async fn execute_approved_mcp_tool_call(
     let execution = async {
         async {
             let rewritten_arguments = rewrite?;
-            let request_meta =
-                build_mcp_tool_call_request_meta(turn_context, server, call_id, metadata);
             execute_mcp_tool_call(
                 sess,
                 step_context,
@@ -604,7 +602,6 @@ async fn execute_approved_mcp_tool_call(
                 &invocation,
                 rewritten_arguments,
                 metadata,
-                request_meta,
                 dispatched,
             )
             .await
@@ -762,10 +759,11 @@ async fn execute_mcp_tool_call(
     invocation: &McpInvocation,
     rewritten_arguments: crate::mcp_openai_file::PreparedOpenAiArguments,
     metadata: Option<&McpToolApprovalMetadata>,
-    request_meta: Option<JsonValue>,
     dispatched: &std::sync::atomic::AtomicBool,
 ) -> Result<ExecutedMcpToolCall, String> {
     let turn_context = step_context.turn.as_ref();
+    let request_meta =
+        build_mcp_tool_call_request_meta(turn_context, &invocation.server, call_id, metadata);
     let manager = step_context.mcp.manager();
     let request_meta = with_tool_call_thread_id_meta(request_meta, &sess.thread_id.to_string());
     let request_meta = augment_mcp_tool_request_meta_with_sandbox_state(
@@ -1263,7 +1261,6 @@ async fn custom_mcp_tool_approval_mode(
 }
 
 #[cfg(test)]
-
 fn configured_mcp_tool_approval_mode(
     servers: &HashMap<String, codex_config::types::McpServerConfig>,
     server: &str,
@@ -1358,6 +1355,10 @@ impl McpToolApprovalKey {
     // Keep durable consent in the existing per-tool policy map, under an exact
     // authority-bound key instead of changing the tool's unqualified policy.
     fn policy_key(&self) -> String {
+        #[expect(
+            clippy::expect_used,
+            reason = "Approval keys derive Serialize over String and Option<String>; preserve durable consent hash bytes"
+        )]
         let bytes = serde_json::to_vec(self).expect("approval keys are serializable");
         format!("__codex_approval_{:x}", sha2::Sha256::digest(bytes))
     }
@@ -1606,8 +1607,8 @@ async fn mcp_tool_metadata_from_tool_info(
         .cloned();
 
     let auth = sess.services.auth_manager.auth().await;
-    let account = auth.as_ref().and_then(|auth| auth.get_account_id());
-    let user = auth.as_ref().and_then(|auth| auth.get_chatgpt_user_id());
+    let account = auth.as_ref().and_then(codex_login::CodexAuth::get_account_id);
+    let user = auth.as_ref().and_then(codex_login::CodexAuth::get_chatgpt_user_id);
     let authority = manager.approval_authority(server).map(|(provider, persistent)| {
         let contract = serde_json::json!({
             "provider": provider,

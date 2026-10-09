@@ -4,12 +4,14 @@ import asyncio
 import queue
 import threading
 from concurrent.futures import Future
+from contextlib import nullcontext
 from typing import AsyncIterator, Callable, ParamSpec, TypeVar
 
 from pydantic import BaseModel
 
 from ._goal import _GoalOperationState
 from .client import CodexClient, CodexConfig
+from .errors import CodexError
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
@@ -63,6 +65,8 @@ class AsyncCodexClient:
     def __init__(self, config: CodexConfig | None = None) -> None:
         """Create the wrapped sync client that owns the transport process."""
         self._sync = CodexClient(config=config)
+        self._worker_slots = threading.BoundedSemaphore(self._sync.config.max_in_flight_requests)
+        self._close_slot = threading.BoundedSemaphore(1)
 
     @property
     def process_epoch(self) -> int:
@@ -86,35 +90,94 @@ class AsyncCodexClient:
         **kwargs: ParamsT.kwargs,
     ) -> ReturnT:
         """Run a blocking sync-client operation without blocking the event loop."""
+        return await self._run_sync(lambda: fn(*args, **kwargs))
+
+    async def _run_sync(
+        self,
+        fn: Callable[[], ReturnT],
+        on_cancel: Callable[[ReturnT], None] | None = None,
+        *,
+        shutdown: bool = False,
+    ) -> ReturnT:
+        slots = self._close_slot if shutdown else self._worker_slots
+        if not slots.acquire(blocking=False):
+            raise CodexError("async worker limit exceeded")
         operation: Future[ReturnT] = Future()
+        exited: Future[None] = Future()
+        cancelled = threading.Event()
+        delivered = threading.Event()
 
         def run_operation() -> None:
             try:
-                operation.set_result(fn(*args, **kwargs))
+                with nullcontext() if shutdown else self._sync._operation(cancelled):
+                    result = fn()
+                operation.set_result(result)
+                if on_cancel is not None:
+                    # The same admitted worker owns late-result cleanup. No
+                    # unbounded cleanup threads, even if cancellation races delivery.
+                    if not delivered.wait(self._sync.config.operation_timeout_s):
+                        cancelled.set()
+                    if cancelled.is_set():
+                        on_cancel(result)
             except BaseException as exc:
-                operation.set_exception(exc)
+                if not operation.done():
+                    operation.set_exception(exc)
+            finally:
+                slots.release()
+                exited.set_result(None)
 
-        threading.Thread(
-            target=run_operation,
-            name="codex-async-client-rpc",
-            daemon=True,
-        ).start()
         try:
-            return await asyncio.shield(asyncio.wrap_future(operation))
-        except asyncio.CancelledError:
-            # The daemon worker is independent from the event loop's default
-            # executor, so asyncio.run() shutdown cannot wait for an unbounded
-            # RPC after its caller is cancelled.
-            operation.add_done_callback(_consume_background_future_result)
+            threading.Thread(
+                target=run_operation,
+                name="codex-async-client-rpc",
+                daemon=True,
+            ).start()
+        except BaseException:
+            slots.release()
             raise
+        wrapped = asyncio.wrap_future(operation)
+        worker_exited = asyncio.wrap_future(exited)
+        try:
+            timeout = (
+                self._sync.config.shutdown_timeout_s + 1
+                if shutdown
+                else self._sync.config.operation_timeout_s
+            )
+            deadline = asyncio.get_running_loop().time() + timeout
+            result = await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            cancelled.set()
+            # SDK pipe/response waits observe this event and abort the captured
+            # transport generation. Arbitrary caller callbacks cannot be forcibly
+            # interrupted, but continue to occupy their bounded worker slot.
+            operation.add_done_callback(_consume_background_future_result)
+            wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            raise
+        else:
+            # Delivery has committed: return the successful handle rather than
+            # losing it to cancellation during the worker's admission handoff.
+            delivered.set()
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0 or cancelled.is_set():
+                    cancelled.set()
+                    raise TimeoutError("operation delivery deadline exceeded")
+                try:
+                    await asyncio.wait_for(asyncio.shield(worker_exited), remaining)
+                    break
+                except asyncio.CancelledError:
+                    continue
+            return result
+        finally:
+            delivered.set()
 
     async def start(self) -> None:
         """Start the wrapped sync client in a worker thread."""
-        await self._call_sync(self._sync.start)
+        await self._run_sync(self._sync.start, lambda _: self._sync.close())
 
     async def close(self) -> None:
         """Close the wrapped sync client in a worker thread."""
-        await self._call_sync(self._sync.close)
+        await self._run_sync(self._sync.close, shutdown=True)
 
     async def initialize(self) -> InitializeResponse:
         """Initialize the Codex session."""
@@ -262,47 +325,19 @@ class AsyncCodexClient:
         objective: str,
     ) -> tuple[_GoalOperationState, str]:
         """Start a logical goal through the wrapped sync client."""
-        operation: Future[tuple[_GoalOperationState, str]] = Future()
 
-        def start_operation() -> None:
+        def cleanup(result: tuple[_GoalOperationState, str]) -> None:
+            state, _ = result
             try:
-                operation.set_result(self._sync.start_goal_operation(thread_id, objective))
-            except BaseException as exc:
-                operation.set_exception(exc)
+                self._sync.cancel_goal_operation(state)
+            finally:
+                state.finish()
+                self._sync.unregister_goal_operation(state)
 
-        worker = threading.Thread(
-            target=start_operation,
-            name="codex-goal-start",
-            daemon=True,
+        return await self._run_sync(
+            lambda: self._sync.start_goal_operation(thread_id, objective),
+            cleanup,
         )
-        worker.start()
-        try:
-            return await asyncio.shield(asyncio.wrap_future(operation))
-        except asyncio.CancelledError:
-
-            def cleanup_cancelled_start(
-                completed: Future[tuple[_GoalOperationState, str]],
-            ) -> None:
-                try:
-                    state, _ = completed.result()
-                except BaseException:
-                    return
-
-                def stop_cancelled_goal() -> None:
-                    try:
-                        self._sync.cancel_goal_operation(state)
-                    finally:
-                        state.finish()
-                        self._sync.unregister_goal_operation(state)
-
-                threading.Thread(
-                    target=stop_cancelled_goal,
-                    name="codex-goal-start-cleanup",
-                    daemon=True,
-                ).start()
-
-            operation.add_done_callback(cleanup_cancelled_start)
-            raise
 
     async def turn_start(
         self,
@@ -311,47 +346,19 @@ class AsyncCodexClient:
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> TurnStartResponse:
         """Start a turn using the wrapped sync client."""
-        operation: Future[TurnStartResponse] = Future()
 
-        def start_turn() -> None:
+        def cleanup(started: TurnStartResponse) -> None:
             try:
-                operation.set_result(self._sync.turn_start(thread_id, input_items, params))
-            except BaseException as exc:
-                operation.set_exception(exc)
+                self._sync.turn_interrupt(thread_id, started.turn.id)
+            except BaseException:
+                pass
+            finally:
+                self._sync.unregister_turn_notifications(started.turn.id)
 
-        threading.Thread(
-            target=start_turn,
-            name="codex-turn-start",
-            daemon=True,
-        ).start()
-        try:
-            return await asyncio.shield(asyncio.wrap_future(operation))
-        except asyncio.CancelledError:
-
-            def cleanup_cancelled_start(
-                completed: Future[TurnStartResponse],
-            ) -> None:
-                try:
-                    started = completed.result()
-                except BaseException:
-                    return
-
-                def stop_cancelled_turn() -> None:
-                    try:
-                        self._sync.turn_interrupt(thread_id, started.turn.id)
-                    except BaseException:
-                        pass
-                    finally:
-                        self._sync.unregister_turn_notifications(started.turn.id)
-
-                threading.Thread(
-                    target=stop_cancelled_turn,
-                    name="codex-turn-start-cleanup",
-                    daemon=True,
-                ).start()
-
-            operation.add_done_callback(cleanup_cancelled_start)
-            raise
+        return await self._run_sync(
+            lambda: self._sync.turn_start(thread_id, input_items, params),
+            cleanup,
+        )
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> TurnInterruptResponse:
         """Interrupt a turn using the wrapped sync client."""
@@ -396,37 +403,35 @@ class AsyncCodexClient:
             max_delay_s=max_delay_s,
         )
 
-    async def next_notification(self) -> Notification:
-        """Wait for the next global notification without blocking the event loop."""
+    async def _poll_notification(self, receive: Callable[[], Notification]) -> Notification:
+        deadline = asyncio.get_running_loop().time() + self._sync.config.operation_timeout_s
         while True:
             try:
-                return self._sync.next_notification(0.0)
+                return receive()
             except queue.Empty:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("notification wait deadline exceeded") from None
                 await asyncio.sleep(0.01)
+
+    async def next_notification(self) -> Notification:
+        """Wait for a global notification within the configured operation budget."""
+        return await self._poll_notification(lambda: self._sync.next_notification(0.0))
 
     async def next_login_notification(self, login_id: str) -> Notification:
         """Wait for the next notification routed to one login attempt."""
-        while True:
-            try:
-                return self._sync.next_login_notification(login_id, 0.0)
-            except queue.Empty:
-                await asyncio.sleep(0.01)
+        return await self._poll_notification(
+            lambda: self._sync.next_login_notification(login_id, 0.0)
+        )
 
     async def next_turn_notification(self, turn_id: str) -> Notification:
         """Wait for the next notification routed to one turn."""
-        while True:
-            try:
-                return self._sync.next_turn_notification(turn_id, 0.0)
-            except queue.Empty:
-                await asyncio.sleep(0.01)
+        return await self._poll_notification(
+            lambda: self._sync.next_turn_notification(turn_id, 0.0)
+        )
 
     async def next_goal_notification(self, state: _GoalOperationState) -> Notification:
         """Wait for the next notification in a logical goal turn."""
-        while True:
-            try:
-                return self._sync.next_goal_notification(state, 0.0)
-            except queue.Empty:
-                await asyncio.sleep(0.01)
+        return await self._poll_notification(lambda: self._sync.next_goal_notification(state, 0.0))
 
     async def wait_for_login_completed(
         self,

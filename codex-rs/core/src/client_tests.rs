@@ -740,6 +740,8 @@ async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
         while let Some(event) = stream.next().await {
             event.unwrap();
         }
+        assert!(client.state.cached_websocket_transport.lock().unwrap()
+            .fallback.last_transient_failure.is_none());
         assert_eq!(session.websocket_session.connection_reused(), turn == 1);
         drop(session);
         session = client.new_session();
@@ -753,6 +755,57 @@ async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
         assert!(body["input"].to_string().contains("history including HTTP work"));
     }
     server.shutdown().await;
+    // Another service restart after successful requests starts a new cooldown,
+    // rather than permanently disabling WebSockets for this process.
+    tokio::time::pause();
+    session.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
+    assert!(session.try_switch_fallback_transport_after_error(&telemetry, &error));
+    assert!(!client.responses_websocket_enabled());
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(client.responses_websocket_enabled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn websocket_fallback_only_current_completed_requests_clear_failures() {
+    for scenario in ["completed", "partial", "error", "http", "stale", "disabled"] {
+        let client = websocket_test_model_client();
+        let telemetry = test_session_telemetry();
+        client.activate_http_fallback(&telemetry, true);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let epoch = client.state.cached_websocket_transport.lock().unwrap().epoch;
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let (mut stream, _) = super::map_response_stream(
+            codex_api::ResponseStream { rx_event: receiver, upstream_request_id: None },
+            telemetry.clone(), InferenceTraceAttempt::disabled().into(), test_model_provider(),
+            None, None,
+            (scenario != "http").then(|| (client.clone(), epoch)),
+        );
+        sender.send(Ok(ResponseEvent::Created)).await.unwrap();
+        stream.next().await.unwrap().unwrap();
+        assert!(client.state.cached_websocket_transport.lock().unwrap()
+            .fallback.last_transient_failure.is_some());
+        if scenario == "stale" {
+            // A newer recoverable failure outside the window must retain its cooldown.
+            tokio::time::advance(Duration::from_secs(30 * 60)).await;
+            client.activate_http_fallback(&telemetry, true);
+        } else if scenario == "disabled" {
+            client.force_http_fallback(&telemetry);
+        }
+        if scenario == "error" {
+            sender.send(Err(ApiError::Stream("closed".into()))).await.unwrap();
+        } else if scenario != "partial" {
+            sender.send(Ok(ResponseEvent::Completed {
+                response_id: "done".into(), token_usage: None, end_turn: Some(true),
+            })).await.unwrap();
+        }
+        drop(sender);
+        let terminal = stream.next().await.unwrap();
+        assert_eq!(terminal.is_ok(), !matches!(scenario, "partial" | "error"));
+        assert!(stream.next().await.is_none());
+        let cache = client.state.cached_websocket_transport.lock().unwrap();
+        assert_eq!(cache.fallback.last_transient_failure.is_none(), scenario == "completed");
+        assert_eq!(cache.fallback.disabled, scenario == "disabled");
+    }
 }
 
 #[test]
@@ -5275,7 +5328,7 @@ fn websocket_history_lookup_preserves_global_substitution_indices() {
     );
     let response = LastResponse {
         response_id: "response".into(),
-        items_added: vec![output.clone(), history_test_item("end", None)],
+        items_added: vec![output, history_test_item("end", None)],
     };
     for previous in [None, Some(request)] {
         session.websocket_session.last_request = previous;
@@ -5371,7 +5424,7 @@ async fn inference_stream_preserves_delta_and_large_item_contents_with_or_withou
         } else {
             Some(history)
         };
-        for index in 0..3 {
+        for (index, expected_item) in items.iter().enumerate() {
             let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
                 .await
                 .unwrap()
@@ -5404,7 +5457,7 @@ async fn inference_stream_preserves_delta_and_large_item_contents_with_or_withou
                     assert_eq!(delta, format!("arguments-{index}"));
                 }
                 ("large_items" | "discarded_history", ResponseEvent::OutputItemDone(item)) => {
-                    assert_eq!(item, items[index])
+                    assert_eq!(&item, expected_item)
                 }
                 (_, event) => panic!("unexpected {scenario} event: {event:?}"),
             }
@@ -5444,7 +5497,7 @@ async fn inference_stream_preserves_independent_first_output_milestones() {
     let (mut stream, history) = super::map_response_stream(
         codex_api::ResponseStream { rx_event: receiver, upstream_request_id: None },
         test_session_telemetry(), InferenceTraceAttempt::disabled().into(), test_model_provider(),
-        Some(attempt.into()), None,
+        Some(attempt.into()), None, None,
     );
     // The HTTP path drops history immediately; this must not affect delivery.
     drop(history);
@@ -5487,6 +5540,10 @@ async fn inference_stream_preserves_independent_first_output_milestones() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "holding the timing lock proves repeated deltas do not reacquire it; the guard is released before failure assertions and teardown"
+)]
 async fn inference_stream_repeated_deltas_do_not_lock_first_event_timing() {
     let clock = ModelAttemptClock::new();
     clock.mark_dispatch_ready();
@@ -5501,7 +5558,7 @@ async fn inference_stream_repeated_deltas_do_not_lock_first_event_timing() {
     let (mut stream, _) = super::map_response_stream(
         codex_api::ResponseStream { rx_event: receiver, upstream_request_id: None },
         test_session_telemetry(), InferenceTraceAttempt::disabled().into(), test_model_provider(),
-        Some(attempt.into()), None,
+        Some(attempt.into()), None, None,
     );
     sender.send(Ok(ResponseEvent::OutputTextDelta("first".into()))).await.unwrap();
     stream.next().await.unwrap().unwrap();

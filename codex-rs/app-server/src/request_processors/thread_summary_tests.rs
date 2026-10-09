@@ -73,7 +73,7 @@ fn started_notification_preserves_response_history_without_copying_it() -> Resul
 
 #[test]
 fn rollout_preview_prefers_plain_user_messages() -> Result<()> {
-    let head = vec![
+    let head = [
         json!({
             "type": "message",
             "role": "user",

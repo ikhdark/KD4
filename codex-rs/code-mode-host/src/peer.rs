@@ -184,15 +184,15 @@ impl HostPeer {
             id,
             result: WireResult::from_result(result),
         };
-        if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            if let Err(error) = self.send(HostToClient::Response {
+        if let Err(PeerSendError::Payload(err)) = self.send(message)
+            && let Err(error) = self.send(HostToClient::Response {
                 id,
                 result: WireResult::Err {
                     message: format!("code-mode host response exceeds the IPC frame limit: {err}"),
                 },
-            }) {
-                self.fail(format!("cannot deliver code-mode response failure: {error}"));
-            }
+            })
+        {
+            self.fail(format!("cannot deliver code-mode response failure: {error}"));
         }
     }
 
@@ -205,17 +205,17 @@ impl HostPeer {
             id,
             result: WireResult::from_result(result),
         };
-        if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            if let Err(error) = self.send(HostToClient::InitialResponse {
+        if let Err(PeerSendError::Payload(err)) = self.send(message)
+            && let Err(error) = self.send(HostToClient::InitialResponse {
                 id,
                 result: WireResult::Err {
                     message: format!(
                         "code-mode initial response exceeds the IPC frame limit: {err}"
                     ),
                 },
-            }) {
-                self.fail(format!("cannot deliver code-mode initial response failure: {error}"));
-            }
+            })
+        {
+            self.fail(format!("cannot deliver code-mode initial response failure: {error}"));
         }
     }
 

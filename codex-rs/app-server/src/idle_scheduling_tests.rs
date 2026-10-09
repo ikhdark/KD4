@@ -74,6 +74,7 @@ async fn cancelled_writer_wakes_compatible_reader_without_another_enqueue() {
 
 #[tokio::test]
 #[ignore = "narrow wall-clock scheduling benchmark"]
+#[expect(clippy::print_stderr, reason = "this scheduling benchmark emits machine-readable cancellation latency measurements")]
 async fn cancelled_writer_wall_clock_benchmark() {
     let mut samples = Vec::new();
     for round in 0..8 {

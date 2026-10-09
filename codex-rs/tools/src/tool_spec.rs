@@ -54,6 +54,10 @@ pub enum ToolSpec {
 impl ToolSpec {
     /// Complete callable contract, distinct from the Responses wire schema.
     pub fn callable_contract(&self) -> Value {
+        #[expect(
+            clippy::expect_used,
+            reason = "ToolSpec and its schema serializers contain only JSON values and string-keyed maps"
+        )]
         let mut value = serde_json::to_value(self).expect("tool specs serialize");
         match self {
             Self::Function(tool) => {
@@ -62,9 +66,12 @@ impl ToolSpec {
                 }
             }
             Self::Namespace(namespace) => {
-                for (child, tool) in value["tools"].as_array_mut().expect("namespace tools")
-                    .iter_mut().zip(&namespace.tools)
-                {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "The derived ResponsesApiNamespace serializer always emits its Vec tools field as an array"
+                )]
+                let children = value["tools"].as_array_mut().expect("namespace tools");
+                for (child, tool) in children.iter_mut().zip(&namespace.tools) {
                     let crate::ResponsesApiNamespaceTool::Function(tool) = tool;
                     if let Some(output) = &tool.output_schema {
                         child["output_schema"] = output.to_value();

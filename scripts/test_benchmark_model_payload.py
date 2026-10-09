@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest import mock
 
-from scripts.benchmark_model_payload import fixture, receive, summarize
+from scripts.benchmark_model_payload import fixture, paired_summary, receive, summarize
 
 
 class FakeSocket:
@@ -80,6 +80,55 @@ class PayloadBenchmarkTests(unittest.TestCase):
                 "post_first_text_ms": 28, "input_tokens": 40, "cached_tokens": 0,
             })
         self.assertEqual(summarize(rows), expected)
+
+    def test_summary_separates_returned_service_tiers(self):
+        base = {"scenario": "inherit", "variant": "full", "phase": "warm", "correct": True,
+                "wire_bytes": 1, "serialization_ms": 1, "send_ms": 1, "ttft_ms": 2,
+                "wall_ms": 3, "post_first_text_ms": 1, "input_tokens": 1, "cached_tokens": 0,
+                "returned_model": "same", "returned_effort": "high"}
+        rows = summarize([{**base, "returned_service_tier": "default"},
+                          {**base, "returned_service_tier": "priority", "ttft_ms": 100}])
+        self.assertEqual([(r["returned_service_tier"], r["n"], r["ttft_ms"]) for r in rows],
+                         [("default", 1, 2), ("priority", 1, 100)])
+
+    def test_paired_latency_uses_pair_deltas_and_includes_connection_setup(self):
+        rows = []
+        # Pair deltas [10, 10, -99] have median 10, but subtracting the
+        # two group medians would report 11 - 100 = -89 (wrong direction).
+        for pair, (before, after) in enumerate(((0, 10), (100, 110), (110, 11))):
+            for variant, value, setup in (("full", before, 20), ("delta", after, 5)):
+                rows.append({"scenario": "inherit", "phase": "cold", "pair": pair,
+                             "variant": variant, "ttft_ms": value, "wall_ms": value + 30,
+                             "connection_setup_ms": setup, "correct": True,
+                             "returned_model": "same", "returned_effort": "high",
+                             "returned_service_tier": "default"})
+        report = paired_summary(rows)
+        self.assertEqual(report["excluded_pairs"], {})
+        metrics = report["groups"][0]["metrics"]
+        self.assertEqual(metrics["ttft_ms"], {"n": 3, "median_delta_ms": 10,
+                         "min_delta_ms": -99, "max_delta_ms": 10, "candidate_faster_pairs": 1})
+        self.assertEqual(metrics["wall_ms"], metrics["ttft_ms"])
+        self.assertEqual(metrics["setup_inclusive_wall_ms"]["median_delta_ms"], -5)
+        self.assertEqual(metrics["setup_inclusive_ttft_ms"]["candidate_faster_pairs"], 3)
+
+    def test_paired_latency_rejects_invalid_pairs_without_losing_valid_siblings(self):
+        before = {"scenario": "deduplicate", "phase": "warm", "pair": 0,
+                  "variant": "repeated", "correct": True, "returned_model": "same",
+                  "returned_effort": "high", "returned_service_tier": "default",
+                  "ttft_ms": None, "wall_ms": 5}
+        after = {**before, "variant": "unique", "wall_ms": 4}
+        rows = [before, after]
+        for pair, mutation in enumerate(({"returned_service_tier": "priority"},
+                                          {"returned_effort": None}, {"correct": False}), 1):
+            rows.extend([{**before, "pair": pair}, {**after, "pair": pair, **mutation}])
+        rows.extend([{**before, "pair": 4}, {**before, "pair": 5},
+                     {**after, "pair": 5}, {**after, "pair": 5}])
+        report = paired_summary(rows)
+        self.assertEqual(report["excluded_pairs"], {"unknown_or_mismatched_provider_cohort": 2,
+                         "incorrect_answer": 1, "incomplete_or_duplicate_pair": 2})
+        self.assertEqual(set(report["groups"][0]["metrics"]), {"wall_ms"})
+        self.assertEqual(report["groups"][0]["metrics"]["wall_ms"]["median_delta_ms"], -1)
+        self.assertEqual(paired_summary([])["groups"], [])
 
     def test_first_token_is_text_not_created_or_reasoning_item(self):
         now = [0.0]

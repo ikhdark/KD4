@@ -21,7 +21,7 @@ pub enum ThreadEvent {
     TurnCompleted(Box<TurnCompletedEvent>),
     /// Indicates that a turn failed with an error.
     #[serde(rename = "turn.failed")]
-    TurnFailed(TurnFailedEvent),
+    TurnFailed(Box<TurnFailedEvent>),
     /// Emitted when a new item is added to the thread. Typically the item will be in an "in progress" state.
     #[serde(rename = "item.started")]
     ItemStarted(ItemStartedEvent),

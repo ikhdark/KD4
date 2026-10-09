@@ -15,7 +15,6 @@ from scripts import rust_build_status
 from scripts import rust_build_status_support
 from scripts import tool_versions
 from scripts.build_tooling_test_support import REPO_ROOT
-from scripts.build_tooling_test_support import load_toml
 from scripts.build_tooling_test_support import powershell
 from scripts.build_tooling_test_support import ps_single_quote
 
@@ -235,9 +234,9 @@ class WarmLaneReservationTest(unittest.TestCase):
 
     def test_context_tracks_inline_and_file_config_but_not_program_arguments(self):
         command = ["cargo", "build", "-p", "example"]
-        context = lambda extra: rust_build_status.cargo_build_context(
-            self.repo, command + extra, {}
-        )
+        def context(extra):
+            return rust_build_status.cargo_build_context(self.repo, command + extra, {})
+
         plain = context([])
         self.assertNotEqual(plain, context(["--config", 'build.rustflags=["--cfg=a"]']))
         self.assertEqual(
@@ -344,9 +343,9 @@ class WarmLaneReservationTest(unittest.TestCase):
 
     def test_named_runner_context_tracks_build_profile_not_test_policy(self):
         runner = [sys.executable, str(REPO_ROOT / "scripts" / "rust_test_runner.py")]
-        context = lambda command: rust_build_status.cargo_build_context(
-            self.repo, command, {}
-        )
+        def context(command):
+            return rust_build_status.cargo_build_context(self.repo, command, {})
+
         plain = context([*runner, "run-target", "app_server_lib"])
         small = context([*runner, "--cargo-profile", "dev-small", "run-target", "app_server_lib"])
         self.assertNotEqual(plain, small)
@@ -377,10 +376,12 @@ class WarmLaneReservationTest(unittest.TestCase):
 
     def test_named_test_policy_change_uses_idle_compatible_lane(self):
         runner = [sys.executable, str(REPO_ROOT / "scripts" / "rust_test_runner.py")]
-        command = lambda profile: [*runner, "run-target", "--profile", profile, "app_server_lib"]
-        context = lambda profile: rust_build_status.cargo_build_context(
-            self.repo, command(profile), {}
-        )
+        def command(profile):
+            return [*runner, "run-target", "--profile", profile, "app_server_lib"]
+
+        def context(profile):
+            return rust_build_status.cargo_build_context(self.repo, command(profile), {})
+
         busy, idle = self.warm("core-tests"), self.warm("core-tests-2")
         (busy / ".lane-build-context.json").write_text(json.dumps(context("local")))
         (idle / ".lane-build-context.json").write_text(json.dumps(context("fast")))
@@ -641,7 +642,9 @@ class BuildToolingStorageTest(unittest.TestCase):
             repo = Path(temp)
             command = ["cargo", "check", "-p", "example"]
             target = repo / "codex-rs" / "target" / "lanes" / "unit"
-            which = lambda name, **_kwargs: f"/tools/{name}"
+            def which(name, **_kwargs):
+                return f"/tools/{name}"
+
             # Assert the child contract independently, not by calling the same
             # environment helper that run_in_cargo_lane invokes. The 80G policy
             # is also owned by common-rust-env.ps1; paths come from this fixture.
@@ -2896,6 +2899,45 @@ function Get-CimInstance {
             self.assertEqual(rejected.exception.code, 2)
             self.assertIn(option, diagnostic.getvalue())
             prune.assert_not_called()
+
+    def test_positive_float_preserves_finite_positive_values(self) -> None:
+        for value, expected in (("0.125", 0.125), ("1", 1.0), ("2.5e2", 250.0)):
+            with self.subTest(value=value):
+                self.assertEqual(rust_build_status_support.positive_float(value), expected)
+
+    def test_cli_rejects_nonfinite_positive_floats_before_dispatch(self) -> None:
+        prune_options = (
+            "--warn-gib",
+            "--max-age-days",
+            "--max-lane-gib",
+            "--max-total-lane-gib",
+            "--max-total-target-gib",
+        )
+        cases = [(["disk"], "--warn-gib", "target_disk_report")]
+        for command, handler in (
+            (["prune"], "prune_stale_lanes_report"),
+            (["prune", "--json-plan"], "prune_stale_lanes_plan"),
+            (["optimize"], "target_optimize_report"),
+        ):
+            cases.extend((command, option, handler) for option in prune_options)
+        cases.append(
+            (["run-lane", "--lane", "unit"], "--lock-timeout-seconds", "run_in_cargo_lane")
+        )
+        for command, option, handler in cases:
+            for value in ("nan", "NaN", "+nan", "-nan", "inf", "Infinity", "-inf", "1e999"):
+                with (
+                    self.subTest(command=command, option=option, value=value),
+                    contextlib.redirect_stderr(io.StringIO()) as diagnostic,
+                    mock.patch.object(rust_build_status, handler) as dispatch,
+                    self.assertRaises(SystemExit) as rejected,
+                ):
+                    # Use '=' so signed nonfinite values reach the converter,
+                    # rather than being rejected as unknown option tokens.
+                    rust_build_status.main([*command, f"{option}={value}"])
+                self.assertEqual(rejected.exception.code, 2)
+                self.assertIn(option, diagnostic.getvalue())
+                self.assertIn("must be finite", diagnostic.getvalue())
+                dispatch.assert_not_called()
 
     def test_lane_regexes_use_shared_tooling_patterns(self) -> None:
         patterns = tool_versions.cargo_lane_patterns()

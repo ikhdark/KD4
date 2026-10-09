@@ -2,6 +2,11 @@ use std::borrow::Cow;
 use std::path::Component;
 use std::path::Path;
 
+#[path = "full_suite.rs"]
+mod full_suite;
+pub(crate) use full_suite::FullSuiteBudget;
+pub(crate) use full_suite::check_full_suite_command;
+
 use super::command_search::rg_search_path_operands;
 use super::command_search::rg_search_path_indices;
 use crate::shell::ShellType;
@@ -465,7 +470,7 @@ fn source_paging_advisory(
                     && pair[1].parse::<usize>().is_ok()
             });
         } else if program.eq_ignore_ascii_case("Select-Object") {
-            if args.is_empty() || args.len() % 2 != 0 || !args.chunks_exact(2).all(|pair| {
+            if args.is_empty() || args.len() % 2 != 0 || !args.as_chunks::<2>().0.iter().all(|pair| {
                 matches_ignore_ascii_case(&pair[0], &["-Skip", "-First"])
                     && pair[1].parse::<usize>().is_ok()
             }) {

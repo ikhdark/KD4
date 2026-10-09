@@ -259,6 +259,27 @@ enum TurnTerminalOutcome {
 }
 
 impl TurnTerminalOutcome {
+    fn allows_pending_input_restart(&self, published: Option<&EventMsg>) -> bool {
+        // Request-level retries own their bounded retry/backoff policy. Once a
+        // turn has failed, recovered input is not permission to retry it. This
+        // also covers workers that emit Error and then return Ok (compaction).
+        // Preserve the input for explicit admission without creating a timer,
+        // holding admission during a sleep, or retrying a finalizer failure.
+        matches!(
+            self,
+            Self::Completed { .. }
+                | Self::Aborted(TurnAbortReason::Interrupted)
+                | Self::ReturnedError(CodexErr::TurnAborted)
+        ) && matches!(
+            published,
+            Some(EventMsg::TurnComplete(TurnCompleteEvent { error: None, .. }))
+                | Some(EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                    ..
+                }))
+        )
+    }
+
     fn abort_reason(&self) -> Option<TurnAbortReason> {
         match self {
             Self::Aborted(reason) => Some(reason.clone()),
@@ -1383,6 +1404,9 @@ impl Session {
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
         self.publish_terminal_outcome(finalization, event).await;
         if cleared_active_turn
+            && finalization.outcome.allows_pending_input_restart(
+                finalization.published_terminal_event.as_ref(),
+            )
             && (abort_reason == Some(TurnAbortReason::Interrupted)
                 || required_tool_terminal.is_some()
                 || defer_pending_input
@@ -1499,6 +1523,9 @@ impl Session {
             _ => false,
         };
         if cleared_active_turn
+            && finalization.outcome.allows_pending_input_restart(
+                finalization.published_terminal_event.as_ref(),
+            )
             && (finalization.restart_for_pending_input || restart_for_terminal_outcome)
         {
             self.maybe_start_turn_for_pending_work().await;

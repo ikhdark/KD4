@@ -1879,8 +1879,10 @@ fn decode_utf16(
     }
 
     let units: Vec<u16> = input
-        .chunks_exact(2)
-        .map(|chunk| decode_unit([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| decode_unit(*chunk))
         .collect();
 
     String::from_utf16(&units).map_err(|_| PromptDecodeError::InvalidUtf16 { encoding })

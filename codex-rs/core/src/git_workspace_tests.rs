@@ -161,13 +161,13 @@ async fn ignored_build_events_are_journaled_without_changing_capture_keys() {
     cache.record_watched_source_change_event(Some(vec![other])).await;
     assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before);
     assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 1);
-    assert!(git_ignores_all_changed_paths(repo.as_path(), &[build.clone()]).await);
+    assert!(git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(&build)).await);
     assert!(std::process::Command::new("git").args(["add", "-f", "target/output.bin"])
         .current_dir(repo.as_path()).status().unwrap().success());
     // Force-added files, including changes reported only on their directory,
     // affect git status even though the directory itself is ignored.
     for path in [build, repo.join("target").to_path_buf(), repo.join(".gitignore").to_path_buf()] {
-        assert!(!git_ignores_all_changed_paths(repo.as_path(), &[path.clone()]).await);
+        assert!(!git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(&path)).await);
         let before = cache.source_capture_generation.load(Ordering::Acquire);
         cache.record_watched_source_change_event(Some(vec![path])).await;
         assert!(cache.source_capture_generation.load(Ordering::Acquire) > before);
@@ -279,6 +279,80 @@ async fn root_discovery_starts_independent_resolutions_concurrently_and_preserve
     .expect("independent root probes should start concurrently");
 
     assert_eq!(roots, vec!["first", "second"]);
+}
+
+#[tokio::test]
+async fn root_discovery_refills_slots_behind_a_blocked_first_resolution() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let count = ROOT_DISCOVERY_CONCURRENCY * 3;
+    let resolutions = (0..count).map(|index| {
+        let release = Arc::clone(&release);
+        let active = Arc::clone(&active);
+        let peak = Arc::clone(&peak);
+        let completed_tx = completed_tx.clone();
+        async move {
+            let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(running, Ordering::SeqCst);
+            if index == 0 {
+                release.notified().await;
+            } else {
+                tokio::task::yield_now().await;
+                completed_tx.send(index).unwrap();
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            // A failed root probe is retained, not a reason to abandon siblings.
+            (index != 1).then_some(index)
+        }
+    });
+    let observer = async {
+        let progress = timeout(Duration::from_secs(2), async {
+            for _ in 1..count {
+                completed_rx.recv().await.expect("completed sibling");
+            }
+        })
+        .await;
+        // Release even on regression so no started future is detached.
+        release.notify_one();
+        progress
+    };
+    let (roots, progress) = tokio::join!(resolve_roots_in_order(resolutions), observer);
+    assert!(progress.is_ok(), "a slow first root prevented independent probes");
+    assert_eq!(roots, (0..count).map(|index| (index != 1).then_some(index)).collect::<Vec<_>>());
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(peak.load(Ordering::SeqCst), ROOT_DISCOVERY_CONCURRENCY);
+}
+
+#[tokio::test]
+async fn workspace_collection_cancellation_drops_active_work_without_starting_backlog() {
+    struct Active(Arc<AtomicUsize>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    for concurrency in [1, ROOT_DISCOVERY_CONCURRENCY] {
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let work = (0..12).map(|_| {
+            let active = Arc::clone(&active);
+            let started = Arc::clone(&started);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                active.fetch_add(1, Ordering::SeqCst);
+                let _active = Active(active);
+                std::future::pending::<()>().await;
+            }
+        });
+        let mut collection = Box::pin(collect_workspace_work_in_order(work, concurrency));
+        assert!(futures::poll!(&mut collection).is_pending());
+        assert_eq!(active.load(Ordering::SeqCst), concurrency);
+        drop(collection);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(started.load(Ordering::SeqCst), concurrency);
+    }
 }
 
 #[tokio::test]

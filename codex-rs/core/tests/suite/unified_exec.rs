@@ -46,9 +46,11 @@ async fn mount_sse_sequence(
             let Ok(mut event) = serde_json::from_str::<Value>(data) else { return line.to_string() };
             let item = &mut event["item"];
             if item["type"] == "function_call" && item["name"] == "write_stdin" {
-                let mut args: Value = serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
+                let mut args: Value = serde_json::from_str(
+                    item["arguments"].as_str().expect("write_stdin fixture arguments must be a string"),
+                ).expect("write_stdin fixture arguments must be valid JSON");
                 if args.get("incarnation").is_none() {
-                    let incarnation = request["input"].as_array().unwrap().iter().rev()
+                    let incarnation = request["input"].as_array().expect("model request input must be an array").iter().rev()
                         .filter(|item| item["type"] == "function_call_output")
                         .filter_map(extract_output_text)
                         .filter_map(|text| serde_json::from_str::<Value>(text).ok())

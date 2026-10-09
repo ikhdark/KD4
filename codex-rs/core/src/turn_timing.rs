@@ -10,8 +10,10 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+#[cfg(test)]
 use futures::FutureExt;
 use tokio::sync::Notify;
+#[cfg(test)]
 use tokio_util::task::AbortOnDropHandle;
 
 use codex_analytics::TurnProfile;
@@ -191,6 +193,7 @@ impl TurnClock for SystemTurnClock {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 enum CheckoutSnapshotCapture {
     #[default]
@@ -201,6 +204,7 @@ enum CheckoutSnapshotCapture {
 
 pub(crate) struct TurnTimingState {
     live_phase: StdMutex<LiveTurnPhase>,
+    #[cfg(test)]
     checkout_snapshot: StdMutex<CheckoutSnapshotCapture>,
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
@@ -1603,6 +1607,7 @@ impl TurnTimingState {
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
             live_phase: Default::default(),
+            #[cfg(test)]
             checkout_snapshot: Default::default(),
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
@@ -1733,6 +1738,7 @@ impl TurnTimingState {
         state.start(sample)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_checkout_snapshot(&self, cwd: &std::path::Path) {
         let mut capture = self
             .checkout_snapshot
@@ -1748,6 +1754,7 @@ impl TurnTimingState {
 
     /// Provenance is optional: never delay dispatch or let a capture include later tool edits.
     /// Poll once, retaining only an already completed hash and aborting unfinished work on drop.
+    #[cfg(test)]
     fn finish_checkout_snapshot(&self) {
         let capture = {
             let mut capture = self
@@ -1774,6 +1781,7 @@ impl TurnTimingState {
         physical_attempt_id: &str,
         bytes: &[u8],
     ) {
+        #[cfg(test)]
         self.finish_checkout_snapshot();
         let hash = format!("{:x}", Sha256::digest(bytes));
         let mut state = self.state();
@@ -1803,10 +1811,8 @@ impl TurnTimingState {
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
                 && request.physical_attempt_ids.iter().any(|id| id == physical_attempt_id)
-        }) {
-            if let Some(sections) = sections {
-                request.request_section_sha256_by_attempt.insert(physical_attempt_id.to_owned(), sections);
-            }
+        }) && let Some(sections) = sections {
+            request.request_section_sha256_by_attempt.insert(physical_attempt_id.to_owned(), sections);
         }
         state.refresh_completed_request_diagnostics();
     }
@@ -1827,6 +1833,7 @@ impl TurnTimingState {
     }
 
     pub(crate) fn complete_snapshot(&self) -> TurnTimingSnapshot {
+        #[cfg(test)]
         self.finish_checkout_snapshot();
         let mut state = self.state();
         let sample = self.clock.sample();
@@ -3050,21 +3057,20 @@ impl TurnTimingState {
             let digest = Sha256::digest(key.as_bytes());
             format!("{digest:x}")
         });
-        if state.completed_snapshot.is_some() {
-            if let Some(request) = state
+        if state.completed_snapshot.is_some()
+            && let Some(request) = state
                 .model_requests
                 .iter()
                 .find(|request| request.sampling_request_id.as_deref() == Some(sampling_request_id))
-            {
-                tracing::info!(
-                    sampling_request_id,
-                    physical_attempt_id,
-                    request_diagnostics_status = ?request.request_diagnostics_status,
-                    fixed_prefix_reuse_eligible,
-                    prompt_cache_key_fingerprint = ?request.prompt_cache_key_fingerprint,
-                    "late model request cache identity"
-                );
-            }
+        {
+            tracing::info!(
+                sampling_request_id,
+                physical_attempt_id,
+                request_diagnostics_status = ?request.request_diagnostics_status,
+                fixed_prefix_reuse_eligible,
+                prompt_cache_key_fingerprint = ?request.prompt_cache_key_fingerprint,
+                "late model request cache identity"
+            );
         }
         state.refresh_completed_request_diagnostics();
     }

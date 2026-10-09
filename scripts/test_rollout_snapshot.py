@@ -31,11 +31,14 @@ class RolloutSnapshotTest(unittest.TestCase):
             digest = hashlib.sha256(data).hexdigest()
             directory = rollout_snapshot.rollout_payload_root(source)
             directory.mkdir()
-            (directory / f"{digest}.json").write_bytes(data)
+            blob = directory / f"{digest}.json"
+            blob.write_bytes(data)
             for actual in (data, data + b"x", data[:-1], b"x" * len(data)):
-                with self.subTest(actual=actual):
-                    opened = mock.mock_open(read_data=actual)
-                    with mock.patch.object(Path, "open", opened):
+                with self.subTest(actual=actual), blob.open("rb") as handle:
+                    opened = mock.MagicMock(wraps=handle)
+                    opened.__enter__.return_value = opened
+                    opened.read.return_value = actual
+                    with mock.patch.object(rollout_snapshot, "_open_payload_binary", return_value=opened):
                         if actual == data:
                             self.assertEqual(
                                 rollout_snapshot.load_rollout_payload(source, digest, len(data)),
@@ -44,7 +47,108 @@ class RolloutSnapshotTest(unittest.TestCase):
                         else:
                             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                                 rollout_snapshot.load_rollout_payload(source, digest, len(data))
-                    opened().read.assert_called_once_with(len(data) + 1)
+                    opened.read.assert_called_once_with(len(data) + 1)
+
+    def test_payload_metadata_and_read_use_the_same_pinned_handle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rollout.jsonl"
+            data = b'{"type":"event_msg","payload":{}}'
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            blob = directory / f"{digest}.json"
+            blob.write_bytes(data)
+            substitute = directory / "replacement"
+            substitute.write_bytes(b"untrusted replacement")
+            real_fstat = os.fstat
+            swapped = []
+
+            def swap_after_stat(fd):
+                metadata = real_fstat(fd)
+                if not swapped:
+                    # Windows can rename a shared-open file even where replacing
+                    # its occupied destination directly is denied.
+                    os.replace(blob, directory / "pinned-old")
+                    os.replace(substitute, blob)
+                    swapped.append(True)
+                return metadata
+
+            with mock.patch.object(rollout_snapshot.os, "fstat", side_effect=swap_after_stat):
+                self.assertEqual(rollout_snapshot.load_rollout_payload(source, digest, len(data)), data)
+            self.assertEqual(swapped, [True])
+            self.assertEqual(blob.read_bytes(), b"untrusted replacement")
+
+    def test_payload_rejects_links_at_open_and_never_falls_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rollout.jsonl"
+            data = b'{"type":"event_msg","payload":{}}'
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            target = Path(temp) / "target"
+            target.write_bytes(data)
+            blob = directory / f"{digest}.json"
+            link = directory / "link"
+            try:
+                link.symlink_to(target)
+            except OSError as error:
+                self.skipTest(f"symlink creation unavailable: {error}")
+            real_open = rollout_snapshot._open_payload_binary
+            for dangling in (False, True):
+                with self.subTest(dangling=dangling):
+                    if dangling:
+                        target.unlink()
+                    blob.write_bytes(data)
+                    if not link.is_symlink():
+                        link.symlink_to(target)
+                    opened = []
+
+                    def substitute(path):
+                        opened.append(path)
+                        os.replace(link, blob)
+                        return real_open(path)
+
+                    with mock.patch.object(rollout_snapshot, "_open_payload_binary", side_effect=substitute):
+                        with self.assertRaises((ValueError, OSError)):
+                            rollout_snapshot.load_rollout_payload(source, digest, len(data))
+                    self.assertEqual(opened, [blob])
+                    blob.unlink()
+
+    def test_payload_rejects_directory_and_oversize_on_the_handle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rollout.jsonl"
+            data = b"payload"
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            blob = directory / f"{digest}.json"
+            blob.mkdir()
+            with self.assertRaises((ValueError, OSError)):
+                rollout_snapshot.load_rollout_payload(source, digest)
+            blob.rmdir()
+            blob.write_bytes(data)
+            with mock.patch.object(rollout_snapshot, "_MAX_PAYLOAD_BYTES", len(data) - 1):
+                with self.assertRaisesRegex(ValueError, "invalid rollout payload file"):
+                    rollout_snapshot.load_rollout_payload(source, digest)
+            # A failed validation must release the descriptor (including on Windows).
+            blob.unlink()
+
+    @unittest.skipIf(os.name == "nt", "POSIX FIFO open semantics")
+    def test_payload_fifo_is_rejected_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rollout.jsonl"
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            digest = "0" * 64
+            os.mkfifo(directory / f"{digest}.json")
+            result = subprocess.run(
+                [sys.executable, "-B", "-c",
+                 "from pathlib import Path; from scripts.rollout_snapshot import load_rollout_payload; "
+                 f"load_rollout_payload(Path({str(source)!r}), {digest!r})"],
+                cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=5,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"invalid rollout payload file", result.stderr)
 
     def test_relocated_rollout_reads_codex_home_store_but_not_over_corrupt_blob(self):
         with tempfile.TemporaryDirectory() as temp:

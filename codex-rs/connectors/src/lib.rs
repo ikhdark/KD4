@@ -621,6 +621,7 @@ mod tests {
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     #[tokio::test]
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout async pagination")]
     async fn workspace_pagination_is_complete_and_reused_without_granting_access()
     -> anyhow::Result<()> {
         let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
@@ -680,6 +681,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout async pagination")]
     async fn complete_workspace_and_public_pagination_overlap() -> anyhow::Result<()> {
         let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
         let home = TempDir::new()?;
@@ -731,6 +733,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout async pagination")]
     async fn workspace_pagination_failure_preserves_complete_memory_and_disk_cache()
     -> anyhow::Result<()> {
         let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
@@ -776,6 +779,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::await_holding_invalid_type, reason = "Serializes shared directory-cache fixtures throughout cancellation and refresh")]
     async fn cancelled_directory_pagination_drops_both_fetches_and_releases_refresh()
     -> anyhow::Result<()> {
         struct ActiveFetch(Arc<AtomicUsize>);

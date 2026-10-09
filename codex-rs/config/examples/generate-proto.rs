@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .build_server(true)
         .out_dir(&proto_dir)
-        .compile_protos(&[proto_file], &[proto_dir.clone()])?;
+        .compile_protos(&[proto_file], std::slice::from_ref(&proto_dir))?;
 
     // Keep the module-level allowance reproducible when regenerating tonic's
     // service code, rather than requiring a manual edit to generated Rust.

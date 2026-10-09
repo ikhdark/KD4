@@ -938,19 +938,20 @@ impl CommandExecutionLedger {
         evidence: RawOutputArtifact,
         exit_code: i32,
     ) {
-        let mut state = self.state.lock().await;
-        let entry = attempt_entry_locked(&mut state, key);
-        entry.last_exit_code = Some(exit_code);
-        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-        entry.deterministic_failure = Some(
-            DeterministicFailureRecord::from_input_state_determined(proof, evidence, exit_code),
-        );
-        state.retry.input_failures.insert(key.fingerprint(), PersistedInputFailure { proof, exit_code });
-        while state.retry.input_failures.len() > MAX_TRACKED_COMMANDS {
-            state.retry.input_failures.pop_first();
+        {
+            let mut state = self.state.lock().await;
+            let entry = attempt_entry_locked(&mut state, key);
+            entry.last_exit_code = Some(exit_code);
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            entry.deterministic_failure = Some(
+                DeterministicFailureRecord::from_input_state_determined(proof, evidence, exit_code),
+            );
+            state.retry.input_failures.insert(key.fingerprint(), PersistedInputFailure { proof, exit_code });
+            while state.retry.input_failures.len() > MAX_TRACKED_COMMANDS {
+                state.retry.input_failures.pop_first();
+            }
+            state.retry.revision = state.retry.revision.wrapping_add(1);
         }
-        state.retry.revision = state.retry.revision.wrapping_add(1);
-        drop(state);
         self.persist_cache().await;
     }
 

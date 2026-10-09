@@ -190,7 +190,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             "recipe-recovery" => (
                 Some("{ const head = await tools.read_file({path:'bulk.json'}); if (!head.complete || head.file_complete || !head.recovery) throw Error('expected retained suffix'); store('recipeHead',head); }".to_string()),
                 format!(r#"const head = load('recipeHead'); let args = {{...head.recovery.arguments}};
-                    if (!{}) delete args.max_bytes;
+                    if (!{candidate}) delete args.max_bytes;
                     let offset = head.continuation.start, parts = [head.results[0].text], calls = 0;
                     while (offset < head.canonical_bytes && calls < 64) {{
                         const r = await tools.read_tool_output(args); ++calls;
@@ -212,10 +212,10 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                             stop.selector.start !== offset || stop.selector.end !== head.canonical_bytes) throw Error('recovery needs review');
                         args = {{...args,selectors:[stop.selector]}};
                     }}
-                    if (offset !== head.canonical_bytes || ({} && calls !== 1)) throw Error('incomplete/redundant recovery');
+                    if (offset !== head.canonical_bytes || ({candidate} && calls !== 1)) throw Error('incomplete/redundant recovery');
                     const value = JSON.parse(parts.join(''));
                     if (value.padding !== 'filler '.repeat(160000)) throw Error('changed evidence');
-                    text(value.answer);"#, candidate, candidate),
+                    text(value.answer);"#),
             ),
             "retained" => (
                 Some("const r = await tools.read_file({path:'answer.txt'}); if (!r.file_complete) throw Error('incomplete source'); store('evidence', r);".to_string()),
@@ -378,12 +378,10 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             messages[0].content.as_slice(),
             [AgentMessageContent::Text { text }] if text == answer
         ));
-        if candidate {
-            if messages[0].phase != Some(MessagePhase::FinalAnswer) {
-                let request = final_response.single_request();
-                let (output, success) = custom_tool_output_body_and_success(&request, "compute-answer");
-                panic!("{scenario}: direct delivery fell back ({success:?}): {output}");
-            }
+        if candidate && messages[0].phase != Some(MessagePhase::FinalAnswer) {
+            let request = final_response.single_request();
+            let (output, success) = custom_tool_output_body_and_success(&request, "compute-answer");
+            panic!("{scenario}: direct delivery fell back ({success:?}): {output}");
         }
         test.codex.flush_rollout().await?;
         let (items, _, errors) = codex_core::RolloutRecorder::load_rollout_items(
@@ -402,7 +400,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             .collect::<Vec<_>>();
         assert_eq!(persisted.len(), 1, "the visible answer must survive reopening");
         assert_eq!(
-            persisted[0].0.as_ref().map(|id| id.as_str()),
+            persisted[0].0.as_ref().map(codex_protocol::ResponseItemId::as_str),
             Some(messages[0].id.as_str())
         );
         assert_eq!(
@@ -648,7 +646,7 @@ async fn completion_audit_plan_closure_uses_existing_evidence(close_plan: bool) 
     let test = builder.build(&server).await?;
     fs::write(test.cwd.path().join("evidence.txt"), "verified result")?;
     let close = if close_plan {
-        "const closed = await tools.update_plan({set:p.step_ids.map(step_id=>({step_id,status:'completed'}))}); if(closed.obligations.unresolved.length || closed.obligations.completed !== 2) throw Error('unresolved obligations');"
+        "const advanced = await tools.update_plan({expected_revision:p.revision,set:[{step_id:p.step_ids[0],status:'completed'}]}); const closed = await tools.update_plan({expected_revision:advanced.revision,set:advanced.step_ids.map(step_id=>({step_id,status:'completed'}))}); if(closed.obligations.unresolved.length || closed.obligations.completed !== 2) throw Error('unresolved obligations');"
     } else { "" };
     let code = format!(r#"// @exec: {{"deliver":true}}
 const p = await tools.update_plan({{plan:[{{step:'Inspect source',status:'in_progress'}},{{step:'Verify result',status:'pending'}}]}});
@@ -667,7 +665,7 @@ text(source.results[0].text);"#);
 const source = load('completionEvidence');
 if (!source.file_complete || source.results[0].text !== 'verified result') throw Error('verification failed');
 const p = load('completionPlan');
-const closed = await tools.update_plan({set:p.step_ids.map(step_id=>({step_id,status:'completed'}))});
+const closed = await tools.update_plan({expected_revision:p.revision,set:p.step_ids.map(step_id=>({step_id,status:'completed'}))});
 if (closed.obligations.unresolved.length) throw Error('work remains');
 text('Required work completed.');"#), ev_completed("fallback"),
     ])).await;
@@ -682,5 +680,102 @@ text('Required work completed.');"#), ev_completed("fallback"),
     assert_eq!(server.received_requests().await.unwrap().iter()
         .filter(|request| request.url.path().contains("responses")).count(),
         1);
+    Ok(())
+}
+#[test_case::test_case(0)]
+#[test_case::test_case(1)]
+#[test_case::test_case(2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_alias_avoids_repair_request(pair: usize) -> Result<()> {
+    require_network!();
+    for candidate in if pair.is_multiple_of(2) { [false, true] } else { [true, false] } {
+        let server = responses::start_mock_server().await;
+        let mut builder = test_codex().with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::Kd4Runtime);
+        });
+        let mut test = builder.build(&server).await?;
+        let options = test.thread_manager.start_thread_options(test.config.clone())
+            .with_dynamic_tools(vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                name: "fixture".into(), description: "Namespace identity fixture".into(),
+                tools: vec![DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                    name: "result".into(), description: "Return the exact fixture answer".into(),
+                    input_schema: serde_json::json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}),
+                    defer_loading: false,
+                })],
+            })]);
+        let thread = test.thread_manager.start_thread_with_options(options).await?;
+        test.codex.replace_thread(thread.thread);
+        test.session_configured = thread.session_configured;
+        let answer = "Verified namespace answer: λ\n";
+        // Reproduce the old catalog shape without reverting production source:
+        // hashed canonical functions existed, but their namespace object did not.
+        // Both sides use direct delivery, isolating the alias-repair request.
+        let remove_alias = if candidate { "" } else { "delete tools.fixture;" };
+        let initial = format!(r#"// @exec: {{"deliver":true}}
+{remove_alias}
+text(await tools.fixture.result({{value:42}}));"#);
+        responses::mount_sse_once(&server, sse(vec![
+            ev_custom_tool_call("namespace-call", "exec", &initial), ev_completed("initial"),
+        ])).await;
+        let repair = responses::mount_sse_once(&server, sse(vec![
+            ev_custom_tool_call("namespace-repair", "exec", r#"// @exec: {"deliver":true}
+text(await resolve_tool('fixture.result')({value:42}));"#), ev_completed("repair"),
+        ])).await;
+        responses::mount_sse_once(&server, sse(vec![
+            ev_assistant_message("unexpected", "unexpected final model request"), ev_completed("fallback"),
+        ])).await;
+        let started_at = std::time::Instant::now();
+        test.codex.submit(Op::UserInput {
+            items: vec![UserInput::Text { text: "Return the exact fixture result for value 42.".into(), text_elements: Vec::new() }],
+            final_output_json_schema: None, responsesapi_client_metadata: None,
+            additional_context: Default::default(), thread_settings: Default::default(),
+        }).await?;
+        let request = wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::DynamicToolCallRequest(request) => Some(request.clone()), _ => None,
+        }).await;
+        assert_eq!(request.namespace.as_deref(), Some("fixture"));
+        assert_eq!(request.tool, "result");
+        assert_eq!(request.arguments, serde_json::json!({"value":42}));
+        test.codex.submit(Op::DynamicToolResponse {
+            turn_id: request.turn_id, id: request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText { text: answer.into() }],
+                success: true,
+            },
+        }).await?;
+        let completed = wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::TurnComplete(event) => Some(event.clone()), _ => None,
+        }).await;
+        assert!(completed.error.is_none(), "{:?}", completed.error);
+        assert_eq!(completed.last_agent_message.as_deref(), Some(answer));
+        assert!(completed.surfaced_result.is_some(), "must deliver the tool result, not a model rewrite");
+        if !candidate {
+            let (output, _) = custom_tool_output_body_and_success(&repair.single_request(), "namespace-call");
+            assert!(output.contains("TypeError") && output.contains("result"), "expected alias miss: {output}");
+        }
+        let requests = server.received_requests().await.unwrap().iter()
+            .filter(|request| request.url.path().contains("responses")).count();
+        assert_eq!(requests, if candidate { 1 } else { 2 });
+        let timing = completed.timing.as_ref().expect("turn timing");
+        assert_eq!(timing.counters.model_request_count as usize, requests);
+        assert_eq!(timing.counters.logical_generation_count as usize, requests);
+        test.codex.flush_rollout().await?;
+        let (items, _, errors) = codex_core::RolloutRecorder::load_rollout_items(
+            &test.codex.rollout_path().expect("rollout"),
+        ).await?;
+        assert_eq!(errors, 0);
+        let answers = items.iter().filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) if role == "assistant" => Some(content),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(answers, vec![&vec![ContentItem::OutputText { text: answer.into() }]]);
+        eprintln!("LATENCY_COMPARISON {}", serde_json::json!({
+            "scenario":"namespace-alias", "pair":pair, "candidate":candidate,
+            "wall_ms":started_at.elapsed().as_secs_f64() * 1000.0,
+            "model_requests":requests, "exact_answer_and_persistence_verified":true,
+            "provider":"scripted", "baseline":"old namespace absence injected; same current native runtime",
+        }));
+    }
     Ok(())
 }

@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use codex_core_skills::HostSkillsSnapshot;
-use codex_core_skills::SKILLS_INTRO_WITH_ABSOLUTE_PATHS;
 use codex_core_skills::SkillLoadOutcome;
 use codex_core_skills::SkillMetadata;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
@@ -23,8 +22,6 @@ use codex_extension_api::TurnInputContext;
 use codex_extension_api::WorldStateContributionInput;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
-use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG;
-use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
@@ -177,17 +174,11 @@ async fn assert_installed_host_skill_fragment(
         )
         .await;
 
-    let expected_catalog = format!(
-        "{EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills\n{SKILLS_INTRO_WITH_ABSOLUTE_PATHS}\n### Available skills\n- demo: Demo skill. (file: {skill_prompt_path})\n{EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG}"
-    );
     let expected_skill = format!(
         "<skill>\n<name>demo</name>\n<path>{skill_path_string}</path>\n<scope>admin</scope>\n{rendered_contents}\n</skill>"
     );
     assert_eq!(
-        vec![
-            ("developer", expected_catalog),
-            ("developer", expected_skill),
-        ],
+        vec![("developer", expected_skill)],
         fragments
             .iter()
             .map(|fragment| (fragment.role(), fragment.render()))
@@ -1060,10 +1051,9 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
         )
         .await;
 
-    assert_eq!(2, fragments.len());
-    assert!(fragments[0].render().contains("visible-skill"));
-    assert!(!fragments[0].render().contains("hidden-skill"));
-    assert!(fragments[1].render().contains("<name>hidden-skill</name>"));
+    assert_eq!(1, fragments.len());
+    assert!(fragments[0].render().contains("<name>hidden-skill</name>"));
+    assert!(!fragments[0].render().contains("visible-skill"));
     assert_eq!(
         vec![(
             SkillAuthority::new(SkillSourceKind::Host, "host"),

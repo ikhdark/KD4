@@ -221,7 +221,7 @@ impl ToolPlanProbe {
             authorization_classes,
             external_mutation_intents,
             tool_search_texts,
-            tool_search_sources: router.tool_search_sources.clone(),
+            tool_search_sources: router.tool_search_sources,
             tool_search_namespace_descriptions,
             warnings,
         }
@@ -422,9 +422,7 @@ async fn planning_tools_keep_their_schemas_in_plan_mode() {
     plan_mode.assert_visible_contains(&["update_plan"]);
     plan_mode.assert_registered_contains(&["update_plan"]);
     plan_mode.assert_registered_lacks(&["context_checkpoint"]);
-    for name in ["update_plan"] {
-        assert_eq!(default_mode.visible_spec(name), plan_mode.visible_spec(name));
-    }
+    assert_eq!(default_mode.visible_spec("update_plan"), plan_mode.visible_spec("update_plan"));
 }
 
 #[tokio::test]
@@ -902,6 +900,7 @@ async fn request_user_input_respects_coarse_mode_and_role_eligibility() {
 }
 
 #[tokio::test]
+#[expect(clippy::print_stderr, reason = "the contract projection test reports full and eager token counts for auditing")]
 async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvable() {
     let configure = |turn: &mut TurnContext, code_mode_only| {
         turn.model_info.supports_search_tool = true;
@@ -2729,7 +2728,6 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
 fn namespaced_multi_agent_v2_tools_keep_their_handler_identity() {
     use crate::tools::context::ToolPayload;
     use crate::tools::hook_names::HookToolName;
-    use crate::tools::registry::CoreToolRuntime;
 
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -2856,6 +2854,44 @@ async fn multi_agent_v2_surface_changes_only_at_the_four_coarse_stages() {
                 "expected `{tool_name}` for {stage:?}, got {actual:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn code_mode_initial_agent_catalog_retains_lifecycle_without_typed_administration() {
+    for (stage, excluded, expected) in [
+        (AgentSurfaceStage::SpawnOnly, false, true),
+        (AgentSurfaceStage::SpawnOnly, true, false),
+        (AgentSurfaceStage::Prohibited, false, false),
+    ] {
+        let plan = probe_with(
+            |turn| {
+                set_features(turn, &[Feature::MultiAgentV2, Feature::CodeMode, Feature::CodeModeOnly]);
+                turn.model_info.supports_search_tool = true;
+                if excluded {
+                    update_config(turn, |config| {
+                        config.code_mode.excluded_tool_namespaces = vec![MULTI_AGENT_V2_NAMESPACE.into()];
+                    });
+                }
+            },
+            ToolPlanInputs {
+                exposure_identity: ToolExposureIdentity {
+                    agent_surface_stage: stage,
+                    ..ToolExposureIdentity::default()
+                },
+                ..ToolPlanInputs::default()
+            },
+        ).await;
+        for tool in ["wait_agent", "list_agents", "send_message", "followup_task", "interrupt_agent"] {
+            let name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, tool).to_string();
+            if expected {
+                plan.assert_registered_contains(&[&name]);
+            } else {
+                plan.assert_registered_lacks(&[&name]);
+            }
+        }
+        plan.assert_registered_lacks(&[&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "amend_agent_task").to_string()]);
+        plan.assert_visible_lacks(&[MULTI_AGENT_V2_NAMESPACE]);
     }
 }
 

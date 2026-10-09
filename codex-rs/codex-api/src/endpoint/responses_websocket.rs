@@ -229,7 +229,12 @@ impl WsStream {
                     }
                     // Pause reads at the ingress bounds, but keep dispatch commands
                     // runnable: a reused connection sends before draining ingress.
-                    result = async { tx_message.send(pending_message.as_ref().unwrap()).await }, if pending_message.is_some() => {
+                    result = async {
+                        match pending_message.as_ref() {
+                            Some(message) => tx_message.send(message).await,
+                            None => std::future::pending().await,
+                        }
+                    }, if pending_message.is_some() => {
                         match result {
                             Ok(()) => {
                                 if matches!(pending_message.take(), Some(Message::Close(_))) {

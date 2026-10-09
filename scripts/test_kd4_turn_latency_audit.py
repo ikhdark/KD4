@@ -1755,6 +1755,75 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             [10_000_000, 20_000_000],
         )
 
+    def test_detailed_timing_rejects_execution_id_collisions(self) -> None:
+        for record_count, detail_count in ((2, 2), (2, 1), (1, 2)):
+            with self.subTest(records=record_count, details=detail_count):
+                records = [
+                    {"turnId": "turn", "callId": "duplicate", "executionId": "same",
+                     "roundTripNs": 7, "status": "running", "timingConfidence": "low"}
+                    for _ in range(record_count)
+                ]
+                calls = [
+                    {"_turnId": "turn", "callId": "duplicate", "executionId": "same",
+                     "acceptedAtMs": 0, "outputModelVisibleAtMs": end,
+                     "processSpawnedAtMs": 1, "processExitedAtMs": 2,
+                     "outcome": "success"}
+                    for end in (10, 20)[:detail_count]
+                ]
+                stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+                self.assertEqual(stats, {"ambiguousGroups": 1, "ambiguousRecords": record_count})
+                for record in records:
+                    self.assertTrue(record["detailedTimingAmbiguous"])
+                    self.assertEqual(record["roundTripNs"], 7)
+                    self.assertEqual(record["status"], "running")
+                    self.assertEqual(record["timingConfidence"], "low")
+                    self.assertNotIn("detailedTimingMatch", record)
+                    self.assertNotIn("timingSource", record)
+
+    def test_detailed_timing_excludes_collisions_from_anonymous_fallback(self) -> None:
+        records = [
+            {"turnId": "turn", "callId": "duplicate", "executionId": "same"},
+            {"turnId": "turn", "callId": "duplicate", "executionId": "same"},
+            {"turnId": "turn", "callId": "duplicate"},
+            {"turnId": "turn", "callId": "duplicate", "executionId": "unique"},
+        ]
+        base = {"_turnId": "turn", "callId": "duplicate", "acceptedAtMs": 0,
+                "processSpawnedAtMs": 1, "processExitedAtMs": 2}
+        calls = [
+            {**base, "executionId": "unique", "outputModelVisibleAtMs": 30},
+            {**base, "executionId": "same", "outputModelVisibleAtMs": 10},
+            {**base, "outputModelVisibleAtMs": 20},
+        ]
+        stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+        self.assertEqual(stats, {"execution_idMatches": 1, "unambiguousMatches": 1,
+                                 "ambiguousGroups": 1, "ambiguousRecords": 2})
+        for record in records[:2]:
+            self.assertTrue(record["detailedTimingAmbiguous"])
+            self.assertNotIn("roundTripNs", record)
+        self.assertEqual(records[2]["roundTripNs"], 20_000_000)
+        self.assertEqual(records[2]["detailedTimingMatch"], "unambiguous")
+        self.assertEqual(records[3]["roundTripNs"], 30_000_000)
+        self.assertEqual(records[3]["detailedTimingMatch"], "execution_id")
+
+    def test_detailed_timing_execution_ids_match_once_within_each_call_and_turn(self) -> None:
+        records = [
+            {"turnId": "turn", "callId": "call", "executionId": "one"},
+            {"turnId": "turn", "callId": "call", "executionId": "two"},
+            {"turnId": "other-turn", "callId": "call", "executionId": "one"},
+            {"turnId": "turn", "callId": "other-call", "executionId": "one"},
+        ]
+        calls = [
+            {"_turnId": record["turnId"], "callId": record["callId"],
+             "executionId": record["executionId"], "acceptedAtMs": 0,
+             "outputModelVisibleAtMs": (index + 1) * 10,
+             "processSpawnedAtMs": 1, "processExitedAtMs": 2}
+            for index, record in enumerate(records)
+        ]
+        stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, list(reversed(calls)))
+        self.assertEqual(stats, {"execution_idMatches": 4})
+        self.assertEqual([record["roundTripNs"] for record in records],
+                         [10_000_000, 20_000_000, 30_000_000, 40_000_000])
+
     def test_detailed_timing_marks_unequal_duplicate_groups_ambiguous(self) -> None:
         records = [{"turnId": "turn", "callId": "duplicate"}]
         calls = [

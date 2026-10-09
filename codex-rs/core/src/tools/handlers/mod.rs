@@ -388,7 +388,7 @@ pub(crate) async fn wait_for_tool_environment(
     };
     let Some(starting) = starting else {
         return resolve_tool_environment(environments, environment_id)
-            .map(|environment| environment.cloned());
+            .map(Option::<&_>::cloned);
     };
     tokio::select! {
         biased;

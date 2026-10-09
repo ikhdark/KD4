@@ -848,24 +848,61 @@ mod tests {
         assert!(!temp_dir.path().join("escaped.txt").exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn finalizer_deadline_terminates_the_process_tree() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("cwd");
         #[cfg(windows)]
-        let script = "Set-Content -Encoding ascii child.pid $PID; Start-Sleep -Seconds 3; Set-Content escaped.txt late";
+        let script = {
+            let marker = temp_dir.path().join("escaped.txt");
+            let marker = marker.to_string_lossy().replace('\'', "''");
+            let child_script = temp_dir.path().join("child.ps1");
+            std::fs::write(
+                &child_script,
+                format!("Start-Sleep -Seconds 60; Set-Content -LiteralPath '{marker}' -Value late"),
+            )
+            .expect("write child script");
+            let child_script = child_script.to_string_lossy().replace('\'', "''");
+            format!(
+                "$child = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile -NonInteractive -File \"{child_script}\"'; Set-Content -Encoding ascii child.pid $child.Id; Start-Sleep -Seconds 60"
+            )
+        };
         #[cfg(not(windows))]
-        let script = "(sleep 3; printf late > escaped.txt) & printf '%s' $! > child.pid; sleep 60";
-        let handler = test_handler(script.to_string(), 1, &cwd);
+        let script =
+            "(sleep 60; printf late > escaped.txt) & printf '%s\\n' $! > child.pid; sleep 60".to_string();
+        let handler = test_handler(script, 1, &cwd);
         let mut command = build_command(&explicit_test_shell(), &handler);
         command.current_dir(cwd.as_path());
-        let result = super::run_finalizer_command(command, 1).await;
+        let mut finalizer = Box::pin(super::run_finalizer_command(command, 1));
+        let startup = Instant::now();
+        // Startup is part of the production deadline. Hold virtual time still
+        // until this fixture has a descendant to test, without relying on shell
+        // startup fitting into one wall-clock second. A yielding ready task
+        // prevents Tokio from automatically advancing the paused clock.
+        let pid = loop {
+            tokio::select! {
+                result = &mut finalizer => panic!("finalizer exited before readiness: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+            if let Ok(contents) = std::fs::read_to_string(temp_dir.path().join("child.pid"))
+                && let Some(line) = contents.strip_suffix('\n')
+                && let Ok(pid) = line.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            if startup.elapsed() >= Duration::from_secs(10) {
+                // Dropping the owned runner closes its Windows Job / Unix
+                // process-group guard, including on readiness failure.
+                drop(finalizer);
+                panic!("finalizer descendant did not become ready");
+            }
+        };
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(10), finalizer)
+            .await
+            .expect("finalizer deadline must complete cleanup");
         assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
-        let pid = std::fs::read_to_string(temp_dir.path().join("child.pid"))
-            .expect("finalizer process was spawned")
-            .trim()
-            .parse()
-            .expect("finalizer PID");
         codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2))
             .await
             .expect("finalizer deadline must terminate its process tree");

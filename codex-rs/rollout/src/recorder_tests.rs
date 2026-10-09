@@ -839,7 +839,7 @@ async fn recorder_persists_every_sampling_request_token_count() -> std::io::Resu
         recorder
             .record_canonical_items(&[token_count(10), token_count(20)])
             .await?;
-        // Acceptance of the next item fences both prior automatic writes.
+        // The explicit barrier below fences both prior writes and this marker.
         recorder
             .record_canonical_items_ordered(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
                 AgentMessageEvent {
@@ -1930,7 +1930,7 @@ async fn unrecoverable_append_stops_writer_with_live_senders() -> std::io::Resul
 }
 
 #[tokio::test]
-async fn ordered_append_waits_for_in_memory_acceptance_without_materializing() -> std::io::Result<()>
+async fn ordered_append_accepts_into_bounded_queue_without_materializing() -> std::io::Result<()>
 {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
@@ -1967,25 +1967,26 @@ async fn ordered_append_waits_for_in_memory_acceptance_without_materializing() -
         phase: None,
     }));
     let items = [item];
-    let append = recorder.record_canonical_items_ordered(&items);
-    tokio::pin!(append);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), append.as_mut())
-            .await
-            .is_err(),
-        "ordered append must wait until the writer accepts the item"
-    );
+    tokio::time::timeout(Duration::from_secs(1), recorder.record_canonical_items_ordered(&items))
+        .await
+        .expect("queue custody must not wait for a stalled consumer")?;
+    assert!(recorder.writer_task.pending_bytes.available_permits() < MAX_PENDING_ROLLOUT_BYTES);
+    assert!(!rollout_path.exists(), "queue admission must not materialize the rollout");
 
     resume_tx
         .send(())
         .expect("writer pause receiver should remain open");
-    append.await?;
     assert!(
         !rollout_path.exists(),
         "in-memory acceptance must not materialize or flush the rollout"
     );
 
-    recorder.shutdown().await
+    recorder.shutdown().await?;
+    let (recovered, _, errors) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(serde_json::to_value(recovered.last())?, serde_json::to_value(items.last())?);
+    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+    Ok(())
 }
 
 #[tokio::test]
@@ -2033,6 +2034,227 @@ async fn ordered_append_reaches_disk_before_a_terminal_barrier() -> std::io::Res
     }
 
     recorder.shutdown().await
+}
+
+// Real materialized writer, with a small queue for deterministic backpressure.
+fn storage_overlap_recorder(home: &Path, capacity: usize) -> std::io::Result<RolloutRecorder> {
+    let path = home.join("rollout.jsonl");
+    File::create(&path)?;
+    let writer = open_log_file(&path)?.into_jsonl_writer();
+    let task = Arc::new(RolloutWriterTask::new());
+    let (tx, rx) = mpsc::channel(capacity);
+    let owner = Arc::clone(&task);
+    let cwd = home.to_path_buf();
+    let writer_path = path.clone();
+    task.set_handle(tokio::spawn(async move {
+        if let Err(error) = rollout_writer(Some(writer), None, rx, None, cwd,
+            Some(None), writer_path, Default::default(), Arc::clone(&owner)).await
+        {
+            owner.mark_failed(&error);
+        }
+    }));
+    Ok(RolloutRecorder { tx, writer_task: task, rollout_path: path })
+}
+
+#[tokio::test]
+async fn ordered_append_overlaps_blocked_storage_but_queue_remains_bounded() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = storage_overlap_recorder(home.path(), 1)?;
+    let lock = compression::lock_rollout_for_write_blocking(recorder.rollout_path())?;
+    // The old acceptance path is a deterministic fence: the writer owns this
+    // first item and cannot consume another until the OS write lock is released.
+    recorder.record_canonical_items_with_flush(&[agent_message("first")], true, true).await?;
+    tokio::time::timeout(Duration::from_secs(1),
+        recorder.record_canonical_items_ordered(&[agent_message("second")]))
+        .await.expect("independent execution must not wait for the previous write")?;
+    let permits = recorder.writer_task.pending_bytes.available_permits();
+    assert!(tokio::time::timeout(Duration::from_millis(20),
+        recorder.record_canonical_items_ordered(&[agent_message("cancelled")])).await.is_err());
+    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), permits,
+        "cancelled queue admission must release its byte charge");
+    // A cancelled barrier cannot remove either accepted item or unlock storage.
+    assert!(tokio::time::timeout(Duration::from_millis(20), recorder.flush()).await.is_err());
+    let other_home = TempDir::new()?;
+    let other = storage_overlap_recorder(other_home.path(), 1)?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        other.record_canonical_items_ordered(&[agent_message("independent")]).await?;
+        other.shutdown().await
+    }).await.expect("another writer must remain independent")?;
+    drop(lock);
+    recorder.flush_durable().await?;
+    recorder.shutdown().await?;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(serde_json::to_value(items)?,
+        serde_json::to_value(vec![agent_message("first"), agent_message("second")])?);
+    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_append_cancelled_shutdown_still_drains_owned_queue() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = storage_overlap_recorder(home.path(), 4)?;
+    let lock = compression::lock_rollout_for_write_blocking(recorder.rollout_path())?;
+    recorder.record_canonical_items_with_flush(&[agent_message("first")], true, true).await?;
+    recorder.record_canonical_items_ordered(&[agent_message("second")]).await?;
+    assert!(tokio::time::timeout(Duration::from_millis(20), recorder.shutdown()).await.is_err());
+    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUTTING_DOWN);
+    assert!(recorder.record_canonical_items_ordered(&[agent_message("too-late")]).await.is_err());
+    drop(lock);
+    let worker = recorder.writer_task.handle.lock().unwrap().take().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker).await.expect("owned shutdown drain")
+        .expect("writer task");
+    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUT_DOWN);
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(serde_json::to_value(items)?,
+        serde_json::to_value(vec![agent_message("first"), agent_message("second")])?);
+    Ok(())
+}
+
+/// Matched real persistence pipeline: capture -> artifact publication -> next
+/// work -> durable flush -> shutdown -> authenticated reload. No provider/model
+/// calls are included. The unchanged private acceptance path is the baseline.
+#[tokio::test]
+#[ignore = "wall-clock benchmark; run explicitly without competing benchmarks"]
+async fn benchmark_ordered_append_storage_overlap() -> std::io::Result<()> {
+    for slow_ms in [0, 2_000] {
+        for sample in 0..4 {
+            for baseline in if sample % 2 == 0 { [true, false] } else { [false, true] } {
+                let home = TempDir::new()?;
+                let recorder = storage_overlap_recorder(home.path(), 4)?;
+                let first = RolloutItem::ToolManifest(ToolManifestItem::full(
+                    "storage-overlap".into(), serde_json::json!({
+                        "tools":[{"name":"fixture", "description":"EXACT_EVIDENCE\n".repeat(4096)}]
+                    }),
+                ));
+                let second = agent_message("next-work");
+                let lock = if slow_ms > 0 {
+                    Some(compression::lock_rollout_for_write_blocking(recorder.rollout_path())?)
+                } else { None };
+                let started = std::time::Instant::now();
+                let release = tokio::spawn(async move {
+                    if lock.is_some() { tokio::time::sleep(Duration::from_millis(slow_ms)).await; }
+                    drop(lock);
+                });
+                recorder.record_canonical_items_with_flush(std::slice::from_ref(&first), true, true).await?;
+                let append_started = std::time::Instant::now();
+                if baseline {
+                    recorder.record_canonical_items_with_flush(std::slice::from_ref(&second), true, true).await?;
+                } else {
+                    recorder.record_canonical_items_ordered(std::slice::from_ref(&second)).await?;
+                }
+                let continuation_us = append_started.elapsed().as_micros();
+                // Fixed independent work on both sides, not a removed wait.
+                tokio::time::sleep(Duration::from_millis(if slow_ms == 0 { 5 } else { 2_000 })).await;
+                let drain_started = std::time::Instant::now();
+                recorder.flush_durable().await?;
+                recorder.shutdown().await?;
+                release.await.expect("storage release");
+                let drain_us = drain_started.elapsed().as_micros();
+                let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+                assert_eq!(errors, 0);
+                assert_eq!(serde_json::to_value(items)?, serde_json::to_value(vec![first, second])?);
+                assert!(fs::read_to_string(recorder.rollout_path())?.contains(crate::payload_artifact::KIND));
+                assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+                if sample > 0 {
+                    println!("{}", serde_json::json!({"benchmark":"ordered_append_storage_overlap",
+                        "baseline":baseline, "slow_storage_ms":slow_ms, "sample":sample,
+                        "continuation_us":continuation_us, "drain_us":drain_us,
+                        "end_to_end_us":started.elapsed().as_micros(), "records":2,
+                        "exact_recovery":true, "model_calls":0}));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn payload_sync_failure_keeps_durable_barrier_retryable() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = storage_overlap_recorder(home.path(), 4)?;
+    let items = (0..16).map(|i| RolloutItem::ToolManifest(ToolManifestItem::full(
+        format!("payload-{i}"), serde_json::json!({"index":i,"body":"exact evidence\n".repeat(2048)}),
+    ))).collect::<Vec<_>>();
+    recorder.record_canonical_items_ordered(&items).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failed_calls = Arc::clone(&calls);
+    crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(recorder.rollout_path().to_path_buf(),
+        crate::payload_artifact::SyncTestHook { parallelism:8, before_sync: Arc::new(move |_| {
+            if failed_calls.fetch_add(1, Ordering::SeqCst) == 0 { Err(std::io::Error::other("injected sync failure")) }
+            else { Ok(()) }
+        }) });
+    assert!(recorder.flush_durable().await.is_err(), "must not claim rollout durability after a failed payload sync");
+    assert!(calls.load(Ordering::SeqCst) > 1, "successful workers also ran");
+    let retry_calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&retry_calls);
+    crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(recorder.rollout_path().to_path_buf(),
+        crate::payload_artifact::SyncTestHook { parallelism:8, before_sync: Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst); Ok(())
+        }) });
+    recorder.flush_durable().await?;
+    assert_eq!(retry_calls.load(Ordering::SeqCst), 16, "failure acknowledges no payloads");
+    recorder.flush_durable().await?;
+    assert_eq!(retry_calls.load(Ordering::SeqCst), 16, "successful barrier clears its prefix");
+    crate::payload_artifact::sync_test_hooks().lock().unwrap().remove(recorder.rollout_path());
+    recorder.shutdown().await?;
+    let (reloaded, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(serde_json::to_value(reloaded)?, serde_json::to_value(items)?);
+    Ok(())
+}
+
+/// Real recorder admission, artifact writes, durability, subsequent execution,
+/// shutdown and authenticated reload. One worker reproduces the previous serial
+/// barrier; eight uses the production bound. No model/provider time is measured.
+#[tokio::test]
+#[ignore = "wall-clock benchmark; run explicitly without competing benchmarks"]
+async fn benchmark_payload_sync_end_to_end() -> std::io::Result<()> {
+    for slow_ms in [0, 250] {
+        for sample in 0..4 {
+            for parallelism in if sample % 2 == 0 { [1, 8] } else { [8, 1] } {
+                let home = TempDir::new()?;
+                let recorder = storage_overlap_recorder(home.path(), 4)?;
+                let items = (0..16).map(|i| RolloutItem::ToolManifest(ToolManifestItem::full(
+                    format!("payload-{i}"), serde_json::json!({"index":i,"body":"exact evidence\n".repeat(2048)}),
+                ))).collect::<Vec<_>>();
+                let syncs = Arc::new(AtomicUsize::new(0));
+                let counted = Arc::clone(&syncs);
+                crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(recorder.rollout_path().to_path_buf(),
+                    crate::payload_artifact::SyncTestHook { parallelism, before_sync: Arc::new(move |_| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if slow_ms > 0 { std::thread::sleep(Duration::from_millis(slow_ms)); }
+                        Ok(())
+                    }) });
+                let started = std::time::Instant::now();
+                recorder.record_canonical_items_ordered(&items).await?;
+                let admission_us = started.elapsed().as_micros();
+                recorder.flush_durable().await?;
+                let continuation_us = started.elapsed().as_micros();
+                // Same useful subsequent work on both sides, after durability.
+                recorder.record_canonical_items_ordered(&[agent_message("next execution")]).await?;
+                recorder.shutdown().await?;
+                let (reloaded, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+                let mut expected = items;
+                expected.push(agent_message("next execution"));
+                assert_eq!(errors, 0);
+                assert_eq!(serde_json::to_value(reloaded)?, serde_json::to_value(expected)?);
+                assert_eq!(syncs.load(Ordering::SeqCst), 16);
+                assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+                crate::payload_artifact::sync_test_hooks().lock().unwrap().remove(recorder.rollout_path());
+                if sample > 0 {
+                    println!("{}", serde_json::json!({"benchmark":"payload_sync_end_to_end",
+                        "parallelism":parallelism,"slow_storage_ms_per_payload":slow_ms,"sample":sample,
+                        "admission_us":admission_us,"continuation_us":continuation_us,
+                        "end_to_end_us":started.elapsed().as_micros(),"payloads":16,
+                        "exact_recovery":true,"model_calls":0}));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]

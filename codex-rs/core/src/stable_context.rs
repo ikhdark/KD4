@@ -731,7 +731,6 @@ fn project_stable_context_inner(
         let ResponseItem::Message {
             role,
             content,
-            internal_chat_message_metadata_passthrough: _,
             ..
         } = item
         else {
@@ -1433,6 +1432,7 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
     })
 }
 
+#[cfg(test)]
 fn contains_known_open_marker(text: &str) -> bool {
     known_open_marker_kind(text).is_some()
 }

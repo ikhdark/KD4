@@ -487,9 +487,15 @@ impl RequestSerializationQueues {
         loop {
             let changed = {
                 let mut state = self.inner.lock().await;
+                let RequestSerializationState {
+                    queues,
+                    total_queued,
+                    total_queued_bytes,
+                    ..
+                } = &mut *state;
+                let Some(queue) = queues.get_mut(&key) else { return };
                 loop {
-                    let queues = state.queues.get_mut(&key).expect("drain owns its queue");
-                    let next = queues.control.front().or_else(|| queues.ordered.front());
+                    let next = queue.control.front().or_else(|| queue.ordered.front());
                     let Some(next) = next else { break };
                     // Refill free reader slots, but never cross a queued writer.
                     if !running.is_empty() && (exclusive
@@ -499,19 +505,21 @@ impl RequestSerializationQueues {
                         break;
                     }
                     let control = next.access == RequestSerializationAccess::Control;
-                    let request = if control { queues.control.pop_front() } else { queues.ordered.pop_front() }.unwrap();
+                    let Some(request) = (if control { queue.control.pop_front() } else { queue.ordered.pop_front() }) else {
+                        break;
+                    };
                     exclusive = request.access != RequestSerializationAccess::SharedRead;
                     if !control {
-                        state.total_queued -= 1;
-                        state.total_queued_bytes = state.total_queued_bytes.saturating_sub(request.estimated_bytes());
+                        *total_queued -= 1;
+                        *total_queued_bytes = total_queued_bytes.saturating_sub(request.estimated_bytes());
                     }
                     running.push(request.request.run());
                 }
                 if running.is_empty() {
-                    state.queues.remove(&key);
+                    queues.remove(&key);
                     return;
                 }
-                Arc::clone(&state.queues[&key].changed)
+                Arc::clone(&queue.changed)
             };
             tokio::select! {
                 biased;

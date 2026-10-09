@@ -154,6 +154,9 @@ mod tests {
         let session_store = codex_extension_api::ExtensionData::new("session");
         let thread_store = codex_extension_api::ExtensionData::new(thread_id.to_string());
         let turn_store = codex_extension_api::ExtensionData::new("turn-warning");
+        turn_store.insert(codex_core::skills::model::HostSkillsSnapshot::new(Arc::new(
+            codex_core::skills::SkillLoadOutcome::default(),
+        )));
         for contributor in registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(codex_extension_api::ThreadStartInput {

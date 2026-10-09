@@ -53,6 +53,7 @@ use rmcp::service::{self};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::auth::AuthClient;
 use rmcp::transport::auth::AuthError;
+use rmcp::transport::auth::InMemoryCredentialStore;
 use rmcp::transport::auth::OAuthState;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
@@ -551,7 +552,7 @@ struct RecoveryOwner<'a> {
 
 impl Drop for RecoveryOwner<'_> {
     fn drop(&mut self) {
-        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         slot.take();
         self.sender.send_if_modified(|outcome| {
             if outcome.is_some() { return false; }
@@ -1453,7 +1454,7 @@ impl RmcpClient {
             return Ok(());
         }
         let (mut observation, owner) = {
-            let mut slot = self.session_recovery.lock().unwrap_or_else(|error| error.into_inner());
+            let mut slot = self.session_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(observation) = slot.as_ref() {
                 (observation.clone(), None)
             } else {
@@ -1579,6 +1580,12 @@ async fn create_oauth_transport_and_runtime(
     let mut oauth_state =
         OAuthState::new_with_oauth_http_client(url.to_string(), oauth_http_client).await?;
 
+    let credential_store = InMemoryCredentialStore::new();
+    let OAuthState::Unauthorized(manager) = &mut oauth_state else {
+        return Err(anyhow!("unexpected OAuth state before client setup"));
+    };
+    manager.set_credential_store(credential_store.clone());
+
     oauth_state
         .set_credentials(
             &initial_tokens.client_id,
@@ -1598,7 +1605,6 @@ async fn create_oauth_transport_and_runtime(
         StreamableHttpClientAdapter::new(http_client, default_headers, /*auth_provider*/ None),
         manager,
     );
-    let auth_manager = auth_client.auth_manager.clone();
 
     let transport = StreamableHttpClientTransport::with_client(
         auth_client,
@@ -1609,7 +1615,7 @@ async fn create_oauth_transport_and_runtime(
         server_name.to_string(),
         url.to_string(),
         codex_home,
-        auth_manager,
+        credential_store,
         credentials_store,
         keyring_backend_kind,
         Some(initial_tokens),

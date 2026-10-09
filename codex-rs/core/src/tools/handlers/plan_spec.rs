@@ -88,7 +88,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             ..JsonSchema::object(
             BTreeMap::from([
                 ("expected_revision".to_string(), JsonSchema::string(Some(
-                    "Revision from the last update_plan result or conflict reconciliation. Checked atomically before any change. A replacement may omit it only if the plan has not changed since this sampling step began; otherwise reconcile and supply it. Index-based updates always require it. Stable-ID deltas may instead use expected_step_revisions.".into()
+                    "Revision from the last update_plan result or conflict reconciliation. In exec, store the returned object and pass expected_revision: saved.revision directly; do not retype the hash. Checked atomically before any change. A replacement may omit it only if the plan has not changed since this sampling step began; otherwise reconcile and supply it. Index-based updates always require it. Stable-ID deltas may instead use expected_step_revisions.".into()
                 ))),
                 (
                     "explanation".to_string(),

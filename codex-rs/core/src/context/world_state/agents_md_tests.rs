@@ -268,7 +268,7 @@ fn freshness_notice_alone_does_not_prove_instruction_body_retention() {
 #[test]
 fn oversized_freshness_updates_do_not_repeat_body_and_middle_changes_do() {
     let body = "b".repeat(50_000);
-    let loaded = LoadedAgentsMd::from_text_for_testing(body.clone());
+    let loaded = LoadedAgentsMd::from_text_for_testing(body);
     let mut refreshed = WorldState::default();
     refreshed.add_section(AgentsMdState::new(Some(&loaded)));
     let (fragments, accepted) = refreshed.render_full_with_snapshot();

@@ -50,6 +50,18 @@ def main() -> int:
     command = sys.argv[1]
     recipe_name = sys.argv[2] if len(sys.argv) > 2 else ""
     recipe_args = sys.argv[3:]
+    which, cache_dir = prepare_recipe_environment(command)
+    try:
+        return run_powershell(
+            command, recipe_name, recipe_args, which=which, cache_dir=cache_dir
+        )
+    except ValueError as exc:
+        print(f"just shell adapter: {exc}", file=sys.stderr)
+        return 1
+
+
+def prepare_recipe_environment(command: str) -> tuple[Callable[[str], str | None], Path]:
+    """Apply the same defaults to shell and explicitly structured recipes."""
     repo_root = Path(__file__).resolve().parents[1]
     cache_dir = probe_cache_dir(repo_root)
     os.environ.update(python_cpu_env(os.environ))
@@ -72,12 +84,32 @@ def main() -> int:
             )
         )
 
-    try:
+    return which, cache_dir
+
+
+def run_python(script: str, arguments: list[str], *, program: str = "python") -> int:
+    """Run an explicit Python recipe without parsing or launching a shell.
+
+    Keep interpreter selection after environment setup: a local scripts venv or
+    caller's active venv must be used just as it is by the PowerShell adapter.
+    Inherit streams and process ownership; do not buffer, retry, or detach.
+    """
+    which, cache_dir = prepare_recipe_environment(f"{program} {script}")
+    if program != "python":
+        # The Just `python` variable historically accepts a shell expression
+        # (for example `python -I`). Preserve explicit overrides unchanged;
+        # only the known default takes the structured fast path.
+        quoted_script = "'" + script.replace("'", "''") + "'"
         return run_powershell(
-            command, recipe_name, recipe_args, which=which, cache_dir=cache_dir
+            f"{program} {quoted_script} {{args}}; exit $LASTEXITCODE",
+            "python-recipe", arguments, which=which, cache_dir=cache_dir,
         )
-    except ValueError as exc:
-        print(f"just shell adapter: {exc}", file=sys.stderr)
+    try:
+        return subprocess.run(
+            [which("python") or "python", script, *arguments], check=False
+        ).returncode
+    except OSError as exc:
+        print(f"Failed to launch Python recipe: {exc}", file=sys.stderr)
         return 1
 
 

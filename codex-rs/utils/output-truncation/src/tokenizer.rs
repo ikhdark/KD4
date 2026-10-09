@@ -24,6 +24,16 @@ pub fn truncate_model_text_at_lines_with_artifact(
 pub fn truncate_model_text_at_lines_with_recovery(
     text: &str, limit: usize, line_offset: usize, total_lines: usize, artifact_id: Option<&str>,
 ) -> (String, Option<(usize, usize)>) {
+    truncate_model_text_at_lines_with_limits(text, limit, limit, line_offset, total_lines, artifact_id)
+}
+
+/// Retain a whole packet up to `whole_packet_limit`, otherwise truncate to
+/// `limit`. Reuse the same encoding for admission and truncation. Callers own
+/// the hard cap; a zero truncation budget never admits a nonempty packet.
+pub fn truncate_model_text_at_lines_with_limits(
+    text: &str, limit: usize, whole_packet_limit: usize, line_offset: usize,
+    total_lines: usize, artifact_id: Option<&str>,
+) -> (String, Option<(usize, usize)>) {
     let all_lines = (!text.is_empty()).then(|| (line_offset + 1, line_offset + text.lines().count()));
     // Silent projections need neither the vocabulary nor a token vector for
     // output that will be discarded, including logs preceding a script error.
@@ -32,12 +42,13 @@ pub fn truncate_model_text_at_lines_with_recovery(
     }
     // Every ordinary token encodes at least one byte, so text this short fits
     // without encoding it or loading the vocabulary.
-    if text.len() <= limit {
+    let whole_packet_limit = whole_packet_limit.max(limit);
+    if text.len() <= whole_packet_limit {
         return (text.to_string(), None);
     }
     let bpe = tiktoken_rs::o200k_base_singleton();
     let tokens = bpe.encode_ordinary(text);
-    if tokens.len() <= limit {
+    if tokens.len() <= whole_packet_limit {
         return (text.to_string(), None);
     }
     let mut marker = format!("\nWarning: truncated output ({} tokens)\n", tokens.len());
@@ -147,6 +158,28 @@ fn omitted_file_counts(text: &str, start: usize, end: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_packet_admission_reuses_encoding_without_changing_recovery() {
+        for source in ["", "hello world", "λ😀\r\n", "<|endoftext|>"] {
+            let source = source.repeat(64);
+            let tokens = model_token_count(&source);
+            for limit in [0, 1, 10, 100, tokens, tokens.saturating_sub(1)] {
+                let whole = limit.saturating_add(limit / 3);
+                let actual = truncate_model_text_at_lines_with_limits(
+                    &source, limit, whole, 50, 200, Some("fixture"),
+                );
+                if limit > 0 && tokens <= whole {
+                    assert_eq!(actual, (source.clone(), None));
+                } else {
+                    assert_eq!(actual, truncate_model_text_at_lines_with_recovery(
+                        &source, limit, 50, 200, Some("fixture"),
+                    ));
+                    assert!(model_token_count(&actual.0) <= limit);
+                }
+            }
+        }
+    }
 
     #[test]
     fn code_packet_uses_tokenizer_capacity_and_preserves_failure_tail() {

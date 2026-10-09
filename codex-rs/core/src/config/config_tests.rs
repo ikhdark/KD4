@@ -9719,6 +9719,42 @@ max_concurrent_threads_per_session = 17
 }
 
 #[test]
+fn multi_agent_v2_default_usage_hints_require_report_reconciliation() {
+    let config = resolve_multi_agent_v2_config(&ConfigToml::default());
+    for hint in [
+        config.root_agent_usage_hint_text,
+        config.subagent_usage_hint_text,
+    ] {
+        let hint = hint.expect("root and worker parents need report reconciliation guidance");
+        let sections = crate::stable_context::multi_agent_usage_hint_sections(Some(&hint));
+        let rendered = sections.join("\n");
+        for required in [
+            "Read every returned report in full",
+            "including read-only reviews and substantive follow-up messages",
+            "Recover truncated or omitted portions from retained output",
+            "keep the affected assessment incomplete",
+            "Account for every substantive finding or recommendation",
+            "rejected with an evidence-based reason",
+            "outside the user's scope",
+            "unresolved with a concrete next action or blocker",
+            "Verify claims against current source and relevant consumers",
+            "do not blindly implement recommendations or duplicate settled investigations",
+            "Investigate unresolved in-scope findings",
+            "does not discharge obtainable work",
+            "When implementation is authorized, implement verified, applicable, in-scope suggestions",
+            "validate the resulting behavior through affected consumers",
+            "Do not stop at acknowledging them, listing them in a plan, or describing future work",
+            "do not ask for renewed permission to perform already-authorized changes",
+            "record the evidence instead of making unnecessary edits",
+            "Respect review-only/no-write scope, cancellation, and genuine blockers",
+            "do not call a partial integration complete",
+        ] {
+            assert!(rendered.contains(required), "missing report policy: {required}");
+        }
+    }
+}
+
+#[test]
 fn multi_agent_v2_preserves_empty_mode_hint_override() {
     let config_toml = toml::from_str(
         r#"[features.multi_agent_v2]

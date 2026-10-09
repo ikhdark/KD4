@@ -551,9 +551,18 @@ def _rust_module(
             for sibling in sorted(path.parent.glob("*.rs")):
                 try:
                     text = sibling.read_text(encoding="utf-8", errors="replace")
-                except OSError:
+                    # Use the regex only as a cheap prefilter. Ownership must
+                    # come from declarations, never comments or string literals.
+                    modules = [
+                        (declared, name)
+                        for (kind, name), items in _rust_scope_items(text).items()
+                        if kind == "mod"
+                        for declared, body in items
+                        if declared is not None and body is None
+                    ] if _PATH_MODULE.search(text) else []
+                except (OSError, ValueError):
                     continue
-                siblings.append((sibling, _PATH_MODULE.findall(text)))
+                siblings.append((sibling, modules))
             declarations[path.parent] = siblings
         for sibling, modules in declarations[path.parent]:
             if sibling == path:
@@ -575,7 +584,7 @@ def _rust_scope_items(
 ) -> dict[tuple[str, str], list[tuple[str | None, str | None]]]:
     """Read named module/function declarations at this scope, excluding literal bodies."""
     token = re.compile(
-        r'//[^\n]*|/\*|r(?P<hashes>\#*)".*?"(?P=hashes)|'
+        r'//[^\n]*|/\*|(?:br|cr|r)(?P<hashes>\#*)".*?"(?P=hashes)|'
         r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\'|[A-Za-z_][A-Za-z_0-9]*|[^\s]',
         re.DOTALL,
     )
@@ -1525,7 +1534,8 @@ class RustTestRunner:
               + " ".join(quote(arg) for arg in command), file=sys.stderr)
 
     def check_gates(
-        self, names: Sequence[str], *, include_generated: bool = True
+        self, names: Sequence[str], *, include_generated: bool = True,
+        discovered_builds: dict[str, dict[str, Any]] | None = None,
     ) -> dict[GateStep, tuple[str, ...]]:
         """Verify declared filter/ID parity without running tests or helpers."""
         if not names:
@@ -1545,14 +1555,21 @@ class RustTestRunner:
         # Invocation-local discovery only, never cached test proof. Identical
         # selections shared by multiple gates need one Cargo/list pass, while
         # every declaration still checks its own exact/ignored-test contract.
-        listings: dict[tuple[str, ...], dict[str, bool]] = {}
+        listings: dict[tuple[str, ...], tuple[dict[str, bool], dict[str, Any]]] = {}
         for step in discovery_steps:
             target = self.target(step.target)
             filter_args = self._gate_filter_args(step)
             key = tuple(self._list_command(target, filter_args))
             if key not in listings:
-                listings[key] = self._list_tests(target, filter_args)
-            listed = listings[key]
+                build: dict[str, Any] = {}
+                listed = self._list_tests(
+                    target, filter_args,
+                    discovered_build=build if discovered_builds is not None else None,
+                )
+                listings[key] = listed, build
+            listed, build = listings[key]
+            if discovered_builds is not None:
+                discovered_builds[_nextest_binary_id(target)] = build
             actual = set(listed)
             expected = set(step.tests) if step.tests else actual
             if not actual:
@@ -1594,8 +1611,11 @@ class RustTestRunner:
         # Exact generated selections are proved by completed results below.
         # Explicit filters must always prove parity before batching: execution
         # of the declared IDs alone cannot detect an over-broad source filter.
+        discovered_builds: dict[str, dict[str, Any]] = {}
         try:
-            resolved_tests = self.check_gates(names, include_generated=discover)
+            resolved_tests = self.check_gates(
+                names, include_generated=discover, discovered_builds=discovered_builds,
+            )
         except RunnerError:
             for name in dict.fromkeys(names):
                 for step in self.gate(name).steps:
@@ -1650,6 +1670,14 @@ class RustTestRunner:
             if any(helper.name not in artifacts for helper in helpers):
                 continue
             targets = [self.target(step.target) for step in batch]
+            # As in run_target, reuse only this invocation's discovered binary,
+            # never its test results. Keep multi-target Cargo feature unification
+            # intact rather than merging independently compiled build metadata.
+            build = discovered_builds.get(_nextest_binary_id(targets[0])) if len(batch) == 1 else None
+            binaries_metadata = (
+                self._retain_text(json.dumps(build), prefix="discovered-build-")
+                if build else None
+            )
             try:
                 env = self._helper_environment(targets, helpers, artifacts)
                 result = self._checked(
@@ -1657,6 +1685,7 @@ class RustTestRunner:
                         targets[0],
                         self._batch_filter_args(targets, batch),
                         batch=targets[1:],
+                        binaries_metadata=binaries_metadata,
                     ),
                     env=env,
                     capture=self._test_run_capture(),
@@ -1845,11 +1874,15 @@ class RustTestRunner:
         filter_args: Sequence[str],
         *,
         batch: Sequence[Target] = (),
+        binaries_metadata: Path | None = None,
     ) -> list[str]:
         # The proof owns its execution policy: no profile may let one failing
         # test cancel another step's tests, least of all in a shared batch.
         return [
-            *self._run_command(target, filter_args, no_fail_fast=True, batch=batch),
+            *self._run_command(
+                target, filter_args, no_fail_fast=True, batch=batch,
+                binaries_metadata=binaries_metadata,
+            ),
             "--color",
             "never",
             "--status-level",

@@ -843,7 +843,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             "core-test-lane target *args:",
         ):
             body = justfile.split(recipe, 1)[1].split("\n\n", 1)[0]
-            self.assertIn('just _core-test-reserved fast "{{ target }}"', body)
+            self.assertIn('"just", "_core-test-reserved", "fast", *sys.argv[1:]', body)
             self.assertNotIn("--fail-fast", body)
         reserved = justfile.split("_core-test-reserved profile target *args:", 1)[
             1
@@ -1328,6 +1328,130 @@ class FormatterWorkflowRegressionTest(unittest.TestCase):
         ):
             formatter.main(["--only", "python-scripts", "--rust-package", "codex-core"])
         run.assert_not_called()
+
+
+class StructuredPythonRecipeTest(unittest.TestCase):
+    def fixture(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "codex-rs").mkdir()
+        (root / "scripts").mkdir()
+        shutil.copyfile(REPO_ROOT / "justfile", root / "justfile")
+        for name in ("just-shell.py", "rust_tool_env.py"):
+            shutil.copyfile(REPO_ROOT / "scripts" / name, root / "scripts" / name)
+        return root
+
+    def test_direct_recipe_preserves_environment_interpreter_streams_and_exit(self):
+        shell = load_just_shell_module()
+        seen = {}
+
+        def which(name):
+            seen.update(os.environ)
+            return "/venv/python" if name == "python" else None
+
+        with (
+            mock.patch.dict(os.environ, {"PYTHONHOME": "old"}, clear=True),
+            mock.patch.object(shell, "python_tool_env", return_value={"VIRTUAL_ENV": "/venv"}),
+            mock.patch.object(shell, "rust_tool_env", return_value={"RUSTC_WRAPPER": ""}),
+            mock.patch.object(shell.shutil, "which", side_effect=which),
+            mock.patch.object(shell.subprocess, "run", return_value=subprocess.CompletedProcess([], 75)) as run,
+            mock.patch.object(shell, "run_powershell") as powershell,
+        ):
+            self.assertEqual(shell.run_python("rust_test_runner.py", ["a b", "", "$x;*", "é"]), 75)
+        run.assert_called_once_with(
+            ["/venv/python", "rust_test_runner.py", "a b", "", "$x;*", "é"], check=False
+        )
+        powershell.assert_not_called()
+        self.assertNotIn("PYTHONHOME", seen)
+        self.assertEqual(seen["VIRTUAL_ENV"], "/venv")
+        self.assertEqual(seen["RUSTC_WRAPPER"], "")
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    def test_real_recipes_forward_exact_arguments_without_powershell(self):
+        root = self.fixture()
+        stub = "import json, os, sys\nprint(json.dumps(sys.argv[1:]))\nprint('diagnostic', file=sys.stderr)\nsys.exit(int(os.environ.get('STUB_EXIT', '0')))\n"
+        for script in ("rust_build_status.py", "rust_test_runner.py"):
+            (root / "scripts" / script).write_text(stub, encoding="utf-8")
+        # A shell fallback must fail, rather than accidentally satisfying the test.
+        with (root / "scripts" / "just-shell.py").open("a", encoding="utf-8") as source:
+            source.write("\ndef run_powershell(*args, **kwargs):\n raise AssertionError('shell hop')\n")
+        tail = ["-E", "test(a b) | test(é); '$literal'", "--skip", "*"]
+        cases = [
+            (["core-test", "fixture", *tail], ["run-lane", "--lane", "core-tests", "--warm-wait-seconds", "0", "--", "just", "_core-test-reserved", "local", "fixture", "--no-fail-fast", *tail]),
+            (["core-test-fast", "fixture", *tail], ["run-lane", "--lane", "core-tests", "--warm-wait-seconds", "0", "--", "just", "_core-test-reserved", "fast", "fixture", *tail]),
+            (["core-test-small", "fixture", *tail], ["run-lane", "--lane", "core-tests-small", "--warm-wait-seconds", "0", "--", "just", "_core-test-small-reserved", "fixture", *tail]),
+            (["core-test-lane", "fixture", *tail], ["run-lane", "--lane", "fixture", "--warm-wait-seconds", "0", "--", "just", "_core-test-reserved", "fast", "fixture", *tail]),
+            (["core-gate", "one", "two"], ["run-lane", "--lane", "core-tests", "--warm-wait-seconds", "0", "--", "just", "_core-gate-reserved", "one", "two"]),
+            (["core-test-plan", "fixture"], ["plan", "fixture"]),
+            (["core-test-list"], ["list-targets"]),
+            (["core-test-manifest-check"], ["check-manifest"]),
+            (["core-test-gates-for", "a b.rs", "é.rs"], ["gates-for", "a b.rs", "é.rs"]),
+        ]
+        for index, (arguments, expected) in enumerate(cases):
+            code = (0, 2, 75)[index % 3]
+            with self.subTest(recipe=arguments[0], code=code):
+                result = subprocess.run(
+                    ["just", *arguments], cwd=root, capture_output=True,
+                    encoding="utf-8", timeout=15,
+                    env=dict(os.environ, STUB_EXIT=str(code), PYTHONIOENCODING="utf-8"),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+                self.assertIn("diagnostic", result.stderr)
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    def test_explicit_python_override_retains_shell_semantics(self):
+        root = self.fixture()
+        (root / "scripts" / "rust_test_runner.py").write_text(
+            "import json,sys\nprint(json.dumps([sys.flags.isolated, *sys.argv[1:]]))\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["just", "--set", "python", "python -I", "core-test-plan", "a b"],
+            cwd=root, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [1, "plan", "a b"])
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    def test_real_recipe_preserves_large_split_streams_and_failure(self):
+        root = self.fixture()
+        (root / "scripts" / "rust_build_status.py").write_text(
+            "import sys\nsys.stdout.buffer.write(('é\\r\\n'*40000).encode())\n"
+            "sys.stderr.buffer.write(b'failure\\r\\n'*20000)\nsys.exit(7)\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["just", "core-gate", "fixture"], cwd=root, capture_output=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, ("é\r\n" * 40000).encode())
+        self.assertTrue(result.stderr.startswith(b"failure\r\n" * 20000))
+        self.assertIn(b"exit code 7", result.stderr)
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    def test_real_recipe_cancellation_keeps_output_and_reaps_descendants(self):
+        from scripts import process_owner
+
+        root = self.fixture()
+        marker = root / "escaped"
+        child = f"import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).touch()"
+        (root / "scripts" / "rust_build_status.py").write_text(
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+            "print('ready', flush=True)\ntime.sleep(60)\n", encoding="utf-8"
+        )
+        with process_owner.operation() as operation:
+            def observe(chunk):
+                if "ready" in chunk:
+                    operation.cancelled.set()
+            result = process_owner.run_finite(
+                ["just", "core-gate", "fixture"], cwd=root, timeout=10, observe=observe
+            )
+        self.assertEqual((result.status, result.returncode), ("cancelled", 130))
+        self.assertIn("ready", result.stdout)
+        time.sleep(1.1)
+        self.assertFalse(marker.exists(), "descendant escaped cancellation")
 
 
 if __name__ == "__main__":

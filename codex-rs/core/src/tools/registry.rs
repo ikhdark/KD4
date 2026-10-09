@@ -154,6 +154,7 @@ pub(crate) enum TerminalFailureReuse {
     /// arguments and the same turn-local mutation/plan/input/tool-exposure
     /// revision. Producers with external or time-dependent invalidators must
     /// not opt in. Authorization and hooks must remain unchanged.
+    #[cfg(test)]
     RequestRevision,
     /// Also permits reuse of a previously rejected malformed JSON payload.
     /// The runtime must parse JSON before any effects. Syntax is rechecked by
@@ -699,6 +700,7 @@ impl AnyToolResult {
     /// here handed JS a logical-artifact envelope with no `results[]`, so code
     /// inside a cell could not branch on what a read actually returned. The
     /// projection stays on the model-facing `into_response` path.
+    #[cfg(test)]
     pub(crate) fn code_mode_result(self) -> serde_json::Value {
         let Self {
             payload, result, ..

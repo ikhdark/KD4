@@ -508,12 +508,12 @@ impl EventProcessorWithJsonOutput {
         let error = ThreadErrorEvent { message };
         self.last_critical_error = Some(error.clone());
         events.push(ThreadEvent::Error(error.clone()));
-        events.push(ThreadEvent::TurnFailed(TurnFailedEvent {
+        events.push(ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
             error,
             disposition: crate::exec_events::TurnFailureDisposition::TransportLost,
             usage: self.last_total_token_usage.as_ref().map(|_| self.usage_from_last_total()),
             timing: None,
-        }));
+        })));
         events
     }
 
@@ -719,12 +719,12 @@ impl EventProcessorWithJsonOutput {
                             .unwrap_or_else(|| ThreadErrorEvent {
                                 message: "turn failed".to_string(),
                             });
-                        events.push(ThreadEvent::TurnFailed(TurnFailedEvent {
+                        events.push(ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                             error,
                             disposition: crate::exec_events::TurnFailureDisposition::Failed,
                             usage: self.last_total_token_usage.as_ref().map(|_| self.usage_from_last_total()),
                             timing,
-                        }));
+                        })));
                         CodexStatus::InitiateShutdown
                     }
                     TurnStatus::Interrupted => {
@@ -738,12 +738,12 @@ impl EventProcessorWithJsonOutput {
                             .unwrap_or_else(|| ThreadErrorEvent {
                                 message: "turn interrupted".to_string(),
                             });
-                        events.push(ThreadEvent::TurnFailed(TurnFailedEvent {
+                        events.push(ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                             error,
                             disposition: crate::exec_events::TurnFailureDisposition::Interrupted,
                             usage: self.last_total_token_usage.as_ref().map(|_| self.usage_from_last_total()),
                             timing,
-                        }));
+                        })));
                         CodexStatus::InitiateShutdown
                     }
                     TurnStatus::InProgress => CodexStatus::Running,

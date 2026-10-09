@@ -579,6 +579,49 @@ class RootMaintenanceTest(unittest.TestCase):
         self.assertNotIn("format-prettier", subcommands.choices)
         self.assertNotIn("format-python", subcommands.choices)
 
+    def test_python_tests_route_harbor_and_preserve_failures(self):
+        maintenance = load_root_maintenance_module()
+        harbor = "scripts.test_harbor_windows_codex.TerminalTests"
+        ordinary = "scripts.test_asciicheck"
+        for codes, expected in (([0, 0], 0), ([7, 0], 7), ([0, 9], 9)):
+            with (
+                self.subTest(codes=codes),
+                mock.patch.object(maintenance, "harbor_python", return_value=Path("harbor-python")),
+                mock.patch.object(maintenance, "run", side_effect=codes) as run,
+            ):
+                self.assertEqual(
+                    maintenance.main(["test-python", "--module", ordinary, "--module", harbor]),
+                    expected,
+                )
+                self.assertEqual(run.call_args_list, [
+                    mock.call([*maintenance.UV_RUN_SCRIPTS, "python", "-m", "unittest", ordinary, "-v"]),
+                    mock.call(["harbor-python", "-m", "unittest", harbor, "-v"]),
+                ])
+
+    def test_missing_harbor_environment_fails_without_skipping_ordinary_tests(self):
+        maintenance = load_root_maintenance_module()
+        with (
+            mock.patch.object(maintenance, "harbor_python", side_effect=ValueError("missing Harbor")),
+            mock.patch.object(maintenance, "run", return_value=0) as run,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(maintenance.run_python_tests([
+                "scripts.test_asciicheck", "scripts.test_harbor_windows_codex",
+            ]), 2)
+        run.assert_called_once()
+        self.assertIn("Could not run Harbor script tests", stderr.getvalue())
+
+    def test_script_audit_uses_shared_test_environment_routing(self):
+        maintenance = load_root_maintenance_module()
+        targets = ["scripts.test_asciicheck", "scripts.test_harbor_windows_codex"]
+        commands, _missing = maintenance.script_audit_commands(
+            include_tests=True, test_targets=targets, resolve_tool=lambda name: name,
+        )
+        self.assertEqual(dict(commands)["script unit tests"], (
+            *maintenance.UV_RUN_SCRIPTS, "python", "scripts/root_maintenance.py",
+            "test-python", "--module", targets[0], "--module", targets[1],
+        ))
+
     def test_root_maintenance_uv_commands_use_frozen_lock(self) -> None:
         root_maintenance = load_root_maintenance_module()
         calls: list[tuple[str, ...]] = []
@@ -630,6 +673,188 @@ class RootMaintenanceTest(unittest.TestCase):
         )
 
 
+class StructuredMaintenanceTest(unittest.TestCase):
+    def setUp(self):
+        self.owner = load_root_maintenance_module()
+        self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.errors = self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(self.directory)
+        self.enterContext(mock.patch.object(self.owner, "REPO_ROOT", self.root))
+
+    def test_json_worker_uses_file_backed_transport_and_rejects_invalid_output(self):
+        code, report = self.owner._run_json_worker(
+            [sys.executable, "-c", "import json,sys; print(json.dumps(json.load(sys.stdin)))"],
+            request={"text": "λ😀"}, timeout=5,
+        )
+        self.assertEqual((code, report), (0, {"text": "λ😀"}))
+        with self.assertRaises(ValueError):
+            self.owner._run_json_worker([sys.executable, "-c", "print('not JSON')"])
+        with mock.patch.object(self.owner, "JSON_WORKER_MAX_BYTES", 16):
+            with self.assertRaisesRegex(ValueError, "request exceeds"):
+                self.owner._run_json_worker(["must-not-start"], request={"x": "a" * 30})
+            with self.assertRaisesRegex(ValueError, "report exceeds"):
+                self.owner._run_json_worker([sys.executable, "-c", "print('x'*32)"])
+
+    def test_json_worker_timeout_reaps_a_stalled_child(self):
+        ready = self.root / "ready"
+        command = [sys.executable, "-c", (
+            f"import pathlib,time; pathlib.Path({str(ready)!r}).write_text('ready'); time.sleep(60)"
+        )]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.owner._run_json_worker(command, timeout=2)
+        self.assertTrue(ready.exists(), "the fixture must start before timeout")
+
+    def write_test(self, name, body="pass"):
+        scripts = self.root / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "__init__.py").write_text("", encoding="utf-8")
+        (scripts / f"{name}.py").write_text(
+            "import unittest\nclass Example(unittest.TestCase):\n"
+            f"    def test_example(self):\n        {body}\n", encoding="utf-8",
+        )
+        return f"scripts.{name}"
+
+    def run_json(self, targets, *, missing_harbor=False):
+        original = self.owner._run_json_worker
+        commands = []
+
+        def execute(command, **kwargs):
+            commands.append(command)
+            # Only substitute the environment launcher; execute the actual
+            # reporter and temporary tests with this test interpreter.
+            if command[:2] == ["fixture-uv", "python"]:
+                command = [sys.executable, *command[2:]]
+            return original(command, **kwargs)
+
+        with (
+            mock.patch.object(self.owner, "UV_RUN_SCRIPTS", ["fixture-uv"]),
+            mock.patch.object(self.owner, "_run_json_worker", side_effect=execute),
+            mock.patch.object(self.owner, "harbor_python", return_value=Path(sys.executable),
+                              side_effect=ValueError("missing Harbor") if missing_harbor else None),
+        ):
+            code = self.owner.main(["test-python", "--json", *(
+                arg for target in targets for arg in ("--module", target)
+            )])
+        return code, json.loads(self.output.getvalue()), commands
+
+    def test_json_mode_aggregates_real_workers_and_preserves_failure_details(self):
+        ordinary = self.write_test("test_ordinary", "self.fail('assertion λ detail')")
+        harbor = self.write_test("test_harbor_windows_codex")
+        code, report, commands = self.run_json([ordinary, harbor])
+        self.assertEqual(code, 1)
+        self.assertTrue(report["complete"])
+        self.assertFalse(report["successful"])
+        self.assertEqual(report["tests_run"], 2)
+        self.assertFalse(report["reusable_validation_receipt"])
+        self.assertEqual([item["environment"] for item in report["environments"]], ["scripts", "harbor"])
+        self.assertEqual(commands[0][:2], ["fixture-uv", "python"])
+        self.assertEqual(commands[1][0], sys.executable)
+        failed = report["environments"][0]["report"]["tests"][0]
+        self.assertEqual(failed["outcome"], "failure")
+        self.assertIn("assertion λ detail", json.dumps(failed, ensure_ascii=False))
+        self.assertIn("Traceback", json.dumps(failed))
+        self.assertEqual(report["environments"][1]["report"]["tests"][0]["outcome"], "success")
+
+    def test_json_mode_missing_harbor_preserves_ordinary_result(self):
+        ordinary = self.write_test("test_ordinary")
+        harbor = self.write_test("test_harbor_windows_codex")
+        code, report, commands = self.run_json([ordinary, harbor], missing_harbor=True)
+        self.assertEqual(code, 2)
+        self.assertFalse(report["complete"])
+        self.assertFalse(report["successful"])
+        self.assertEqual(report["tests_run"], 1)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("missing Harbor", report["errors"][0])
+
+    def test_json_mode_empty_selection_and_broken_worker_fail_closed(self):
+        with mock.patch.object(self.owner, "python_test_targets", return_value=[]):
+            self.assertEqual(self.owner.main(["test-python", "--json"]), 2)
+        report = json.loads(self.output.getvalue())
+        self.assertEqual(report["tests_run"], 0)
+        self.assertFalse(report["successful"])
+        self.output.seek(0)
+        self.output.truncate()
+        with mock.patch.object(self.owner, "_run_json_worker", return_value=(0, {})):
+            self.assertEqual(self.owner.main(["test-python", "--json", "--module", "missing"]), 2)
+        self.assertFalse(json.loads(self.output.getvalue())["complete"])
+
+    def oracle_audit(self, sources, *, strict=True):
+        for path, text in sources.items():
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8", newline="")
+        with (
+            mock.patch.object(self.owner, "script_source_targets", return_value=list(sources)),
+            mock.patch.object(self.owner, "script_kind_map", return_value=dict.fromkeys(sources, "python")),
+            mock.patch.object(self.owner, "git_context_label", return_value="fixture"),
+            mock.patch.object(self.owner, "script_audit_context_issues", return_value=[]),
+            mock.patch.object(self.owner, "test_modules_for_changed_path", return_value=("fixture",)),
+            mock.patch.object(self.owner, "script_audit_commands", return_value=([], [])),
+        ):
+            return self.owner.main(["audit-scripts", "--quick", "--oracles", *(["--strict"] if strict else [])])
+
+    def test_oracles_use_source_only_and_remain_advisory_under_strict(self):
+        marker = self.root / "must-not-execute"
+        source = (f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
+                  "import unittest\ndef report(): return {'executed': False}\n"
+                  "class Case(unittest.TestCase):\n"
+                  "    def test_literal(self): self.assertEqual(report()['executed'], False)\n")
+        self.assertEqual(self.oracle_audit({"scripts/test_fixture.py": source}), 0)
+        self.assertFalse(marker.exists())
+        self.assertIn("[ORACLE ADVISORY]", self.output.getvalue())
+        self.assertIn("analysis_complete=False", self.output.getvalue())
+        self.assertIn("SCRIPT AUDIT PASSED", self.output.getvalue())
+
+    def test_oracle_worker_isolated_from_source_import_shadowing(self):
+        marker = self.root / "imported-source"
+        shadow = (f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
+                  "raise RuntimeError('analyzed source was imported')\n")
+        source = ("import unittest\nVALUE = 7\nclass Case(unittest.TestCase):\n"
+                  "    def test_literal(self): self.assertEqual(VALUE, 7)\n")
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
+            self.assertEqual(self.oracle_audit({"ast.py": shadow, "test_fixture.py": source}), 0)
+        self.assertFalse(marker.exists())
+        self.assertIn("parse_complete=True", self.output.getvalue())
+        self.assertIn("constant_only_oracle", self.output.getvalue())
+
+    def test_oracle_incomplete_input_and_invalid_reports_are_unverified(self):
+        with mock.patch.object(self.owner, "_run_json_worker") as worker:
+            self.owner._print_oracle_advisories({}, {"missing.py"})
+        worker.assert_not_called()
+        self.assertIn("incomplete Python input snapshot", self.output.getvalue())
+        source = "VALUE = 7\n"
+        for change in ({"analysis_complete": True}, {"diagnostics": ["not a diagnostic"]}):
+            with self.subTest(change=change):
+                self.output.seek(0)
+                self.output.truncate()
+                report = {"schema_version": 1, "language": "python", "advisory_only": True,
+                          "parse_complete": True, "analysis_complete": False,
+                          "diagnostics": [], "unknown": [], "limitations": [], **change}
+                with mock.patch.object(self.owner, "_run_json_worker", return_value=(0, report)):
+                    self.assertEqual(self.oracle_audit({"fixture.py": source}), 0)
+                self.assertIn("Analysis unverified", self.output.getvalue())
+
+    def test_oracles_reject_changed_inputs_and_worker_failures_without_gating(self):
+        source = "def test_literal():\n    assert 1 == 1\n"
+        original = self.owner._run_json_worker
+
+        def change_source(*args, **kwargs):
+            result = original(*args, **kwargs)
+            (self.root / "scripts/test_fixture.py").write_text(source + "# changed\n", encoding="utf-8")
+            return result
+
+        with mock.patch.object(self.owner, "_run_json_worker", side_effect=change_source):
+            self.assertEqual(self.oracle_audit({"scripts/test_fixture.py": source}), 0)
+        self.assertIn("source changed during oracle analysis", self.output.getvalue())
+        self.output.seek(0)
+        self.output.truncate()
+        with mock.patch.object(self.owner, "_run_json_worker", side_effect=subprocess.TimeoutExpired("oracle", 30)):
+            self.assertEqual(self.oracle_audit({"scripts/test_fixture.py": source}), 0)
+        self.assertIn("Analysis unverified", self.output.getvalue())
+        self.assertIn("SCRIPT AUDIT PASSED", self.output.getvalue())
+
+
 class SyntaxSchedulingTest(unittest.TestCase):
     def setUp(self):
         self.owner = load_root_maintenance_module()
@@ -668,7 +893,7 @@ class SyntaxSchedulingTest(unittest.TestCase):
                 self.assertEqual(sorted(completed), list(range(7)))
             return 0
 
-        commands = [("Python lint", ("before",)), *self.commands(7),
+        commands = [("unknown", ("before",)), *self.commands(7),
                     ("script unit tests", ("after",))]
         with (mock.patch.object(self.owner, "run_owned", side_effect=parser),
               mock.patch.object(self.owner, "run", side_effect=exclusive)):
@@ -704,6 +929,134 @@ class SyntaxSchedulingTest(unittest.TestCase):
               self.assertRaises(KeyboardInterrupt)):
             list(self.owner._audit_command_results(self.commands(2)))
         self.assertTrue(stopped.is_set())
+
+    def test_python_checks_share_one_worker_without_blocking_parsers(self):
+        self.enterContext(mock.patch.object(self.owner, "which", return_value=None))
+        rendezvous = threading.Barrier(4, timeout=5)
+        format_finished = threading.Event()
+        completed = []
+        commands = [("Python format", ("format",)), ("Python lint", ("lint",)),
+                    *self.commands(3), ("script unit tests", ("tests",))]
+
+        def execute(command, **kwargs):
+            name = command[0]
+            if name == "lint":
+                self.assertTrue(format_finished.is_set(), "uv checks overlapped")
+            else:
+                rendezvous.wait()
+            kwargs["stdout"].write(f"diagnostic-{name}\n".encode())
+            completed.append(name)
+            if name == "format":
+                format_finished.set()
+            return subprocess.CompletedProcess(command, int(name == "format"))
+
+        def tests(command):
+            self.assertCountEqual(completed, ["format", "lint", "0", "1", "2"])
+            return 0
+
+        with (mock.patch.object(self.owner, "run_owned", side_effect=execute),
+              mock.patch.object(self.owner, "run", side_effect=tests)):
+            results = list(self.owner._audit_command_results(commands))
+        self.assertEqual(results, [(label, int(label == "Python format")) for label, _ in commands])
+        diagnostics = [line for line in self.output.getvalue().splitlines()
+                       if line.startswith("diagnostic-")]
+        self.assertEqual(diagnostics, [f"diagnostic-{name}" for name in ["format", "lint", "0", "1", "2"]])
+
+    def test_parser_interrupt_cancels_python_chain_without_starting_lint(self):
+        from scripts import process_owner
+
+        self.enterContext(mock.patch.object(self.owner, "which", return_value=None))
+        started = threading.Event()
+        stopped = threading.Event()
+        calls = []
+
+        def execute(command, **kwargs):
+            calls.append(command[0])
+            kwargs["stdout"].write(f"started-{command[0]}\n".encode())
+            if command[0] == "parser":
+                self.assertTrue(started.wait(5))
+                raise KeyboardInterrupt()
+            self.assertEqual(command[0], "format")
+            with process_owner.operation() as operation:
+                started.set()
+                try:
+                    self.assertTrue(operation.cancelled.wait(5))
+                    process_owner.check_operation()
+                finally:
+                    kwargs["stdout"].write(b"format-cleaned-up\n")
+                    stopped.set()
+
+        commands = [("Python format", ("format",)), ("Python lint", ("lint",)),
+                    ("PowerShell syntax", ("parser",))]
+        with (mock.patch.object(self.owner, "run_owned", side_effect=execute),
+              self.assertRaises(KeyboardInterrupt)):
+            list(self.owner._audit_command_results(commands))
+        self.assertTrue(stopped.is_set())
+        self.assertCountEqual(calls, ["format", "parser"])
+        for marker in ("started-format", "started-parser", "format-cleaned-up"):
+            self.assertEqual(self.output.getvalue().count(marker), 1)
+
+    def test_closing_results_cancels_held_sibling_and_drains_its_log(self):
+        from scripts import process_owner
+
+        self.enterContext(mock.patch.object(self.owner, "which", return_value=None))
+        started = threading.Event()
+        stopped = threading.Event()
+
+        def execute(command, **kwargs):
+            if command[0] == "first":
+                self.assertTrue(started.wait(5))
+                kwargs["stdout"].write(b"first-result\n")
+                return subprocess.CompletedProcess(command, 0)
+            with process_owner.operation() as operation:
+                kwargs["stdout"].write(b"held-started\n")
+                started.set()
+                try:
+                    self.assertTrue(operation.cancelled.wait(5))
+                    process_owner.check_operation()
+                finally:
+                    kwargs["stdout"].write(b"held-cleaned-up\n")
+                    stopped.set()
+
+        commands = [("Python format", ("first",)), ("PowerShell syntax", ("held",)),
+                    ("script unit tests", ("not-started",))]
+        with (mock.patch.object(self.owner, "run_owned", side_effect=execute),
+              mock.patch.object(self.owner, "run") as serial):
+            results = self.owner._audit_command_results(commands)
+            self.assertEqual(next(results), ("Python format", 0))
+            results.close()
+        serial.assert_not_called()
+        self.assertTrue(stopped.is_set())
+        for marker in ("first-result", "held-started", "held-cleaned-up"):
+            self.assertEqual(self.output.getvalue().count(marker), 1)
+
+    def test_slow_output_delivery_does_not_hold_a_worker_or_python_cache_lane(self):
+        self.enterContext(mock.patch.object(self.owner, "which", return_value=None))
+        delivering = threading.Event()
+        parser_finished = threading.Event()
+        original_write = self.output.write
+
+        def write(text):
+            if text == "python-diagnostic\n":
+                delivering.set()
+                self.assertTrue(parser_finished.wait(5), "output delivery blocked the parser")
+            return original_write(text)
+
+        def execute(command, **kwargs):
+            if command[0] == "python":
+                kwargs["stdout"].write(b"python-diagnostic\n")
+            else:
+                self.assertTrue(delivering.wait(5))
+                kwargs["stdout"].write(b"parser-diagnostic\n")
+                parser_finished.set()
+            return subprocess.CompletedProcess(command, 0)
+
+        commands = [("Python format", ("python",)), ("PowerShell syntax", ("parser",))]
+        with (mock.patch.object(self.output, "write", side_effect=write),
+              mock.patch.object(self.owner, "run_owned", side_effect=execute)):
+            self.assertEqual(list(self.owner._audit_command_results(commands)),
+                             [(label, 0) for label, _ in commands])
+        self.assertTrue(self.output.getvalue().endswith("python-diagnostic\nparser-diagnostic\n"))
 
     def test_missing_parser_preserves_sibling_and_unicode_diagnostics(self):
         body = "x" * 65535 + "λ😀\n"

@@ -138,7 +138,9 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                             if original.try_exists().map_err(delete_recovery_error)? {
                                 return Err(delete_recovery_error(format!("restore conflict at {}; both files retained", original.display())));
                             }
-                            let parent = original.parent().expect("staged rollout parent");
+                            let parent = original.parent().ok_or_else(|| {
+                                delete_recovery_error("staged rollout has no parent; files retained")
+                            })?;
                             std::fs::create_dir_all(parent).map_err(delete_recovery_error)?;
                             if !std::fs::canonicalize(parent).map_err(delete_recovery_error)?.starts_with(&home) {
                                 return Err(delete_recovery_error("restore parent escapes codex home"));
@@ -416,7 +418,10 @@ pub(super) async fn stage_thread_deletes<'a>(
                     .join(if indexed { "indexed" } else { "unindexed" })
                     .join(thread_id.to_string())
                     .join(relative);
-                std::fs::create_dir_all(staged_path.parent().expect("staged parent"))
+                let staged_parent = staged_path.parent().ok_or_else(|| {
+                    delete_recovery_error("staged rollout has no parent; deletion not staged")
+                })?;
+                std::fs::create_dir_all(staged_parent)
                     .map_err(delete_recovery_error)?;
                 std::fs::rename(&original_path, &staged_path).map_err(|err| {
                     ThreadStoreError::Internal {

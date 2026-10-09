@@ -222,14 +222,28 @@ fn build_tools_object<'s>(
         let function = tool_function(scope, tool_index)?;
         tools.create_data_property(scope, name.into(), function.into());
     }
-    for tool in enabled_tools {
-        let Some((namespace, member)) = tool.global_name.split_once("__") else {
-            continue;
-        };
-        // Aliases never shadow canonical tools or guess deeper namespaces.
-        if namespace.is_empty() || member.is_empty() || member.contains("__") {
-            continue;
+    // Canonical identifiers carry collision-resistant suffixes. Namespace
+    // access must use registered identity, not reverse-engineer that suffix.
+    // Keep legacy two-part aliases, but reject collisions before installing any.
+    let mut aliases = std::collections::BTreeMap::new();
+    for (index, tool) in enabled_tools.iter().enumerate() {
+        let legacy = tool.global_name.split_once("__")
+            .filter(|(_, member)| !member.contains("__"));
+        let registered = tool.tool_name.namespace.as_deref()
+            .map(|namespace| (namespace, tool.tool_name.name.as_str()));
+        for (namespace, member) in legacy.into_iter().chain(registered) {
+            if namespace.is_empty() || member.is_empty() { continue; }
+            aliases.entry((namespace, member))
+                .and_modify(|owner| {
+                    if *owner != Some(index) { *owner = None; }
+                })
+                .or_insert(Some(index));
         }
+    }
+    for ((namespace, member), owner) in aliases {
+        let Some(index) = owner else { continue; };
+        let tool = &enabled_tools[index];
+        // Namespace aliases never shadow a canonical top-level callable.
         let namespace_key = v8::String::new(scope, namespace)
             .ok_or_else(|| "failed to allocate tool namespace".to_string())?;
         let namespace = if tools.has_own_property(scope, namespace_key.into()) == Some(true) {

@@ -157,9 +157,11 @@ impl RetainedPatches {
             self.patches.insert(id.to_string(), saved);
             return Err("hook replacement cannot be retained within the patch recovery limit".into());
         };
+        #[expect(clippy::expect_used, reason = "retain constructs patch_id as a string after inserting that exact key")]
         let replacement_id = receipt["patch_id"].as_str().expect("retained patch id");
-        self.patches.get_mut(replacement_id).expect("new retained patch").hook_recovery =
-            Some((call_id.to_string(), receipt.clone()));
+        #[expect(clippy::expect_used, reason = "retain just inserted this key and exclusive access prevents intervening removal")]
+        let replacement = self.patches.get_mut(replacement_id).expect("new retained patch");
+        replacement.hook_recovery = Some((call_id.to_string(), receipt.clone()));
         Ok(receipt)
     }
 

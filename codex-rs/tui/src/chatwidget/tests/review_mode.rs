@@ -1080,13 +1080,6 @@ async fn review_capture_prompt_forwards_exact_text() {
     }
 }
 
-/// The commit picker shows only commit subjects (no timestamps).
-
-
-/// Empty capture input is forwarded without local normalization so the server can
-/// enforce the authoritative rejection rule.
-
-
 // Interrupting a running exec must report failure in both the compact status
 // color and the transcript marker, not merely replace "Running" with "Ran".
 #[tokio::test]

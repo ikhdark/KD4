@@ -3228,6 +3228,10 @@ function New-CodexRuntimeBundleTransaction {
             if (-not (Test-Path -LiteralPath $entry.SourcePath -PathType Leaf)) {
                 throw "Cannot stage runtime bundle: source is missing: $($entry.SourcePath)"
             }
+            $expectedSha256 = $entry.PSObject.Properties["ExpectedSha256"]
+            if ($null -eq $expectedSha256 -or -not (Test-Sha256Text -Value $expectedSha256.Value)) {
+                throw "Cannot stage runtime bundle: verified SHA-256 is missing or invalid for $($entry.Name)."
+            }
             $targetFullPath = [IO.Path]::GetFullPath([string]$entry.TargetPath)
             $installPrefix = $installFullPath + [IO.Path]::DirectorySeparatorChar
             if (-not $targetFullPath.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
@@ -3237,8 +3241,11 @@ function New-CodexRuntimeBundleTransaction {
             $stagedPath = Join-Path $stageRoot $relativeTargetPath
             New-Item -ItemType Directory -Path (Split-Path -Parent $stagedPath) -Force | Out-Null
             [IO.File]::Copy($entry.SourcePath, $stagedPath, $true)
-            if (-not [string]::Equals((Get-FileSha256 $entry.SourcePath), (Get-FileSha256 $stagedPath), [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Cannot stage runtime bundle: SHA-256 mismatch for $($entry.Name)."
+            # Bind the copy to the bytes verified before staging, not to another
+            # observation of a mutable source. Check unchanged entries too: they
+            # are copied into the bundle and become visible during activation.
+            if (-not [string]::Equals([string]$expectedSha256.Value, (Get-FileSha256 $stagedPath), [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Cannot stage runtime bundle: verified SHA-256 mismatch for $($entry.Name)."
             }
             if ($entry.Changed -and $entry.HadPreviousTarget) {
                 $backupFullPath = [IO.Path]::GetFullPath([string]$entry.BackupPath)
@@ -4370,10 +4377,10 @@ try {
         -JournalPath $publishTransactionJournalPath `
         -InstallDir $InstallDir `
         -Entries @(
-            [pscustomobject]@{ Name = "commandRunner"; SourcePath = $SourceCommandRunnerExe; TargetPath = $commandRunnerTargetPath; BackupPath = $commandRunnerBackupPath; HadPreviousTarget = $commandRunnerTargetExists; Changed = $commandRunnerBinaryChanged }
-            [pscustomobject]@{ Name = "windowsSandboxSetup"; SourcePath = $SourceWindowsSandboxSetupExe; TargetPath = $windowsSandboxSetupTargetPath; BackupPath = $windowsSandboxSetupBackupPath; HadPreviousTarget = $windowsSandboxSetupTargetExists; Changed = $windowsSandboxSetupBinaryChanged }
-            [pscustomobject]@{ Name = "codeModeHost"; SourcePath = $SourceCodeModeHostExe; TargetPath = $codeModeHostTargetPath; BackupPath = $codeModeHostBackupPath; HadPreviousTarget = $codeModeHostTargetExists; Changed = $codeModeHostBinaryChanged }
-            [pscustomobject]@{ Name = "codex"; SourcePath = $SourceExe; TargetPath = $targetPath; BackupPath = $backupPath; HadPreviousTarget = $targetExists; Changed = $codexBinaryChanged }
+            [pscustomobject]@{ Name = "commandRunner"; SourcePath = $SourceCommandRunnerExe; ExpectedSha256 = $sourceCommandRunnerSha256; TargetPath = $commandRunnerTargetPath; BackupPath = $commandRunnerBackupPath; HadPreviousTarget = $commandRunnerTargetExists; Changed = $commandRunnerBinaryChanged }
+            [pscustomobject]@{ Name = "windowsSandboxSetup"; SourcePath = $SourceWindowsSandboxSetupExe; ExpectedSha256 = $sourceWindowsSandboxSetupSha256; TargetPath = $windowsSandboxSetupTargetPath; BackupPath = $windowsSandboxSetupBackupPath; HadPreviousTarget = $windowsSandboxSetupTargetExists; Changed = $windowsSandboxSetupBinaryChanged }
+            [pscustomobject]@{ Name = "codeModeHost"; SourcePath = $SourceCodeModeHostExe; ExpectedSha256 = $sourceCodeModeHostSha256; TargetPath = $codeModeHostTargetPath; BackupPath = $codeModeHostBackupPath; HadPreviousTarget = $codeModeHostTargetExists; Changed = $codeModeHostBinaryChanged }
+            [pscustomobject]@{ Name = "codex"; SourcePath = $SourceExe; ExpectedSha256 = $sourceSha256; TargetPath = $targetPath; BackupPath = $backupPath; HadPreviousTarget = $targetExists; Changed = $codexBinaryChanged }
         )
     $publishedCommandRunner = Publish-CodexRuntimeBundleEntry -Transaction $publishTransaction -Name "commandRunner"
     $publishedWindowsSandboxSetup = Publish-CodexRuntimeBundleEntry -Transaction $publishTransaction -Name "windowsSandboxSetup"

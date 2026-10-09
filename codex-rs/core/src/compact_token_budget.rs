@@ -62,6 +62,9 @@ pub(crate) async fn run_inline_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    #[cfg(not(test))]
+    let InitialContextInjection::AtStart(world_state) = initial_context_injection;
+    #[cfg(test)]
     let world_state = match initial_context_injection {
         InitialContextInjection::AtStart(world_state) => world_state,
         #[cfg(test)]

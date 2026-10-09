@@ -1400,29 +1400,6 @@ async fn expire_workspace_actor_leases(
     comparison_now
 }
 
-async fn remove_workspace_actor(fixture: &Fixture, attempt_id: AttemptId) {
-    let database_path = fixture
-        .state
-        .codex_home()
-        .join("agent-task-coordination")
-        .join("agent_tasks.sqlite");
-    let options = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(database_path)
-        .foreign_keys(true);
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .expect("coordination database opens");
-    let deleted = sqlx::query("DELETE FROM workspace_actors WHERE attempt_id = ?")
-        .bind(attempt_id.to_string())
-        .execute(&pool)
-        .await
-        .expect("workspace actor is removed");
-    assert_eq!(deleted.rows_affected(), 1);
-    pool.close().await;
-}
-
 fn criterion() -> AcceptanceCriterion {
     AcceptanceCriterion {
         id: "criterion-1".to_string(),
@@ -1898,21 +1875,6 @@ async fn identical_validation_calls_record_independently_and_ignore_historical_c
             .count(),
         2
     );
-}
-
-fn completed_receipt_with_changes(
-    validation_call_ids: Vec<String>,
-    paths: &[&str],
-) -> ReceiptDraft {
-    let mut receipt = completed_receipt(validation_call_ids);
-    receipt.declared_changes = paths
-        .iter()
-        .map(|path| DeclaredChange {
-            path: (*path).to_string(),
-            summary: "versioned controlled change".to_string(),
-        })
-        .collect();
-    receipt
 }
 
 async fn controlled_write(

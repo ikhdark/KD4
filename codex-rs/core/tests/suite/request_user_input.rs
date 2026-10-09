@@ -537,7 +537,7 @@ where
         })
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let req = second_mock.single_request();
     let (output, success) = call_output_content_and_success(&req, &call_id);

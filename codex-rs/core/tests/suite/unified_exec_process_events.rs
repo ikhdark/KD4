@@ -37,6 +37,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::task::AbortOnDropHandle;
 
 const CALL_ID: &str = "pushed-remote-process-events";
 const COMPLETE_OUTPUT: &str = "pushed remote output\n";
@@ -44,6 +45,8 @@ const RECOVERED_OUTPUT: &str = "recovered missing output\n";
 const RETAINED_OUTPUT: &str = "retained output\n";
 const REPLAY_OUTPUT_EVENT_COUNT: u64 = 1024;
 const REPLAY_RETAINED_OUTPUT_SEQ: u64 = 800;
+const REPLAY_BATCH_SIZE: u64 = 64;
+const REPLAY_BARRIER_PROCESS_ID: &str = "replay-consumer-barrier";
 const PUSHED_EXEC_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +196,7 @@ async fn serve_evidence_filesystem_request(
 async fn serve_exec_with_pushed_events(
     listener: TcpListener,
     scenario: PushedExecScenario,
+    replay_barrier: tokio::sync::oneshot::Receiver<tokio::sync::watch::Receiver<u64>>,
 ) -> usize {
     let mut websocket = accept_initialized_exec_server(listener).await;
     send_environment_info(&mut websocket, scenario).await;
@@ -208,6 +212,18 @@ async fn serve_exec_with_pushed_events(
             continue;
         }
         match request["method"].as_str() {
+            Some("process/start")
+                if request["params"]["processId"].as_str() == Some(REPLAY_BARRIER_PROCESS_ID) =>
+            {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": request["id"],
+                        "result": { "processId": REPLAY_BARRIER_PROCESS_ID }
+                    }),
+                )
+                .await;
+            }
             Some("process/start")
                 if request["params"]["processId"]
                     .as_str()
@@ -334,12 +350,16 @@ async fn serve_exec_with_pushed_events(
         }
     };
     if matches!(scenario, PushedExecScenario::ReplayGap) {
-        // The process replay log retains 256 events. This burst is much larger
-        // than both that log and the JSON-RPC event queue, so the reader must
-        // apply enough notifications to evict seq 1 before it can read the
-        // start response. The total output stays well below the server's 1 MiB
-        // retained-output limit, making the subsequent read genuinely able to
-        // recover every missing chunk.
+        let mut replay_barrier = timeout(PUSHED_EXEC_EVENT_TIMEOUT, replay_barrier)
+            .await
+            .expect("replay barrier registration should not time out")
+            .expect("replay barrier should be registered");
+        // Evict the target's 256-event replay history before its start response,
+        // without overflowing the separate 128-slot RPC notification queue.
+        // The same FIFO notification consumer publishes the marker process's
+        // wake after applying every preceding target output. Acknowledging each
+        // bounded batch makes replay eviction independent of task scheduling.
+        // Total output remains below the server's 1 MiB retained-output limit.
         for seq in 1..=REPLAY_OUTPUT_EVENT_COUNT {
             send_exec_server_json(
                 &mut websocket,
@@ -354,6 +374,41 @@ async fn serve_exec_with_pushed_events(
                 }),
             )
             .await;
+            if seq % REPLAY_BATCH_SIZE == 0 {
+                let marker_seq = seq / REPLAY_BATCH_SIZE;
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "method": "process/output",
+                        "params": {
+                            "processId": REPLAY_BARRIER_PROCESS_ID,
+                            "seq": marker_seq,
+                            "stream": "stdout",
+                            "chunk": BASE64_STANDARD.encode(b"marker"),
+                        }
+                    }),
+                )
+                .await;
+                timeout(
+                    PUSHED_EXEC_EVENT_TIMEOUT,
+                    replay_barrier.wait_for(|seen| *seen >= marker_seq),
+                )
+                .await
+                .expect("notification consumer should acknowledge the replay batch")
+                .expect("replay barrier should remain registered");
+            }
+        }
+        let marker_seq = REPLAY_OUTPUT_EVENT_COUNT / REPLAY_BATCH_SIZE;
+        for message in [
+            json!({"method": "process/exited", "params": {
+                "processId": REPLAY_BARRIER_PROCESS_ID, "seq": marker_seq + 1,
+                "exitCode": 0, "sandboxDenied": false,
+            }}),
+            json!({"method": "process/closed", "params": {
+                "processId": REPLAY_BARRIER_PROCESS_ID, "seq": marker_seq + 2,
+            }}),
+        ] {
+            send_exec_server_json(&mut websocket, message).await;
         }
         send_exec_server_json(
             &mut websocket,
@@ -605,7 +660,10 @@ async fn exec_command_consumes_pushed_remote_process_events(
     }
     let response_mock = mount_sse_sequence(&server, responses).await;
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
-    let exec_server = tokio::spawn(serve_exec_with_pushed_events(listener, scenario));
+    let (replay_barrier_tx, replay_barrier_rx) = tokio::sync::oneshot::channel();
+    let exec_server = AbortOnDropHandle::new(tokio::spawn(serve_exec_with_pushed_events(
+        listener, scenario, replay_barrier_rx,
+    )));
     let mut builder = test_codex()
         .with_model_info_override("gpt-5.5", |model_info| {
             model_info.tool_mode = Some(ToolMode::Direct);
@@ -642,6 +700,32 @@ async fn exec_command_consumes_pushed_remote_process_events(
     let test = timeout(Duration::from_secs(5), builder.build(&server))
         .await
         .context("thread startup should connect to the fake exec-server")??;
+
+    // Keep a separate logical process registered on the very same RPC client.
+    // Its wake receiver observes application of notifications, not merely socket
+    // receipt, so the fake server can bound each target-output batch precisely.
+    let _replay_barrier_process = if matches!(scenario, PushedExecScenario::ReplayGap) {
+        let environment = test.thread_manager.environment_manager()
+            .get_environment(REMOTE_ENVIRONMENT_ID)
+            .context("remote replay environment should exist")?;
+        let started = environment.get_exec_backend().start(codex_exec_server::ExecParams {
+            process_id: REPLAY_BARRIER_PROCESS_ID.into(),
+            argv: vec!["replay-barrier".into()],
+            cwd: PathUri::parse("file:///C:/workspace")?,
+            env_policy: None,
+            env: Default::default(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+        }).await?;
+        assert!(replay_barrier_tx.send(started.process.subscribe_wake()).is_ok());
+        Some(started.process)
+    } else {
+        None
+    };
 
     // Foreign path conventions cannot seed a host sandbox. The approval case
     // still exercises the explicit escalation flow, but its initial profile

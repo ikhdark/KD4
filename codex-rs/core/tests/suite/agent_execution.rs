@@ -204,6 +204,165 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     Ok(())
 }
 
+/// Matched offline benchmark: only provider responses are scripted. The measured
+/// interval includes admission, four real children, result collection, and the
+/// parent's final response. Cleanup is checked and reported separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_agent_end_to_end_batch_benchmark() -> Result<()> {
+    run_multi_agent_batch_benchmark(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_agent_end_to_end_wait_overlap_benchmark() -> Result<()> {
+    run_multi_agent_batch_benchmark(true).await
+}
+
+async fn run_multi_agent_batch_benchmark(overlapping_wait: bool) -> Result<()> {
+    for trial in 0..3 {
+        let server = start_mock_server().await;
+        let wait_prefix = if overlapping_wait {
+            r#"
+const pendingWait = resolve_tool("agents.wait_agent")({timeout_ms: 1000});
+await new Promise(resolve => setTimeout(resolve, 50));
+"#
+        } else {
+            ""
+        };
+        let wait_suffix = if overlapping_wait {
+            r#"
+const wake = await pendingWait;
+text(wake.timed_out ? "overlap_wait_timed_out" : "overlap_wait_woke");
+"#
+        } else {
+            ""
+        };
+        let batch_script = format!("{wait_prefix}{}{wait_suffix}", r#"
+const spawn = resolve_tool("agents.spawn_agent");
+const outcomes = await Promise.allSettled([0, 1, 2, 3].map(i =>
+    spawn({task_name: "batch_" + i, message: "Return batch result " + i})));
+if (outcomes.some(x => x.status !== "fulfilled" || !x.value.assignment_id))
+    throw Error(JSON.stringify(outcomes));
+const names = outcomes.map(x => x.value.task_name);
+const list = resolve_tool("agents.list_agents");
+const wait = resolve_tool("agents.wait_agent");
+for (let attempt = 0; attempt < 256; attempt++) {
+    const current = await list({});
+    const workers = names.map(name => current.agents.find(x => x.agent_name === name));
+    if (workers.every((x, i) => x && typeof x.agent_status === "object"
+        && x.agent_status.completed?.includes("batch-result-" + i))) {
+        text({batch_complete: true, workers});
+        break;
+    }
+    if (attempt === 255) throw Error(JSON.stringify(current));
+    await wait({timeout_ms: 1000});
+    // Mailbox wakes remain pending until the next model request. A bounded
+    // fixture backoff prevents repeatedly reading that same queued wake.
+    await new Promise(resolve => setTimeout(resolve, 10));
+}
+"#);
+        mount_sse_once_match(
+            &server,
+            |request: &wiremock::Request| {
+                request_has_last_message_input_text(request, "user", "Run the four independent agents")
+            },
+            sse(vec![
+                ev_response_created("batch-start"),
+                ev_custom_tool_call("batch", "exec", &batch_script),
+                ev_completed("batch-start"),
+            ]),
+        ).await;
+        for worker in 0..4 {
+            let objective = format!("Return batch result {worker}");
+            let response = sse(vec![
+                ev_response_created(&format!("child-{worker}")),
+                ev_assistant_message(&format!("result-{worker}"), &format!("batch-result-{worker}")),
+                ev_completed(&format!("child-{worker}")),
+            ]);
+            mount_sse_once_match(
+                &server,
+                move |request: &wiremock::Request| has_task_capsule_objective(request, &objective),
+                response,
+            ).await;
+        }
+        let finish = mount_sse_once_match(
+            &server,
+            |request: &wiremock::Request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| {
+                    body["input"].as_array().is_some_and(|items| items.iter().any(|item| {
+                        item["type"] == "custom_tool_call_output" && item["call_id"] == "batch"
+                    }))
+                })
+            },
+            sse(vec![
+                ev_response_created("batch-finish"),
+                ev_assistant_message("batch-answer", "All four results collected"),
+                ev_completed("batch-finish"),
+            ]),
+        ).await;
+        let mut builder = test_codex()
+            .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = true)
+            .with_config(|config| {
+                for feature in [Feature::Collab, Feature::MultiAgentV2, Feature::CodeMode, Feature::CodeModeOnly] {
+                    config.features.enable(feature).expect("enable batch fixture");
+                }
+                config.multi_agent_v2.max_concurrent_threads_per_session = 5;
+                config.multi_agent_v2.min_wait_timeout_ms = 0;
+            });
+        let test = builder.build(&server).await?;
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(45),
+            test.submit_turn("Run the four independent agents"),
+        ).await;
+        let completion_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut terminal_results = std::collections::BTreeMap::new();
+        for id in test.thread_manager.list_thread_ids().await {
+            let thread = test.thread_manager.get_thread(id).await?;
+            if let Some(path) = thread.config_snapshot().await.session_source.get_agent_path() {
+                terminal_results.insert(path.to_string(), thread.agent_status().await);
+            }
+        }
+        let cleanup_started = std::time::Instant::now();
+        let shutdown = test.thread_manager.shutdown_all_threads_bounded(Duration::from_secs(5)).await;
+        let cleanup_ms = cleanup_started.elapsed().as_secs_f64() * 1000.0;
+        outcome.context("batch timed out")??;
+        let request = finish.single_request();
+        let output = request.custom_tool_call_output("batch").to_string();
+        anyhow::ensure!(shutdown.timed_out.is_empty() && shutdown.submit_failed.is_empty(), "{shutdown:?}");
+        anyhow::ensure!(shutdown.completed.len() == 5, "lost or duplicated child: {shutdown:?}; batch output: {output}");
+        let requests = server.received_requests().await.unwrap_or_default();
+        for worker in 0..4 {
+            let objective = format!("Return batch result {worker}");
+            let count = requests.iter().filter(|request| has_task_capsule_objective(request, &objective)).count();
+            anyhow::ensure!(count == 1, "child {worker} must execute exactly once, got {count}; {output}");
+        }
+        anyhow::ensure!(output.contains("batch_complete"), "collection failed: {output}");
+        if overlapping_wait {
+            anyhow::ensure!(output.contains("overlap_wait_"), "missing wait outcome: {output}");
+        }
+        for worker in 0..4 {
+            anyhow::ensure!(output.contains(&format!("batch-result-{worker}")), "lost result: {output}");
+            assert_eq!(
+                terminal_results.get(&format!("/root/batch_{worker}")),
+                Some(&AgentStatus::Completed(Some(format!(
+                    "Agent-reported result (behavior unverified): batch-result-{worker}"
+                )))),
+            );
+        }
+        let model_requests = requests.iter().filter(|request| request.url.path().ends_with("/responses")).count();
+        anyhow::ensure!(model_requests == 6, "unexpected coordination cycles: {model_requests}");
+        eprintln!("multi_agent_batch_benchmark {}", json!({
+            "trial": trial, "agents": 4, "model_requests": model_requests,
+            "overlapping_wait": overlapping_wait,
+            "overlap_wait_timed_out": output.contains("overlap_wait_timed_out"),
+            "parent_completion_ms": completion_ms, "cleanup_ms": cleanup_ms,
+            "total_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "provider": "scripted_loopback", "correct": true,
+        }));
+    }
+    Ok(())
+}
+
 /// Script only the model's decisions; discovery, JavaScript execution, agent admission,
 /// mailbox delivery, completion tracking, and shutdown all use the real runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

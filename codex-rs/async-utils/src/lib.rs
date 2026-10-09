@@ -59,6 +59,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "This cancellation regression deliberately holds a guard across await to verify it is dropped"
+    )]
     async fn returns_err_when_token_cancelled_first() {
         let token = CancellationToken::new();
         let child = token.child_token();

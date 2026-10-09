@@ -117,7 +117,7 @@ pub struct ReqwestTransport {
 #[derive(Clone, Debug)]
 enum TransportClient {
     Fixed(HttpClient),
-    Routed(crate::RouteAwareClientPool),
+    Routed(Box<crate::RouteAwareClientPool>),
 }
 
 impl ReqwestTransport {
@@ -133,7 +133,7 @@ impl ReqwestTransport {
 
     /// Keeps route selection at dispatch, including each redirect hop.
     pub fn from_client_pool(pool: crate::RouteAwareClientPool) -> Self {
-        Self { client: TransportClient::Routed(pool) }
+        Self { client: TransportClient::Routed(Box::new(pool)) }
     }
 
     fn build(client: &HttpClient, req: Request) -> Result<RequestBuilder, TransportError> {

@@ -68,6 +68,7 @@ async fn desktop_missing_tool_notice_uses_current_instructions_on_a_reused_route
 }
 
 #[tokio::test]
+#[expect(clippy::print_stderr, reason = "the schema-size regression test reports measurements for each tool mode")]
 async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Result<()> {
     use codex_features::Feature;
     use codex_protocol::openai_models::ToolMode;

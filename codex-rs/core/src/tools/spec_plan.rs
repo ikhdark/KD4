@@ -877,7 +877,7 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
 
 fn quarantine_conflicting_namespaces(planned: &mut PlannedTools) {
     let conflicts = conflicting_namespace_metadata(
-        planned.runtimes.iter().map(|runtime| runtime.spec()).chain(planned.hosted_specs.iter()),
+        planned.runtimes.iter().map(RegisteredTool::spec).chain(planned.hosted_specs.iter()),
     );
     for name in &conflicts {
         planned.warnings.push(format!("Namespace `{name}` was not loaded: conflicting descriptions."));
@@ -1269,7 +1269,19 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                     TypedToolClass::RootTaskControl,
                 );
             }
-            if agent_surface_stage == AgentSurfaceStage::SpawnOnly {
+            // A code-mode cell keeps its initial catalog after spawning. Keep
+            // lifecycle tools callable so it can collect the new children in
+            // the same cell instead of requiring another model request.
+            let nested_lifecycle = matches!(
+                effective_tool_mode(turn_context),
+                ToolMode::CodeMode | ToolMode::CodeModeOnly
+            ) && exposure != ToolExposure::DirectModelOnly
+                && tool_namespace.is_none_or(|namespace| {
+                    !turn_context.config.code_mode.excluded_tool_namespaces.iter()
+                        .chain(&turn_context.config.code_mode.direct_only_tool_namespaces)
+                        .any(|excluded| excluded == namespace)
+                });
+            if agent_surface_stage == AgentSurfaceStage::SpawnOnly && !nested_lifecycle {
                 return;
             }
             planned_tools.add_arc_with_exposure_and_authorization_class(

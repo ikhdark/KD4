@@ -143,7 +143,9 @@ describe("CodexExec", () => {
     await new Codex({
       codexPathOverride: "codex",
       config: { rules: [{ "key\u007f": "value\u007f" }] },
-    }).startThread().run("hello");
+    })
+      .startThread()
+      .run("hello");
 
     expect(spawnMock.mock.calls[0]?.[1]).toEqual([
       "exec",

@@ -13,6 +13,89 @@ use tokio::sync::mpsc;
 use super::*;
 
 #[tokio::test]
+async fn storage_inventory_reports_admission_bytes_without_loading_values() {
+    let (_tx, _termination, mut rx) = start(r#"
+        store('z', false); store('a', 'λ😀'); store('__proto__', 9007199254740993n);
+        text(listKeys({limit:2})); text(listKeys({after:'a',limit:2}));
+        store('a', 'x'); deleteStored('z');
+        const before = listKeys();
+        try { store('overflow', 'x'.repeat(8388608)); } catch (error) {
+            if (!error.message.includes('listKeys().usage')) throw error;
+        }
+        const after = listKeys();
+        if (JSON.stringify(before) !== JSON.stringify(after)) throw Error('quota rejection mutated inventory');
+        text(after);
+    "#).await;
+    let first: JsonValue = serde_json::from_str(&text(next(&mut rx).await)).unwrap();
+    let last: JsonValue = serde_json::from_str(&text(next(&mut rx).await)).unwrap();
+    let after: JsonValue = serde_json::from_str(&text(next(&mut rx).await)).unwrap();
+    // Independently count the serialized key and value bytes, including UTF-8
+    // and exact unsafe integers. JS string length is not the quota's unit.
+    let charge = |key: &str, value: JsonValue| {
+        serde_json::to_vec(key).unwrap().len() + serde_json::to_vec(&value).unwrap().len()
+    };
+    let a = charge("a", json!("λ😀"));
+    let proto = charge("__proto__", json!(9_007_199_254_740_993_u64));
+    let z = charge("z", json!(false));
+    assert_eq!(first["keys"], json!(["__proto__", "a"]));
+    assert_eq!(first["entry_bytes"], json!([proto,a]));
+    assert_eq!(first["next_after"], "a");
+    assert_eq!(first["usage"], json!({"entries":3,"bytes":a+proto+z,"entry_limit":256,"byte_limit":8388608}));
+    assert_eq!(last["keys"], json!(["z"]));
+    assert_eq!(last["entry_bytes"], json!([z]));
+    assert_eq!(last["usage"], first["usage"]);
+    assert_eq!(last["next_after"], JsonValue::Null);
+    assert_eq!(after["usage"]["entries"], 2);
+    assert_eq!(after["usage"]["bytes"], proto + charge("a", json!("x")));
+    let RuntimeEvent::Result { error_text, stored_value_writes, .. } = next(&mut rx).await else { panic!("result"); };
+    assert_eq!(error_text, None);
+    assert!(!stored_value_writes.contains_key("overflow"));
+    assert_eq!(*stored_value_writes["__proto__"].value, json!(9_007_199_254_740_993_u64));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+#[ignore = "narrow storage-recovery wall-clock benchmark"]
+async fn storage_inventory_wall_clock_benchmark() {
+    for pair in 0..5 {
+        for candidate in if pair % 2 == 0 { [false, true] } else { [true, false] } {
+            let inspection = if candidate {
+                "for (const bytes of page.entry_bytes) total += bytes;"
+            } else {
+                "for (const key of page.keys) total += JSON.stringify(key).length + JSON.stringify(load(key)).length;"
+            };
+            let code = format!(r#"
+                for(let i=0;i<238;i++) store('receipt-'+String(i).padStart(3,'0'), 'x'.repeat(24000));
+                await tools.sample_tool({{phase:'ready'}});
+                let total=0;
+                for(let round=0;round<8;round++) {{
+                    let after;
+                    do {{ const page=listKeys({{after,limit:64}}); {inspection} after=page.next_after; }} while(after);
+                }}
+                text(total);
+            "#);
+            let (tx, _termination, mut rx) = start(&code).await;
+            let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else { panic!("ready"); };
+            let started = std::time::Instant::now();
+            tx.send(RuntimeCommand::ToolResponse { id, result:json!(null) }).unwrap();
+            let total = text(next(&mut rx).await).parse::<usize>().unwrap();
+            let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+            // ASCII fixture: quoted 11-byte key + quoted 24,000-byte value.
+            assert_eq!(total, 8 * 238 * (13 + 24_002));
+            let RuntimeEvent::Result { error_text, stored_value_writes, .. } = next(&mut rx).await else { panic!("result"); };
+            assert_eq!(error_text, None);
+            assert_eq!(stored_value_writes.len(), 238, "inspection must not evict evidence");
+            closed(&mut rx).await;
+            eprintln!("STORAGE_RECOVERY_BENCHMARK {}", json!({
+                "pair":pair,"candidate":candidate,"wall_ms":wall_ms,
+                "value_loads":if candidate {0} else {8*238},"model_requests":0,
+                "scope":"native V8 inventory inspection; excludes seeding and provider inference",
+            }));
+        }
+    }
+}
+
+#[tokio::test]
 async fn python_string_index_error_has_a_javascript_hint() {
     for (source, hinted) in [
         ("const base = 'abc'; base.index('b');", true),
@@ -105,6 +188,45 @@ async fn critical_path_lazy_aliases_preserve_metadata_and_canonical_identity() {
     closed(&mut rx).await;
 }
 
+#[tokio::test]
+async fn registered_namespace_aliases_preserve_identity_and_reject_collisions() {
+    let definition = |global: &str, namespace: Option<&str>, name: &str| ToolDefinition {
+        name: global.into(), tool_name: ToolName::new(namespace.map(str::to_owned), name),
+        kind: CodeModeToolKind::Function, description: "contract".into(),
+        input_schema: None, output_schema: None, default_timeout_ms: None,
+    };
+    let definitions = vec![
+        definition("agents__list_agents__hash", Some("agents"), "list_agents"),
+        definition("old__read", None, "old__read"),
+        definition("duplicate_one", Some("ambiguous"), "read"),
+        definition("duplicate_two", Some("ambiguous"), "read"),
+        definition("blocked", None, "blocked"),
+        definition("blocked_child", Some("blocked"), "read"),
+        definition("clash__read", None, "clash__read"),
+        definition("clash_other", Some("clash"), "read"),
+        definition("special", Some("__proto__"), "constructor"),
+        definition("unicode", Some("命名"), "读取"),
+    ];
+    let (tx, _termination, mut rx) = start_with_tools(r#"
+        const tool = tools.agents.list_agents;
+        if (tool !== resolve_tool('agents.list_agents') || tool !== tools.agents__list_agents__hash ||
+            tool.name !== 'agents__list_agents__hash' || tool.description !== 'contract') throw Error('identity');
+        if (tools.old.read !== tools.old__read) throw Error('legacy alias');
+        if (tools.ambiguous?.read !== undefined || tools.clash?.read !== undefined) throw Error('ambiguous alias');
+        if (typeof tools.blocked !== 'function' || tools.blocked.read !== undefined) throw Error('canonical shadowed');
+        if (tools.__proto__.constructor !== tools.special || Object.getPrototypeOf(tools.__proto__) !== null ||
+            tools['命名']['读取'] !== tools.unicode) throw Error('literal identities');
+        text(await tool({value:42}));
+    "#, definitions).await;
+    let RuntimeEvent::ToolCall { id, name, input, .. } = next(&mut rx).await else { panic!("namespace dispatch"); };
+    assert_eq!(name, ToolName::namespaced("agents", "list_agents"));
+    assert_eq!(input, Some(json!({"value":42})));
+    tx.send(RuntimeCommand::ToolResponse { id, result: json!("namespace aliases passed") }).unwrap();
+    assert_eq!(text(next(&mut rx).await), "namespace aliases passed");
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text: None, .. }));
+    closed(&mut rx).await;
+}
+
 async fn start(source: &str) -> (std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle, mpsc::UnboundedReceiver<RuntimeEvent>) {
     start_with_tool(source, ToolDefinition {
         name: "sample_tool".to_string(),
@@ -118,11 +240,15 @@ async fn start(source: &str) -> (std_mpsc::Sender<RuntimeCommand>, RuntimeTermin
 }
 
 async fn start_with_tool(source: &str, tool: ToolDefinition) -> (std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle, mpsc::UnboundedReceiver<RuntimeEvent>) {
+    start_with_tools(source, vec![tool]).await
+}
+
+async fn start_with_tools(source: &str, tools: Vec<ToolDefinition>) -> (std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle, mpsc::UnboundedReceiver<RuntimeEvent>) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let request = ExecuteRequest {
         state_path: None,
         tool_call_id: "regression".to_string(),
-        enabled_tools: vec![tool].into(),
+        enabled_tools: tools.into(),
         source: source.to_string(),
         yield_time_ms: Some(1),
         max_output_tokens: None,
@@ -370,6 +496,39 @@ async fn unsafe_integers_round_trip_through_nested_tools_and_storage() {
     assert_eq!(*stored_value_writes["exact"].value, raw);
     assert!(!stored_value_writes.contains_key("overflow"));
     closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn tool_transport_parse_fast_path_preserves_values_and_captured_intrinsics() {
+    for raw in [
+        json!({"values":[null, true, 42, 0, 1.5, 1e100], "text":"λ😀\r\n", "__proto__":{"kept":true}}),
+        json!({"values":[9_007_199_254_740_991_u64, 9_007_199_254_740_993_u64, u64::MAX, i64::MIN]}),
+        json!({"text":"12345678901234567890", "values":[1, 2, 3]}),
+    ] {
+        let tool = ToolDefinition {
+            name:"sample_tool".into(), tool_name:ToolName::plain("sample_tool"),
+            kind:CodeModeToolKind::Function, description:"".into(), default_timeout_ms:None,
+            input_schema:None, output_schema:None,
+        };
+        let (tx, _termination, mut rx) = start_with_tool(r#"
+            RegExp.prototype.exec = RegExp.prototype.test = () => { throw Error('overridden regex'); };
+            JSON.parse = () => { throw Error('overridden parse'); };
+            const r = await tools.sample_tool({});
+            store('packet', r);
+            const loaded = load('packet');
+            loaded.changed = true;
+            await tools.sample_tool(load('packet'));
+        "#, tool).await;
+        let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else { panic!("initial call"); };
+        tx.send(RuntimeCommand::ToolResponse { id, result:raw.clone() }).unwrap();
+        let RuntimeEvent::ToolCall { id, input:Some(input), .. } = next(&mut rx).await else { panic!("round trip"); };
+        assert_eq!(input, raw);
+        tx.send(RuntimeCommand::ToolResponse { id, result:json!(null) }).unwrap();
+        let RuntimeEvent::Result { error_text, stored_value_writes, .. } = next(&mut rx).await else { panic!("result"); };
+        assert_eq!(error_text, None);
+        assert_eq!(*stored_value_writes["packet"].value, raw);
+        closed(&mut rx).await;
+    }
 }
 
 #[tokio::test]

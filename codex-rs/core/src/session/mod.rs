@@ -45,7 +45,7 @@ use crate::image_preparation::response_items_need_preparation;
 use crate::parse_turn_item;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
-use crate::session_prefix::format_inter_agent_completion_message;
+use crate::session_prefix::inter_agent_completion_communication;
 use crate::skills::SkillRenderSideEffects;
 use crate::skills_load_input_from_config;
 use crate::turn_metadata::TurnMetadataState;
@@ -1281,6 +1281,7 @@ async fn thread_title_from_thread_store(
     (!title.is_empty() && thread.preview.trim() != title).then(|| title.to_string())
 }
 
+#[cfg(test)]
 fn take_prompt_fragment(
     fragment: PromptFragment,
     budget: &mut ModelContextBudget,
@@ -1289,6 +1290,10 @@ fn take_prompt_fragment(
     take_prompt_fragment_with_identity(fragment, budget, turn_id, None)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "context source identities must fit usize; overflow must fail rather than alias a different contributor"
+)]
 fn context_contribution_index(producer: usize, fragment: usize, thread: bool) -> usize {
     // Cantor pairing is injective; source identity cannot shift when another
     // contributor times out or an earlier fragment fails admission.
@@ -2925,9 +2930,10 @@ impl Session {
                 "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
                 binding.assignment_id, binding.attempt_id,
             ));
-        let Some(message) = format_inter_agent_completion_message(
-            parent_agent_path.clone(),
+        let Some(communication) = inter_agent_completion_communication(
+            parent_agent_path,
             child_agent_path.clone(),
+            self.thread_id,
             &status,
             receipt.as_deref(),
         ) else {
@@ -2939,14 +2945,7 @@ impl Session {
             .services
             .rollout_thread_trace
             .is_enabled()
-            .then(|| message.clone());
-        let communication = InterAgentCommunication::new(
-            child_agent_path.clone(),
-            parent_agent_path,
-            Vec::new(),
-            message,
-            /*trigger_turn*/ false,
-        );
+            .then(|| communication.content.clone());
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Result, self.thread_id);
         if let Err(err) = self
@@ -3708,6 +3707,7 @@ impl Session {
         rx_response.await.ok()
     }
 
+    #[cfg(test)]
     pub async fn notify_user_input_response(
         &self,
         sub_id: &str,
@@ -5084,13 +5084,13 @@ impl Session {
     ) -> InitialContextBuild {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
-        let mut separate_developer_sections = Vec::<String>::new();
+        let separate_developer_sections = Vec::<String>::new();
         // Settings and world state have typed baselines and dedicated diff protocols. Fragment
         // receipts intentionally cover only unstructured prompt material that cannot otherwise be
         // compared safely.
         let mut stable_developer_sections = Vec::<String>::with_capacity(4);
-        let mut stable_contextual_user_sections = Vec::<String>::with_capacity(2);
-        let mut stable_separate_developer_sections = Vec::<String>::new();
+        let stable_contextual_user_sections = Vec::<String>::with_capacity(2);
+        let stable_separate_developer_sections = Vec::<String>::new();
         let (previous_turn_settings, collaboration_mode, session_source, retractable) = {
             let state = self.state.lock().await;
             (
@@ -5793,8 +5793,13 @@ impl Session {
             let members = pins.as_array().into_iter().flatten()
                 .filter_map(|pin| pin["artifact_id"].as_str().map(str::to_string)).collect();
             let directory = self.retain_context_source("artifact_directory", pins).await?;
+            #[expect(
+                clippy::expect_used,
+                reason = "successful retain_context_source always constructs an envelope with a string artifact_id"
+            )]
+            let artifact_id = directory["artifact_id"].as_str().expect("retained directory ID").to_string();
             let mutation = crate::tool_history::ToolHistoryMutation::RegisterArtifactDirectory {
-                artifact_id: directory["artifact_id"].as_str().expect("retained directory ID").to_string(),
+                artifact_id,
                 members,
             };
             let _permit = self.tool_history_reconciliation_gate.acquire().await
@@ -5821,6 +5826,10 @@ impl Session {
             .map_err(CodexErr::InvalidRequest)?;
         let recovery_sources = crate::state::AdditionalContextStore::recovery_sources(&values);
         for source in recovery_sources {
+            #[expect(
+                clippy::expect_used,
+                reason = "recovery_sources selects keys from this owned map and the loop never removes entries"
+            )]
             let entry = values.get_mut(&source).expect("source selected from this snapshot");
             let recovery = self.retain_context_source("additional_context", serde_json::json!([
                 {"source": source, "kind": "untrusted", "value": entry.value}

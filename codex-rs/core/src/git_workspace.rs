@@ -268,6 +268,7 @@ pub(crate) async fn capture_workspace_evidence_identity(
 /// Portable content identity, unlike the status/metadata freshness marker.
 /// Hash every indexed and non-ignored untracked path, including clean files.
 /// No partial hash is returned on drift, unsupported entries, or timeout.
+#[cfg(test)]
 pub(crate) async fn capture_checkout_snapshot(cwd: &Path) -> Option<String> {
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = cancellation.clone().drop_guard();
@@ -413,9 +414,11 @@ async fn resolve_workspace_evidence_root(cwd: &Path) -> std::io::Result<Option<P
         .await.map_err(std::io::Error::other)?
 }
 
+type WorkspaceRootCacheEntry = (Option<PathBuf>, Vec<DependencyFingerprint>);
+
 #[derive(Debug, Default)]
 pub(crate) struct WorkspaceRootCache {
-    entries: StdMutex<HashMap<PathBuf, (Option<PathBuf>, Vec<DependencyFingerprint>)>>,
+    entries: StdMutex<HashMap<PathBuf, WorkspaceRootCacheEntry>>,
 }
 
 impl WorkspaceRootCache {
@@ -1053,9 +1056,9 @@ async fn capture_workspace_metadata(
     let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
     let observed_bytes = Arc::new(AtomicU64::new(0));
     let hashing_concurrency = std::thread::available_parallelism().map_or(4, usize::from);
-    // Ordered buffering bounds blocking workers and preserves the status
-    // reader's sorted manifest order regardless of hash completion order.
-    let results = futures::stream::iter(paths.into_iter().map(|observation| {
+    // Bound active workers, not completed results waiting behind a slow file.
+    // Restore status order only after every independent capture has settled.
+    let captures = paths.into_iter().map(|observation| {
         let repo_root = repo_root.clone();
         let control = control.clone();
         let observed_bytes = Arc::clone(&observed_bytes);
@@ -1111,7 +1114,8 @@ async fn capture_workspace_metadata(
             manifest.push(b'\n');
             Some((manifest, None))
         }).await.ok()? }
-    })).buffered(hashing_concurrency).collect::<Vec<_>>().await;
+    });
+    let results = collect_workspace_work_in_order(captures, hashing_concurrency).await;
     let mut deletions = Vec::new();
     let mut path_fingerprints = BTreeMap::new();
     for result in results {
@@ -1519,7 +1523,7 @@ async fn ignored_directory_proof(root: &Path, path: &Path) -> Option<IgnoredDire
     }).await.ok()??;
     let fields = output.strip_suffix(&[0])?.split(|byte| *byte == 0).collect::<Vec<_>>();
     if fields.len() % 4 != 0 { return None; }
-    let directory = fields.chunks_exact(4).filter_map(|fields| {
+    let directory = fields.as_chunks::<4>().0.iter().filter_map(|fields| {
         let source = root.join(std::str::from_utf8(fields[0]).ok()?);
         let directory = root.join(std::str::from_utf8(fields[3]).ok()?);
         (fields[2].first() != Some(&b'!')
@@ -2089,6 +2093,22 @@ impl GitWorkspaceCache {
             .await.map_err(std::io::Error::other)?
     }
 
+    /// Only for projections whose complete dependency scope is checked by path
+    /// watches. Never publish this as a full capture or use it for digest replay.
+    pub(crate) async fn workspace_root_identity(&self, cwd: &Path) -> Option<WorkspaceEvidenceIdentity> {
+        match self.resolve_workspace_root(cwd).await {
+            Ok(root) => root.map(|root| WorkspaceEvidenceIdentity {
+                unavailable: false,
+                repository_root: Some(root.to_string_lossy().into_owned()),
+                head_identity: None,
+                index_identity: None,
+                worktree_identity: None,
+                path_fingerprints: None,
+            }),
+            Err(_) => Some(WorkspaceEvidenceIdentity::unavailable(None)),
+        }
+    }
+
     /// Exclude only proven irrelevant local paths. Discovery/ignore failures and
     /// remote environments remain conservatively attributable.
     pub(crate) async fn validation_relevant_paths(
@@ -2572,6 +2592,10 @@ impl GitWorkspaceCache {
         self.record_source_change_with_capture_effect(changed_paths, true)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serialize bounded ignore classification with journal/generation publication; retain the proof cache lock until classification completes"
+    )]
     async fn record_watched_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) {
         let _guard = self.source_event_gate.write().await;
         let changed_paths = changed_paths.map(|paths| paths.into_iter()
@@ -2957,10 +2981,27 @@ impl GitWorkspaceCache {
 async fn resolve_roots_in_order<T>(
     resolutions: impl IntoIterator<Item = impl Future<Output = T> + Send>,
 ) -> Vec<T> {
-    futures::stream::iter(resolutions)
-        .buffered(ROOT_DISCOVERY_CONCURRENCY)
-        .collect()
-        .await
+    collect_workspace_work_in_order(resolutions, ROOT_DISCOVERY_CONCURRENCY).await
+}
+
+async fn collect_workspace_work_in_order<T>(
+    work: impl IntoIterator<Item = impl Future<Output = T> + Send>,
+    concurrency: usize,
+) -> Vec<T> {
+    // Delivery order is not an execution dependency. An ordered buffer keeps
+    // completed siblings in its admission window until its oldest item ends.
+    // No tasks are spawned here: cancellation still drops owned futures, and
+    // callers retain their existing blocking-worker cancellation controls.
+    let mut results = futures::stream::iter(
+        work.into_iter()
+            .enumerate()
+            .map(|(index, future)| async move { (index, future.await) }),
+    )
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, value)| value).collect()
 }
 
 async fn matching_checkout_root(

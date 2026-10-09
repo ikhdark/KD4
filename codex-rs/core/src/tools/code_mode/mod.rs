@@ -532,7 +532,7 @@ impl CodeModeService {
     ) -> Option<JsonValue> {
         let mut admission = self.packet_admission.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else { return None; };
+        let metrics = admission.cells.get_mut(cell_id.as_str())?;
         let mut recovery = None;
         if artifact_required {
             if let Some((id, sha256, bytes)) = artifact {
@@ -1552,6 +1552,7 @@ fn prepend_script_status(
 }
 
 /// Returns the model-visible packet and whether it omits any output.
+#[cfg(test)]
 fn truncate_code_mode_result(
     items: Vec<FunctionCallOutputContentItem>,
     max_output_tokens: Option<usize>,
@@ -1588,27 +1589,24 @@ fn truncate_code_mode_result_at_lines(
     let whole_packet_limit = limits.applied_limit
         .saturating_add(limits.applied_limit / 3)
         .min(hard_limit);
-    if limits.applied_limit != 0
-        && codex_utils_output_truncation::model_token_count(&diagnostic_text) <= whole_packet_limit
-    {
-        return (items, false, None);
-    }
-    let policy = TruncationPolicy::Tokens(limits.applied_limit);
-    if let Some(error_index) = diagnostic_index {
-        return truncate_code_mode_failure(items, error_index, limits.applied_limit, source_lines);
-    }
-    if items
+    if diagnostic_index.is_none() && items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
         let (offset, total) = source_lines.unwrap_or((0, diagnostic_text.lines().count()));
-        let (truncated, omitted_lines) = codex_utils_output_truncation::truncate_model_text_at_lines_with_recovery(
+        let (truncated, omitted_lines) = codex_utils_output_truncation::truncate_model_text_at_lines_with_limits(
             &diagnostic_text,
             limits.applied_limit,
+            whole_packet_limit,
             offset, total,
             Some("{cell_output_artifact_id}"),
         );
         let omitted = truncated != diagnostic_text;
+        // Keep original item boundaries for a fitting packet, including empty
+        // items. The zero-budget path retains its existing empty projection.
+        if !omitted && limits.applied_limit != 0 {
+            return (items, false, None);
+        }
         return (
             vec![FunctionCallOutputContentItem::InputText { text: truncated }],
             omitted,
@@ -1616,6 +1614,15 @@ fn truncate_code_mode_result_at_lines(
         );
     }
 
+    if limits.applied_limit != 0
+        && codex_utils_output_truncation::model_token_count(&diagnostic_text) <= whole_packet_limit
+    {
+        return (items, false, None);
+    }
+    if let Some(error_index) = diagnostic_index {
+        return truncate_code_mode_failure(items, error_index, limits.applied_limit, source_lines);
+    }
+    let policy = TruncationPolicy::Tokens(limits.applied_limit);
     let projected = truncate_function_output_items_with_policy(&items, policy);
     let omitted = projected != items;
     (projected, omitted, None)
@@ -2193,6 +2200,10 @@ fn retained_nested_output(
 }
 
 /// Exact identities let bounded fallback diagnostics recognize already printed commands.
+#[expect(
+    clippy::expect_used,
+    reason = "serializing a string to an in-memory JSON string has no fallible keys or custom serializer; preserve exact escaped fingerprints"
+)]
 fn nested_output_fingerprints(tool: &ToolName, value: &JsonValue) -> Vec<(String, usize, [u8; 32])> {
     if tool.namespace.is_some() || !matches!(tool.name.as_str(), "exec_command" | "write_stdin")
         || value["repair"].as_str().is_some_and(|repair| !repair.is_empty())
@@ -2508,9 +2519,7 @@ fn nested_command_state(
 pub(crate) fn command_result_state(result: &JsonValue) -> Option<JsonValue> {
     // Command capability comes from the registered runtime, not a public-name
     // whitelist. Legacy shell forwarding returns the unified owner's contract.
-    if result.get("process_exited").is_none() {
-        return None;
-    }
+    result.get("process_exited")?;
     let mut state = serde_json::json!({});
     for key in [
         "error",
@@ -4194,6 +4203,25 @@ mod tests {
         );
         assert!(omitted);
         assert!(codex_utils_output_truncation::model_token_count(&super::code_mode_text_content(&cut)) <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+    }
+
+    #[test]
+    fn fitting_text_packets_preserve_item_boundaries() {
+        let items = vec![
+            FunctionCallOutputContentItem::InputText { text: String::new() },
+            FunctionCallOutputContentItem::InputText { text: "hello world".to_string() },
+            FunctionCallOutputContentItem::InputText { text: "λ😀\r\n".to_string() },
+        ];
+        let (projected, omitted) = truncate_code_mode_result(
+            items.clone(), Some(100), OutputOutcome::Success, 100, None,
+        );
+        assert_eq!(projected, items);
+        assert!(!omitted);
+        let (silent, omitted) = truncate_code_mode_result(
+            items, Some(0), OutputOutcome::Success, 100, None,
+        );
+        assert_eq!(silent, vec![FunctionCallOutputContentItem::InputText { text: String::new() }]);
+        assert!(omitted);
     }
 
     #[test]

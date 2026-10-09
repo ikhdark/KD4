@@ -782,17 +782,16 @@ impl CoreToolRuntime for ApplyPatchHandler {
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let tool_name = self.pre_tool_use_hook_name(&invocation.tool_name, &invocation.payload)?;
         let mut command = apply_patch_payload_command(&invocation.payload)?;
-        if apply_patch_retries::is_retry(&command) {
-            if let Ok(retry) = invocation
+        if apply_patch_retries::is_retry(&command)
+            && let Ok(retry) = invocation
                 .session
                 .services
                 .retained_patches
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .prepare(&command)
-            {
-                command = retry.args.patch;
-            }
+        {
+            command = retry.args.patch;
         }
         Some(PreToolUsePayload {
             tool_name,
@@ -839,6 +838,7 @@ impl CoreToolRuntime for ApplyPatchHandler {
             let receipt = retained
                 .replace_after_hook(&retry.id, patch, &invocation.call_id)
                 .map_err(FunctionCallError::RespondToModel)?;
+            #[expect(clippy::expect_used, reason = "replace_after_hook returns the string patch_id created by retain")]
             let id = receipt["patch_id"].as_str().expect("retained replacement id");
             invocation.payload = ToolPayload::Custom {
                 input: format!("*** Begin Patch\n*** Retry Patch: {id}\n*** End Patch"),

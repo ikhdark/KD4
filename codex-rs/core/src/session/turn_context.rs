@@ -222,6 +222,8 @@ pub struct TurnContext {
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
     pub(crate) tool_call_acceptance: Arc<crate::state::ToolCallAcceptanceGate>,
+    /// Shared across tool calls and model switches; never reset by test failures or edits.
+    pub(crate) full_suite_budget: Arc<crate::tools::handlers::command_preflight::FullSuiteBudget>,
     /// Remembers completed ordered-history commit retry keys for this turn only.
     pub(crate) durable_history_completed_commits: Arc<Mutex<HashSet<String>>>,
     pub(crate) terminal_error: Arc<Mutex<Option<ErrorEvent>>>,
@@ -639,6 +641,7 @@ impl TurnContext {
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
             tool_call_acceptance: Arc::clone(&self.tool_call_acceptance),
+            full_suite_budget: Arc::clone(&self.full_suite_budget),
             durable_history_completed_commits: Arc::clone(&self.durable_history_completed_commits),
             terminal_error: Arc::clone(&self.terminal_error),
             agent_task_binding: Arc::clone(&self.agent_task_binding),
@@ -1002,6 +1005,7 @@ impl Session {
             turn_skills: TurnSkillsContext::new(skills_snapshot),
             turn_timing_state: Arc::new(TurnTimingState::default()),
             tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),
+            full_suite_budget: Arc::default(),
             durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
             terminal_error: Arc::new(Mutex::new(None)),
             agent_task_binding: Arc::new(OnceLock::new()),

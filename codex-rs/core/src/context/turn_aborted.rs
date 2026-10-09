@@ -102,7 +102,7 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
         let process_running = call.process_spawned_at_ms.is_some() && call.process_exited_at_ms.is_none();
         if handler_running || process_running {
             in_flight += 1;
-            notice.push_str("\n");
+            notice.push('\n');
             notice.push_str(&serde_json::json!({
                 "call_id": call.call_id, "tool": call.tool_name,
                 "parent_call_id": call.parent_call_id, "cell_id": call.parent_cell_id,

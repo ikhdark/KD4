@@ -16,6 +16,140 @@ from scripts import process_owner, rust_tool_env, vscode_runtime_proof
 
 
 class ProcessOwnerTest(unittest.TestCase):
+    def test_primary_exit_reaps_inherited_pipes_without_losing_output_or_retrying(self):
+        for code, text_mode in ((0, False), (7, True)):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                ready = Path(directory) / "ready"
+                child = (
+                    "import socket,time; from pathlib import Path; "
+                    "s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); "
+                    f"Path({str(ready)!r}).write_text(str(s.getsockname()[1])); "
+                    "time.sleep(60)"
+                )
+                stdout = ("completed λ🙂\n" * 10_000).encode("utf-8")
+                stderr = ("failure detail\n" * 10_000).encode("utf-8")
+                parent = (
+                    "import subprocess,sys,time; from pathlib import Path; "
+                    f"subprocess.Popen([sys.executable,'-c',{child!r}]); "
+                    f"ready=Path({str(ready)!r})\n"
+                    "while not ready.exists(): time.sleep(.01)\n"
+                    "sys.stdout.buffer.write(('completed λ🙂\\n'*10000).encode('utf-8')); "
+                    "sys.stdout.buffer.flush(); "
+                    "sys.stderr.buffer.write(b'failure detail\\n'*10000); "
+                    f"sys.stderr.buffer.flush(); sys.exit({code})"
+                )
+                started = time.monotonic()
+                with mock.patch.object(
+                    process_owner.subprocess, "Popen", wraps=subprocess.Popen
+                ) as launch:
+                    try:
+                        result = process_owner.run_owned(
+                            [sys.executable, "-c", parent], capture_output=True,
+                            text=text_mode, encoding="utf-8" if text_mode else None,
+                            timeout=5, check=True,
+                        )
+                    except subprocess.CalledProcessError as error:
+                        result = error
+                    launch.assert_called_once()
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertEqual(result.returncode, code)
+                self.assertEqual(result.stdout, stdout.decode() if text_mode else stdout)
+                self.assertEqual(result.stderr, stderr.decode() if text_mode else stderr)
+                with socket.socket() as probe:
+                    probe.settimeout(.2)
+                    self.assertNotEqual(probe.connect_ex(("127.0.0.1", int(ready.read_text()))), 0)
+
+    def test_successful_opt_in_descendant_is_preserved(self):
+        child = "import time; time.sleep(.3); print('descendant',flush=True)"
+        parent = (
+            "import subprocess,sys; "
+            f"subprocess.Popen([sys.executable,'-c',{child!r}]); "
+            "print('primary',flush=True)"
+        )
+        result = process_owner.run_owned(
+            [sys.executable, "-c", parent], capture_output=True, text=True,
+            timeout=5, preserve_descendants_on_success=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "primary\ndescendant\n")
+
+    def test_owned_timeout_and_cancellation_recover_flushed_output_without_replay(self):
+        real_owned_process = process_owner.owned_process
+        for mode in ("timeout", "cancel", "operation_timeout"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                ready = Path(directory) / "ready"
+                expected_error = {
+                    "timeout": subprocess.TimeoutExpired,
+                    "cancel": process_owner.CancelledError,
+                    "operation_timeout": TimeoutError,
+                }[mode]
+                with process_owner.operation() as operation:
+                    @contextlib.contextmanager
+                    def after_flush(*args, **kwargs):
+                        with real_owned_process(*args, **kwargs) as child:
+                            deadline = time.monotonic() + 5
+                            while not ready.exists():
+                                self.assertIsNone(child.poll())
+                                self.assertLess(time.monotonic(), deadline)
+                                time.sleep(.01)
+                            if mode == "cancel":
+                                operation.cancelled.set()
+                            elif mode == "operation_timeout":
+                                operation.deadline = time.monotonic() - 1
+                            yield child
+
+                    with (
+                        mock.patch.object(process_owner, "owned_process", after_flush),
+                        mock.patch.object(process_owner.subprocess, "Popen", wraps=subprocess.Popen) as launch,
+                        self.assertRaises(expected_error) as raised,
+                    ):
+                        process_owner.run_owned(
+                            [sys.executable, "-c",
+                             "import sys,time; from pathlib import Path; "
+                             "sys.stdout.buffer.write(b'completed step\\n'); sys.stdout.buffer.flush(); "
+                             "sys.stderr.buffer.write(b'unfinished step\\n'); sys.stderr.buffer.flush(); "
+                             f"Path({str(ready)!r}).touch(); time.sleep(60)"],
+                            capture_output=True, timeout=.2,
+                        )
+                    launch.assert_called_once()
+                    self.assertEqual(raised.exception.output, b"completed step\n")
+                    self.assertEqual(raised.exception.stderr, b"unfinished step\n")
+
+    def test_owned_post_cleanup_drain_is_bounded_and_never_claims_success(self):
+        process = mock.Mock()
+        process.poll.return_value = 7
+        process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 5, output=b"partial")
+
+        @contextlib.contextmanager
+        def owner(*args, **kwargs):
+            yield process
+
+        with (
+            mock.patch.object(process_owner, "owned_process", owner),
+            self.assertRaisesRegex(process_owner.CleanupFailed, "output pipes") as raised,
+        ):
+            process_owner.run_owned(["fixture"], capture_output=True)
+        self.assertEqual(process.communicate.call_count, 2)
+        self.assertEqual(process.communicate.call_args, mock.call(timeout=5))
+        self.assertEqual(raised.exception.__cause__.output, b"partial")
+
+    def test_owned_failed_tree_cleanup_is_not_replaced_by_output_drain(self):
+        process = mock.Mock()
+        process.poll.return_value = 7
+        process.communicate.side_effect = subprocess.TimeoutExpired("fixture", .1)
+
+        @contextlib.contextmanager
+        def owner(*args, **kwargs):
+            yield process
+            raise process_owner.CleanupFailed("tree exit unconfirmed")
+
+        with (
+            mock.patch.object(process_owner, "owned_process", owner),
+            self.assertRaisesRegex(process_owner.CleanupFailed, "tree exit unconfirmed"),
+        ):
+            process_owner.run_owned(["fixture"], capture_output=True)
+        process.communicate.assert_called_once()
+
     def test_cli_below_normal_priority_is_opt_in(self):
         for flags in ([], ["--below-normal-priority"]):
             with self.subTest(flags=flags), mock.patch.object(

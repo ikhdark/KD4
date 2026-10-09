@@ -243,8 +243,8 @@ impl SessionState {
     }
 
     fn recover_output_gap(&self, response: ReadResponse) -> Result<bool, ExecServerError> {
-        let gap = response.output_gap.as_ref().expect("checked output gap");
         let target = response.next_seq.saturating_sub(1);
+        let gap = response.output_gap.as_ref().ok_or_else(|| recovery_gap_error(target))?;
         if gap.through_seq > target
             || response.exited != gap.exit_seq.is_some()
             || gap.exit_seq.is_some_and(|seq| seq == 0 || seq > target || response.exit_code.is_none())
@@ -271,7 +271,7 @@ impl SessionState {
         if let Some(seq) = gap.exit_seq {
             recovered.insert(seq, ExecProcessEvent::Exited {
                 seq,
-                exit_code: response.exit_code.expect("validated exit code"),
+                exit_code: response.exit_code.ok_or_else(|| recovery_gap_error(target))?,
                 sandbox_denied: (response.sandbox_denied || response.closed)
                     .then_some(response.sandbox_denied),
             });
@@ -286,9 +286,10 @@ impl SessionState {
             recovered.entry(*seq).or_insert_with(|| event.clone());
         }
         let mut cursor = ordered.last_published_seq;
+        let last_published_seq = cursor;
         // Validate all holes before publishing anything. Only server-declared
         // output eviction can advance the cursor without an event.
-        for seq in recovered.keys().copied().filter(|seq| *seq > cursor).collect::<Vec<_>>() {
+        for seq in recovered.keys().copied().filter(|seq| *seq > last_published_seq) {
             if seq > cursor.saturating_add(1) && seq - 1 > gap.through_seq {
                 return Err(recovery_gap_error(target));
             }

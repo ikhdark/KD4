@@ -1074,8 +1074,10 @@ mod tests {
                     background: SyntectColor { r: 100, g: 200, b: 150, a: 255 },
                     font_style,
                 });
-                let mut expected_style = Style::default();
-                expected_style.fg = expected;
+                let mut expected_style = Style {
+                    fg: expected,
+                    ..Style::default()
+                };
                 if font_style.contains(FontStyle::BOLD) {
                     expected_style.add_modifier = Modifier::BOLD;
                 }

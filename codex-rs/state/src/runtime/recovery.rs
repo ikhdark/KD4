@@ -30,10 +30,10 @@ pub(super) async fn lock_runtime_initialization(home: &Path) -> std::io::Result<
             let mut name = std::ffi::OsString::from(".");
             name.push(home_name);
             name.push(".");
-            name.push(db.path.file_name().expect("database name"));
+            name.push(file_name(&db.path)?);
             name.push(".initialize.lock");
-            parent.join(name)
-        }).collect::<Vec<_>>();
+            Ok(parent.join(name))
+        }).collect::<std::io::Result<Vec<_>>>()?;
         paths.sort();
         paths.into_iter().map(|path| {
             let file = std::fs::OpenOptions::new().create(true).truncate(false)

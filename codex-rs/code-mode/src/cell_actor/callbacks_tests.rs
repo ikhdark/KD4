@@ -22,6 +22,102 @@ struct PanickingCallbackHost;
 
 struct NonCooperativeCallbackHost;
 
+struct SlowSetupCallbackHost {
+    setup: Duration,
+    ready: std_mpsc::Sender<Option<std::time::Instant>>,
+    completed: Option<JsonValue>,
+}
+
+impl CellHost for SlowSetupCallbackHost {
+    fn invoke_tool(
+        &self,
+        invocation: CellToolCall,
+        _cancellation: NestedCancellation,
+    ) -> impl std::future::Future<Output = Result<JsonValue, String>> + Send {
+        // Future construction can do synchronous work before either select
+        // branch is polled. It must not start a second timeout budget.
+        std::thread::sleep(self.setup);
+        self.ready.send(invocation.deadline).unwrap();
+        let completed = self.completed.clone();
+        async move {
+            match completed {
+                Some(value) => Ok(value),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    async fn notify(&self, _: String, _: String, _: CancellationToken) -> Result<(), String> {
+        panic!("unexpected notification");
+    }
+
+    async fn commit_completion(
+        &self,
+        _: HashMap<String, crate::runtime::StoredValue>,
+        _: CellEvent,
+        _: Option<Vec<crate::session_runtime::OutputItem>>,
+        _: Arc<CellState>,
+    ) -> CompletionCommit {
+        panic!("unexpected completion commit");
+    }
+
+    async fn closed(&self, _: Option<CellEvent>) {}
+}
+
+#[tokio::test]
+async fn callback_setup_does_not_restart_the_published_deadline() {
+    for timeout in [Duration::from_millis(150), Duration::ZERO] {
+        let mut tasks = JoinSet::new();
+        let (runtime_tx, runtime_rx) = std_mpsc::channel();
+        let (ready_tx, ready_rx) = std_mpsc::channel();
+        let cancellation = NestedCancellation::new(CancellationToken::new());
+        let setup = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        spawn_tool(
+            &mut tasks,
+            Arc::new(SlowSetupCallbackHost {
+                setup,
+                ready: ready_tx,
+                completed: timeout.is_zero().then(|| serde_json::json!({"retained": "done"})),
+            }),
+            CellToolCall {
+                id: "slow-setup".into(),
+                name: ToolName { name: "fixture".into(), namespace: None },
+                kind: ToolKind::Function,
+                input: None,
+                timeout,
+                deadline: None,
+                buffered_output_bytes: 0,
+            },
+            runtime_tx,
+            cancellation.clone(),
+            None,
+        );
+        tasks.join_next().await.unwrap().unwrap();
+        let elapsed = started.elapsed();
+        let deadline = ready_rx.try_recv().unwrap();
+        let command = runtime_rx.try_recv().unwrap();
+        assert!(tasks.is_empty());
+        assert!(runtime_rx.try_recv().is_err(), "one invocation must yield only one receipt");
+        if timeout.is_zero() {
+            assert!(deadline.is_none());
+            assert!(!cancellation.token().is_cancelled());
+            assert!(matches!(command, RuntimeCommand::ToolResponse { result, .. }
+                if result == serde_json::json!({"retained": "done"})));
+        } else {
+            assert!(matches!(command, RuntimeCommand::ToolError { error_text, .. }
+                if error_text.contains("150ms timeout")));
+            assert!(cancellation.token().is_cancelled());
+            let excess = elapsed.saturating_sub(setup);
+            eprintln!("callback_setup_deadline wall_us={} setup_us={} extra_wait_us={} deadline_overrun_us={}",
+                elapsed.as_micros(), setup.as_micros(), excess.as_micros(), deadline.unwrap().elapsed().as_micros());
+            // Synchronous setup itself cannot be preempted, but after it yields
+            // an expired deadline must not add another full 150 ms wait.
+            assert!(excess < Duration::from_millis(100), "restarted callback timeout: {elapsed:?}");
+        }
+    }
+}
+
 impl CellHost for PanickingCallbackHost {
     async fn invoke_tool(
         &self,

@@ -151,6 +151,7 @@ pub(super) async fn spawn_review_thread(
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.snapshot.clone()),
         turn_timing_state: Arc::new(TurnTimingState::default()),
         tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),
+        full_suite_budget: Arc::clone(&parent_turn_context.full_suite_budget),
         durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
         terminal_error: Arc::new(Mutex::new(None)),
         agent_task_binding: Arc::new(std::sync::OnceLock::new()),

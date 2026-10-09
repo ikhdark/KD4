@@ -5727,6 +5727,7 @@ async fn request_effort_uses_model_default_and_preserves_explicit_choice() {
 #[tokio::test]
 async fn turn_context_with_model_updates_model_fields() {
     let (_session, mut turn_context) = make_session_and_context().await;
+    turn_context.full_suite_budget.admit(true).unwrap();
     let models_manager: codex_models_manager::manager::SharedModelsManager =
         Arc::new(codex_models_manager::manager::StaticModelsManager::new(
             None,
@@ -5748,6 +5749,7 @@ async fn turn_context_with_model_updates_model_fields() {
         .await;
 
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.4"));
+    assert!(updated.full_suite_budget.admit(true).is_err(), "switching models must not reset full-suite admission");
     assert_eq!(updated.collaboration_mode.model(), "gpt-5.4");
     assert_eq!(updated.model_info, expected_model_info);
     assert!(Arc::ptr_eq(
@@ -10579,7 +10581,7 @@ async fn compacted_history_installs_application_policy_in_live_and_durable_histo
                     _ => None,
                 }
             })
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(installed, history);
     }
@@ -16574,6 +16576,9 @@ async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
         .await
         .expect("steer pending input into active turn");
 
+        let terminal = sess.active_turn.lock().await.as_ref()
+            .and_then(|active| active.terminal.clone())
+            .expect("original turn has a terminal coordinator");
         finish.cancel();
 
         let (original_terminal_seen, fresh_turn_id) = tokio::time::timeout(
@@ -16588,6 +16593,18 @@ async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
                     {
                         assert_eq!(error.is_some(), panic_at_stop, "injected stop panic determines original terminal failure");
                         original_terminal_seen = true;
+                        if panic_at_stop {
+                            terminal.wait_cleanup_completed().await;
+                            assert!(sess.active_turn.lock().await.is_none(), "failed finalization must not automatically retry accepted input");
+                            assert!(sess.input_queue.has_pending_turn_start_work().await, "failed finalization must preserve the accepted input");
+                            while let Ok(event) = rx.try_recv() {
+                                assert!(!matches!(event.msg, EventMsg::TurnStarted(_) | EventMsg::ItemStarted(_)), "failed finalization published an automatic successor");
+                            }
+                            // A failed terminal requires explicit admission. The new
+                            // turn must consume the retained steering exactly once.
+                            let next = sess.new_default_turn_with_sub_id("explicit-follow-up".into()).await;
+                            sess.start_task(next, Vec::new(), crate::tasks::RegularTask::new()).await;
+                        }
                     }
                     EventMsg::ItemStarted(ItemStartedEvent {
                         turn_id,

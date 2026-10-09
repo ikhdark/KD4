@@ -335,8 +335,11 @@ where
             let mut fragments: Vec<Box<dyn ContextualUserFragment + Send>> = Vec::new();
             if config.include_instructions {
                 // Selection has already copied its entries, so the catalog can be narrowed in place.
+                // Core owns the host catalog's model-aware budget and recovery locators.
+                // Re-emitting it here would bypass that budget with duplicate descriptions.
                 catalog.entries.retain(|entry| {
-                    entry.authority.kind != SkillSourceKind::Executor
+                    entry.authority.kind != SkillSourceKind::Host
+                        && entry.authority.kind != SkillSourceKind::Executor
                         && entry.authority.kind != SkillSourceKind::Orchestrator
                 });
                 // Orchestrator discovery and its recovery route belong to thread context.

@@ -141,6 +141,10 @@ impl ProjectDocOmissionRecovery {
         Self { thread_id, cached: tokio::sync::Mutex::new(None) }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize omission artifact publication so concurrent notices reuse one recoverable manifest identity"
+    )]
     async fn notice(&self, config: &Config, documents: &[ProjectDocOmission]) -> String {
         let (notice, overflow) = project_doc_omission_notice(documents, "");
         if !overflow { return notice; }
@@ -296,6 +300,7 @@ pub(crate) async fn discover_project_instructions_with_markers(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn load_project_instructions_from_discovery(
     config: &Config,
     user_instructions: Option<UserInstructions>,

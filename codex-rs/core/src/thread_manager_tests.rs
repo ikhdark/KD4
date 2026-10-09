@@ -2303,7 +2303,7 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
         internal_chat_message_metadata_passthrough: None,
     });
     let history = InitialHistory::Forked(vec![
-        committed_user.clone(),
+        committed_user,
         RolloutItem::SamplingBoundary(SamplingBoundaryItem {
             sampling_request_id: "previous-request".to_string(),
             physical_attempt_id: "previous-attempt".to_string(),
@@ -2311,7 +2311,7 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
             unresolved_context: false,
             timing_checkpoint: None,
         }),
-        boundary.clone(),
+        boundary,
         unfinished_output,
         RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),

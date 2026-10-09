@@ -1592,6 +1592,7 @@ fn validation_diagnostic_evidence(raw_output: &[u8]) -> Vec<String> {
 }
 
 fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static FAILED_TEST: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(concat!(
             r"^(?:FAIL\s+\[\s*[^]]+\]\s+(?:\(\s*\d+/\d+\)\s+)?(?P<nextest>.+)",
@@ -1599,6 +1600,7 @@ fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
             r"|FAILED (?P<pytest>\S+)(?: - (?P<message>.*))?)$"
         )).expect("valid failed test regex")
     });
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static RUNNER_INDEX: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(r"\(\s*\d+/\d+\)\s*").expect("valid runner index regex")
     });
@@ -1670,6 +1672,7 @@ fn normalize_test_diagnostic_line(line: &str) -> String {
     {
         return line.to_string();
     }
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static VOLATILE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(concat!(
             r"(?P<duration>^\s*(?:FAIL|PASS|SKIP|TIMEOUT)\s+\[)\s*\d+(?:\.\d+)?s\]",
@@ -1694,6 +1697,7 @@ fn command_failure_signature(semantic_evidence: &[String], exit_code: Option<i32
 /// Normalize only recognizable producer framing. Durations in source, diffs,
 /// application data, or assertion messages remain substantive evidence.
 fn normalize_command_diagnostic_line(line: &str) -> String {
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static RUNNER_DURATION: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(concat!(
             r"^(?P<prefix>\s*(?:",
@@ -1706,6 +1710,7 @@ fn normalize_command_diagnostic_line(line: &str) -> String {
             r"(?P<suffix>\s*(?:=+)?|\].*)$"
         )).expect("valid runner duration regex")
     });
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static LOG_TIMESTAMP: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(concat!(
             r"^(?P<prefix>\s*)",
@@ -1924,12 +1929,15 @@ pub(crate) fn attach_command_validation(
 
 fn validation_summary_test_count(raw_output: &[u8]) -> Option<u64> {
     use std::sync::LazyLock;
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static CARGO: LazyLock<regex_lite::Regex> = LazyLock::new(|| regex_lite::Regex::new(
-        r"^test result: ok\. ([0-9]+) passed; 0 failed; .*; finished in .+$").unwrap());
+        r"^test result: ok\. ([0-9]+) passed; 0 failed; .*; finished in .+$").expect("valid cargo summary regex"));
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static UNITTEST: LazyLock<regex_lite::Regex> = LazyLock::new(|| regex_lite::Regex::new(
-        r"^Ran ([0-9]+) tests? in .+$").unwrap());
+        r"^Ran ([0-9]+) tests? in .+$").expect("valid unittest summary regex"));
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static PYTEST: LazyLock<regex_lite::Regex> = LazyLock::new(|| regex_lite::Regex::new(
-        r"^=*[ ]*([0-9]+) passed(?:, [0-9]+ (?:skipped|deselected|xfailed|xpassed|warnings?))* in .+?(?:[ ]*=*)$").unwrap());
+        r"^=*[ ]*([0-9]+) passed(?:, [0-9]+ (?:skipped|deselected|xfailed|xpassed|warnings?))* in .+?(?:[ ]*=*)$").expect("valid pytest summary regex"));
     let text = std::str::from_utf8(raw_output).ok()?;
     let lines = text.lines().map(strip_ansi_sequences).collect::<Vec<_>>();
     let last = lines.iter().rev().find(|line| !line.trim().is_empty())?.trim();
@@ -2132,7 +2140,7 @@ impl ExecCommandToolOutput {
                         std::str::from_utf8(&snapshot.stderr).ok()?.to_string()))
                 }),
             });
-            if self.validation.as_ref().is_some_and(|validation| validation.is_validation())
+            if self.validation.as_ref().is_some_and(crate::validation::CommandValidation::is_validation)
                 || exit_code != 0
             {
                 output_fragment.kind = ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary;
@@ -2242,7 +2250,7 @@ impl ExecCommandToolOutput {
         let compact_validation = self.process_id.is_none()
             && self.process_exited
             && self.exit_code == Some(0)
-            && self.validation.as_ref().is_some_and(|validation| validation.is_validation())
+            && self.validation.as_ref().is_some_and(crate::validation::CommandValidation::is_validation)
             && self.raw_output_artifact.as_ref().is_some_and(|artifact| {
                 artifact.model_projection().0.is_some()
                     && artifact.retained_bytes().is_some_and(|bytes| bytes >= raw_output.len() as u64)

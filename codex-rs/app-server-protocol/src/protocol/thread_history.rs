@@ -3939,7 +3939,7 @@ mod tests {
     #[test]
     fn preserves_compaction_only_turn() {
         for explicit in [false, true] {
-            let items = vec![
+            let items = [
                 RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                     turn_id: "turn-compact".into(),
                     trace_id: None,

@@ -187,31 +187,7 @@ pub(crate) fn parse(
                                     && let Some(value) = attribute.child_by_field_name("value")
                                     && let Some(value) = rust_string_value(value, source)
                                 {
-                                    // A top-level #[path] is relative to the source's directory.
-                                    // Inline modules add their module directories below that base.
-                                    let mut modules = Vec::new();
-                                    let mut ancestor = node.parent();
-                                    while let Some(parent) = ancestor {
-                                        if parent.kind() == "mod_item"
-                                            && let Some(name) = parent.child_by_field_name("name")
-                                        {
-                                            modules.push(source[name.byte_range()].to_owned());
-                                        }
-                                        ancestor = parent.parent();
-                                    }
-                                    let mut base = Path::new(path)
-                                        .parent()
-                                        .unwrap_or_else(|| Path::new(""))
-                                        .to_path_buf();
-                                    if !modules.is_empty() {
-                                        let stem = Path::new(path).file_stem()?.to_str()?;
-                                        if !matches!(stem, "mod" | "lib" | "main") {
-                                            base.push(stem);
-                                        }
-                                    }
-                                    for module in modules.iter().rev() {
-                                        base.push(module);
-                                    }
+                                    let base = module_directory(path, node, source, false)?;
                                     linked_path = Some(
                                         base.join(value).to_string_lossy().into_owned(),
                                     );
@@ -238,18 +214,7 @@ pub(crate) fn parse(
             // Bound outline metadata; the complete signature remains in the exact section.
             let mut linked_path_candidates = Vec::new();
             if rust && kind == "mod" && body.is_none() && linked_path.is_none() {
-                let mut base = Path::new(path).parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-                let stem = Path::new(path).file_stem()?.to_str()?;
-                if !matches!(stem, "mod" | "lib" | "main") { base.push(stem); }
-                let mut modules = Vec::new();
-                let mut ancestor = node.parent();
-                while let Some(parent) = ancestor {
-                    if parent.kind() == "mod_item" && let Some(name) = parent.child_by_field_name("name") {
-                        modules.push(source[name.byte_range()].trim_start_matches("r#"));
-                    }
-                    ancestor = parent.parent();
-                }
-                for module in modules.iter().rev() { base.push(module); }
+                let base = module_directory(path, node, source, true)?;
                 let name = name.trim_start_matches("r#");
                 linked_path_candidates.push(base.join(format!("{name}.rs")).to_string_lossy().into_owned());
                 linked_path_candidates.push(base.join(name).join("mod.rs").to_string_lossy().into_owned());
@@ -295,6 +260,53 @@ pub(crate) fn parse(
     }
 }
 
+// Resolve only syntax-known directories; never probe the filesystem. A path on
+// the first inline module replaces the pending non-mod.rs stem, while ordinary
+// inline modules consume it. Explicit leaf paths at file scope use the parent.
+fn module_directory(
+    path: &str,
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    conventional: bool,
+) -> Option<std::path::PathBuf> {
+    let path = Path::new(path);
+    let mut base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let stem = path.file_stem()?.to_str()?;
+    let mut pending_stem = (!matches!(stem, "mod" | "lib" | "main")).then_some(stem);
+    let mut modules = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "mod_item" { modules.push(parent); }
+        ancestor = parent.parent();
+    }
+    for module in modules.into_iter().rev() {
+        let mut override_path = None;
+        let mut sibling = module.prev_named_sibling();
+        while let Some(previous) = sibling {
+            if !matches!(previous.kind(), "attribute_item" | "line_comment" | "block_comment") { break; }
+            if previous.kind() == "attribute_item"
+                && let Some(attribute) = previous.named_child(0)
+                && let Some(name) = attribute.named_child(0)
+                && &source[name.byte_range()] == "path"
+                && let Some(value) = attribute.child_by_field_name("value")
+            {
+                override_path = Some(rust_string_value(value, source)?);
+            }
+            sibling = previous.prev_named_sibling();
+        }
+        if let Some(value) = override_path {
+            pending_stem = None;
+            base.push(value);
+        } else {
+            if let Some(stem) = pending_stem.take() { base.push(stem); }
+            let name = module.child_by_field_name("name")?;
+            base.push(source[name.byte_range()].trim_start_matches("r#"));
+        }
+    }
+    if conventional && let Some(stem) = pending_stem { base.push(stem); }
+    Some(base)
+}
+
 // Decode only the string node selected by the grammar, never parse an attribute
 // a second time. Unsupported or malformed literals do not advertise a path.
 fn rust_string_value(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
@@ -332,7 +344,7 @@ fn rust_string_value(node: tree_sitter::Node<'_>, source: &str) -> Option<String
                 char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?
             }
             '\n' | '\r' => {
-                while chars.peek().is_some_and(|ch| ch.is_ascii_whitespace()) { chars.next(); }
+                while chars.peek().is_some_and(char::is_ascii_whitespace) { chars.next(); }
                 continue;
             }
             _ => return None,

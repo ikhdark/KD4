@@ -1075,7 +1075,7 @@ impl MessageProcessor {
                 .clients_revoke(params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ConfigRequirementsRead { params: _, .. } => self
+            ClientRequest::ConfigRequirementsRead { .. } => self
                 .config_processor
                 .config_requirements_read()
                 .await
@@ -1131,12 +1131,12 @@ impl MessageProcessor {
                 .unwatch(connection_id, params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ModelProviderCapabilitiesRead { params: _, .. } => self
+            ClientRequest::ModelProviderCapabilitiesRead { .. } => self
                 .config_processor
                 .model_provider_capabilities_read()
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::GatewayOAuthRead { params: _, .. } => self
+            ClientRequest::GatewayOAuthRead { .. } => self
                 .config_processor
                 .gateway_oauth_read()
                 .await

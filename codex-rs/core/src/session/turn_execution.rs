@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 
 use codex_config::schema::canonicalize as canonicalize_json;
 use codex_protocol::models::ResponseInputItem;
+#[cfg(test)]
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
@@ -196,7 +197,6 @@ struct SamplingToolOutcome {
     tests_attributed: bool,
     runner_test_evidence: Option<RunnerTestEvidence>,
     process_observation_progress: bool,
-    empty_output: bool,
     validation_scope: Option<ValidationScope>,
     validation_mutation_revision: Option<u64>,
     background_process_id: Option<u64>,
@@ -436,7 +436,6 @@ impl SamplingToolOutcome {
             runner_test_evidence: signal.and_then(RunnerTestEvidence::from_signal),
             process_observation_progress: signal
                 .is_some_and(|signal| signal["process_observation_progress"] == true),
-            empty_output: signal.is_some_and(|signal| signal["empty_output"] == true),
             validation_scope: signal.and_then(|signal| signal.get("validation_scope"))
                 .and_then(|scope| serde_json::from_value(scope.clone()).ok()),
             validation_mutation_revision: signal
@@ -3335,8 +3334,7 @@ impl TurnExecutionControl {
         }
         if current_failures != 0 {
             assessment.failed_checks.push(format!(
-                "{} validation check(s) failed without a later passing execution or current per-test repairs.",
-                current_failures,
+                "{current_failures} validation check(s) failed without a later passing execution or current per-test repairs.",
             ));
             for (_, failed) in self.failed_validation_tests.iter().filter(|(check, _)| !self.inherited_validation_checks.contains(*check)) {
                 if let Some(required) = &failed.evidence.required {
@@ -3367,8 +3365,7 @@ impl TurnExecutionControl {
         if !self.pending_validation_coverage.is_empty() {
             let current = self.pending_validation_coverage.values().filter(|pending| !pending.inherited).count();
             if current != 0 { assessment.verification_gaps.push(format!(
-                "{} validation process(es) still await a consumed terminal result.",
-                current,
+                "{current} validation process(es) still await a consumed terminal result.",
             )); }
             let inherited = self.pending_validation_coverage.len() - current;
             if inherited != 0 { assessment.advisories.push(format!(
@@ -3688,15 +3685,18 @@ impl TurnExecutionControl {
             input_revision: self.input_revision,
             tool_exposure_revision,
             evidence_fingerprint: self.evidence_fingerprint.get_or_init(|| {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "derived evidence serialization contains only strings, string-keyed maps, collections, and integer ranges"
+                )]
+                let evidence = serde_json::to_vec(&(
+                    &self.budget_progress_evidence,
+                    &self.delivered_coverage,
+                ))
+                .expect("ordered evidence contains only JSON-serializable values");
                 format!(
                     "{:x}",
-                    Sha256::digest(
-                        serde_json::to_vec(&(
-                            &self.budget_progress_evidence,
-                            &self.delivered_coverage,
-                        ))
-                        .expect("ordered evidence contains only JSON-serializable values"),
-                    ),
+                    Sha256::digest(evidence),
                 )
             }).clone(),
         }
@@ -4531,6 +4531,7 @@ impl TurnExecutionControl {
     }
 }
 
+#[cfg(test)]
 fn plan_is_unfinished(plan: &UpdatePlanArgs) -> bool {
     !plan.plan.is_empty()
         && plan
@@ -4789,6 +4790,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::print_stderr, reason = "this policy replay emits machine-readable deterministic measurements")]
     fn lightweight_handoff_advisory_preserves_novel_progress_and_tool_access() {
         let mut measurements = Vec::new();
         for generations in [2, 3, 4] {
@@ -8085,7 +8087,7 @@ mod tests {
             assert_ne!(expected, fingerprint(serde_json::json!({"port":8080}), changed), "{key}");
         }
         assert_ne!(expected, fingerprint(serde_json::json!({"port":8081}), base.clone()));
-        let mut moved = base.clone();
+        let mut moved = base;
         moved["error"] = serde_json::json!("src/a.rs:99:8: failed");
         assert_eq!(expected, fingerprint(serde_json::json!({"port":8080}), moved));
         assert_ne!(fingerprint(serde_json::json!({}), serde_json::json!({"error":"timeout after 7s"})),
@@ -8191,12 +8193,10 @@ mod tests {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
 
-        for (_generation, (artifact_id, fingerprint)) in [
+        for (artifact_id, fingerprint) in [
             ("artifact-1", "io.locked"),
             ("artifact-2", "schema.invalid"),
         ]
-        .into_iter()
-        .enumerate()
         {
             let collector = direct_failure_collector_for_artifact(
                 &control,
@@ -8230,12 +8230,10 @@ mod tests {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
 
-        for (_index, (artifact_id, fingerprint)) in [
+        for (artifact_id, fingerprint) in [
             ("artifact-1", "io.locked"),
             ("artifact-2", "schema.invalid"),
         ]
-        .into_iter()
-        .enumerate()
         {
             let collector = direct_failure_collector_for_artifact(
                 &control,

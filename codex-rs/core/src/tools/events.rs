@@ -837,6 +837,10 @@ pub(crate) async fn begin_uncertain_command_baseline(
 
 
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "reconciliation and recording must exclude patches that change the tracker's expected content during filesystem reads"
+)]
 async fn emit_exec_end(
     ctx: ToolEventCtx<'_>,
     exec_input: ExecCommandInput<'_>,

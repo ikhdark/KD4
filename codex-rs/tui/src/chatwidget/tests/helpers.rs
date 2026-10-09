@@ -467,24 +467,6 @@ pub(super) fn handle_warning(chat: &mut ChatWidget, message: impl Into<String>) 
     );
 }
 
-pub(super) fn handle_model_verification(
-    chat: &mut ChatWidget,
-    verifications: Vec<AppServerModelVerification>,
-) {
-    chat.handle_server_notification(
-        ServerNotification::ModelVerification(ModelVerificationNotification {
-            thread_id: thread_id(chat),
-            turn_id: chat
-                .turn_lifecycle
-                .last_turn_id
-                .clone()
-                .unwrap_or_else(|| "turn-1".to_string()),
-            verifications,
-        }),
-        /*replay_kind*/ None,
-    );
-}
-
 pub(super) fn handle_agent_message_delta(chat: &mut ChatWidget, delta: impl Into<String>) {
     chat.handle_server_notification(
         ServerNotification::AgentMessageDelta(

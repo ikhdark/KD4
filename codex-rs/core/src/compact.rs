@@ -587,7 +587,7 @@ async fn run_compact_task_inner_impl(
         );
 
         let mut prompt = Prompt {
-            input: turn_input.into(),
+            input: turn_input,
             base_instructions,
             ..Default::default()
         };
@@ -1790,7 +1790,7 @@ fn build_bounded_input_history(
         recovery_count += usize::from(matches!(item, ResponseItem::Message { .. } | ResponseItem::AgentMessage { .. }));
         index
     }).collect::<Vec<_>>();
-    let (user_source_indices, messages): (Vec<_>, Vec<_>) = collect_user_messages_with_indices(&unresolved)
+    let (user_source_indices, messages): (Vec<_>, Vec<_>) = collect_user_messages_with_indices(unresolved)
         .into_iter()
         .unzip();
     let (user_items, retained_image_count, omitted_image_count, selected_user_indices) =
@@ -1802,7 +1802,7 @@ fn build_bounded_input_history(
             MAX_RETAINED_USER_IMAGE_BYTES,
         );
     let (agent_items, agent_source_indices) =
-        append_bounded_agent_messages_with_indices(&unresolved, COMPACT_AGENT_MESSAGE_MAX_TOKENS);
+        append_bounded_agent_messages_with_indices(unresolved, COMPACT_AGENT_MESSAGE_MAX_TOKENS);
     let selected_agent_items = agent_source_indices
         .iter()
         .copied()
@@ -2227,9 +2227,9 @@ fn compaction_text_recovery_with_source(
         // Exclude private reasoning. Public assistant conclusions and tool
         // observations remain exact, including qualifications omitted by the
         // generated handoff. Existing /items selectors remain compatible.
-        value["summarized_items"] = serde_json::to_value(summarized_items.iter()
+        value["summarized_items"] = serde_json::json!(summarized_items.iter()
             .filter(|item| !matches!(item, ResponseItem::Reasoning { .. }))
-            .collect::<Vec<_>>()).expect("response items serialize");
+            .collect::<Vec<_>>());
         value["summary_is_lossless"] = false.into();
         value["instruction"] = "Source archive, not an open-work checklist. Summary omission is not resolution. Recover missing decision-relevant text with read_tool_output under /summarized_items or /items; do not repeat producers or recover irrelevant history.".into();
     }

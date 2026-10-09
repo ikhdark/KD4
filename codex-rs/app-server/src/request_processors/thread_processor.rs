@@ -200,20 +200,21 @@ fn collect_resume_override_mismatches(
         ));
     }
 
-    if request.config.is_some() {
-        mismatch_details
-            .push("config overrides were provided and ignored while running".to_string());
+    mismatch_details
+}
+
+fn collect_resume_ignored_overrides(request: &ThreadResumeParams) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+    if request.config.as_ref().is_some_and(|config| !config.is_empty()) {
+        ignored.push("config");
     }
     if request.base_instructions.is_some() {
-        mismatch_details
-            .push("baseInstructions override was provided and ignored while running".to_string());
+        ignored.push("baseInstructions");
     }
     if request.developer_instructions.is_some() {
-        mismatch_details.push(
-            "developerInstructions override was provided and ignored while running".to_string(),
-        );
+        ignored.push("developerInstructions");
     }
-    mismatch_details
+    ignored
 }
 
 fn persisted_settings_fallback(stored_thread: &StoredThread) -> PersistedThreadSettings {
@@ -3406,7 +3407,8 @@ impl ThreadRequestProcessor {
             }
             let config_snapshot = existing_thread.config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
-            if !mismatch_details.is_empty() {
+            let ignored_overrides = collect_resume_ignored_overrides(params);
+            if !mismatch_details.is_empty() || !ignored_overrides.is_empty() {
                 let has_subscribers = !self
                     .thread_state_manager
                     .subscribed_connection_ids(existing_thread_id)
@@ -3448,10 +3450,21 @@ impl ThreadRequestProcessor {
                     }
                 }
 
-                return Err(invalid_request(format!(
-                    "cannot apply thread/resume overrides to loaded thread {existing_thread_id}: {}",
-                    mismatch_details.join("; ")
-                )));
+                if !mismatch_details.is_empty() {
+                    return Err(invalid_request(format!(
+                        "cannot apply thread/resume overrides to loaded thread {existing_thread_id}: {}",
+                        mismatch_details.join("; ")
+                    )));
+                }
+                // Desktop can resend config and instruction fields when attaching.
+                // Their presence alone is not evidence of a conflicting setting.
+                // Rejoin without mutating or interrupting the loaded session; cold
+                // resume above still applies them when it is safe to replace it.
+                warn!(
+                    thread_id = %existing_thread_id,
+                    ignored_overrides = ?ignored_overrides,
+                    "rejoining loaded thread without applying config or instruction overrides"
+                );
             }
             let redact_resume_payloads =
                 should_redact_thread_resume_payloads(app_server_client_name.as_deref());

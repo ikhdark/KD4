@@ -503,6 +503,7 @@ impl TurnDiffTracker {
 
     /// Net changed paths, including both sides of renames. Never infer an empty
     /// change set from an invalidated diff.
+    #[cfg(test)]
     pub(crate) fn exact_changed_paths(&self) -> Option<Vec<(String, PathBuf)>> {
         if !self.valid {
             return None;
@@ -551,6 +552,7 @@ impl TurnDiffTracker {
 
     /// An on-demand snapshot, not a workspace diff. Reuse rendered fragments
     /// without consuming the client's change notification or reading files.
+    #[cfg(test)]
     pub(crate) fn model_snapshot(&self) -> serde_json::Value {
         let status = if !self.valid {
             "unavailable"

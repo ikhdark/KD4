@@ -16,6 +16,10 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold one process store locked to prove independent cleanup custody still retires"
+)]
 async fn fallback_cleanup_worker_does_not_serialize_independent_custody() {
     use crate::unified_exec::process_tests::TerminationControl;
     use crate::unified_exec::process_tests::remote_process_with_termination_control;
@@ -136,6 +140,10 @@ async fn validation_workspace_lease_survives_observer_and_releases_at_process_ex
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Keep the process store unavailable while verifying deadline handback does not reacquire it"
+)]
 async fn queued_exit_returns_observed_state_without_expired_lock_waits() {
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;

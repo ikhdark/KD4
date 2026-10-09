@@ -432,7 +432,8 @@ fn fragment_budget_truncates_body_inside_markers() {
     let cut = budget_with_remaining(30).take(&rendered).expect("prefix");
     assert!(!TestFragment::matches_text(&cut));
 
-    for (remaining, expected) in [(rendered.len(), rendered.as_str())] {
+    {
+        let (remaining, expected) = (rendered.len(), rendered.as_str());
         let mut budget = budget_with_remaining(remaining);
         let admitted = budget.take_fragment(&fragment).expect("fragment admitted");
         assert_eq!(admitted, expected);

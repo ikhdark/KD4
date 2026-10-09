@@ -51,7 +51,8 @@ use self::store_lock::OAuthStoreLockFailure;
 
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
-use rmcp::transport::auth::AuthorizationManager;
+use rmcp::transport::auth::CredentialStore;
+use rmcp::transport::auth::InMemoryCredentialStore;
 use tokio::sync::Mutex;
 
 const KEYRING_SERVICE: &str = "Codex MCP Credentials";
@@ -531,7 +532,7 @@ pub(crate) struct OAuthPersistor {
 }
 
 struct OAuthPersistorInner {
-    authorization_manager: Arc<Mutex<AuthorizationManager>>,
+    credential_store: InMemoryCredentialStore,
     persistence: OAuthPersistenceState,
 }
 
@@ -725,24 +726,18 @@ impl OAuthPersistor {
     /// Adjust only this client's in-memory expiry; never the wall clock or disk.
     #[cfg(test)]
     pub(crate) async fn set_remaining_lifetime_for_test(&self, lifetime: Duration) -> Result<()> {
-        use rmcp::transport::auth::CredentialStore;
-        use rmcp::transport::auth::InMemoryCredentialStore;
-        use rmcp::transport::auth::StoredCredentials;
-
-        let mut manager = self.inner.authorization_manager.lock().await;
-        let (client_id, token) = manager.get_credentials().await?;
-        let mut token = token.ok_or_else(|| anyhow::anyhow!("test client has no token"))?;
-        token.set_expires_in(Some(&lifetime));
-        let store = InMemoryCredentialStore::new();
-        store
-            .save(StoredCredentials::new(
-                client_id,
-                Some(token),
-                Vec::new(),
-                Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
-            ))
-            .await?;
-        manager.set_credential_store(store);
+        let mut credentials = self
+            .inner
+            .credential_store
+            .load()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("test client has no credentials"))?;
+        credentials
+            .token_response
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("test client has no token"))?
+            .set_expires_in(Some(&lifetime));
+        self.inner.credential_store.save(credentials).await?;
         Ok(())
     }
 
@@ -750,7 +745,7 @@ impl OAuthPersistor {
         server_name: String,
         url: String,
         codex_home: PathBuf,
-        authorization_manager: Arc<Mutex<AuthorizationManager>>,
+        credential_store: InMemoryCredentialStore,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
         initial_credentials: Option<StoredOAuthTokens>,
@@ -759,7 +754,7 @@ impl OAuthPersistor {
             Arc::new(move |operation| operation.execute(&codex_home));
         Self {
             inner: Arc::new(OAuthPersistorInner {
-                authorization_manager,
+                credential_store,
                 persistence: OAuthPersistenceState::new(
                     server_name,
                     url,
@@ -773,7 +768,7 @@ impl OAuthPersistor {
     }
 
     /// Bound the caller's wait, not the lifetime of an admitted disk write.
-    /// Before admission, credentials remain in the authorization manager for a
+    /// Before admission, credentials remain in the shared credential store for a
     /// later attempt. After admission, execute() owns the write lock and its
     /// bookkeeping in spawn_blocking even if this observer times out.
     pub(crate) async fn persist_if_needed(&self) -> Result<()> {
@@ -784,19 +779,19 @@ impl OAuthPersistor {
 
     /// Persists the latest stored credentials if they have changed.
     /// Deletes the credentials if they are no longer present.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "AuthorizationManager async access must be serialized through its mutex"
-    )]
     async fn persist_latest(&self) -> Result<()> {
         let operation_guard = Arc::clone(&self.inner.persistence.operation_lock)
             .lock_owned()
             .await;
-        let (client_id, maybe_credentials) = {
-            let manager = self.inner.authorization_manager.clone();
-            let guard = manager.lock().await;
-            guard.get_credentials().await
-        }?;
+        // Sample after write admission, but never join a network refresh just
+        // to persist the last committed credentials of a completed operation.
+        let (client_id, maybe_credentials) = self
+            .inner
+            .credential_store
+            .load()
+            .await?
+            .map(|stored| (stored.client_id, stored.token_response))
+            .unwrap_or_default();
 
         self.inner
             .persistence
@@ -1589,6 +1584,7 @@ mod tests {
         reason = "Holds write ordering while replacing credentials to prove persistence samples after admission"
     )]
     async fn persistence_samples_credentials_after_acquiring_write_order() -> Result<()> {
+        use rmcp::transport::auth::AuthorizationManager;
         use rmcp::transport::auth::AuthorizationMetadata;
         use rmcp::transport::auth::CredentialStore;
         use rmcp::transport::auth::InMemoryCredentialStore;
@@ -1611,23 +1607,30 @@ mod tests {
         manager.set_metadata(metadata);
         manager.configure_client_id(&tokens.client_id)?;
         manager.set_credential_store(store.clone());
+        let manager = Mutex::new(manager);
         let persistor = OAuthPersistor::new(
             tokens.server_name.clone(),
             tokens.url.clone(),
             home.path().to_path_buf(),
-            Arc::new(Mutex::new(manager)),
+            store.clone(),
             OAuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::Direct,
             None,
         );
-        // An unrelated authorization or persistence lock must not hold a
-        // completed MCP result hostage. A later attempt still samples the
-        // latest credentials, rather than persisting a stale captured token.
-        let manager_guard = persistor.inner.authorization_manager.lock().await;
-        assert!(persistor.persist_if_needed().await.unwrap_err().to_string().contains("durability remains pending"));
+        // Authentication does not block persistence. A busy disk write still
+        // bounds the caller's wait; a later attempt samples the latest token.
+        let manager_guard = manager.lock().await;
+        persistor.persist_if_needed().await?;
         drop(manager_guard);
         let guard = persistor.inner.persistence.operation_lock.lock().await;
-        assert!(persistor.persist_if_needed().await.unwrap_err().to_string().contains("durability remains pending"));
+        assert!(
+            persistor
+                .persist_if_needed()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("durability remains pending")
+        );
         let pending = persistor.persist_if_needed();
         tokio::pin!(pending);
         assert!(futures::poll!(&mut pending).is_pending());
@@ -1654,6 +1657,18 @@ mod tests {
         assert_eq!(
             saved.token_response.0.access_token().secret(),
             "new-access-token"
+        );
+        store.clear().await?;
+        persistor.persist_if_needed().await?;
+        assert!(
+            load_oauth_tokens(
+                home.path(),
+                &tokens.server_name,
+                &tokens.url,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+            )?
+            .is_none()
         );
         Ok(())
     }

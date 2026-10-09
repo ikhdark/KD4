@@ -271,7 +271,12 @@ def test_compact_rpc_hits_mock_responses(tmp_path) -> None:
     with AppServerHarness(tmp_path) as harness:
         harness.responses.enqueue_assistant_message("history", response_id="compact-history")
         harness.responses.enqueue_assistant_message(
-            "compact summary",
+            "## Goal\nCreate history.\n\n"
+            "## Current state\nThe history turn completed.\n\n"
+            "## Completed work\nThe assistant replied with history.\n\n"
+            "## Unresolved work\nNo pending work.\n\n"
+            "## Evidence\nThe prior assistant response was history.\n\n"
+            "## Next action\nWait for the next user request.\n",
             response_id="compact-summary",
         )
 

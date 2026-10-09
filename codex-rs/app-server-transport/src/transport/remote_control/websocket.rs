@@ -3367,9 +3367,11 @@ mod tests {
                 assert!(err.to_string().contains("test flush failure"));
             }
             assert_eq!(*used_rx.borrow(), 1);
-            let state = state.lock().await;
-            assert_eq!(state.outbound_buffer.server_envelopes().count(), 1);
-            assert!(state.next_seq_id_by_stream.is_empty());
+            {
+                let state = state.lock().await;
+                assert_eq!(state.outbound_buffer.server_envelopes().count(), 1);
+                assert!(state.next_seq_id_by_stream.is_empty());
+            }
             assert!(matches!(
                 done_rx.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)

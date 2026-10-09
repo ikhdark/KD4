@@ -454,7 +454,7 @@ fn structured_compiler_summary_with_streams(
         let mut item = serde_json::json!({"source_line": index + 1});
         item["diagnostic"] = std::mem::take(diagnostic);
         if let Some(package_id) = package_id { item["package_id"] = package_id; }
-        if let Some(target) = target { item["target"] = target.into(); }
+        if let Some(target) = target { item["target"] = target; }
         if item.to_string().len() > SUMMARY_MAX_BYTES / 2
             && compact_compiler_diagnostic(&mut item["diagnostic"])
         {
@@ -554,14 +554,12 @@ fn compact_compiler_diagnostic(diagnostic: &mut serde_json::Value) -> bool {
     }
     if diagnostic["children"].as_array().is_some_and(|children| !children.is_empty())
         && diagnostic.to_string().len() > SUMMARY_MAX_BYTES / 2
+        && let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut)
+        && !children.is_empty()
     {
-        if let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut)
-            && !children.is_empty()
-        {
-            let before = children.len();
-            children.retain(compiler_diagnostic_has_locations);
-            changed |= children.len() != before;
-        }
+        let before = children.len();
+        children.retain(compiler_diagnostic_has_locations);
+        changed |= children.len() != before;
     }
     changed
 }
@@ -635,6 +633,7 @@ fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> O
     if !command.split(|c: char| !c.is_alphanumeric() && c != '_').any(|word| word == "rg") {
         return None;
     }
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static HIT: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(||
         regex_lite::Regex::new(r"^(.+?):[0-9]+:").expect("rg path and line prefix"));
     let mut files = std::collections::BTreeMap::<&str, usize>::new();
@@ -979,6 +978,7 @@ fn progress_line_key(line: &str) -> Option<String> {
     {
         return None;
     }
+    #[expect(clippy::expect_used, reason = "the regex is a fixed source literal, not runtime input")]
     static COUNTERS: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(concat!(
             r"(?i)\b(?P<elapsed>elapsed\s+)\d+(?:\.\d+)?(?P<unit>ms|s)\b",

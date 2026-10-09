@@ -254,27 +254,59 @@ def run_owned(
     prepare_sccache=False,
     **kwargs,
 ):
+    """Run once; reap owned descendants before draining terminal output.
+
+    Timeout/cancellation exceptions retain captured ``output`` and ``stderr``.
+    They remain failures even when cleanup successfully closes both pipes.
+    """
     check_operation()
     if prepare_sccache:
         prepare_shared_sccache(env=kwargs.get("env"), cwd=kwargs.get("cwd"))
         check_operation()
     if capture_output:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    with owned_process(args, **kwargs) as process:
-        deadline = time.monotonic() + timeout if timeout else None
-        while True:
-            check_operation()
-            remaining = deadline - time.monotonic() if deadline else None
-            if remaining is not None and remaining <= 0:
-                raise subprocess.TimeoutExpired(args, timeout)
-            try:
-                stdout, stderr = process.communicate(
-                    timeout=min(0.1, remaining) if remaining is not None else 0.1
-                )
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+    drain_after_cleanup = False
+    failure = None
+    process = None
+    try:
+        with owned_process(args, **kwargs) as process:
+            deadline = time.monotonic() + timeout if timeout else None
+            while True:
+                check_operation()
+                remaining = deadline - time.monotonic() if deadline else None
+                if remaining is not None and remaining <= 0:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=min(0.1, remaining) if remaining is not None else 0.1
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    code = process.poll()
+                    if code is not None and not (
+                        code == 0 and kwargs.get("preserve_descendants_on_success", False)
+                    ):
+                        # communicate waits for pipe EOF, not just primary exit.
+                        # Reap the tree before draining inherited pipes; never
+                        # replay the command or discard its buffered output.
+                        drain_after_cleanup = True
+                        break
+    except (subprocess.TimeoutExpired, CancelledError, TimeoutError, KeyboardInterrupt) as error:
+        if process is None:
+            raise
+        # The context has confirmed tree cleanup. Finish the existing readers,
+        # retaining diagnostics even on Windows where TimeoutExpired has none.
+        failure = error
+        drain_after_cleanup = True
+    if drain_after_cleanup:
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise CleanupFailed("owned output pipes did not close after process cleanup") from error
+    if failure is not None:
+        failure.output, failure.stderr = stdout, stderr
+        raise failure
+    result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
     if check:
         result.check_returncode()
     return result

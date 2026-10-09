@@ -3218,7 +3218,6 @@ dependencies = [
  "os_info",
  "pretty_assertions",
  "rand 0.9.5",
- "regex-lite",
  "serde",
  "serde_json",
  "serial_test",
@@ -3649,7 +3648,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "chrono",
- "codex-file-search",
  "codex-git-utils",
  "codex-otel",
  "codex-protocol",
@@ -3744,6 +3742,7 @@ dependencies = [
  "tree-sitter-bash",
  "url",
  "which 8.0.5",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3915,7 +3914,6 @@ dependencies = [
  "codex-http-client",
  "codex-install-context",
  "codex-login",
- "codex-mcp",
  "codex-message-history",
  "codex-model-provider",
  "codex-model-provider-info",

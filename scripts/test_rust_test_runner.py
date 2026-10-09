@@ -8,6 +8,7 @@ mirrors the shape consumed from `cargo metadata --no-deps`.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
 import hashlib
@@ -433,6 +434,126 @@ class WallClockRunnerTest(RunnerTestCase):
             runner.run_target("core_lib", ["alpha"])
         self.assertEqual(len(commands), 2)
         self.assertIn("--binaries-metadata", commands[-1])
+
+    def discovered_gate_runner(self, *, helpers=("codex",)):
+        runner, fake, commands, builds = self.discovered_build_runner()
+        runner.platform = "linux"
+        runner.manifest = self.manifest(gates={
+            "filtered": {"steps": [{
+                "target": "core_lib", "filter": "test(alpha)",
+                "tests": ["mod::tests::alpha"], "helpers": list(helpers),
+            }]},
+        })
+        return runner, fake, commands, builds
+
+    def test_gate_reuses_discovery_build_but_never_prior_test_results(self):
+        runner, _, commands, builds = self.discovered_gate_runner()
+        for _ in range(2):
+            receipts = runner.run_gates(["filtered"], quiet=True)
+            self.assertEqual(receipts, {"filtered": ["mod::tests::alpha"]})
+            self.assertEqual(receipts.executed, receipts.required)
+        self.assertEqual([command[:3] for command in commands], [
+            ["cargo", "nextest", "list"],
+            ["cargo", "build", "--message-format=json-render-diagnostics"],
+            ["cargo", "nextest", "run"],
+        ] * 2)
+        for command in (commands[2], commands[5]):
+            self.assertIn("--binaries-metadata", command)
+            self.assertNotIn("--target-dir", command)
+            self.assertIn("--no-tests=fail", command)
+            self.assertIn("--no-fail-fast", command)
+            self.assertEqual(command[command.index("--retries") + 1], "0")
+            self.assertEqual(command[command.index("-E") + 1], "test(=mod::tests::alpha)")
+        self.assertNotEqual(commands[2][4], commands[5][4])
+        self.assertEqual(len(builds), 2)
+        self.assertEqual(set(builds[0]["rust-binaries"]), {"codex-core"})
+        self.assertEqual(builds[0]["rust-build-meta"]["build-script-out-dirs"],
+                         {"codex-core": "out"})
+
+    def test_gate_build_reuse_preserves_parity_and_ignored_test_rejection(self):
+        for listing in ({"unexpected": False}, {"mod::tests::alpha": True}):
+            with self.subTest(listing=listing):
+                runner, fake, commands, builds = self.discovered_gate_runner()
+                fake.default_listing = listing
+                with self.assertRaises(RunnerError):
+                    runner.run_gates(["filtered"], quiet=True)
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(builds, [])
+
+    def test_gate_build_reuse_falls_back_when_retention_or_metadata_is_unavailable(self):
+        for incomplete in (False, True):
+            with self.subTest(incomplete=incomplete):
+                runner, fake, commands, builds = self.discovered_gate_runner(helpers=())
+                if incomplete:
+                    runner.executor = fake
+                    context = contextlib.nullcontext()
+                else:
+                    context = mock.patch.object(runner, "_retain_text", return_value=None)
+                with context:
+                    self.assertEqual(runner.run_gates(["filtered"], quiet=True),
+                                     {"filtered": ["mod::tests::alpha"]})
+                self.assertEqual(builds, [])
+                command = fake.calls[-1]["args"]
+                self.assertIn("--target-dir", command)
+                self.assertNotIn("--binaries-metadata", command)
+
+    def test_gate_reused_binary_failure_is_not_recompiled_or_retried(self):
+        runner, fake, commands, _ = self.discovered_gate_runner(helpers=())
+        fake.failing_runs.add("--lib")
+        with self.assertRaises(RunnerError) as failure:
+            runner.run_gates(["filtered"], quiet=True)
+        self.assertEqual(failure.exception.completed_gates, {})
+        self.assertEqual(len(commands), 2)
+        self.assertIn("--binaries-metadata", commands[-1])
+
+    def test_gate_build_reuse_keeps_separate_helper_proof(self):
+        runner, _, commands, builds = self.discovered_gate_runner()
+        first = runner.gate("filtered").steps[0]
+        runner.manifest.gates["without-helper"] = rust_test_runner.Gate(
+            "without-helper", "", (rust_test_runner.replace(first, helpers=()),),
+        )
+        receipt = runner.run_gates(["filtered", "without-helper"], quiet=True)
+        self.assertEqual(receipt.executed, {
+            ("codex-core", frozenset({"codex"}), "mod::tests::alpha"),
+            ("codex-core", frozenset(), "mod::tests::alpha"),
+        })
+        self.assertEqual(receipt.required, receipt.executed)
+        self.assertEqual(len(commands), 4, "one listing/build, two distinct executions")
+        self.assertEqual(len(builds), 2)
+
+    def test_multi_target_gate_keeps_joint_cargo_build(self):
+        runner, _, commands, builds = self.discovered_gate_runner(helpers=())
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_bin"] = {
+            "package": "codex-core", "bin": "fixture_bin", "helpers": [],
+        }
+        data["gates"] = {"filtered": {"steps": [
+            {"target": "core_lib", "filter": "test(alpha)",
+             "tests": ["mod::tests::alpha"], "helpers": []},
+            {"target": "core_bin", "tests": ["bin::beta"], "helpers": []},
+        ]}}
+        runner.manifest = Manifest.from_data(data)
+        runner.metadata.packages["codex-core"]["targets"].append(
+            {"name": "fixture_bin", "kind": ["bin"]},
+        )
+        execute = runner.executor
+
+        def batch_executor(args, **kwargs):
+            if args[:3] == ["cargo", "nextest", "run"]:
+                commands.append(args)
+                self.assertNotIn("--binaries-metadata", args)
+                self.assertIn("--lib", args)
+                self.assertIn("--bin", args)
+                return subprocess.CompletedProcess(args, 0,
+                    "PASS [0.01s] codex-core mod::tests::alpha\n"
+                    "PASS [0.01s] codex-core::bin/fixture_bin bin::beta\n", "")
+            return execute(args, **kwargs)
+
+        runner.executor = batch_executor
+        self.assertEqual(runner.run_gates(["filtered"], quiet=True),
+                         {"filtered": ["bin::beta", "mod::tests::alpha"]})
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(builds, [])
 
     def test_focused_benchmark_skips_discovery_and_helper_builds(self):
         scenario = kd4_perf_snapshot.scenario_catalog()["focused-core-test"]
@@ -1428,6 +1549,39 @@ class NamedSelectionTest(RunnerTestCase):
 
 
 class GatesForTest(RunnerTestCase):
+    def test_sibling_comments_and_literals_cannot_hide_a_real_owner(self) -> None:
+        crate = self.temp_dir / "core"
+        src = crate / "src"
+        src.mkdir(parents=True)
+        lib, real, decoy = (src / name for name in ("lib.rs", "real.rs", "decoy.rs"))
+        lib.write_text("mod real;\n", encoding="utf-8")
+        real.write_text("", encoding="utf-8")
+        runner, executor = self.runner(manifest=self.manifest(gates={}))
+        core = runner.metadata.packages["codex-core"]
+        core["manifest_path"] = str(crate / "Cargo.toml")
+        core["targets"] = [{"name": "codex_core", "kind": ["lib"], "src_path": str(lib)}]
+        declaration = '#[path = "real.rs"] mod fake;'
+        sources = [
+            "// " + declaration,
+            "/* outer /* nested */ " + declaration + " */",
+            'const TEXT: &str = "' + declaration.replace('"', '\\"') + '";',
+            *(f'const TEXT: &str = {prefix}###"before " {declaration} "###;'
+              for prefix in ("r", "br", "cr")),
+            "/* unterminated " + declaration,
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                decoy.write_text(source, encoding="utf-8")
+                result = runner.gates_for([str(real)], cwd=self.temp_dir)
+                self.assertEqual(result["target_paths"], {str(real): ["core_lib"]})
+                self.assertEqual(result["unresolved_targets"], [])
+        # Real renamed declarations still establish the actual module prefix.
+        lib.write_text('#[path = "real.rs"] pub(crate) mod renamed;\n', encoding="utf-8")
+        decoy.write_text("", encoding="utf-8")
+        self.assertEqual(rust_test_runner._rust_module(lib, real), "renamed")
+        self.assertEqual(runner.gates_for([str(real)])["targets"], ["core_lib"])
+        self.assertEqual(executor.calls, [])
+
     def test_named_targets_verify_nested_shards_without_gates_or_execution(self) -> None:
         crate = self.temp_dir / "core"
 
@@ -3876,6 +4030,75 @@ class RepositoryManifestTest(unittest.TestCase):
         self.assertEqual({path.stem for path in tests_dir.glob("*.rs")}, declared)
 
 
+    def assert_core_suite_registration(self, tests_dir: Path, targets: list[str]) -> None:
+        suite = (tests_dir / "suite").resolve()
+        owners = {}
+
+        def visit(binary: Path, prefix: str, text: str) -> None:
+            for (kind, name), declarations in rust_test_runner._rust_scope_items(text).items():
+                if kind != "mod":
+                    continue
+                module = f"{prefix}::{name}" if prefix else name
+                self.assertEqual(len(declarations), 1, f"ambiguous module {module}")
+                _, body = declarations[0]
+                if body is not None:
+                    visit(binary, module, body)
+                    continue
+                resolved = rust_test_runner._rust_module_source(binary, module, tests_dir)
+                self.assertIsNotNone(resolved, f"unresolved module {binary.name}::{module}")
+                source, _ = resolved
+                self.assertTrue(source.is_relative_to(suite), str(source))
+                self.assertNotIn(source, owners, f"repeated suite source: {source}")
+                owners[source] = (binary.name, module)
+                visit(binary, module, source.read_text(encoding="utf-8"))
+
+        for target in targets:
+            binary = tests_dir / f"{target}.rs"
+            visit(binary, "", binary.read_text(encoding="utf-8"))
+        # The shared prelude is intentionally included by every shard, not a
+        # standalone suite. The migration-contract test checks those includes.
+        expected = {path.resolve() for path in suite.rglob("*.rs")} - {suite / "prelude.rs"}
+        self.assertEqual(set(owners), expected, "suite registration mismatch")
+
+    def test_core_shards_register_every_suite_source_exactly_once(self) -> None:
+        self.assert_core_suite_registration(
+            REPO_ROOT / "codex-rs" / "core" / "tests",
+            [target.selector_value for target in self.manifest.targets.values()
+             if target.package == "codex-core" and target.selector_kind == "test"],
+        )
+
+    def test_core_suite_inventory_rejects_omissions_duplicates_and_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suite = root / "suite"
+            suite.mkdir()
+            wrapper = '#[path = "suite"] mod suite { mod parent; }\n'
+            (root / "first.rs").write_text(wrapper, encoding="utf-8")
+            parent, leaf = suite / "parent.rs", suite / "leaf.rs"
+            declaration = '#[path = "leaf.rs"] mod child;\n'
+            parent.write_text(declaration, encoding="utf-8")
+            leaf.write_text("", encoding="utf-8")
+            (suite / "prelude.rs").write_text("", encoding="utf-8")
+            self.assert_core_suite_registration(root, ["first"])
+            orphan = suite / "orphan.rs"
+            orphan.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "suite registration mismatch"):
+                self.assert_core_suite_registration(root, ["first"])
+            orphan.unlink()
+            (root / "second.rs").write_text(wrapper, encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "repeated suite source"):
+                self.assert_core_suite_registration(root, ["first", "second"])
+            leaf.write_text('#[path = "parent.rs"] mod cycle;\n', encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "repeated suite source"):
+                self.assert_core_suite_registration(root, ["first"])
+            leaf.write_text("", encoding="utf-8")
+            parent.write_text("// " + declaration, encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "suite registration mismatch"):
+                self.assert_core_suite_registration(root, ["first"])
+            parent.write_text(declaration * 2, encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "ambiguous module"):
+                self.assert_core_suite_registration(root, ["first"])
+
     def test_shard_modules_and_helpers_match_migration_contract(self) -> None:
         expected_modules = {
             "core_cli_workspace": [
@@ -4310,12 +4533,33 @@ class JustfileContractTest(unittest.TestCase):
             tokens.append("".join(current))
         return tokens
 
-    def invocations(self) -> list[list[str]]:
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+    def invocations(self, justfile: str | None = None) -> list[list[str]]:
+        if justfile is None:
+            justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         found: list[list[str]] = []
         for line in justfile.splitlines():
             _, separator, rest = line.partition("rust_test_runner.py")
             if not separator:
+                continue
+            if 'adapter["run_python"]' in line:
+                calls = [
+                    node
+                    for node in ast.walk(ast.parse(line.strip()))
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Subscript)
+                    and ast.literal_eval(node.func.slice) == "run_python"
+                ]
+                self.assertEqual(len(calls), 1)
+                arguments = calls[0].args[1]
+                self.assertIsInstance(arguments, ast.List)
+                tokens = []
+                for argument in arguments.elts:
+                    if isinstance(argument, ast.Starred):
+                        self.assertEqual(ast.unparse(argument.value), "sys.argv[1:]")
+                        tokens.append("core_exec_permissions")
+                    else:
+                        tokens.append(ast.literal_eval(argument))
+                found.append(tokens)
                 continue
             argv = rest.lstrip('"').split(";", 1)[0]
             if "run-gate" in argv:
@@ -4328,6 +4572,21 @@ class JustfileContractTest(unittest.TestCase):
             ]
             found.append([token for token in tokens if token])
         return found
+
+    def test_extracts_shell_and_python_recipes_without_losing_arguments(self):
+        source = '''
+    python "{{ justfile_directory() }}/scripts/rust_test_runner.py" run-target "{{ target }}"; exit $LASTEXITCODE
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["plan", *sys.argv[1:]], program=r"{{ python }}"))
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["invalid-command", "--bad-option"], program=r"{{ python }}"))
+'''
+        self.assertEqual(
+            self.invocations(source),
+            [
+                ["run-target", "core_exec_permissions"],
+                ["plan", "core_exec_permissions"],
+                ["invalid-command", "--bad-option"],
+            ],
+        )
 
     def test_every_justfile_invocation_parses_and_names_declared_selections(self) -> None:
         invocations = self.invocations()

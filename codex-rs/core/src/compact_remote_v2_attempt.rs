@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::RemoteCompactionV2Output;
+use super::prepare_v2_retained_input;
 use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
@@ -113,6 +114,23 @@ pub(super) async fn run_remote_compact_v2_attempt(
         .is_enabled()
         .then(|| history.raw_items().to_vec());
 
+    // Required recovery must be available before spending a provider request.
+    // Use source IDs, not the lossy sampling projection or synthetic trigger.
+    // Retention is awaited to completion: cancellation must not detach writes.
+    {
+        let (retained_input, _) = prepare_v2_retained_input(sess, history.raw_items()).await?;
+        let current_history = sess.clone_history().await;
+        let mut reference_items = current_history.raw_items().to_vec();
+        reference_items.extend(retained_input);
+        // Installation rechecks the live plan and pins after the provider wait.
+        // Existing content-addressed retention reuses unchanged recovery bytes.
+        sess.compaction_artifact_pins(&current_history.tool_history_state(), &reference_items)
+            .await?;
+    }
+    if cancellation_token.is_cancelled() {
+        return Err(codex_protocol::error::CodexErr::TurnAborted);
+    }
+
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
         sess.installation_id.clone(),
@@ -133,9 +151,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         token_usage,
     } = compaction_output_result?;
-    // Sampling projection may split messages and discard their trusted IDs.
-    // Select exact task/skill retention from the same source history instead;
-    // it also excludes the synthetic compaction trigger by construction.
     let retention_input = history.into_raw_items();
     Ok(RemoteCompactV2Attempt {
         trace_input_history,
@@ -171,7 +186,8 @@ fn largest_compaction_request_input(prompt: &Prompt) -> Arc<[ResponseItem]> {
 fn append_compaction_trigger(prompt: &mut Prompt) {
     // Preserve sharing established by prompt projection. Pointer identity is
     // sufficient; do not compare large distinct transcripts for equality.
-    let mut appended: Vec<(Arc<[ResponseItem]>, Arc<[ResponseItem]>)> = Vec::with_capacity(4);
+    type SharedInput = Arc<[ResponseItem]>;
+    let mut appended: Vec<(SharedInput, SharedInput)> = Vec::with_capacity(4);
     for input in [
         &mut prompt.input,
         &mut prompt.stable_context_fallback_input,
@@ -243,6 +259,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[expect(clippy::print_stderr, reason = "This opt-in benchmark reports timing samples and their median")]
     fn benchmark_compaction_shared_variants() {
         let input: Arc<[ResponseItem]> = vec![ResponseItem::Compaction {
             id: None,

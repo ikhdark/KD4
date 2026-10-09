@@ -2383,8 +2383,8 @@ impl CodexClient {
         self.command_approval_count += 1;
         if self.approval_expectation.is_some() {
             self.approval_requests.push((
-                thread_id.clone(),
-                turn_id.clone(),
+                thread_id,
+                turn_id,
                 ApprovalExpectation::Command,
             ));
         }

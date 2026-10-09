@@ -838,6 +838,13 @@ async fn process_thread_listener_event(
     event: codex_protocol::protocol::Event,
 ) {
     let queue_completed = matches!(&event.msg, EventMsg::TurnComplete(_));
+    // Core emits the legacy user-message event after recording the input in
+    // either history format. Reconcile custody off the listener's critical path.
+    if matches!(&event.msg, EventMsg::UserMessage(_))
+        && let Some(queue) = &context.thread_queue_processor
+    {
+        queue.input_recorded(conversation_id);
+    }
     let queue_paused = matches!(&event.msg, EventMsg::TurnAborted(_))
         || matches!(&event.msg, EventMsg::TurnComplete(completed)
             if completed.error.is_some())

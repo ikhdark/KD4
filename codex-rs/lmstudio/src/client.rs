@@ -155,7 +155,7 @@ impl LMStudioClient {
         let json: serde_json::Value = response.json().await.map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("JSON parse error: {e}"))
         })?;
-        let models = json["data"]
+        json["data"]
             .as_array()
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "No 'data' array in response")
@@ -170,8 +170,7 @@ impl LMStudioClient {
                         io::Error::new(io::ErrorKind::InvalidData, "Invalid model id in response")
                     })
             })
-            .collect();
-        models
+            .collect()
     }
 
     // Find lms on PATH, falling back to LM Studio's per-user install location.

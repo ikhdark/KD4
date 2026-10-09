@@ -22,12 +22,12 @@ fn resolve_codex_binary() -> Result<PathBuf, codex_utils_cargo_bin::CargoBinErro
 
 /// Runs the real CLI with live output and the same contained capture path as
 /// hermetic subprocess tests. No output-reader thread can outlive the command.
-fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let home = TempDir::new().unwrap();
+fn run_live(prompt: &str) -> anyhow::Result<(assert_cmd::assert::Assert, TempDir)> {
+    let dir = TempDir::new()?;
+    let home = TempDir::new()?;
     let codex_home = home.path().join(".codex");
-    std::fs::create_dir_all(&codex_home).unwrap();
-    let mut command = tokio::process::Command::new(resolve_codex_binary().unwrap());
+    std::fs::create_dir_all(&codex_home)?;
+    let mut command = tokio::process::Command::new(resolve_codex_binary()?);
     command
         .current_dir(dir.path())
         .env("OPENAI_API_KEY", require_api_key())
@@ -37,40 +37,42 @@ fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
         .arg("--skip-git-repo-check")
         .arg("--")
         .arg(prompt);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let output = runtime.block_on(core_test_support::process::capture_contained_command(
         &mut command,
         Duration::from_secs(5 * 60),
         /*mirror_output*/ true,
-    )).expect("live codex CLI should finish within its process/output deadline");
-    (output.assert(), dir)
+    )).map_err(|error| anyhow::anyhow!("live codex CLI should finish within its process/output deadline: {error}"))?;
+    Ok((output.assert(), dir))
 }
 
 #[ignore = "requires OPENAI_API_KEY and sends paid requests to the live OpenAI API"]
 #[test]
-fn live_create_file_hello_txt() {
+fn live_create_file_hello_txt() -> anyhow::Result<()> {
     let (assert, dir) = run_live(
         "Use the shell tool with the apply_patch command to create a file named hello.txt containing the text 'hello'.",
-    );
+    )?;
 
     assert.success();
 
     let path = dir.path().join("hello.txt");
     assert!(path.exists(), "hello.txt was not created by the model");
 
-    let contents = std::fs::read_to_string(path).unwrap();
+    let contents = std::fs::read_to_string(path)?;
 
     assert_eq!(contents.trim(), "hello");
+    Ok(())
 }
 
 #[ignore = "requires OPENAI_API_KEY and sends paid requests to the live OpenAI API"]
 #[test]
-fn live_print_working_directory() {
-    let (assert, dir) = run_live("Print the current working directory using the shell function.");
+fn live_print_working_directory() -> anyhow::Result<()> {
+    let (assert, dir) = run_live("Print the current working directory using the shell function.")?;
 
     assert
         .success()
         .stdout(predicate::str::contains(dir.path().to_string_lossy()));
+    Ok(())
 }
 
 #[tokio::test]

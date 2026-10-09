@@ -9,6 +9,7 @@ use codex_protocol::protocol::{EventMsg, RolloutItem};
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
 pub(crate) const KIND: &str = "rollout_payload_artifact";
+const MAX_CONCURRENT_PAYLOAD_SYNCS: usize = 8;
 
 #[derive(Default)]
 struct PendingSync {
@@ -32,9 +33,16 @@ pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
             .paths.iter().filter(|((owner, _), _)| owner == &rollout)
             .map(|(path, sequence)| (path.clone(), *sequence)).collect::<Vec<_>>();
         if pending.is_empty() { return Ok(()); }
-        for ((_, path), _) in &pending {
-            std::fs::OpenOptions::new().read(true).write(true).open(path)?.sync_all()?;
-        }
+        #[cfg(test)]
+        let hook = sync_test_hooks().lock().unwrap().get(&rollout).cloned();
+        let parallelism = MAX_CONCURRENT_PAYLOAD_SYNCS;
+        #[cfg(test)]
+        let parallelism = hook.as_ref().map_or(parallelism, |hook| hook.parallelism);
+        sync_payload_files(&pending, parallelism, |path| {
+            #[cfg(test)]
+            if let Some(hook) = &hook { (hook.before_sync)(path)?; }
+            std::fs::OpenOptions::new().read(true).write(true).open(path)?.sync_all()
+        })?;
         #[cfg(unix)]
         std::fs::File::open(&directory)?.sync_all()?;
         let mut registry = pending_sync().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -45,6 +53,56 @@ pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
         }
         Ok(())
     }).await.map_err(io::Error::other)?
+}
+
+/// Independent immutable payloads can sync concurrently, but the rollout must
+/// wait for every worker. No registry lock is held during I/O; cancellation of
+/// the async observer leaves this blocking barrier and its acknowledgements owned.
+fn sync_payload_files(
+    pending: &[((PathBuf, PathBuf), u64)],
+    parallelism: usize,
+    sync_file: impl Fn(&Path) -> io::Result<()> + Sync,
+) -> io::Result<()> {
+    let workers = parallelism.clamp(1, MAX_CONCURRENT_PAYLOAD_SYNCS).min(pending.len());
+    if workers <= 1 {
+        return pending.iter().try_for_each(|((_, path), _)| sync_file(path));
+    }
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        let mut result = Ok(());
+        for chunk in pending.chunks(pending.len().div_ceil(workers)) {
+            let sync_file = &sync_file;
+            match std::thread::Builder::new().spawn_scoped(scope, move || {
+                chunk.iter().try_for_each(|((_, path), _)| sync_file(path))
+            }) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => { result = Err(error); break; }
+            }
+        }
+        // Join successful siblings even after a failure or panic. A failed
+        // barrier acknowledges nothing, so an explicit retry is lossless.
+        for handle in handles {
+            let joined = handle.join().unwrap_or_else(|_| Err(io::Error::other("payload sync worker panicked")));
+            if result.is_ok() { result = joined; }
+        }
+        result
+    })
+}
+
+#[cfg(test)]
+type BeforeSync = std::sync::Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SyncTestHook {
+    pub(crate) parallelism: usize,
+    pub(crate) before_sync: BeforeSync,
+}
+
+#[cfg(test)]
+pub(crate) fn sync_test_hooks() -> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, SyncTestHook>> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<PathBuf, SyncTestHook>>> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
 }
 
 pub(crate) fn root(path: &Path) -> PathBuf {
@@ -169,6 +227,88 @@ pub(crate) fn hydrate_line(path: &Path, line: String) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_payload_sync_is_bounded_and_joins_failed_or_panicking_siblings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for failure in ["none", "error", "panic"] {
+            let pending = (0..8).map(|i| ((PathBuf::new(), PathBuf::from(i.to_string())), 0)).collect::<Vec<_>>();
+            let barrier = std::sync::Barrier::new(8);
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let completed = AtomicUsize::new(0);
+            let result = sync_payload_files(&pending, usize::MAX, |path| {
+                peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                barrier.wait();
+                if path == Path::new("0") && failure != "none" {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    if failure == "panic" { panic!("injected worker panic"); }
+                    return Err(io::Error::other("injected sync failure"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                completed.fetch_add(1, Ordering::SeqCst);
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), failure == "none");
+            assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_PAYLOAD_SYNCS);
+            assert_eq!(active.load(Ordering::SeqCst), 0, "all started siblings must settle");
+            assert_eq!(completed.load(Ordering::SeqCst), if failure == "none" { 8 } else { 7 });
+        }
+        let pending = (0..65).map(|i| ((PathBuf::new(), PathBuf::from(i.to_string())), 0)).collect::<Vec<_>>();
+        let completed = AtomicUsize::new(0);
+        sync_payload_files(&pending, 8, |_| { completed.fetch_add(1, Ordering::SeqCst); Ok(()) }).unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), pending.len());
+        sync_payload_files(&[], 8, |_| panic!("empty barrier must not perform I/O")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_payload_barrier_keeps_ownership_and_newer_publications() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("rollout.jsonl");
+        let lines = (0..8).map(|i| serde_json::to_vec(&serde_json::json!({
+            "type":"event_msg", "payload":{"index":i,"saved":"exact bytes".repeat(2000)}
+        })).unwrap()).collect::<Vec<_>>();
+        for line in &lines { store_line(&path, line).unwrap(); }
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let blocked = Arc::clone(&gate);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        sync_test_hooks().lock().unwrap().insert(path.clone(), SyncTestHook {
+            parallelism: 8,
+            before_sync: Arc::new(move |_| {
+                if let Some(entered) = entered.lock().unwrap().take() { let _ = entered.send(()); }
+                let released = blocked.1.wait_timeout_while(blocked.0.lock().unwrap(), Duration::from_secs(5), |value| !*value).unwrap();
+                if !*released.0 { return Err(io::Error::other("test did not release blocked storage")); }
+                Ok(())
+            }),
+        });
+        let observed_path = path.clone();
+        let observer = tokio::spawn(async move { sync_payload_artifacts(&observed_path).await });
+        tokio::time::timeout(Duration::from_secs(2), started).await.unwrap().unwrap();
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        // No registry mutex is held by stalled I/O. Another rollout completes,
+        // and a repeated publication gets a newer sequence during the barrier.
+        let other = home.path().join("other.jsonl");
+        store_line(&other, &lines[0]).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sync_payload_artifacts(&other)).await.unwrap().unwrap();
+        store_line(&path, &lines[0]).unwrap();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let remaining = pending_sync().lock().unwrap().paths.keys().filter(|(owner, _)| owner == &path).count();
+                if remaining == 1 { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("cancelled observer must not cancel acknowledgement of its old prefix");
+        sync_test_hooks().lock().unwrap().remove(&path);
+        sync_payload_artifacts(&path).await.unwrap();
+        assert!(!pending_sync().lock().unwrap().paths.keys().any(|(owner, _)| owner == &path));
+    }
 
     #[tokio::test]
     async fn durable_barrier_rejects_missing_payload_and_retains_retry_work() {

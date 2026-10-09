@@ -121,6 +121,7 @@ async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTi
 #[test]
 #[ignore = "narrow wall-clock dispatch benchmark"]
 #[serial(app_server_tracing)]
+#[expect(clippy::print_stderr, reason = "this dispatch benchmark emits machine-readable latency measurements")]
 fn turn_start_dispatch_wall_clock_benchmark() -> Result<()> {
     run_multi_thread_with_stack("turn_start_dispatch_wall_clock_benchmark", async {
         let mut harness = TracingHarness::new().await?;
@@ -160,6 +161,7 @@ fn turn_start_dispatch_wall_clock_benchmark() -> Result<()> {
 
 #[test]
 #[ignore = "narrow CPU split of inline turn/start dispatch work"]
+#[expect(clippy::print_stderr, reason = "this dispatch benchmark emits machine-readable CPU timing measurements")]
 fn turn_start_inline_cpu_split_benchmark() {
     for (label, bytes) in PAYLOADS {
         let line = turn_line(1, "00000000-0000-0000-0000-000000000000", &"x".repeat(bytes));
@@ -192,6 +194,7 @@ fn turn_start_inline_cpu_split_benchmark() {
 
 #[test]
 #[ignore = "narrow wall-clock queue hand-off benchmark"]
+#[expect(clippy::print_stderr, reason = "this queue benchmark emits machine-readable hand-off timing measurements")]
 fn idle_thread_queue_handoff_wall_clock_benchmark() -> Result<()> {
     run_multi_thread_with_stack("idle_thread_queue_handoff_wall_clock_benchmark", async {
         let queues = RequestSerializationQueues::default();

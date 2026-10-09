@@ -4055,7 +4055,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
 
     // Assert first request captured expected user message that triggers function call.
     let first_request = first_turn_mock.single_request().input();

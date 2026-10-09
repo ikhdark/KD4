@@ -650,6 +650,7 @@ const MAX_SUGGESTION_CLIMBS: usize = 2;
 /// A guessed path, such as a file this repository renamed, otherwise costs
 /// another search, so name the closest existing paths. Advisory only: the
 /// command and its results are unchanged.
+#[cfg(test)]
 pub(crate) fn missing_rg_path_advisory(output: &str, cwd: &Path) -> Option<String> {
     missing_rg_path_advisory_with_cancellation(output, cwd, CancellationToken::new())
 }
@@ -658,6 +659,7 @@ pub(crate) fn missing_rg_path_advisory_with_cancellation(
     output: &str, cwd: &Path, cancellation: CancellationToken,
 ) -> Option<String> {
     let mut budget = suggestion_budget(cancellation);
+    #[expect(clippy::expect_used, reason = "the fixed missing-path regex is valid and exercised by advisory tests")]
     static MISSING_PATH: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
         regex_lite::Regex::new(r"(?m)^rg: (.+?): [^\r\n]*\(os error [23]\)\r?$")
             .expect("valid rg missing-path regex")

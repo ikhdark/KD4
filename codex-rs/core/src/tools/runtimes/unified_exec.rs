@@ -133,6 +133,10 @@ fn unified_exec_approval_reason(
     permissions: Option<&UriAdditionalPermissionProfile>,
 ) -> Option<String> {
     let Some(permissions) = permissions else { return reason; };
+    #[expect(
+        clippy::expect_used,
+        reason = "URI permission profiles contain only JSON-serializable scalars, paths serialized as strings, and sequences; never silently omit approval grants"
+    )]
     let profile = serde_json::to_string(permissions)
         .expect("URI permission profiles are JSON serializable");
     Some(format!("{}Additional permissions (canonical URI profile): {profile}",

@@ -1463,6 +1463,20 @@ async fn multi_agent_v2_spawn_does_not_reuse_completed_explorer_without_input_fi
     let reused: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(reused["reused"], true);
     assert_eq!(reused["assignment_id"], assignment_id.to_string());
+    let active_followup = FollowupTaskHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "followup_task",
+            function_payload(json!({"target": first_name, "message": "clarify the active task"})),
+        ))
+        .await
+        .expect("an active typed attempt accepts followups");
+    assert_eq!(expect_text_output(active_followup).1, Some(true));
+    assert!(manager.captured_ops().iter().any(|(id, op)| {
+        *id == first_thread_id
+            && matches!(op, Op::InterAgentCommunication { communication } if communication.trigger_turn)
+    }));
     agent_control
         .task_coordinator()
         .store()
@@ -1488,6 +1502,68 @@ async fn multi_agent_v2_spawn_does_not_reuse_completed_explorer_without_input_fi
         )
         .await
         .expect("explorer result should seal");
+
+    let ops_before_rejected_followups = manager.captured_ops().len();
+    for _ in 0..2 {
+        let rejected = FollowupTaskHandlerV2
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "followup_task",
+                function_payload(
+                    json!({"target": first_name, "message": "repeat the sealed task"}),
+                ),
+            ))
+            .await;
+        let Err(FunctionCallError::RespondToModel(error)) = rejected else {
+            panic!("sealed typed followup must fail before delivery");
+        };
+        assert!(error.contains("no active bound attempt"));
+        assert!(error.contains("get_agent_task"));
+        assert_eq!(manager.captured_ops().len(), ops_before_rejected_followups);
+    }
+    let cancelled = invocation(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "followup_task",
+        function_payload(json!({"target": first_name, "message": "cancelled followup"})),
+    );
+    cancelled.cancellation_token.cancel();
+    let Err(FunctionCallError::RespondToModel(error)) =
+        FollowupTaskHandlerV2.handle(cancelled).await
+    else {
+        panic!("cancelled preflight must fail before delivery");
+    };
+    assert_eq!(error, "Follow-up task cancelled before delivery");
+    assert_eq!(manager.captured_ops().len(), ops_before_rejected_followups);
+
+    let queued = SendMessageHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "send_message",
+            function_payload(json!({"target": first_name, "message": "information only"})),
+        ))
+        .await
+        .expect("sealed typed agents still accept queue-only messages");
+    assert_eq!(expect_text_output(queued).1, Some(true));
+    let ops = manager.captured_ops();
+    assert_eq!(ops.len(), ops_before_rejected_followups + 1);
+    assert!(matches!(
+        ops.last(),
+        Some((id, Op::InterAgentCommunication { communication }))
+            if *id == first_thread_id && !communication.trigger_turn
+    ));
+    let authorization = agent_control
+        .task_coordinator()
+        .get_agent_task_authorization(assignment_id)
+        .await
+        .expect("sealed task remains recoverable");
+    assert_eq!(authorization.current_attempt.attempt_id, binding.attempt_id);
+    assert_eq!(
+        authorization.current_attempt.state,
+        codex_agent_task_store::AttemptState::Completed
+    );
 
     let fresh = SpawnAgentHandlerV2::default()
         .handle(invocation(

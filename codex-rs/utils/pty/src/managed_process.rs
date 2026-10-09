@@ -455,6 +455,7 @@ type NtResumeProcess =
 
 #[cfg(windows)]
 fn nt_resume_process() -> Option<NtResumeProcess> {
+    use winapi::shared::minwindef::FARPROC;
     use winapi::um::libloaderapi::GetModuleHandleW;
     use winapi::um::libloaderapi::GetProcAddress;
 
@@ -474,7 +475,7 @@ fn nt_resume_process() -> Option<NtResumeProcess> {
         }
         // SAFETY: NtResumeProcess takes a process HANDLE and returns NTSTATUS using
         // the Windows system ABI. ntdll remains loaded for the cached pointer's lifetime.
-        Some(unsafe { std::mem::transmute::<_, NtResumeProcess>(address) })
+        Some(unsafe { std::mem::transmute::<FARPROC, NtResumeProcess>(address) })
     })
 }
 

@@ -93,8 +93,8 @@ impl ToolExecutor<ToolCall> for ListTool {
                 catalog
                     .entries
                     .iter()
-                    .cloned()
                     .filter(|entry| entry.enabled && entry.authority == authority)
+                    .cloned()
                     .filter_map(listed_skill)
                     .collect::<Vec<_>>()
             };

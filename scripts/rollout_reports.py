@@ -18,22 +18,26 @@ import collections
 import contextlib
 import datetime
 import hashlib
+import io
 import json
 import os
+import tempfile
 from pathlib import Path
 
 try:
-    from scripts.atomic_json import write_json_atomic
+    from scripts.atomic_json import write_json_atomic, write_stream_atomic
     from scripts.kd4_timing_analysis import analyze_timing, timing_profile_valid
     from scripts.rollout_snapshot import (
+        existing_rollout_path,
         hydrate_rollout_record,
         read_rollout_records,
         read_rollout_snapshot,
     )
 except ImportError:
-    from atomic_json import write_json_atomic
+    from atomic_json import write_json_atomic, write_stream_atomic
     from kd4_timing_analysis import analyze_timing, timing_profile_valid
     from rollout_snapshot import (
+        existing_rollout_path,
         hydrate_rollout_record,
         read_rollout_records,
         read_rollout_snapshot,
@@ -146,10 +150,27 @@ def text_of(content):
     return "\n".join(out)
 
 
+@contextlib.contextmanager
+def _report_writer(path, out_path):
+    """Render completely before publication, with bounded in-memory staging."""
+    source = existing_rollout_path(Path(path)).resolve()
+    output = Path(out_path)
+    if output.resolve() == source or (output.exists() and output.samefile(source)):
+        raise ValueError("report output must not overwrite the source rollout")
+    with tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024) as raw:
+        with io.TextIOWrapper(raw, encoding="utf-8") as writer:
+            yield writer
+            writer.flush()
+            raw.seek(0)
+            write_stream_atomic(output, raw)
+
+
 def dump(path, out_path):
     rows = [row for row, _ in read_rollout_records(Path(path))]
-    with open(out_path, "w", encoding="utf-8") as w:
-        P = lambda *a: print(*a, file=w)
+    with _report_writer(path, out_path) as w:
+        def P(*a):
+            print(*a, file=w)
+
         prev_t = None
         seen_manifests = set()
         cache_keys = {}
@@ -824,8 +845,10 @@ def dump_narrative(path, out_path, start_idx=0):
     if output_limit < 0:
         raise ValueError("NARR_OUT_LIMIT must be nonnegative")
     rows = [row for row, _ in read_rollout_records(Path(path))]
-    with open(out_path, "w", encoding="utf-8") as w:
-        P = lambda *a: print(*a, file=w)
+    with _report_writer(path, out_path) as w:
+        def P(*a):
+            print(*a, file=w)
+
         prev_t = None
         for i, o in enumerate(rows):
             t = ts(o)

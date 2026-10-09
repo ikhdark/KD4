@@ -1,8 +1,11 @@
 import json
+import math
 import os
+import queue
 import re
 import subprocess
 import threading
+import time
 import uuid
 from _thread import LockType
 from contextlib import contextmanager
@@ -69,6 +72,21 @@ _STDERR_TAIL_MAX_BYTES = 64 * 1024
 _STDERR_READ_CHARS = 8 * 1024
 _STDERR_DRAIN_JOIN_TIMEOUT_S = 1.0
 _STDERR_TRUNCATION_MARKER = f"[stderr truncated; showing last {_STDERR_TAIL_MAX_BYTES} bytes]\n"
+
+
+@dataclass(slots=True)
+class _Operation:
+    deadline: float
+    cancelled: threading.Event
+    proc: subprocess.Popen[str] | None
+    router: MessageRouter
+
+
+@dataclass(slots=True)
+class _Write:
+    line: str
+    done: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
 
 
 @dataclass(slots=True)
@@ -203,6 +221,34 @@ class CodexConfig:
     client_title: str = "Codex Python SDK"
     client_version: str = SDK_VERSION
     experimental_api: bool = True
+    operation_timeout_s: float = 300.0
+    shutdown_timeout_s: float = 2.0
+    max_message_bytes: int = 8 * 1024 * 1024
+    max_buffered_notifications: int = 4096
+    max_buffer_bytes: int = 64 * 1024 * 1024
+    max_notification_routes: int = 256
+    max_in_flight_requests: int = 32
+
+    def __post_init__(self) -> None:
+        for name in ("operation_timeout_s", "shutdown_timeout_s"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and > 0")
+        for name in (
+            "max_message_bytes",
+            "max_buffered_notifications",
+            "max_buffer_bytes",
+            "max_notification_routes",
+            "max_in_flight_requests",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
 
 class CodexClient:
@@ -217,16 +263,80 @@ class CodexClient:
         self._approval_handler = approval_handler or self._default_approval_handler
         self._proc: subprocess.Popen[str] | None = None
         self._process_epoch = 0
-        self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._thread_start_locks_guard = threading.Lock()
         self._thread_start_locks: dict[str, _ThreadStartLock] = {}
-        self._router = MessageRouter()
+        self._router = self._new_router()
+        self._operation_local = threading.local()
+        self._operation_slots = threading.BoundedSemaphore(self.config.max_in_flight_requests)
+        self._closing = False
+        self._stopped = threading.Event()
+        self._writes: queue.Queue[_Write | None] = queue.Queue(self.config.max_in_flight_requests)
+        self._writer_thread: threading.Thread | None = None
         self._stderr_lock = threading.Lock()
         self._stderr_tail_bytes = bytearray()
         self._stderr_truncated = False
         self._stderr_thread: threading.Thread | None = None
         self._reader_thread: threading.Thread | None = None
+
+    def _new_router(self) -> MessageRouter:
+        return MessageRouter(
+            max_notifications=self.config.max_buffered_notifications,
+            max_buffer_bytes=self.config.max_buffer_bytes,
+            max_routes=self.config.max_notification_routes,
+            max_requests=self.config.max_in_flight_requests,
+            operation_timeout_s=self.config.operation_timeout_s,
+        )
+
+    @contextmanager
+    def _operation(
+        self, cancelled: threading.Event | None = None, *, control: bool = False
+    ) -> Iterator[_Operation]:
+        current = getattr(self._operation_local, "current", None)
+        if current is not None:
+            yield current
+            return
+        if not control and not self._operation_slots.acquire(blocking=False):
+            raise CodexError("in-flight operation limit exceeded")
+        operation = _Operation(
+            time.monotonic() + self.config.operation_timeout_s,
+            cancelled if cancelled is not None else threading.Event(),
+            self._proc,
+            self._router,
+        )
+        self._operation_local.current = operation
+        try:
+            yield operation
+        finally:
+            del self._operation_local.current
+            if not control:
+                self._operation_slots.release()
+
+    def _check_operation(self, operation: _Operation) -> float:
+        remaining = operation.deadline - time.monotonic()
+        error: BaseException | None = None
+        if operation.cancelled.is_set():
+            error = TransportClosedError("operation cancelled; transport closed")
+        elif remaining <= 0:
+            error = TimeoutError("operation deadline exceeded; transport closed")
+        if error is not None:
+            if operation.proc is not None:
+                self._abort_transport(operation.proc, operation.router, error)
+            raise error
+        return min(remaining, 0.05)
+
+    def _abort_transport(
+        self, proc: subprocess.Popen[str], router: MessageRouter, error: BaseException
+    ) -> None:
+        # Never wait for a pipe owner or acquire its I/O lock here.
+        router.fail_all(error)
+        with self._lifecycle_lock:
+            if proc is self._proc:
+                self._stopped.set()
+        try:
+            proc.terminate()
+        except OSError:
+            pass
 
     def __enter__(self) -> "CodexClient":
         self.start()
@@ -237,8 +347,21 @@ class CodexClient:
 
     def start(self) -> None:
         with self._lifecycle_lock:
+            if self._closing:
+                raise TransportClosedError("Codex process is closing")
             if self._proc is not None:
+                if self._stopped.is_set():
+                    raise TransportClosedError("failed transport must be closed before restart")
                 return
+            if any(
+                thread is not None and thread.is_alive()
+                for thread in (
+                    self._reader_thread,
+                    self._stderr_thread,
+                    self._writer_thread,
+                )
+            ):
+                raise TransportClosedError("previous transport workers have not stopped")
 
             path_dirs: tuple[Path, ...] = ()
             if self.config.launch_args_override is not None:
@@ -269,58 +392,92 @@ class CodexClient:
                 env=env,
                 bufsize=1,
             )
-            router = MessageRouter()
+            router = self._new_router()
             self._router = router
             with self._stderr_lock:
                 self._stderr_tail_bytes.clear()
                 self._stderr_truncated = False
             self._proc = proc
             self._process_epoch += 1
+            self._stopped = threading.Event()
+            self._writes = queue.Queue(self.config.max_in_flight_requests)
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop,
+                args=(proc, router, self._writes, self._stopped),
+                name="codex-stdin",
+                daemon=True,
+            )
+            self._writer_thread.start()
+            operation = getattr(self._operation_local, "current", None)
+            if operation is not None and operation.proc is None:
+                operation.proc, operation.router = proc, router
             self._start_stderr_drain_thread(proc)
             self._start_reader_thread(proc, router)
 
     def close(self) -> None:
         with self._lifecycle_lock:
-            if self._proc is None:
+            if self._proc is None or self._closing:
                 return
-            proc = self._proc
-            router = self._router
-            self._proc = None
-
-            if proc.stdin:
-                proc.stdin.close()
+            self._closing = True
+            proc, router = self._proc, self._router
+            stopped, writes = self._stopped, self._writes
+            threads = (self._writer_thread, self._stderr_thread, self._reader_thread)
+            stopped.set()
+        deadline = time.monotonic() + self.config.shutdown_timeout_s
+        try:
+            router.fail_all(TransportClosedError("Codex process was closed"))
+            # The writer owns stdin, including close/flush. Terminate first so a
+            # full pipe cannot keep shutdown behind a blocked write or flush.
+            while True:
+                try:
+                    pending = writes.get_nowait()
+                except queue.Empty:
+                    break
+                if pending is not None:
+                    pending.error = TransportClosedError("Codex process was closed")
+                    pending.done.set()
+            writes.put_nowait(None)
             try:
                 proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                proc.kill()
-                proc.wait()
-
-            router.fail_all(TransportClosedError("Codex process was closed"))
-            if self._stderr_thread and self._stderr_thread.is_alive():
-                self._stderr_thread.join(timeout=2)
-            if self._reader_thread and self._reader_thread.is_alive():
-                self._reader_thread.join(timeout=2)
-            self._stderr_thread = None
-            self._reader_thread = None
+                proc.wait(timeout=max(0.0, (deadline - time.monotonic()) / 2))
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+            for thread in threads:
+                if thread is not None and thread is not threading.current_thread():
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            with self._lifecycle_lock:
+                # Keep an unreaped process reachable, and prohibit restart while
+                # old pipe owners remain alive (including inherited pipe handles).
+                if proc.poll() is not None:
+                    self._proc = None
+                self._closing = False
 
     def initialize(self) -> InitializeResponse:
-        result = self.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": self.config.client_name,
-                    "title": self.config.client_title,
-                    "version": self.config.client_version,
+        with self._operation():
+            result = self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": self.config.client_name,
+                        "title": self.config.client_title,
+                        "version": self.config.client_version,
+                    },
+                    "capabilities": {
+                        "experimentalApi": self.config.experimental_api,
+                    },
                 },
-                "capabilities": {
-                    "experimentalApi": self.config.experimental_api,
-                },
-            },
-            response_model=InitializeResponse,
-        )
-        self.notify("initialized", None)
-        return result
+                response_model=InitializeResponse,
+            )
+            self.notify("initialized", None)
+            return result
 
     @property
     def process_epoch(self) -> int:
@@ -340,39 +497,42 @@ class CodexClient:
         return response_model.model_validate(result)
 
     def _request_raw(self, method: str, params: JsonObject | None = None) -> JsonValue:
-        """Send a JSON-RPC request and wait for the reader thread to route its response."""
-        with self._lifecycle_lock:
-            proc = self._proc
-            router = self._router
-            if proc is None:
-                raise TransportClosedError("Codex process is not running")
-            request_id = str(uuid.uuid4())
-            waiter = router.create_response_waiter(request_id)
-
+        """Send one bounded JSON-RPC operation through this transport generation."""
+        with self._operation() as operation:
+            with self._lifecycle_lock:
+                proc, router = self._proc, self._router
+                if proc is None or self._closing:
+                    raise TransportClosedError("Codex process is not running")
+                if operation.proc is not None and operation.proc is not proc:
+                    raise TransportClosedError("operation belongs to a previous transport")
+                operation.proc, operation.router = proc, router
+                request_id = str(uuid.uuid4())
+                waiter = router.create_response_waiter(request_id)
             try:
                 message: JsonObject = {"id": request_id, "method": method}
                 if params is not None:
                     message["params"] = params
                 self._write_message(message, proc=proc)
-            except BaseException:
+                while True:
+                    timeout = self._check_operation(operation)
+                    router.check_failure()
+                    try:
+                        item = waiter.get(timeout=timeout)
+                        break
+                    except queue.Empty:
+                        continue
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+            finally:
                 router.discard_response_waiter(request_id)
-                raise
-
-        item = waiter.get()
-        if isinstance(item, BaseException):
-            raise item
-        return item
 
     def notify(self, method: str, params: JsonObject | None = None) -> None:
         """Send a JSON-RPC notification without waiting for a response."""
         message: JsonObject = {"method": method}
         if params is not None:
             message["params"] = params
-        with self._lifecycle_lock:
-            proc = self._proc
-            if proc is None:
-                raise TransportClosedError("Codex process is not running")
-            self._write_message(message, proc=proc)
+        self._write_message(message)
 
     def next_notification(self, timeout_s: float | None = None) -> Notification:
         """Return the next notification that is not scoped to an active turn."""
@@ -380,7 +540,8 @@ class CodexClient:
 
     def register_login_notifications(self, login_id: str) -> None:
         """Start routing notifications for one interactive login attempt."""
-        self._router.register_login(login_id)
+        operation = getattr(self._operation_local, "current", None)
+        self._router.register_login(login_id, deadline=operation.deadline if operation else None)
 
     def unregister_login_notifications(self, login_id: str) -> None:
         """Stop routing notifications for one interactive login attempt."""
@@ -394,7 +555,8 @@ class CodexClient:
 
     def register_turn_notifications(self, turn_id: str) -> None:
         """Start routing notifications for one turn into its dedicated queue."""
-        self._router.register_turn(turn_id)
+        operation = getattr(self._operation_local, "current", None)
+        self._router.register_turn(turn_id, deadline=operation.deadline if operation else None)
 
     def unregister_turn_notifications(self, turn_id: str) -> None:
         """Stop routing notifications for one turn into its dedicated queue."""
@@ -406,11 +568,17 @@ class CodexClient:
 
     def register_goal_operation(self, thread_id: str) -> _GoalOperationState:
         """Register a private thread-scoped route for a logical goal turn."""
-        return self._router.register_goal(thread_id)
+        operation = getattr(self._operation_local, "current", None)
+        return self._router.register_goal(
+            thread_id, deadline=operation.deadline if operation else None
+        )
 
     def reserve_goal_operation(self, thread_id: str) -> _GoalOperationState:
         """Reserve a private thread route before replacing its stored goal."""
-        return self._router.reserve_goal(thread_id)
+        operation = getattr(self._operation_local, "current", None)
+        return self._router.reserve_goal(
+            thread_id, deadline=operation.deadline if operation else None
+        )
 
     def unregister_goal_operation(self, state: _GoalOperationState) -> None:
         """Release routing state for one logical goal turn."""
@@ -426,18 +594,19 @@ class CodexClient:
         self,
         params: V2LoginAccountParams | JsonObject,
     ) -> LoginAccountResponse:
-        response = self.request(
-            "account/login/start",
-            _params_dict(params),
-            response_model=LoginAccountResponse,
-        )
-        response_root = response.root
-        if isinstance(
-            response_root,
-            ChatgptLoginAccountResponse | ChatgptDeviceCodeLoginAccountResponse,
-        ):
-            self.register_login_notifications(response_root.login_id)
-        return response
+        with self._operation():
+            response = self.request(
+                "account/login/start",
+                _params_dict(params),
+                response_model=LoginAccountResponse,
+            )
+            response_root = response.root
+            if isinstance(
+                response_root,
+                ChatgptLoginAccountResponse | ChatgptDeviceCodeLoginAccountResponse,
+            ):
+                self.register_login_notifications(response_root.login_id)
+            return response
 
     def account_login_cancel(self, login_id: str) -> CancelLoginAccountResponse:
         return self.request(
@@ -617,7 +786,12 @@ class CodexClient:
                 status=ThreadGoalStatus.active,
             )
             activated = True
-            turn_id = state.wait_for_start(_GOAL_START_TIMEOUT_S)
+            deadline = time.monotonic() + _GOAL_START_TIMEOUT_S
+            operation = self._operation_local.current
+            turn_id = None
+            while turn_id is None and time.monotonic() < deadline:
+                timeout = min(self._check_operation(operation), deadline - time.monotonic())
+                turn_id = state.wait_for_start(max(0.0, timeout))
             if turn_id is None:
                 raise CodexError(
                     "timed out waiting for goal turn to start after "
@@ -655,6 +829,12 @@ class CodexClient:
 
     @contextmanager
     def _thread_start_lock(self, thread_id: str) -> Iterator[None]:
+        with self._operation() as operation:
+            with self._thread_start_lock_inner(thread_id, operation):
+                yield
+
+    @contextmanager
+    def _thread_start_lock_inner(self, thread_id: str, operation: _Operation) -> Iterator[None]:
         with self._thread_start_locks_guard:
             entry = self._thread_start_locks.get(thread_id)
             if entry is None:
@@ -662,8 +842,12 @@ class CodexClient:
                 self._thread_start_locks[thread_id] = entry
             entry.users += 1
         try:
-            with entry.lock:
+            while not entry.lock.acquire(timeout=self._check_operation(operation)):
+                pass
+            try:
                 yield
+            finally:
+                entry.lock.release()
         finally:
             with self._thread_start_locks_guard:
                 entry.users -= 1
@@ -710,12 +894,15 @@ class CodexClient:
         initial_delay_s: float = 0.25,
         max_delay_s: float = 2.0,
     ) -> ModelT:
-        return retry_on_overload(
-            lambda: self.request(method, params, response_model=response_model),
-            max_attempts=max_attempts,
-            initial_delay_s=initial_delay_s,
-            max_delay_s=max_delay_s,
-        )
+        with self._operation() as operation:
+            return retry_on_overload(
+                lambda: self.request(method, params, response_model=response_model),
+                max_attempts=max_attempts,
+                initial_delay_s=initial_delay_s,
+                max_delay_s=max_delay_s,
+                timeout_s=max(0.0, operation.deadline - time.monotonic()),
+                _cancelled=operation.cancelled,
+            )
 
     def wait_for_turn_completed(self, turn_id: str) -> TurnCompletedNotification:
         """Block on the routed turn stream until the matching completion arrives."""
@@ -803,12 +990,14 @@ class CodexClient:
         return input_items
 
     def _default_approval_handler(self, method: str, params: JsonObject | None) -> JsonObject:
-        """Accept approval requests when the caller did not provide a handler."""
+        """Fail closed unless the caller explicitly installs an approval handler."""
         if method == "item/commandExecution/requestApproval":
-            return {"decision": "accept"}
+            return {"decision": "decline"}
         if method == "item/fileChange/requestApproval":
-            return {"decision": "accept"}
-        return {}
+            return {"decision": "decline"}
+        if method == "item/permissions/requestApproval":
+            return {"permissions": {}, "scope": "turn"}
+        raise CodexError(f"Unsupported server request: {method}")
 
     def _start_stderr_drain_thread(self, proc: subprocess.Popen[str]) -> None:
         if proc.stderr is None:
@@ -816,8 +1005,11 @@ class CodexClient:
         stderr = proc.stderr
 
         def _drain() -> None:
-            while chunk := stderr.read(_STDERR_READ_CHARS):
-                self._append_stderr(chunk)
+            try:
+                while chunk := stderr.read(_STDERR_READ_CHARS):
+                    self._append_stderr(chunk)
+            finally:
+                stderr.close()
 
         self._stderr_thread = threading.Thread(target=_drain, daemon=True)
         self._stderr_thread.start()
@@ -844,7 +1036,10 @@ class CodexClient:
                 msg = self._read_message(proc)
                 if "method" in msg and "id" in msg:
                     response = self._handle_server_request(msg)
-                    self._write_message({"id": msg["id"], "result": response}, proc=proc)
+                    # The single reader has reserved control admission: an
+                    # approval reply must not be rejected by saturated RPC slots.
+                    with self._operation(control=True):
+                        self._write_message({"id": msg["id"], "result": response}, proc=proc)
                     continue
                 if "method" in msg and "id" not in msg:
                     method = msg["method"]
@@ -856,6 +1051,11 @@ class CodexClient:
                 active_router.route_response(msg)
         except BaseException as exc:
             active_router.fail_all(exc)
+            if proc is not None:
+                self._abort_transport(proc, active_router, exc)
+        finally:
+            if proc is not None and proc.stdout is not None:
+                proc.stdout.close()
 
     def _append_stderr(self, chunk: str) -> None:
         encoded = chunk.encode("utf-8")
@@ -900,22 +1100,86 @@ class CodexClient:
             params if isinstance(params, dict) else None,
         )
 
+    def _writer_loop(
+        self,
+        proc: subprocess.Popen[str],
+        router: MessageRouter,
+        writes: queue.Queue[_Write | None],
+        stopped: threading.Event,
+    ) -> None:
+        try:
+            while not stopped.is_set():
+                try:
+                    pending = writes.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if pending is None:
+                    break
+                try:
+                    if stopped.is_set() or proc.stdin is None:
+                        raise TransportClosedError("Codex process was closed")
+                    proc.stdin.write(pending.line)
+                    proc.stdin.flush()
+                except BaseException as exc:
+                    pending.error = exc
+                    self._abort_transport(proc, router, exc)
+                    break
+                finally:
+                    pending.done.set()
+        finally:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
     def _write_message(
         self, payload: JsonObject, *, proc: subprocess.Popen[str] | None = None
     ) -> None:
-        with self._lock:
-            target = proc or self._proc
-            if target is None or target.stdin is None:
-                raise TransportClosedError("Codex process is not running")
-            target.stdin.write(json.dumps(payload) + "\n")
-            target.stdin.flush()
+        with self._operation() as operation:
+            line = json.dumps(payload) + "\n"
+            if len(line.encode("utf-8")) > self.config.max_message_bytes:
+                raise CodexError("outbound message size limit exceeded")
+            pending = _Write(line)
+            with self._lifecycle_lock:
+                target = proc or self._proc
+                if (
+                    target is None
+                    or target is not self._proc
+                    or self._closing
+                    or self._stopped.is_set()
+                ):
+                    raise TransportClosedError("Codex process is not running")
+                if operation.proc is not None and operation.proc is not target:
+                    raise TransportClosedError("operation belongs to a previous transport")
+                operation.proc, operation.router = target, self._router
+                self._check_operation_before_write(operation)
+                try:
+                    self._writes.put_nowait(pending)
+                except queue.Full as exc:
+                    raise CodexError("outbound message queue limit exceeded") from exc
+            while not pending.done.wait(self._check_operation(operation)):
+                operation.router.check_failure()
+                if self._stopped.is_set():
+                    raise TransportClosedError("Codex process was closed during write")
+            if pending.error is not None:
+                raise pending.error
+
+    def _check_operation_before_write(self, operation: _Operation) -> None:
+        # Called under the lifecycle lock: do not invoke transport shutdown here.
+        if operation.cancelled.is_set():
+            raise TransportClosedError("operation cancelled before write")
+        if time.monotonic() >= operation.deadline:
+            raise TimeoutError("operation deadline exceeded before write")
 
     def _read_message(self, proc: subprocess.Popen[str] | None = None) -> dict[str, JsonValue]:
         target = proc or self._proc
         if target is None or target.stdout is None:
             raise TransportClosedError("Codex process is not running")
 
-        line = target.stdout.readline()
+        line = target.stdout.readline(self.config.max_message_bytes + 1)
+        if len(line.encode("utf-8")) > self.config.max_message_bytes:
+            raise CodexError("inbound message size limit exceeded")
         if not line:
             stderr_thread = self._stderr_thread
             if stderr_thread is not None and stderr_thread is not threading.current_thread():

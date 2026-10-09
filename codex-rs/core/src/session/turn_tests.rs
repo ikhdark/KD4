@@ -2127,7 +2127,7 @@ fn verified_turn_contract_after_agent_abort_revokes_delivery_authority() {
 
     let result = after_agent_abort_result(
         Some("completed answer".to_string()),
-        Some(surfaced_result.clone()),
+        Some(surfaced_result),
         true,
     );
 
@@ -2553,7 +2553,6 @@ async fn regular_follow_up_admission_reports_exhaustion_once() {
     let exhausted = LogicalGenerationBudget {
         regular_generations: MAX_REGULAR_LOGICAL_GENERATIONS,
         terminal_generation_used: true,
-        ..Default::default()
     };
     reported = false;
     assert!(!admit_regular_follow_up(&session, &turn, &exhausted, &mut reported).await);
@@ -2586,7 +2585,6 @@ fn logical_generation_budget_preview_preserves_capacity() {
         let budget = LogicalGenerationBudget {
             regular_generations,
             terminal_generation_used,
-            ..Default::default()
         };
         assert_eq!(budget.can_admit(false), regular_allowed);
         assert_eq!(budget.can_admit(true), terminal_allowed);
@@ -4553,8 +4551,8 @@ async fn repeated_failed_read_preserves_a_different_required_action_impl() -> Re
     // Missing-artifact errors do not claim to be permanent, so they remain
     // retryable. Their repeated cycle still exercises convergence without
     // permission to disable a different required action.
-    for index in 1..=3 {
-        let failure = requests[index]
+    for (index, request) in requests.iter().enumerate().take(4).skip(1) {
+        let failure = request
             .function_call_output_text(&format!("repeat-{index}"))
             .expect("repeated artifact lookup failure");
         assert!(
@@ -8666,7 +8664,7 @@ fn completion_boundary_rejected_direct_answers_are_never_published() -> Result<(
         for mode in ["repair-model", "repair-direct", "abort"] {
             let server = responses::start_mock_server().await;
             let direct = |id: &str, text: &str| responses::sse(vec![
-                responses::ev_custom_tool_call(id, "exec", &format!("// @exec: {{\"deliver\":true}}\ntext('{}');", text)),
+                responses::ev_custom_tool_call(id, "exec", &format!("// @exec: {{\"deliver\":true}}\ntext('{text}');")),
                 responses::ev_completed(id),
             ]);
             let mut sequence = vec![direct("candidate-a", "rejected A")];
@@ -8999,4 +8997,7 @@ async fn failed_response_recording_is_reported_at_the_relay_boundary() {
 
 #[path = "completion_latency_tests.rs"]
 mod completion_latency;
+
+#[path = "request_latency_tests.rs"]
+mod request_latency;
 

@@ -302,16 +302,8 @@ impl ThreadQueueRequestProcessor {
 
     async fn recover(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
         let Some(pending) = &queue.pending_start else { return Ok(()) };
-        let live = self.thread_state_manager.thread_state(id).await;
-        if live.lock().await.in_progress_turn_id() == Some(pending.turn_id.as_str()) {
-            return Ok(());
-        }
-        // Worker installation is not durable input acceptance. Leave custody in
-        // the queue while the worker can still be starting or recording input.
-        if let Ok(thread) = self.thread_manager.get_thread(id).await {
-            if matches!(thread.agent_status().await, AgentStatus::Running) {
-                return Ok(());
-            }
+        let thread = self.thread_manager.get_thread(id).await.ok();
+        if let Some(thread) = &thread {
             thread.flush_rollout().await.map_err(queue_error)?;
         }
         let history = self.thread_store.read_thread(codex_thread_store::ReadThreadParams {
@@ -319,10 +311,26 @@ impl ThreadQueueRequestProcessor {
         }).await.map_err(queue_error)?;
         let accepted = history.history.as_ref().is_some_and(|history|
             pending_input_recorded(&history.items, &pending.turn_id));
+        // Accepted input belongs to history even while the turn is running.
+        // Without that evidence, worker installation is not enough to release
+        // custody: it may still be starting or recording the prompt.
+        if !accepted {
+            let live = self.thread_state_manager.thread_state(id).await;
+            if live.lock().await.in_progress_turn_id() == Some(pending.turn_id.as_str()) {
+                return Ok(());
+            }
+            if let Some(thread) = &thread
+                && matches!(thread.agent_status().await, AgentStatus::Running)
+            {
+                return Ok(());
+            }
+        }
         let origin_present = self.origins.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(&(id, pending.submission_id.clone()));
-        let pending = queue.pending_start.take().expect("pending start");
+        let pending = queue.pending_start.take().ok_or_else(|| {
+            internal_error("pending thread queue start disappeared during recovery")
+        })?;
         if accepted {
             if let Some(index) = queue.submissions.iter().position(|item| item.id == pending.submission_id) {
                 let submission = queue.submissions.remove(index);
@@ -331,12 +339,14 @@ impl ThreadQueueRequestProcessor {
                     queue.accepted.remove(0);
                 }
             }
-            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(id, pending.submission_id));
         }
         // Never silently replay an unaccepted start or resume after process death.
         queue.paused |= !accepted || !origin_present;
         self.save(id, queue).await?;
+        if accepted {
+            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(id, pending.submission_id));
+        }
         self.changed(id).await;
         Ok(())
     }
@@ -544,7 +554,8 @@ impl ThreadQueueRequestProcessor {
         match result {
             Ok(response) => {
                 // Keep pending_start and its input until persisted history takes
-                // custody. Completion's existing kick performs that handoff.
+                // custody. The input event reconciles that handoff; completion
+                // and later queue requests remain recovery paths.
                 drop(guard);
                 self.changed(id).await;
                 Ok(Some(ThreadQueueStartResponse {
@@ -599,6 +610,22 @@ impl ThreadQueueRequestProcessor {
         }
     }
 
+    pub(super) fn input_recorded(&self, id: ThreadId) {
+        if !self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys().any(|(thread_id, _)| *thread_id == id) { return; }
+        let processor = self.clone();
+        // Never wait for the queue lock or storage in the event listener: a
+        // start can still hold the lock while core is publishing this event.
+        // Keep the tracked task and lock alive through persistence. Timing out
+        // a queue write could release the lock before SQLite finishes it and
+        // let that late write overwrite a newer queue mutation.
+        self.background_tasks.spawn(async move {
+            if let Err(error) = processor.mutate(id, |_| Ok(((), false))).await {
+                tracing::warn!(%id, error = %error.message, "queued input handoff failed");
+            }
+        });
+    }
+
     pub(super) fn kick(&self, id: ThreadId) {
         if !self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys().any(|(thread_id, _)| *thread_id == id) { return; }
@@ -641,6 +668,12 @@ fn pending_input_recorded(items: &[RolloutItem], turn_id: &str) -> bool {
         match item {
             RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => in_turn = event.turn_id == turn_id,
             RolloutItem::EventMsg(EventMsg::UserMessage(_)) if in_turn => return true,
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                if event.turn_id == turn_id
+                    && matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(_)) =>
+            {
+                return true;
+            }
             _ => {}
         }
     }
@@ -709,6 +742,24 @@ mod tests {
         assert!(!pending_input_recorded(&[start("turn")], "turn"));
         assert!(!pending_input_recorded(&[start("turn"), start("other"), input.clone()], "turn"));
         assert!(pending_input_recorded(&[start("turn"), input], "turn"));
+    }
+
+    #[test]
+    fn queue_ownership_recognizes_paginated_input_only_for_its_turn() {
+        use codex_protocol::items::{TurnItem, UserMessageItem};
+        use codex_protocol::protocol::{ItemCompletedEvent, ItemStartedEvent};
+
+        let item = TurnItem::UserMessage(UserMessageItem::new(&[]));
+        let thread_id = ThreadId::new();
+        let started = RolloutItem::EventMsg(EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id, turn_id: "turn".into(), item: item.clone(), started_at_ms: 0,
+        }));
+        let completed = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id, turn_id: "turn".into(), item, completed_at_ms: 0,
+        }));
+        assert!(!pending_input_recorded(&[started], "turn"));
+        assert!(!pending_input_recorded(std::slice::from_ref(&completed), "other"));
+        assert!(pending_input_recorded(&[completed], "turn"));
     }
 
     #[test]

@@ -93,7 +93,9 @@ class LaneLatencyTests(unittest.TestCase):
             (root / "scripts" / "just-shell.py").write_text(
                 "import runpy, sys\n"
                 f"adapter=runpy.run_path({str(repo / 'scripts' / 'just-shell.py')!r})\n"
-                "raise SystemExit(adapter['run_powershell'](sys.argv[1], sys.argv[2], sys.argv[3:]))\n")
+                "run_python = adapter['run_python']\n"
+                "if __name__ == '__main__':\n"
+                " raise SystemExit(adapter['run_powershell'](sys.argv[1], sys.argv[2], sys.argv[3:]))\n")
             (root / "scripts" / "rust_build_status.py").write_text(
                 "import json, os, sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(int(os.environ['STUB_EXIT']))\n")
             for code, wait in ((75, None), (75, "5"), (0, None), (2, None)):

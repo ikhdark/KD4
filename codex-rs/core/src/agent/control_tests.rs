@@ -2024,6 +2024,98 @@ async fn cancelled_spawn_after_thread_created_cleans_child_and_releases_path() {
 }
 
 #[test]
+fn registered_independent_spawns_overlap_before_initial_submission() {
+    run_current_thread_test_with_stack(
+        "registered_independent_spawns_overlap_before_initial_submission",
+        || async {
+            use crate::session::step_context::StepContext;
+            use crate::tools::context::ToolPayload;
+            use crate::tools::parallel::ToolCallRuntime;
+            use crate::tools::router::ToolCall;
+            use crate::tools::router::ToolRouter;
+            use crate::tools::router::ToolRouterParams;
+            use core_test_support::responses;
+
+            let server = responses::start_mock_server().await;
+            let models = responses::mount_sse_sequence(&server, (0..2).map(|i| responses::sse(vec![
+                responses::ev_response_created(&format!("parallel-child-{i}")),
+                responses::ev_assistant_message(&format!("parallel-answer-{i}"), "done"),
+                responses::ev_completed(&format!("parallel-child-{i}")),
+            ])).collect()).await;
+            let (home, mut config) = test_config().await;
+            for feature in [Feature::MultiAgentV2, Feature::Collab] {
+                config.features.enable(feature).expect("enable V2 registration");
+            }
+            config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+            config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+            config.model_provider.supports_websockets = false;
+            let harness = AgentControlHarness::new_with_config(home, config).await;
+            let (_, parent) = harness.start_thread().await;
+            let control = parent.codex.session.services.agent_control.clone();
+            let step = StepContext::for_test(parent.codex.session.new_default_turn().await);
+            let router = Arc::new(ToolRouter::from_context(
+                step.as_ref(),
+                ToolRouterParams {
+                    tool_suggest_candidates: None,
+                    deferred_mcp_tools: None,
+                    mcp_tools: None,
+                    extension_tool_executors: Vec::new(),
+                    dynamic_tools: &[],
+                    exposure_identity: Default::default(),
+                },
+                &Default::default(),
+            ));
+            step.turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+            assert!(step.set_tool_router(router).is_ok());
+            let runtime = ToolCallRuntime::new(
+                Arc::clone(&parent.codex.session), step,
+                Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::default())),
+            );
+            let barrier = Arc::new(AgentControlTestBarrier::default());
+            control.set_before_initial_submission_barrier(Some(barrier.clone()));
+            let call = |name: &str| ToolCall {
+                tool_name: codex_tools::ToolName::namespaced("agents", "spawn_agent"),
+                call_id: format!("parallel-{name}"),
+                payload: ToolPayload::Function { arguments: serde_json::json!({
+                    "task_name": name, "message": "Return done."
+                }).to_string() },
+            };
+            let first_runtime = runtime.clone();
+            let first_call = call("first");
+            let first = tokio::spawn(async move {
+                first_runtime.handle_tool_call(first_call, tokio_util::sync::CancellationToken::new()).await
+            });
+            timeout(Duration::from_secs(15), barrier.wait_until_reached()).await.expect("first child reaches setup barrier");
+            let second_call = call("second");
+            let second = tokio::spawn(async move {
+                runtime.handle_tool_call(second_call, tokio_util::sync::CancellationToken::new()).await
+            });
+            // The first child's setup remains blocked. No timing improvement alone
+            // can satisfy this: the second real dispatch must reach the same point.
+            let overlap = timeout(Duration::from_secs(10), barrier.wait_until_reached()).await;
+            control.set_before_initial_submission_barrier(None);
+            barrier.release_one();
+            barrier.release_one();
+            for (name, task) in [("first", first), ("second", second)] {
+                let result = timeout(Duration::from_secs(15), task).await.unwrap().unwrap().unwrap();
+                let output = serde_json::to_string(&result).unwrap();
+                assert!(output.contains(&format!("/root/{name}")), "{output}");
+            }
+            let sampled = timeout(Duration::from_secs(10), async {
+                while models.requests().len() < 2 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }).await;
+            let shutdown = harness.manager.shutdown_all_threads_bounded(Duration::from_secs(5)).await;
+            assert!(shutdown.timed_out.is_empty() && shutdown.submit_failed.is_empty(), "{shutdown:?}");
+            assert_eq!(shutdown.completed.len(), 3);
+            sampled.expect("both children sample before shutdown");
+            assert!(overlap.is_ok(), "independent spawn was serialized behind blocked setup");
+        },
+    );
+}
+
+#[test]
 fn registered_cancelled_spawn_retains_usage_until_child_termination() {
     run_current_thread_test_with_stack(
         "registered_cancelled_spawn_retains_usage_until_child_termination",
@@ -3668,6 +3760,59 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
         ),
     ));
     assert!(!has_subagent_notification(&root_history_items));
+}
+
+#[tokio::test]
+async fn repeated_terminal_errors_and_watcher_deliver_one_parent_message() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    let (child_id, child) = harness.start_thread().await;
+    let child_path = AgentPath::root().join("failing_child").unwrap();
+    let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: parent_id,
+        depth: 1,
+        agent_path: Some(child_path.clone()),
+        agent_nickname: None,
+        agent_role: None,
+    });
+    for index in 0..3 {
+        let mut turn = child.codex.session.new_default_turn().await;
+        Arc::get_mut(&mut turn).unwrap().session_source = source.clone();
+        child.codex.session.send_event(&turn, EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: turn.sub_id.clone(),
+            last_agent_message: None,
+            surfaced_result: None,
+            error: Some(CodexErr::Fatal("no active bound attempt".into()).to_error_event(None)),
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: None,
+        })).await;
+        if index == 0 {
+            let watcher = harness.control.maybe_start_completion_watcher(
+                child_id, Some(source.clone()), child_path.to_string(), Some(child_path.clone()),
+            ).unwrap();
+            timeout(Duration::from_secs(5), watcher).await.unwrap().unwrap();
+            let pending = parent.codex.session.input_queue
+                .get_pending_input(&parent.codex.session.active_turn).await;
+            let [crate::session::TurnInput::InterAgentCommunication(message)] = pending.as_slice() else {
+                panic!("terminal publication and watcher must deliver one error: {pending:?}");
+            };
+            let parent_turn = parent.codex.session.new_default_turn().await;
+            parent.codex.session.record_inter_agent_communication(&parent_turn, message.clone())
+                .await.unwrap();
+        } else {
+            assert!(parent.codex.session.input_queue
+                .get_pending_input(&parent.codex.session.active_turn).await.is_empty());
+        }
+    }
+    let history = parent.codex.session.clone_history().await;
+    assert_eq!(history.raw_items().iter().filter(|item| matches!(
+        item, ResponseItem::AgentMessage { .. }
+    )).count(), 1);
+    assert!(parent.codex.session.active_turn.lock().await.is_none());
 }
 
 #[tokio::test]

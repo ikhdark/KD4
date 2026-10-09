@@ -171,12 +171,12 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         ("input_schema", definition.input_schema.as_ref(), input_fragments.incomplete),
         ("output_schema", definition.output_schema.as_ref(), output_fragments.incomplete),
     ] {
-        if let Some(schema) = schema {
-            if incomplete {
-                description.push_str(&format!(
-                    "\n\nAuthoritative {label} (TypeScript projection incomplete):\n```json\n{schema}\n```"
-                ));
-            }
+        if let Some(schema) = schema
+            && incomplete
+        {
+            description.push_str(&format!(
+                "\n\nAuthoritative {label} (TypeScript projection incomplete):\n```json\n{schema}\n```"
+            ));
         }
     }
     // One shape reached from several properties, or from both the argument and
@@ -256,7 +256,7 @@ pub fn render_code_mode_tool_bundle(definitions: &[ToolDefinition]) -> String {
         {
             output.push_str(&format!(
                 "// Use resolve_tool({}) for its authoritative JSON schema; do not infer arguments from unknown.\n",
-                serde_json::to_string(&definition.name).expect("tool name serializes")
+                JsonValue::String(definition.name.clone())
             ));
         }
         if definition.name == "tool_search" {
@@ -330,7 +330,7 @@ mod tests {
         let small = json!({"type":"object", "description":"Root prerequisite", "properties": {"count":{"type":"integer"}}});
         for (input, output, label) in [
             (large.clone(), small.clone(), "input_schema"),
-            (small.clone(), large.clone(), "output_schema"),
+            (small, large.clone(), "output_schema"),
         ] {
             let definition = ToolDefinition {
                 name: "sample".into(), tool_name: ToolName::plain("sample"),
@@ -365,7 +365,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "guidance".into(), tool_name: ToolName::plain("guidance"),
             description: "".into(), kind: CodeModeToolKind::Function,
-            input_schema: Some(schema.clone()), output_schema: None, default_timeout_ms: None,
+            input_schema: Some(schema), output_schema: None, default_timeout_ms: None,
         };
         let rendered = augment_tool_definition(definition.clone());
         let bundle = render_code_mode_tool_bundle(&[definition]);

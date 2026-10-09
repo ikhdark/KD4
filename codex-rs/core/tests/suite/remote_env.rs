@@ -39,7 +39,6 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;

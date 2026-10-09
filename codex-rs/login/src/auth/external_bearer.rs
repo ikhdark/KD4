@@ -52,9 +52,28 @@ impl BearerTokenRefresher {
         Ok(CodexAuth::from_api_key(access_token.as_str()))
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "forced refreshes share the existing per-provider cache lock with TTL refreshes"
+    )]
     async fn refresh(&self, _context: ExternalAuthRefreshContext) -> io::Result<CodexAuth> {
-        let access_token = run_provider_auth_command(&self.state.config).await?;
+        let started = Instant::now();
         let mut cached = self.state.cached_token.lock().await;
+        if let Some(token) = cached.as_ref()
+            && token.fetched_at > started
+            && self
+                .state
+                .config
+                .refresh_interval()
+                .is_none_or(|interval| token.fetched_at.elapsed() < interval)
+        {
+            // Only reuse an acquisition completed while this refresh waited.
+            // A subsequent rejection must still run the provider command.
+            return Ok(CodexAuth::from_api_key(token.access_token.as_str()));
+        }
+        // Failed or cancelled refreshes must not expose the rejected token.
+        *cached = None;
+        let access_token = run_provider_auth_command(&self.state.config).await?;
         *cached = Some(CachedExternalBearerToken {
             access_token: access_token.clone(),
             fetched_at: Instant::now(),
@@ -169,3 +188,7 @@ fn resolve_provider_auth_program(command: &str, cwd: &Path) -> io::Result<PathBu
 
     Ok(PathBuf::from(command))
 }
+
+#[cfg(test)]
+#[path = "external_bearer_tests.rs"]
+mod tests;

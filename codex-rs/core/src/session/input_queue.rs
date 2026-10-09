@@ -1517,6 +1517,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_error_completions_are_dropped_before_wake_and_history() {
+        let queue = InputQueue::with_mailbox_limits(1, 4);
+        let sender = codex_protocol::ThreadId::new();
+        let make = |receipt| crate::session_prefix::inter_agent_completion_communication(
+            AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(), sender,
+            &codex_protocol::protocol::AgentStatus::Errored("same failure".into()), receipt,
+        ).unwrap();
+        let first = make(Some("attempt-1"));
+        let mut activity = queue.subscribe_agent_activity(None).await.0;
+        let (one, two) = tokio::join!(
+            queue.enqueue_mailbox_communication(first.clone()),
+            queue.enqueue_mailbox_communication(make(Some("attempt-1"))),
+        );
+        assert_ne!(one.unwrap(), two.unwrap(), "concurrent producers admit one error");
+        activity.borrow_and_update();
+        for _ in 0..100 {
+            assert!(!queue.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
+        }
+        assert!(!activity.has_changed().unwrap(), "duplicates must not wake the parent");
+        // A full mailbox rejects a genuinely new attempt without poisoning its retry.
+        assert!(queue.enqueue_mailbox_communication(make(Some("attempt-2"))).await.is_err());
+        assert_eq!(queue.get_pending_input(&Mutex::new(None)).await,
+            vec![TurnInput::InterAgentCommunication(first.clone())]);
+        assert!(!queue.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
+        assert!(queue.enqueue_mailbox_communication(make(Some("attempt-2"))).await.unwrap());
+
+        let restored = InputQueue::new();
+        restored.seed_seen_mailbox_communication_ids(&[
+            RolloutItem::ResponseItem(first.to_model_input_item()),
+        ]).await;
+        assert!(!restored.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
+        assert!(restored.get_pending_input(&Mutex::new(None)).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn mailbox_admission_is_bounded_without_poisoning_retries() {
         let input_queue =
             InputQueue::with_mailbox_limits(/*max_pending*/ 1, /*max_seen_ids*/ 4);

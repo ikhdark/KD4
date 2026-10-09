@@ -85,6 +85,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_spawn_agent_tool_v2(self.options.clone())
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        // V2 admission reserves capacity and identity before asynchronous setup;
+        // durable task admission and rollback own their synchronization. Holding
+        // the parent tool gate across startup only serializes independent children.
+        true
+    }
+
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move { handle_spawn_agent(invocation).await.map(boxed_tool_output) })
     }

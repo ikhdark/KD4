@@ -54,6 +54,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_wait_agent_tool_v2(self.options)
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        // A passive wait must not exclude independent spawns or receipt reads
+        // that can produce its wake. Cursor publication is already compare-and-
+        // swap guarded by the store; cancellation remains owned by this handler.
+        true
+    }
+
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(invocation))
     }
@@ -1118,6 +1125,115 @@ mod tests {
         );
     }
     use super::*;
+
+    #[tokio::test]
+    async fn registered_wait_does_not_hold_up_an_independent_wait_or_cancellation()
+    -> anyhow::Result<()> {
+        use crate::agent::task_capabilities::TypedToolClass;
+        use crate::session::step_context::StepContext;
+        use crate::tools::parallel::ToolCallRuntime;
+        use crate::tools::registry::RegisteredTool;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolCallSource;
+        use crate::tools::router::ToolRouter;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use codex_protocol::protocol::EventMsg;
+
+        for nested in [false, true] {
+            let fixture = tempfile::tempdir()?;
+            let (session, mut turn, events) =
+                crate::session::tests::make_session_and_context_with_rx().await;
+            Arc::make_mut(&mut Arc::get_mut(&mut turn).expect("unique fixture turn").config)
+                .multi_agent_v2
+                .min_wait_timeout_ms = 0;
+            session.services.agent_control.task_coordinator()
+                .initialize_for_workspace_coordination(
+                    None,
+                    fixture.path().join("state"),
+                    turn.config.model_provider_id.clone(),
+                    session.services.agent_control.session_id().to_string(),
+                )
+                .await?;
+            let handler = Arc::new(Handler::default()) as Arc<dyn CoreToolRuntime>;
+            let router = Arc::new(ToolRouter::from_parts(
+                ToolRegistry::from_unique_registered_tools([RegisteredTool::new(
+                    handler,
+                    TypedToolClass::AgentCommunication,
+                )]),
+                Vec::new(),
+            ));
+            let step = StepContext::for_test(turn).with_tool_router_for_test(router);
+            let runtime = ToolCallRuntime::new(
+                Arc::clone(&session),
+                step,
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            );
+            let source = |id: &str| {
+                if nested {
+                    ToolCallSource::CodeMode {
+                        cell_id: "wait-overlap".into(),
+                        parent_call_id: None,
+                        runtime_tool_call_id: id.into(),
+                        nested_deadline: None,
+                        cancellation_cause: None,
+                    }
+                } else {
+                    ToolCallSource::Direct
+                }
+            };
+            let call = |id: &str, timeout_ms: i64| ToolCall {
+                tool_name: ToolName::plain("wait_agent"),
+                call_id: id.into(),
+                payload: ToolPayload::Function {
+                    arguments: json!({"timeout_ms": timeout_ms}).to_string(),
+                },
+            };
+            let cancellation = CancellationToken::new();
+            let first = tokio::spawn(runtime.clone().handle_tool_call_with_source(
+                call("held-wait", 60_000), source("held-wait"), cancellation.clone(),
+            ));
+            // Observe actual handler entry, not a sleep or a flag-only assertion.
+            let entered = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await?;
+                    if let EventMsg::ItemStarted(event) = event.msg
+                        && let TurnItem::CollabAgentToolCall(item) = event.item
+                        && item.id == "held-wait"
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+            }).await;
+            let second = if matches!(&entered, Ok(Ok(()))) {
+                Some(tokio::time::timeout(Duration::from_secs(5),
+                    runtime.clone().handle_tool_call_with_source(
+                        call("independent-wait", 0), source("independent-wait"),
+                        CancellationToken::new(),
+                    ),
+                ).await)
+            } else {
+                None
+            };
+            let first_was_pending = !first.is_finished();
+            cancellation.cancel();
+            let cancelled = tokio::time::timeout(Duration::from_secs(5), first).await???;
+            entered??;
+            assert!(first_was_pending, "the long wait must still own its lifecycle");
+            let second = second.expect("first wait entered")??;
+            assert_eq!(second.code_mode_result()["timed_out"], true);
+            assert!(serde_json::to_string(&cancelled.response())?.contains("aborted by user"));
+            // A cancelled waiter must release its gate and leave later work usable.
+            let after = tokio::time::timeout(Duration::from_secs(5),
+                runtime.handle_tool_call_with_source(
+                    call("after-cancellation", 0), source("after-cancellation"),
+                    CancellationToken::new(),
+                ),
+            ).await??;
+            assert_eq!(after.code_mode_result()["timed_out"], true);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn registered_wait_includes_descendant_beyond_global_binding_limit() -> anyhow::Result<()>

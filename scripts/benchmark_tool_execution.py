@@ -26,6 +26,7 @@ mod tokenizer;
 mod baseline_tokenizer;
 use std::hint::black_box;
 use std::time::Instant;
+const CELL_PRECHECK: bool = false;
 
 #[cfg(windows)]
 fn cpu_us() -> u64 {
@@ -56,6 +57,17 @@ fn fixture(name: &str) -> String {
 }
 
 fn project(text: &str, limit: usize, baseline: bool) -> (String, Option<(usize, usize)>) {
+    if CELL_PRECHECK {
+        let whole = limit.saturating_add(limit / 3).min(40_000);
+        if !baseline {
+            return tokenizer::truncate_model_text_at_lines_with_limits(
+                text, limit, whole, 0, text.lines().count(), Some("fixture-artifact"),
+            );
+        }
+        if limit != 0 && baseline_tokenizer::model_token_count(text) <= whole {
+            return (text.to_string(), None);
+        }
+    }
     let project = if baseline { baseline_tokenizer::truncate_model_text_at_lines_with_recovery }
         else { tokenizer::truncate_model_text_at_lines_with_recovery };
     project(
@@ -73,7 +85,11 @@ fn small_budget_differential_preserves_diagnostics() {
             assert!(before.is_empty() || !after.is_empty(), "lost packet at {limit}: {line}");
             assert!(!before.ends_with("FAILURE_TAIL\n") || after.ends_with("FAILURE_TAIL\n"),
                 "lost failure tail at {limit}: {line}");
-            assert!(tokenizer::model_token_count(&after) <= limit);
+            let ceiling = if CELL_PRECHECK && !after.is_empty() && after == source {
+                limit.saturating_add(limit / 3)
+            } else { limit };
+            assert!(tokenizer::model_token_count(&after) <= ceiling);
+            if CELL_PRECHECK { assert_eq!(project(&source, limit, true), project(&source, limit, false)); }
         }
     }
     for name in ["source", "search", "unicode"] {
@@ -89,6 +105,29 @@ fn main() {
         return;
     }
     let samples: usize = args[1].parse().unwrap();
+    if let Some(path) = args.get(2) {
+        // Length-prefixed UTF-8 avoids measuring an unrelated JSON parser.
+        let bytes = std::fs::read(path).unwrap();
+        let mut rest = bytes.as_slice();
+        let mut corpus = Vec::new();
+        while !rest.is_empty() {
+            let size = u64::from_le_bytes(rest[..8].try_into().unwrap()) as usize;
+            corpus.push(std::str::from_utf8(&rest[8..8 + size]).unwrap());
+            rest = &rest[8 + size..];
+        }
+        for text in &corpus { assert_eq!(project(text, 10_000, true), project(text, 10_000, false)); }
+        for sample in 0..samples {
+            for baseline in if sample % 2 == 0 { [true, false] } else { [false, true] } {
+                let cpu_start = cpu_us();
+                let start = Instant::now();
+                let mut output_bytes = 0;
+                for text in &corpus { output_bytes += black_box(project(text, 10_000, baseline)).0.len(); }
+                let micros = start.elapsed().as_micros();
+                let cpu = cpu_us() - cpu_start;
+                println!("corpus,recorded_packets,10000,{baseline},{micros},{},{output_bytes},{cpu}", corpus.len());
+            }
+        }
+    }
     for name in ["source", "search", "unicode"] {
         let source = fixture(name);
         for limit in [100, 10_000] {
@@ -101,9 +140,12 @@ fn main() {
                 let cpu = cpu_us() - cpu_start;
                 let iterations = if baseline { baseline_tokenizer::take_iterations() }
                     else { tokenizer::take_iterations() };
-                assert!(tokenizer::model_token_count(&output) <= limit);
+                let whole = limit.saturating_add(limit / 3).min(40_000);
+                let fits_whole = CELL_PRECHECK && tokenizer::model_token_count(&source) <= whole;
+                assert!(tokenizer::model_token_count(&output) <= if fits_whole { whole } else { limit });
                 assert!(output.ends_with("FAILURE_TAIL\n"));
-                assert!(gap.is_some());
+                assert_eq!(gap.is_none(), fits_whole);
+                assert_eq!(project(&source, limit, true), project(&source, limit, false));
                 if sample > 0 {
                     println!("projection,{name},{limit},{baseline},{micros},{iterations},{},{cpu}", output.len());
                 }
@@ -153,8 +195,12 @@ def main() -> None:
     parser.add_argument("--baseline-dir", type=Path, help="Alternate samples against this immutable tokenizer baseline")
     parser.add_argument("--capture", type=Path, help="Create an immutable baseline source directory, then benchmark it")
     parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument("--cell-precheck", action="store_true", help="Compare the prior count-then-truncate cell path with single-pass admission")
+    parser.add_argument("--corpus", type=Path, help="JSON array of recorded packets with text fields; replay at a controlled 10000-token budget")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.corpus and not args.cell_precheck:
+        parser.error("--corpus requires --cell-precheck")
     if not 1 <= args.samples <= 100:
         parser.error("samples must be 1–100")
     root = Path(__file__).resolve().parents[1]
@@ -177,12 +223,37 @@ def main() -> None:
         work = Path(directory)
         for name, data in [("tokenizer.rs", sources["tokenizer.rs"]), ("baseline_tokenizer.rs", baseline)]:
             text = data.decode("utf-8")
+            if name == "tokenizer.rs" and "pub fn truncate_model_text_at_lines_with_limits(" not in text:
+                if args.cell_precheck:
+                    parser.error("--cell-precheck requires the single-pass tokenizer source")
+                # Keep historical --source-dir snapshots usable in legacy mode.
+                text += "\npub fn truncate_model_text_at_lines_with_limits(text: &str, limit: usize, _whole: usize, offset: usize, total: usize, artifact: Option<&str>) -> (String, Option<(usize, usize)>) { truncate_model_text_at_lines_with_recovery(text, limit, offset, total, artifact) }\n"
             assert text.count("    loop {") == 1, "fitting-loop instrumentation boundary changed"
             text = text.replace("    loop {", "    loop {\n        ITERATIONS.with(|n| n.set(n.get() + 1));")
             text += "\nthread_local! { static ITERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }\n"
             text += "pub fn take_iterations() -> usize { ITERATIONS.with(|n| n.replace(0)) }\n"
             (work / name).write_text(text, encoding="utf-8")
-        (work / "main.rs").write_text(HARNESS + helpers, encoding="utf-8")
+        harness = HARNESS.replace("const CELL_PRECHECK: bool = false;",
+                                  f"const CELL_PRECHECK: bool = {str(args.cell_precheck).lower()};")
+        corpus_info = None
+        corpus_args = []
+        if args.corpus:
+            data = args.corpus.read_bytes()
+            packets = json.loads(data)
+            if not isinstance(packets, list) or not packets or not all(
+                isinstance(packet, dict) and isinstance(packet.get("text"), str) for packet in packets
+            ):
+                parser.error("corpus must be a nonempty array of objects with text fields")
+            corpus_path = work / "corpus.bin"
+            with corpus_path.open("wb") as stream:
+                for packet in packets:
+                    raw = packet["text"].encode("utf-8")
+                    stream.write(len(raw).to_bytes(8, "little"))
+                    stream.write(raw)
+            corpus_info = {"sha256": hashlib.sha256(data).hexdigest(), "packets": len(packets),
+                           "note": "Recorded displayed packets, not recovered original pre-projection input; controlled 10000-token replay, not historical saved time."}
+            corpus_args = [str(corpus_path)]
+        (work / "main.rs").write_text(harness + helpers, encoding="utf-8")
         compile_args = ["rustc", "--edition=2024", "-O", "-C", "target-feature=+crt-static",
                         "-L", f"dependency={deps}", "--extern", f"tiktoken_rs={tiktoken[0]}"]
         if linker := shutil.which("lld-link"):
@@ -190,7 +261,7 @@ def main() -> None:
         binary = work / ("probe.exe" if os.name == "nt" else "probe")
         compiler = run(["rustc", "--version"], root / "codex-rs").strip()
         run(compile_args + [str(work / "main.rs"), "-o", str(binary)], root / "codex-rs")
-        records = run([str(binary), str(args.samples)], root / "codex-rs").splitlines()
+        records = run([str(binary), str(args.samples), *corpus_args], root / "codex-rs").splitlines()
         tests = work / ("tests.exe" if os.name == "nt" else "tests")
         run(compile_args + ["--test", str(work / "main.rs"), "-o", str(tests)], root / "codex-rs")
         tests_output = run([str(tests)], work)
@@ -208,6 +279,8 @@ def main() -> None:
         "cpu_note": "Windows process CPU uses GetProcessTimes (coarse quantization); wall minus CPU is not a pure scheduler measurement. Child wall includes creation, execution and pipe collection. CPU is zero/unavailable on other platforms.",
         "tiktoken_rlib_sha256": hashlib.sha256(tiktoken[0].read_bytes()).hexdigest(),
         "samples": args.samples,
+        "cell_precheck": args.cell_precheck,
+        "corpus": corpus_info,
         "timings_us": {k: {"samples": v, "median": statistics.median(v)} for k, v in groups.items()},
         "records": records,
         "tests": tests_output,

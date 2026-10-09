@@ -217,34 +217,31 @@ async fn run_connection(
                         }
                         // Reserve HTTP identity before spawning: cancellation may
                         // arrive before the spawned request starts running.
-                        if initialized && method == crate::protocol::HTTP_REQUEST_METHOD {
-                            if let Ok(params) =
+                        if initialized
+                            && method == crate::protocol::HTTP_REQUEST_METHOD
+                            && let Ok(params) =
                                 serde_json::from_value::<crate::protocol::HttpRequestParams>(
                                     request.params.clone().unwrap_or_default(),
                                 )
+                            && params.stream_response
+                            && let Err(error) = handler
+                                .reserve_http_body_stream(&params.request_id, &request.id)
+                                .await
+                        {
+                            if send_outbound(
+                                &outgoing_tx,
+                                RpcServerOutboundMessage::Error {
+                                    request_id: request.id,
+                                    error,
+                                },
+                                &cancelled,
+                            )
+                            .await
+                            .is_err()
                             {
-                                if params.stream_response {
-                                    if let Err(error) = handler
-                                        .reserve_http_body_stream(&params.request_id, &request.id)
-                                        .await
-                                    {
-                                        if send_outbound(
-                                            &outgoing_tx,
-                                            RpcServerOutboundMessage::Error {
-                                                request_id: request.id,
-                                                error,
-                                            },
-                                            &cancelled,
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                }
+                                break;
                             }
+                            continue;
                         }
                         pending_starts.retain(|_, completion| completion.peek().is_none());
                         let process_id = request
@@ -269,10 +266,10 @@ async fn run_connection(
                             .boxed()
                             .shared();
                             last_ordered = Some(completion.clone());
-                            if method == crate::protocol::EXEC_METHOD {
-                                if let Some(process_id) = process_id {
-                                    pending_starts.insert(process_id, completion);
-                                }
+                            if method == crate::protocol::EXEC_METHOD
+                                && let Some(process_id) = process_id
+                            {
+                                pending_starts.insert(process_id, completion);
                             }
                         }
                         let request_span = request_span(method, &request);
@@ -810,10 +807,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "Force client preparation on a current-thread runtime"
-    )]
     fn registered_http_route_bounds_preparation_and_releases_stream_reservation() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

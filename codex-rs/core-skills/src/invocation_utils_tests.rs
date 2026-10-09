@@ -53,7 +53,7 @@ fn command_detection_resolves_script_and_document_paths() {
         (format!("cat \"{doc}\" | head"), "/tmp", Some(skill.clone())),
         (format!("nl -ba \"{doc}\""), "/tmp", Some(skill.clone())),
         ("python3 scripts/fetch_comments.py".to_string(), "/tmp/skill-test", Some(skill.clone())),
-        (format!("python3 \"{script}\""), "/tmp/other", Some(skill.clone())),
+        (format!("python3 \"{script}\""), "/tmp/other", Some(skill)),
         ("python3 scripts/fetch_comments.py".to_string(), "/tmp/other", None),
         ("cat unrelated.md".to_string(), "/tmp/skill-test", None),
     ] {

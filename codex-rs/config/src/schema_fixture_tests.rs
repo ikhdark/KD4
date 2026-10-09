@@ -15,7 +15,7 @@ fn config_schema_matches_fixture() {
     // without depending on the core crate or the caller's working directory.
     let fixture = include_str!("../../core/config.schema.json");
     let fixture_value: serde_json::Value =
-        serde_json::from_str(&fixture).expect("parse config schema fixture");
+        serde_json::from_str(fixture).expect("parse config schema fixture");
     let schema_json = config_schema_json().expect("serialize config schema");
     let schema_value: serde_json::Value =
         serde_json::from_slice(&schema_json).expect("decode schema json");

@@ -596,7 +596,7 @@ impl McpConnectionManager {
                 // authentication. Healthy servers need no extra OAuth request,
                 // and a slow provider must not block session initialization.
                 let auth_entry = if auth_entry.is_none()
-                    && outcome.as_ref().err().is_some_and(|error| error.is_authentication_required())
+                    && outcome.as_ref().err().is_some_and(StartupOutcomeError::is_authentication_required)
                 {
                     tokio::select! {
                         _ = cancel_token.cancelled() => None,
@@ -1702,13 +1702,14 @@ async fn emit_update(
     submit_id: &str,
     tx_event: &Sender<Event>,
     update: McpStartupUpdateEvent,
-) -> Result<(), async_channel::SendError<Event>> {
+) -> Result<(), Box<async_channel::SendError<Event>>> {
     tx_event
         .send(Event {
             id: submit_id.to_string(),
             msg: EventMsg::McpStartupUpdate(update),
         })
         .await
+        .map_err(Box::new)
 }
 
 fn mcp_startup_failure_reason(

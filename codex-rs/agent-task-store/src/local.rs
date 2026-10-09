@@ -430,13 +430,6 @@ impl LocalAgentTaskStore {
             .expect("test owns the durable poller");
     }
 
-    #[cfg(test)]
-    pub(crate) async fn configured_busy_timeout_millis(&self) -> StoreResult<i64> {
-        Ok(sqlx::query_scalar("PRAGMA busy_timeout")
-            .fetch_one(&self.pool)
-            .await?)
-    }
-
     async fn create_assignment_impl(
         &self,
         repo_root: &Path,
@@ -3337,13 +3330,10 @@ pub(crate) fn verified_evidence_kind(call: &ValidationCall) -> Option<crate::Cri
             && inspection.source_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .then_some(crate::CriterionEvidenceKind::SourceInspection);
     }
-    let Some(result) =
+    let result =
         call.evidence.validation_result.as_ref().and_then(|result| {
             serde_json::from_value::<StoredValidationResult>(result.clone()).ok()
-        })
-    else {
-        return None;
-    };
+        })?;
     (call.status == ValidationCallStatus::Succeeded
         && call.evidence.end_epoch == Some(call.evidence.start_epoch)
         && result.call_id == call.call_id

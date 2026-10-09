@@ -58,7 +58,7 @@ fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
     for text in [
         record.to_string(),
         serde_json::to_string_pretty(&record).unwrap(),
-        format!("{}\nstatus text", record),
+        format!("{record}\nstatus text"),
     ] {
         let mut history = vec![
             ResponseItem::FunctionCall {

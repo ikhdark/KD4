@@ -66,7 +66,9 @@ async fn native_admission_identifies_missing_cwd_and_executable_without_starting
             sandbox: codex_sandboxing::SandboxType::None,
             windows_sandbox: None,
         };
-        let error = prepared.spawn(false, false).await.err().expect("admission must fail");
+        let Err(error) = prepared.spawn(false, false).await else {
+            panic!("admission must fail");
+        };
         assert!(error.contains("process not started"), "{error}");
         assert!(error.contains(expected), "{error}");
     }

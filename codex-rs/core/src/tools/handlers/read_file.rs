@@ -670,17 +670,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             if let Some(error) = snapshot_error {
                 output["snapshot_error"] = json!(error);
             }
-            if let Some(artifact_id) = &artifact_id {
-                if let Some(mut recovery) = file_recovery_recipe(&output, artifact_id) {
-                    // Preserve the consumer's existing byte budget across this
-                    // mechanical continuation. Otherwise a script-sized read
-                    // silently falls back to 16 KiB recovery pages. The recovery
-                    // owner still enforces its serialized cap and exact scope.
-                    if script_consumer {
-                        recovery["arguments"]["max_bytes"] = json!(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES);
-                    }
-                    output["recovery"] = recovery;
+            if let Some(artifact_id) = &artifact_id
+                && let Some(mut recovery) = file_recovery_recipe(&output, artifact_id)
+            {
+                // Preserve the consumer's existing byte budget across this
+                // mechanical continuation. Otherwise a script-sized read
+                // silently falls back to 16 KiB recovery pages. The recovery
+                // owner still enforces its serialized cap and exact scope.
+                if script_consumer {
+                    recovery["arguments"]["max_bytes"] = json!(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES);
                 }
+                output["recovery"] = recovery;
             }
             let projected = codex_code_mode::model_visible_tool_result(
                 &ToolName::plain("read_file"), &output,

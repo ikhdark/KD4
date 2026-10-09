@@ -1126,6 +1126,20 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
+    /// Capture the complete construction inputs without loading credentials.
+    pub fn from_config(config: &impl AuthManagerConfig) -> Self {
+        Self {
+            codex_home: config.codex_home(),
+            auth_credentials_store_mode: config.cli_auth_credentials_store_mode(),
+            keyring_backend_kind: config.auth_keyring_backend_kind(),
+            forced_login_method: config.forced_login_method(),
+            chatgpt_base_url: Some(config.chatgpt_base_url()),
+            forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id(),
+            managed_auth_policy: config.managed_auth_policy(),
+            auth_route_config: config.auth_route_config(),
+        }
+    }
+
     pub fn is_login_method_allowed(&self, method: ForcedLoginMethod) -> bool {
         self.managed_auth_policy.allows_login_method(
             method,
@@ -1316,15 +1330,15 @@ async fn enforce_login_restrictions_with_agent_identity_authapi_base_url(
         }
     }
 
-    if let Some(expected_account_ids) = config.forced_chatgpt_workspace_id.as_deref() {
-        if let Err(message) = validate_auth_restrictions(None, Some(expected_account_ids), &auth) {
-            return logout_with_message(
-                &config.codex_home,
-                format!("{message}. Logging out."),
-                config.auth_credentials_store_mode,
-                config.keyring_backend_kind,
-            );
-        }
+    if let Some(expected_account_ids) = config.forced_chatgpt_workspace_id.as_deref()
+        && let Err(message) = validate_auth_restrictions(None, Some(expected_account_ids), &auth)
+    {
+        return logout_with_message(
+            &config.codex_home,
+            format!("{message}. Logging out."),
+            config.auth_credentials_store_mode,
+            config.keyring_backend_kind,
+        );
     }
     Ok(())
 }
@@ -2654,16 +2668,7 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
     ) -> Arc<Self> {
         Self::shared_from_auth_config(
-            AuthConfig {
-                codex_home: config.codex_home(),
-                auth_credentials_store_mode: config.cli_auth_credentials_store_mode(),
-                keyring_backend_kind: config.auth_keyring_backend_kind(),
-                forced_login_method: config.forced_login_method(),
-                chatgpt_base_url: Some(config.chatgpt_base_url()),
-                forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id(),
-                managed_auth_policy: config.managed_auth_policy(),
-                auth_route_config: config.auth_route_config(),
-            },
+            AuthConfig::from_config(config),
             enable_codex_api_key_env,
         )
         .await

@@ -12,7 +12,7 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
         (
             "query".to_string(),
             JsonSchema::string(Some(
-                "Short capability terms or exact tool names. +term requires a metadata match; source:<canonical namespace> restricts membership to that namespace (scope tokens appear in the source catalog; shared namespaces may contain several connectors). At most one scope; omit it for broad discovery. Unknown snake_case names fail in name-only lookups; mixed capability queries retain identifiers as task terms, not fuzzy callable aliases. Must contain capability terms and must not exceed 4,096 UTF-8 bytes."
+                "Short capability terms or exact tool names. +term requires a metadata match; source:<canonical namespace> (also +source:) restricts membership to that namespace (scope tokens appear in the source catalog; shared namespaces may contain several connectors). At most one scope; omit it for broad discovery. Name-only batches return available exact tools and report unknown snake_case names; wholly unknown name lookups fail. Mixed capability queries retain identifiers as task terms, not fuzzy callable aliases. Must contain capability terms and must not exceed 4,096 UTF-8 bytes."
                     .to_string(),
             )),
         ),
@@ -29,7 +29,7 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
     ]);
 
     let description = format!(
-        "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call. An exact deferred-tool name may be called directly; the router resolves and activates that registered capability atomically.\n\nAvailable sources are listed in the latest <tool_search_sources> context message, not in this stable contract. Use `{TOOL_SEARCH_TOOL_NAME}` to discover or disambiguate deferred capabilities. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
+        "# Tool discovery\n\nSearches deferred tool metadata with BM25. Direct results expose contracts on the next model call; inside exec, matches can be resolved and invoked in the same cell when their arguments are already known. An exact deferred-tool name may be called directly; the router resolves and activates that registered capability atomically.\n\nAvailable sources are listed in the latest <tool_search_sources> context message, not in this stable contract. Use `{TOOL_SEARCH_TOOL_NAME}` to discover or disambiguate deferred capabilities. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
     );
     ToolSpec::ToolSearch {
         execution: "client".to_string(),

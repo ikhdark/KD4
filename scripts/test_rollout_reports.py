@@ -14,6 +14,7 @@ from unittest import mock
 
 from scripts import rollout_reports as reports
 from scripts import rollout_snapshot
+from scripts import atomic_json
 
 
 def record(kind, payload, second=0):
@@ -75,6 +76,67 @@ class RolloutReportsTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             reports.analyze(self.path)
         return output.getvalue()
+
+    def test_text_reports_publish_only_after_complete_render_and_storage(self):
+        self.path.write_bytes(encode([record("response_item", {
+            "type": "message", "role": "assistant", "content": [{"text": "日本語"}],
+        })]))
+
+        def failed_copy(source, destination):
+            destination.write(source.read(2))
+            raise OSError("partial storage write")
+
+        for renderer in (reports.dump, reports.dump_narrative):
+            for existed in (False, True):
+                for stage in ("render", "copy", "sync", "replace"):
+                    with self.subTest(renderer=renderer.__name__, existed=existed, stage=stage):
+                        self.output.unlink(missing_ok=True)
+                        if existed:
+                            self.output.write_bytes(b"existing report")
+                        if stage == "render":
+                            patch = mock.patch.object(reports, "text_of", side_effect=KeyboardInterrupt())
+                        elif stage == "copy":
+                            patch = mock.patch.object(atomic_json.shutil, "copyfileobj", side_effect=failed_copy)
+                        elif stage == "sync":
+                            patch = mock.patch.object(atomic_json.os, "fsync", side_effect=OSError("disk full"))
+                        else:
+                            patch = mock.patch.object(atomic_json.os, "replace", side_effect=PermissionError("blocked"))
+                        with patch, self.assertRaises((OSError, KeyboardInterrupt)):
+                            renderer(self.path, self.output)
+                        self.assertEqual(self.output.exists(), existed)
+                        if existed:
+                            self.assertEqual(self.output.read_bytes(), b"existing report")
+                        self.assertEqual(set(self.root.iterdir()), {self.path, self.output} if existed else {self.path})
+            renderer(self.path, self.output)
+            self.assertIn("日本語", self.output.read_text(encoding="utf-8"))
+
+    def test_text_reports_reject_source_aliases_and_preserve_unrelated_hardlinks(self):
+        data = encode([record("event_msg", {"type": "user_message", "message": "retained"})])
+        self.path.write_bytes(data)
+        other = self.root / "other.txt"
+        other.write_bytes(b"user work")
+        for renderer in (reports.dump, reports.dump_narrative):
+            with self.subTest(renderer=renderer.__name__):
+                with self.assertRaisesRegex(ValueError, "must not overwrite"):
+                    renderer(self.path, self.path)
+                os.link(self.path, self.output)
+                with self.assertRaisesRegex(ValueError, "must not overwrite"):
+                    renderer(self.path, self.output)
+                self.assertEqual(self.path.read_bytes(), data)
+                self.output.unlink()
+                os.link(other, self.output)
+                renderer(self.path, self.output)
+                self.assertEqual(other.read_bytes(), b"user work")
+                self.assertIn("retained", self.output.read_text(encoding="utf-8"))
+                self.output.unlink()
+
+    def test_text_report_spill_preserves_utf8_and_native_newlines(self):
+        message = "背景\n" * 800_000
+        self.path.write_bytes(encode([record("event_msg", {"type": "user_message", "message": message})]))
+        for renderer in (reports.dump, reports.dump_narrative):
+            with self.subTest(renderer=renderer.__name__):
+                renderer(self.path, self.output)
+                self.assertTrue(self.output.read_bytes().endswith((message + "\n").replace("\n", os.linesep).encode()))
 
     def test_native_timing_and_compaction_usage_replace_event_estimates(self):
         token_event = record(

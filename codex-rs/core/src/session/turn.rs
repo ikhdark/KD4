@@ -245,10 +245,17 @@ pub(crate) async fn prepare_sampling_prompt_for_client(
     git_workspace: &crate::git_workspace::GitWorkspaceCache,
 ) -> PreparedPromptInput {
     let workspace_identity = if history.requires_workspace_evidence_validation() {
-        git_workspace
-            .workspace_evidence_for_turn(turn_context, turn_context.config.cwd.as_path())
-            .await
-            .identity
+        if history.can_use_root_only_workspace_identity()
+            && !turn_context.environments.primary()
+                .is_some_and(|selected| selected.environment.is_remote())
+        {
+            git_workspace.workspace_root_identity(turn_context.config.cwd.as_path()).await
+        } else {
+            git_workspace
+                .workspace_evidence_for_turn(turn_context, turn_context.config.cwd.as_path())
+                .await
+                .identity
+        }
     } else {
         None
     };
@@ -304,6 +311,14 @@ async fn start_continuation_workspace_prefetch(
     environments: crate::environment_selection::TurnEnvironmentSnapshot,
 ) -> Option<ContinuationWorkspacePrefetch> {
     if !history.requires_workspace_evidence_validation() {
+        return None;
+    }
+    // Do not launch a full scan that the projection cannot use. Recheck the
+    // final history in prepare_sampling_prompt_for_client: later calls or
+    // recovered evidence may require a full identity after all.
+    if history.can_use_root_only_workspace_identity()
+        && !environments.primary().is_some_and(|selected| selected.environment.is_remote())
+    {
         return None;
     }
     let baseline_mutation_revision = turn_diff_tracker.lock().await.current_mutation_revision();
@@ -742,7 +757,7 @@ pub(crate) async fn run_turn(
                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
                 .await?;
 
-            // Request preparation begins with the history snapshot. Pending-turn
+            // Request preparation includes notices, routing, and the history snapshot. Pending-turn
             // planning, hooks, input recording, and analytics above remain owned
             // orchestration, but are not part of the model-request preparation lane.
             // The guard is consumed at dispatch, so begin it again for every
@@ -759,7 +774,10 @@ pub(crate) async fn run_turn(
                 budget_forced_terminal,
             )
             .await?;
-            let sampling_request_input: PreparedPromptInput = async {
+            // Keep this future lazy: the finalized router must record its source
+            // notice before we snapshot and normalize history. Otherwise a source
+            // change discards this work and captures workspace evidence twice.
+            let sampling_request_input = async {
                 let history_snapshot_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::HistorySnapshot);
@@ -797,7 +815,11 @@ pub(crate) async fn run_turn(
                 prepared
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
-            .await;
+            // This is read-only preparation, including an owned abort-on-drop
+            // workspace prefetch. A blocked capture must not delay interruption
+            // until the task owner's forced-abort timeout.
+            .or_cancel(&cancellation_token)
+            .map_err(|_| CodexErr::TurnAborted);
 
             let mut responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
@@ -1149,6 +1171,9 @@ pub(crate) async fn run_turn(
                             )
                             .await;
                             // Finalizers can partially mutate even when they fail.
+                            // Retire the shared pre-hook baseline before another
+                            // command can reuse it as its pre-execution snapshot.
+                            sess.services.git_workspace.note_host_workspace_mutation();
                             let mut tracker = turn_diff_tracker.lock().await;
                             tracker.record_unknown_mutation();
                             finalized_mutation_revision = Some(tracker.current_mutation_revision());
@@ -4034,7 +4059,7 @@ async fn run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
-    mut prepared_input: PreparedPromptInput,
+    prepare_input: impl std::future::Future<Output = CodexResult<PreparedPromptInput>>,
     selected_skill_invocations: &[SkillInvocation],
     prebuilt_router: &mut Option<Arc<ToolRouter>>,
     base_instructions: &BaseInstructions,
@@ -4108,21 +4133,14 @@ async fn run_sampling_request(
     // still rebuild while ordinary tool continuations reuse the same registry.
     *prebuilt_router = Some(Arc::clone(&router));
     drop(router_preparation_guard);
-    if record_context_notice_if_changed(
+    record_context_notice_if_changed(
         sess.as_ref(),
         turn_context.as_ref(),
         "tool_search_sources",
         &router.tool_search_sources_for_instructions(turn_context.developer_instructions.as_deref()),
     )
-    .await?
-    {
-        prepared_input = prepare_sampling_prompt_for_client(
-            sess.clone_history().await,
-            turn_context.as_ref(),
-            sess.services.git_workspace.as_ref(),
-        )
-        .await;
-    }
+    .await?;
+    let prepared_input = prepare_input.await?;
     let scaffold_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::RequestTransformation);

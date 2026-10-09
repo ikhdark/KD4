@@ -39,6 +39,36 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
 }
 
 #[test]
+fn spawn_agent_descriptions_require_report_reconciliation() {
+    // V1's custom hint replaces its default guidance; V2 retains its base contract.
+    let descriptions = [
+        spawn_agent_tool_description(None, None, "", None),
+        spawn_agent_tool_description_v2(None, None, None, None),
+        spawn_agent_tool_description_v2(None, None, None, Some("Custom guidance.".to_string())),
+    ];
+    for description in descriptions {
+        for required in [
+            "Read every returned report in full",
+            "recovering omitted portions from retained output",
+            "Account for every substantive finding, including read-only reviews",
+            "implement and verify it, reject it with evidence",
+            "outside the user's scope",
+            "keep it unresolved with a next action or blocker",
+            "Investigate unresolved in-scope findings before finalizing",
+            "do not discharge obtainable work",
+            "When implementation is authorized, implement verified, applicable, in-scope suggestions",
+            "validate the resulting behavior through affected consumers",
+            "Do not stop at acknowledging them, listing them in a plan, or describing future work",
+            "do not ask for renewed permission to perform already-authorized changes",
+            "record the evidence instead of making unnecessary edits",
+            "Respect review-only/no-write scope and do not blindly implement recommendations",
+        ] {
+            assert!(description.contains(required), "missing report policy: {required}");
+        }
+    }
+}
+
+#[test]
 fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
         available_models: Arc::new(vec![
@@ -69,6 +99,9 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         .expect("spawn_agent should use object params");
     assert!(description.contains("Spawns an agent to work on the specified task."));
     assert!(description.contains("The spawned agent receives a durable task binding"));
+    assert!(description.contains("Launch authorized independent assignments in the same batch"));
+    assert!(description.contains("retain every success and failure"));
+    assert!(description.contains("Sequence only real dependencies or shared-resource conflicts"));
     assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
     assert!(!description.contains("max_concurrent_threads_per_session"));
     assert!(description.contains(&spawn_agent_default_guidance()));

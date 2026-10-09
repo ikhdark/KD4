@@ -1801,7 +1801,7 @@ impl UnifiedExecProcessManager {
             let new_output = {
                 let output = output_buffer.lock().await;
                 output.has_uncollected_output()
-                    || output.pending_output().is_some_and(|pending| pending.has_uncollected_output())
+                    || output.pending_output().is_some_and(HeadTailBuffer::has_uncollected_output)
             };
             let minimum = if request.input.is_empty() && !new_output
             {
@@ -2376,7 +2376,7 @@ impl UnifiedExecProcessManager {
         .map_err(|err| match err {
             UnifiedExecError::SandboxDenied { output, .. } => {
                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                    output: Box::new(output),
+                    output,
                     network_policy_decision: None,
                 }))
             }

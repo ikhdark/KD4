@@ -902,15 +902,14 @@ pub(super) async fn submission_loop(
         }
         if matches!(queued.submission.op, Op::Interrupt | Op::Shutdown) {
             let shutting_down = matches!(queued.submission.op, Op::Shutdown);
-            if shutting_down
+            if (shutting_down
                 || pending
                     .as_ref()
-                    .is_some_and(|(_, cancellable, _)| *cancellable)
+                    .is_some_and(|(_, cancellable, _)| *cancellable))
+                && let Some((id, cancellable, preparation)) = pending.take()
             {
-                if let Some((id, cancellable, preparation)) = pending.take() {
-                    drop(preparation);
-                    cancel_queued_preparation(&sess, id, cancellable).await;
-                }
+                drop(preparation);
+                cancel_queued_preparation(&sess, id, cancellable).await;
             }
             let mut retained = std::collections::VecDeque::new();
             while let Some(deferred) = ordered.pop_front() {

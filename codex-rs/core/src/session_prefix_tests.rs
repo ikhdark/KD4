@@ -7,6 +7,40 @@ use super::ERROR_NEXT_ACTION;
 use super::TYPED_COMPLETION_NEXT_ACTION;
 use super::format_inter_agent_completion_message;
 use super::format_subagent_notification_message;
+use super::inter_agent_completion_communication;
+
+#[test]
+fn error_completion_identity_preserves_producer_attempt_and_full_error() {
+    let thread = codex_protocol::ThreadId::new();
+    let make = |thread, sender: &str, receipt, error: &str| {
+        inter_agent_completion_communication(
+            AgentPath::root(), AgentPath::try_from(sender).unwrap(), thread,
+            &AgentStatus::Errored(error.to_string()), receipt,
+        ).unwrap()
+    };
+    let original = make(thread, "/root/worker", Some("attempt-1"), "failed");
+    assert!(original.id.is_some());
+    assert_eq!(original, make(thread, "/root/worker", Some("attempt-1"), "failed"));
+    for changed in [
+        make(thread, "/root/worker", Some("attempt-2"), "failed"),
+        make(thread, "/root/other", Some("attempt-1"), "failed"),
+        make(codex_protocol::ThreadId::new(), "/root/worker", Some("attempt-1"), "failed"),
+        make(thread, "/root/worker", Some("attempt-1"), "different failure"),
+    ] {
+        assert_ne!(original.id, changed.id);
+    }
+    let long_error = "same prefix ".repeat(5_000);
+    assert_ne!(
+        make(thread, "/root/worker", None, &format!("{long_error}cause-a")).id,
+        make(thread, "/root/worker", None, &format!("{long_error}cause-b")).id,
+        "bounded displays must not alias distinct full errors",
+    );
+    let success = inter_agent_completion_communication(
+        AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(), thread,
+        &AgentStatus::Completed(Some("done".into())), None,
+    ).unwrap();
+    assert!(success.id.is_none(), "successful follow-ups are not suppressed");
+}
 
 #[test]
 fn complete_error_does_not_require_fetching_the_same_error_again() {
