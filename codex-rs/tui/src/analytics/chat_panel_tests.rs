@@ -161,6 +161,16 @@ fn unavailable_chat_titles_are_hidden_in_panel_and_overview() {
     let output = screen(&mut view, /*width*/ 110, /*height*/ 28);
     assert!(!output.contains("Another workspace's private title"));
     assert!(output.contains("Chat usage unavailable"));
+    view.zoomed = false;
+    let overview = view
+        .dashboard_lines(/*width*/ 110, /*height*/ 60)
+        .0
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!overview.contains("Another workspace's private title"));
+    assert!(overview.contains("Chat usage unavailable"));
 }
 
 #[test]

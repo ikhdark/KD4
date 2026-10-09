@@ -126,6 +126,21 @@ async fn request_user_input_round_trip() -> Result<()> {
     assert_eq!(params.turn_id, turn.id);
     assert_eq!(params.item_id, "call1");
     assert_eq!(params.questions.len(), 1);
+    let question = &params.questions[0];
+    assert_eq!(question.id, "confirm_path");
+    assert_eq!(question.header, "Confirm");
+    assert_eq!(question.question, "Proceed with the plan?");
+    let options = question.options.as_ref().expect("question options");
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| (option.label.as_str(), option.description.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Yes (Recommended)", "Continue the current plan."),
+            ("No", "Stop and revisit the approach."),
+        ]
+    );
     assert_eq!(params.auto_resolution_ms, Some(60_000));
     let resolved_request_id = request_id.clone();
 
@@ -158,11 +173,38 @@ async fn request_user_input_round_trip() -> Result<()> {
             }
             "turn/completed" => {
                 assert!(saw_resolved, "serverRequest/resolved should arrive first");
+                let completed: TurnCompletedNotification =
+                    serde_json::from_value(notification.params.expect("completion params"))?;
+                assert_eq!(completed.thread_id, thread.id);
+                assert_eq!(completed.turn.id, turn.id);
+                assert_eq!(completed.turn.status, TurnStatus::Completed);
                 break;
             }
             _ => {}
         }
     }
+
+    let mut answers = Vec::new();
+    for request in server.received_requests().await.context("recorded requests")? {
+        if !request.url.path().ends_with("/responses") {
+            continue;
+        }
+        let body: serde_json::Value = request.body_json()?;
+        for item in body["input"].as_array().into_iter().flatten() {
+            if item["type"] == "function_call_output" && item["call_id"] == "call1" {
+                let answer: codex_protocol::request_user_input::RequestUserInputResponse =
+                    serde_json::from_str(item["output"].as_str().context("answer output text")?)?;
+                answers.push(answer);
+            }
+        }
+    }
+    assert_eq!(answers.len(), 1, "model must receive the user's answer");
+    assert!(!answers[0].interrupted);
+    assert_eq!(answers[0].answers.len(), 1);
+    assert_eq!(
+        answers[0].answers["confirm_path"].answers,
+        vec!["yes".to_string()]
+    );
 
     Ok(())
 }
@@ -173,13 +215,13 @@ enum FailedUserInputClientResponse {
     MalformedResponse,
 }
 
-async fn assert_failed_user_input_response_interrupts_turn(
-    failed_response: FailedUserInputClientResponse,
-) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_user_input_responses_interrupt_without_poisoning_the_next_turn() -> Result<()> {
     let codex_home = tempfile::TempDir::new()?;
-    let responses = vec![create_request_user_input_sse_response_with_auto_resolution(
+    let response = create_request_user_input_sse_response_with_auto_resolution(
         "call1", /*auto_resolution_ms*/ 60_000,
-    )?];
+    )?;
+    let responses = vec![response.clone(), response];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(codex_home.path(), &server.uri())?;
 
@@ -202,103 +244,97 @@ async fn assert_failed_user_input_response_interrupts_turn(
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
 
-    let turn_start_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "ask something".to_string(),
-                text_elements: Vec::new(),
-            }],
-            model: Some("mock-model".to_string()),
-            effort: Some(ReasoningEffort::Medium),
-            collaboration_mode: Some(CollaborationMode {
-                mode: ModeKind::Plan,
-                settings: Settings {
-                    model: "mock-model".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::Medium),
-                    developer_instructions: None,
-                },
-            }),
-            ..Default::default()
-        })
-        .await?;
-    let turn_start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
-    )
-    .await??;
-    let TurnStartResponse { turn, .. } = to_response(turn_start_resp)?;
-
-    let server_req = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_request_message(),
-    )
-    .await??;
-    let ServerRequest::ToolRequestUserInput { request_id, .. } = server_req else {
-        panic!("expected ToolRequestUserInput request, got: {server_req:?}");
-    };
-
-    match failed_response {
-        FailedUserInputClientResponse::ClientError => {
-            mcp.send_error(
-                request_id,
-                JSONRPCErrorError {
-                    code: -32_000,
-                    message: "client could not collect an answer".to_string(),
-                    data: None,
-                },
-            )
+    for (index, failed_response) in [
+        FailedUserInputClientResponse::ClientError,
+        FailedUserInputClientResponse::MalformedResponse,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let turn_start_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "ask something".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                model: Some("mock-model".to_string()),
+                effort: Some(ReasoningEffort::Medium),
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Plan,
+                    settings: Settings {
+                        model: "mock-model".to_string(),
+                        reasoning_effort: Some(ReasoningEffort::Medium),
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            })
             .await?;
-        }
-        FailedUserInputClientResponse::MalformedResponse => {
-            mcp.send_response(request_id, json!({ "answers": "not-an-answer-map" }))
+        let turn_start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+        )
+        .await??;
+        let TurnStartResponse { turn, .. } = to_response(turn_start_resp)?;
+
+        let server_req = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_request_message(),
+        )
+        .await??;
+        let ServerRequest::ToolRequestUserInput { request_id, .. } = server_req else {
+            panic!("expected ToolRequestUserInput request, got: {server_req:?}");
+        };
+
+        match failed_response {
+            FailedUserInputClientResponse::ClientError => {
+                mcp.send_error(
+                    request_id,
+                    JSONRPCErrorError {
+                        code: -32_000,
+                        message: "client could not collect an answer".to_string(),
+                        data: None,
+                    },
+                )
                 .await?;
+            }
+            FailedUserInputClientResponse::MalformedResponse => {
+                mcp.send_response(request_id, json!({ "answers": "not-an-answer-map" }))
+                    .await?;
+            }
         }
+
+        let completed = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let completed: TurnCompletedNotification = serde_json::from_value(
+            completed
+                .params
+                .expect("turn/completed params must be present"),
+        )?;
+        assert_eq!(completed.thread_id, thread.id);
+        assert_eq!(completed.turn.id, turn.id);
+        assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+
+        let requests = server
+            .received_requests()
+            .await
+            .context("failed to fetch received requests")?;
+        let response_request_count = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/responses"))
+            .count();
+        assert_eq!(
+            response_request_count, index + 1,
+            "a failed client response must not trigger follow-up sampling"
+        );
     }
 
-    let completed = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-    let completed: TurnCompletedNotification = serde_json::from_value(
-        completed
-            .params
-            .expect("turn/completed params must be present"),
-    )?;
-    assert_eq!(completed.thread_id, thread.id);
-    assert_eq!(completed.turn.id, turn.id);
-    assert_eq!(completed.turn.status, TurnStatus::Interrupted);
-
-    let requests = server
-        .received_requests()
-        .await
-        .context("failed to fetch received requests")?;
-    let response_request_count = requests
-        .iter()
-        .filter(|request| request.url.path().ends_with("/responses"))
-        .count();
-    assert_eq!(
-        response_request_count, 1,
-        "a failed client response must not trigger follow-up sampling"
-    );
-
     Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn request_user_input_client_error_interrupts_turn() -> Result<()> {
-    assert_failed_user_input_response_interrupts_turn(FailedUserInputClientResponse::ClientError)
-        .await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn request_user_input_malformed_response_interrupts_turn() -> Result<()> {
-    assert_failed_user_input_response_interrupts_turn(
-        FailedUserInputClientResponse::MalformedResponse,
-    )
-    .await
 }
 
 fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {

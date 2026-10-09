@@ -414,37 +414,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_errors_when_placeholder_is_empty() {
-        let err = Template::parse("Hello, {{   }}.").unwrap_err();
-
-        assert_eq!(err, TemplateParseError::EmptyPlaceholder { start: 7 });
-    }
-
-    #[test]
-    fn parse_errors_when_placeholder_is_unterminated() {
-        let err = Template::parse("Hello, {{ name.").unwrap_err();
-
-        assert_eq!(
-            err,
-            TemplateParseError::UnterminatedPlaceholder { start: 7 }
-        );
-    }
-
-    #[test]
-    fn parse_errors_when_placeholder_is_nested() {
-        let err = Template::parse("Hello, {{ outer {{ inner }} }}.").unwrap_err();
-
-        assert_eq!(err, TemplateParseError::NestedPlaceholder { start: 7 });
-    }
-
-    #[test]
-    fn parse_errors_when_closing_delimiter_is_unmatched() {
-        let err = Template::parse("Hello, }} world.").unwrap_err();
-
-        assert_eq!(
-            err,
-            TemplateParseError::UnmatchedClosingDelimiter { start: 7 }
-        );
+    fn parse_reports_each_invalid_delimiter_with_its_offset() {
+        for (source, expected) in [
+            ("Hello, {{   }}.", TemplateParseError::EmptyPlaceholder { start: 7 }),
+            ("Hello, {{ name.", TemplateParseError::UnterminatedPlaceholder { start: 7 }),
+            ("Hello, {{ outer {{ inner }} }}.", TemplateParseError::NestedPlaceholder { start: 7 }),
+            ("Hello, }} world.", TemplateParseError::UnmatchedClosingDelimiter { start: 7 }),
+        ] {
+            assert_eq!(Template::parse(source).unwrap_err(), expected, "{source:?}");
+        }
     }
 
     #[test]

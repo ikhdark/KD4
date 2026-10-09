@@ -2472,113 +2472,53 @@ mod tests {
     }
 
     #[test]
-    fn empty_tool_approval_schema_session_choice_sets_persist_meta() {
-        let (tx, mut rx) = test_sender();
-        let thread_id = ThreadId::default();
-        let request = from_form_request(
-            thread_id,
-            form_request(
-                "Allow this request?",
-                empty_object_schema(),
-                tool_approval_meta(
-                    &[
-                        APPROVAL_PERSIST_SESSION_VALUE,
-                        APPROVAL_PERSIST_ALWAYS_VALUE,
-                    ],
-                    /*tool_params*/ None,
-                    /*tool_params_display*/ None,
+    fn tool_approval_persistent_choices_send_matching_metadata() {
+        for (key, persist) in [
+            ('2', APPROVAL_PERSIST_SESSION_VALUE),
+            ('3', APPROVAL_PERSIST_ALWAYS_VALUE),
+        ] {
+            let (tx, mut rx) = test_sender();
+            let thread_id = ThreadId::default();
+            let request = from_form_request(
+                thread_id,
+                form_request(
+                    "Allow this request?",
+                    empty_object_schema(),
+                    tool_approval_meta(
+                        &[APPROVAL_PERSIST_SESSION_VALUE, APPROVAL_PERSIST_ALWAYS_VALUE],
+                        /*tool_params*/ None,
+                        /*tool_params_display*/ None,
+                    ),
                 ),
-            ),
-        )
-        .expect("expected approval fallback");
-        let mut overlay = McpServerElicitationOverlay::new(
-            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
-            /*disable_paste_burst*/ false,
-        );
-
-        if let Some(answer) = overlay.current_answer_mut() {
-            answer.selection.selected_idx = Some(1);
+            )
+            .expect("expected approval fallback");
+            let mut overlay = McpServerElicitationOverlay::new(
+                request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+                /*disable_paste_burst*/ false,
+            );
+            overlay.handle_key_event(KeyEvent::from(KeyCode::Char(key)));
+            let AppEvent::SubmitThreadOp {
+                thread_id: resolved_thread_id,
+                op,
+            } = rx.try_recv().expect("expected resolution")
+            else {
+                panic!("expected SubmitThreadOp");
+            };
+            assert_eq!(resolved_thread_id, thread_id);
+            assert_eq!(
+                op,
+                Op::ResolveElicitation {
+                    server_name: "server-1".to_string(),
+                    request_id: request_id("request-1"),
+                    decision: McpServerElicitationAction::Accept,
+                    content: None,
+                    meta: Some(serde_json::json!({ APPROVAL_PERSIST_KEY: persist })),
+                }
+            );
+            assert!(overlay.is_complete());
+            assert!(rx.try_recv().is_err());
         }
-        overlay.select_current_option(/*committed*/ true);
-        overlay.submit_answers();
-
-        let event = rx.try_recv().expect("expected resolution");
-        let AppEvent::SubmitThreadOp {
-            thread_id: resolved_thread_id,
-            op,
-        } = event
-        else {
-            panic!("expected SubmitThreadOp");
-        };
-        assert_eq!(resolved_thread_id, thread_id);
-        assert_eq!(
-            op,
-            Op::ResolveElicitation {
-                server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
-                decision: McpServerElicitationAction::Accept,
-                content: None,
-                meta: Some(serde_json::json!({
-                    APPROVAL_PERSIST_KEY: APPROVAL_PERSIST_SESSION_VALUE,
-                })),
-            }
-        );
     }
-
-    #[test]
-    fn empty_tool_approval_schema_always_allow_sets_persist_meta() {
-        let (tx, mut rx) = test_sender();
-        let thread_id = ThreadId::default();
-        let request = from_form_request(
-            thread_id,
-            form_request(
-                "Allow this request?",
-                empty_object_schema(),
-                tool_approval_meta(
-                    &[
-                        APPROVAL_PERSIST_SESSION_VALUE,
-                        APPROVAL_PERSIST_ALWAYS_VALUE,
-                    ],
-                    /*tool_params*/ None,
-                    /*tool_params_display*/ None,
-                ),
-            ),
-        )
-        .expect("expected approval fallback");
-        let mut overlay = McpServerElicitationOverlay::new(
-            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
-            /*disable_paste_burst*/ false,
-        );
-
-        if let Some(answer) = overlay.current_answer_mut() {
-            answer.selection.selected_idx = Some(2);
-        }
-        overlay.select_current_option(/*committed*/ true);
-        overlay.submit_answers();
-
-        let event = rx.try_recv().expect("expected resolution");
-        let AppEvent::SubmitThreadOp {
-            thread_id: resolved_thread_id,
-            op,
-        } = event
-        else {
-            panic!("expected SubmitThreadOp");
-        };
-        assert_eq!(resolved_thread_id, thread_id);
-        assert_eq!(
-            op,
-            Op::ResolveElicitation {
-                server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
-                decision: McpServerElicitationAction::Accept,
-                content: None,
-                meta: Some(serde_json::json!({
-                    APPROVAL_PERSIST_KEY: APPROVAL_PERSIST_ALWAYS_VALUE,
-                })),
-            }
-        );
-    }
-
     #[test]
     fn ctrl_c_cancels_elicitation() {
         let (tx, mut rx) = test_sender();
@@ -2791,76 +2731,54 @@ mod tests {
 
     #[test]
     fn queues_requests_fifo() {
-        let (tx, _rx) = test_sender();
-        let first = from_form_request(
-            ThreadId::default(),
-            form_request(
-                "First",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "confirmed": {
-                            "type": "boolean",
-                            "title": "Confirm",
-                        }
-                    },
-                }),
-                /*meta*/ None,
-            ),
-        )
-        .expect("expected supported form");
-        let second = from_form_request(
-            ThreadId::default(),
-            form_request(
-                "Second",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "confirmed": {
-                            "type": "boolean",
-                            "title": "Confirm",
-                        }
-                    },
-                }),
-                /*meta*/ None,
-            ),
-        )
-        .expect("expected supported form");
-        let third = from_form_request(
-            ThreadId::default(),
-            form_request(
-                "Third",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "confirmed": {
-                            "type": "boolean",
-                            "title": "Confirm",
-                        }
-                    },
-                }),
-                /*meta*/ None,
-            ),
-        )
-        .expect("expected supported form");
+        let (tx, mut rx) = test_sender();
+        let thread_id = ThreadId::default();
+        let make_request = |id: &str| {
+            McpServerElicitationFormRequest::from_app_server_request(
+                thread_id,
+                request_id(id),
+                form_request(
+                    id,
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": { "confirmed": { "type": "boolean", "title": "Confirm" } },
+                    }),
+                    /*meta*/ None,
+                ),
+            )
+            .expect("expected supported form")
+        };
         let mut overlay = McpServerElicitationOverlay::new(
-            first, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
-            /*disable_paste_burst*/ false,
+            make_request("First"), tx, /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false, /*disable_paste_burst*/ false,
         );
-
-        overlay.try_consume_mcp_server_elicitation_request(second);
-        overlay.try_consume_mcp_server_elicitation_request(third);
-        overlay.select_current_option(/*committed*/ true);
-        overlay.submit_answers();
-
-        assert_eq!(overlay.request.message, "Second");
-
-        overlay.select_current_option(/*committed*/ true);
-        overlay.submit_answers();
-
-        assert_eq!(overlay.request.message, "Third");
+        for id in ["Second", "Third"] {
+            assert!(overlay.try_consume_mcp_server_elicitation_request(make_request(id)).is_none());
+        }
+        for id in ["First", "Second", "Third"] {
+            assert!(!overlay.is_complete());
+            assert_eq!(overlay.request.message, id);
+            overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+            let AppEvent::SubmitThreadOp { thread_id: actual_thread, op } =
+                rx.try_recv().expect("FIFO resolution")
+            else {
+                panic!("expected SubmitThreadOp");
+            };
+            assert_eq!(actual_thread, thread_id);
+            assert_eq!(
+                op,
+                Op::ResolveElicitation {
+                    server_name: "server-1".to_string(),
+                    request_id: request_id(id),
+                    decision: McpServerElicitationAction::Accept,
+                    content: Some(serde_json::json!({ "confirmed": true })),
+                    meta: None,
+                }
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(overlay.is_complete());
     }
-
     #[test]
     fn resolved_request_dismisses_overlay_without_emitting_events() {
         let (tx, mut rx) = test_sender();

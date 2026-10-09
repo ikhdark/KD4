@@ -100,64 +100,38 @@ fn render_instruction_template_expands_placeholders_and_escapes_braces() {
         "path": "src/lib.rs",
         "area": "test",
         "file path": "docs/readme.md",
-    });
-    let rendered = render_instruction_template(
-        "Review {path} in {area}. Also see {file path}. Use {{literal}}.",
-        &row,
-    );
-    assert_eq!(
-        rendered,
-        "Review src/lib.rs in test. Also see docs/readme.md. Use {literal}."
-    );
-}
-
-#[test]
-fn render_instruction_template_leaves_unknown_placeholders() {
-    let row = json!({
-        "path": "src/lib.rs",
-    });
-    let rendered = render_instruction_template("Check {path} then {missing}", &row);
-    assert_eq!(rendered, "Check src/lib.rs then {missing}");
-}
-
-#[test]
-fn render_instruction_template_does_not_reinterpret_replacements_or_sentinels() {
-    let row = json!({
         "a": "{b}",
         "b": "secret",
         "marker": "__CODEX_CLOSE_BRACE__",
     });
-    let rendered = render_instruction_template("{a} {b} __CODEX_OPEN_BRACE__ {marker}", &row);
-    assert_eq!(
-        rendered,
-        "{b} secret __CODEX_OPEN_BRACE__ __CODEX_CLOSE_BRACE__"
-    );
+    for (input, expected) in [
+        (
+            "Review {path} in {area}. Also see {file path}. Use {{literal}}.",
+            "Review src/lib.rs in test. Also see docs/readme.md. Use {literal}.",
+        ),
+        ("Check {path} then {missing}", "Check src/lib.rs then {missing}"),
+        (
+            "{a} {b} __CODEX_OPEN_BRACE__ {marker}",
+            "{b} secret __CODEX_OPEN_BRACE__ __CODEX_CLOSE_BRACE__",
+        ),
+    ] {
+        assert_eq!(render_instruction_template(input, &row), expected, "{input}");
+    }
 }
 
 #[test]
 fn ensure_unique_headers_rejects_duplicates() {
-    let headers = vec!["path".to_string(), "path".to_string()];
-    let Err(err) = ensure_unique_headers(headers.as_slice()) else {
-        panic!("expected duplicate header error");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel("csv header path is duplicated".to_string())
-    );
-}
-
-#[test]
-fn ensure_unique_headers_rejects_generated_output_column_collisions() {
-    let headers = vec!["path".to_string(), "result_json".to_string()];
-    let Err(err) = ensure_unique_headers(headers.as_slice()) else {
-        panic!("expected generated output column collision error");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "csv header result_json conflicts with a generated output column".to_string()
-        )
-    );
+    ensure_unique_headers(&["path".to_string(), "description".to_string()]).unwrap();
+    for (second, message) in [
+        ("path", "csv header path is duplicated"),
+        ("result_json", "csv header result_json conflicts with a generated output column"),
+    ] {
+        let headers = vec!["path".to_string(), second.to_string()];
+        assert_eq!(
+            ensure_unique_headers(&headers),
+            Err(FunctionCallError::RespondToModel(message.to_string()))
+        );
+    }
 }
 
 #[tokio::test]

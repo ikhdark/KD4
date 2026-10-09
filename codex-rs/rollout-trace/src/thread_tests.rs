@@ -326,6 +326,75 @@ fn terminal_runtime_payloads_use_terminal_runtime_payload_kind() -> anyhow::Resu
     Ok(())
 }
 
+#[test]
+fn terminal_protocol_replay_preserves_absent_and_nonzero_exit_status() -> anyhow::Result<()> {
+    for exit_code in [None, Some(0), Some(7)] {
+        let temp = TempDir::new()?;
+        let thread_id = ThreadId::new();
+        let trace = ThreadTraceContext::start_root_in_root_for_test(
+            temp.path(),
+            minimal_metadata(thread_id),
+        )?;
+        trace.record_codex_turn_started("turn-1");
+        let dispatch = trace.start_tool_dispatch_trace(|| Some(ToolDispatchInvocation {
+            thread_id: thread_id.to_string(),
+            codex_turn_id: "turn-1".into(),
+            tool_call_id: "terminal".into(),
+            tool_name: "exec_command".into(),
+            tool_namespace: None,
+            requester: crate::ToolDispatchRequester::Model {
+                model_visible_call_id: "call-1".into(),
+            },
+            payload: crate::ToolDispatchPayload::Function {
+                arguments: r#"{"cmd":"test command"}"#.into(),
+            },
+        }));
+        trace.record_tool_call_event("turn-1", &EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            call_id: "terminal".into(),
+            process_id: Some("process-1".into()),
+            turn_id: "turn-1".into(),
+            started_at_ms: 1,
+            command: vec!["test command".into()],
+            cwd: "file:///workspace".parse()?,
+            parsed_cmd: vec![],
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+        }));
+        trace.record_tool_call_event("turn-1", &EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            output_metadata: None,
+            call_id: "terminal".into(),
+            process_id: Some("process-1".into()),
+            turn_id: "turn-1".into(),
+            completed_at_ms: 2,
+            command: vec!["test command".into()],
+            cwd: "file:///workspace".parse()?,
+            parsed_cmd: vec![],
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            stdout: "captured stdout".into(),
+            stderr: "captured stderr".into(),
+            aggregated_output: "captured stdoutcaptured stderr".into(),
+            exit_code,
+            duration: Duration::from_millis(1),
+            formatted_output: "display".into(),
+            status: ExecCommandStatus::Completed,
+        }));
+        dispatch.record_completed(ExecutionStatus::Completed, crate::ToolDispatchResult::CodeModeResponse {
+            value: serde_json::json!({"output":"display"}),
+        });
+        let replayed = replay_bundle(single_bundle_dir(temp.path())?)?;
+        let operation = replayed.terminal_operations.values().next().expect("terminal operation");
+        let result = operation.result.as_ref().expect("runtime result");
+        assert_eq!(result.exit_code, exit_code);
+        assert_eq!(result.stdout, "captured stdout");
+        assert_eq!(result.stderr, "captured stderr");
+        assert_eq!(operation.execution.status, ExecutionStatus::Completed);
+        // An operation returning without an exit code is not evidence of process exit.
+        assert_eq!(replayed.terminal_sessions["process-1"].execution.status, ExecutionStatus::Running);
+    }
+    Ok(())
+}
+
 fn minimal_metadata(thread_id: ThreadId) -> ThreadStartedTraceMetadata {
     ThreadStartedTraceMetadata {
         thread_id: thread_id.to_string(),

@@ -1426,6 +1426,21 @@ mod tests {
             vec!["codex-logs.log"]
         );
         assert_eq!(attachments_without_diagnostics[0].buffer, vec![1]);
+        let (without_logs, omitted) = snapshot_with_diagnostics.feedback_attachments(
+            /*include_logs*/ false,
+            &[],
+            std::slice::from_ref(&extra_attachment_path),
+            Some(vec![1]),
+        );
+        assert!(omitted.is_empty());
+        assert_eq!(
+            without_logs
+                .iter()
+                .map(|attachment| attachment.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec![extra_filename.as_str()]
+        );
+        assert_eq!(without_logs[0].buffer, b"rollout");
         fs::remove_file(extra_path).expect("extra attachment should be removed");
     }
 

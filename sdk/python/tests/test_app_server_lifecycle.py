@@ -136,12 +136,19 @@ def test_read_include_turns_returns_persisted_history(tmp_path) -> None:
             thread.run("second question")
             read = thread.read(include_turns=True)
 
-    assert _thread_message_summary(read) == [
+        # A live read can reconstruct history from memory. Reopen the same
+        # saved thread through a new app-server process to prove durability.
+        with Codex(config=harness.app_server_config()) as reopened:
+            persisted_read = reopened.thread_resume(thread.id).read(include_turns=True)
+
+    expected = [
         ("user", "first question"),
         ("agent", "first answer"),
         ("user", "second question"),
         ("agent", "second answer"),
     ]
+    assert _thread_message_summary(read) == expected
+    assert _thread_message_summary(persisted_read) == expected
 
 
 def test_async_lifecycle_methods_round_trip(tmp_path) -> None:
@@ -193,13 +200,19 @@ def test_thread_fork_returns_distinct_thread(tmp_path) -> None:
             thread = codex.thread_start()
             seeded = thread.run("materialize this thread before fork")
             forked = codex.thread_fork(thread.id)
+            forked_history = forked.read(include_turns=True)
 
     assert {
         "seeded_response": seeded.final_response,
         "forked_is_distinct": forked.id != thread.id,
+        "forked_history": _thread_message_summary(forked_history),
     } == {
         "seeded_response": "materialized",
         "forked_is_distinct": True,
+        "forked_history": [
+            ("user", "materialize this thread before fork"),
+            ("agent", "materialized"),
+        ],
     }
 
 
@@ -228,12 +241,23 @@ def test_archive_unarchive_round_trip_uses_materialized_rollout(tmp_path) -> Non
     }
 
 
-def test_models_rpc(tmp_path) -> None:
+def test_models_rpc(tmp_path, monkeypatch) -> None:
     """Model listing should go through the pinned app-server method."""
+    requests = []
     with AppServerHarness(tmp_path) as harness:
         with Codex(config=harness.app_server_config()) as codex:
+            write_message = codex._client._write_message
+
+            def capture_request(payload, **options):
+                requests.append(payload)
+                return write_message(payload, **options)
+
+            monkeypatch.setattr(codex._client, "_write_message", capture_request)
             models = codex.models(include_hidden=True)
 
+    assert [(request["method"], request.get("params")) for request in requests] == [
+        ("model/list", {"includeHidden": True}),
+    ]
     assert {
         "models_payload_has_data": isinstance(
             models.model_dump(by_alias=True, mode="json").get("data"),

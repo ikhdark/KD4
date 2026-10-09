@@ -62,7 +62,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 #[tokio::test]
 async fn plugin_read_rejects_invalid_requests_before_side_effects() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_plugins_enabled_config_with_base_url(codex_home.path(), "https://example.invalid/backend-api/")?;
+    let server = MockServer::start().await;
+    write_plugins_enabled_config_with_base_url(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+    )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -123,6 +127,7 @@ async fn plugin_read_rejects_invalid_requests_before_side_effects() -> Result<()
             );
         }
     }
+    assert!(server.received_requests().await.unwrap().is_empty());
     Ok(())
 }
 
@@ -283,6 +288,7 @@ apps = true
         Some("plugins~Plugin_00000000000000000000000000000000")
     );
     assert_eq!(response.plugin.summary.name, "example-plugin");
+    assert!(!response.plugin.summary.installed);
     assert_eq!(response.plugin.summary.source, PluginSource::Remote);
     assert_eq!(response.plugin.summary.share_context, None);
     assert_eq!(
@@ -1963,62 +1969,7 @@ async fn plugin_read_describes_uninstalled_git_source_without_cloning() -> Resul
 }
 
 #[tokio::test]
-async fn plugin_read_returns_invalid_request_when_plugin_is_missing() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let repo_root = TempDir::new()?;
-    std::fs::create_dir_all(repo_root.path().join(".git"))?;
-    std::fs::create_dir_all(repo_root.path().join(".agents/plugins"))?;
-    std::fs::write(
-        repo_root.path().join(".agents/plugins/marketplace.json"),
-        r#"{
-  "name": "codex-curated",
-  "plugins": [
-    {
-      "name": "demo-plugin",
-      "source": {
-        "source": "local",
-        "path": "./plugins/demo-plugin"
-      }
-    }
-  ]
-}"#,
-    )?;
-    write_plugins_enabled_config(&codex_home)?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_plugin_read_request(PluginReadParams {
-            marketplace_path: Some(AbsolutePathBuf::try_from(
-                repo_root.path().join(".agents/plugins/marketplace.json"),
-            )?),
-            remote_marketplace_name: None,
-            plugin_name: "missing-plugin".to_string(),
-        })
-        .await?;
-
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(err.error.code, -32600);
-    assert!(
-        err.error
-            .message
-            .contains("plugin `missing-plugin` was not found")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn plugin_read_returns_invalid_request_when_plugin_manifest_is_missing() -> Result<()> {
+async fn plugin_read_rejects_missing_plugin_and_manifest() -> Result<()> {
     let codex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
     let plugin_root = repo_root.path().join("plugins/demo-plugin");
@@ -2049,24 +2000,33 @@ async fn plugin_read_returns_invalid_request_when_plugin_manifest_is_missing() -
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_plugin_read_request(PluginReadParams {
-            marketplace_path: Some(AbsolutePathBuf::try_from(
-                repo_root.path().join(".agents/plugins/marketplace.json"),
-            )?),
-            remote_marketplace_name: None,
-            plugin_name: "demo-plugin".to_string(),
-        })
-        .await?;
+    for (plugin_name, expected_message) in [
+        ("missing-plugin", "plugin `missing-plugin` was not found"),
+        ("demo-plugin", "missing or invalid plugin.json"),
+    ] {
+        let request_id = mcp
+            .send_plugin_read_request(PluginReadParams {
+                marketplace_path: Some(AbsolutePathBuf::try_from(
+                    repo_root.path().join(".agents/plugins/marketplace.json"),
+                )?),
+                remote_marketplace_name: None,
+                plugin_name: plugin_name.to_string(),
+            })
+            .await?;
 
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+        let err = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
 
-    assert_eq!(err.error.code, -32600);
-    assert!(err.error.message.contains("missing or invalid plugin.json"));
+        assert_eq!(err.error.code, -32600);
+        assert!(
+            err.error.message.contains(expected_message),
+            "{plugin_name}: {}",
+            err.error.message
+        );
+    }
     Ok(())
 }
 

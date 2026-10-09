@@ -83,6 +83,8 @@ fn validation_signals_require_executing_or_checking_modes() {
         ("cargo test", true, true, "execution"),
         ("cargo bench --no-run", false, false, "compilation_only"),
         ("cargo test -- --list", false, false, "listing"),
+        ("cargo test -- --help", false, false, "listing"),
+        ("cargo test -- -h", false, false, "listing"),
         ("cargo fuzz list", false, false, "listing"),
         ("cargo fuzz run target", true, false, "execution"),
         ("cargo fmt", false, false, "mutation"),
@@ -477,6 +479,14 @@ mod tests {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Some(Vec::new())
                 }));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                while !cache.entries.lock().unwrap()
+                    .get(&(std::path::PathBuf::from("slow"), "oid".to_string()))
+                    .is_some_and(|slot| std::sync::Arc::strong_count(slot) >= 3)
+                {
+                    assert!(std::time::Instant::now() < deadline, "second caller must join the in-flight cache slot");
+                    std::thread::yield_now();
+                }
                 let start = std::time::Instant::now();
                 cache.get_or_load(std::path::Path::new("other"), "oid", || Some(Vec::new()));
                 let elapsed = start.elapsed();
@@ -750,7 +760,8 @@ mod tests {
                             ref leaves,
                             exit_code_is_authoritative: false,
                             ..
-                        } if leaves.iter().all(|leaf| leaf.operation == ValidationOperation::Test)
+                        } if !leaves.is_empty()
+                            && leaves.iter().all(|leaf| leaf.operation == ValidationOperation::Test)
                     ),
                     "{script}"
                 );
@@ -929,7 +940,6 @@ mod tests {
             argv("dotnet", &["run", "test"]),
             argv("go", &["run", "test"]),
             argv("npm", &["install", "test"]),
-            argv("python", &["script.py", "-m", "pytest"]),
             argv("gradle", &["-p", "test", "build"]),
             argv("mvn", &["-f", "test", "package"]),
             argv("make", &["-f", "test", "all"]),

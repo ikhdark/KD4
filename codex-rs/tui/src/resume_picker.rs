@@ -3611,11 +3611,23 @@ mod tests {
         state.filtered_rows.push(row);
         let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
         state.handle_key(key).await.unwrap();
+        assert_eq!(*requests.lock().unwrap(), vec![id]);
         state
-            .transcript_previews
-            .insert(id, TranscriptPreviewState::Failed);
+            .handle_background_event(BackgroundEvent::Preview {
+                thread_id: id,
+                preview: Err(std::io::Error::other("preview unavailable")),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.transcript_previews.get(&id),
+            Some(TranscriptPreviewState::Failed)
+        ));
         state.handle_key(key).await.unwrap();
+        assert_eq!(state.expanded_thread_id, None);
+        assert_eq!(*requests.lock().unwrap(), vec![id]);
         state.handle_key(key).await.unwrap();
+        assert_eq!(state.expanded_thread_id, Some(id));
         assert_eq!(*requests.lock().unwrap(), vec![id, id]);
         assert!(matches!(
             state.transcript_previews.get(&id),
@@ -3716,33 +3728,29 @@ mod tests {
     }
 
     #[test]
-    fn relative_time_formats_zero_seconds_as_now() {
+    fn relative_time_formats_boundaries_and_pluralization() {
         let reference = DateTime::parse_from_rfc3339("2026-05-02T12:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&Utc);
 
-        assert_eq!(format_relative_time(reference, Some(reference)), "now");
-        assert_eq!(
-            format_relative_time(reference, Some(reference - Duration::seconds(1))),
-            "1s ago"
-        );
-    }
-
-    #[test]
-    fn long_relative_time_uses_words() {
-        let reference = DateTime::parse_from_rfc3339("2026-05-02T12:00:00Z")
-            .expect("valid timestamp")
-            .with_timezone(&Utc);
-
-        assert_eq!(format_relative_time_long(reference, reference), "now");
-        assert_eq!(
-            format_relative_time_long(reference, reference - Duration::minutes(20)),
-            "20 minutes ago"
-        );
-        assert_eq!(
-            format_relative_time_long(reference, reference - Duration::hours(1)),
-            "1 hour ago"
-        );
+        assert_eq!(format_relative_time(reference, None), "-");
+        for (seconds, short, long) in [
+            (-1, "now", "now"),
+            (0, "now", "now"),
+            (1, "1s ago", "1 second ago"),
+            (59, "59s ago", "59 seconds ago"),
+            (60, "1m ago", "1 minute ago"),
+            (1_200, "20m ago", "20 minutes ago"),
+            (3_599, "59m ago", "59 minutes ago"),
+            (3_600, "1h ago", "1 hour ago"),
+            (86_399, "23h ago", "23 hours ago"),
+            (86_400, "1d ago", "1 day ago"),
+            (172_800, "2d ago", "2 days ago"),
+        ] {
+            let timestamp = reference - Duration::seconds(seconds);
+            assert_eq!(format_relative_time(reference, Some(timestamp)), short);
+            assert_eq!(format_relative_time_long(reference, timestamp), long);
+        }
     }
 
     #[test]
@@ -4455,24 +4463,28 @@ mod tests {
 
     #[tokio::test]
     async fn ctrl_o_toggles_density_without_typing_into_search() {
-        let loader = page_only_loader(|_| {});
-        let mut state = PickerState::new(
-            FrameRequester::test_dummy(),
-            loader,
-            ProviderFilter::MatchDefault(String::from("openai")),
-            /*show_all*/ true,
-            /*filter_cwd*/ None,
-            SessionPickerAction::Resume,
-        );
-        state.query = String::from("pick");
+        for key in [
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('\u{000f}'), KeyModifiers::NONE),
+        ] {
+            let loader = page_only_loader(|_| {});
+            let mut state = PickerState::new(
+                FrameRequester::test_dummy(),
+                loader,
+                ProviderFilter::MatchDefault(String::from("openai")),
+                /*show_all*/ true,
+                /*filter_cwd*/ None,
+                SessionPickerAction::Resume,
+            );
+            state.query = String::from("pick");
 
-        state
-            .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
-            .await
-            .unwrap();
-
-        assert_eq!(state.density, SessionListDensity::Dense);
-        assert_eq!(state.query, "pick");
+            for expected in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
+                assert!(state.handle_key(key).await.unwrap().is_none());
+                assert_eq!(state.density, expected);
+                assert_eq!(state.query, "pick");
+                assert!(state.inline_error.is_none());
+            }
+        }
     }
 
     #[tokio::test]
@@ -4513,6 +4525,49 @@ mod tests {
         assert_eq!(state.density, SessionListDensity::Comfortable);
         assert_eq!(*recorded_requests.lock().unwrap(), vec![thread_id]);
         assert_eq!(state.pending_transcript_open, Some(thread_id));
+        assert!(matches!(
+            state.transcript_cells.get(&thread_id),
+            Some(SessionTranscriptState::Loading)
+        ));
+
+        // An unrelated failed request must not dismiss the selected loading session.
+        let other_thread_id = ThreadId::new();
+        state
+            .handle_background_event(BackgroundEvent::Transcript {
+                thread_id: other_thread_id,
+                transcript: Err(std::io::Error::other("other transcript unavailable")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.pending_transcript_open, Some(thread_id));
+        assert!(state.inline_error.is_none());
+
+        state
+            .handle_background_event(BackgroundEvent::Transcript {
+                thread_id,
+                transcript: Err(std::io::Error::other("transcript unavailable")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.pending_transcript_open, None);
+        assert!(!state.transcript_loading_frame_shown);
+        assert!(state.overlay.is_none());
+        assert_eq!(
+            state.inline_error.as_deref(),
+            Some("Could not load transcript preview")
+        );
+        assert!(matches!(
+            state.transcript_cells.get(&thread_id),
+            Some(SessionTranscriptState::Failed)
+        ));
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(*recorded_requests.lock().unwrap(), vec![thread_id, thread_id]);
+        assert_eq!(state.pending_transcript_open, Some(thread_id));
+        assert!(state.inline_error.is_none());
         assert!(matches!(
             state.transcript_cells.get(&thread_id),
             Some(SessionTranscriptState::Loading)
@@ -4573,6 +4628,10 @@ mod tests {
 
         assert!(selection.is_none());
         assert_eq!(state.query, "");
+
+        state.handle_paste(String::from("must not enter the search"));
+        assert_eq!(state.query, "");
+        assert_eq!(state.pending_transcript_open, Some(thread_id));
     }
 
     #[tokio::test]
@@ -4885,28 +4944,6 @@ session_picker_view = "dense"
             "expected persistence error, got {:?}",
             state.inline_error
         );
-    }
-
-    #[tokio::test]
-    async fn raw_ctrl_o_toggles_density_without_typing_into_search() {
-        let loader = page_only_loader(|_| {});
-        let mut state = PickerState::new(
-            FrameRequester::test_dummy(),
-            loader,
-            ProviderFilter::MatchDefault(String::from("openai")),
-            /*show_all*/ true,
-            /*filter_cwd*/ None,
-            SessionPickerAction::Resume,
-        );
-        state.query = String::from("pick");
-
-        state
-            .handle_key(KeyEvent::new(KeyCode::Char('\u{000f}'), KeyModifiers::NONE))
-            .await
-            .unwrap();
-
-        assert_eq!(state.density, SessionListDensity::Dense);
-        assert_eq!(state.query, "pick");
     }
 
     #[tokio::test]
@@ -6101,6 +6138,8 @@ session_picker_view = "dense"
 
     #[tokio::test]
     async fn enter_on_row_without_resolvable_thread_id_shows_inline_error() {
+        let tmp = tempdir().expect("tmpdir");
+        let missing_path = tmp.path().join("missing.jsonl");
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
             FrameRequester::test_dummy(),
@@ -6113,7 +6152,7 @@ session_picker_view = "dense"
 
         let row = Row {
             search_fields: Default::default(),
-            path: Some(PathBuf::from("/tmp/missing.jsonl")),
+            path: Some(missing_path.clone()),
             preview: String::from("missing metadata"),
             thread_id: None,
             thread_name: None,
@@ -6133,8 +6172,9 @@ session_picker_view = "dense"
         assert!(selection.is_none());
         assert_eq!(
             state.inline_error,
-            Some(String::from(
-                "Failed to read session metadata from /tmp/missing.jsonl"
+            Some(format!(
+                "Failed to read session metadata from {}",
+                missing_path.display()
             ))
         );
     }
@@ -6694,7 +6734,7 @@ session_picker_view = "dense"
                 search_token: active_request.search_token,
                 page: Ok(page(
                     Vec::new(),
-                    /*next_cursor*/ None,
+                    Some("cursor-beyond-scan-cap"),
                     /*num_scanned_files*/ 3,
                     /*reached_scan_cap*/ true,
                 )),
@@ -6705,6 +6745,16 @@ session_picker_view = "dense"
         assert!(state.filtered_rows.is_empty());
         assert!(!state.search_state.is_active());
         assert!(state.pagination.reached_scan_cap);
+        assert!(state.pagination.next_cursor.is_some());
+        assert_eq!(state.pagination.num_scanned_files, 16);
+        assert_eq!(recorded_requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            render_empty_state_line(&state).to_string(),
+            "Search scanned first 16 sessions; more may exist"
+        );
+        state.set_query("still missing".to_string());
+        assert!(!state.search_state.is_active());
+        assert_eq!(recorded_requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

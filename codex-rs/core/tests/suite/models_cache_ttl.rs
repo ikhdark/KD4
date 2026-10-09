@@ -41,7 +41,6 @@ const ETAG: &str = "\"models-etag-ttl\"";
 const CACHE_FILE: &str = "models_cache.json";
 const REMOTE_MODEL: &str = "codex-test-ttl";
 const VERSIONED_MODEL: &str = "codex-test-versioned";
-const MISSING_VERSION_MODEL: &str = "codex-test-missing-version";
 const DIFFERENT_VERSION_MODEL: &str = "codex-test-different-version";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -245,59 +244,10 @@ async fn uses_cache_when_version_matches() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case(None; "missing")]
+#[test_case::test_case(Some(format!("{}-diff", client_version_to_whole())); "different")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refreshes_when_cache_version_missing() -> Result<()> {
-    let server = MockServer::start().await;
-    let cached_model = test_remote_model(MISSING_VERSION_MODEL, /*priority*/ 1);
-    let models_mock = responses::mount_models_once(
-        &server,
-        ModelsResponse {
-            models: vec![test_remote_model("remote-missing", /*priority*/ 2)],
-        },
-    )
-    .await;
-
-    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    builder = builder
-        .with_pre_build_hook(move |home| {
-            let cache = ModelsCache {
-                fetched_at: Utc::now(),
-                etag: None,
-                client_version: None,
-                provider_cache_identity: None,
-                models: vec![cached_model],
-            };
-            let cache_path = home.join(CACHE_FILE);
-            write_cache_sync(&cache_path, &cache).expect("write cache");
-        })
-        .with_config(|config| {
-            config.model_provider.request_max_retries = Some(0);
-        });
-
-    let test = builder.build(&server).await?;
-    let models_manager = test.thread_manager.get_models_manager();
-    let models = models_manager
-        .list_models(
-            RefreshStrategy::OnlineIfUncached,
-            codex_core::test_support::default_http_client_factory(),
-        )
-        .await?;
-
-    assert!(
-        models.iter().any(|preset| preset.model == "remote-missing"),
-        "expected refreshed models"
-    );
-    assert_eq!(
-        models_mock.requests().len(),
-        1,
-        "/models should be called when cache version is missing"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refreshes_when_cache_version_differs() -> Result<()> {
+async fn refreshes_when_cache_version_invalid(cache_version: Option<String>) -> Result<()> {
     let server = MockServer::start().await;
     let cached_model = test_remote_model(DIFFERENT_VERSION_MODEL, /*priority*/ 1);
     let refreshed_model = test_remote_model("remote-different", /*priority*/ 2);
@@ -342,7 +292,7 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
         .provider_cache_identity
         .clone()
         .expect("real manager should persist a provider cache identity");
-    stale_cache.client_version = Some(format!("{}-diff", client_version_to_whole()));
+    stale_cache.client_version = cache_version;
     stale_cache.models = vec![cached_model];
     write_cache(&cache_path, &stale_cache).await?;
 
@@ -381,7 +331,7 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
     assert_eq!(
         models_mock.requests().len(),
         1,
-        "/models should be called exactly once when cache version differs"
+        "/models should be called exactly once when cache version is missing or differs"
     );
 
     let cache = read_cache(&cache_path).await?;
@@ -454,12 +404,6 @@ async fn read_cache(path: &Path) -> Result<ModelsCache> {
 async fn write_cache(path: &Path, cache: &ModelsCache) -> Result<()> {
     let contents = serde_json::to_vec_pretty(cache)?;
     tokio::fs::write(path, contents).await?;
-    Ok(())
-}
-
-fn write_cache_sync(path: &Path, cache: &ModelsCache) -> Result<()> {
-    let contents = serde_json::to_vec_pretty(cache)?;
-    std::fs::write(path, contents)?;
     Ok(())
 }
 

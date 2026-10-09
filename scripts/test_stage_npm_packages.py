@@ -614,6 +614,12 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         staged_target = staging_dir / "vendor" / "x86_64-pc-windows-msvc"
         self.assertEqual(relative_files(staged_target), relative_files(selected_target))
+        for relative in relative_files(selected_target):
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    (staged_target / relative).read_bytes(),
+                    (selected_target / relative).read_bytes(),
+                )
         self.assertIn("bin/codex.exe", relative_files(staged_target))
         self.assertFalse((staging_dir / "vendor" / "aarch64-pc-windows-msvc").exists())
 
@@ -856,7 +862,12 @@ class StageNpmPackagesTests(unittest.TestCase):
         ) as check_output:
             self.assertEqual(stage.resolve_github_repo(None), "local/fork")
 
-        self.assertIn("repo", check_output.call_args.args[0])
+        check_output.assert_called_once_with(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+            cwd=stage.REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
 
     def test_resolve_github_repo_falls_back_to_kd4_when_gh_unavailable(
         self,
@@ -1061,7 +1072,7 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_build_stage_command_uses_target_specific_vendor_src(self) -> None:
         key = (("codex-package",), ("x86_64-pc-windows-msvc",))
         vendor_src = self.root / "vendor-src"
-        _pack_output, command = stage.build_stage_command(
+        pack_output, command = stage.build_stage_command(
             "codex-win32-x64",
             "1.2.3",
             self.root / "dist",
@@ -1069,8 +1080,15 @@ class StageNpmPackagesTests(unittest.TestCase):
             {key: vendor_src},
         )
 
-        self.assertIn("--vendor-src", command)
-        self.assertEqual(command[command.index("--vendor-src") + 1], str(vendor_src))
+        self.assertEqual(
+            pack_output, self.root / "dist" / "codex-npm-win32-x64-1.2.3.tgz"
+        )
+        self.assertEqual(command, [
+            sys.executable, str(stage.BUILD_SCRIPT),
+            "--package", "codex-win32-x64", "--release-version", "1.2.3",
+            "--staging-dir", str(self.root / "staging"),
+            "--pack-output", str(pack_output), "--vendor-src", str(vendor_src),
+        ])
 
     def test_download_artifacts_uses_complete_markers(self) -> None:
         archives_by_id: dict[int, bytes] = {}
@@ -1112,8 +1130,10 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         self.assertCountEqual(calls, ["windows-x64", "windows-arm64"])
         for artifact in artifacts:
-            self.assertTrue(
-                (self.root / "artifacts" / artifact.name / ".complete").is_file()
+            artifact_dir = self.root / "artifacts" / artifact.name
+            self.assertTrue(stage.artifact_is_complete(artifact_dir, artifact))
+            self.assertEqual(
+                (artifact_dir / f"{artifact.name}.txt").read_text(), artifact.name
             )
 
     def test_digest_mismatch_preserves_existing_artifact_cache(self) -> None:
@@ -1229,8 +1249,8 @@ class StageNpmPackagesTests(unittest.TestCase):
                 output.mkdir()
                 results = []
                 for name in ("one.tgz", "two.tgz"):
-                    (staging / name).write_bytes(b"new")
-                    (output / name).write_bytes(b"old")
+                    (staging / name).write_bytes(f"new:{name}".encode())
+                    (output / name).write_bytes(f"old:{name}".encode())
                     results.append(stage.StagePackageResult(name, staging / name, ""))
                 real_replace = Path.replace
 
@@ -1262,7 +1282,7 @@ class StageNpmPackagesTests(unittest.TestCase):
                         if p.name != ".npm-activation.lock"
                     },
                     {
-                        name: b"old" if fail_second else b"new"
+                        name: f"{'old' if fail_second else 'new'}:{name}".encode()
                         for name in ("one.tgz", "two.tgz")
                     },
                 )
@@ -1285,6 +1305,12 @@ class StageNpmPackagesTests(unittest.TestCase):
                 self.assertIn("END", log)
                 self.assertIn("truncated", log)
                 self.assertLess(len(log), stage.MAX_CAPTURED_LOG_CHARS + 1000)
+                retained = Path(log.rsplit("\nFull log: ", 1)[1])
+                self.addCleanup(retained.unlink, missing_ok=True)
+                self.assertEqual(
+                    retained.read_text(encoding="utf-8"),
+                    "BEGIN" + "x" * 100000 + "END\n",
+                )
 
     def test_codex_package_archive_extraction_is_reused(self) -> None:
         target = "x86_64-pc-windows-msvc"
@@ -1318,8 +1344,10 @@ class StageNpmPackagesTests(unittest.TestCase):
             )
 
         self.assertEqual(opened_archives.count(archive_path), 1)
-        self.assertTrue((self.root / "vendor-one" / target / "payload.txt").is_file())
-        self.assertTrue((self.root / "vendor-two" / target / "payload.txt").is_file())
+        for vendor in ("vendor-one", "vendor-two"):
+            self.assertEqual(
+                (self.root / vendor / target / "payload.txt").read_text(), "payload"
+            )
         self.assertFalse((self.root / "vendor-one" / target / ".complete").exists())
 
     def test_existing_vendor_tree_survives_failed_archive_install(self) -> None:
@@ -1424,6 +1452,18 @@ class StageNpmPackagesTests(unittest.TestCase):
             "payload",
         )
 
+        # The public fallback must invoke validation, not merely expose a
+        # validator that is correct when called directly.
+        with tarfile.open(archive_path, "w:gz") as archive:
+            member = tarfile.TarInfo("../escape.txt")
+            member.size = len(b"unsafe")
+            archive.addfile(member, io.BytesIO(b"unsafe"))
+        with mock.patch.object(tarfile.TarFile, "extractall", legacy_extractall):
+            with self.assertRaisesRegex(RuntimeError, "unsafe archive member path"):
+                stage.extract_tar_data(archive_path, self.root / "dest")
+        self.assertFalse((self.root / "escape.txt").exists())
+        self.assertEqual((self.root / "dest" / "payload.txt").read_bytes(), b"payload")
+
     def test_cached_tree_materialization_skips_marker(self) -> None:
         cached_dir = self.root / "cached"
         nested_dir = cached_dir / "nested"
@@ -1434,7 +1474,12 @@ class StageNpmPackagesTests(unittest.TestCase):
         dest_dir = self.root / "dest"
         stage.materialize_cached_tree(cached_dir, dest_dir, "copy")
 
-        self.assertTrue((dest_dir / "nested" / "payload.txt").is_file())
+        staged = dest_dir / "nested" / "payload.txt"
+        self.assertEqual(staged.read_text(encoding="utf-8"), "payload")
+        staged.write_text("changed", encoding="utf-8")
+        self.assertEqual(
+            (nested_dir / "payload.txt").read_text(encoding="utf-8"), "payload"
+        )
         self.assertFalse((dest_dir / ".complete").exists())
 
     def test_bounded_log_preserves_edges(self) -> None:
@@ -1446,8 +1491,21 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertIn("[truncated 14 chars]", result)
         self.assertTrue(result.endswith("bbbbb"))
 
+    def test_zero_bounded_log_budget_exposes_no_payload(self) -> None:
+        # A zero display budget must expose no payload; Python's [-0:] would
+        # instead return every character while claiming they were omitted.
+        self.assertEqual(
+            stage.bounded_log("private payload", max_chars=0),
+            "\n...[truncated 15 chars]...\n",
+        )
+
     def test_format_bytes_returns_rendered_size(self) -> None:
-        self.assertEqual(stage.format_bytes(1024), "1.0 KiB")
+        for size, expected in (
+            (0, "0.0 B"), (1023, "1023.0 B"), (1024, "1.0 KiB"),
+            (1536, "1.5 KiB"), (1024**2, "1.0 MiB"), (1024**3, "1.0 GiB"),
+        ):
+            with self.subTest(size=size):
+                self.assertEqual(stage.format_bytes(size), expected)
 
     def test_extract_zstd_archive_decompresses_in_destination_directory(self) -> None:
         archive_path = self.root / "cache" / "artifact.zst"
@@ -1483,7 +1541,7 @@ class StageNpmPackagesTests(unittest.TestCase):
 
     def test_failed_binary_extract_preserves_existing_vendor_binary(self) -> None:
         target = "x86_64-pc-windows-msvc"
-        component = stage.BinaryComponent("codex", "codex", "codex.exe")
+        component = stage.BinaryComponent("codex", "codex", "codex")
         dest = self.root / "vendor" / target / "codex" / "codex.exe"
         dest.parent.mkdir(parents=True)
         dest.write_bytes(b"existing")
@@ -1496,16 +1554,20 @@ class StageNpmPackagesTests(unittest.TestCase):
         artifact.parent.mkdir(parents=True)
         artifact.write_bytes(b"invalid archive")
 
+        def fail_decompression(cmd, **kwargs):
+            self.assertEqual(cmd[:4], ["zstd", "-f", "-d", str(artifact)])
+            self.assertTrue(kwargs["check"])
+            temporary = Path(cmd[cmd.index("-o") + 1])
+            self.assertEqual(temporary.parent, dest.parent)
+            self.assertNotEqual(temporary, dest)
+            temporary.write_bytes(b"partial decompression")
+            raise subprocess.CalledProcessError(1, cmd)
+
         with (
             mock.patch.object(
-                stage,
-                "binary_archive_path",
-                return_value=self.root / "artifact.zst",
-            ),
-            mock.patch.object(
-                stage, "extract_zstd_archive", side_effect=RuntimeError("bad archive")
-            ),
-            self.assertRaisesRegex(RuntimeError, "bad archive"),
+                archives, "run_owned", side_effect=fail_decompression
+            ) as decompress,
+            self.assertRaises(subprocess.CalledProcessError),
         ):
             stage.install_single_binary(
                 self.root / "artifacts",
@@ -1514,7 +1576,9 @@ class StageNpmPackagesTests(unittest.TestCase):
                 component,
             )
 
+        decompress.assert_called_once()
         self.assertEqual(dest.read_bytes(), b"existing")
+        self.assertEqual(list(dest.parent.iterdir()), [dest])
 
     def test_install_single_binary_rejects_non_windows_target(self) -> None:
         component = stage.BinaryComponent("codex", "codex", "codex.exe")

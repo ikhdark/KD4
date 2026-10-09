@@ -36,6 +36,7 @@ struct ProjectRootMarkersCacheEntry {
 struct AgentsMdCache {
     key: Option<AgentsMdCacheKey>,
     loaded: Option<Arc<LoadedAgentsMd>>,
+    retained_sources: Vec<crate::agents_md::RetainedProjectDoc>,
     stable_context: Option<RepositoryStableContextBundle>,
 }
 
@@ -282,14 +283,16 @@ impl AgentsMdManager {
         // so every sampling-step refresh must read the discovered instruction files again.
         let previous = {
             let cache = self.cache.lock().await;
-            (cache.key.as_ref() == Some(&key)).then(|| cache.loaded.clone()).flatten()
+            (cache.key.as_ref() == Some(&key))
+                .then(|| cache.loaded.clone().map(|loaded| (loaded, cache.retained_sources.clone())))
+                .flatten()
         };
         let load = load_project_instructions_with_fallback(
             config.as_ref(),
             self.user_instructions.clone(),
             discovery,
             self.omission_recovery.as_ref(),
-            previous.as_deref(),
+            previous.as_ref().map(|(loaded, sources)| (loaded.as_ref(), sources.as_slice())),
         )
         .await;
         let mut cache = self.cache.lock().await;
@@ -301,6 +304,7 @@ impl AgentsMdManager {
             AgentsMdFreshness::IncompleteRead
         };
         let loaded = load.loaded;
+        cache.retained_sources = load.retained_sources;
         let semantically_unchanged = cache.key.as_ref() == Some(&key)
             && match (cache.loaded.as_ref(), loaded.as_ref()) {
                 (Some(current), Some(candidate)) => current.as_ref() == candidate,

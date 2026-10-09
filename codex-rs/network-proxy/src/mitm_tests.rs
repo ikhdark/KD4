@@ -374,6 +374,7 @@ async fn mitm_policy_blocks_hook_miss_for_hooked_host_and_records_telemetry_in_f
 
 #[test]
 fn apply_mitm_hook_actions_replaces_authorization_header() {
+    let secret_file = NamedTempFile::new().unwrap();
     let mut headers = HeaderMap::new();
     headers.append(
         HeaderName::from_static("authorization"),
@@ -390,7 +391,7 @@ fn apply_mitm_hook_actions_replaces_authorization_header() {
             name: HeaderName::from_static("authorization"),
             value: HeaderValue::from_static("Bearer secret-token"),
             source: crate::mitm_hook::SecretSource::File(
-                AbsolutePathBuf::try_from("/tmp/github-token").unwrap(),
+                AbsolutePathBuf::try_from(secret_file.path()).unwrap(),
             ),
         }],
     };

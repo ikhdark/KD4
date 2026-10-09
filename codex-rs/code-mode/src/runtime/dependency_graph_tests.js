@@ -131,6 +131,19 @@ const node = (id, run = () => id, extra = {}) => ({ id, run, accept: () => true,
     "failure aggregation not deterministic");
 }
 
+// Acceptance requires literal true, not merely a truthy transport result.
+for (const acceptance of [1, "true", {}]) {
+  let consumed = false;
+  const receipt = { exit_code: 7 };
+  const results = await run_graph([
+    node("producer", () => receipt, { accept: () => acceptance }),
+    node("consumer", () => { consumed = true; }, { deps: ["producer"] }),
+  ]).then(() => { throw Error("non-boolean acceptance passed"); }, error => error.results);
+  check(!consumed && results.producer.status === "rejected" &&
+    results.producer.value === receipt && results.consumer.status === "skipped",
+    "truthy acceptance bypassed the postcondition or lost evidence");
+}
+
 // Rejected asynchronous acceptance must retain the exact returned object, not
 // just its error. Recover from this receipt without redispatch or lost handles.
 {

@@ -126,42 +126,31 @@ async fn apply_explorer_role_sets_read_only_permissions() {
 }
 
 #[test]
-fn read_only_role_config_keeps_existing_backend_when_legacy_windows_is_compatible() {
-    let config: TomlValue = toml::from_str(
-        built_in::read_only_config_file_contents_for_legacy_compatibility(
-            /*legacy_windows_sandbox_compatible*/ true,
-        ),
-    )
-    .expect("built-in read-only role config should parse");
+fn read_only_role_config_selects_backend_for_legacy_windows_compatibility() {
+    for compatible in [true, false] {
+        let config: TomlValue = toml::from_str(
+            built_in::read_only_config_file_contents_for_legacy_compatibility(compatible),
+        )
+        .expect("built-in read-only role config should parse");
 
-    assert_eq!(
-        config.get("sandbox_mode").and_then(TomlValue::as_str),
-        Some("read-only")
-    );
-    assert!(config.get("windows").is_none());
-}
-
-#[test]
-fn read_only_role_config_uses_elevated_windows_when_legacy_windows_is_incompatible() {
-    let config: TomlValue = toml::from_str(
-        built_in::read_only_config_file_contents_for_legacy_compatibility(
-            /*legacy_windows_sandbox_compatible*/ false,
-        ),
-    )
-    .expect("built-in read-only role config should parse");
-
-    assert_eq!(
-        config.get("sandbox_mode").and_then(TomlValue::as_str),
-        Some("read-only")
-    );
-    assert_eq!(
-        config
-            .get("windows")
-            .and_then(TomlValue::as_table)
-            .and_then(|windows| windows.get("sandbox"))
-            .and_then(TomlValue::as_str),
-        Some("elevated")
-    );
+        assert_eq!(
+            config.get("sandbox_mode").and_then(TomlValue::as_str),
+            Some("read-only"),
+            "legacy compatibility: {compatible}"
+        );
+        if compatible {
+            assert!(config.get("windows").is_none());
+        } else {
+            assert_eq!(
+                config
+                    .get("windows")
+                    .and_then(TomlValue::as_table)
+                    .and_then(|windows| windows.get("sandbox"))
+                    .and_then(TomlValue::as_str),
+                Some("elevated")
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -460,6 +449,38 @@ async fn apply_role_preserves_existing_service_tier_without_override() {
         config.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+}
+
+#[tokio::test]
+async fn apply_role_preserves_runtime_provider_without_override() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    // The role-loading contract preserves the active provider, including runtime
+    // changes that are absent from persisted config and the provider catalog.
+    config.model_provider.base_url = Some("https://runtime-provider.invalid/v1".to_string());
+    config.model_provider.request_max_retries = Some(7);
+    let expected_provider = config.model_provider.clone();
+    let expected_id = config.model_provider_id.clone();
+    let role_path = write_role_config(
+        &home,
+        "provider-preserving-role.toml",
+        "developer_instructions = 'Keep the active provider'\n",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            config_file: Some(role_path),
+            ..Default::default()
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("custom role should apply");
+
+    assert_eq!(config.model_provider_id, expected_id);
+    assert_eq!(config.model_provider, expected_provider);
+    assert_eq!(config.model_providers[&expected_id], expected_provider);
 }
 
 #[tokio::test]

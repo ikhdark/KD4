@@ -1840,11 +1840,12 @@ def analyze_runner_evidence(
             "task_complete",
             "turn_aborted",
         ):
+            terminal_error = turn.get("error", params.get("error"))
             default_status = (
                 "aborted"
                 if payload_type == "turn_aborted"
                 else "failed"
-                if turn.get("error") is not None
+                if terminal_error is not None
                 else "completed"
             )
             status = str(turn.get("status") or default_status)
@@ -1856,7 +1857,7 @@ def analyze_runner_evidence(
                     {
                         "kind": "turn_" + status,
                         **location,
-                        "evidence": turn.get("error"),
+                        "evidence": terminal_error,
                     }
                 )
         timing = params.get("timing", turn.get("timing"))

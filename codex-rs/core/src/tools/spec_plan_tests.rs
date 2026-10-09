@@ -902,21 +902,6 @@ async fn request_user_input_respects_coarse_mode_and_role_eligibility() {
 }
 
 #[tokio::test]
-async fn wait_is_always_registered_when_code_mode_is_enabled() {
-    let plan = probe_with(
-        |turn| set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]),
-        ToolPlanInputs::default(),
-    )
-    .await;
-
-    plan.assert_visible_contains(&[
-        codex_code_mode::PUBLIC_TOOL_NAME,
-        codex_code_mode::WAIT_TOOL_NAME,
-    ]);
-    plan.assert_registered_contains(&[codex_code_mode::WAIT_TOOL_NAME]);
-}
-
-#[tokio::test]
 async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvable() {
     let configure = |turn: &mut TurnContext, code_mode_only| {
         turn.model_info.supports_search_tool = true;
@@ -1115,7 +1100,7 @@ async fn code_mode_identifier_collision_is_disambiguated_during_router_planning(
         }),
     ];
 
-    let _router = ToolRouter::try_from_context(
+    let router = ToolRouter::try_from_context(
         step_context.as_ref(),
         ToolRouterParams {
             mcp_tools: None,
@@ -1128,6 +1113,12 @@ async fn code_mode_identifier_collision_is_disambiguated_during_router_planning(
         &tool_search_cache,
     )
     .expect("colliding flattened names should receive distinct code-mode globals");
+    let plan = ToolPlanProbe::from_router(router, &tool_search_cache);
+    plan.assert_registered_contains(&[
+        "acme__lookup",
+        &ToolName::namespaced("acme", "lookup").to_string(),
+    ]);
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 }
 
 #[tokio::test]
@@ -1142,7 +1133,7 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
         codex_code_mode::PUBLIC_TOOL_NAME,
         codex_code_mode::WAIT_TOOL_NAME,
     ]);
-    plan.assert_registered_contains(&["request_user_input"]);
+    plan.assert_registered_contains(&["request_user_input", codex_code_mode::WAIT_TOOL_NAME]);
     assert_eq!(
         plan.exposure("request_user_input"),
         ToolExposure::DirectModelOnly
@@ -2275,30 +2266,7 @@ async fn request_plugin_install_requires_all_discovery_features() {
         "list_available_plugins_to_install",
         "request_plugin_install",
     ]);
-}
-
-#[tokio::test]
-async fn request_plugin_install_stays_visible_without_tool_search() {
-    let plan = probe_with(
-        |turn| {
-            turn.model_info.supports_search_tool = false;
-            set_features(
-                turn,
-                &[Feature::ToolSuggest, Feature::Apps, Feature::Plugins],
-            );
-        },
-        ToolPlanInputs {
-            tool_suggest_candidates: Some(plugin_candidates(ToolSuggestPresentation::ListTool)),
-            ..ToolPlanInputs::default()
-        },
-    )
-    .await;
-
-    plan.assert_visible_contains(&[
-        "list_available_plugins_to_install",
-        "request_plugin_install",
-    ]);
-    plan.assert_visible_lacks(&["tool_search"]);
+    enabled.assert_visible_lacks(&["tool_search"]);
 }
 
 #[tokio::test]
@@ -3004,22 +2972,22 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
     let namespaced = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
         update_config(turn, |config| {
-            config.multi_agent_v2.tool_namespace = Some("agents".to_string());
+            config.multi_agent_v2.tool_namespace = Some("custom_agents".to_string());
         });
     })
     .await;
 
-    namespaced.assert_visible_contains(&["agents"]);
-    namespaced.assert_visible_lacks(&["assign_task"]);
+    namespaced.assert_visible_contains(&["custom_agents"]);
+    namespaced.assert_visible_lacks(&["agents", "assign_task"]);
     assert!(
         !namespaced
             .registered_names
-            .contains(&ToolName::namespaced("agents", "assign_task").to_string()),
+            .contains(&ToolName::namespaced("custom_agents", "assign_task").to_string()),
         "expected no namespaced runtime for assign_task"
     );
     assert!(
         !namespaced
-            .namespace_function_names("agents")
+            .namespace_function_names("custom_agents")
             .iter()
             .any(|name| name == "assign_task"),
         "expected assign_task to be absent from agents namespace"
@@ -3040,7 +3008,7 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
         assert!(
             namespaced
                 .registered_names
-                .contains(&ToolName::namespaced("agents", tool_name).to_string()),
+                .contains(&ToolName::namespaced("custom_agents", tool_name).to_string()),
             "expected namespaced runtime for {tool_name}"
         );
         assert!(
@@ -3051,7 +3019,7 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
         );
         assert!(
             namespaced
-                .namespace_function_names("agents")
+                .namespace_function_names("custom_agents")
                 .iter()
                 .any(|name| name == tool_name),
             "expected {tool_name} in agents namespace"

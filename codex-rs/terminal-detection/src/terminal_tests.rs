@@ -310,38 +310,31 @@ fn detects_tmux_multiplexer() {
 
 #[test]
 fn detects_zellij_multiplexer() {
-    let env = FakeEnvironment::new().with_var("ZELLIJ", "1");
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        TerminalInfo {
-            name: TerminalName::Unknown,
-            term_program: None,
-            version: None,
-            term: None,
-            multiplexer: Some(Multiplexer::Zellij { version: None }),
-        },
-        "zellij_multiplexer"
-    );
-}
+    for (variable, value, version) in [
+        ("ZELLIJ", "1", None),
+        ("ZELLIJ_SESSION_NAME", "session", None),
+        ("ZELLIJ_VERSION", "0.43.1", Some("0.43.1")),
+    ] {
+        let env = FakeEnvironment::new().with_var(variable, value);
+        let terminal = detect_terminal_info_from_env(&env);
+        assert_eq!(
+            terminal,
+            terminal_info(
+                TerminalName::Unknown,
+                /*term_program*/ None,
+                /*version*/ None,
+                /*term*/ None,
+                Some(Multiplexer::Zellij {
+                    version: version.map(ToString::to_string),
+                }),
+            ),
+            "{variable}"
+        );
+        assert!(terminal.is_zellij(), "{variable}");
 
-#[test]
-fn detects_zellij_multiplexer_version() {
-    let env = FakeEnvironment::new().with_var("ZELLIJ_VERSION", "0.43.1");
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::Unknown,
-            /*term_program*/ None,
-            /*version*/ None,
-            /*term*/ None,
-            Some(Multiplexer::Zellij {
-                version: Some("0.43.1".to_string()),
-            }),
-        ),
-        "zellij_multiplexer_version"
-    );
+        let empty = FakeEnvironment::new().with_var(variable, " \t");
+        assert_eq!(detect_terminal_info_from_env(&empty).multiplexer, None);
+    }
 }
 
 #[test]

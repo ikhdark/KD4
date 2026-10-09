@@ -72,30 +72,49 @@ class TargetMetadataTest(unittest.TestCase):
     def test_npm_targets_are_canonical_binary_target_metadata(self) -> None:
         self.assertEqual(set(NPM_TARGETS), set(BINARY_TARGETS))
         self.assertEqual(
-            {target.node_platform_key for target in NPM_TARGETS.values()},
-            {"win32-x64", "win32-arm64"},
-        )
-        self.assertEqual(
-            {target.package for target in NPM_TARGETS.values()},
-            {"codex-win32-x64", "codex-win32-arm64"},
-        )
-        self.assertTrue(
-            all(
-                target.executable_name == "codex.exe" for target in NPM_TARGETS.values()
-            )
+            {
+                triple: (
+                    target.package,
+                    target.npm_name,
+                    target.npm_tag,
+                    target.node_platform_key,
+                    target.executable_name,
+                )
+                for triple, target in NPM_TARGETS.items()
+            },
+            {
+                "x86_64-pc-windows-msvc": (
+                    "codex-win32-x64", "@openai/codex-win32-x64",
+                    "win32-x64", "win32-x64", "codex.exe",
+                ),
+                "aarch64-pc-windows-msvc": (
+                    "codex-win32-arm64", "@openai/codex-win32-arm64",
+                    "win32-arm64", "win32-arm64", "codex.exe",
+                ),
+            },
         )
 
     def test_entrypoint_name_uses_precomputed_variant_target_names(self) -> None:
         variant = PACKAGE_VARIANTS["codex"]
-
-        self.assertEqual(
-            variant.entrypoint_name(TARGET_SPECS["x86_64-pc-windows-msvc"]),
-            "codex.exe",
-        )
-        self.assertEqual(
-            variant.entrypoint_name(TARGET_SPECS["aarch64-pc-windows-msvc"]),
-            "codex.exe",
-        )
+        with patch.dict(
+            targets.PACKAGE_ENTRYPOINT_NAMES,
+            {"codex": {"x86_64-pc-windows-msvc": "custom-codex.exe"}},
+            clear=True,
+        ):
+            self.assertEqual(
+                variant.entrypoint_name(TARGET_SPECS["x86_64-pc-windows-msvc"]),
+                "custom-codex.exe",
+            )
+            self.assertEqual(
+                variant.entrypoint_name(TARGET_SPECS["aarch64-pc-windows-msvc"]),
+                "codex.exe",
+            )
+            self.assertEqual(
+                PACKAGE_VARIANTS["codex-app-server"].entrypoint_name(
+                    TARGET_SPECS["x86_64-pc-windows-msvc"]
+                ),
+                "codex-app-server.exe",
+            )
 
     def test_default_target_is_cached_for_process_lifetime(self) -> None:
         calls = {"machine": 0}

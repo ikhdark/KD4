@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import hashlib
 import json
 import os
 import subprocess
@@ -57,6 +58,9 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
     missingSource = Test-FileStaleAgainstSource -SourceNewestUtc $null -FileLastWriteUtc ([DateTime]::UtcNow)
     missingArtifact = Test-FileStaleAgainstSource -SourceNewestUtc ([DateTime]::UtcNow) -FileLastWriteUtc $null
     malformed = Test-FileStaleAgainstSource -SourceNewestUtc 'not-a-time' -FileLastWriteUtc ([DateTime]::UtcNow)
+    equal = Test-FileStaleAgainstSource -SourceNewestUtc ([DateTime]'2000-01-01') -FileLastWriteUtc ([DateTime]'2000-01-01')
+    tolerance = Test-FileStaleAgainstSource -SourceNewestUtc ([DateTime]'2000-01-01T00:00:01') -FileLastWriteUtc ([DateTime]'2000-01-01')
+    stale = Test-FileStaleAgainstSource -SourceNewestUtc ([DateTime]'2000-01-01T00:00:01.0000001') -FileLastWriteUtc ([DateTime]'2000-01-01')
 }} | ConvertTo-Json -Compress
 """
         result = subprocess.run(
@@ -77,7 +81,14 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             json.loads(result.stdout),
-            {"missingSource": True, "missingArtifact": True, "malformed": True},
+            {
+                "missingSource": True,
+                "missingArtifact": True,
+                "malformed": True,
+                "equal": False,
+                "tolerance": False,
+                "stale": True,
+            },
         )
 
     def test_apply_skips_replacement_when_target_hash_matches_source(self) -> None:
@@ -192,6 +203,10 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "@echo off\r\necho codex 9.9.9\r\nrem artifact B\r\n", encoding="utf-8"
             )
             os.utime(target, (source_timestamp, source_timestamp))
+            self.install_matching_publish_helpers(install_dir)
+            self.assertEqual(target.stat().st_size, fake_codex.stat().st_size)
+            self.assertEqual(target.stat().st_mtime_ns, fake_codex.stat().st_mtime_ns)
+            original_target = target.read_bytes()
 
             result = self.run_script(
                 "-DryRun",
@@ -207,10 +222,21 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertNotEqual(
-                self.proof_value(result.stdout, "sourceSha256"),
-                self.proof_value(result.stdout, "targetBeforeSha256"),
+            self.assert_proof_value(
+                result.stdout, "sourceSha256",
+                hashlib.sha256(fake_codex.read_bytes()).hexdigest(),
             )
+            self.assert_proof_value(
+                result.stdout, "targetBeforeSha256",
+                hashlib.sha256(original_target).hexdigest(),
+            )
+            self.assertNotEqual(fake_codex.read_bytes(), original_target)
+            self.assertEqual(target.read_bytes(), original_target)
+            self.assert_proof_value(result.stdout, "codexBinaryChanged", "true")
+            for helper in ("codeModeHost", "windowsSandboxSetup", "commandRunner"):
+                self.assert_proof_value(
+                    result.stdout, helper + "BinaryChanged", "false"
+                )
             self.assert_proof_value(result.stdout, "sourceSha256Mode", "hashed")
             self.assert_proof_value(result.stdout, "binaryChanged", "true")
             self.assert_proof_value(result.stdout, "replace", "not run")

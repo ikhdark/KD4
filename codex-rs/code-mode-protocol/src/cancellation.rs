@@ -190,47 +190,78 @@ mod tests {
     #[test]
     fn a_shared_cell_is_visible_through_every_clone() {
         let cancellation = NestedCancellation::new(CancellationToken::new());
+        let cloned = cancellation.clone();
         let derived =
             NestedCancellation::with_cause(CancellationToken::new(), cancellation.cause_cell());
 
         derived.cancel_with(CancellationCause::RuntimeShutdown);
 
         assert!(derived.is_cancelled());
+        assert!(!cancellation.is_cancelled());
+        assert!(!cloned.is_cancelled());
         assert_eq!(
             cancellation.cause(),
             Some(CancellationCause::RuntimeShutdown),
             "an origin holding a derived token records into the shared cell"
         );
+        assert_eq!(cloned.cause(), cancellation.cause());
+        cloned.cancel_with(CancellationCause::NestedDeadline);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(cancellation.cause(), Some(CancellationCause::RuntimeShutdown));
     }
 
     #[test]
-    fn each_origin_renders_its_own_text() {
-        for (cause, expected) in [
+    fn each_origin_preserves_its_wire_tag_and_model_facing_text() {
+        use serde_json::json;
+
+        for (cause, expected, wire) in [
             (
-                CancellationCause::TurnAborted {
-                    reason: TurnAbortReason::Interrupted,
-                },
+                CancellationCause::TurnAborted { reason: TurnAbortReason::Interrupted },
                 "aborted by user",
+                json!({"type": "turn_aborted", "reason": "interrupted"}),
             ),
             (
-                CancellationCause::TurnAborted {
-                    reason: TurnAbortReason::Replaced,
-                },
+                CancellationCause::TurnAborted { reason: TurnAbortReason::Replaced },
                 "cancelled: turn replaced",
+                json!({"type": "turn_aborted", "reason": "replaced"}),
             ),
             (
-                CancellationCause::TurnAborted {
-                    reason: TurnAbortReason::BudgetLimited,
-                },
+                CancellationCause::TurnAborted { reason: TurnAbortReason::ReviewEnded },
+                "cancelled: turn review ended",
+                json!({"type": "turn_aborted", "reason": "review_ended"}),
+            ),
+            (
+                CancellationCause::TurnAborted { reason: TurnAbortReason::BudgetLimited },
                 "cancelled: turn budget limited",
+                json!({"type": "turn_aborted", "reason": "budget_limited"}),
+            ),
+            (
+                CancellationCause::TurnAborted { reason: TurnAbortReason::InternalError },
+                "cancelled: turn internal error",
+                json!({"type": "turn_aborted", "reason": "internal_error"}),
+            ),
+            (
+                CancellationCause::TurnAborted { reason: TurnAbortReason::ProcessLost },
+                "cancelled: turn process lost",
+                json!({"type": "turn_aborted", "reason": "process_lost"}),
             ),
             (
                 CancellationCause::NestedDeadline,
                 "nested runtime deadline reached",
+                json!({"type": "nested_deadline"}),
             ),
-            (CancellationCause::RuntimeShutdown, "cancelled by runtime"),
+            (
+                CancellationCause::RuntimeShutdown,
+                "cancelled by runtime",
+                json!({"type": "runtime_shutdown"}),
+            ),
         ] {
             assert_eq!(cause.describe(), expected);
+            assert_eq!(serde_json::to_value(&cause).expect("encode"), wire);
+            assert_eq!(
+                serde_json::from_value::<CancellationCause>(wire).expect("decode"),
+                cause
+            );
         }
     }
 
@@ -257,20 +288,4 @@ mod tests {
         assert!(quiet_call.is_cancelled(), "the scope cancels its children");
     }
 
-    #[test]
-    fn a_cause_round_trips_over_the_host_wire() {
-        for cause in [
-            CancellationCause::NestedDeadline,
-            CancellationCause::TurnAborted {
-                reason: TurnAbortReason::Interrupted,
-            },
-            CancellationCause::RuntimeShutdown,
-        ] {
-            let encoded = serde_json::to_value(&cause).expect("encode");
-            assert_eq!(
-                serde_json::from_value::<CancellationCause>(encoded).expect("decode"),
-                cause
-            );
-        }
-    }
 }

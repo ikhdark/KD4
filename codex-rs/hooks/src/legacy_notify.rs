@@ -186,25 +186,7 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_user_notification() -> Result<()> {
-        let notification = UserNotification::AgentTurnComplete {
-            thread_id: "b5f6c1c2-1111-2222-3333-444455556666".to_string(),
-            turn_id: "12345".to_string(),
-            cwd: test_path_buf("/Users/example/project")
-                .display()
-                .to_string(),
-            client: Some("codex-tui".to_string()),
-            input_messages: vec!["Rename `foo` to `bar` and update the callsites.".to_string()],
-            last_assistant_message: Some(
-                "Rename complete and verified `cargo build` succeeds.".to_string(),
-            ),
-        };
-        let serialized = serde_json::to_string(&notification)?;
-        let actual: Value = serde_json::from_str(&serialized)?;
-        assert_eq!(actual, expected_notification_json());
-        Ok(())
-    }
+
 
     #[test]
     fn legacy_notify_json_matches_historical_wire_shape() -> Result<()> {

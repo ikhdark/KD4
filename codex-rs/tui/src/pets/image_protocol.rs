@@ -244,20 +244,19 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn kitty_png_transmission_encodes_inline_data() {
+    fn kitty_png_transmission_encodes_inline_data_with_optional_image_id() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frame.png");
         fs::write(&path, b"png").unwrap();
 
-        let command = kitty_transmit_png_with_id(
-            &path, /*columns*/ 4, /*rows*/ 3, /*image_id*/ None,
-        )
-        .unwrap();
-
-        assert!(command.starts_with("\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,m=0;"));
-        assert!(command.contains("cG5n"));
-        assert!(command.ends_with("\x1b\\"));
+        for (image_id, expected) in [
+            (None, "\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,m=0;cG5n\x1b\\"),
+            (Some(7), "\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,i=7,m=0;cG5n\x1b\\"),
+        ] {
+            let command = kitty_transmit_png_with_id(&path, /*columns*/ 4, /*rows*/ 3, image_id)
+                .unwrap();
+            assert_eq!(command, expected);
+        }
     }
 
     #[test]
@@ -379,24 +378,4 @@ mod tests {
         assert!(sixel.ends_with("\x1b\\"));
     }
 
-    #[test]
-    #[serial]
-    fn kitty_png_transmission_includes_image_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("frame.png");
-        fs::write(&path, b"png").unwrap();
-
-        let command = kitty_transmit_png_with_id(
-            &path,
-            /*columns*/ 4,
-            /*rows*/ 3,
-            /*image_id*/ Some(7),
-        )
-        .unwrap();
-
-        assert_eq!(
-            command,
-            "\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,i=7,m=0;cG5n\x1b\\"
-        );
-    }
 }

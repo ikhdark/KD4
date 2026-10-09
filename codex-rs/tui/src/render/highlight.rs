@@ -1017,43 +1017,19 @@ mod tests {
     }
 
     #[test]
-    fn highlight_unknown_lang_falls_back() {
-        let code = "some random text";
-        let lines = highlight_code_to_lines(code, "xyzlang");
-        assert_eq!(reconstructed(&lines), code);
-        // Should be plain text with no styling.
-        for line in &lines {
-            for span in &line.spans {
-                assert_eq!(
-                    span.style,
-                    Style::default(),
-                    "expected default style for unknown language"
-                );
-            }
+    fn highlight_fallback_preserves_plain_lines() {
+        for (code, lang, expected) in [
+            ("some random text", "xyzlang", vec![Line::from("some random text")]),
+            ("hello world\n", "xyzlang", vec![Line::from("hello world")]),
+            ("", "rust", vec![Line::from("")]),
+        ] {
+            assert_eq!(highlight_code_to_lines(code, lang), expected, "{code:?}");
         }
     }
 
-    #[test]
-    fn fallback_trailing_newline_no_phantom_line() {
-        // pulldown-cmark sends code block text ending with '\n'.
-        // The fallback path (unknown language) must not produce a phantom
-        // empty trailing line from that newline.
-        let code = "hello world\n";
-        let lines = highlight_code_to_lines(code, "xyzlang");
-        assert_eq!(
-            lines.len(),
-            1,
-            "trailing newline should not produce phantom blank line, got {lines:?}"
-        );
-        assert_eq!(reconstructed(&lines), "hello world");
-    }
 
-    #[test]
-    fn highlight_empty_string() {
-        let lines = highlight_code_to_lines("", "rust");
-        assert_eq!(lines.len(), 1);
-        assert_eq!(reconstructed(&lines), "");
-    }
+
+
 
     #[test]
     fn highlight_bash_preserves_content() {
@@ -1068,6 +1044,7 @@ mod tests {
         // span text — that would propagate into rendered code blocks.
         let code = "fn main() {\r\n    println!(\"hi\");\r\n}\r\n";
         let lines = highlight_code_to_lines(code, "rust");
+        assert_eq!(reconstructed(&lines), "fn main() {\n    println!(\"hi\");\n}");
         for (i, line) in lines.iter().enumerate() {
             for span in &line.spans {
                 assert!(
@@ -1081,149 +1058,43 @@ mod tests {
 
     #[test]
     #[allow(clippy::disallowed_methods)]
-    fn style_conversion_correctness() {
-        let syn = SyntectStyle {
-            foreground: syntect::highlighting::Color {
-                r: 255,
-                g: 128,
-                b: 0,
-                a: 255,
-            },
-            background: syntect::highlighting::Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 255,
-            },
-            font_style: FontStyle::BOLD | FontStyle::ITALIC,
-        };
-        let rt = convert_style(syn);
-        assert_eq!(rt.fg, Some(RtColor::Rgb(255, 128, 0)));
-        // Background is intentionally skipped.
-        assert_eq!(rt.bg, None);
-        assert!(rt.add_modifier.contains(Modifier::BOLD));
-        // Italic is intentionally suppressed.
-        assert!(!rt.add_modifier.contains(Modifier::ITALIC));
-        assert!(!rt.add_modifier.contains(Modifier::UNDERLINED));
+    fn style_conversion_preserves_foreground_and_only_bold() {
+        let colors = [
+            (SyntectColor { r: 255, g: 128, b: 0, a: 255 }, Some(RtColor::Rgb(255, 128, 0))),
+            (SyntectColor { r: 2, g: 0, b: 0, a: 0 }, Some(RtColor::Green)),
+            (SyntectColor { r: 7, g: 0, b: 0, a: 0 }, Some(RtColor::Gray)),
+            (SyntectColor { r: 0x9a, g: 0, b: 0, a: 0 }, Some(RtColor::Indexed(0x9a))),
+            (SyntectColor { r: 0, g: 0, b: 0, a: 1 }, None),
+            (SyntectColor { r: 10, g: 20, b: 30, a: 0x80 }, Some(RtColor::Rgb(10, 20, 30))),
+        ];
+        for (foreground, expected) in colors {
+            for font_style in [FontStyle::empty(), FontStyle::ITALIC | FontStyle::UNDERLINE, FontStyle::BOLD | FontStyle::ITALIC | FontStyle::UNDERLINE] {
+                let converted = convert_style(SyntectStyle {
+                    foreground,
+                    background: SyntectColor { r: 100, g: 200, b: 150, a: 255 },
+                    font_style,
+                });
+                let mut expected_style = Style::default();
+                expected_style.fg = expected;
+                if font_style.contains(FontStyle::BOLD) {
+                    expected_style.add_modifier = Modifier::BOLD;
+                }
+                assert_eq!(converted, expected_style, "{foreground:?}, {font_style:?}");
+            }
+        }
     }
 
-    #[test]
-    fn convert_style_suppresses_underline() {
-        // Dracula (and other themes) set FontStyle::UNDERLINE on type scopes,
-        // producing distracting underlines on type names in terminal output.
-        // convert_style must suppress underline, just like it suppresses italic.
-        let syn = SyntectStyle {
-            foreground: syntect::highlighting::Color {
-                r: 100,
-                g: 200,
-                b: 150,
-                a: 255,
-            },
-            background: syntect::highlighting::Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0xFF,
-            },
-            font_style: FontStyle::UNDERLINE,
-        };
-        let rt = convert_style(syn);
-        assert!(
-            !rt.add_modifier.contains(Modifier::UNDERLINED),
-            "convert_style should suppress UNDERLINE from themes — \
-             themes like Dracula use underline on type scopes which \
-             looks wrong in terminal output"
-        );
-    }
 
-    #[test]
-    fn style_conversion_uses_ansi_named_color_when_alpha_is_zero_low_index() {
-        let syn = SyntectStyle {
-            foreground: syntect::highlighting::Color {
-                r: 0x02,
-                g: 0,
-                b: 0,
-                a: 0,
-            },
-            background: syntect::highlighting::Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0xFF,
-            },
-            font_style: FontStyle::empty(),
-        };
-        let rt = convert_style(syn);
-        assert_eq!(rt.fg, Some(RtColor::Green));
-    }
 
-    #[test]
-    fn style_conversion_uses_indexed_color_when_alpha_is_zero_high_index() {
-        let syn = SyntectStyle {
-            foreground: syntect::highlighting::Color {
-                r: 0x9a,
-                g: 0,
-                b: 0,
-                a: 0,
-            },
-            background: syntect::highlighting::Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0xFF,
-            },
-            font_style: FontStyle::empty(),
-        };
-        let rt = convert_style(syn);
-        assert!(matches!(rt.fg, Some(RtColor::Indexed(0x9a))));
-    }
 
-    #[test]
-    fn style_conversion_uses_terminal_default_when_alpha_is_one() {
-        let syn = SyntectStyle {
-            foreground: syntect::highlighting::Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 1,
-            },
-            background: syntect::highlighting::Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0xFF,
-            },
-            font_style: FontStyle::empty(),
-        };
-        let rt = convert_style(syn);
-        assert_eq!(rt.fg, None);
-    }
 
-    #[test]
-    fn style_conversion_unexpected_alpha_falls_back_to_rgb() {
-        let syn = SyntectStyle {
-            foreground: syntect::highlighting::Color {
-                r: 10,
-                g: 20,
-                b: 30,
-                a: 0x80,
-            },
-            background: syntect::highlighting::Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0xFF,
-            },
-            font_style: FontStyle::empty(),
-        };
-        let rt = convert_style(syn);
-        assert!(matches!(rt.fg, Some(RtColor::Rgb(10, 20, 30))));
-    }
 
-    #[test]
-    fn ansi_palette_color_maps_ansi_white_to_gray() {
-        assert_eq!(ansi_palette_color(/*index*/ 0x07), RtColor::Gray);
-    }
+
+
+
+
+
+
 
     #[test]
     fn ansi_family_themes_use_terminal_palette_colors_not_rgb() {
@@ -1286,7 +1157,9 @@ mod tests {
         let result = highlight_code_to_styled_spans("let x = 1;", "rust");
         assert!(result.is_some());
         let spans = result.unwrap_or_default();
-        assert!(!spans.is_empty());
+        let lines: Vec<Line<'static>> = spans.into_iter().map(Line::from).collect();
+        assert_eq!(reconstructed(&lines), "let x = 1;");
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| span.style.fg.is_some()));
     }
 
     #[test]
@@ -1301,36 +1174,24 @@ mod tests {
     }
 
     #[test]
-    fn highlight_large_input_falls_back() {
-        // Input exceeding MAX_HIGHLIGHT_BYTES should return None (plain text
-        // fallback) rather than attempting to parse.
-        let big = "x".repeat(MAX_HIGHLIGHT_BYTES + 1);
-        let result = highlight_code_to_styled_spans(&big, "rust");
-        assert!(result.is_none(), "oversized input should fall back to None");
-    }
-
-    #[test]
-    fn highlight_many_lines_falls_back() {
-        // Input exceeding MAX_HIGHLIGHT_LINES should return None.
+    fn highlight_guardrails_preserve_fallback_content() {
+        // Keep byte-limit input within both the line-count and per-line limits,
+        // so each case independently proves its intended guard.
+        let long_line = "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1);
+        let too_many_bytes = format!("{}\n", "x".repeat(MAX_HIGHLIGHT_LINE_BYTES)).repeat(129);
+        assert!(too_many_bytes.len() > MAX_HIGHLIGHT_BYTES);
+        assert!(too_many_bytes.lines().count() < MAX_HIGHLIGHT_LINES);
         let many_lines = "let x = 1;\n".repeat(MAX_HIGHLIGHT_LINES + 1);
-        let result = highlight_code_to_styled_spans(&many_lines, "rust");
-        assert!(result.is_none(), "too many lines should fall back to None");
+        for code in [too_many_bytes, long_line, many_lines.trim_end_matches('\n').to_string(), many_lines] {
+            assert!(highlight_code_to_styled_spans(&code, "rust").is_none());
+            let expected: Vec<Line<'static>> = code.lines().map(|line| Line::from(line.to_string())).collect();
+            assert_eq!(highlight_code_to_lines(&code, "rust"), expected);
+        }
     }
 
-    #[test]
-    fn highlight_many_lines_no_trailing_newline_falls_back() {
-        // A snippet with exactly MAX_HIGHLIGHT_LINES+1 lines but no trailing
-        // newline has only MAX_HIGHLIGHT_LINES newline bytes.  The guard must
-        // count actual lines, not newline bytes, to catch this.
-        let mut code = "let x = 1;\n".repeat(MAX_HIGHLIGHT_LINES);
-        code.push_str("let x = 1;"); // line MAX_HIGHLIGHT_LINES+1, no trailing \n
-        assert_eq!(code.lines().count(), MAX_HIGHLIGHT_LINES + 1);
-        let result = highlight_code_to_styled_spans(&code, "rust");
-        assert!(
-            result.is_none(),
-            "MAX_HIGHLIGHT_LINES+1 lines without trailing newline should fall back"
-        );
-    }
+
+
+
 
     #[test]
     fn find_syntax_resolves_languages_and_aliases() {
@@ -1404,6 +1265,7 @@ mod tests {
             settings: ThemeSettings::default(),
             scopes: vec![
                 theme_item("markup.inserted", Some((10, 20, 30))),
+                theme_item("diff.inserted", Some((90, 80, 70))),
                 theme_item("diff.deleted", Some((40, 50, 60))),
             ],
             ..Theme::default()
@@ -1451,7 +1313,7 @@ mod tests {
 
     #[test]
     fn foreground_style_for_scopes_uses_first_scope_with_foreground() {
-        let theme = Theme {
+        let mut theme = Theme {
             settings: ThemeSettings::default(),
             scopes: vec![theme_item_with_foreground("string", (40, 50, 60))],
             ..Theme::default()
@@ -1461,6 +1323,9 @@ mod tests {
             .expect("expected string foreground style");
 
         assert_rgb(style.fg, (40, 50, 60));
+        theme.scopes.push(theme_item_with_foreground("keyword", (10, 20, 30)));
+        let style = foreground_style_for_scopes_with_theme(&theme, &["keyword", "string"]).unwrap();
+        assert_rgb(style.fg, (10, 20, 30));
     }
 
     #[test]
@@ -1566,20 +1431,26 @@ mod tests {
     }
 
     #[test]
-    fn load_custom_theme_from_tmtheme_file() {
+    fn custom_theme_validation_tracks_missing_valid_and_invalid_files() {
         let dir = tempfile::tempdir().unwrap();
         let themes_dir = dir.path().join("themes");
         std::fs::create_dir(&themes_dir).unwrap();
-        write_minimal_tmtheme(&themes_dir.join("test-custom.tmTheme"));
-        let theme = load_custom_theme("test-custom", dir.path());
-        assert!(theme.is_some(), "should load .tmTheme from themes dir");
+        let path = themes_dir.join("my-fancy.tmTheme");
+        assert!(load_custom_theme("my-fancy", dir.path()).is_none());
+        let missing = validate_theme_name(Some("my-fancy"), Some(dir.path())).expect("missing warning");
+        assert!(missing.contains("my-fancy") && missing.contains("not found"));
+        write_minimal_tmtheme(&path);
+        let theme = load_custom_theme("my-fancy", dir.path()).expect("valid theme");
+        assert_eq!(theme.name.as_deref(), Some("Test"));
+        assert_rgb(theme.settings.foreground.map(|color| convert_syntect_color(color).unwrap()), (255, 255, 255));
+        assert!(validate_theme_name(Some("my-fancy"), Some(dir.path())).is_none());
+        std::fs::write(&path, "placeholder").unwrap();
+        assert!(load_custom_theme("my-fancy", dir.path()).is_none());
+        let invalid = validate_theme_name(Some("my-fancy"), Some(dir.path())).expect("invalid warning");
+        assert!(invalid.contains("my-fancy") && invalid.contains("could not be loaded"));
     }
 
-    #[test]
-    fn load_custom_theme_returns_none_for_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(load_custom_theme("nonexistent", dir.path()).is_none());
-    }
+
 
     #[test]
     fn validate_theme_name_none_for_bundled() {
@@ -1593,48 +1464,11 @@ mod tests {
         assert!(validate_theme_name(/*name*/ None, /*codex_home*/ None).is_none());
     }
 
-    #[test]
-    fn validate_theme_name_warns_for_missing_custom() {
-        let dir = tempfile::tempdir().unwrap();
-        let warning = validate_theme_name(Some("my-fancy"), Some(dir.path()));
-        assert!(warning.is_some(), "should warn when theme file is absent");
-        let msg = warning.unwrap();
-        assert!(
-            msg.contains("my-fancy"),
-            "warning should mention the theme name"
-        );
-    }
 
-    #[test]
-    fn validate_theme_name_none_when_custom_file_is_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let themes_dir = dir.path().join("themes");
-        std::fs::create_dir(&themes_dir).unwrap();
-        write_minimal_tmtheme(&themes_dir.join("my-fancy.tmTheme"));
-        assert!(
-            validate_theme_name(Some("my-fancy"), Some(dir.path())).is_none(),
-            "should not warn when custom .tmTheme file parses successfully"
-        );
-    }
 
-    #[test]
-    fn validate_theme_name_warns_when_custom_file_is_invalid() {
-        let dir = tempfile::tempdir().unwrap();
-        let themes_dir = dir.path().join("themes");
-        std::fs::create_dir(&themes_dir).unwrap();
-        std::fs::write(themes_dir.join("my-fancy.tmTheme"), "placeholder").unwrap();
-        let warning = validate_theme_name(Some("my-fancy"), Some(dir.path()));
-        assert!(
-            warning.is_some(),
-            "should warn when custom .tmTheme exists but cannot be parsed"
-        );
-        assert!(
-            warning
-                .as_deref()
-                .is_some_and(|msg| msg.contains("could not be loaded")),
-            "warning should explain that the theme file is invalid"
-        );
-    }
+
+
+
 
     #[test]
     fn list_available_themes_excludes_invalid_custom_files() {
@@ -1675,6 +1509,9 @@ mod tests {
             .map(|entry| (entry.is_custom, entry.name.clone()))
             .collect();
 
+        let custom: Vec<_> = entries.iter().filter(|entry| entry.is_custom).map(|entry| entry.name.as_str()).collect();
+        assert_eq!(custom, vec!["Aaa-custom", "mmm-custom", "zzz-custom"]);
+        assert_eq!(entries.iter().filter(|entry| !entry.is_custom).count(), BUILTIN_THEME_NAMES.len());
         let mut expected = actual.clone();
         expected.sort_by_cached_key(|entry| (entry.1.to_ascii_lowercase(), entry.1.clone()));
 

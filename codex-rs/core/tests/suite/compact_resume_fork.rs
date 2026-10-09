@@ -163,6 +163,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
         "compact+resume test expects resumed path {resumed_path:?} to exist",
     );
 
+    resumed.flush_rollout().await.expect("flush source before fork");
     let forked = fork_thread(&manager, &config, resumed_path, /*nth_user_message*/ 2).await;
     user_turn(&forked, "AFTER_FORK").await;
 
@@ -234,6 +235,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
         "second compact test expects resumed path {resumed_path:?} to exist",
     );
 
+    resumed.flush_rollout().await?;
     let forked = fork_thread(&manager, &config, resumed_path, /*nth_user_message*/ 3).await;
     user_turn(&forked, "AFTER_FORK").await;
 
@@ -256,6 +258,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
         .collect::<Vec<_>>();
     requests.iter_mut().for_each(normalize_line_endings);
     normalize_compact_prompts(&mut requests);
+    assert_eq!(requests.len(), 8, "all compact/resume/fork phases must execute");
     assert_eq!(
         json_conversation_user_texts(&requests[0]),
         vec!["hello world".to_string()]

@@ -375,7 +375,8 @@ impl ResponsesRequest {
 /// JSON string, so quotes and newlines in `text` still match.
 pub fn body_contains_text(body: &str, text: &str) -> bool {
     let json_fragment = serde_json::to_string(text).expect("serialize text to JSON");
-    body.contains(json_fragment.trim_matches('"'))
+    // Remove only the enclosing JSON quotes, not an escaped quote in the text.
+    body.contains(&json_fragment[1..json_fragment.len() - 1])
 }
 
 pub(crate) fn output_value_to_text(value: &Value) -> Option<String> {
@@ -445,6 +446,38 @@ mod tests {
             body: serde_json::to_vec(&serde_json::json!({ "input": input }))
                 .expect("serialize request body"),
         })
+    }
+
+    #[test]
+    fn body_text_matching_preserves_escaped_trailing_quotes() {
+        // JSON's escaped quote is two bytes (backslash + quote), distinct from
+        // the backslash + n encoding of a newline. Neither may match the other.
+        assert!(body_contains_text(r#"{"text":"quoted\""}"#, "quoted\""));
+        assert!(!body_contains_text(r#"{"text":"quoted\n"}"#, "quoted\""));
+        assert!(!body_contains_text(r#"{"text":"line\n"}"#, "\""));
+        assert!(body_contains_text(r#"{"text":"🦀\""}"#, "🦀\""));
+    }
+
+    #[test]
+    fn captured_outputs_require_a_prior_matching_call() {
+        // The request-invariant contract requires chronological call/output
+        // pairing. Equal ID sets alone cannot establish that ordering.
+        for (call_kind, output_kind) in [
+            ("function_call", "function_call_output"),
+            ("local_shell_call", "function_call_output"),
+            ("custom_tool_call", "custom_tool_call_output"),
+            ("tool_search_call", "tool_search_output"),
+        ] {
+            let call = serde_json::json!({ "type": call_kind, "call_id": "call-1" });
+            let output = serde_json::json!({ "type": output_kind, "call_id": "call-1" });
+            let ordered = request_with_input(serde_json::json!([call, output]));
+            assert!(ResponseMock::new().matches(&ordered.0));
+            let reversed = request_with_input(serde_json::json!([output, call]));
+            assert!(
+                std::panic::catch_unwind(|| ResponseMock::new().matches(&reversed.0)).is_err(),
+                "{output_kind} must not be accepted before {call_kind}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1627,7 +1660,6 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
     let function_calls = gather_ids(items, "function_call");
     let tool_search_calls = gather_ids(items, "tool_search_call");
     let custom_tool_calls = gather_ids(items, "custom_tool_call");
-    let local_shell_calls = gather_ids(items, "local_shell_call");
     let function_call_outputs = gather_output_ids(
         items,
         "function_call_output",
@@ -1640,23 +1672,37 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
         "orphan custom_tool_call_output with empty call_id should be dropped",
     );
 
-    for cid in &function_call_outputs {
-        assert!(
-            function_calls.contains(cid) || local_shell_calls.contains(cid),
-            "function_call_output without matching call in input: {cid}",
-        );
-    }
-    for cid in &custom_tool_call_outputs {
-        assert!(
-            custom_tool_calls.contains(cid),
-            "custom_tool_call_output without matching call in input: {cid}",
-        );
-    }
-    for cid in &tool_search_outputs {
-        assert!(
-            tool_search_calls.contains(cid),
-            "tool_search_output without matching call in input: {cid}",
-        );
+    let mut prior_function_calls = HashSet::new();
+    let mut prior_custom_calls = HashSet::new();
+    let mut prior_search_calls = HashSet::new();
+    for item in items {
+        let Some(cid) = get_call_id(item) else {
+            continue; // Missing output IDs were checked above, including legacy search items.
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "local_shell_call") => {
+                prior_function_calls.insert(cid);
+            }
+            Some("custom_tool_call") => {
+                prior_custom_calls.insert(cid);
+            }
+            Some("tool_search_call") => {
+                prior_search_calls.insert(cid);
+            }
+            Some("function_call_output") => assert!(
+                prior_function_calls.contains(cid),
+                "function_call_output without prior matching call in input: {cid}",
+            ),
+            Some("custom_tool_call_output") => assert!(
+                prior_custom_calls.contains(cid),
+                "custom_tool_call_output without prior matching call in input: {cid}",
+            ),
+            Some("tool_search_output") => assert!(
+                prior_search_calls.contains(cid),
+                "tool_search_output without prior matching call in input: {cid}",
+            ),
+            _ => {}
+        }
     }
 
     for cid in &function_calls {

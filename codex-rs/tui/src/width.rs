@@ -40,33 +40,23 @@ mod tests {
 
     #[test]
     fn usable_content_width_returns_none_when_reserved_exhausts_width() {
-        assert_eq!(
-            usable_content_width(/*total_width*/ 0, /*reserved_cols*/ 0),
-            None
-        );
-        assert_eq!(
-            usable_content_width(/*total_width*/ 2, /*reserved_cols*/ 2),
-            None
-        );
-        assert_eq!(
-            usable_content_width(/*total_width*/ 3, /*reserved_cols*/ 4),
-            None
-        );
-        assert_eq!(
-            usable_content_width(/*total_width*/ 5, /*reserved_cols*/ 4),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn usable_content_width_u16_matches_usize_variant() {
-        assert_eq!(
-            usable_content_width_u16(/*total_width*/ 2, /*reserved_cols*/ 2),
-            None
-        );
-        assert_eq!(
-            usable_content_width_u16(/*total_width*/ 5, /*reserved_cols*/ 4),
-            Some(1)
-        );
+        for (total, reserved, expected) in [
+            (0, 0, None),
+            (2, 2, None),
+            (3, 4, None),
+            (5, 4, Some(1)),
+            (u16::MAX, 0, Some(usize::from(u16::MAX))),
+        ] {
+            assert_eq!(
+                usable_content_width(usize::from(total), usize::from(reserved)),
+                expected,
+                "usize: total={total}, reserved={reserved}"
+            );
+            assert_eq!(
+                usable_content_width_u16(total, reserved),
+                expected,
+                "u16: total={total}, reserved={reserved}"
+            );
+        }
     }
 }

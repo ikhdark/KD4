@@ -628,6 +628,58 @@ async fn backfill_sessions_completes_past_unreadable_rollout() {
 }
 
 #[tokio::test]
+async fn backfill_sessions_retries_rollout_io_failure_without_losing_checkpoint() {
+    let dir = tempdir().expect("tempdir");
+    let home = dir.path();
+    let ids = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+    let mut paths = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        paths.push(write_rollout_in_sessions(
+            home,
+            &format!("2026-01-27T12-3{index}-00"),
+            &format!("2026-01-27T12:3{index}:00Z"),
+            *id,
+            None,
+        ));
+    }
+    let runtime = codex_state::StateRuntime::init(home.to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+    let hidden = home.join("temporarily-unavailable.jsonl");
+    let mut moved = false;
+    backfill_sessions_until(runtime.as_ref(), home, "test-provider", 60, || {
+        // Discovery has completed. A real file disappearance must not become a permanent
+        // skip merely because the bounded open retries are exhausted.
+        if !moved {
+            std::fs::rename(&paths[1], &hidden).expect("hide middle rollout");
+            moved = true;
+        }
+        false
+    })
+    .await;
+    let state = runtime.get_backfill_state().await.expect("pending state");
+    assert_eq!(state.status, BackfillStatus::Pending);
+    assert_eq!(
+        state.last_watermark,
+        Some(format!("sessions/rollout-2026-01-27T12-30-00-{}.jsonl", ids[0]))
+    );
+    for (index, id) in ids.iter().enumerate() {
+        let id = ThreadId::from_string(&id.to_string()).expect("thread id");
+        assert_eq!(runtime.get_thread(id).await.expect("thread").is_some(), index != 1);
+    }
+    std::fs::rename(&hidden, &paths[1]).expect("restore middle rollout");
+    backfill_sessions(runtime.as_ref(), home, "test-provider").await;
+    assert_eq!(
+        runtime.get_backfill_state().await.expect("complete state").status,
+        BackfillStatus::Complete
+    );
+    for id in ids {
+        let id = ThreadId::from_string(&id.to_string()).expect("thread id");
+        assert!(runtime.get_thread(id).await.expect("recovered thread").is_some());
+    }
+}
+
+#[tokio::test]
 async fn stopped_backfill_checkpoints_progress_and_releases_its_claim() {
     let dir = tempdir().expect("tempdir");
     let codex_home = dir.path().to_path_buf();
@@ -869,9 +921,9 @@ async fn backfill_discovery_failure_remains_retryable() {
         .await
         .unwrap();
     backfill_sessions(runtime.as_ref(), dir.path(), "test-provider").await;
-    assert_ne!(
+    assert_eq!(
         runtime.get_backfill_state().await.unwrap().status,
-        BackfillStatus::Complete
+        BackfillStatus::Pending
     );
     std::fs::remove_file(&sessions).unwrap();
     let id = Uuid::new_v4();

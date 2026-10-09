@@ -1114,10 +1114,11 @@ async fn plugin_detail_popup_shows_admin_disabled_status_snapshot() {
     );
 
     while rx.try_recv().is_ok() {}
-    assert!(
-        rx.try_recv().is_err(),
-        "expected no action after rendering disabled install state"
-    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|event| {
+        !matches!(event, AppEvent::FetchPluginInstall { .. } | AppEvent::OpenPluginInstallLoading { .. })
+    }), "admin-disabled install must not dispatch an install");
 }
 
 #[tokio::test]
@@ -1817,45 +1818,15 @@ async fn plugins_popup_search_filters_visible_rows_snapshot() {
         !popup.contains("Calendar") && !popup.contains("Drive"),
         "expected search to leave only matching rows visible, got:\n{popup}"
     );
-}
-
-#[tokio::test]
-async fn plugins_popup_search_matches_plugin_descriptions() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
-
-    render_loaded_plugins_popup(
-        &mut chat,
-        plugins_test_response(vec![plugins_test_curated_marketplace(vec![
-            plugins_test_summary(
-                "plugin-calendar",
-                "calendar",
-                Some("Calendar"),
-                Some("Schedule management."),
-                /*installed*/ false,
-                /*enabled*/ true,
-                PluginInstallPolicy::Available,
-            ),
-            plugins_test_summary(
-                "plugin-drive",
-                "drive",
-                Some("Drive"),
-                Some("Document access."),
-                /*installed*/ false,
-                /*enabled*/ true,
-                PluginInstallPolicy::Available,
-            ),
-        ])]),
-    );
-
+    for _ in 0..3 {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+    }
     type_plugins_search_query(&mut chat, "document");
-
-    let popup = render_bottom_popup(&chat, /*width*/ 100);
-    assert!(
-        popup.contains("Drive") && !popup.contains("Calendar"),
-        "expected plugin search to match descriptions, got:\n{popup}"
-    );
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(popup.contains("Drive") && !popup.contains("Calendar") && !popup.contains("Slack"), "{popup}");
 }
+
+
 
 #[tokio::test]
 async fn plugins_popup_installed_tab_filters_rows_and_clears_search() {
@@ -2697,50 +2668,7 @@ async fn apps_refresh_failure_without_full_snapshot_falls_back_to_installed_apps
     );
 }
 
-#[tokio::test]
-async fn apps_popup_shows_disabled_status_for_installed_but_disabled_apps() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-    chat.config
-        .features
-        .enable(Feature::Apps)
-        .expect("test config should allow feature update");
-    chat.bottom_pane.set_connectors_enabled(/*enabled*/ true);
 
-    chat.on_connectors_loaded(
-        Ok(ConnectorsSnapshot {
-            connectors: vec![AppInfo {
-                id: "connector_1".to_string(),
-                name: "Notion".to_string(),
-                description: Some("Workspace docs".to_string()),
-                logo_url: None,
-                logo_url_dark: None,
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: None,
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                install_url: Some("https://example.test/notion".to_string()),
-                is_accessible: true,
-                is_enabled: false,
-                plugin_display_names: Vec::new(),
-            }],
-        }),
-        /*is_final*/ true,
-    );
-
-    chat.add_connectors_output();
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert!(
-        popup.contains("Installed · Disabled. Press Enter to open the app page"),
-        "expected selected app description to include disabled status, got:\n{popup}"
-    );
-    assert!(
-        popup.contains("enable/disable this app."),
-        "expected selected app description to mention enable/disable action, got:\n{popup}"
-    );
-}
 
 #[tokio::test]
 async fn apps_refresh_preserves_toggled_enabled_state() {
@@ -2820,6 +2748,7 @@ async fn apps_refresh_preserves_toggled_enabled_state() {
 
         chat.add_connectors_output();
         let popup = render_bottom_popup(&chat, /*width*/ 80);
+        assert!(popup.contains("enable/disable this app."), "{popup}");
         assert!(
             popup.contains("Installed · Disabled. Press Enter to open the app page"),
             "expected disabled status to persist after reload, got:\n{popup}"
@@ -2942,21 +2871,14 @@ async fn experimental_features_toggle_saves_on_exit() {
     assert_eq!(updates, vec![(expected_feature, true)]);
 }
 
-#[tokio::test]
-async fn multi_agent_enable_prompt_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.open_multi_agent_enable_prompt();
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("multi_agent_enable_prompt", popup);
-}
 
 #[tokio::test]
 async fn multi_agent_enable_prompt_updates_feature_and_emits_notice() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.open_multi_agent_enable_prompt();
+    assert_chatwidget_snapshot!("multi_agent_enable_prompt", render_bottom_popup(&chat, 80));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     assert_matches!(
@@ -2969,6 +2891,7 @@ async fn multi_agent_enable_prompt_updates_feature_and_emits_notice() {
     };
     let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 120));
     assert!(rendered.contains("Subagents will be enabled in the next session."));
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -3014,14 +2937,7 @@ async fn personality_selection_popup_snapshot() {
     assert_chatwidget_snapshot!("personality_selection_popup", popup);
 }
 
-#[tokio::test]
-async fn skills_menu_default_mentions_shortcut_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.open_skills_menu();
 
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("skills_menu_default_mentions_shortcut", popup);
-}
 
 #[tokio::test]
 async fn skills_shortcuts_do_not_depend_on_removed_mentions_feature() {
@@ -3032,6 +2948,7 @@ async fn skills_shortcuts_do_not_depend_on_removed_mentions_feature() {
 
     chat.open_skills_menu();
     let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("skills_menu_default_mentions_shortcut", popup);
     assert!(popup.contains("Tip: press @ to open this list directly."));
     assert!(!popup.contains("Tip: press $ to open this list directly."));
 }
@@ -3091,6 +3008,7 @@ async fn server_overloaded_error_does_not_switch_models() {
         Some(CodexErrorInfo::ServerOverloaded),
     );
 
+    assert_eq!(chat.current_model(), "gpt-5.2");
     while let Ok(event) = rx.try_recv() {
         if let AppEvent::UpdateModel(model) = event {
             assert_eq!(
@@ -3128,6 +3046,8 @@ async fn model_reasoning_selection_popup_snapshot() {
     chat.open_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Extra high"));
+    assert!(!popup.contains("Extrahigh"));
     assert_chatwidget_snapshot!("model_reasoning_selection_popup", popup);
 }
 
@@ -3209,10 +3129,11 @@ async fn select_ultra_with_multi_agent_thread_limit(max_threads: usize) -> (bool
 }
 
 #[tokio::test]
-async fn ultra_reasoning_selection_warns_for_high_multi_agent_concurrency() {
+async fn ultra_reasoning_selection_warns_at_multi_agent_concurrency_threshold() {
     let (selected_ultra, warnings) =
         select_ultra_with_multi_agent_thread_limit(/*max_threads*/ 8).await;
 
+    assert_eq!(select_ultra_with_multi_agent_thread_limit(7).await, (true, Vec::new()));
     assert!(selected_ultra);
     assert_eq!(warnings.len(), 1);
     assert_chatwidget_snapshot!(
@@ -3221,12 +3142,7 @@ async fn ultra_reasoning_selection_warns_for_high_multi_agent_concurrency() {
     );
 }
 
-#[tokio::test]
-async fn ultra_reasoning_selection_skips_warning_below_threshold() {
-    let below_threshold = select_ultra_with_multi_agent_thread_limit(/*max_threads*/ 7).await;
 
-    assert_eq!(below_threshold, (true, Vec::new()));
-}
 
 #[tokio::test]
 async fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
@@ -3313,7 +3229,7 @@ async fn assert_reasoning_shortcuts_update_effort(
 }
 
 #[tokio::test]
-async fn reasoning_up_shortcuts_raise_reasoning_effort() {
+async fn reasoning_shortcuts_adjust_reasoning_effort() {
     assert_reasoning_shortcuts_update_effort(
         [
             KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT),
@@ -3323,20 +3239,17 @@ async fn reasoning_up_shortcuts_raise_reasoning_effort() {
         /*expect_model_update*/ true,
     )
     .await;
-}
-
-#[tokio::test]
-async fn reasoning_down_shortcuts_lower_reasoning_effort() {
     assert_reasoning_shortcuts_update_effort(
         [
             KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT),
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
         ],
         ReasoningEffortConfig::Low,
-        /*expect_model_update*/ false,
-    )
-    .await;
+        false,
+    ).await;
 }
+
+
 
 #[tokio::test]
 async fn reasoning_shortcut_is_ignored_with_model_popup_open() {
@@ -3362,25 +3275,7 @@ async fn reasoning_shortcut_is_ignored_with_model_popup_open() {
     );
 }
 
-#[tokio::test]
-async fn reasoning_popup_shows_extra_high_with_space() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
 
-    set_chatgpt_auth(&mut chat);
-
-    let preset = get_available_model(&chat, "gpt-5.4");
-    chat.open_reasoning_popup(preset);
-
-    let popup = render_bottom_popup(&chat, /*width*/ 120);
-    assert!(
-        popup.contains("Extra high"),
-        "expected popup to include 'Extra high'; popup: {popup}"
-    );
-    assert!(
-        !popup.contains("Extrahigh"),
-        "expected popup not to include 'Extrahigh'; popup: {popup}"
-    );
-}
 
 #[tokio::test]
 async fn single_reasoning_option_skips_selection() {

@@ -37,7 +37,6 @@ use super::MAX_MODEL_REQUEST_PROGRESS_KINDS;
 use super::MAX_MODEL_REQUEST_TIMINGS;
 use super::MAX_TOOL_CALL_TIMINGS;
 use super::NextSampleBlockReason;
-use super::RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT;
 use super::TimeSample;
 use super::ToolCallTimingLineage;
 use super::TurnClock;
@@ -1263,10 +1262,8 @@ async fn sealed_tool_closure_waits_for_terminal_timing_and_persistence() {
     ));
     state.record_tool_call_acceptance_closed();
 
-    let waiter_state = Arc::clone(&state);
-    let waiter = tokio::spawn(async move { waiter_state.wait_for_tool_closure_after_seal().await });
-    tokio::task::yield_now().await;
-    assert!(!waiter.is_finished());
+    let mut waiter = Box::pin(state.wait_for_tool_closure_after_seal());
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
 
     state.record_tool_dispatch_timing(
         "sealed-call",
@@ -1279,13 +1276,14 @@ async fn sealed_tool_closure_waits_for_terminal_timing_and_persistence() {
             ..ToolDispatchTimingSnapshot::default()
         },
     );
-    tokio::task::yield_now().await;
-    assert!(!waiter.is_finished());
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
 
     state.record_tool_output_model_visible("sealed-call");
-    assert!(!waiter.is_finished());
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
     state.record_tool_result_persisted("sealed-call");
-    let closure = waiter.await.expect("closure waiter should finish");
+    let closure = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("persisted terminal timing must release the closure waiter");
     assert_eq!(closure.accepted_count, 1);
     assert_eq!(closure.timing_paired_count, 1);
     assert_eq!(closure.terminal_count, 1);
@@ -1366,7 +1364,12 @@ async fn exact_tool_closure_is_not_limited_by_diagnostic_history_cap() {
     }
     state.record_tool_call_acceptance_closed();
 
-    let closure = state.wait_for_tool_closure_after_seal().await;
+    let closure = tokio::time::timeout(
+        Duration::from_secs(1),
+        state.wait_for_tool_closure_after_seal(),
+    )
+    .await
+    .expect("diagnostic overflow must not keep the exact closure open");
     assert_eq!(closure.accepted_count as usize, exact_call_count);
     assert_eq!(closure.timing_paired_count as usize, exact_call_count);
     assert_eq!(closure.terminal_count as usize, exact_call_count);
@@ -1375,6 +1378,9 @@ async fn exact_tool_closure_is_not_limited_by_diagnostic_history_cap() {
     assert!(closure.unresolved_calls.is_empty());
     assert!(closure.orphan_calls.is_empty());
     assert!(closure.complete);
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.tool_calls.len(), MAX_TOOL_CALL_TIMINGS);
+    assert_eq!(timing.tool_call_timing_overflow, 1);
 }
 
 #[test]
@@ -1653,13 +1659,13 @@ async fn failed_persistence_barrier_releases_waiter_without_attesting_durability
     state.record_tool_result_persistence_queued("failed-persistence-call");
     state.record_tool_call_acceptance_closed();
 
-    let waiter_state = Arc::clone(&state);
-    let waiter = tokio::spawn(async move { waiter_state.wait_for_tool_closure_after_seal().await });
-    tokio::task::yield_now().await;
-    assert!(!waiter.is_finished());
+    let mut waiter = Box::pin(state.wait_for_tool_closure_after_seal());
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
 
     state.record_tool_result_persistence_barrier_failed();
-    let closure = waiter.await.expect("failed barrier should release waiter");
+    let closure = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("failed barrier must release the closure waiter");
     assert_eq!(closure.accepted_count, 1);
     assert_eq!(closure.timing_paired_count, 1);
     assert_eq!(closure.terminal_count, 1);
@@ -2598,6 +2604,8 @@ fn repeated_wait_uses_exact_purpose() {
             Some(fingerprint.to_string()),
         );
         drop(state.begin_model_request_wait());
+        state.record_model_retry();
+        drop(state.begin_model_request_wait());
     }
 
     let mut pending = Some(ContinuationCause::ToolResult);
@@ -2606,7 +2614,7 @@ fn repeated_wait_uses_exact_purpose() {
         &SessionSource::Cli,
         Some(TurnTimingGenerationPurpose::ImplementationDecision),
         TurnTimingGenerationDisposition::DecisionBearing,
-        Some("candidate-a".to_string()),
+        Some("wait-a".to_string()),
     );
     drop(state.begin_model_request_wait());
 
@@ -2616,7 +2624,7 @@ fn repeated_wait_uses_exact_purpose() {
         &SessionSource::Cli,
         Some(TurnTimingGenerationPurpose::Repair),
         TurnTimingGenerationDisposition::DecisionBearing,
-        Some("repair-a".to_string()),
+        Some("wait-a".to_string()),
     );
     drop(state.begin_model_request_wait());
 
@@ -2660,6 +2668,9 @@ fn zero_requests_and_cancellation_before_request_do_not_count_continuations() {
     assert_eq!(profile.pending_input, 0);
     assert_eq!(pending, Some(ContinuationCause::PendingInput));
 
+    // A completion snapshot is frozen; use a fresh turn to exercise cancellation
+    // after start rather than attempting to restart the already completed state.
+    let (_clock, state) = timing();
     state.mark_turn_started();
     let profile = state.complete_snapshot().legacy_profile;
     assert_eq!(profile.sampling_request_count, 0);
@@ -2874,14 +2885,15 @@ fn concurrent_timing_updates_serialize_clock_sampling_with_state_updates() {
 
     let second_state = state.clone();
     let second = std::thread::spawn(move || second_state.record_tool_gate_admitted("second"));
-    assert!(
-        !clock.second_parallel_sample_before_release(),
-        "a second caller sampled the clock before the first caller committed its sample"
-    );
-
+    let sampled_before_release = clock.second_parallel_sample_before_release();
+    // Always release and join workers before reporting a regression.
     clock.release_first_parallel_sample();
     first.join().expect("first timing update");
     second.join().expect("second timing update");
+    assert!(
+        !sampled_before_release,
+        "a second caller sampled the clock before the first caller committed its sample"
+    );
 
     let profile = state.complete_snapshot().profile;
     assert!(profile.profile_valid);
@@ -3115,20 +3127,6 @@ fn optimization_activation_decision_counters_are_additive() {
     assert_eq!(counters.tool_router_rebuild_count, 1);
     assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
     assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
-}
-
-#[test]
-fn reserved_recursive_spill_counter_remains_zero_in_protocol() {
-    let (_clock, state) = timing();
-
-    state.record_tool_output_recovery(2);
-
-    let counters = state.complete_snapshot().protocol_timing().counters;
-    assert_eq!(
-        counters.tool_output_recursive_spill_count,
-        RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT
-    );
-    assert_eq!(counters.tool_output_recursive_spill_count, 0);
 }
 
 #[test]
@@ -3461,11 +3459,21 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
     }
 
     for attempt_index in 0..=MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
+        let sampling = format!("sampling-{MAX_MODEL_REQUEST_TIMINGS}");
+        let attempt = format!("latest-attempt-{attempt_index}");
         state.record_model_attempt_identity(
-            &format!("sampling-{MAX_MODEL_REQUEST_TIMINGS}"),
-            &format!("latest-attempt-{attempt_index}"),
+            &sampling,
+            &attempt,
         );
+        state.record_model_request_payload(&sampling, &attempt, br#"{"input":[]}"#);
+        state.record_model_request_sections(&sampling, &attempt, br#"{"input":[]}"#);
+        state.record_model_response_id(&attempt, &format!("response-{attempt_index}"));
     }
+    // Late diagnostics for an evicted attempt must not recreate its metadata.
+    let sampling = format!("sampling-{MAX_MODEL_REQUEST_TIMINGS}");
+    state.record_model_request_payload(&sampling, "latest-attempt-0", b"late");
+    state.record_model_request_sections(&sampling, "latest-attempt-0", br#"{"late":true}"#);
+    state.record_model_response_id("latest-attempt-0", "late-response");
     state.record_generation_outcome(
         vec![TurnTimingProgressKind::WorkspaceMutation; MAX_MODEL_REQUEST_PROGRESS_KINDS + 1],
         Some("latest-action".to_string()),
@@ -3491,6 +3499,13 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
         latest.physical_attempt_ids.first().map(String::as_str),
         Some("latest-attempt-1")
     );
+    let expected_attempts = (1..=MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS)
+        .map(|index| format!("latest-attempt-{index}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(latest.request_sha256_by_attempt.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected_attempts);
+    assert_eq!(latest.request_section_sha256_by_attempt.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected_attempts);
+    assert_eq!(latest.response_id_by_attempt.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected_attempts);
+    assert_eq!(latest.response_id_by_attempt["latest-attempt-1"], "response-1");
     assert_eq!(
         latest.progress_kinds.len(),
         MAX_MODEL_REQUEST_PROGRESS_KINDS

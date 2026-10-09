@@ -238,8 +238,13 @@ impl ExecServerHarness {
         &mut self,
         timeout_duration: Duration,
     ) -> anyhow::Result<JSONRPCMessage> {
+        let deadline = Instant::now() + timeout_duration;
         loop {
-            let frame = timeout(timeout_duration, self.websocket.next())
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("timed out waiting for exec-server websocket event"));
+            }
+            let frame = timeout(remaining, self.websocket.next())
                 .await
                 .map_err(|_| anyhow!("timed out waiting for exec-server websocket event"))?
                 .ok_or_else(|| anyhow!("exec-server websocket closed"))??;
@@ -391,4 +396,37 @@ async fn read_listen_url_from_stdout(child: &mut Child) -> anyhow::Result<String
             return Ok(listen_url.to_string());
         }
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(remote_exec_server)]
+async fn websocket_control_frames_do_not_restart_event_timeout() -> anyhow::Result<()> {
+    let mut harness = exec_server().await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut websocket = tokio_tungstenite::accept_async(stream).await?;
+        // With the old per-frame timeout, every control frame restarts the wait
+        // and the eventual JSON message is incorrectly accepted after its budget.
+        for _ in 0..50 {
+            websocket.send(Message::Pong(Vec::new().into())).await?;
+            sleep(Duration::from_millis(10)).await;
+        }
+        websocket.send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into(),
+        )).await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let (websocket, _) = connect_async(format!("ws://{address}")).await?;
+    harness.websocket.close(None).await?;
+    harness.websocket = websocket;
+    let result = timeout(Duration::from_secs(2),
+        harness.next_event_with_timeout(Duration::from_millis(100))).await;
+    peer.abort();
+    let _ = peer.await;
+    let error = result.expect("event wait must remain bounded")
+        .expect_err("control frames must not extend the event deadline");
+    assert!(error.to_string().contains("timed out waiting"), "{error}");
+    Ok(())
 }

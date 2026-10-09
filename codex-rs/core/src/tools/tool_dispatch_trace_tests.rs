@@ -126,8 +126,8 @@ fn live_gate_phases_clear_only_after_the_last_owner_resumes_or_cancels() {
     }
 }
 
-#[test]
-fn process_wait_records_timeout_wake_and_reentry() {
+#[tokio::test(start_paused = true)]
+async fn process_wait_records_timeout_wake_and_reentry() {
     let turn_timing = Arc::new(TurnTimingState::default());
     turn_timing.mark_turn_started();
     let timing =
@@ -288,8 +288,8 @@ async fn confirmed_abort_cleanup_closes_retained_process_lifecycle_before_handle
     timing.mark_handler_exit_if_entered();
 
     let snapshot = timing.snapshot(tokio::time::Instant::now());
-    assert!(snapshot.handler_duration_ms.is_some());
-    assert!(snapshot.exec_spawn_to_exit_ms.is_some());
+    assert_eq!(snapshot.handler_duration_ms, Some(10));
+    assert_eq!(snapshot.exec_spawn_to_exit_ms, Some(10));
     assert!(!snapshot.exec_process_alive_at_delivery);
     assert!(snapshot.exec_cleanup_state_observed);
     assert!(!snapshot.exec_background_process_expected);

@@ -615,6 +615,16 @@ fn agent_status_schema_accepts_every_serialized_status() {
             "advertised agent status schema rejects {value}"
         );
     }
+    for value in [
+        json!("unknown_status"),
+        json!({}),
+        json!({"completed": 42}),
+        json!({"errored": null}),
+        json!({"completed": "done", "errored": "failed"}),
+        json!({"completed_with_surface": {"last_agent_message": null}}),
+    ] {
+        assert!(!validator.is_valid(&value), "schema accepts invalid status {value}");
+    }
 }
 
 #[test]

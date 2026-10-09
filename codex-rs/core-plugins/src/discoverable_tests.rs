@@ -516,15 +516,26 @@ source = "/tmp/{marketplace_name}"
 
     let plugins = load_plugins_config(codex_home.path(), codex_home.path()).await;
     let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let input = discovery_input(plugins, &["sample@openai-bundled"], &[], &[]);
     let discoverable_plugins = list_discoverable_plugins(
         &plugins_manager,
-        discovery_input(plugins, &[], &[], &[]),
+        input.clone(),
         /*auth*/ None,
     )
     .await;
 
     assert_eq!(discoverable_plugins.len(), 1);
     assert_eq!(discoverable_plugins[0].id, "slack@openai-curated");
+
+    // The configured candidate must become discoverable once its source exists;
+    // otherwise the missing-source assertion could pass at the allowlist gate.
+    write_curated_plugin(&marketplace_root, "sample");
+    plugins_manager.clear_cache();
+    let restored = list_discoverable_plugins(&plugins_manager, input, None).await;
+    assert_eq!(
+        restored.into_iter().map(|plugin| plugin.id).collect::<Vec<_>>(),
+        ["sample@openai-bundled", "slack@openai-curated"]
+    );
 }
 
 #[tokio::test]

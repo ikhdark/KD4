@@ -33,7 +33,13 @@ describe("AbortSignal support", () => {
       controller.abort("Test abort");
 
       // The operation should fail because the signal is already aborted
-      await expect(thread.run("Hello, world!", { signal: controller.signal })).rejects.toThrow();
+      await expect(
+        thread.run("Hello, world!", { signal: controller.signal }),
+      ).rejects.toMatchObject({
+        name: "AbortError",
+        code: "ABORT_ERR",
+        cause: "Test abort",
+      });
     } finally {
       cleanup();
       await close();
@@ -56,22 +62,14 @@ describe("AbortSignal support", () => {
 
       const { events } = await thread.runStreamed("Hello, world!", { signal: controller.signal });
 
-      // Attempting to iterate should fail
-      let iterationStarted = false;
       try {
-        for await (const event of events) {
-          iterationStarted = true;
-          // Should not get here
-          expect(event).toBeUndefined();
-        }
-        // If we get here, the test should fail
-        throw new Error(
-          "Expected iteration to throw due to aborted signal, but it completed successfully",
-        );
-      } catch (error) {
-        // We expect an error to be thrown
-        expect(iterationStarted).toBe(false); // Should fail before any iteration
-        expect(error).toBeDefined();
+        await expect(events.next()).rejects.toMatchObject({
+          name: "AbortError",
+          code: "ABORT_ERR",
+          cause: "Test abort",
+        });
+      } finally {
+        await events.return(undefined);
       }
     } finally {
       cleanup();
@@ -80,25 +78,30 @@ describe("AbortSignal support", () => {
   });
 
   it("aborts run() when signal is aborted during execution", async () => {
+    const controller = new AbortController();
+    let reachedModel = false;
+    function* abortAfterRequest(): Generator<SseResponseBody> {
+      // Synchronize with the real HTTP request rather than racing process startup.
+      reachedModel = true;
+      controller.abort("Aborted during execution");
+      yield sse(responseStarted(), assistantMessage("unused"), responseCompleted());
+    }
     const { url, close } = await startResponsesTestProxy({
       statusCode: 200,
-      responseBodies: infiniteShellCall(),
+      responseBodies: abortAfterRequest(),
     });
     const { client, cleanup } = createMockClient(url);
 
     try {
       const thread = client.startThread();
 
-      const controller = new AbortController();
-
-      // Start the operation and abort it immediately after
       const runPromise = thread.run("Hello, world!", { signal: controller.signal });
-
-      // Abort after a tiny delay to simulate aborting during execution
-      setTimeout(() => controller.abort("Aborted during execution"), 10);
-
-      // The operation should fail
-      await expect(runPromise).rejects.toThrow();
+      await expect(runPromise).rejects.toMatchObject({
+        name: "AbortError",
+        code: "ABORT_ERR",
+        cause: "Aborted during execution",
+      });
+      expect(reachedModel).toBe(true);
     } finally {
       cleanup();
       await close();
@@ -133,7 +136,12 @@ describe("AbortSignal support", () => {
             // Continue iterating - should eventually throw
           }
         })(),
-      ).rejects.toThrow();
+      ).rejects.toMatchObject({
+        name: "AbortError",
+        code: "ABORT_ERR",
+        cause: "Aborted during iteration",
+      });
+      expect(eventCount).toBeGreaterThan(0);
     } finally {
       cleanup();
       await close();

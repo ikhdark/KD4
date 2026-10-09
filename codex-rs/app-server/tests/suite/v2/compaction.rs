@@ -64,7 +64,7 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
         responses::ev_assistant_message("m4", "FINAL_REPLY"),
         responses::ev_completed_with_tokens("r4", /*total_tokens*/ 120),
     ]);
-    responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    let requests = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml(
@@ -101,6 +101,10 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
     assert_eq!(started.thread_id, thread_id);
     assert_eq!(completed.thread_id, thread_id);
     assert_eq!(started_id, completed_id);
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3].message_input_texts("user").iter().any(|text| text.contains("LOCAL_SUMMARY")));
 
     Ok(())
 }
@@ -400,6 +404,8 @@ async fn wait_for_turn_completed(mcp: &mut TestAppServer, turn_id: &str) -> Resu
         let completed: TurnCompletedNotification =
             serde_json::from_value(notification.params.clone().expect("turn/completed params"))?;
         if completed.turn.id == turn_id {
+            assert_eq!(completed.turn.status, codex_app_server_protocol::TurnStatus::Completed);
+            assert_eq!(completed.turn.error, None);
             return Ok(());
         }
     }

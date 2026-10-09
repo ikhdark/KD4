@@ -438,15 +438,9 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn windows_build_number_returns_value() {
-        // We can't stably check the version of the GH workers, but we can
-        // at least check that this.
-        let version = windows_build_number().unwrap();
-        assert!(version >= MIN_CONPTY_BUILD);
-    }
-
-    #[test]
     fn conpty_functions_create_and_resize_console() {
+        assert!(windows_build_number().unwrap() >= MIN_CONPTY_BUILD);
+        assert!(crate::conpty_supported());
         let system = ConPtySystem::default();
         let initial_size = PtySize {
             rows: 24,
@@ -522,14 +516,17 @@ mod tests {
 
     #[test]
     fn launch_rejects_nulls_in_every_native_string() {
-        assert!(build_cmdline(&CommandBuilder::new("cmd.exe\0ignored")).is_err());
+        assert_eq!(build_cmdline(&CommandBuilder::new("cmd.exe\0ignored")).unwrap_err().to_string(), "program name contains a null character");
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.arg("argument\0ignored");
+        assert!(build_cmdline(&command).unwrap_err().to_string().starts_with("invalid encoding for command line argument"));
         let mut command = CommandBuilder::new("cmd.exe");
         command.cwd("C:\\bad\0directory");
-        assert!(super::resolve_current_directory(&command).is_err());
+        assert_eq!(super::resolve_current_directory(&command).unwrap_err().to_string(), "current directory contains a null character");
         for (key, value) in [("BAD\0KEY", "value"), ("KEY", "bad\0value")] {
             let mut command = CommandBuilder::new("cmd.exe");
             command.env(key, value);
-            assert!(build_environment_block(&command).is_err());
+            assert_eq!(build_environment_block(&command).unwrap_err().to_string(), "environment contains a null character");
         }
     }
 

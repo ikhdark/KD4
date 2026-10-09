@@ -2327,110 +2327,59 @@ mod tests {
     }
 
     #[test]
-    fn wraps_plain_text_when_width_provided() {
-        let markdown = "This is a simple sentence that should wrap.";
-        let rendered = render_markdown_text_with_width(markdown, Some(16));
-        let lines = lines_to_strings(&rendered);
-        assert_eq!(
-            lines,
-            vec![
+    fn wrapping_preserves_block_structure_and_indent() {
+        for (markdown, width, expected) in [
+            ("This is a simple sentence that should wrap.", 16, vec![
                 "This is a simple".to_string(),
                 "sentence that".to_string(),
                 "should wrap.".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn wraps_list_items_preserving_indent() {
-        let markdown = "- first second third fourth";
-        let rendered = render_markdown_text_with_width(markdown, Some(14));
-        let lines = lines_to_strings(&rendered);
-        assert_eq!(
-            lines,
-            vec!["- first second".to_string(), "  third fourth".to_string(),]
-        );
-    }
-
-    #[test]
-    fn wraps_nested_lists() {
-        let markdown =
-            "- outer item with several words to wrap\n  - inner item that also needs wrapping";
-        let rendered = render_markdown_text_with_width(markdown, Some(20));
-        let lines = lines_to_strings(&rendered);
-        assert_eq!(
-            lines,
-            vec![
+            ]),
+            ("- first second third fourth", 14, vec!["- first second".to_string(), "  third fourth".to_string(),]),
+            ("- outer item with several words to wrap\n  - inner item that also needs wrapping", 20, vec![
                 "- outer item with".to_string(),
                 "  several words to".to_string(),
                 "  wrap".to_string(),
                 "    - inner item".to_string(),
                 "      that also".to_string(),
                 "      needs wrapping".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn wraps_ordered_lists() {
-        let markdown = "1. ordered item contains many words for wrapping";
-        let rendered = render_markdown_text_with_width(markdown, Some(18));
-        let lines = lines_to_strings(&rendered);
-        assert_eq!(
-            lines,
-            vec![
+            ]),
+            ("1. ordered item contains many words for wrapping", 18, vec![
                 "1. ordered item".to_string(),
                 "   contains many".to_string(),
                 "   words for".to_string(),
                 "   wrapping".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn wraps_blockquotes() {
-        let markdown = "> block quote with content that should wrap nicely";
-        let rendered = render_markdown_text_with_width(markdown, Some(22));
-        let lines = lines_to_strings(&rendered);
-        assert_eq!(
-            lines,
-            vec![
+            ]),
+            ("> block quote with content that should wrap nicely", 22, vec![
                 "> block quote with".to_string(),
                 "> content that should".to_string(),
                 "> wrap nicely".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn wraps_blockquotes_inside_lists() {
-        let markdown = "- list item\n  > block quote inside list that wraps";
-        let rendered = render_markdown_text_with_width(markdown, Some(24));
-        let lines = lines_to_strings(&rendered);
-        assert_eq!(
-            lines,
-            vec![
+            ]),
+            ("- list item\n  > block quote inside list that wraps", 24, vec![
                 "- list item".to_string(),
                 "  > block quote inside".to_string(),
                 "  > list that wraps".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn wraps_list_items_containing_blockquotes() {
-        let markdown = "1. item with quote\n   > quoted text that should wrap";
-        let rendered = render_markdown_text_with_width(markdown, Some(24));
-        let lines = lines_to_strings(&rendered);
-        assert_eq!(
-            lines,
-            vec![
+            ]),
+            ("1. item with quote\n   > quoted text that should wrap", 24, vec![
                 "1. item with quote".to_string(),
                 "   > quoted text that".to_string(),
                 "   > should wrap".to_string(),
-            ]
-        );
+            ]),
+        ] {
+            assert_eq!(lines_to_strings(&render_markdown_text_with_width(markdown, Some(width))), expected, "{markdown}");
+        }
     }
+
+
+
+
+
+
+
+
+
+
+
+
 
     #[test]
     fn does_not_wrap_code_blocks() {
@@ -2450,11 +2399,7 @@ mod tests {
         let rendered = render_markdown_text_with_width(url_like, Some(24));
         let lines = lines_to_strings(&rendered);
 
-        assert_eq!(
-            lines.iter().filter(|line| line.contains(url_like)).count(),
-            1,
-            "expected full URL-like token in one rendered line, got: {lines:?}"
-        );
+        assert_eq!(lines, vec![url_like]);
     }
 
     #[test]
@@ -2465,6 +2410,7 @@ mod tests {
         for info in &["rust,no_run", "rust no_run", "rust title=\"demo\""] {
             let markdown = format!("```{info}\nfn main() {{}}\n```\n");
             let rendered = render_markdown_text(&markdown);
+            assert_eq!(lines_to_strings(&rendered), ["fn main() {}"]);
             let has_rgb = rendered.lines.iter().any(|line| {
                 line.spans
                     .iter()
@@ -2599,57 +2545,22 @@ mod tests {
     }
 
     #[test]
-    fn preferred_floor_narrative_retains_readable_width() {
-        let m = TableColumnMetrics {
-            max_width: 40,
-            header_token_width: 15,
-            body_token_width: 8,
-            kind: TableColumnKind::Narrative,
-        };
-        assert_eq!(W::preferred_column_floor(&m, /*min_column_width*/ 3), 16);
-
-        let m2 = TableColumnMetrics {
-            max_width: 12,
-            header_token_width: 6,
-            body_token_width: 8,
-            kind: TableColumnKind::Narrative,
-        };
-        assert_eq!(W::preferred_column_floor(&m2, /*min_column_width*/ 3), 12);
+    fn preferred_column_floors_preserve_readability_and_limits() {
+        for (kind, max_width, header_token_width, body_token_width, expected) in [
+            (TableColumnKind::Narrative, 40, 15, 8, 16),
+            (TableColumnKind::Narrative, 12, 6, 8, 12),
+            (TableColumnKind::TokenHeavy, 80, 5, 60, 16),
+            (TableColumnKind::Compact, 30, 5, 12, 12),
+            (TableColumnKind::Compact, 30, 5, 20, 16),
+        ] {
+            let metrics = TableColumnMetrics { max_width, header_token_width, body_token_width, kind };
+            assert_eq!(W::preferred_column_floor(&metrics, 3), expected);
+        }
     }
 
-    #[test]
-    fn preferred_floor_token_heavy_retains_readable_width() {
-        let m = TableColumnMetrics {
-            max_width: 80,
-            header_token_width: 5,
-            body_token_width: 60,
-            kind: TableColumnKind::TokenHeavy,
-        };
-        assert_eq!(W::preferred_column_floor(&m, /*min_column_width*/ 3), 16);
-    }
 
-    #[test]
-    fn preferred_floor_compact_uses_body_token() {
-        // Compact: max(header_token_width, body_token_width.min(16))
-        let m = TableColumnMetrics {
-            max_width: 30,
-            header_token_width: 5,
-            body_token_width: 12,
-            kind: TableColumnKind::Compact,
-        };
-        // max(5, min(12, 16)) = max(5, 12) = 12
-        assert_eq!(W::preferred_column_floor(&m, /*min_column_width*/ 3), 12);
 
-        // Body token exceeds 16 cap → capped at 16, then max with header
-        let m2 = TableColumnMetrics {
-            max_width: 30,
-            header_token_width: 5,
-            body_token_width: 20,
-            kind: TableColumnKind::Compact,
-        };
-        // max(5, min(20, 16)) = max(5, 16) = 16
-        assert_eq!(W::preferred_column_floor(&m2, /*min_column_width*/ 3), 16);
-    }
+
 
     #[test]
     fn next_column_to_shrink_prefers_token_heavy_then_narrative() {
@@ -2675,99 +2586,49 @@ mod tests {
                 kind: TableColumnKind::Compact,
             },
         ];
-        let idx = W::next_column_to_shrink(&widths, &floors, &metrics);
-        assert_eq!(idx, Some(1), "token-heavy column should shrink first");
+        let mut actual = widths;
+        W::shrink_columns(&mut actual, &floors, &metrics, 59);
+        assert_eq!(actual, [20, 19, 20], "real allocator shrinks token-heavy first");
 
         let widths = [20usize, 8, 20];
-        let idx = W::next_column_to_shrink(&widths, &floors, &metrics);
-        assert_eq!(
-            idx,
-            Some(0),
-            "narrative column should shrink before compact"
-        );
+        let mut actual = widths;
+        W::shrink_columns(&mut actual, &floors, &metrics, 47);
+        assert_eq!(actual, [19, 8, 20], "real allocator shrinks narrative before compact");
     }
 
     // ===== Spillover-detection unit tests =====
 
     #[test]
-    fn spillover_detects_single_cell_row() {
-        let row = make_body_row(
-            vec![make_cell("some trailing text")],
-            /*has_table_pipe_syntax*/ false,
-        );
-        assert!(W::is_spillover_row(&row, /*next_row*/ None));
+    fn spillover_distinguishes_prose_from_explicit_table_rows() {
+        for (cells, pipe, next, expected) in [
+            (vec!["some trailing text"], false, None, true),
+            (vec!["some sparse value"], true, None, false),
+            (vec!["<div>content</div>", "", ""], false, None, true),
+            (vec!["HTML block:", "", ""], false, Some("<div>x</div>"), true),
+            (vec!["HTML block:", "", ""], false, None, true),
+            (vec!["one", "two", "three"], true, None, false),
+            (vec!["one", "two", "three"], false, None, false),
+            (vec!["Status:", "", ""], true, Some("ok"), false),
+            (vec!["Status:", "", ""], false, Some("ok"), false),
+            (vec!["", "", ""], false, None, false),
+        ] {
+            let row = make_body_row(cells.into_iter().map(make_cell).collect(), pipe);
+            let next = next.map(|text| make_body_row(vec![make_cell(text), make_cell(""), make_cell("")], false));
+            assert_eq!(W::is_spillover_row(&row, next.as_ref()), expected);
+        }
     }
 
-    #[test]
-    fn spillover_keeps_single_cell_row_with_table_pipe_syntax() {
-        let row = make_body_row(
-            vec![make_cell("some sparse value")],
-            /*has_table_pipe_syntax*/ true,
-        );
-        assert!(!W::is_spillover_row(&row, /*next_row*/ None));
-    }
 
-    #[test]
-    fn spillover_detects_html_content() {
-        // 3-cell row where only cell 0 has HTML content
-        let row = make_body_row(
-            vec![
-                make_cell("<div>content</div>"),
-                make_cell(""),
-                make_cell(""),
-            ],
-            /*has_table_pipe_syntax*/ false,
-        );
-        assert!(W::is_spillover_row(&row, /*next_row*/ None));
-    }
 
-    #[test]
-    fn spillover_detects_label_followed_by_html() {
-        // cell 0 = "HTML block:" and next_row cell 0 = "<div>x</div>"
-        let row = make_body_row(
-            vec![make_cell("HTML block:"), make_cell(""), make_cell("")],
-            /*has_table_pipe_syntax*/ false,
-        );
-        let next = make_body_row(
-            vec![make_cell("<div>x</div>"), make_cell(""), make_cell("")],
-            /*has_table_pipe_syntax*/ false,
-        );
-        assert!(W::is_spillover_row(&row, Some(&next)));
-    }
 
-    #[test]
-    fn spillover_detects_trailing_html_label() {
-        // "HTML block:" with no next_row → trailing HTML label spillover
-        let row = make_body_row(
-            vec![make_cell("HTML block:"), make_cell(""), make_cell("")],
-            /*has_table_pipe_syntax*/ false,
-        );
-        assert!(W::is_spillover_row(&row, /*next_row*/ None));
-    }
 
-    #[test]
-    fn spillover_keeps_normal_multi_cell_row() {
-        // 3 cells all non-empty → not spillover
-        let row = make_body_row(
-            vec![make_cell("one"), make_cell("two"), make_cell("three")],
-            /*has_table_pipe_syntax*/ true,
-        );
-        assert!(!W::is_spillover_row(&row, /*next_row*/ None));
-    }
 
-    #[test]
-    fn spillover_keeps_label_when_next_is_not_html() {
-        // cell 0 = "Status:" and next_row cell 0 = "ok" → not spillover (not HTML)
-        let row = make_body_row(
-            vec![make_cell("Status:"), make_cell(""), make_cell("")],
-            /*has_table_pipe_syntax*/ true,
-        );
-        let next = make_body_row(
-            vec![make_cell("ok"), make_cell(""), make_cell("")],
-            /*has_table_pipe_syntax*/ true,
-        );
-        assert!(!W::is_spillover_row(&row, Some(&next)));
-    }
+
+
+
+
+
+
 
     #[test]
     fn annotates_explicit_web_link_label_and_visible_destination() {
@@ -2912,6 +2773,10 @@ mod tests {
             /*cwd*/ None,
         );
 
+        let rendered = lines.iter().map(|line| line.line.to_string()).collect::<Vec<_>>().join("\n");
+        for expected in ["https://example.com/inline", "https://example.com/block", "mailto:test@example.com", "https://example.com/label", "https://example.com/table-label"] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
         assert!(lines.iter().all(|line| line.hyperlinks.is_empty()));
     }
 

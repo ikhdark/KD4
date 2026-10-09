@@ -731,6 +731,18 @@ mod tests {
             normalized_proxy_ports(&[8080, 0, 3128, 8080]).expect("valid proxy ports"),
             vec![3128, 8080]
         );
+        let at_limit = (1..=MAX_PROXY_PORTS as u16).collect::<Vec<_>>();
+        assert_eq!(
+            normalized_proxy_ports(&at_limit).expect("all fixed slots are usable"),
+            at_limit
+        );
+        let over_limit = (1..=MAX_PROXY_PORTS as u16 + 1).collect::<Vec<_>>();
+        assert!(
+            normalized_proxy_ports(&over_limit)
+                .expect_err("distinct ports cannot exceed fixed slots")
+                .to_string()
+                .contains("too many loopback proxy ports")
+        );
         let first = loopback_proxy_filter_key(0, 0);
         let last = loopback_proxy_filter_key(1, MAX_PROXY_PORTS - 1);
         assert_eq!(
@@ -753,12 +765,19 @@ mod tests {
 
     #[test]
     fn static_ale_port_blocks_exclude_loopback_proxy_ports() {
+        let mut ports = Vec::new();
         for spec in FILTER_SPECS.iter().filter(|spec| {
             spec.conditions
                 .iter()
                 .any(|condition| matches!(condition, ConditionSpec::RemotePort(_)))
         }) {
             assert!(spec.conditions.contains(&ConditionSpec::NotLoopback));
+            ports.extend(spec.conditions.iter().filter_map(|condition| match condition {
+                ConditionSpec::RemotePort(port) => Some(*port),
+                _ => None,
+            }));
         }
+        ports.sort_unstable();
+        assert_eq!(ports, vec![53, 53, 139, 139, 445, 445, 853, 853]);
     }
 }

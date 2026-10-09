@@ -618,7 +618,11 @@ mod tests {
             ))
             .await
             .expect("second DB page");
-        assert_ne!(first.items[0].thread_id, second.items[0].thread_id);
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(first.items[0].thread_id.to_string(), Uuid::from_u128(201).to_string());
+        assert_eq!(second.items[0].thread_id.to_string(), Uuid::from_u128(202).to_string());
+        assert!(second.next_cursor.is_none());
         assert!(
             second
                 .backwards_cursor
@@ -694,6 +698,10 @@ mod tests {
             .await
             .expect("scan cursor should remain scan-backed");
         assert_eq!(second.items.len(), 1);
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].thread_id.to_string(), Uuid::from_u128(221).to_string());
+        assert_eq!(second.items[0].thread_id.to_string(), Uuid::from_u128(222).to_string());
+        assert!(second.next_cursor.is_none());
     }
 
     #[tokio::test]

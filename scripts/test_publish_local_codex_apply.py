@@ -23,6 +23,46 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
+    def test_recovery_rejects_unowned_paths_without_changing_files(self) -> None:
+        # A durable journal is input, not authority to delete arbitrary paths.
+        # Both rollback and committed cleanup own only the install directory
+        # named by the journal and its transaction-specific sibling directories.
+        for phase in ("Applying", "Committed"):
+            for field in ("InstallDir", "StageRoot", "RollbackRoot"):
+                with self.subTest(phase=phase, field=field), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    install = root / "install"
+                    stage = root / ".install.bundle.fixture"
+                    rollback = root / ".install.rollback.fixture"
+                    unrelated = root / "unrelated"
+                    for path in (install, stage, rollback, unrelated):
+                        path.mkdir()
+                        (path / "keep.txt").write_bytes(path.name.encode())
+                    journal = root / ".install.codex-local-publish.transaction.json"
+                    metadata = {
+                        "SchemaVersion": 1, "TransactionId": "fixture", "Phase": phase,
+                        "InstallDir": str(install), "StageRoot": str(stage),
+                        "RollbackRoot": str(rollback), "HadPreviousInstall": True,
+                        "JournalPath": str(journal), "Entries": [],
+                    }
+                    metadata[field] = str(unrelated)
+                    journal.write_text(json.dumps(metadata), encoding="utf-8")
+                    before = {str(path.relative_to(root)): path.read_bytes()
+                              for path in root.rglob("*") if path.is_file()}
+                    result = subprocess.run(
+                        [self.shell, "-NoProfile", "-Command",
+                         f". {ps_single_quote(SCRIPT)} -ImportOnly; "
+                         f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}"],
+                        env=clean_env(), capture_output=True, text=True,
+                        check=False, timeout=RUN_TIMEOUT_SECONDS,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("Cannot recover runtime bundle transaction", result.stderr)
+                    self.assertEqual(
+                        {str(path.relative_to(root)): path.read_bytes()
+                         for path in root.rglob("*") if path.is_file()}, before,
+                    )
+
     def test_unrelated_executable_is_rejected_before_install(self) -> None:
         install_dir = self.repo_root / "install"
         install_dir.mkdir()
@@ -227,7 +267,6 @@ $transaction = [pscustomobject]@{{
     }})
 }}
 Write-CodexPublishTransactionJournal -Transaction $transaction
-if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)})) {{ throw 'recovery did not run' }}
 """
             result = subprocess.run(
                 [
@@ -245,6 +284,23 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            persisted = json.loads(journal.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["Phase"], "Applying")
+            self.assertEqual(persisted["InstallDir"], str(install_dir))
+            self.assertEqual(persisted["RollbackRoot"], str(rollback))
+            # Recovery must work after the writer exits, with no ambient
+            # $transaction variable left to substitute for the durable journal.
+            result = subprocess.run(
+                [
+                    self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    f". {ps_single_quote(SCRIPT)} -ImportOnly; "
+                    f"if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)})) "
+                    "{ throw 'recovery did not run' }",
+                ],
+                text=True, capture_output=True, check=False,
+                env=clean_env(), timeout=RUN_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(target.read_bytes(), b"old")
             self.assertFalse(journal.exists())
             self.assertFalse(stage.exists())
@@ -366,7 +422,9 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
             for index in range(12):
                 backup = backup_dir / f"codex-20000101T0000{index:02d}000Z.exe"
                 backup.write_bytes(f"backup-{index}".encode("utf-8"))
-                os.utime(backup, (946684800 + index, 946684800 + index))
+                # Retention follows the timestamp in the name, not mutable mtime.
+                timestamp = 946684800 + (11 - index)
+                os.utime(backup, (timestamp, timestamp))
 
             fake_codex = self.copy_valid_codex(
                 temp_path / "fake-codex.exe",
@@ -435,7 +493,19 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertEqual(len(list(backup_dir.glob("codex-2*.exe"))), 10)
+            self.assertCountEqual(
+                [path.read_bytes() for path in backup_dir.glob("codex-2*.exe")],
+                [f"backup-{index}".encode("utf-8") for index in range(10)],
+            )
+            self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
+            self.assertEqual(
+                (install_dir / "codex-code-mode-host.exe").read_bytes(),
+                self.source_code_mode_host_bytes,
+            )
+            host_backups = list(backup_dir.glob("codex-code-mode-host-*.exe"))
+            self.assertEqual(len(host_backups), 1)
+            self.assertEqual(host_backups[0].read_bytes(), b"old-host")
+            self.assert_no_publish_temps(install_dir)
             self.assert_proof_value(result.stdout, "codexBinaryChanged", "false")
             self.assert_proof_value(result.stdout, "codeModeHostBinaryChanged", "true")
 

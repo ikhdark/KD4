@@ -229,20 +229,30 @@ mod tests {
         let manager = SecretsManager::new_with_keyring_store(
             codex_home.path().to_path_buf(),
             SecretsBackendKind::Local,
-            keyring,
+            keyring.clone(),
         );
         let scope = SecretScope::Global;
         let name = SecretName::new("GITHUB_TOKEN")?;
 
         manager.set(&scope, &name, "token-1")?;
+        // Reopen through the public manager: an in-memory-only implementation
+        // must not satisfy the persistence contract.
+        let manager = SecretsManager::new_with_keyring_store(
+            codex_home.path().to_path_buf(),
+            SecretsBackendKind::Local,
+            keyring,
+        );
         assert_eq!(manager.get(&scope, &name)?, Some("token-1".to_string()));
 
         let listed = manager.list(/*scope_filter*/ None)?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, name);
+        assert_eq!(listed[0].scope, scope);
 
         assert!(manager.delete(&scope, &name)?);
         assert_eq!(manager.get(&scope, &name)?, None);
+        assert!(manager.list(None)?.is_empty());
+        assert!(!manager.delete(&scope, &name)?);
         Ok(())
     }
 }

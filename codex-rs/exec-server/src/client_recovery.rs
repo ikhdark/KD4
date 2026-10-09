@@ -247,7 +247,8 @@ impl SessionState {
         let target = response.next_seq.saturating_sub(1);
         if gap.through_seq > target
             || response.exited != gap.exit_seq.is_some()
-            || gap.exit_seq.is_some_and(|seq| seq > target || response.exit_code.is_none())
+            || gap.exit_seq.is_some_and(|seq| seq == 0 || seq > target || response.exit_code.is_none())
+            || (response.closed && gap.exit_seq.is_none_or(|seq| seq >= target))
             || response.chunks.windows(2).any(|pair| pair[0].seq >= pair[1].seq)
             || response.chunks.iter().any(|chunk| {
                 chunk.seq > target || Some(chunk.seq) == gap.exit_seq

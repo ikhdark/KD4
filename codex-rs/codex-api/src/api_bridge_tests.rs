@@ -84,23 +84,27 @@ fn bad_request_transport_errors_publish_bad_request_events() {
 
 #[test]
 fn map_api_error_distinguishes_transport_stream_failures_from_provider_retries() {
-    let transport = map_api_error(ApiError::Stream("websocket closed".to_string()));
+    for (source, message) in [
+        (ApiError::Stream("websocket closed".to_string()), "websocket closed"),
+        (
+            ApiError::Transport(TransportError::Network("connection reset".to_string())),
+            "connection reset",
+        ),
+    ] {
+        let transport = map_api_error(source);
+        let CodexErr::ResponseStreamFailed(error) = transport else {
+            panic!("expected transport stream failure: {transport:?}");
+        };
+        assert_eq!(error.message, message);
+        assert_eq!(error.status, None);
+        assert_eq!(error.request_id, None);
+    }
     let provider = map_api_error(ApiError::Retryable {
         message: "response.failed".to_string(),
         delay: None,
     });
 
-    assert!(matches!(transport, CodexErr::ResponseStreamFailed(_)));
     assert!(matches!(provider, CodexErr::Stream(message, None) if message == "response.failed"));
-}
-
-#[test]
-fn map_api_error_preserves_network_failures_as_transport_stream_failures() {
-    let error = map_api_error(ApiError::Transport(TransportError::Network(
-        "connection reset".to_string(),
-    )));
-
-    assert!(matches!(error, CodexErr::ResponseStreamFailed(_)));
 }
 
 #[test]

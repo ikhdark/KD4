@@ -193,10 +193,9 @@ fn cell_closure_has_reserved_capacity() {
     let peer = HostPeer::new(outgoing_tx);
     let cell = CellId::new("pending-cell".to_string());
     let key = (session_id("session-1"), cell.clone());
-    for index in 0..super::CELL_MESSAGE_CAPACITY {
+    for index in 0..=super::CELL_MESSAGE_CAPACITY {
         let (dispatched_tx, _dispatched_rx) = oneshot::channel();
-        assert!(
-            peer.route_cell_message(
+        let result = peer.route_cell_message(
                 key.clone(),
                 super::CellMessage::Delegate {
                     id: codex_code_mode_protocol::host::DelegateRequestId::new(index as i64),
@@ -208,11 +207,15 @@ fn cell_closure_has_reserved_capacity() {
                     dispatched_tx,
                 },
                 None
-            )
-            .is_ok()
-        );
+            );
+        if index < super::CELL_MESSAGE_CAPACITY {
+            assert_eq!(result, Ok(()));
+        } else {
+            assert_eq!(result, Err("code-mode cell message queue is full".to_string()));
+        }
     }
     assert!(!peer.is_disconnected());
+    peer.close_cell(key.0.clone(), cell.clone());
     peer.close_cell(key.0, cell);
     assert!(!peer.is_disconnected());
     let routes = peer.cell_routes.lock().unwrap();

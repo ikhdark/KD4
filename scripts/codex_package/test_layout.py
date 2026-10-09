@@ -312,6 +312,23 @@ class CopyFileForStagingTest(unittest.TestCase):
                 )
             self.assertIn("Package file digest mismatch", str(cm.exception))
 
+            # A self-consistent inventory must not legitimize a broken alias.
+            metadata_path = package_dir / "codex-package.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["files"] = layout.package_file_inventory(
+                package_dir, variant=PACKAGE_VARIANTS["codex"], spec=spec
+            )
+            metadata["bundleId"] = hashlib.sha256(
+                json.dumps(
+                    metadata["files"], sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            layout.write_json(metadata_path, metadata)
+            with self.assertRaisesRegex(RuntimeError, "Invalid package file contents"):
+                layout.validate_package_dir(
+                    package_dir, PACKAGE_VARIANTS["codex"], spec
+                )
+
     def test_canonical_validation_and_staged_input_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -329,6 +346,7 @@ class CopyFileForStagingTest(unittest.TestCase):
             ]
             for source in sources:
                 write_pe(source)
+                source.write_bytes(source.read_bytes() + source.name.encode())
             inputs = PackageInputs(*sources)
             variant = PACKAGE_VARIANTS["codex"]
             spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
@@ -359,10 +377,16 @@ class CopyFileForStagingTest(unittest.TestCase):
             layout.validate_package_dir(package, variant, spec)
             metadata = json.loads((package / "codex-package.json").read_text())
             self.assertEqual(
-                metadata["buildIdentity"]["inputs"]["entrypoint"],
+                metadata["buildIdentity"]["inputs"],
                 {
-                    "size": 128,
-                    "sha256": hashlib.sha256(sources[0].read_bytes()).hexdigest(),
+                    role: {
+                        "size": len(source.read_bytes()),
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    }
+                    for role, source in zip(
+                        ["entrypoint", "code-mode-host", "ripgrep", "command-runner", "sandbox-setup"],
+                        sources,
+                    )
                 },
             )
             for relative in [

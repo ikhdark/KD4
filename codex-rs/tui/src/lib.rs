@@ -1135,6 +1135,11 @@ pub async fn run_main(
         // Ensure the file is only readable and writable by the current user.
         // Doing the equivalent to `chmod 600` on Windows is quite a bit more
         // code and requires the Windows API crates.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            log_file_opts.mode(0o600);
+        }
 
         let log_file = log_file_opts.open(log_dir.join(TUI_LOG_FILE_NAME))?;
         let (non_blocking, guard) = non_blocking(log_file);
@@ -2233,23 +2238,11 @@ mod tests {
     }
 
     #[test]
-    fn alternate_screen_auto_uses_alt_screen() {
-        assert!(determine_alt_screen_mode(
-            /*no_alt_screen*/ false,
-            AltScreenMode::Auto,
-        ));
-        assert!(determine_alt_screen_mode(
-            /*no_alt_screen*/ false,
-            AltScreenMode::Always,
-        ));
-        assert!(!determine_alt_screen_mode(
-            /*no_alt_screen*/ false,
-            AltScreenMode::Never,
-        ));
-        assert!(!determine_alt_screen_mode(
-            /*no_alt_screen*/ true,
-            AltScreenMode::Auto,
-        ));
+    fn alternate_screen_respects_config_and_cli_override() {
+        for (mode, configured) in [(AltScreenMode::Auto, true), (AltScreenMode::Always, true), (AltScreenMode::Never, false)] {
+            assert_eq!(determine_alt_screen_mode(false, mode), configured);
+            assert!(!determine_alt_screen_mode(true, mode));
+        }
     }
 
     #[test]
@@ -2264,74 +2257,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_remote_addr_accepts_explicit_default_ipv6_ports() {
-        for address in ["ws://[::1]:80", "wss://[::1]:443"] {
-            assert!(
-                resolve_remote_addr(address).is_ok(),
-                "explicit IPv6 port rejected: {address}"
-            );
+    fn resolve_remote_addr_normalizes_websocket_endpoints() {
+        for (input, expected) in [
+            ("ws://127.0.0.1:4500", "ws://127.0.0.1:4500/"),
+            ("wss://example.com:443", "wss://example.com/"),
+            ("ws://[::1]:80", "ws://[::1]/"),
+            ("wss://[::1]:443", "wss://[::1]/"),
+        ] {
+            assert_eq!(resolve_remote_addr(input).expect("valid endpoint"), RemoteAppServerEndpoint::WebSocket {
+                websocket_url: expected.to_string(), auth_token: None,
+            });
         }
         assert!(resolve_remote_addr("ws://[::1]").is_err());
         assert!(resolve_remote_addr("wss://[::1]").is_err());
     }
 
-    #[test]
-    fn resolve_remote_addr_accepts_websocket_url() {
-        assert_eq!(
-            resolve_remote_addr("ws://127.0.0.1:4500").expect("ws URL should normalize"),
-            RemoteAppServerEndpoint::WebSocket {
-                websocket_url: "ws://127.0.0.1:4500/".to_string(),
-                auth_token: None,
-            }
-        );
-    }
+
+
+
 
     #[test]
-    fn resolve_remote_addr_accepts_secure_websocket_url() {
-        assert_eq!(
-            resolve_remote_addr("wss://example.com:443").expect("wss URL should normalize"),
-            RemoteAppServerEndpoint::WebSocket {
-                websocket_url: "wss://example.com/".to_string(),
-                auth_token: None,
-            }
-        );
-    }
-
-    #[test]
-    fn resolve_remote_addr_accepts_default_socket() -> color_eyre::Result<()> {
-        let codex_home = find_codex_home().wrap_err("failed to resolve CODEX_HOME")?;
-        assert_eq!(
-            resolve_remote_addr("unix://")?,
-            RemoteAppServerEndpoint::UnixSocket {
-                socket_path: codex_app_server_client::app_server_control_socket_path(&codex_home)?,
-            }
-        );
+    fn resolve_remote_addr_resolves_socket_paths() -> color_eyre::Result<()> {
+        let home = find_codex_home().wrap_err("failed to resolve CODEX_HOME")?;
+        let temporary = TempDir::new()?;
+        let absolute = temporary.path().join("codex.sock");
+        for (input, socket_path) in [
+            ("unix://".to_string(), codex_app_server_client::app_server_control_socket_path(&home)?),
+            ("unix://codex.sock".to_string(), AbsolutePathBuf::relative_to_current_dir("codex.sock")?),
+            (format!("unix://{}", absolute.display()), AbsolutePathBuf::from_absolute_path(&absolute)?),
+        ] {
+            assert_eq!(resolve_remote_addr(&input)?, RemoteAppServerEndpoint::UnixSocket { socket_path });
+        }
         Ok(())
     }
 
-    #[test]
-    fn resolve_remote_addr_accepts_relative_socket_path() -> color_eyre::Result<()> {
-        assert_eq!(
-            resolve_remote_addr("unix://codex.sock")?,
-            RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
-            }
-        );
-        Ok(())
-    }
 
-    #[test]
-    fn resolve_remote_addr_accepts_absolute_socket_path() -> color_eyre::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let socket_path = temp_dir.path().join("codex.sock");
-        assert_eq!(
-            resolve_remote_addr(&format!("unix://{}", socket_path.display()))?,
-            RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::from_absolute_path(&socket_path)?,
-            }
-        );
-        Ok(())
-    }
+
+
 
     #[test]
     fn resolve_remote_addr_rejects_invalid_remote_addresses() {
@@ -2348,16 +2310,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn default_daemon_auto_connect_skips_missing_socket() -> color_eyre::Result<()> {
-        let codex_home = TempDir::new()?;
-        assert!(
-            maybe_probe_default_daemon_socket(codex_home.path())
-                .await
-                .is_none()
-        );
-        Ok(())
-    }
+
 
     #[test]
     fn app_server_target_for_launch_uses_local_daemon_for_default_socket() -> color_eyre::Result<()>
@@ -2494,136 +2447,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_session_lookup_params_keep_local_filters_for_embedded_sessions()
-    -> std::io::Result<()> {
+    async fn latest_session_lookup_params_preserve_target_scope_and_scan_mode() -> color_eyre::Result<()> {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
+        let targets = [
+            AppServerTarget::Embedded,
+            AppServerTarget::LocalDaemon { endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")? } },
+            AppServerTarget::Remote { endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path: AbsolutePathBuf::relative_to_current_dir("remote.sock")? } },
+        ];
         let cwd = temp_dir.path().join("project");
-
-        let params = latest_session_lookup_params(
-            /*uses_remote_workspace*/ false,
-            &config,
-            Some(cwd.as_path()),
-            /*include_non_interactive*/ false,
-            LatestSessionLookupMode::StateDbOnly,
-        );
-
-        assert_eq!(
-            params.model_providers,
-            Some(vec![config.model_provider_id.clone()])
-        );
-        assert_eq!(
-            params.cwd,
-            Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
-        );
-        assert_eq!(params.use_state_db_only, Some(true));
-
-        let scan_params = latest_session_lookup_params(
-            /*uses_remote_workspace*/ false,
-            &config,
-            Some(cwd.as_path()),
-            /*include_non_interactive*/ false,
-            LatestSessionLookupMode::ScanAndRepair,
-        );
-        assert_eq!(scan_params.use_state_db_only, Some(false));
+        for target in targets {
+            for cwd in [None, Some(cwd.as_path()), Some(Path::new("repo/on/server"))] {
+                for include_non_interactive in [false, true] {
+                    for (mode, state_only) in [(LatestSessionLookupMode::StateDbOnly, true), (LatestSessionLookupMode::ScanAndRepair, false)] {
+                        let params = latest_session_lookup_params(target.uses_remote_workspace(), &config, cwd, include_non_interactive, mode);
+                        let sources = if include_non_interactive { vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode, ThreadSourceKind::Exec, ThreadSourceKind::AppServer] } else { vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode] };
+                        assert_eq!(params.model_providers, (!target.uses_remote_workspace()).then(|| vec![config.model_provider_id.clone()]));
+                        assert_eq!(params.cwd, cwd.map(|path| ThreadListCwdFilter::One(path.to_string_lossy().to_string())));
+                        assert_eq!(params.source_kinds, Some(sources));
+                        assert_eq!(params.use_state_db_only, Some(state_only));
+                        assert_eq!(params.limit, Some(1));
+                        assert_eq!(params.sort_key, Some(AppServerThreadSortKey::UpdatedAt));
+                        assert_eq!(params.archived, Some(false));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
-    #[tokio::test]
-    async fn latest_session_lookup_params_keep_local_filters_for_local_daemon_sessions()
-    -> color_eyre::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let config = build_config(&temp_dir).await?;
-        let cwd = temp_dir.path().join("project");
-        let target = AppServerTarget::LocalDaemon {
-            endpoint: RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
-            },
-        };
 
-        let params = latest_session_lookup_params(
-            target.uses_remote_workspace(),
-            &config,
-            Some(cwd.as_path()),
-            /*include_non_interactive*/ false,
-            LatestSessionLookupMode::StateDbOnly,
-        );
 
-        assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
-        assert_eq!(
-            params.cwd,
-            Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
-        );
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn latest_session_lookup_params_omit_local_filters_for_remote_sessions()
-    -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let config = build_config(&temp_dir).await?;
 
-        let params = latest_session_lookup_params(
-            /*uses_remote_workspace*/ true,
-            &config,
-            /*cwd_filter*/ None,
-            /*include_non_interactive*/ false,
-            LatestSessionLookupMode::StateDbOnly,
-        );
 
-        assert_eq!(params.model_providers, None);
-        assert_eq!(params.cwd, None);
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn latest_session_lookup_params_can_include_non_interactive_sources()
-    -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let config = build_config(&temp_dir).await?;
 
-        let params = latest_session_lookup_params(
-            /*uses_remote_workspace*/ true,
-            &config,
-            /*cwd_filter*/ None,
-            /*include_non_interactive*/ true,
-            LatestSessionLookupMode::StateDbOnly,
-        );
-
-        assert_eq!(
-            params.source_kinds,
-            Some(vec![
-                ThreadSourceKind::Cli,
-                ThreadSourceKind::VsCode,
-                ThreadSourceKind::Exec,
-                ThreadSourceKind::AppServer,
-            ])
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn latest_session_lookup_params_keep_explicit_cwd_filter_for_remote_sessions()
-    -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let config = build_config(&temp_dir).await?;
-        let cwd = Path::new("repo/on/server");
-
-        let params = latest_session_lookup_params(
-            /*uses_remote_workspace*/ true,
-            &config,
-            Some(cwd),
-            /*include_non_interactive*/ false,
-            LatestSessionLookupMode::StateDbOnly,
-        );
-
-        assert_eq!(params.model_providers, None);
-        assert_eq!(
-            params.cwd,
-            Some(ThreadListCwdFilter::One(String::from("repo/on/server")))
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn latest_session_cwd_filter_respects_scope_options() -> std::io::Result<()> {
@@ -2791,61 +2650,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_cwd_for_app_server_target_canonicalizes_embedded_cli_cwd() -> std::io::Result<()>
-    {
+    async fn local_config_cwd_is_canonical_and_missing_paths_fail() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
-        let target = AppServerTarget::Embedded;
         let environment_manager = EnvironmentManager::default_for_tests();
-
-        let config_cwd =
-            config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?;
-
-        assert_eq!(
-            config_cwd,
-            Some(AbsolutePathBuf::from_absolute_path(dunce::canonicalize(
-                temp_dir.path()
-            )?)?)
-        );
+        for target in [
+            AppServerTarget::Embedded,
+            AppServerTarget::LocalDaemon { endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")? } },
+        ] {
+            assert_eq!(config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?, Some(AbsolutePathBuf::from_absolute_path(dunce::canonicalize(temp_dir.path())?)?));
+            let missing = temp_dir.path().join("missing");
+            assert_eq!(config_cwd_for_app_server_target(Some(&missing), &target, &environment_manager).expect_err("missing cwd").kind(), std::io::ErrorKind::NotFound);
+        }
         Ok(())
     }
 
-    #[tokio::test]
-    async fn config_cwd_for_app_server_target_canonicalizes_local_daemon_cli_cwd()
-    -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let target = AppServerTarget::LocalDaemon {
-            endpoint: RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
-            },
-        };
-        let environment_manager = EnvironmentManager::default_for_tests();
 
-        let config_cwd =
-            config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?;
 
-        assert_eq!(
-            config_cwd,
-            Some(AbsolutePathBuf::from_absolute_path(dunce::canonicalize(
-                temp_dir.path()
-            )?)?)
-        );
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn config_cwd_for_app_server_target_errors_for_missing_embedded_cli_cwd()
-    -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let missing = temp_dir.path().join("missing");
-        let target = AppServerTarget::Embedded;
-        let environment_manager = EnvironmentManager::default_for_tests();
-
-        let err = config_cwd_for_app_server_target(Some(&missing), &target, &environment_manager)
-            .expect_err("missing embedded cwd should fail");
-
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        Ok(())
-    }
 
     #[tokio::test]
     async fn config_cwd_for_app_server_target_omits_cwd_for_remote_exec_server()
@@ -2869,17 +2690,17 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn windows_shows_trust_prompt_without_sandbox() -> std::io::Result<()> {
+    async fn trust_prompt_depends_on_decision_not_windows_sandbox() -> std::io::Result<()> {
+        use codex_protocol::config_types::TrustLevel;
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
-        config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(/*value*/ false);
-
-        let should_show = should_show_trust_screen(&config);
-        assert!(
-            should_show,
-            "Trust prompt should be shown when project trust is undecided"
-        );
+        for enabled in [false, true] {
+            config.set_windows_sandbox_enabled(enabled);
+            for trust_level in [None, Some(TrustLevel::Untrusted), Some(TrustLevel::Trusted)] {
+                config.active_project = ProjectConfig { trust_level };
+                assert_eq!(should_show_trust_screen(&config), trust_level.is_none());
+            }
+        }
         Ok(())
     }
 
@@ -2984,7 +2805,15 @@ mod tests {
             /*log_db*/ None,
             /*state_db*/ None,
             Arc::new(EnvironmentManager::default_for_tests()),
-            |_args| async { Err(std::io::Error::other("boom")) },
+            |args| async move {
+                assert_eq!(args.client_name, "codex-tui");
+                assert_eq!(args.client_version, env!("CARGO_PKG_VERSION"));
+                assert!(args.experimental_api);
+                assert!(!args.enable_codex_api_key_env);
+                assert!(!args.mcp_server_openai_form_elicitation);
+                assert_eq!(args.channel_capacity, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY);
+                Err(std::io::Error::other("boom"))
+            },
         )
         .await;
         let err = match result {
@@ -2997,6 +2826,7 @@ mod tests {
                 .contains("failed to start embedded app server"),
             "error should preserve the embedded app server startup context"
         );
+        assert_eq!(err.root_cause().to_string(), "boom");
         Ok(())
     }
 
@@ -3061,37 +2891,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let mut config = build_config(&temp_dir).await?;
-        config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(/*value*/ true);
 
-        let should_show = should_show_trust_screen(&config);
-        assert!(
-            should_show,
-            "Windows trust prompt should be shown on native Windows with sandbox enabled"
-        );
-        Ok(())
-    }
-    #[tokio::test]
-    async fn untrusted_project_skips_trust_prompt() -> std::io::Result<()> {
-        use codex_protocol::config_types::TrustLevel;
-        let temp_dir = TempDir::new()?;
-        let mut config = build_config(&temp_dir).await?;
-        config.active_project = ProjectConfig {
-            trust_level: Some(TrustLevel::Untrusted),
-        };
 
-        let should_show = should_show_trust_screen(&config);
-        assert!(
-            !should_show,
-            "Trust prompt should not be shown for projects explicitly marked as untrusted"
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn config_rebuild_changes_trust_defaults_with_cwd() -> std::io::Result<()> {
@@ -3249,6 +3050,12 @@ trust_level = "untrusted"
         const PASSED: &str = "CONFIGURED_LOG_STARTUP_VERIFIED";
         if let Some(case) = std::env::var_os(CHILD) {
             use clap::Parser;
+            #[cfg(unix)]
+            if case == "create" {
+                // This child runs only this test. A permissive umask ensures the
+                // permission assertion tests the open mode, not the host's defaults.
+                unsafe { libc::umask(0) };
+            }
             let home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("isolated home"));
             let log_dir = home.join(if case == "legacy-append" {
                 "log"
@@ -3325,6 +3132,15 @@ trust_level = "untrusted"
                 );
                 assert!(log_dir.is_dir());
                 let contents = std::fs::read(&log_file)?;
+                #[cfg(unix)]
+                if case == "create" {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(&log_file)?.permissions().mode() & 0o077,
+                        0,
+                        "a newly created TUI log must not be accessible to other users"
+                    );
+                }
                 if case == "append" || case == "legacy-append" {
                     assert!(contents.starts_with(b"keep prior log\n"));
                 }

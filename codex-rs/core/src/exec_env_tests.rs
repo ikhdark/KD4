@@ -12,54 +12,28 @@ fn make_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 
 #[test]
 fn inject_permission_profile_env_overrides_policy_value() {
-    let mut env = HashMap::from([(
-        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
-        "stale-profile".to_string(),
-    )]);
-
-    inject_permission_profile_env(
-        &mut env,
-        Some(&ActivePermissionProfile::new("current-profile")),
-    );
-
-    assert_eq!(
-        env.get(CODEX_PERMISSION_PROFILE_ENV_VAR)
-            .map(String::as_str),
-        Some("current-profile")
-    );
-}
-
-#[test]
-fn inject_permission_profile_env_removes_stale_value_without_active_profile() {
-    let mut env = HashMap::from([(
-        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
-        "stale-profile".to_string(),
-    )]);
-
-    inject_permission_profile_env(&mut env, /*active_permission_profile*/ None);
-
-    assert_eq!(env.get(CODEX_PERMISSION_PROFILE_ENV_VAR), None);
-}
-
-#[test]
-fn inject_permission_profile_env_replaces_differently_cased_windows_key() {
-    let mut env = HashMap::from([(
-        "codex_permission_profile".to_string(),
-        "stale-profile".to_string(),
-    )]);
-
-    inject_permission_profile_env(
-        &mut env,
-        Some(&ActivePermissionProfile::new("current-profile")),
-    );
-
-    assert_eq!(
-        env,
-        HashMap::from([(
-            CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
-            "current-profile".to_string(),
-        )])
-    );
+    for active in [None, Some(ActivePermissionProfile::new("current-profile"))] {
+        let mut env = HashMap::from([
+            (
+                CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+                "stale-profile".to_string(),
+            ),
+            (
+                "codex_permission_profile".to_string(),
+                "stale-alias".to_string(),
+            ),
+            ("UNRELATED".to_string(), "preserved".to_string()),
+        ]);
+        inject_permission_profile_env(&mut env, active.as_ref());
+        let mut expected = HashMap::from([("UNRELATED".to_string(), "preserved".to_string())]);
+        if active.is_some() {
+            expected.insert(
+                CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+                "current-profile".to_string(),
+            );
+        }
+        assert_eq!(env, expected);
+    }
 }
 
 #[test]
@@ -142,12 +116,15 @@ fn test_set_overrides() {
         ..Default::default()
     };
     policy.r#set.insert("NEW_VAR".to_string(), "42".to_string());
+    policy
+        .r#set
+        .insert("PATH".to_string(), "/custom/bin".to_string());
 
     let thread_id = ThreadId::new();
     let result = populate_env(vars, &policy, Some(thread_id));
 
     let mut expected: HashMap<String, String> = hashmap! {
-        "PATH".to_string() => "/usr/bin".to_string(),
+        "PATH".to_string() => "/custom/bin".to_string(),
         "NEW_VAR".to_string() => "42".to_string(),
     };
     expected.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
@@ -157,30 +134,20 @@ fn test_set_overrides() {
 
 #[test]
 fn populate_env_inserts_thread_id() {
-    let vars = make_vars(&[("PATH", "/usr/bin")]);
-    let policy = ShellEnvironmentPolicy::default();
-    let thread_id = ThreadId::new();
-    let result = populate_env(vars, &policy, Some(thread_id));
+    for thread_id in [None, Some(ThreadId::new())] {
+        let vars = make_vars(&[("PATH", "/usr/bin")]);
+        let policy = ShellEnvironmentPolicy::default();
+        let result = populate_env(vars, &policy, thread_id);
 
-    let mut expected: HashMap<String, String> = hashmap! {
-        "PATH".to_string() => "/usr/bin".to_string(),
-    };
-    expected.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
+        let mut expected: HashMap<String, String> = hashmap! {
+            "PATH".to_string() => "/usr/bin".to_string(),
+        };
+        if let Some(thread_id) = thread_id {
+            expected.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
+        }
 
-    assert_eq!(result, expected);
-}
-
-#[test]
-fn populate_env_omits_thread_id_when_missing() {
-    let vars = make_vars(&[("PATH", "/usr/bin")]);
-    let policy = ShellEnvironmentPolicy::default();
-    let result = populate_env(vars, &policy, /*thread_id*/ None);
-
-    let expected: HashMap<String, String> = hashmap! {
-        "PATH".to_string() => "/usr/bin".to_string(),
-    };
-
-    assert_eq!(result, expected);
+        assert_eq!(result, expected);
+    }
 }
 
 #[test]

@@ -2,8 +2,10 @@ use super::*;
 use assert_matches::assert_matches;
 use codex_utils_path_uri::PathUri;
 
+
+
 #[tokio::test]
-async fn status_command_renders_immediately_and_refreshes_rate_limits_for_chatgpt_auth() {
+async fn status_command_refresh_updates_cached_limits_for_future_status_outputs() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     set_chatgpt_auth(&mut chat);
 
@@ -19,32 +21,15 @@ async fn status_command_renders_immediately_and_refreshes_rate_limits_for_chatgp
         !rendered.contains("refreshing limits"),
         "expected /status to avoid transient refresh text in terminal history, got: {rendered}"
     );
-    let request_id = match rx.try_recv() {
-        Ok(AppEvent::RefreshRateLimits {
-            origin: RateLimitRefreshOrigin::StatusCommand { request_id },
-        }) => request_id,
-        other => panic!("expected rate-limit refresh request, got {other:?}"),
-    };
-    pretty_assertions::assert_eq!(request_id, 0);
-}
-
-#[tokio::test]
-async fn status_command_refresh_updates_cached_limits_for_future_status_outputs() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    chat.dispatch_command(SlashCommand::Status);
-
-    match rx.try_recv() {
-        Ok(AppEvent::InsertHistoryCell(_)) => {}
-        other => panic!("expected status output before refresh request, got {other:?}"),
-    }
     let first_request_id = match rx.try_recv() {
         Ok(AppEvent::RefreshRateLimits {
-            origin: RateLimitRefreshOrigin::StatusCommand { request_id },
-        }) => request_id,
+            origin: RateLimitRefreshOrigin::StatusCommand {
+                request_id: first_request_id,
+            },
+        }) => first_request_id,
         other => panic!("expected rate-limit refresh request, got {other:?}"),
     };
+    pretty_assertions::assert_eq!(first_request_id, 0);
 
     chat.finish_status_rate_limit_refresh(first_request_id, Ok(vec![snapshot(/*percent*/ 92.0)]));
     drain_insert_history(&mut rx);

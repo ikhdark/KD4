@@ -2187,13 +2187,25 @@ async fn thread_resume_skips_restored_token_usage_when_turns_are_excluded() -> R
     } = to_response::<ThreadResumeResponse>(second_resume_resp)?;
     assert!(resumed_again.turns.is_empty());
 
-    let second_note = timeout(
+    // Loaded resumes run serially on the thread listener. Its next response is
+    // a barrier after the preceding resume's optional token-usage replay.
+    let barrier_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: resumed_again.id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let barrier_resp = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/tokenUsage/updated"),
+        mcp.read_stream_until_response_message(RequestId::Integer(barrier_id)),
     )
-    .await;
+    .await??;
+    let _: ThreadResumeResponse = to_response(barrier_resp)?;
     assert!(
-        second_note.is_err(),
+        !mcp.pending_notification_methods()
+            .iter()
+            .any(|method| method == "thread/tokenUsage/updated"),
         "excludeTurns=true should not replay token usage"
     );
 
@@ -2891,8 +2903,13 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
+async fn thread_resume_keeps_in_flight_turn_active_until_input_resolves() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("seeded")?,
+        app_test_support::create_request_user_input_sse_response("hold-active")?,
+        create_final_assistant_message_sse_response("Done")?,
+    ])
+    .await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
@@ -2904,6 +2921,7 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
 
     let start_id = primary
         .send_thread_start_request_with_auto_env(ThreadStartParams {
+            approval_policy: Some(AskForApproval::OnRequest),
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -2938,12 +2956,6 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     .await??;
     primary.clear_message_buffer();
 
-    let mut secondary = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
-
     let turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
@@ -2952,42 +2964,85 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
                 text: "respond with docs".to_string(),
                 text_elements: Vec::new(),
             }],
+            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                mode: codex_protocol::config_types::ModeKind::Plan,
+                settings: codex_protocol::config_types::Settings {
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
             ..Default::default()
         })
         .await?;
-    timeout(
+    let turn_response = timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
+    let TurnStartResponse { turn: active_turn } = to_response(turn_response)?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
 
-    let resume_id = secondary
+    // An unanswered request holds the actual loaded turn active without a race
+    // against a delayed model response.
+    let question = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_request_message(),
+    )
+    .await??;
+    let ServerRequest::ToolRequestUserInput { request_id, .. } = &question else {
+        anyhow::bail!("expected pending user input, got {question:?}");
+    };
+
+    let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             ..Default::default()
         })
         .await?;
     let resume_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        secondary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
     )
     .await??;
     let ThreadResumeResponse {
         thread: resumed_thread,
         ..
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
-    assert_ne!(resumed_thread.status, ThreadStatus::NotLoaded);
-
-    timeout(
+    assert_eq!(resumed_thread.id, thread.id);
+    let resumed_turn = resumed_thread
+        .turns
+        .iter()
+        .find(|turn| turn.id == active_turn.id)
+        .expect("resume must retain the active turn");
+    assert_eq!(resumed_turn.status, TurnStatus::InProgress);
+    let replayed = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_request_message(),
+    )
+    .await??;
+    assert_eq!(replayed, question);
+    primary
+        .send_response(
+            request_id.clone(),
+            json!({"answers": {"confirm_path": {"answers": ["yes"]}}}),
+        )
+        .await?;
+    let completed = timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    let completed: codex_app_server_protocol::TurnCompletedNotification =
+        serde_json::from_value(completed.params.expect("turn/completed params"))?;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.id, active_turn.id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+    assert_eq!(completed.turn.error, None);
 
     Ok(())
 }
@@ -3486,13 +3541,8 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     )
     .await??;
 
-    let mut secondary = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
-
-    let resume_id = secondary
+    // Rejoin the existing process; another TestAppServer would cold-resume.
+    let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
             exclude_turns: true,
@@ -3506,7 +3556,7 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
         .await?;
     let resume_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        secondary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
     )
     .await??;
     let ThreadResumeResponse {

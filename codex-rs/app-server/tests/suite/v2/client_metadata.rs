@@ -80,7 +80,7 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
     ]);
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "Hello".to_string(),
@@ -113,8 +113,9 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
     assert_eq!(metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(metadata["thread_source"].as_str(), Some("automation"));
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
-    assert!(metadata.get("installation_id").is_some());
-    assert!(metadata.get("session_id").is_some());
+    assert!(metadata["installation_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert_eq!(metadata["session_id"].as_str(), Some(thread.session_id.as_str()));
+    assert!(metadata["window_id"].as_str().is_some_and(|id| !id.is_empty()));
     assert_eq!(
         metadata["window_id"].as_str(),
         request.header("x-codex-window-id").as_deref()
@@ -494,7 +495,7 @@ async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body
     ]);
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "Hello".to_string(),
@@ -539,7 +540,8 @@ async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body
     assert_eq!(metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(metadata["thread_source"].as_str(), Some("automation"));
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
-    assert!(metadata.get("session_id").is_some());
+    assert_eq!(metadata["session_id"].as_str(), Some(thread.session_id.as_str()));
+    assert!(metadata["window_id"].as_str().is_some_and(|id| !id.is_empty()));
     assert_eq!(
         metadata["window_id"].as_str(),
         request["client_metadata"]["x-codex-window-id"].as_str()

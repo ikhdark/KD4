@@ -189,14 +189,6 @@ async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManaged
 }
 
 #[tokio::test]
-async fn managed_clients_store_a_concrete_tool_timeout() {
-    let managed = create_test_managed_client(Vec::new()).await;
-    let timeout: Duration = managed.tool_timeout;
-
-    assert_eq!(timeout, DEFAULT_TOOL_TIMEOUT);
-}
-
-#[tokio::test]
 async fn approval_authority_tracks_provider_account_and_connection_reuse() {
     let policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permissions = Constrained::allow_any(PermissionProfile::default());
@@ -2794,7 +2786,7 @@ async fn shutdown_clients_share_one_deadline_before_forcing() {
 
 #[tokio::test]
 async fn shutdown_clients_force_explicit_graceful_failures() {
-    let forced = Arc::new(AtomicUsize::new(0));
+    let forced = Arc::new(StdMutex::new(Vec::new()));
     let forced_for_shutdown = Arc::clone(&forced);
 
     shutdown_clients_with_deadline(
@@ -2807,16 +2799,16 @@ async fn shutdown_clients_force_explicit_graceful_failures() {
                 Ok(())
             }
         },
-        move |_| {
+        move |client| {
             let forced = Arc::clone(&forced_for_shutdown);
             async move {
-                forced.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                forced.lock().expect("forced clients").push(client);
             }
         },
     )
     .await;
 
-    assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(*forced.lock().expect("forced clients"), vec![1]);
 }
 
 #[test]

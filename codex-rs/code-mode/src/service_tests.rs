@@ -269,36 +269,22 @@ async fn fallback_provider_uses_in_process_session_when_host_is_missing() {
 }
 
 #[test]
-fn yield_time_does_not_extend_the_default_nested_tool_timeout() {
-    let request = runtime_request(ExecuteRequest {
-        yield_time_ms: Some(120_000),
-        ..execute_request("text('done');")
-    });
-
-    assert_eq!(request.default_tool_timeout_ms, 60_000);
-}
-
-#[test]
-fn host_supplied_default_nested_tool_timeout_reaches_the_runtime() {
-    let request = runtime_request(ExecuteRequest {
-        default_tool_timeout_ms: Some(75_000),
-        ..execute_request("text('done');")
-    });
-
-    assert_eq!(request.default_tool_timeout_ms, 75_000);
-}
-
-#[test]
-fn host_supplied_default_nested_tool_timeout_saturates_at_the_cap() {
-    let request = runtime_request(ExecuteRequest {
-        default_tool_timeout_ms: Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS + 1),
-        ..execute_request("text('done');")
-    });
-
-    assert_eq!(
-        request.default_tool_timeout_ms,
-        codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS
-    );
+fn runtime_request_preserves_nested_timeout_policy_independently_of_yield() {
+    for (default_tool_timeout_ms, expected) in [
+        (None, 60_000),
+        (Some(0), 0),
+        (Some(75_000), 75_000),
+        (Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS), codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS),
+        (Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS + 1), codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS),
+    ] {
+        let request = runtime_request(ExecuteRequest {
+            yield_time_ms: Some(120_000),
+            default_tool_timeout_ms,
+            ..execute_request("text('done');")
+        });
+        assert_eq!(request.default_tool_timeout_ms, expected, "{default_tool_timeout_ms:?}");
+        assert_eq!(request.source, "text('done');");
+    }
 }
 
 async fn execute(service: &InProcessCodeModeSession, request: ExecuteRequest) -> RuntimeResponse {
@@ -1045,84 +1031,31 @@ text("second");"#
 }
 
 #[tokio::test]
-async fn date_locale_string_formats_with_icu_data() {
+async fn date_and_intl_format_with_icu_data() {
     let service = InProcessCodeModeSession::new();
-
-    let response = execute(
-        &service,
-        ExecuteRequest {
-            source: r#"
-const value = new Date("2025-01-02T03:04:05Z")
-  .toLocaleString("fr-FR", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-    timeZone: "UTC",
-  });
-text(value);
-"#
-            .to_string(),
-            yield_time_ms: None,
-            ..execute_request("")
-        },
-    )
-    .await;
-
-    assert_eq!(
-        response,
-        RuntimeResponse::Result {
-            output_loss: None,
-            cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
-            }],
-            error_text: None,
-        }
-    );
-}
-
-#[tokio::test]
-async fn intl_date_time_format_formats_with_icu_data() {
-    let service = InProcessCodeModeSession::new();
-
-    let response = execute(
-        &service,
-        ExecuteRequest {
-            source: r#"
-const formatter = new Intl.DateTimeFormat("fr-FR", {
-  weekday: "long",
-  month: "long",
-  day: "numeric",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hour12: false,
-  timeZone: "UTC",
-});
-text(formatter.format(new Date("2025-01-02T03:04:05Z")));
-"#
-            .to_string(),
-            yield_time_ms: None,
-            ..execute_request("")
-        },
-    )
-    .await;
-
-    assert_eq!(
-        response,
-        RuntimeResponse::Result {
-            output_loss: None,
-            cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
-            }],
-            error_text: None,
-        }
-    );
+    let response = execute(&service, ExecuteRequest {
+        source: r#"
+const date = new Date("2025-01-02T03:04:05Z");
+const options = {
+  weekday: "long", month: "long", day: "numeric",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  hour12: false, timeZone: "UTC",
+};
+text(date.toLocaleString("fr-FR", options));
+text(new Intl.DateTimeFormat("fr-FR", options).format(date));
+"#.into(),
+        yield_time_ms: None,
+        ..execute_request("")
+    }).await;
+    assert_eq!(response, RuntimeResponse::Result {
+        output_loss: None,
+        cell_id: cell_id("1"),
+        content_items: vec![FunctionCallOutputContentItem::InputText {
+            text: "jeudi 2 janvier \u{e0} 03:04:05".into(),
+        }; 2],
+        error_text: None,
+    });
+    service.shutdown().await.unwrap();
 }
 
 #[tokio::test]

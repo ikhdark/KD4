@@ -394,22 +394,23 @@ impl ChatComposer {
             return Vec::new();
         }
 
-        let query_lower = query
-            .chars()
-            .flat_map(char::to_lowercase)
-            .collect::<String>();
+        let query_lower = query.to_lowercase();
         if query_lower.is_empty() {
             return Vec::new();
         }
 
-        let mut folded = String::new();
+        // Match the history traversal's whole-string lowercase operation,
+        // including contextual final sigma. Per-character lowercasing has the
+        // same UTF-8 lengths but can produce a different sigma character.
+        let folded = text.to_lowercase();
+        let mut folded_offset = 0;
         let mut folded_spans: Vec<(Range<usize>, Range<usize>)> = Vec::new();
         for (original_start, ch) in text.char_indices() {
             let original_range = original_start..original_start + ch.len_utf8();
             for lower in ch.to_lowercase() {
-                let folded_start = folded.len();
-                folded.push(lower);
-                folded_spans.push((folded_start..folded.len(), original_range.clone()));
+                let folded_start = folded_offset;
+                folded_offset += lower.len_utf8();
+                folded_spans.push((folded_start..folded_offset, original_range.clone()));
             }
         }
 
@@ -596,6 +597,31 @@ mod tests {
             vec![1..3, 4..5]
         );
         assert!(ChatComposer::case_insensitive_match_ranges("git", "").is_empty());
+    }
+
+    #[test]
+    fn history_search_highlights_contextual_lowercase_matches() {
+        for (text, query, expected_range) in [
+            ("İΣ Alpha", "i\u{307}ς", 0..4),
+            ("prefix ΟΣ suffix", "ΟΣ", 7..11),
+        ] {
+            let (tx, _rx) = unbounded_channel::<AppEvent>();
+            let mut composer =
+                ChatComposer::new(true, AppEventSender::new(tx), true, String::new(), true);
+            composer
+                .history
+                .record_local_submission(HistoryEntry::new(text.to_string()));
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+            for ch in query.chars() {
+                composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+
+            // A successful search must highlight the same substring it matched.
+            // Each capital Greek/Turkish character occupies two original UTF-8
+            // bytes, irrespective of lowercase expansion or final-sigma context.
+            assert_eq!(composer.draft.textarea.text(), text);
+            assert_eq!(composer.history_search_highlight_ranges(), vec![expected_range]);
+        }
     }
 
     #[test]
@@ -878,36 +904,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn history_search_esc_restores_original_draft() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        composer
-            .history
-            .record_local_submission(HistoryEntry::new("remembered command".to_string()));
-        composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
-        composer.draft.textarea.set_cursor(/*pos*/ 2);
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-        assert_eq!(composer.draft.textarea.text(), "draft");
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.text(), "remembered command");
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!composer.history_search_active());
-        assert_eq!(composer.draft.textarea.text(), "draft");
-        assert_eq!(composer.draft.textarea.cursor(), 2);
-    }
 
     #[test]
-    fn history_search_ctrl_c_restores_original_draft() {
+    fn history_search_cancel_keys_restore_original_draft() {
         fn composer_with_search_preview() -> ChatComposer {
             let (tx, _rx) = unbounded_channel::<AppEvent>();
             let sender = AppEventSender::new(tx);
@@ -926,6 +925,7 @@ mod tests {
 
             let _ =
                 composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+            assert_eq!(composer.draft.textarea.text(), "draft");
             let _ =
                 composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
             assert_eq!(composer.draft.textarea.text(), "remembered command");
@@ -933,6 +933,7 @@ mod tests {
         }
 
         for cancel_key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Char('\u{0003}'), KeyModifiers::NONE),
         ] {
@@ -1062,12 +1063,18 @@ mod tests {
         composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(composer.draft.textarea.text(), "git status");
         for ch in ['z', 'z', 'z'] {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
 
         assert!(composer.history_search_active());
         assert_eq!(composer.draft.textarea.text(), "draft");
+        assert!(matches!(
+            composer.history_search.as_ref().unwrap().status,
+            HistorySearchStatus::NoMatch
+        ));
         assert_eq!(composer.footer_mode(), FooterMode::HistorySearch);
     }
 }

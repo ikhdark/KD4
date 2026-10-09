@@ -1013,22 +1013,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_oauth_callback_accepts_default_path() {
-        let parsed = parse_oauth_callback("/callback?code=abc&state=xyz", "/callback");
-        assert!(matches!(parsed, CallbackOutcome::Success(_)));
-    }
-
-    #[test]
-    fn parse_oauth_callback_accepts_custom_path() {
-        let parsed = parse_oauth_callback("/oauth/callback?code=abc&state=xyz", "/oauth/callback");
-        assert!(matches!(parsed, CallbackOutcome::Success(_)));
-    }
-
-    #[test]
-    fn parse_oauth_callback_accepts_callback_id_path() {
-        let parsed =
-            parse_oauth_callback("/callback/abc123?code=abc&state=xyz", "/callback/abc123");
-        assert!(matches!(parsed, CallbackOutcome::Success(_)));
+    fn parse_oauth_callback_preserves_values_for_supported_paths() {
+        for path in ["/callback", "/oauth/callback", "/callback/abc123"] {
+            for (query, code, state) in [
+                ("code=abc&state=xyz", "abc", "xyz"),
+                ("code=a%2Bb&state=x+y", "a+b", "x y"),
+            ] {
+                assert_eq!(
+                    parse_oauth_callback(&format!("{path}?{query}"), path),
+                    CallbackOutcome::Success(super::OauthCallbackResult {
+                        code: code.to_string(),
+                        state: state.to_string(),
+                    }),
+                    "callback {path}?{query}"
+                );
+            }
+        }
     }
 
     #[test]

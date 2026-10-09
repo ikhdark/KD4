@@ -1317,7 +1317,7 @@ mod tests {
         let state =
             NetworkProxyState::with_reloader(initial, Arc::new(StaticReloader { state: reloaded }));
         state
-            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+            .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                 host: "blocked.example".to_string(),
                 reason: "not_allowed".to_string(),
                 client: None,
@@ -1330,9 +1330,10 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert_eq!(state.state.read().await.config.mode, NetworkMode::Full);
         state.force_reload().await.unwrap();
         assert_eq!(
-            state.current_cfg().await.unwrap().mode,
+            state.state.read().await.config.mode,
             NetworkMode::Limited
         );
         let blocked = state.drain_blocked().await.unwrap();
@@ -1357,7 +1358,11 @@ mod tests {
 
     #[tokio::test]
     async fn host_blocked_requires_allowlist_match() {
-        let state = network_proxy_state_for_policy(network_settings(&["example.com"], &[]));
+        // Exercise list membership independently of ambient DNS and its private-address guard.
+        let state = network_proxy_state_for_policy(NetworkProxyConfig {
+            allow_local_binding: true,
+            ..network_settings(&["example.com"], &[])
+        });
 
         assert_eq!(
             state
@@ -1376,7 +1381,10 @@ mod tests {
 
     #[tokio::test]
     async fn add_allowed_domain_removes_matching_deny_entry() {
-        let state = network_proxy_state_for_policy(network_settings(&[], &["example.com"]));
+        let state = network_proxy_state_for_policy(NetworkProxyConfig {
+            allow_local_binding: true,
+            ..network_settings(&[], &["example.com"])
+        });
 
         state.add_allowed_domain("ExAmPlE.CoM").await.unwrap();
 
@@ -1624,7 +1632,14 @@ mod tests {
 
         let blocked = state.drain_blocked().await.expect("drain should succeed");
         assert_eq!(blocked.len(), MAX_BLOCKED_EVENTS);
-        assert_eq!(blocked[0].host, "example5.com");
+        assert_eq!(
+            blocked.iter().map(|entry| entry.host.clone()).collect::<Vec<_>>(),
+            (5..MAX_BLOCKED_EVENTS + 5)
+                .map(|idx| format!("example{idx}.com"))
+                .collect::<Vec<_>>()
+        );
+        assert!(state.drain_blocked().await.unwrap().is_empty());
+        assert_eq!(state.state.read().await.blocked_total, (MAX_BLOCKED_EVENTS + 5) as u64);
     }
 
     #[test]
@@ -1651,7 +1666,10 @@ mod tests {
 
     #[tokio::test]
     async fn host_blocked_subdomain_wildcards_exclude_apex() {
-        let state = network_proxy_state_for_policy(network_settings(&["*.openai.com"], &[]));
+        let state = network_proxy_state_for_policy(NetworkProxyConfig {
+            allow_local_binding: true,
+            ..network_settings(&["*.openai.com"], &[])
+        });
 
         assert_eq!(
             state
@@ -1668,7 +1686,10 @@ mod tests {
 
     #[tokio::test]
     async fn host_blocked_global_wildcard_allowlist_allows_public_hosts_except_denylist() {
-        let state = network_proxy_state_for_policy(network_settings(&["*"], &["evil.example"]));
+        let state = network_proxy_state_for_policy(NetworkProxyConfig {
+            allow_local_binding: true,
+            ..network_settings(&["*"], &["evil.example"])
+        });
 
         assert_eq!(
             state
@@ -2237,35 +2258,21 @@ mod tests {
     }
 
     #[test]
-    fn build_config_state_allows_global_wildcard_allowed_domains() {
-        let mut config = network_settings(&["*"], &[]);
-        config.enabled = true;
+    fn build_config_state_allows_global_allowlist_but_rejects_global_denylist() {
+        for pattern in ["*", "[*]"] {
+            let mut allowed = network_settings(&[pattern], &[]);
+            allowed.enabled = true;
+            let state = build_config_state(allowed, NetworkProxyConstraints::default()).unwrap();
+            assert!(state.allow_set.is_match("example.com"), "{pattern}");
+            assert!(state.deny_set.is_empty());
 
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_ok());
-    }
-
-    #[test]
-    fn build_config_state_allows_bracketed_global_wildcard_allowed_domains() {
-        let mut config = network_settings(&["[*]"], &[]);
-        config.enabled = true;
-
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_ok());
-    }
-
-    #[test]
-    fn build_config_state_rejects_global_wildcard_denied_domains() {
-        let mut config = network_settings(&["example.com"], &["*"]);
-        config.enabled = true;
-
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_err());
-    }
-
-    #[test]
-    fn build_config_state_rejects_bracketed_global_wildcard_denied_domains() {
-        let mut config = network_settings(&["example.com"], &["[*]"]);
-        config.enabled = true;
-
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_err());
+            let mut denied = network_settings(&["example.com"], &[pattern]);
+            denied.enabled = true;
+            let error = build_config_state(denied, NetworkProxyConstraints::default())
+                .err()
+                .expect("global denylist must be rejected");
+            assert!(error.to_string().contains("network.denied_domains"), "{error}");
+        }
     }
 
     #[tokio::test]

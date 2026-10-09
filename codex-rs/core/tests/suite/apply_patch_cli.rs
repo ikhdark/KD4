@@ -219,21 +219,31 @@ async fn apply_patch_cli_multiple_chunks() -> Result<()> {
     require_network!();
 
     let harness = apply_patch_harness().await?;
-
-    harness
-        .write_file("multi.txt", "line1\nline2\nline3\nline4\n")
-        .await?;
-
-    let patch = "*** Begin Patch\n*** Update File: multi.txt\n@@\n-line2\n+changed2\n@@\n-line4\n+changed4\n*** End Patch";
-    let call_id = "apply-multi-chunks";
-    mount_apply_patch(&harness, call_id, patch, "ok").await;
-
-    harness.submit("apply multi-chunk patch").await?;
-
-    assert_eq!(
-        harness.read_file_text("multi.txt").await?,
-        "line1\nchanged2\nline3\nchanged4\n"
-    );
+    let cases = [
+        ("multi.txt", "line1\nline2\nline3\nline4\n",
+            "@@\n-line2\n+changed2\n@@\n-line4\n+changed4",
+            "line1\nchanged2\nline3\nchanged4\n"),
+        ("no_newline.txt", "no newline at end",
+            "@@\n-no newline at end\n+first line\n+second line",
+            "first line\nsecond line"),
+        ("insert_only.txt", "alpha\nomega\n",
+            "@@\n alpha\n+beta\n omega", "alpha\nbeta\nomega\n"),
+        ("tail.txt", "alpha\nlast\n",
+            "@@\n-last\n+end\n*** End of File", "alpha\nend\n"),
+        ("multi_ctx.txt", "fn a\nx=10\ny=2\nfn b\nx=10\ny=20\n",
+            "@@ fn b\n-x=10\n+x=11", "fn a\nx=10\ny=2\nfn b\nx=11\ny=20\n"),
+    ];
+    let mut patch = "*** Begin Patch\n".to_string();
+    for (path, before, hunks, _) in &cases {
+        harness.write_file(path, before).await?;
+        patch.push_str(&format!("*** Update File: {path}\n{hunks}\n"));
+    }
+    patch.push_str("*** End Patch");
+    mount_apply_patch(&harness, "apply-update-variants", &patch, "ok").await;
+    harness.submit("apply each update variant").await?;
+    for (path, _, _, expected) in cases {
+        assert_eq!(harness.read_file_text(path).await?, expected, "{path}");
+    }
     Ok(())
 }
 
@@ -259,49 +269,7 @@ async fn apply_patch_cli_moves_file_to_new_directory() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_cli_updates_file_preserves_missing_trailing_newline() -> Result<()> {
-    require_network!();
 
-    let harness = apply_patch_harness().await?;
-
-    harness
-        .write_file("no_newline.txt", "no newline at end")
-        .await?;
-
-    let patch = "*** Begin Patch\n*** Update File: no_newline.txt\n@@\n-no newline at end\n+first line\n+second line\n*** End Patch";
-    let call_id = "apply-append-nl";
-    mount_apply_patch(&harness, call_id, patch, "ok").await;
-
-    harness.submit("apply newline patch").await?;
-
-    let contents = harness.read_file_text("no_newline.txt").await?;
-    assert_eq!(contents, "first line\nsecond line");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_cli_insert_only_hunk_modifies_file() -> Result<()> {
-    require_network!();
-
-    let harness = apply_patch_harness().await?;
-
-    harness
-        .write_file("insert_only.txt", "alpha\nomega\n")
-        .await?;
-
-    let patch = "*** Begin Patch\n*** Update File: insert_only.txt\n@@\n alpha\n+beta\n omega\n*** End Patch";
-    let call_id = "apply-insert-only";
-    mount_apply_patch(&harness, call_id, patch, "ok").await;
-
-    harness.submit("insert lines via apply_patch").await?;
-
-    assert_eq!(
-        harness.read_file_text("insert_only.txt").await?,
-        "alpha\nbeta\nomega\n"
-    );
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_move_overwrites_existing_destination() -> Result<()> {
@@ -565,8 +533,14 @@ async fn apply_patch_cli_delete_directory_reports_verification_error() -> Result
 async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()> {
     require_network!();
 
-    let harness = apply_patch_harness_with(|builder| {
-        builder.with_config(|config| config.set_windows_elevated_sandbox_enabled(true))
+    let test_root = tempfile::tempdir()?;
+    let work_dir = AbsolutePathBuf::try_from(test_root.path().join("work"))?;
+    std::fs::create_dir_all(work_dir.as_path())?;
+    let harness = apply_patch_harness_with(move |builder| {
+        builder.with_config(move |config| {
+            config.set_windows_elevated_sandbox_enabled(true);
+            config.cwd = work_dir;
+        })
     })
     .await?;
 
@@ -577,7 +551,7 @@ async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()
         .parent()
         .expect("cwd should have parent")
         .join("escape.txt");
-    harness.remove_abs_path(&escape_path).await?;
+    assert!(!escape_path.exists(), "isolated escape target starts absent");
 
     let patch = "*** Begin Patch\n*** Add File: ../escape.txt\n+outside\n*** End Patch";
     let call_id = "apply-path-traversal";
@@ -750,6 +724,10 @@ async fn apply_patch_cli_verification_failure_has_no_side_effects() -> Result<()
 
     harness.submit("attempt partial apply patch").await?;
 
+    let output = harness.apply_patch_output(call_id).await;
+    assert!(output.contains("apply_patch verification failed"), "{output}");
+    assert!(output.contains("Failed to read file to update"), "{output}");
+    assert!(output.contains("missing.txt"), "{output}");
     assert!(
         !harness.path_exists("created.txt").await?,
         "verification failure should prevent any filesystem changes"
@@ -998,22 +976,7 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_cli_end_of_file_anchor() -> Result<()> {
-    require_network!();
 
-    let harness = apply_patch_harness().await?;
-
-    harness.write_file("tail.txt", "alpha\nlast\n").await?;
-
-    let patch = "*** Begin Patch\n*** Update File: tail.txt\n@@\n-last\n+end\n*** End of File\n*** End Patch";
-    let call_id = "apply-eof";
-    mount_apply_patch(&harness, call_id, patch, "ok").await;
-
-    harness.submit("apply EOF-anchored patch").await?;
-    assert_eq!(harness.read_file_text("tail.txt").await?, "alpha\nend\n");
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_missing_second_chunk_context_rejected() -> Result<()> {
@@ -1045,44 +1008,7 @@ async fn apply_patch_cli_missing_second_chunk_context_rejected() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_emits_turn_diff_event_with_unified_diff() -> Result<()> {
-    require_network!();
 
-    let harness = apply_patch_harness().await?;
-    let test = harness.test();
-    let codex = test.codex.clone();
-
-    let call_id = "apply-diff-event";
-    let file = "udiff.txt";
-    let patch = format!("*** Begin Patch\n*** Add File: {file}\n+hello\n*** End Patch\n");
-    mount_apply_patch(&harness, call_id, patch.as_str(), "ok").await;
-
-    submit_without_wait(&harness, "emit diff").await?;
-
-    let mut turn_diffs = Vec::new();
-    wait_for_event(&codex, |event| match event {
-        EventMsg::TurnDiff(ev) => {
-            turn_diffs.push(ev.unified_diff.clone());
-            false
-        }
-        EventMsg::TurnComplete(_) => true,
-        _ => false,
-    })
-    .await;
-
-    assert_eq!(
-        turn_diffs.len(),
-        1,
-        "one workspace change must emit one TurnDiff update"
-    );
-    let diff = &turn_diffs[0];
-    // Basic markers of a unified diff with file addition
-    assert!(diff.contains("diff --git"), "diff header missing: {diff:?}");
-    assert!(diff.contains("--- /dev/null") || diff.contains("--- a/"));
-    assert!(diff.contains("+++ b/"));
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> {
@@ -1140,10 +1066,18 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
         "the first projection must precede the second mutation"
     );
     let diff = &turn_diffs[1];
+    let first_diff = &turn_diffs[0];
+    assert!(first_diff.contains("diff --git"), "{first_diff}");
+    assert!(first_diff.contains("--- /dev/null") || first_diff.contains("--- a/"));
+    assert!(first_diff.contains("+++ b/"));
+    assert!(first_diff.contains("agg/a.txt") && first_diff.contains("+v1\n"), "{first_diff}");
     assert!(diff.contains("agg/a.txt"), "diff missing a.txt");
     assert!(diff.contains("agg/b.txt"), "diff missing b.txt");
     // Final content reflects v2 for a.txt
-    assert!(diff.contains("+v2\n") || diff.contains("v2\n"));
+    assert!(diff.contains("+v2\n") && diff.contains("+B\n"), "{diff}");
+    assert!(!diff.contains("+v1\n"), "aggregate must replace intermediate contents: {diff}");
+    assert_eq!(harness.read_file_text("agg/a.txt").await?, "v2\n");
+    assert_eq!(harness.read_file_text("agg/b.txt").await?, "B\n");
     Ok(())
 }
 
@@ -1221,7 +1155,7 @@ async fn apply_patch_aggregates_diff_preserves_success_after_failure() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_clears_aggregated_diff_after_inexact_delta() -> Result<()> {
+async fn apply_patch_preserves_aggregated_diff_after_unreadable_preimage_refusal() -> Result<()> {
     require_network!();
 
     let harness = apply_patch_harness_with(|builder| {
@@ -1290,24 +1224,4 @@ async fn apply_patch_clears_aggregated_diff_after_inexact_delta() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_change_context_disambiguates_target() -> Result<()> {
-    require_network!();
 
-    let harness = apply_patch_harness().await?;
-
-    harness
-        .write_file("multi_ctx.txt", "fn a\nx=10\ny=2\nfn b\nx=10\ny=20\n")
-        .await?;
-
-    let patch =
-        "*** Begin Patch\n*** Update File: multi_ctx.txt\n@@ fn b\n-x=10\n+x=11\n*** End Patch";
-    let call_id = "apply-ctx";
-    mount_apply_patch(&harness, call_id, patch, "ok").await;
-
-    harness.submit("apply with change_context").await?;
-
-    let contents = harness.read_file_text("multi_ctx.txt").await?;
-    assert_eq!(contents, "fn a\nx=10\ny=2\nfn b\nx=11\ny=20\n");
-    Ok(())
-}

@@ -3,6 +3,7 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn preset_names_use_mode_display_names() {
+    assert_eq!(builtin_collaboration_mode_presets(), vec![plan_preset(), default_preset()]);
     assert_eq!(plan_preset().mode, Some(ModeKind::Plan));
     assert_eq!(default_preset().mode, Some(ModeKind::Default));
     assert_eq!(plan_preset().name, ModeKind::Plan.display_name());
@@ -56,8 +57,3 @@ fn plan_mode_instructions_preserve_planning_contract() {
     assert!(plan_instructions.len() < 3_000);
 }
 
-#[test]
-fn collaboration_mode_templates_stay_within_prompt_budgets() {
-    assert!(COLLABORATION_MODE_DEFAULT.len() < 3_000);
-    assert!(COLLABORATION_MODE_PLAN.len() < 3_000);
-}

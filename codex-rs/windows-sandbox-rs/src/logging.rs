@@ -111,16 +111,17 @@ mod tests {
 
     #[test]
     fn preview_does_not_panic_on_utf8_boundary() {
-        // Place a 4-byte emoji such that naive (byte-based) truncation would split it.
-        let prefix = "x".repeat(LOG_COMMAND_PREVIEW_LIMIT - 1);
-        let command = vec![format!("{prefix}😀")];
-        let result = std::panic::catch_unwind(|| preview(&command));
-        assert!(result.is_ok());
-        let previewed = result.unwrap();
-        assert!(previewed.starts_with(&"x".repeat(97)));
-        assert!(previewed.contains(" … "));
-        assert!(previewed.ends_with('😀'));
-        assert!(previewed.len() <= LOG_COMMAND_PREVIEW_LIMIT);
+        // Exercise both actual truncation boundaries, not just the total byte limit.
+        for (command, expected) in [
+            (format!("{}😀{}", "x".repeat(96), "y".repeat(200)),
+             format!("{} … {}", "x".repeat(96), "y".repeat(98))),
+            (format!("{}😀{}", "x".repeat(200), "y".repeat(96)),
+             format!("{} … {}", "x".repeat(97), "y".repeat(96))),
+            (format!("{}😀", "x".repeat(199)),
+             format!("{} … {}😀", "x".repeat(97), "x".repeat(94))),
+        ] {
+            assert_eq!(preview(&[command]), expected);
+        }
     }
 
     #[test]

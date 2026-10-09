@@ -985,7 +985,7 @@ async fn run_websocket_response_stream(
                 }
             }
             Message::Binary(_) => {
-                return Err(ApiError::Stream("unexpected binary websocket event".into()));
+                return Err(ApiError::invalid_response("unexpected binary websocket event"));
             }
             Message::Close(frame) => {
                 let mut message =
@@ -1102,6 +1102,7 @@ mod tests {
                 None, ResponsesStreamMetadata::default(), None).await
         });
         tokio::task::yield_now().await;
+        assert_eq!(rx.len(), 1, "producer must reach backpressure before time advances");
         tokio::time::advance(Duration::from_millis(100)).await;
         assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
         assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
@@ -1287,26 +1288,20 @@ mod tests {
 
     #[test]
     fn reset_without_close_handshake_maps_to_incomplete_stream_error() {
-        let error = websocket_read_error(WsError::Protocol(
-            ProtocolError::ResetWithoutClosingHandshake,
-        ));
-        let ApiError::Stream(message) = error else {
-            panic!("expected stream error");
-        };
-
-        assert_eq!(message, "websocket closed before response.completed");
-    }
-
-    #[test]
-    fn other_websocket_read_errors_keep_their_message() {
-        let source = WsError::ConnectionClosed;
-        let expected = source.to_string();
+        for (source, expected) in [
+            (
+                WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+                "websocket closed before response.completed".to_string(),
+            ),
+            (WsError::ConnectionClosed, WsError::ConnectionClosed.to_string()),
+        ] {
         let error = websocket_read_error(source);
         let ApiError::Stream(message) = error else {
             panic!("expected stream error");
         };
 
         assert_eq!(message, expected);
+        }
     }
 
     #[tokio::test]
@@ -1866,6 +1861,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_ingress_failure_follows_staged_messages() {
+        for transport_failure in [false, true] {
         let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
         let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
         tx_message
@@ -1873,9 +1869,11 @@ mod tests {
             .expect("message should be staged");
         let (tx_failure, rx_failure) = oneshot::channel();
         tx_failure
-            .send(WsIngressFailure::Overflow(WsError::Io(
+            .send(if transport_failure {
+                WsIngressFailure::Transport(WsError::ConnectionClosed)
+            } else { WsIngressFailure::Overflow(WsError::Io(
                 std::io::Error::other(WEBSOCKET_INGRESS_OVERFLOW_MESSAGE),
-            )))
+            )) })
             .expect("failure receiver should be open");
         let pump_task = tokio::spawn(async {});
         let mut stream = WsStream {
@@ -1903,43 +1901,16 @@ mod tests {
             .await
             .expect("failure should be emitted")
             .expect_err("overflow should fail the stream");
+        if transport_failure {
+            assert!(matches!(error, WsError::ConnectionClosed));
+        } else {
         assert!(
             error
                 .to_string()
                 .contains(WEBSOCKET_INGRESS_OVERFLOW_MESSAGE)
         );
-    }
-
-    #[tokio::test]
-    async fn websocket_ingress_transport_failure_follows_staged_messages() {
-        let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
-        let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
-        let queued = Message::Text("queued".into());
-        tx_message
-            .try_send(queued.clone())
-            .expect("message should be staged");
-        let (tx_failure, rx_failure) = oneshot::channel();
-        tx_failure
-            .send(WsIngressFailure::Transport(WsError::ConnectionClosed))
-            .expect("failure receiver should be open");
-        let mut stream = WsStream {
-            tx_command,
-            rx_message,
-            rx_failure: Some(rx_failure),
-            pending_failure: None,
-            pump_task: tokio::spawn(async {}),
-        };
-
-        let message = stream
-            .next()
-            .await
-            .expect("message should be emitted")
-            .expect("staged message should precede the transport failure");
-        assert_eq!(message, queued);
-        assert!(matches!(
-            stream.next().await.expect("failure should be emitted"),
-            Err(WsError::ConnectionClosed)
-        ));
+        }
+        }
     }
 
     #[tokio::test]
@@ -2094,6 +2065,57 @@ mod tests {
                 "case {case} emitted a response event"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn binary_protocol_violation_is_terminal_through_real_websocket() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (done, wait) = oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async_with_config(
+                    socket, Some(websocket_config()),
+                ).await.unwrap();
+                assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
+                websocket.feed(Message::Binary(b"not a Responses text event".to_vec().into())).await.unwrap();
+                websocket.feed(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"must-not-complete"}}"#.into(),
+                )).await.unwrap();
+                websocket.flush().await.unwrap();
+                let _ = wait.await;
+            });
+            let factory = HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+            let connected = connect_websocket(
+                Url::parse(&format!("ws://{address}/responses")).unwrap(),
+                HeaderMap::new(), &factory, None,
+            ).await.unwrap();
+            let connection = ResponsesWebsocketConnection::new(
+                connected.stream, Duration::from_secs(1), connected.metadata, None,
+            );
+            let mut response = connection.stream_request(test_response_request("test"), false, None).await.unwrap();
+            let mut errors = 0;
+            while let Some(event) = response.next().await {
+                match event {
+                    Err(error) => {
+                        // Complete non-text frames violate the Responses protocol;
+                        // reconnecting cannot repair them (ApiError::invalid_response).
+                        assert!(matches!(&error, ApiError::ProviderFailure { code, message }
+                            if code.as_deref() == Some("invalid_response")
+                                && message == "unexpected binary websocket event"));
+                        assert!(!crate::map_api_error(error).is_retryable());
+                        errors += 1;
+                    }
+                    Ok(ResponseEvent::Completed { .. }) => panic!("completion escaped protocol failure"),
+                    Ok(_) => {}
+                }
+            }
+            assert_eq!(errors, 1);
+            assert!(connection.is_closed().await);
+            done.send(()).unwrap();
+            server.await.unwrap();
+        }).await.expect("binary protocol violation must terminate promptly");
     }
 
     #[tokio::test]

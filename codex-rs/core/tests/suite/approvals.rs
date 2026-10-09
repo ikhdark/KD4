@@ -14,6 +14,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::ExecPolicyAmendment;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::Op;
@@ -66,13 +67,14 @@ impl TargetPath {
     fn resolve_for_patch(self, test: &TestCodex) -> (PathBuf, String) {
         match self {
             TargetPath::Workspace(name) => {
-                let path = test.cwd.path().join(name);
+                let path = test.config.cwd.as_path().join(name);
                 (path, name.to_string())
             }
             TargetPath::OutsideWorkspace(name) => {
                 let path = test
+                    .config
                     .cwd
-                    .path()
+                    .as_path()
                     .parent()
                     .expect("workspace should have a parent")
                     .join(name);
@@ -714,6 +716,7 @@ async fn expect_patch_approval(
 
 async fn wait_for_completion_without_approval(test: &TestCodex) -> AutoCompletion {
     let mut command_end = None;
+    let mut required_tool_error = None;
     loop {
         let event = wait_for_event_with_timeout(
             &test.codex,
@@ -722,6 +725,7 @@ async fn wait_for_completion_without_approval(test: &TestCodex) -> AutoCompletio
                     event,
                     EventMsg::ExecCommandEnd(_)
                         | EventMsg::ExecApprovalRequest(_)
+                        | EventMsg::ApplyPatchApprovalRequest(_)
                         | EventMsg::Error(_)
                         | EventMsg::TurnComplete(_)
                 )
@@ -732,20 +736,20 @@ async fn wait_for_completion_without_approval(test: &TestCodex) -> AutoCompletio
 
         match event {
             EventMsg::ExecCommandEnd(event) => command_end = Some(event),
-            EventMsg::TurnComplete(_) => {
+            EventMsg::TurnComplete(completed) => {
                 return AutoCompletion {
                     command_end,
-                    required_tool_error: None,
+                    required_tool_error: completed
+                        .error
+                        .map(|error| error.message)
+                        .or(required_tool_error),
                 };
             }
             EventMsg::ExecApprovalRequest(event) => {
                 panic!("unexpected approval request: {:?}", event.command)
             }
             EventMsg::Error(error) => {
-                return AutoCompletion {
-                    command_end,
-                    required_tool_error: Some(error.message),
-                };
+                required_tool_error = Some(error.message);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1623,12 +1627,18 @@ fn scenario_group(scenario: &ScenarioSpec) -> ScenarioGroup {
 async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
     eprintln!("running approval scenario: {}", scenario.name);
     let server = start_mock_server().await;
+    // Outside-workspace paths must still be private to this scenario, not fixed
+    // names in the shared system temporary directory.
+    let scenario_root = TempDir::new()?;
+    let workspace = scenario_root.path().join("workspace");
+    fs::create_dir(&workspace)?;
     let approval_policy = scenario.approval_policy;
     let sandbox_policy = scenario.sandbox_policy.clone();
     let features = scenario.features.clone();
     let model_override = scenario.model_override;
     let model = model_override.unwrap_or("gpt-5.4");
     let mut builder = test_codex().with_model(model).with_config(move |config| {
+        config.cwd = workspace.try_into().expect("absolute scenario workspace");
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
         config.set_windows_elevated_sandbox_enabled(true);
         config
@@ -1706,8 +1716,7 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
                     decision: decision.clone(),
                 })
                 .await?;
-            wait_for_completion(&test).await;
-            None
+            Some(wait_for_completion_without_approval(&test).await)
         }
         Outcome::ExecApprovalWithAmendment {
             decision,
@@ -1747,8 +1756,7 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
                     decision: decision.clone(),
                 })
                 .await?;
-            wait_for_completion(&test).await;
-            None
+            Some(wait_for_completion_without_approval(&test).await)
         }
         Outcome::PatchApproval {
             decision,
@@ -1774,22 +1782,7 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
         }
     };
 
-    let execution_rejected = match &scenario.outcome {
-        Outcome::ExecApproval { decision, .. }
-        | Outcome::ExecApprovalWithAmendment { decision, .. } => {
-            matches!(decision, ReviewDecision::Denied | ReviewDecision::Abort)
-        }
-        Outcome::Auto | Outcome::PatchApproval { .. } => false,
-    };
-    let result = if execution_rejected {
-        // A rejected required tool call ends the turn before another model request.
-        // The approval event itself proves the rejection; filesystem expectations
-        // below additionally prove that the command never ran.
-        CommandResult {
-            exit_code: Some(1),
-            stdout: "exec command rejected by user".to_string(),
-        }
-    } else if let Some(command_end) = auto_command_end
+    let result = if let Some(command_end) = auto_command_end
         .as_ref()
         .and_then(|completion| completion.command_end.as_ref())
     {
@@ -2014,9 +2007,12 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
     }
     assert!(
         !child_file.exists(),
-        "an execpolicy amendment must not bypass the child's read-only sandbox"
+        "the initial child invocation retains its pre-amendment sandbox decision"
     );
 
+    // Drain the spawning turn before submitting the rerun, otherwise its queued
+    // completion can falsely satisfy the no-second-approval assertion.
+    wait_for_completion(&test).await;
     submit_turn(
         &test,
         "parent reruns child command",
@@ -2024,11 +2020,20 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
         sandbox_policy,
     )
     .await?;
-    wait_for_completion_without_approval(&test).await;
+    let completion = wait_for_completion_without_approval(&test).await;
+    assert!(completion.required_tool_error.is_none(), "{:?}", completion.required_tool_error);
+    let command_end = completion
+        .command_end
+        .expect("the parent's rerun must actually execute under the amended policy");
+    assert_eq!(command_end.call_id, PARENT_CALL_ID_2);
+    assert_eq!(command_end.exit_code, Some(0), "{command_end:?}");
+    // A persisted explicit Allow rule intentionally bypasses the ordinary
+    // read-only sandbox on future invocations, including the parent session.
     assert!(
-        !child_file.exists(),
-        "the propagated execpolicy amendment must not bypass the parent's read-only sandbox"
+        child_file.is_file(),
+        "the propagated allow rule must authorize the parent's write without another approval"
     );
+    assert_eq!(fs::read(&child_file)?, Vec::<u8>::new());
 
     Ok(())
 }
@@ -2178,6 +2183,7 @@ allow_local_binding = true
         .clone()
         .expect("expected network approval context");
     assert_eq!(network_context.protocol, NetworkApprovalProtocol::Http);
+    assert_eq!(network_context.host, "codex-network-test.invalid");
     let expected_network_amendments = vec![
         NetworkPolicyAmendment {
             host: network_context.host.clone(),
@@ -2267,6 +2273,7 @@ allow_local_binding = true
     .await?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut second_command_end = None;
     loop {
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
@@ -2277,6 +2284,7 @@ allow_local_binding = true
                 matches!(
                     event,
                     EventMsg::ExecApprovalRequest(_)
+                        | EventMsg::ExecCommandEnd(_)
                         | EventMsg::Error(_)
                         | EventMsg::TurnComplete(_)
                 )
@@ -2302,10 +2310,24 @@ allow_local_binding = true
                     })
                     .await?;
             }
+            EventMsg::ExecCommandEnd(event) if event.call_id == call_id_second => {
+                assert!(second_command_end.replace(event).is_none());
+            }
             EventMsg::TurnComplete(_) => break,
             other => panic!("unexpected event: {other:?}"),
         }
     }
+    let command_end = second_command_end.expect("the second tool request must report its denial");
+    // A persisted deny must be enforced without asking again. A declined tool
+    // request has no observed process exit code; requiring the script's exit 1
+    // would incorrectly require execution instead of policy enforcement.
+    assert_eq!(command_end.status, ExecCommandStatus::Declined, "{command_end:?}");
+    assert_eq!(command_end.exit_code, None, "{command_end:?}");
+    assert!(
+        command_end.aggregated_output.contains("codex-network-test.invalid")
+            && command_end.aggregated_output.contains("explicitly denied by policy"),
+        "expected the persisted host policy denial, not an unrelated failure: {command_end:?}"
+    );
 
     Ok(())
 }

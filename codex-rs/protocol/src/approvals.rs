@@ -350,8 +350,12 @@ mod tests {
             requested_schema: serde_json::json!({"type": "string"}),
         };
         assert_eq!(
-            openai_form.to_mcp_create_params()["mode"],
-            serde_json::json!("openai/form")
+            openai_form.to_mcp_create_params(),
+            serde_json::json!({
+                "mode": "openai/form",
+                "message": "extension form",
+                "requestedSchema": {"type": "string"},
+            })
         );
 
         let url = ElicitationRequest::Url {

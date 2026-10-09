@@ -68,8 +68,13 @@ fn install_copies_plugin_into_default_marketplace() {
             installed_path: AbsolutePathBuf::try_from(installed_path.clone()).unwrap(),
         }
     );
-    assert!(installed_path.join(".codex-plugin/plugin.json").is_file());
-    assert!(installed_path.join("skills/SKILL.md").is_file());
+    for relative in [".codex-plugin/plugin.json", "skills/SKILL.md", ".mcp.json"] {
+        assert_eq!(
+            fs::read(installed_path.join(relative)).unwrap(),
+            fs::read(tmp.path().join("sample-plugin").join(relative)).unwrap(),
+            "{relative} must be copied without changing the source or contents"
+        );
+    }
 }
 
 #[test]
@@ -266,13 +271,17 @@ fn remote_plugin_install_metadata_follows_installed_cache_lifecycle() {
     let store = PluginStore::new(tmp.path().to_path_buf());
     let source = AbsolutePathBuf::try_from(tmp.path().join("sample-plugin")).unwrap();
 
+    assert_eq!(store.remote_plugin_id(&plugin_id).unwrap(), None);
+    assert!(store.write_remote_plugin_id(&plugin_id, "plugins~Plugin_sample").is_err());
+    assert!(!store.plugin_base_root(&plugin_id).exists());
+
     store
         .install(source.clone(), plugin_id.clone())
         .expect("install plugin");
     assert_eq!(store.remote_plugin_id(&plugin_id).unwrap(), None);
 
     store
-        .write_remote_plugin_id(&plugin_id, "plugins~Plugin_sample")
+        .write_remote_plugin_id(&plugin_id, "  plugins~Plugin_sample  ")
         .expect("write remote identity");
     let metadata_path = store.remote_plugin_install_metadata_path(&plugin_id);
     assert_eq!(
@@ -296,6 +305,10 @@ fn remote_plugin_install_metadata_follows_installed_cache_lifecycle() {
     store
         .write_remote_plugin_id(&plugin_id, "plugins~Plugin_updated")
         .expect("replace remote identity");
+    assert_eq!(
+        store.write_remote_plugin_id(&plugin_id, "   ").unwrap_err().to_string(),
+        "invalid remote plugin install metadata: remote plugin id must not be blank"
+    );
     assert_eq!(
         store.remote_plugin_id(&plugin_id).unwrap(),
         Some("plugins~Plugin_updated".to_string())

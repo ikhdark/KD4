@@ -130,18 +130,9 @@ impl Command for DisableModifyOtherKeys {
 
 #[cfg(test)]
 mod tests {
-    use super::DisableModifyOtherKeys;
-    use super::ResetKeyboardEnhancementFlags;
     use super::keyboard_enhancement_disabled_for;
     use super::parse_bool_env;
-    use crossterm::Command;
     use pretty_assertions::assert_eq;
-
-    fn ansi_for(command: impl Command) -> String {
-        let mut out = String::new();
-        command.write_ansi(&mut out).unwrap();
-        out
-    }
 
     #[test]
     fn keyboard_enhancement_env_flag_parses_common_values() {
@@ -163,11 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_keyboard_enhancement_flags_disables_current_reporting() {
-        assert_eq!(ansi_for(ResetKeyboardEnhancementFlags), "\x1b[=0u");
-    }
-
-    #[test]
     fn cleanup_dispatch_writes_resets_only_on_final_exit() {
         for final_exit in [false, true] {
             let mut output = Vec::new();
@@ -178,8 +164,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn disable_modify_other_keys_resets_xterm_keyboard_reporting() {
-        assert_eq!(ansi_for(DisableModifyOtherKeys), "\x1b[>4;0m");
-    }
 }

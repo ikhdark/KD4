@@ -765,7 +765,9 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
     let codex_home = TempDir::new().unwrap();
     write_auth_projection_plugin(codex_home.path(), "sample", /*include_app*/ true);
     write_auth_projection_plugin(codex_home.path(), "docs", /*include_app*/ false);
-    let config = auth_projection_config(codex_home.path()).await;
+    let mut config = auth_projection_config(codex_home.path()).await;
+    // Isolate auth projection from the separate remote-catalog cache-key change.
+    config.remote_plugin_enabled = false;
     let manager = PluginsManager::new_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
@@ -803,6 +805,15 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
         ]
     );
 
+    // A reload would now lose the MCP/app declarations. Both projections must
+    // instead derive from the same auth-independent cached plugin payload.
+    for component in [
+        "sample/local/.app.json",
+        "sample/local/.mcp.json",
+        "docs/local/.mcp.json",
+    ] {
+        fs::remove_file(codex_home.path().join("plugins/cache/test").join(component)).unwrap();
+    }
     assert!(manager.set_auth_mode(Some(AuthMode::ApiKey)));
     let api_key_outcome = manager.plugins_for_config(&config).await;
 
@@ -832,6 +843,8 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             },
         ]
     );
+    assert!(manager.set_auth_mode(Some(AuthMode::Chatgpt)));
+    assert_eq!(manager.plugins_for_config(&config).await, chatgpt_outcome);
 }
 
 fn write_plugin_with_version(
@@ -932,20 +945,6 @@ fn backend_header_auth(bearer_token: &'static str) -> CodexAuth {
         http::HeaderValue::from_static(bearer_token),
     );
     CodexAuth::Headers(AuthHeaders::new(headers))
-}
-
-async fn wait_for_received_request_count(server: &MockServer, expected: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let request_count = server.received_requests().await.unwrap_or_default().len();
-            if request_count >= expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("expected plugin request should reach the server");
 }
 
 async fn wait_for_remote_installed_refresh_to_finish(manager: &PluginsManager) {
@@ -2995,8 +2994,12 @@ async fn install_plugin_restores_previous_cache_when_config_update_fails() {
         .await
         .expect_err("config update should fail");
 
-    assert!(installed_root.join("previous-version-marker").is_file());
+    assert_eq!(
+        fs::read_to_string(installed_root.join("previous-version-marker")).unwrap(),
+        "previous version"
+    );
     assert!(!installed_root.join("new-version-marker").exists());
+    assert!(tmp.path().join(CONFIG_TOML_FILE).is_dir());
 }
 
 #[tokio::test]
@@ -3509,7 +3512,11 @@ async fn uninstall_plugin_restores_cache_when_config_update_fails() {
         .await
         .expect_err("config update should fail");
 
-    assert!(installed_root.join("installed-marker").is_file());
+    assert_eq!(
+        fs::read_to_string(installed_root.join("installed-marker")).unwrap(),
+        "installed"
+    );
+    assert!(tmp.path().join(CONFIG_TOML_FILE).is_dir());
 }
 
 #[tokio::test]
@@ -5431,6 +5438,12 @@ plugins = true
     );
 
     let server = MockServer::start().await;
+    let mut config = load_config(tmp.path(), tmp.path()).await;
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let response_manager = Arc::clone(&manager);
+    let response_config = config.clone();
+    let first_request = std::sync::atomic::AtomicBool::new(true);
     let empty_installed_response = serde_json::json!({
         "plugins": [],
         "pagination": {"next_page_token": null}
@@ -5438,38 +5451,34 @@ plugins = true
     Mock::given(method("GET"))
         .and(path("/ps/plugins/installed"))
         .and(header("authorization", "Bearer account-a"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(empty_installed_response)
-                .set_delay(Duration::from_millis(200)),
-        )
+        .respond_with(move |_: &wiremock::Request| {
+            // Invalidate and queue account B before any response for account A can
+            // publish. A wall-clock delay cannot establish this ordering reliably.
+            if first_request.swap(false, Ordering::SeqCst) {
+                response_manager.invalidate_account_scoped_remote_plugin_caches();
+                response_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+                    &response_config,
+                    Some(backend_header_auth("Bearer account-b")),
+                    /*on_effective_plugins_changed*/ None,
+                );
+            }
+            ResponseTemplate::new(200).set_body_json(&empty_installed_response)
+        })
         .expect(3)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/ps/plugins/installed"))
         .and(header("authorization", "Bearer account-b"))
-        .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(20)))
+        .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
 
-    let mut config = load_config(tmp.path(), tmp.path()).await;
-    config.chatgpt_base_url = server.uri();
-    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
     let auth_a = backend_header_auth("Bearer account-a");
-    let auth_b = backend_header_auth("Bearer account-b");
 
     manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
         &config,
         Some(auth_a),
-        /*on_effective_plugins_changed*/ None,
-    );
-    wait_for_received_request_count(&server, 1).await;
-
-    manager.invalidate_account_scoped_remote_plugin_caches();
-    manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
-        &config,
-        Some(auth_b),
         /*on_effective_plugins_changed*/ None,
     );
     wait_for_remote_installed_refresh_to_finish(&manager).await;
@@ -5560,21 +5569,33 @@ plugins = true
     );
 
     let server = MockServer::start().await;
+    let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+    let (response_release_tx, response_release_rx) = std::sync::mpsc::channel();
+    let response_release_rx = std::sync::Mutex::new(response_release_rx);
+    let request_seen_tx = std::sync::Mutex::new(Some(request_seen_tx));
     Mock::given(method("GET"))
         .and(path("/ps/plugins/suggested"))
         .and(header("authorization", "Bearer account-a"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "enabled": true,
-                    "plugins": [{
-                        "id": "plugin-a",
-                        "name": "plugin-a",
-                        "release": {"display_name": "Account A Plugin"}
-                    }]
-                }))
-                .set_delay(Duration::from_millis(200)),
-        )
+        .respond_with(move |_: &wiremock::Request| {
+            if let Some(sender) = request_seen_tx.lock().unwrap().take() {
+                sender.send(()).expect("request observer");
+                // Wiremock serves on another thread. Hold its response until the
+                // test has stopped polling A; biased selection alone is not a barrier.
+                response_release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release account A response");
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "enabled": true,
+                "plugins": [{
+                    "id": "plugin-a",
+                    "name": "plugin-a",
+                    "release": {"display_name": "Account A Plugin"}
+                }]
+            }))
+        })
         .expect(1)
         .mount(&server)
         .await;
@@ -5607,16 +5628,21 @@ plugins = true
         }],
     };
 
-    let request_a = {
-        let manager = Arc::clone(&manager);
-        let config = config.clone();
-        tokio::spawn(async move {
-            manager
-                .recommended_plugins_mode_for_config(&config, Some(&auth_a))
-                .await
-        })
-    };
-    wait_for_received_request_count(&server, 1).await;
+    let mut request_a = Box::pin(manager.recommended_plugins_mode_for_config(&config, Some(&auth_a)));
+    // The responder cannot return before this selection finishes, so A must
+    // remain pending even if its poll races with the request-observed signal.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            biased;
+            seen = request_seen_rx => seen.expect("account A request observed"),
+            _ = &mut request_a => panic!("account A completed before request observation"),
+        }
+    })
+    .await
+    .expect("account A request must reach the server");
+    // Release Wiremock before asking it to handle B. A's owning future remains
+    // unpolled until B publishes, so receiving the response cannot publish A yet.
+    response_release_tx.send(()).expect("release HTTP responder");
 
     manager.invalidate_account_scoped_remote_plugin_caches();
     assert_eq!(
@@ -5625,10 +5651,7 @@ plugins = true
             .await,
         expected_b
     );
-    assert_eq!(
-        request_a.await.expect("account A recommendation task"),
-        RecommendedPluginsMode::Legacy
-    );
+    assert_eq!(request_a.await, RecommendedPluginsMode::Legacy);
     assert_eq!(
         manager
             .recommended_plugins_mode_for_config(&config, Some(&auth_b))

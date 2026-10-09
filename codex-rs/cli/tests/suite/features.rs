@@ -34,36 +34,25 @@ fn strict_config_is_not_supported_for_cloud_command() -> Result<()> {
 }
 
 #[tokio::test]
-async fn features_enable_writes_feature_flag_to_config() -> Result<()> {
+async fn features_enable_and_disable_persist_without_losing_other_settings() -> Result<()> {
     let codex_home = TempDir::new()?;
-
-    let mut cmd = codex_command(codex_home.path())?;
-    cmd.args(["features", "enable", "unified_exec"])
-        .assert()
-        .success()
-        .stdout(contains("Enabled feature `unified_exec` in config.toml."));
-
-    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    assert!(config.contains("[features]"));
-    assert!(config.contains("unified_exec = true"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn features_disable_writes_feature_flag_to_config() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut cmd = codex_command(codex_home.path())?;
-    cmd.args(["features", "disable", "shell_tool"])
-        .assert()
-        .success()
-        .stdout(contains("Disabled feature `shell_tool` in config.toml."));
-
-    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    assert!(config.contains("[features]"));
-    assert!(config.contains("shell_tool = false"));
-
+    std::fs::write(codex_home.path().join("config.toml"), "model = \"test-model\"\n")?;
+    for (command, feature, enabled, message) in [
+        ("enable", "unified_exec", true, "Enabled"),
+        ("disable", "shell_tool", false, "Disabled"),
+    ] {
+        codex_command(codex_home.path())?
+            .args(["features", command, feature])
+            .assert()
+            .success()
+            .stdout(contains(format!("{message} feature `{feature}` in config.toml.")));
+        let config: toml::Value = toml::from_str(
+            &std::fs::read_to_string(codex_home.path().join("config.toml"))?,
+        )?;
+        assert_eq!(config["model"].as_str(), Some("test-model"));
+        assert_eq!(config["features"][feature].as_bool(), Some(enabled));
+        assert_eq!(config["features"]["unified_exec"].as_bool(), Some(true));
+    }
     Ok(())
 }
 
@@ -124,7 +113,10 @@ async fn features_list_is_sorted_alphabetically_by_feature_name() -> Result<()> 
                 .expect("feature list output should contain aligned columns")
         })
         .collect::<Vec<_>>();
-    let mut expected_names = actual_names.clone();
+    let mut expected_names = codex_features::user_settable_features()
+        .map(|feature| feature.key.to_string())
+        .collect::<Vec<_>>();
+    assert!(!expected_names.is_empty());
     expected_names.sort();
 
     assert_eq!(actual_names, expected_names);

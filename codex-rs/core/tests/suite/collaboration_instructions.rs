@@ -64,7 +64,7 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
     require_network!();
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(
+    let req1 = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -94,6 +94,14 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        count_messages_containing(
+            &developer_texts(&req1.single_request().input()),
+            &collab_xml(active_instructions),
+        ),
+        1,
+        "the instructions must be active before changing them"
+    );
 
     test.codex
         .submit(Op::UserInput {
@@ -167,51 +175,7 @@ async fn no_collaboration_instructions_by_default() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_input_includes_collaboration_instructions_after_override() -> Result<()> {
-    require_network!();
 
-    let server = start_mock_server().await;
-    let req = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-
-    let test = test_codex().build(&server).await?;
-
-    let collab_text = "collab instructions";
-    let collaboration_mode = collab_mode_with_instructions(Some(collab_text));
-    core_test_support::submit_thread_settings(
-        &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
-            collaboration_mode: Some(collaboration_mode),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let input = req.single_request().input();
-    let dev_texts = developer_texts(&input);
-    let collab_text = collab_xml(collab_text);
-    assert_eq!(count_messages_containing(&dev_texts, &collab_text), 1);
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaboration_instructions_added_on_user_turn() -> Result<()> {
@@ -379,7 +343,7 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
     require_network!();
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(
+    let req1 = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -416,6 +380,14 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        count_messages_containing(
+            &developer_texts(&req1.single_request().input()),
+            &collab_xml(first_text),
+        ),
+        1,
+        "the instructions must be active before changing them"
+    );
 
     core_test_support::submit_thread_settings(
         &test.codex,

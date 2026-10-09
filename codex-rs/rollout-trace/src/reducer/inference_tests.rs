@@ -69,35 +69,16 @@ fn cancelled_inference_reduces_partial_response_items() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn cancelled_turn_closes_running_inference_call() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_writer(&temp)?;
-    start_turn(&writer, "turn-1")?;
 
-    let request = writer.write_json_payload(
-        RawPayloadKind::InferenceRequest,
-        &json!({
-            "input": [message("user", "wait")]
-        }),
-    )?;
-    append_inference_start(&writer, "inference-1", "turn-1", request)?;
-    let turn_end = writer.append(RawTraceEventPayload::CodexTurnEnded {
-        codex_turn_id: "turn-1".to_string(),
-        status: ExecutionStatus::Cancelled,
-    })?;
-
-    let rollout = replay_bundle(temp.path())?;
-    let inference = &rollout.inference_calls["inference-1"];
-
-    assert_eq!(inference.execution.status, ExecutionStatus::Cancelled);
-    assert_eq!(inference.execution.ended_seq, Some(turn_end.seq));
-
-    Ok(())
-}
 
 #[test]
 fn late_cancelled_inference_preserves_turn_end_status() -> anyhow::Result<()> {
+    for (turn_status, expected_status) in [
+        (ExecutionStatus::Completed, ExecutionStatus::Cancelled),
+        (ExecutionStatus::Cancelled, ExecutionStatus::Cancelled),
+        (ExecutionStatus::Failed, ExecutionStatus::Failed),
+        (ExecutionStatus::Aborted, ExecutionStatus::Aborted),
+    ] {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
@@ -111,8 +92,15 @@ fn late_cancelled_inference_preserves_turn_end_status() -> anyhow::Result<()> {
     append_inference_start(&writer, "inference-1", "turn-1", request)?;
     let turn_end = writer.append(RawTraceEventPayload::CodexTurnEnded {
         codex_turn_id: "turn-1".to_string(),
-        status: ExecutionStatus::Failed,
+        status: turn_status,
     })?;
+
+    let before_late_response = replay_bundle(temp.path())?;
+    let inference = &before_late_response.inference_calls["inference-1"];
+    assert_eq!(inference.execution.status, expected_status);
+    assert_eq!(inference.execution.ended_seq, Some(turn_end.seq));
+    assert_eq!(inference.execution.ended_at_unix_ms, Some(turn_end.wall_time_unix_ms));
+    assert!(inference.response_item_ids.is_empty());
 
     let partial_response = writer.write_json_payload(
         RawPayloadKind::InferenceResponse,
@@ -135,7 +123,7 @@ fn late_cancelled_inference_preserves_turn_end_status() -> anyhow::Result<()> {
 
     let rollout = replay_bundle(temp.path())?;
     let inference = &rollout.inference_calls["inference-1"];
-    assert_eq!(inference.execution.status, ExecutionStatus::Failed);
+    assert_eq!(inference.execution.status, expected_status);
     assert_eq!(inference.execution.ended_seq, Some(turn_end.seq));
     assert_eq!(
         inference.raw_response_payload_id,
@@ -153,7 +141,7 @@ fn late_cancelled_inference_preserves_turn_end_status() -> anyhow::Result<()> {
             text: "late partial".to_string(),
         }],
     );
-
+    }
     Ok(())
 }
 

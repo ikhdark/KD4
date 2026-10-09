@@ -619,22 +619,15 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_model_visible_layout_environment_context_includes_one_subagent() -> Result<()> {
+#[test]
+fn snapshot_environment_context_formatter_counts_subagents() {
     insta::assert_snapshot!(
         "model_visible_layout_environment_context_includes_one_subagent",
         format_environment_context_subagents_snapshot(&["- agent-1: Atlas"])
     );
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_model_visible_layout_environment_context_includes_two_subagents() -> Result<()> {
     insta::assert_snapshot!(
         "model_visible_layout_environment_context_includes_two_subagents",
         format_environment_context_subagents_snapshot(&["- agent-1: Atlas", "- agent-2: Juniper"])
     );
-
-    Ok(())
 }

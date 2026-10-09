@@ -231,6 +231,7 @@ async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Res
     };
     assert_eq!(instruction_counts(&first_texts), (1, 0, 0));
     assert_eq!(instruction_counts(&second_texts), (1, 0, 0));
+    test.codex.flush_rollout().await?;
     let rollout_values = std::fs::read_to_string(rollout_path)?
         .lines()
         .map(serde_json::from_str::<Value>)
@@ -315,6 +316,7 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
         .expect("rollout path");
 
     submit_turn(&initial.codex, "before resume", /*effort*/ None).await?;
+    initial.codex.shutdown_and_wait().await?;
     drop(initial);
 
     let mut resume_builder = test_codex()

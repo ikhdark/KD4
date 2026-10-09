@@ -665,6 +665,11 @@ impl ConfigLayerStack {
             record_origins(&config, &metadata, &mut path, &mut origins);
         }
 
+        // Arrays and type-changing overlays replace whole subtrees, unlike
+        // table merges. Origins of removed leaves must not leak into config/read.
+        let mut effective_paths = HashMap::new();
+        record_origins(&self.effective_config(), &(), &mut path, &mut effective_paths);
+        origins.retain(|key, _| effective_paths.contains_key(key));
         origins
     }
 

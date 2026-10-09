@@ -159,20 +159,32 @@ fn audit_everyone_writable_with_timeout(
     logs_base_dir: Option<&Path>,
     time_limit: Duration,
 ) -> Result<WorldWritableScan> {
+    audit_everyone_writable_with_candidates(cwd, logs_base_dir, time_limit, || {
+        gather_candidates(cwd, env)
+    })
+}
+
+fn audit_everyone_writable_with_candidates(
+    cwd: &Path,
+    logs_base_dir: Option<&Path>,
+    time_limit: Duration,
+    candidates: impl FnOnce() -> Vec<PathBuf>,
+) -> Result<WorldWritableScan> {
     let start = Instant::now();
     let mut incomplete = false;
     let mut flagged: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut checked = 0usize;
-    let check_world_writable = |path: &Path| -> bool {
+    let check_world_writable = |path: &Path, incomplete: &mut bool| -> bool {
         // SAFETY: path is borrowed for the synchronous audit; path_has_world_write_allow creates
         // and retains its SID and security-descriptor storage internally.
         match unsafe { path_has_world_write_allow(path) } {
             Ok(has) => has,
             Err(err) => {
+                *incomplete = true;
                 debug_log(
                     &format!(
-                        "AUDIT: treating unreadable ACL as not world-writable: {} ({err})",
+                        "AUDIT: unable to inspect ACL: {} ({err})",
                         path.display()
                     ),
                     logs_base_dir,
@@ -182,22 +194,40 @@ fn audit_everyone_writable_with_timeout(
         }
     };
     // Fast path: check CWD immediate children first so workspace issues are caught early.
-    if let Ok(read) = std::fs::read_dir(cwd) {
-        for ent in read.flatten().take(MAX_ITEMS_PER_DIR as usize) {
+    let read = std::fs::read_dir(cwd);
+    if read.is_err() {
+        incomplete = true;
+    }
+    if let Ok(read) = read {
+        for (index, ent) in read.enumerate() {
+            if index >= MAX_ITEMS_PER_DIR as usize {
+                incomplete = true;
+                break;
+            }
             if start.elapsed() >= time_limit || checked >= MAX_CHECKED_LIMIT as usize {
                 incomplete = true;
                 break;
             }
+            let ent = match ent {
+                Ok(ent) => ent,
+                Err(_) => {
+                    incomplete = true;
+                    continue;
+                }
+            };
             let ft = match ent.file_type() {
                 Ok(ft) => ft,
-                Err(_) => continue,
+                Err(_) => {
+                    incomplete = true;
+                    continue;
+                }
             };
             if ft.is_symlink() || !ft.is_dir() {
                 continue;
             }
             let p = ent.path();
             checked += 1;
-            let has = check_world_writable(&p);
+            let has = check_world_writable(&p, &mut incomplete);
             if has {
                 let key = canonical_path_key(&p);
                 if seen.insert(key) {
@@ -207,14 +237,13 @@ fn audit_everyone_writable_with_timeout(
         }
     }
     // Continue with broader candidate sweep
-    let candidates = gather_candidates(cwd, env);
-    for root in candidates {
+    for root in candidates() {
         if start.elapsed() >= time_limit || checked >= MAX_CHECKED_LIMIT as usize {
             incomplete = true;
             break;
         }
         checked += 1;
-        let has_root = check_world_writable(&root);
+        let has_root = check_world_writable(&root, &mut incomplete);
         if has_root {
             let key = canonical_path_key(&root);
             if seen.insert(key) {
@@ -222,8 +251,23 @@ fn audit_everyone_writable_with_timeout(
             }
         }
         // one level down best-effort
-        if let Ok(read) = std::fs::read_dir(&root) {
-            for ent in read.flatten().take(MAX_ITEMS_PER_DIR as usize) {
+        let read = std::fs::read_dir(&root);
+        if read.is_err() {
+            incomplete = true;
+        }
+        if let Ok(read) = read {
+            for (index, ent) in read.enumerate() {
+                if index >= MAX_ITEMS_PER_DIR as usize {
+                    incomplete = true;
+                    break;
+                }
+                let ent = match ent {
+                    Ok(ent) => ent,
+                    Err(_) => {
+                        incomplete = true;
+                        continue;
+                    }
+                };
                 let p = ent.path();
                 if start.elapsed() >= time_limit || checked >= MAX_CHECKED_LIMIT as usize {
                     incomplete = true;
@@ -232,7 +276,10 @@ fn audit_everyone_writable_with_timeout(
                 // Skip reparse points (symlinks/junctions) to avoid auditing link ACLs
                 let ft = match ent.file_type() {
                     Ok(ft) => ft,
-                    Err(_) => continue,
+                    Err(_) => {
+                        incomplete = true;
+                        continue;
+                    }
                 };
                 if ft.is_symlink() {
                     continue;
@@ -245,7 +292,7 @@ fn audit_everyone_writable_with_timeout(
                 }
                 if ft.is_dir() {
                     checked += 1;
-                    let has_child = check_world_writable(&p);
+                    let has_child = check_world_writable(&p, &mut incomplete);
                     if has_child {
                         let key = canonical_path_key(&p);
                         if seen.insert(key) {
@@ -260,7 +307,7 @@ fn audit_everyone_writable_with_timeout(
     if incomplete {
         log_note(
             &format!(
-                "AUDIT: world-writable scan INCOMPLETE; time or item limit reached; checked={checked}; duration_ms={elapsed_ms}"
+                "AUDIT: world-writable scan INCOMPLETE; read failure or time/item limit reached; checked={checked}; duration_ms={elapsed_ms}"
             ),
             logs_base_dir,
         );
@@ -317,9 +364,10 @@ pub fn apply_world_writable_scan_and_denies_for_permissions(
             &format!("AUDIT: failed to apply capability deny ACEs: {err}"),
             logs_base_dir,
         );
+        return Err(err);
     }
     if scan.incomplete {
-        anyhow::bail!("world-writable scan incomplete: time or item limit reached");
+        anyhow::bail!("world-writable scan incomplete: read failure or time/item limit reached");
     }
     Ok(())
 }
@@ -360,6 +408,7 @@ fn apply_capability_denies_for_world_writable_for_permissions(
         } else {
             (vec![LocalSid::from_string(&caps.readonly)?], Vec::new())
         };
+    let mut first_error = None;
     for path in flagged {
         if workspace_roots
             .iter()
@@ -377,18 +426,28 @@ fn apply_capability_denies_for_world_writable_for_permissions(
                     logs_base_dir,
                 ),
                 Ok(false) => {}
-                Err(err) => log_note(
-                    &format!(
-                        "AUDIT: failed to apply capability deny ACE to {}: {}",
-                        path.display(),
-                        err
-                    ),
-                    logs_base_dir,
-                ),
+                Err(err) => {
+                    log_note(
+                        &format!(
+                            "AUDIT: failed to apply capability deny ACE to {}: {}",
+                            path.display(),
+                            err
+                        ),
+                        logs_base_dir,
+                    );
+                    // Continue protecting the remaining paths, but never report verified
+                    // protection when any required deny could not be installed.
+                    first_error.get_or_insert_with(|| {
+                        err.context(format!("apply capability deny ACE to {}", path.display()))
+                    });
+                }
             }
         }
     }
-    Ok(())
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +505,46 @@ mod tests {
             "the flagged path must receive its capability deny"
         );
         assert_eq!(fs::read(&cap_path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_deny_failure_is_reported_after_remaining_paths_are_protected() -> anyhow::Result<()> {
+        use crate::acl::native_deny_write_test::{Stage, with_error};
+        use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+
+        for stage in [Stage::Entries, Stage::Security] {
+            let home = tempfile::tempdir()?;
+            let failed = tempfile::tempdir()?;
+            let protected = tempfile::tempdir()?;
+            let caps = crate::cap::load_or_create_cap_sids(home.path())?;
+            let sid = crate::token::LocalSid::from_string(&caps.readonly)?;
+            let permissions = crate::resolved_permissions::ResolvedWindowsSandboxPermissions::
+                try_from_permission_profile(&codex_protocol::models::PermissionProfile::read_only())?;
+            let result = with_error(failed.path(), stage, 5, || {
+                super::apply_capability_denies_for_world_writable_for_permissions(
+                    home.path(),
+                    &[failed.path().to_path_buf(), protected.path().to_path_buf()],
+                    &permissions,
+                    failed.path(),
+                    &HashMap::new(),
+                    None,
+                )
+            });
+            let error = result.expect_err("failed protection must reach the warning consumer");
+            assert!(format!("{error:#}").contains(&failed.path().display().to_string()));
+            for (path, expected) in [(failed.path(), false), (protected.path(), true)] {
+                // SAFETY: The temporary directory and SID remain live; the descriptor is
+                // freed after inspecting its borrowed DACL.
+                let present = unsafe {
+                    let (dacl, descriptor) = crate::acl::fetch_dacl_handle(path)?;
+                    let present = crate::acl::dacl_has_write_deny_for_sid(dacl, sid.as_ptr());
+                    LocalFree(descriptor as HLOCAL);
+                    present
+                };
+                assert_eq!(present, expected, "{stage:?}: {}", path.display());
+            }
+        }
         Ok(())
     }
 
@@ -534,6 +633,60 @@ mod tests {
         let log = fs::read_to_string(crate::logging::current_log_file_path(logs.path()))?;
         assert!(log.contains("world-writable scan INCOMPLETE"));
         assert!(!log.contains("world-writable scan OK"));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_directory_limit_reports_only_actual_truncation() -> anyhow::Result<()> {
+        let cwd = tempfile::tempdir()?;
+        for index in 0..super::MAX_ITEMS_PER_DIR {
+            fs::write(cwd.path().join(index.to_string()), b"")?;
+        }
+        let scan = || {
+            super::audit_everyone_writable_with_candidates(
+                cwd.path(),
+                None,
+                std::time::Duration::MAX,
+                Vec::new,
+            )
+        };
+        assert!(!scan()?.incomplete, "exactly the limit is fully enumerated");
+        fs::write(cwd.path().join("one-more"), b"")?;
+        assert!(scan()?.incomplete, "an omitted entry is not a clean scan");
+        Ok(())
+    }
+
+    #[test]
+    fn audit_directory_read_failure_reports_incomplete() -> anyhow::Result<()> {
+        let cwd = tempfile::tempdir()?;
+        let missing = cwd.path().join("missing");
+        assert_eq!(fs::read_dir(&missing).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        let scan = super::audit_everyone_writable_with_candidates(
+            &missing,
+            None,
+            std::time::Duration::MAX,
+            Vec::new,
+        )?;
+        assert_eq!(
+            world_writable_warning_details_from_scan(Ok(scan)),
+            Some((Vec::new(), 0, true))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_acl_read_failure_reports_incomplete() -> anyhow::Result<()> {
+        let cwd = tempfile::tempdir()?;
+        let missing = cwd.path().join("missing");
+        // SAFETY: the native query borrows a path and owns all security descriptor storage.
+        assert!(unsafe { super::path_has_world_write_allow(&missing) }.is_err());
+        let scan = super::audit_everyone_writable_with_candidates(
+            cwd.path(),
+            None,
+            std::time::Duration::MAX,
+            || vec![missing],
+        )?;
+        assert!(scan.incomplete);
         Ok(())
     }
 

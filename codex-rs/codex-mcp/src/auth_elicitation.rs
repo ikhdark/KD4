@@ -343,5 +343,31 @@ mod tests {
 
         assert_eq!(plan.auth_failure.connector_name, "Google Calendar");
         assert_eq!(plan.elicitation.elicitation_id, "codex_apps_auth_call_123");
+        assert_eq!(plan.auth_failure.connector_id, "connector_calendar");
+        assert_eq!(
+            plan.elicitation.url,
+            "https://chatgpt.com/apps/google-calendar/connector_calendar"
+        );
+        assert_eq!(
+            plan.elicitation.meta[MCP_TOOL_CODEX_APPS_META_KEY]
+                [CONNECTOR_AUTH_FAILURE_META_KEY][CONNECTOR_AUTH_FAILURE_ERROR_HTTP_STATUS_CODE_KEY],
+            serde_json::json!(401)
+        );
+
+        for is_error in [None, Some(false)] {
+            let mut result = auth_failure_result();
+            result.is_error = is_error;
+            assert_eq!(
+                build_auth_elicitation_plan(
+                    "call_123",
+                    &result,
+                    Some("connector_calendar"),
+                    Some("Google Calendar"),
+                    Some("https://chatgpt.com/apps/google-calendar/connector_calendar".to_string()),
+                ),
+                None,
+                "non-error results must not trigger authentication"
+            );
+        }
     }
 }

@@ -47,81 +47,6 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[tokio::test]
-async fn mcp_server_status_list_returns_raw_server_and_tool_names() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server("look-up.raw").await?;
-    let codex_home = TempDir::new()?;
-    write_mock_responses_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        &BTreeMap::new(),
-        /*auto_compact_limit*/ 1024,
-        /*requires_openai_auth*/ None,
-        "mock_provider",
-        "compact",
-    )?;
-
-    let config_path = codex_home.path().join("config.toml");
-    let mut config_toml = std::fs::read_to_string(&config_path)?;
-    config_toml.push_str(&format!(
-        r#"
-[mcp_servers.some-server]
-url = "{mcp_server_url}/mcp"
-"#
-    ));
-    std::fs::write(config_path, config_toml)?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_list_mcp_server_status_request(ListMcpServerStatusParams {
-            cursor: None,
-            limit: None,
-            detail: None,
-            thread_id: None,
-        })
-        .await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ListMcpServerStatusResponse = to_response(response)?;
-
-    assert_eq!(response.next_cursor, None);
-    assert_eq!(response.data.len(), 1);
-    let status = &response.data[0];
-    assert_eq!(status.name, "some-server");
-    assert_eq!(
-        status.tools.keys().cloned().collect::<BTreeSet<_>>(),
-        BTreeSet::from(["look-up.raw".to_string()])
-    );
-    assert_eq!(
-        status
-            .tools
-            .get("look-up.raw")
-            .map(|tool| tool.name.as_str()),
-        Some("look-up.raw")
-    );
-    assert_eq!(
-        status
-            .server_info
-            .as_ref()
-            .and_then(|info| info.title.as_deref()),
-        Some("Lookup Server")
-    );
-
-    mcp_server_handle.abort();
-    let _ = mcp_server_handle.await;
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn mcp_server_status_list_uses_thread_project_local_config() -> Result<()> {
@@ -491,7 +416,7 @@ url = "{mcp_server_url}/mcp"
 #[tokio::test]
 async fn mcp_server_status_list_keeps_tools_for_sanitized_name_collisions() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let (dash_server_url, dash_server_handle) = start_mcp_server("dash_lookup").await?;
+    let (dash_server_url, dash_server_handle) = start_mcp_server("look-up.raw").await?;
     let (underscore_server_url, underscore_server_handle) =
         start_mcp_server("underscore_lookup").await?;
     let codex_home = TempDir::new()?;
@@ -555,13 +480,19 @@ url = "{underscore_server_url}/mcp"
     assert_eq!(
         status_tools,
         BTreeMap::from([
-            ("some-server", BTreeSet::from(["dash_lookup".to_string()])),
+            ("some-server", BTreeSet::from(["look-up.raw".to_string()])),
             (
                 "some_server",
                 BTreeSet::from(["underscore_lookup".to_string()])
             )
         ])
     );
+    for status in &response.data {
+        assert_eq!(status.server_info.as_ref().and_then(|info| info.title.as_deref()), Some("Lookup Server"));
+        for (key, tool) in &status.tools {
+            assert_eq!(key, &tool.name);
+        }
+    }
 
     dash_server_handle.abort();
     let _ = dash_server_handle.await;

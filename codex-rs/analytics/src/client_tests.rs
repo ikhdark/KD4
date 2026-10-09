@@ -328,29 +328,6 @@ fn analytics_destination_ignores_capture_file_in_release() {
     );
 }
 
-#[tokio::test]
-#[cfg(debug_assertions)]
-async fn capture_file_writes_exact_serialized_request() {
-    let capture_path = unique_capture_path("single");
-    let destination = AnalyticsEventsDestination::CaptureFile {
-        path: capture_path.clone(),
-    };
-    let event = sample_regular_track_event("thread-1");
-    let expected_event = serde_json::to_value(&event).expect("serialize expected event");
-    let auth = codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let http_clients = test_http_clients();
-
-    send_track_events_request(&auth, &destination, &http_clients, vec![event]).await;
-
-    let contents = fs::read_to_string(&capture_path).expect("read capture file");
-    let lines = contents.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 1);
-    let payload: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("parse captured payload");
-    assert_eq!(payload, serde_json::json!({"events": [expected_event]}));
-
-    fs::remove_file(capture_path).expect("remove capture file");
-}
 
 #[tokio::test]
 #[cfg(debug_assertions)]
@@ -366,6 +343,7 @@ async fn capture_file_writes_final_batches_as_separate_lines() {
         sample_regular_track_event("thread-3"),
     ];
     let http_clients = test_http_clients();
+    let expected = events.iter().map(|event| serde_json::json!({"events": [serde_json::to_value(event).expect("serialize event")]})).collect::<Vec<_>>();
     for batch in track_event_request_batches(events) {
         send_track_events_request(&auth, &destination, &http_clients, batch).await;
     }
@@ -376,6 +354,7 @@ async fn capture_file_writes_final_batches_as_separate_lines() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse capture line"))
         .collect::<Vec<_>>();
     assert_eq!(payloads.len(), 3);
+    assert_eq!(payloads, expected);
     assert_eq!(payloads[0]["events"][0]["skill_id"], "skill-thread-1");
     assert_eq!(
         payloads[1]["events"][0]["event_type"],
@@ -548,11 +527,13 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         (RequestId::Integer(1), sample_turn_start_request()),
         (RequestId::Integer(2), sample_turn_steer_request()),
     ] {
-        client.track_request(/*connection_id*/ 7, request_id, &request);
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(AnalyticsFact::ClientRequest { .. })
-        ));
+        client.track_request(/*connection_id*/ 7, request_id.clone(), &request);
+        let Ok(AnalyticsFact::ClientRequest { connection_id, request_id: queued_id, request: queued }) = receiver.try_recv() else {
+            panic!("relevant request should be queued");
+        };
+        assert_eq!(connection_id, 7);
+        assert_eq!(queued_id, request_id);
+        assert_eq!(serde_json::to_value(queued).unwrap(), serde_json::to_value(request).unwrap());
     }
 
     let ignored_request = sample_thread_archive_request();
@@ -575,11 +556,15 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
         (RequestId::Integer(4), sample_turn_start_response()),
         (RequestId::Integer(5), sample_turn_steer_response()),
     ] {
-        client.track_response(/*connection_id*/ 7, request_id, response);
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(AnalyticsFact::ClientResponse { .. })
-        ));
+        let expected_kind = std::mem::discriminant(&response);
+        client.track_response(/*connection_id*/ 7, request_id.clone(), response);
+        let Ok(AnalyticsFact::ClientResponse { connection_id, request_id: queued_id, response, thread_originator }) = receiver.try_recv() else {
+            panic!("relevant response should be queued");
+        };
+        assert_eq!(connection_id, 7);
+        assert_eq!(queued_id, request_id);
+        assert_eq!(std::mem::discriminant(response.as_ref()), expected_kind);
+        assert_eq!(thread_originator, None);
     }
 
     client.track_response(
@@ -816,25 +801,31 @@ fn usage_deduplication_is_scoped_to_thread_and_turn() {
 
     let (client, mut receiver) = client_with_receiver();
     for thread in ["parent", "child"] {
-        let tracking = test_tracking_context(thread, "shared-turn-id");
+        for turn in ["shared-turn-id", "next-turn"] {
+        let tracking = test_tracking_context(thread, turn);
+        for connector in ["calendar", "drive"] {
         for _ in 0..2 {
             client.track_app_used(
                 tracking.clone(),
                 AppInvocation {
-                    connector_id: Some("calendar".to_string()),
+                    connector_id: Some(connector.to_string()),
                     app_name: None,
                     invocation_type: None,
                 },
             );
-            client.track_plugin_used(tracking.clone(), sample_plugin_metadata());
+            let mut plugin = sample_plugin_metadata();
+            plugin.plugin_id = Some(codex_plugin::PluginId::parse(&format!("{connector}@test")).unwrap());
+            client.track_plugin_used(tracking.clone(), plugin);
         }
         assert!(
-            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input))) if input.tracking.thread_id == thread)
+            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input))) if input.tracking.thread_id == thread && input.tracking.turn_id == turn && input.app.connector_id.as_deref() == Some(connector))
         );
         assert!(
-            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(input))) if input.tracking.thread_id == thread)
+            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(input))) if input.tracking.thread_id == thread && input.tracking.turn_id == turn && input.plugin.plugin_id.as_ref().unwrap().as_key() == format!("{connector}@test"))
         );
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        }
+        }
     }
 }
 

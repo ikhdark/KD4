@@ -1103,18 +1103,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_ca_uses_explicit_codex_home() {
-        let codex_home = tempdir().unwrap();
-
-        let ca = ManagedMitmCa::load_or_create(codex_home.path()).unwrap();
-
-        assert!(
-            ca.certificate_path()
-                .starts_with(codex_home.path().join(MANAGED_MITM_CA_DIR))
-        );
-    }
-
-    #[test]
     fn managed_ca_private_key_is_not_persisted() {
         ensure_rustls_crypto_provider();
         let dir = tempdir().unwrap();

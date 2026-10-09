@@ -2233,9 +2233,15 @@ mod projection_tests {
             metadata.essential_inline["omitted_item_counts"]["proof_references"],
             92
         );
-        assert!(
-            metadata.spillable_text[0].contains("full durable receipt"),
-            "the spill retains the complete canonical receipt"
+        assert_eq!(
+            metadata.spillable_text.len(),
+            1,
+            "the receipt must have one complete retained representation"
+        );
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&metadata.spillable_text[0]).unwrap(),
+            serde_json::to_value(&result).unwrap(),
+            "the spill retains every receipt field and array element"
         );
         assert_eq!(
             metadata.predetermined_json_pointers.len(),
@@ -2496,9 +2502,11 @@ mod projection_tests {
             serde_json::to_value(first_retained_event).expect("event id serializes")
         );
         assert_eq!(projection["omitted_item_counts"]["observations"], 2);
-        assert!(
-            metadata.spillable_text[0].contains("full canonical objective"),
-            "the spill retains the full structured task snapshot"
+        assert_eq!(metadata.spillable_text.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&metadata.spillable_text[0]).unwrap(),
+            serde_json::to_value(&result).unwrap(),
+            "the spill retains every field of the structured task snapshot"
         );
         let pointers = metadata
             .predetermined_json_pointers

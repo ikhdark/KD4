@@ -16,11 +16,12 @@ from openai_codex.client import (
     CodexClient,
     CodexConfig,
 )
-from openai_codex.errors import CodexError, TransportClosedError
+from openai_codex.errors import CodexError, CodexRpcError, TransportClosedError
 from openai_codex.generated.v2_all import (
     AccountUpdatedNotification,
     AgentMessageDeltaNotification,
     ChatgptAccount,
+    ModelListResponse,
     PlanType,
     ThreadListParams,
     ThreadResumeResponse,
@@ -67,10 +68,14 @@ def test_over_cap_newline_free_stderr_is_reported_on_failure() -> None:
             client.next_notification(timeout_s=5)
 
         message = str(exc_info.value)
-        assert _STDERR_TRUNCATION_MARKER in message
-        assert message.endswith("END")
-        assert "discard-me" not in message
-        assert "\ufffd" not in message
+        # The trailing ASCII bytes leave room for exactly 16,383 intact emoji.
+        # Checking only END/the marker also accepts silently discarded evidence.
+        assert message == (
+            "Codex process closed stdout. stderr_tail="
+            + _STDERR_TRUNCATION_MARKER
+            + "\U0001f642" * 16_383
+            + "END"
+        )
     finally:
         client.close()
 
@@ -173,6 +178,36 @@ sys.stdin.read()
         assert request.payload.params["params"] == {"searchTerm": "needle", "limit": 5}
         assert result.data == []
         assert result.next_cursor is None
+    finally:
+        client.close()
+
+
+def test_request_retry_honors_structured_non_retryable_error() -> None:
+    """A server's explicit retry refusal must survive decoding and retry dispatch."""
+    client = _client_for_script("""
+import json
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"method": "test/request", "params": request}), flush=True)
+    print(json.dumps({"id": request["id"], "error": {
+        "code": -32001, "message": "retry limit exceeded",
+        "data": {"reason": "serializedRequestQueue", "retryable": False},
+    }}), flush=True)
+""")
+    try:
+        client.start()
+        with pytest.raises(CodexRpcError) as caught:
+            client.request_with_retry_on_overload(
+                "model/list",
+                {},
+                response_model=ModelListResponse,
+                initial_delay_s=0,
+                max_delay_s=0,
+            )
+        assert type(caught.value) is CodexRpcError
+        assert client.next_notification(timeout_s=5).method == "test/request"
+        with pytest.raises(queue.Empty):
+            client.next_notification(timeout_s=0.01)
     finally:
         client.close()
 

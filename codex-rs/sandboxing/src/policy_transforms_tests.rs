@@ -217,25 +217,33 @@ fn normalize_additional_permissions_preserves_network() {
 }
 
 #[test]
-fn normalize_additional_permissions_rejects_glob_read_grants() {
-    let err = normalize_additional_permissions(PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            entries: vec![FileSystemSandboxEntry {
-                path: FileSystemPath::GlobPattern {
-                    pattern: "**/*.env".to_string(),
-                },
-                access: FileSystemAccessMode::Read,
-            }],
-            glob_scan_max_depth: None,
-        }),
-        ..Default::default()
-    })
-    .expect_err("read glob permissions are unsupported");
-
-    assert_eq!(
-        err,
-        "glob file system permissions only support deny-read entries"
-    );
+fn normalize_additional_permissions_rejects_glob_read_and_write_grants() {
+    for access in [FileSystemAccessMode::Read, FileSystemAccessMode::Write] {
+        let permissions = PermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::GlobPattern {
+                        pattern: "**/*.env".to_string(),
+                    },
+                    access,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+        for err in [
+            normalize_additional_permissions(permissions.clone())
+                .expect_err("native glob grants are unsupported"),
+            super::normalize_uri_additional_permissions(permissions.into())
+                .expect_err("URI glob grants are unsupported"),
+        ] {
+            assert_eq!(
+                err,
+                "glob file system permissions only support deny-read entries",
+                "access: {access:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -750,7 +758,7 @@ fn intersect_permission_profiles_drops_broader_cwd_grant_for_requested_child_pat
 }
 
 #[test]
-fn intersect_permission_profiles_uses_granted_bounded_glob_scan_depth() {
+fn intersect_permission_profiles_uses_granted_glob_scan_depth() {
     let cwd = std::env::current_dir().expect("current dir");
     let root_write = FileSystemSandboxEntry {
         path: FileSystemPath::Special {
@@ -771,92 +779,39 @@ fn intersect_permission_profiles_uses_granted_bounded_glob_scan_depth() {
         }),
         ..Default::default()
     };
-    let granted = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            entries: vec![root_write.clone(), deny_env_files],
-            glob_scan_max_depth: std::num::NonZeroUsize::new(4),
-        }),
-        ..Default::default()
-    };
-
-    assert_eq!(
-        intersect_permission_profiles(requested, granted, cwd.as_path()),
-        PermissionProfile {
+    for depth in [std::num::NonZeroUsize::new(4), None] {
+        let granted = PermissionProfile {
             file_system: Some(FileSystemPermissions {
-                entries: vec![
-                    root_write,
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::GlobPattern {
-                            pattern: AbsolutePathBuf::resolve_path_against_base(
-                                "**/*.env",
-                                cwd.as_path()
-                            )
-                            .to_string_lossy()
-                            .into_owned(),
-                        },
-                        access: FileSystemAccessMode::Deny,
-                    },
-                ],
-                glob_scan_max_depth: std::num::NonZeroUsize::new(4),
+                entries: vec![root_write.clone(), deny_env_files.clone()],
+                glob_scan_max_depth: depth,
             }),
             ..Default::default()
-        }
-    );
-}
+        };
 
-#[test]
-fn intersect_permission_profiles_uses_granted_unbounded_glob_scan_depth() {
-    let cwd = std::env::current_dir().expect("current dir");
-    let root_write = FileSystemSandboxEntry {
-        path: FileSystemPath::Special {
-            value: FileSystemSpecialPath::Root,
-        },
-        access: FileSystemAccessMode::Write,
-    };
-    let deny_env_files = FileSystemSandboxEntry {
-        path: FileSystemPath::GlobPattern {
-            pattern: "**/*.env".to_string(),
-        },
-        access: FileSystemAccessMode::Deny,
-    };
-    let requested = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            entries: vec![root_write.clone(), deny_env_files.clone()],
-            glob_scan_max_depth: std::num::NonZeroUsize::new(2),
-        }),
-        ..Default::default()
-    };
-    let granted = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            entries: vec![root_write.clone(), deny_env_files],
-            glob_scan_max_depth: None,
-        }),
-        ..Default::default()
-    };
-
-    assert_eq!(
-        intersect_permission_profiles(requested, granted, cwd.as_path()),
-        PermissionProfile {
-            file_system: Some(FileSystemPermissions {
-                entries: vec![
-                    root_write,
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::GlobPattern {
-                            pattern: AbsolutePathBuf::resolve_path_against_base(
-                                "**/*.env",
-                                cwd.as_path()
-                            )
-                            .to_string_lossy()
-                            .into_owned(),
+        assert_eq!(
+            intersect_permission_profiles(requested.clone(), granted, cwd.as_path()),
+            PermissionProfile {
+                file_system: Some(FileSystemPermissions {
+                    entries: vec![
+                        root_write.clone(),
+                        FileSystemSandboxEntry {
+                            path: FileSystemPath::GlobPattern {
+                                pattern: AbsolutePathBuf::resolve_path_against_base(
+                                    "**/*.env",
+                                    cwd.as_path()
+                                )
+                                .to_string_lossy()
+                                .into_owned(),
+                            },
+                            access: FileSystemAccessMode::Deny,
                         },
-                        access: FileSystemAccessMode::Deny,
-                    },
-                ],
-                glob_scan_max_depth: None,
-            }),
-            ..Default::default()
-        }
-    );
+                    ],
+                    glob_scan_max_depth: depth,
+                }),
+                ..Default::default()
+            }
+        );
+    }
 }
 
 #[test]

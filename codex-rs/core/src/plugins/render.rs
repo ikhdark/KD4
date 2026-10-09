@@ -1,15 +1,6 @@
 use codex_plugin::PluginId;
 
-#[cfg(test)]
-use crate::context::AvailablePluginsInstructions;
-#[cfg(test)]
-use crate::context::ContextualUserFragment;
 use crate::plugins::PluginCapabilitySummary;
-
-#[cfg(test)]
-pub(crate) fn render_plugins_section(plugins: &[PluginCapabilitySummary]) -> Option<String> {
-    (!plugins.is_empty()).then(|| AvailablePluginsInstructions.render())
-}
 
 pub(crate) fn render_explicit_plugin_instructions(
     plugin: &PluginCapabilitySummary,

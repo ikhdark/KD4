@@ -295,7 +295,9 @@ async fn system_time_source_adds_current_time_reminder() -> Result<()> {
         .build(&server)
         .await?;
 
+    let before = Utc::now().timestamp();
     test.submit_turn("what time is it?").await?;
+    let after = Utc::now().timestamp();
 
     let reminders = current_time_reminders(&responses.single_request());
     assert_eq!(reminders.len(), 1);
@@ -303,6 +305,13 @@ async fn system_time_source_adds_current_time_reminder() -> Result<()> {
         r"^It is \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC\.$",
         &reminders[0],
     );
+    let timestamp = chrono::NaiveDateTime::parse_from_str(
+        &reminders[0],
+        "It is %Y-%m-%d %H:%M:%S UTC.",
+    )?
+    .and_utc()
+    .timestamp();
+    assert!((before..=after).contains(&timestamp), "system reminder must use the current clock");
 
     Ok(())
 }

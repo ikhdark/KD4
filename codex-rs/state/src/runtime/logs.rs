@@ -134,13 +134,20 @@ impl LogRetentionTestControl {
     }
 
     pub(crate) async fn wait_until_deletion_active(&self) {
-        while self
-            .active_deletions
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            self.deletion_entered.notified().await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = self.deletion_entered.notified();
+                tokio::pin!(notified);
+                // Register before checking so notify_waiters cannot be lost in between.
+                notified.as_mut().enable();
+                if self.active_deletions.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("retention deletion must start");
     }
 
     pub(crate) fn release_blocked_deletion(&self) {
@@ -928,8 +935,8 @@ fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: 
         builder
             .push(column)
             .push(" LIKE '%' || ")
-            .push_bind(filter.as_str())
-            .push(" || '%'");
+            .push_bind(filter.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+            .push(" || '%' ESCAPE '\\'");
     }
     builder.push(")");
 }
@@ -1409,28 +1416,12 @@ mod tests {
 
     #[test]
     fn format_feedback_log_line_matches_feedback_formatter_shape() {
-        assert_eq!(
-            format_feedback_log_line(
-                /*ts*/ 1,
-                /*ts_nanos*/ 123_456_000,
-                "INFO",
-                "alpha"
-            ),
-            "1970-01-01T00:00:01.123456Z  INFO alpha\n"
-        );
-    }
-
-    #[test]
-    fn format_feedback_log_line_preserves_existing_trailing_newline() {
-        assert_eq!(
-            format_feedback_log_line(
-                /*ts*/ 1,
-                /*ts_nanos*/ 123_456_000,
-                "INFO",
-                "alpha\n"
-            ),
-            "1970-01-01T00:00:01.123456Z  INFO alpha\n"
-        );
+        for body in ["alpha", "alpha\n"] {
+            assert_eq!(
+                format_feedback_log_line(1, 123_456_000, "INFO", body),
+                "1970-01-01T00:00:01.123456Z  INFO alpha\n"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1484,6 +1475,63 @@ mod tests {
         assert_eq!(rows[0].message.as_deref(), Some("foo=2 alphabet"));
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn module_and_file_filters_match_literal_substrings() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let entries = ["target_100%\\done", "targetX100Z/done", "other"]
+            .into_iter()
+            .map(|path| {
+                let mut entry = test_log(path, "thread");
+                entry.module_path = Some(path.to_string());
+                entry.file = Some(path.to_string());
+                entry
+            })
+            .collect::<Vec<_>>();
+        runtime.insert_logs(&entries).await?;
+        for filters in [vec!["_100%"], vec!["\\done"], vec!["TARGET_100%"], vec!["_100%", "other"]] {
+            let expected = if filters.len() == 2 {
+                vec![Some("target_100%\\done"), Some("other")]
+            } else {
+                vec![Some("target_100%\\done")]
+            };
+            for module in [false, true] {
+                let mut query = LogQuery::default();
+                let values = filters.iter().map(|value| value.to_string()).collect();
+                if module {
+                    query.module_like = values;
+                } else {
+                    query.file_like = values;
+                }
+                let rows = runtime.query_logs(&query).await?;
+                assert_eq!(rows.iter().map(|row| row.message.as_deref()).collect::<Vec<_>>(), expected);
+            }
+        }
+        runtime.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_log_insert_waits_for_sqlite_writer_then_preserves_both_commits() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let mut writer = runtime.logs_pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) VALUES (1, 0, 'INFO', 'fixture', 'held writer')")
+            .execute(&mut *writer).await?;
+        let entries = [test_log("deferred insertion", "thread")];
+        let mut insertion = Box::pin(runtime.insert_logs_deferred_retention(&entries));
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut insertion).await.is_err());
+        writer.commit().await?;
+        tokio::time::timeout(Duration::from_secs(5), insertion).await??;
+        let rows = runtime.query_logs(&LogQuery::default()).await?;
+        assert_eq!(
+            rows.iter().map(|row| row.message.as_deref()).collect::<Vec<_>>(),
+            vec![Some("held writer"), Some("deferred insertion")]
+        );
+        runtime.close().await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2127,7 +2175,7 @@ mod tests {
         let eleven_mebibytes = "z".repeat(11 * 1024 * 1024);
 
         runtime
-            .insert_logs(&[
+            .insert_logs_deferred_retention(&[
                 LogEntry {
                     ts: recent_test_ts(1),
                     ts_nanos: 0,
@@ -2158,6 +2206,8 @@ mod tests {
             .await
             .expect("insert test logs");
 
+        assert_eq!(log_row_count(&logs_db_path(&codex_home)).await, 2,
+            "query bound must be tested before retention deletes the oversized row");
         let bytes = runtime
             .query_feedback_logs("thread-oversized")
             .await
@@ -2530,6 +2580,7 @@ mod tests {
             .await
             .expect("insert test logs");
 
+        assert!(runtime.query_feedback_logs_for_threads(&[]).await.expect("empty selection").is_empty());
         let bytes = runtime
             .query_feedback_logs_for_threads(&["thread-1", "thread-2"])
             .await
@@ -2559,20 +2610,5 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
-    #[tokio::test]
-    async fn query_feedback_logs_for_threads_returns_empty_for_empty_thread_list() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
 
-        let bytes = runtime
-            .query_feedback_logs_for_threads(&[])
-            .await
-            .expect("query feedback logs");
-
-        assert_eq!(bytes, Vec::<u8>::new());
-
-        let _ = tokio::fs::remove_dir_all(codex_home).await;
-    }
 }

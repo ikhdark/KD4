@@ -65,8 +65,6 @@ pub(crate) async fn run_inline_auto_compact_task(
     let world_state = match initial_context_injection {
         InitialContextInjection::AtStart(world_state) => world_state,
         #[cfg(test)]
-        InitialContextInjection::BeforeLastUserMessage(world_state) => world_state,
-        #[cfg(test)]
         InitialContextInjection::DoNotInject => {
             Arc::new(sess.build_world_state_for_step(&step_context).await)
         }

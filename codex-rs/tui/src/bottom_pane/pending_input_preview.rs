@@ -189,24 +189,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn desired_height_empty() {
-        let queue = PendingInputPreview::new();
-        assert_eq!(queue.desired_height(/*width*/ 40), 0);
-    }
-
-    #[test]
-    fn desired_height_one_message() {
-        let mut queue = PendingInputPreview::new();
-        queue.queued_messages.push("Hello, world!".to_string());
-        assert_eq!(queue.desired_height(/*width*/ 40), 3);
-    }
-
-    #[test]
     fn render_one_message() {
         let mut queue = PendingInputPreview::new();
+        assert_eq!(queue.desired_height(/*width*/ 40), 0);
         queue.queued_messages.push("Hello, world!".to_string());
         let width = 40;
         let height = queue.desired_height(width);
+        assert_eq!(height, 3);
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         queue.render(Rect::new(0, 0, width, height), &mut buf);
         assert_snapshot!("render_one_message", format!("{buf:?}"));

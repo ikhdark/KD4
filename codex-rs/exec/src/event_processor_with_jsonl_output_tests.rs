@@ -19,8 +19,10 @@ fn progress_is_correlated_bounded_and_does_not_replace_the_terminal_item() {
         let [ThreadEvent::ItemProgress(event)] = events.events.as_slice() else { panic!("one delta"); };
         assert_eq!(event.item_id, id);
         assert_eq!(event.call_id, "call");
-        let crate::exec_events::ItemProgress::CommandOutput { delta, truncated, stream, .. } = &event.progress else { panic!("command delta"); };
+        let crate::exec_events::ItemProgress::CommandOutput { delta, truncated, stream, decoding_lossy } = &event.progress else { panic!("command delta"); };
         assert_eq!(delta.len(), 16 * 1024);
+        assert_eq!(*delta, "λ".repeat(8192));
+        assert_eq!(*decoding_lossy, Some(false));
         assert!(*truncated);
         assert_eq!(*stream, Some(codex_protocol::protocol::ExecOutputStream::Stderr));
         let events = processor.collect_thread_events(ServerNotification::McpToolCallProgress(
@@ -29,8 +31,13 @@ fn progress_is_correlated_bounded_and_does_not_replace_the_terminal_item() {
                 message: "working".into(), progress: Some(f64::from(index)), total: None,
             },
         ));
+        assert_eq!(events.events.len(), 1);
         let value = serde_json::to_value(&events.events[0]).unwrap();
         assert_eq!(value["item_id"], id);
+        assert_eq!(value["call_id"], "call");
+        assert_eq!(value["kind"], "mcp");
+        assert_eq!(value["message"], "working");
+        assert_eq!(value["truncated"], false);
         assert_eq!(value["progress"], f64::from(index));
         assert!(value["total"].is_null());
     }
@@ -50,8 +57,12 @@ fn every_terminal_outcome_has_one_receipt_with_available_timing() {
         let events = processor.collect_thread_events(ServerNotification::TurnCompleted(notification.clone()));
         assert_eq!(events.events.len(), 1);
         match &events.events[0] {
-            ThreadEvent::TurnCompleted(event) => assert_eq!(event.timing, Some(timing)),
+            ThreadEvent::TurnCompleted(event) => {
+                assert_eq!(status, TurnStatus::Completed);
+                assert_eq!(event.timing, Some(timing));
+            }
             ThreadEvent::TurnFailed(event) => {
+                assert_ne!(status, TurnStatus::Completed);
                 assert_eq!(event.timing, Some(timing));
                 assert_eq!(event.disposition, if status == TurnStatus::Interrupted {
                     crate::exec_events::TurnFailureDisposition::Interrupted
@@ -197,6 +208,7 @@ fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
             completion.turn.items = vec![item];
             let terminal = processor
                 .collect_thread_events(ServerNotification::TurnCompleted(completion.clone()));
+            assert_eq!(terminal.events.len(), 1, "do not repeat the terminal turn receipt");
             let ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) = &terminal.events[0]
             else {
                 panic!("expected terminal item");
@@ -278,25 +290,6 @@ fn stdout_failure_is_returned_without_overwriting_last_message() {
     );
 }
 
-#[test]
-fn declined_patch_retains_its_wire_status() {
-    let mut processor = EventProcessorWithJsonOutput::new(None);
-    let events = processor.collect_thread_events(ServerNotification::ItemCompleted(
-        codex_app_server_protocol::ItemCompletedNotification {
-            thread_id: "thread-1".into(),
-            turn_id: "turn-1".into(),
-            completed_at_ms: 0,
-            item: ThreadItem::FileChange {
-                id: "patch".into(),
-                changes: vec![],
-                status: PatchApplyStatus::Declined,
-            },
-        },
-    ));
-    assert_eq!(events.events.len(), 1);
-    let value = serde_json::to_value(&events.events[0]).expect("serialize patch");
-    assert_eq!(value["item"]["status"], "declined");
-}
 
 #[test]
 fn failed_turn_does_not_overwrite_output_last_message_file() {
@@ -443,7 +436,6 @@ fn event_stream_error_emits_fatal_and_turn_terminal_events() {
 
 #[test]
 fn completed_turn_exposes_timing_in_jsonl_event() {
-    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
     let timing = codex_app_server_protocol::TurnTiming {
         schema_version: 1,
         profile_valid: true,
@@ -464,11 +456,13 @@ fn completed_turn_exposes_timing_in_jsonl_event() {
         ..Default::default()
     };
 
+    for top_level in [true, false] {
+    let mut processor = EventProcessorWithJsonOutput::new(None);
     let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
         codex_app_server_protocol::TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            timing: Some(timing.clone()),
+            timing: top_level.then(|| timing.clone()),
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -478,7 +472,7 @@ fn completed_turn_exposes_timing_in_jsonl_event() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
-                timing: Some(timing.clone()),
+                timing: Some(if top_level { Default::default() } else { timing.clone() }),
                 surfaced_result: None,
             },
         },
@@ -488,7 +482,7 @@ fn completed_turn_exposes_timing_in_jsonl_event() {
     let [ThreadEvent::TurnCompleted(event)] = collected.events.as_slice() else {
         panic!("expected one turn.completed event");
     };
-    assert_eq!(event.timing, Some(timing));
+    assert_eq!(event.timing, Some(timing.clone()));
     let serialized = serde_json::to_value(event).expect("serialize event");
     assert_eq!(
         serialized["timing"]["unions"]["modelStreamWaitUnionNs"],
@@ -498,6 +492,7 @@ fn completed_turn_exposes_timing_in_jsonl_event() {
         serialized["timing"]["modelRequests"][1]["isContinuation"],
         json!(true)
     );
+    }
 }
 
 #[test]

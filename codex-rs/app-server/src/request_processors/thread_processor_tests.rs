@@ -76,31 +76,18 @@ mod fork_config_snapshot_reuse_tests {
     use super::super::reuse_or_capture_fork_snapshot;
 
     #[tokio::test]
-    async fn reuses_captured_snapshot_without_loading_again() {
-        let loads = Cell::new(0);
+    async fn captures_snapshot_only_when_the_branch_has_none() {
+        for (captured, expected, expected_loads) in [(Some(41), 41, 0), (None, 42, 1)] {
+            let loads = Cell::new(0);
+            let snapshot = reuse_or_capture_fork_snapshot(captured, || async {
+                loads.set(loads.get() + 1);
+                42
+            })
+            .await;
 
-        let snapshot = reuse_or_capture_fork_snapshot(Some(41), || async {
-            loads.set(loads.get() + 1);
-            42
-        })
-        .await;
-
-        assert_eq!(snapshot, 41);
-        assert_eq!(loads.get(), 0);
-    }
-
-    #[tokio::test]
-    async fn captures_snapshot_once_when_the_branch_has_none() {
-        let loads = Cell::new(0);
-
-        let snapshot = reuse_or_capture_fork_snapshot(None, || async {
-            loads.set(loads.get() + 1);
-            42
-        })
-        .await;
-
-        assert_eq!(snapshot, 42);
-        assert_eq!(loads.get(), 1);
+            assert_eq!(snapshot, expected);
+            assert_eq!(loads.get(), expected_loads);
+        }
     }
 }
 
@@ -149,7 +136,6 @@ fn rollout_materialization_failure_maps_without_parsing_its_message() {
 mod thread_list_cwd_filter_tests {
     use super::super::normalize_thread_list_cwd_filters;
     use codex_app_server_protocol::ThreadListCwdFilter;
-    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -170,7 +156,7 @@ mod thread_list_cwd_filter_tests {
     #[test]
     fn normalize_thread_list_cwd_filter_resolves_relative_paths_against_server_cwd()
     -> std::io::Result<()> {
-        let expected = AbsolutePathBuf::relative_to_current_dir("repo-b")?.to_path_buf();
+        let expected = std::env::current_dir()?.join("repo-b");
 
         assert_eq!(
             normalize_thread_list_cwd_filters(Some(ThreadListCwdFilter::Many(vec![String::from(
@@ -293,17 +279,19 @@ mod failed_fork_cleanup_tests {
     use super::super::should_finalize_failed_thread_setup;
 
     #[test]
-    fn missing_error_path_finalizes_when_spawn_rollback_reports_already_removed() {
-        assert!(should_finalize_failed_thread_setup(
-            /*rollback_succeeded*/ false, /*thread_id_still_loaded*/ false,
-        ));
-    }
-
-    #[test]
-    fn missing_error_path_preserves_cleanup_state_for_a_replacement_thread() {
-        assert!(!should_finalize_failed_thread_setup(
-            /*rollback_succeeded*/ false, /*thread_id_still_loaded*/ true,
-        ));
+    fn failed_setup_finalizes_unless_rollback_failed_with_a_loaded_thread() {
+        for (rollback_succeeded, thread_id_still_loaded, expected) in [
+            (false, false, true),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                should_finalize_failed_thread_setup(rollback_succeeded, thread_id_still_loaded),
+                expected,
+                "rollback_succeeded={rollback_succeeded}, loaded={thread_id_still_loaded}"
+            );
+        }
     }
 }
 
@@ -444,14 +432,6 @@ mod thread_turn_pagination_tests {
 }
 
 mod thread_processor_behavior_tests {
-    async fn forked_from_id_from_rollout(path: &Path) -> Option<String> {
-        codex_core::read_session_meta_line(path)
-            .await
-            .ok()
-            .and_then(|meta_line| meta_line.meta.forked_from_id)
-            .map(|thread_id| thread_id.to_string())
-    }
-
     use super::super::*;
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
@@ -671,6 +651,12 @@ mod thread_processor_behavior_tests {
         );
 
         assert_eq!(turns.last(), Some(&active_turn));
+        assert_eq!(turns.len(), 2);
+        assert!(matches!(
+            turns[0].items.as_slice(),
+            [ThreadItem::UserMessage { content, .. }]
+                if matches!(content.as_slice(), [V2UserInput::Text { text, .. }] if text == "persisted")
+        ));
     }
 
     #[test]
@@ -748,6 +734,15 @@ mod thread_processor_behavior_tests {
         .expect("initial page");
 
         assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].items_view, TurnItemsView::NotLoaded);
+        assert!(page.data[0].items.is_empty());
+        assert_eq!(page.next_cursor, None);
+        let cursor = super::super::parse_thread_turns_cursor(
+            page.backwards_cursor.as_deref().expect("backwards cursor"),
+        )
+        .expect("valid backwards cursor");
+        assert_eq!(cursor.turn_id, page.data[0].id);
+        assert!(cursor.include_anchor);
     }
 
     #[test]
@@ -1305,153 +1300,6 @@ mod thread_processor_behavior_tests {
     }
 
     #[tokio::test]
-    async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
-        use codex_protocol::protocol::SessionMetaLine;
-        use std::fs;
-        use std::fs::FileTimes;
-
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("rollout.jsonl");
-
-        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
-        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
-
-        let session_meta = SessionMeta {
-            session_id: conversation_id.into(),
-            id: conversation_id,
-            timestamp: timestamp.clone(),
-            model_provider: None,
-            ..SessionMeta::default()
-        };
-
-        let line = RolloutLine {
-            timestamp: timestamp.clone(),
-            item: RolloutItem::SessionMeta(SessionMetaLine {
-                meta: session_meta.clone(),
-                git: None,
-            }),
-        };
-
-        fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
-        let parsed = chrono::DateTime::parse_from_rfc3339(&timestamp)?.with_timezone(&Utc);
-        let times = FileTimes::new().set_modified(parsed.into());
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)?
-            .set_times(times)?;
-
-        let summary = read_summary_from_rollout(path.as_path(), "fallback").await?;
-
-        let expected = ConversationSummary {
-            conversation_id,
-            timestamp: Some(timestamp.clone()),
-            updated_at: Some(timestamp),
-            path: path.clone(),
-            preview: String::new(),
-            model_provider: "fallback".to_string(),
-            cwd: PathBuf::new(),
-            cli_version: String::new(),
-            source: SessionSource::VSCode,
-            git_info: None,
-        };
-
-        assert_eq!(summary, expected);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
-        use codex_protocol::protocol::SessionMetaLine;
-        use std::fs;
-
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("rollout.jsonl");
-
-        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
-        let parent_thread_id = ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?;
-        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
-
-        let session_meta = SessionMeta {
-            session_id: parent_thread_id.into(),
-            id: conversation_id,
-            timestamp: timestamp.clone(),
-            source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-            }),
-            thread_source: Some(codex_protocol::protocol::ThreadSource::Subagent),
-            agent_nickname: Some("atlas".to_string()),
-            agent_role: Some("explorer".to_string()),
-            model_provider: Some("test-provider".to_string()),
-            ..SessionMeta::default()
-        };
-
-        let line = RolloutLine {
-            timestamp,
-            item: RolloutItem::SessionMeta(SessionMetaLine {
-                meta: session_meta,
-                git: None,
-            }),
-        };
-        fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
-
-        let summary = read_summary_from_rollout(path.as_path(), "fallback").await?;
-        let fallback_cwd = AbsolutePathBuf::from_absolute_path("/")?;
-        let thread = summary_to_thread(summary, &fallback_cwd);
-
-        assert_eq!(thread.agent_nickname, Some("atlas".to_string()));
-        assert_eq!(thread.agent_role, Some("explorer".to_string()));
-        assert_eq!(thread.thread_source, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_summary_from_rollout_preserves_forked_from_id() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
-        use codex_protocol::protocol::SessionMetaLine;
-        use std::fs;
-
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("rollout.jsonl");
-
-        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
-        let forked_from_id = ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?;
-        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
-
-        let session_meta = SessionMeta {
-            session_id: conversation_id.into(),
-            id: conversation_id,
-            forked_from_id: Some(forked_from_id),
-            timestamp: timestamp.clone(),
-            model_provider: Some("test-provider".to_string()),
-            ..SessionMeta::default()
-        };
-
-        let line = RolloutLine {
-            timestamp,
-            item: RolloutItem::SessionMeta(SessionMetaLine {
-                meta: session_meta,
-                git: None,
-            }),
-        };
-        fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
-
-        assert_eq!(
-            forked_from_id_from_rollout(path.as_path()).await,
-            Some(forked_from_id.to_string())
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn aborting_pending_request_clears_pending_state() -> Result<()> {
         let thread_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
         let connection_id = ConnectionId(7);
@@ -1520,10 +1368,11 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn summary_from_stored_thread_preserves_agent_nickname() -> Result<()> {
+    fn stored_thread_projections_preserve_metadata_and_empty_preview() {
         let mut stored = summary_test_stored_thread();
+        let parent_thread_id = ThreadId::new();
         stored.source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: ThreadId::new(),
+            parent_thread_id,
             depth: 1,
             agent_path: None,
             agent_nickname: None,
@@ -1531,12 +1380,26 @@ mod thread_processor_behavior_tests {
         });
         stored.agent_nickname = Some("atlas".to_string());
         stored.agent_role = Some("explorer".to_string());
-        let summary = summary_from_stored_thread(stored, "fallback");
+        stored.forked_from_id = Some(parent_thread_id);
+        stored.thread_source = Some(codex_protocol::protocol::ThreadSource::Subagent);
+        stored.preview.clear();
+        stored.model_provider.clear();
+        let summary = summary_from_stored_thread(stored.clone(), "fallback");
+        assert_eq!(summary.source.get_nickname().as_deref(), Some("atlas"));
+        assert_eq!(summary.source.get_agent_role().as_deref(), Some("explorer"));
+        assert_eq!(summary.preview, "");
+        assert_eq!(summary.model_provider, "fallback");
+        assert_eq!(summary.conversation_id, stored.thread_id);
+        assert_eq!(summary.path, stored.rollout_path.clone().expect("rollout path"));
         let fallback_cwd = test_path_buf("/tmp").abs();
-        let thread = summary_to_thread(summary, &fallback_cwd);
+        let (thread, history) = thread_from_stored_thread(stored, "fallback", &fallback_cwd);
         assert_eq!(thread.agent_nickname.as_deref(), Some("atlas"));
         assert_eq!(thread.agent_role.as_deref(), Some("explorer"));
-        Ok(())
+        assert_eq!(thread.forked_from_id, Some(parent_thread_id.to_string()));
+        assert_eq!(thread.thread_source, Some(codex_protocol::protocol::ThreadSource::Subagent));
+        assert_eq!(thread.preview, "");
+        assert_eq!(thread.model_provider, "fallback");
+        assert!(history.is_none());
     }
 
     #[tokio::test]
@@ -1695,18 +1558,10 @@ mod thread_processor_behavior_tests {
             .await;
 
         let wait_for_subscriber = manager.wait_for_thread_subscriber(thread_id);
-        let attach_connection = async {
-            tokio::task::yield_now().await;
-            manager
-                .try_add_connection_to_thread(thread_id, connection)
-                .await
-        };
-        let ((), attached) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(wait_for_subscriber, attach_connection)
-        })
-        .await?;
-
-        assert!(attached);
+        tokio::pin!(wait_for_subscriber);
+        assert!(futures::poll!(&mut wait_for_subscriber).is_pending());
+        assert!(manager.try_add_connection_to_thread(thread_id, connection).await);
+        tokio::time::timeout(Duration::from_secs(1), wait_for_subscriber).await?;
         Ok(())
     }
 

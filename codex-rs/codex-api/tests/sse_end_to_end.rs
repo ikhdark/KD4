@@ -136,18 +136,16 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
 
     assert_eq!(events.len(), 3);
 
-    match &events[0] {
-        ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. }) => {
+    for (event, expected_text) in events[..2].iter().zip(["Hello", "World"]) {
+        match event {
+        ResponseEvent::OutputItemDone(ResponseItem::Message { role, content, .. }) => {
             assert_eq!(role, "assistant");
+            assert_eq!(serde_json::to_value(content)?, serde_json::json!([
+                {"type": "output_text", "text": expected_text}
+            ]));
         }
-        other => panic!("unexpected first event: {other:?}"),
-    }
-
-    match &events[1] {
-        ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. }) => {
-            assert_eq!(role, "assistant");
+        other => panic!("unexpected item event: {other:?}"),
         }
-        other => panic!("unexpected second event: {other:?}"),
     }
 
     match &events[2] {

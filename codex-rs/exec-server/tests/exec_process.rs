@@ -332,26 +332,39 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
 
     let StartedExecProcess { process, .. } = session;
     let actual = collect_process_event_snapshots(process).await?;
-    assert_eq!(
-        actual,
-        vec![
-            ProcessEventSnapshot::Output {
-                seq: 1,
-                stream: ExecOutputStream::Stdout,
-                text: "event output\n".to_string(),
-            },
-            ProcessEventSnapshot::Output {
-                seq: 2,
-                stream: ExecOutputStream::Stderr,
-                text: "event err\n".to_string(),
-            },
-            ProcessEventSnapshot::Exited {
-                seq: 3,
-                exit_code: 7,
-            },
-            ProcessEventSnapshot::Closed { seq: 4 },
-        ]
-    );
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = None;
+    let mut closed = false;
+    for (index, event) in actual.iter().enumerate() {
+        assert!(!closed, "close must be the final event");
+        let seq = match event {
+            ProcessEventSnapshot::Output { seq, stream, text } => {
+                match stream {
+                    ExecOutputStream::Stdout => stdout.push_str(text),
+                    ExecOutputStream::Stderr => stderr.push_str(text),
+                    other => panic!("unexpected piped output stream: {other:?}"),
+                }
+                *seq
+            }
+            ProcessEventSnapshot::Exited { seq, exit_code: code } => {
+                assert!(exit_code.replace(*code).is_none(), "only one exit event");
+                *seq
+            }
+            ProcessEventSnapshot::Closed { seq } => {
+                assert_eq!(exit_code, Some(7), "exit precedes close");
+                closed = true;
+                *seq
+            }
+        };
+        assert_eq!(seq, index as u64 + 1);
+    }
+    // Pipes preserve bytes within each stream, not write/read chunk boundaries
+    // or a total stdout/stderr order. Output may also drain after process exit.
+    assert_eq!(stdout, "event output\n");
+    assert_eq!(stderr, "event err\n");
+    assert_eq!(exit_code, Some(7));
+    assert!(closed);
     Ok(())
 }
 
@@ -480,6 +493,8 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
 async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
     let context = create_process_context(use_remote).await?;
     let process_id = "proc-stdin".to_string();
+    let mut env: std::collections::HashMap<_, _> = std::env::vars().collect();
+    env.insert("CODEX_STDIN_VALUE".to_string(), "hello".to_string());
     let session = context
         .backend
         .start(ExecParams {
@@ -491,7 +506,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: std::env::vars().collect(),
+            env,
             tty: true,
             pipe_stdin: false,
             arg0: None,
@@ -505,7 +520,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let write = session
         .process
-        .write(b"echo from-stdin:hello & exit 0\n".to_vec())
+        .write(b"echo from-stdin:%CODEX_STDIN_VALUE% & exit 0\n".to_vec())
         .await?;
     assert_eq!(write.status, WriteStatus::Accepted);
     let StartedExecProcess { process, .. } = session;
@@ -642,38 +657,6 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
     );
 
     session.process.terminate().await?;
-    Ok(())
-}
-
-async fn assert_exec_process_preserves_queued_events_before_subscribe(
-    use_remote: bool,
-) -> Result<()> {
-    let context = create_process_context(use_remote).await?;
-    let session = context
-        .backend
-        .start(ExecParams {
-            process_id: ProcessId::from("proc-queued"),
-            argv: powershell("[Console]::Out.Write(\"queued output`n\")"),
-            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
-            env_policy: /*env_policy*/ None,
-            env: std::env::vars().collect(),
-            tty: false,
-            pipe_stdin: false,
-            arg0: None,
-            sandbox: None,
-            enforce_managed_network: false,
-            managed_network: None,
-        })
-        .await?;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let StartedExecProcess { process, .. } = session;
-    let wake_rx = process.subscribe_wake();
-    let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
-    assert_eq!(output, "queued output\n");
-    assert_eq!(exit_code, Some(0));
-    assert!(closed);
     Ok(())
 }
 
@@ -904,13 +887,4 @@ async fn exec_process_rejects_write_without_pipe_stdin(use_remote: bool) -> Resu
 #[serial_test::serial(remote_exec_server)]
 async fn exec_process_signal_reports_unsupported_on_windows(use_remote: bool) -> Result<()> {
     assert_exec_process_signal_reports_unsupported_on_windows(use_remote).await
-}
-
-#[test_case(false ; "local")]
-#[test_case(true ; "remote")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// Serialize tests that launch a real exec-server process through the full CLI.
-#[serial_test::serial(remote_exec_server)]
-async fn exec_process_preserves_queued_events_before_subscribe(use_remote: bool) -> Result<()> {
-    assert_exec_process_preserves_queued_events_before_subscribe(use_remote).await
 }

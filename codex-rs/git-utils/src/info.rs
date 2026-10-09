@@ -1292,10 +1292,9 @@ mod tests {
         );
         assert_eq!(primary.common_dir, linked_context.common_dir);
         assert_ne!(primary.worktree_git_dir, linked_context.worktree_git_dir);
-        assert_eq!(
-            primary.git_info.commit_hash,
-            linked_context.git_info.commit_hash
-        );
+        let expected_commit = Some(GitSha::new(&run_git(&repo, &["rev-parse", "HEAD"])));
+        assert_eq!(primary.git_info.commit_hash, expected_commit);
+        assert_eq!(linked_context.git_info.commit_hash, expected_commit);
         assert_eq!(linked_context.git_info.branch, None);
     }
 
@@ -1710,18 +1709,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_to_remote_includes_quoted_unicode_untracked_path() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let (repo, _remote, _branch, _base_sha) = init_repo_with_remote(&temp);
-        std::fs::write(repo.join("é.txt"), "quoted path contents\n").expect("write untracked file");
-
-        let state = git_diff_to_remote(&repo).await.expect("diff to remote");
-
-        assert!(state.diff.contains("\\303\\251.txt"));
-        assert!(state.diff.contains("+quoted path contents"));
-    }
-
-    #[tokio::test]
     async fn diff_to_remote_from_subdirectory_keeps_repository_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (repo, _remote, _branch, _base_sha) = init_repo_with_remote(&temp);
@@ -1730,8 +1717,11 @@ mod tests {
         std::fs::write(subdir.join("nested.txt"), "nested\n").expect("write nested file");
         std::fs::write(repo.join("top.txt"), "top\n").expect("write top-level file");
         std::fs::write(repo.join("tracked.txt"), "changed\n").expect("change tracked file");
+        std::fs::write(repo.join("é.txt"), "quoted path contents\n").expect("write untracked file");
 
         let state = git_diff_to_remote(&subdir).await.expect("diff to remote");
+        assert!(state.diff.contains("\\303\\251.txt"));
+        assert!(state.diff.contains("+quoted path contents"));
 
         for header in [
             "diff --git a/sub/nested.txt b/sub/nested.txt",

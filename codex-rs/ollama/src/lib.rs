@@ -91,19 +91,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supports_responses_for_dev_zero() {
-        assert!(supports_responses(&Version::new(0, 0, 0)));
-    }
-
-    #[test]
-    fn does_not_support_responses_before_cutoff() {
-        assert!(!supports_responses(&Version::new(0, 13, 3)));
-    }
-
-    #[test]
-    fn supports_responses_at_or_after_cutoff() {
-        assert!(supports_responses(&Version::new(0, 13, 4)));
-        assert!(supports_responses(&Version::new(0, 14, 0)));
+    fn supports_responses_version_policy() {
+        for (version, supported) in [
+            (Version::new(0, 0, 0), true),
+            (Version::new(0, 13, 3), false),
+            (Version::new(0, 13, 4), true),
+            (Version::new(0, 14, 0), true),
+        ] {
+            assert_eq!(supports_responses(&version), supported, "{version}");
+        }
     }
 
     #[test]

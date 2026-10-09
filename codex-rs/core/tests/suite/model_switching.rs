@@ -451,7 +451,7 @@ async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()>
         description: "Fast processing.".to_string(),
     }];
     model.default_service_tier = Some(ServiceTier::Fast.request_value().to_string());
-    let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let resp_mock = mount_sse_sequence(&server, vec![sse_completed("resp-1"), sse_completed("resp-2"), sse_completed("resp-3")]).await;
 
     let mut builder = test_codex()
         .with_model(model_slug)
@@ -465,51 +465,18 @@ async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()>
     test.submit_turn_with_service_tier("default turn", Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE))
         .await?;
 
-    let request = resp_mock.single_request();
-    let body = request.body_json();
-    assert_eq!(body.get("service_tier"), None);
+    test.submit_turn_with_service_tier("restore fast tier", Some(ServiceTier::Fast.request_value())).await?;
+    test.submit_turn_with_service_tier("standard turn", None).await?;
+    let requests = resp_mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].body_json().get("service_tier"), None);
+    assert_eq!(requests[1].body_json()["service_tier"], "priority");
+    assert_eq!(requests[2].body_json().get("service_tier"), None);
 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn null_service_tier_override_is_omitted_from_http_turn_with_catalog_default() -> Result<()> {
-    require_network!();
 
-    let server = start_mock_server().await;
-    let model_slug = "test-null-default-tier-model";
-    let mut model = test_model_info(
-        model_slug,
-        model_slug,
-        "has catalog default service tier",
-        default_input_modalities(),
-    );
-    model.service_tiers = vec![ModelServiceTier {
-        id: ServiceTier::Fast.request_value().to_string(),
-        name: "fast".to_string(),
-        description: "Fast processing.".to_string(),
-    }];
-    model.default_service_tier = Some(ServiceTier::Fast.request_value().to_string());
-    let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-
-    let mut builder = test_codex()
-        .with_model(model_slug)
-        .with_config(move |config| {
-            config.model_catalog = Some(ModelsResponse {
-                models: vec![model],
-            });
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn_with_service_tier("standard turn", /*service_tier*/ None)
-        .await?;
-
-    let request = resp_mock.single_request();
-    let body = request.body_json();
-    assert_eq!(body.get("service_tier"), None);
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<()> {

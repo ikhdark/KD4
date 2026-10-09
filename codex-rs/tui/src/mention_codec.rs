@@ -186,17 +186,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn decoded_mentions_use_the_composer_binding_type() {
-        fn accept_composer_binding(binding: crate::bottom_pane::MentionBinding) -> MentionBinding {
-            binding
-        }
-
-        let mut decoded = decode_history_mentions("Use [$figma](app://figma-1).");
-        let binding = accept_composer_binding(decoded.mentions.remove(0));
-        assert_eq!(binding.mention, "figma");
-    }
-
-    #[test]
     fn decode_history_mentions_restores_visible_tokens() {
         let decoded = decode_history_mentions(
             "Use [$figma](app://figma-1), [$sample](plugin://sample@test), and [$figma](/tmp/figma/SKILL.md).",

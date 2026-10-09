@@ -1160,7 +1160,17 @@ mod tests {
 
     #[test]
     fn custom_tool_call_output_text_returns_output_text() {
-        let bodies = vec![json!({
+        let mut bodies = vec![json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "wrong type"
+            }, {
+                "type": "custom_tool_call_output",
+                "call_id": "other-call",
+                "output": "wrong call"
+            }]
+        }), json!({
             "input": [{
                 "type": "custom_tool_call_output",
                 "call_id": "call-1",
@@ -1169,6 +1179,8 @@ mod tests {
         })];
 
         assert_eq!(custom_tool_call_output_text(&bodies, "call-1"), "hello");
+        bodies[1]["input"][0]["output"] = json!([{"type": "input_text", "text": "typed hello"}]);
+        assert_eq!(custom_tool_call_output_text(&bodies, "call-1"), "typed hello");
     }
 
     #[test]

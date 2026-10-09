@@ -1459,80 +1459,7 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn semantic_evidence_for_command_output(raw_output: &[u8]) -> Vec<String> {
-    let Ok(output) = std::str::from_utf8(raw_output) else {
-        return canonical_output_evidence(raw_output);
-    };
-    let compiler_framing = output
-        .lines()
-        .any(|line| is_compiler_location_line(&strip_ansi_sequences(line)));
-    let mut facts = Vec::new();
-    let mut in_diff = false;
-    let mut in_diff_hunk = false;
-    for raw_line in output.lines() {
-        let line = strip_ansi_sequences(raw_line);
-        let line = line.trim_end();
-        if line.starts_with("diff --git ") {
-            in_diff = true;
-            in_diff_hunk = false;
-            continue;
-        }
-        if in_diff {
-            if line.starts_with("@@") {
-                in_diff_hunk = true;
-                continue;
-            }
-            if line.starts_with("+++")
-                || line.starts_with("---")
-                || line.starts_with("index ")
-                || (!in_diff_hunk && is_git_diff_metadata(line))
-            {
-                continue;
-            }
-            if in_diff_hunk {
-                if let Some(changed_line) = line.strip_prefix('+') {
-                    if let Some(fact) = normalize_semantic_fact_line(changed_line, false) {
-                        facts.push(crate::tool_history::sha256(fact.as_bytes()));
-                    }
-                    continue;
-                }
-                if let Some(changed_line) = line.strip_prefix('-') {
-                    if let Some(fact) = normalize_semantic_fact_line(changed_line, false) {
-                        facts.push(crate::tool_history::sha256(
-                            format!("removed:{fact}").as_bytes(),
-                        ));
-                    }
-                    continue;
-                }
-                if let Some(context_line) = line.strip_prefix(' ') {
-                    if let Some(fact) = normalize_semantic_fact_line(context_line, false) {
-                        facts.push(crate::tool_history::sha256(
-                            format!("context:{fact}").as_bytes(),
-                        ));
-                    }
-                    continue;
-                }
-                if line.starts_with('\\') {
-                    continue;
-                }
-            }
-            in_diff = false;
-            in_diff_hunk = false;
-        }
-        let diagnostic = normalize_command_diagnostic_line(line);
-        if let Some(fact) = normalize_semantic_fact_line(&diagnostic, compiler_framing) {
-            facts.push(crate::tool_history::sha256(fact.as_bytes()));
-        }
-    }
-    if facts.is_empty() {
-        return canonical_output_evidence(raw_output);
-    }
-    vec![format!(
-        "command-facts-v1:{}",
-        crate::tool_history::sha256(facts.join("\n").as_bytes())
-    )]
-}
+
 
 pub(crate) fn semantic_evidence_sampling_signal(semantic_evidence: JsonValue) -> JsonValue {
     serde_json::json!({
@@ -1762,25 +1689,7 @@ fn command_failure_signature(semantic_evidence: &[String], exit_code: Option<i32
     )
 }
 
-#[cfg(test)]
-fn normalize_semantic_fact_line(line: &str, compiler_framing: bool) -> Option<String> {
-    let mut line = line.trim();
-    if line.is_empty() || (compiler_framing && is_compiler_location_line(line)) {
-        return None;
-    }
-    if compiler_framing
-        && let Some((prefix, body)) = line.split_once('|')
-        && prefix.trim().parse::<u64>().is_ok()
-    {
-        line = body.trim();
-    } else if let Some(body) = strip_location_prefix(line) {
-        line = body.trim();
-    }
-    if line.is_empty() || (compiler_framing && is_compiler_marker_line(line)) {
-        return None;
-    }
-    Some(line.to_string())
-}
+
 
 /// Normalize only recognizable producer framing. Durations in source, diffs,
 /// application data, or assertion messages remain substantive evidence.
@@ -1854,133 +1763,17 @@ pub(crate) fn normalize_tool_failure_text(text: &str) -> String {
     normalized
 }
 
-#[cfg(test)]
-fn is_compiler_location_line(line: &str) -> bool {
-    line.trim_start()
-        .strip_prefix("--> ")
-        .and_then(strip_location_prefix)
-        .is_some()
-}
 
-#[cfg(test)]
-fn is_compiler_marker_line(line: &str) -> bool {
-    let marker = line.strip_prefix('|').unwrap_or(line).trim();
-    !marker.is_empty()
-        && marker
-            .chars()
-            .all(|character| matches!(character, '^' | '-' | '_' | '~'))
-}
 
-#[cfg(test)]
-fn strip_location_prefix(line: &str) -> Option<&str> {
-    let bytes = line.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte != b':' {
-            continue;
-        }
-        let digits_start = index + 1;
-        let digits_end = bytes[digits_start..]
-            .iter()
-            .position(|byte| !byte.is_ascii_digit())
-            .map(|offset| digits_start + offset)
-            .unwrap_or(bytes.len());
-        if digits_end == digits_start || bytes.get(digits_end) != Some(&b':') {
-            continue;
-        }
-        if !looks_like_source_path(&line[..index]) {
-            continue;
-        }
-        return line.get(digits_end + 1..);
-    }
-    None
-}
 
-#[cfg(test)]
-fn looks_like_source_path(prefix: &str) -> bool {
-    let prefix = prefix.trim().to_ascii_lowercase();
-    if prefix.contains("://") {
-        return false;
-    }
-    let has_path_separator = prefix.contains('/') || prefix.contains('\\');
-    let file_name = prefix.rsplit(['/', '\\']).next().unwrap_or(&prefix);
-    matches!(file_name, "dockerfile" | "gemfile" | "makefile" | "readme")
-        || file_name.rsplit_once('.').is_some_and(|(stem, extension)| {
-            !stem.is_empty()
-                && !extension.is_empty()
-                && extension.len() <= 16
-                && extension
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric())
-                && (has_path_separator || is_common_source_extension(extension))
-        })
-}
 
-#[cfg(test)]
-fn is_common_source_extension(extension: &str) -> bool {
-    matches!(
-        extension,
-        "bash"
-            | "c"
-            | "cc"
-            | "cpp"
-            | "cs"
-            | "css"
-            | "cxx"
-            | "fish"
-            | "go"
-            | "h"
-            | "hpp"
-            | "html"
-            | "java"
-            | "js"
-            | "json"
-            | "jsonl"
-            | "jsx"
-            | "kt"
-            | "kts"
-            | "less"
-            | "lock"
-            | "md"
-            | "php"
-            | "proto"
-            | "ps1"
-            | "py"
-            | "rb"
-            | "rs"
-            | "sass"
-            | "scala"
-            | "scss"
-            | "sh"
-            | "sql"
-            | "swift"
-            | "toml"
-            | "ts"
-            | "tsx"
-            | "txt"
-            | "xml"
-            | "yaml"
-            | "yml"
-            | "zsh"
-    )
-}
 
-#[cfg(test)]
-fn is_git_diff_metadata(line: &str) -> bool {
-    [
-        "Binary files ",
-        "GIT binary patch",
-        "deleted file mode ",
-        "dissimilarity index ",
-        "new file mode ",
-        "new mode ",
-        "old mode ",
-        "rename from ",
-        "rename to ",
-        "similarity index ",
-    ]
-    .iter()
-    .any(|prefix| line.starts_with(prefix))
-}
+
+
+
+
+
+
 
 fn strip_ansi_sequences(line: &str) -> String {
     let mut stripped = String::with_capacity(line.len());

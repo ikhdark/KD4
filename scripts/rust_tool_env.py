@@ -151,6 +151,6 @@ def find_windows_lld_link(
     if on_path:
         return on_path
     for candidate in windows_lld_link_fallbacks(env, default_path=default_path):
-        if candidate.exists():
+        if candidate.is_file():
             return str(candidate)
     return None

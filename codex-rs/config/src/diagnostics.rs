@@ -482,6 +482,9 @@ mod consolidated_type_tests {
         let error =
             super::config_error_from_typed_toml::<crate::config_toml::ConfigToml>(&path, contents)
                 .expect("invalid boolean");
+        let rendered = super::format_config_error_with_source(&error).await;
+        assert!(rendered.contains("allow_login_shell = 123"), "{rendered}");
+        assert!(rendered.contains("^^^"), "{rendered}");
         assert_eq!(
             super::format_config_error_with_source(&error).await,
             super::format_config_error(&error, contents),

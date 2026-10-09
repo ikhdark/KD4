@@ -109,17 +109,22 @@ mod tests {
 
     #[test]
     fn bounded_source_reads_parse_as_reads_for_output_shaping() {
-        for source in ["sed -n '1,700p' src/lib.rs", "rg -n pattern src/lib.rs"] {
-            let parsed = parse_shell_script(source);
-            assert!(
-                !parsed.is_empty()
-                    && parsed.iter().all(|command| matches!(
-                        command,
-                        ParsedCommand::Read { .. } | ParsedCommand::Search { .. }
-                    )),
-                "{source}: {parsed:?}"
-            );
-        }
+        assert_eq!(
+            parse_shell_script("sed -n '1,700p' src/lib.rs"),
+            vec![ParsedCommand::Read {
+                cmd: "sed -n '1,700p' src/lib.rs".to_string(),
+                name: "lib.rs".to_string(),
+                path: PathBuf::from("src/lib.rs"),
+            }]
+        );
+        assert_eq!(
+            parse_shell_script("rg -n pattern src/lib.rs"),
+            vec![ParsedCommand::Search {
+                cmd: "rg -n pattern src/lib.rs".to_string(),
+                query: Some("pattern".to_string()),
+                path: Some("lib.rs".to_string()),
+            }]
+        );
     }
 
     #[test]
@@ -440,15 +445,27 @@ mod tests {
     }
 
     #[test]
-    fn cd_with_multiple_operands_uses_last() {
-        assert_parsed(
-            &shlex_split_safe("cd dir1 dir2 && cat foo.txt"),
-            vec![ParsedCommand::Read {
-                cmd: "cat foo.txt".to_string(),
-                name: "foo.txt".to_string(),
-                path: PathBuf::from("dir2/foo.txt"),
-            }],
-        );
+    fn cd_without_one_literal_target_remains_unknown() {
+        // Bash rejects multiple operands; zsh's two-operand form performs cwd
+        // substitution. Neither establishes the last operand as the new cwd.
+        for source in [
+            "cd dir1 dir2 && cat foo.txt",
+            "cd -- dir1 dir2 && cat foo.txt",
+            "cd && cat foo.txt",
+            "cd - && cat foo.txt",
+            "cd --unknown dir1 && cat foo.txt",
+        ] {
+            for command in [
+                shlex_split_safe(source),
+                vec_str(&["bash", "-lc", source]),
+                vec_str(&["zsh", "-lc", source]),
+            ] {
+                assert!(
+                    matches!(parse_command(&command).as_slice(), [ParsedCommand::Unknown { .. }]),
+                    "ambiguous cwd must not be summarized as a file read: {command:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1399,12 +1416,13 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
         if let Some((head, tail)) = tokens.split_first()
             && head == "cd"
         {
-            if let Some(dir) = cd_target(tail) {
-                cwd = Some(match &cwd {
-                    Some(base) => join_paths(base, &dir),
-                    None => dir.clone(),
-                });
-            }
+            let Some(dir) = cd_target(tail) else {
+                return vec![single_unknown_for_command(command)];
+            };
+            cwd = Some(match &cwd {
+                Some(base) => join_paths(base, &dir),
+                None => dir,
+            });
             continue;
         }
         let parsed = summarize_main_tokens(tokens);
@@ -1755,28 +1773,26 @@ fn awk_data_file_operand(args: &[String]) -> Option<String> {
 }
 
 fn cd_target(args: &[String]) -> Option<String> {
-    if args.is_empty() {
-        return None;
-    }
     let mut i = 0;
-    let mut target: Option<String> = None;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" {
-            return args.get(i + 1).cloned();
+            i += 1;
+            break;
         }
         if matches!(arg.as_str(), "-L" | "-P") {
             i += 1;
             continue;
         }
         if arg.starts_with('-') {
-            i += 1;
-            continue;
+            return None;
         }
-        target = Some(arg.clone());
-        i += 1;
+        break;
     }
-    target
+    match &args[i..] {
+        [target] if target != "-" => Some(target.clone()),
+        _ => None,
+    }
 }
 
 fn is_pathish(s: &str) -> bool {

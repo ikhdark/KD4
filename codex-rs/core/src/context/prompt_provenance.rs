@@ -1125,11 +1125,13 @@ mod tests {
         ];
         CATEGORY_LOOKUP_BYTES.set(0);
         let sidecar = PromptProvenanceSidecar::from_assembled_items(
-            &items,
+            &items[..1],
             &StableContextManifest::default(),
         );
         assert_eq!(CATEGORY_LOOKUP_BYTES.get(), 0);
         let sidecar = sidecar.with_appended_items(&items[1..], &StableContextManifest::default());
+        assert_eq!(sidecar.aligned_items.len(), items.len());
+        assert_eq!(CATEGORY_LOOKUP_BYTES.get(), 0);
         for measured in measure_both(&items, &sidecar) {
             assert_eq!(
                 measured.bytes(PromptContextCategory::TaskInput),
@@ -1429,14 +1431,10 @@ mod tests {
             &items,
             &StableContextManifest::default(),
         );
-        let breakdown = PromptContextBreakdown::from_response_items(&items, &sidecar)
-            .expect("breakdown should build");
-        assert!(breakdown.bytes(PromptContextCategory::TaskInput) > 0);
-        assert!(breakdown.bytes(PromptContextCategory::History) > 0);
-        assert_eq!(
-            breakdown.total_bytes(),
-            serde_json::to_vec(&items).unwrap().len() as u64
-        );
+        for breakdown in measure_both(&items, &sidecar) {
+            assert_eq!(breakdown.bytes(PromptContextCategory::TaskInput), item_bytes(&items[2]));
+            assert_eq!(breakdown.bytes(PromptContextCategory::History), item_bytes(&items[0]) + item_bytes(&items[1]));
+        }
     }
 
     #[test]
@@ -1452,26 +1450,15 @@ mod tests {
         assert!(serialized.contains("estimated_tokens"));
         assert!(serialized.contains("sha256"));
         assert!(!serialized.contains("secret prompt text"));
-    }
-
-    #[test]
-    fn assembly_site_exact_fragments_override_unknown_history_without_parsing() {
-        let permissions = "opaque rendered permissions contribution";
-        let items = vec![message("developer", permissions, Some("turn-2"))];
-        let sidecar = PromptProvenanceSidecar::from_assembled_items(
-            &items,
-            &StableContextManifest::default(),
-        )
-        .with_exact_fragment(
-            &items,
-            permissions,
-            PromptContextCategory::EnvironmentPermissions,
-        );
-        let breakdown = PromptContextBreakdown::from_response_items(&items, &sidecar)
-            .expect("breakdown should build");
-
-        assert!(breakdown.bytes(PromptContextCategory::EnvironmentPermissions) > 0);
-        assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
+        let measurements = breakdown.measurements();
+        assert_eq!(measurements, breakdown.measurements());
+        let empty = PromptContextBreakdown::default().measurements();
+        let hashes = empty.iter().map(|entry| &entry.sha256).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hashes.len(), PromptContextCategory::ALL.len(), "empty category domains must differ");
+        for entry in measurements {
+            assert_eq!(entry.sha256, hex_hash(&entry.hash));
+            assert_eq!(entry.sha256.len(), 64);
+        }
     }
 
     #[test]
@@ -1493,12 +1480,11 @@ mod tests {
                 (role, PromptContextCategory::AgentRole),
             ],
         );
-        let breakdown = PromptContextBreakdown::from_response_items(&items, &sidecar)
-            .expect("breakdown should build");
-
-        assert!(breakdown.bytes(PromptContextCategory::EnvironmentPermissions) > 0);
-        assert!(breakdown.bytes(PromptContextCategory::AgentRole) > 0);
-        assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
+        for breakdown in measure_both(&items, &sidecar) {
+            assert_eq!(breakdown.bytes(PromptContextCategory::EnvironmentPermissions), item_bytes(&items[0]));
+            assert_eq!(breakdown.bytes(PromptContextCategory::AgentRole), item_bytes(&items[1]));
+            assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
+        }
     }
 
     #[test]

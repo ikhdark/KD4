@@ -252,11 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn rm_rf_is_dangerous() {
-        assert!(command_might_be_dangerous(&vec_str(&["rm", "-rf", "/"])));
-    }
-
-    #[test]
     fn authorization_identity_direct_argv_dangerousness_is_opaque() {
         assert!(direct_argv_might_be_dangerous(&vec_str(&[
             "rm", "-rf", "/",
@@ -274,13 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn rm_f_is_dangerous() {
-        assert!(command_might_be_dangerous(&vec_str(&["rm", "-f", "/"])));
-    }
-
-    #[test]
     fn rm_force_variants_and_full_paths_are_dangerous() {
         for command in [
+            vec_str(&["rm", "-rf", "/"]),
+            vec_str(&["rm", "-f", "/"]),
             vec_str(&["/bin/rm", "-fr", "target"]),
             vec_str(&["/bin/rm", "--force", "target"]),
             vec_str(&["/bin/rm", "-r", "-f", "target"]),

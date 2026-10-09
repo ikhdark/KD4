@@ -503,44 +503,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_sandbox_context_drops_unused_cwd() {
-        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: absolute_test_path("remote-root"),
-            },
-            access: FileSystemAccessMode::Read,
-        }]);
-        let permissions =
-            PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted);
-        let sandbox_context = FileSystemSandboxContext::from_permission_profile_with_cwd(
-            permissions,
-            path_uri("host-checkout"),
-        );
-
-        let remote_context =
-            remote_sandbox_context(Some(&sandbox_context)).expect("remote sandbox context");
-
-        assert_eq!(remote_context.cwd, None);
-    }
-
-    #[test]
-    fn remote_sandbox_context_preserves_required_cwd() {
-        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
-            },
-            access: FileSystemAccessMode::Write,
-        }]);
-        let permissions =
-            PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted);
-        let cwd = path_uri("host-checkout");
-        let sandbox_context =
-            FileSystemSandboxContext::from_permission_profile_with_cwd(permissions, cwd.clone());
-
-        let remote_context =
-            remote_sandbox_context(Some(&sandbox_context)).expect("remote sandbox context");
-
-        assert_eq!(remote_context.cwd, Some(cwd));
+    fn remote_sandbox_context_only_preserves_cwd_when_required() {
+        assert_eq!(remote_sandbox_context(None), None);
+        for required in [false, true] {
+            let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+                path: if required {
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(None),
+                    }
+                } else {
+                    FileSystemPath::Path { path: absolute_test_path("remote-root") }
+                },
+                access: if required { FileSystemAccessMode::Write } else { FileSystemAccessMode::Read },
+            }]);
+            let permissions = PermissionProfile::from_runtime_permissions(
+                &policy, NetworkSandboxPolicy::Restricted,
+            );
+            let cwd = path_uri("host-checkout");
+            let original = FileSystemSandboxContext::from_permission_profile_with_cwd(
+                permissions, cwd.clone(),
+            );
+            let mut expected = original.clone();
+            expected.cwd = required.then_some(cwd.clone());
+            assert_eq!(remote_sandbox_context(Some(&original)), Some(expected));
+            assert_eq!(original.cwd, Some(cwd));
+        }
     }
 
     #[test]

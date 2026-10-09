@@ -381,57 +381,33 @@ mod tests {
     use super::sandbox_cwd;
 
     #[test]
-    fn helper_permissions_enable_minimal_reads_for_restricted_profile() {
-        let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir().as_path())
-            .expect("absolute cwd");
-        let mut policy = restricted_policy(Vec::new());
-
-        add_helper_runtime_permissions(&mut policy, /*helper_read_roots*/ &[], cwd.as_path());
-
-        assert!(policy.include_platform_defaults());
-    }
-
-    #[test]
-    fn helper_permissions_enable_minimal_reads_for_restricted_profile_with_writes() {
-        let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir().as_path())
-            .expect("absolute cwd");
-        let mut policy = restricted_policy(vec![path_entry(
-            cwd.join("writable"),
-            FileSystemAccessMode::Write,
-        )]);
-
-        add_helper_runtime_permissions(&mut policy, /*helper_read_roots*/ &[], cwd.as_path());
-
-        assert!(policy.include_platform_defaults());
-    }
-
-    #[test]
-    fn helper_permissions_preserve_existing_writes() {
-        let codex_self_exe = std::env::current_exe().expect("current exe");
-        let runtime_paths = ExecServerRuntimePaths::new(codex_self_exe).expect("runtime paths");
-        let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir().as_path())
-            .expect("absolute cwd");
+    fn helper_permissions_add_reads_without_losing_writes_or_duplicating_entries() {
+        let runtime_paths = ExecServerRuntimePaths::new(std::env::current_exe().expect("exe"))
+            .expect("runtime paths");
+        let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir()).expect("cwd");
         let writable = cwd.join("writable");
-        let mut policy = restricted_policy(vec![path_entry(
-            writable.clone(),
-            FileSystemAccessMode::Write,
-        )]);
-        let readable = AbsolutePathBuf::from_absolute_path(
-            runtime_paths
-                .codex_self_exe
-                .parent()
-                .expect("current exe parent"),
-        )
-        .expect("absolute readable path");
-
-        add_helper_runtime_permissions(
-            &mut policy,
-            &helper_read_roots(&runtime_paths),
-            cwd.as_path(),
-        );
-
-        assert!(policy.can_read_path_with_cwd(readable.as_path(), cwd.as_path()));
-        assert!(policy.can_write_path_with_cwd(writable.as_path(), cwd.as_path()));
+        let roots = helper_read_roots(&runtime_paths);
+        assert_eq!(roots.len(), 1);
+        for writes in [false, true] {
+            for include_helper in [false, true] {
+                let mut policy = restricted_policy(if writes {
+                    vec![path_entry(writable.clone(), FileSystemAccessMode::Write)]
+                } else {
+                    Vec::new()
+                });
+                let helper_roots = if include_helper { roots.as_slice() } else { &[] };
+                add_helper_runtime_permissions(&mut policy, helper_roots, cwd.as_path());
+                assert!(policy.include_platform_defaults());
+                assert_eq!(policy.can_write_path_with_cwd(writable.as_path(), cwd.as_path()), writes);
+                if include_helper {
+                    assert!(policy.can_read_path_with_cwd(roots[0].as_path(), cwd.as_path()));
+                    assert!(!policy.can_write_path_with_cwd(roots[0].as_path(), cwd.as_path()));
+                }
+                let entries = policy.entries.clone();
+                add_helper_runtime_permissions(&mut policy, helper_roots, cwd.as_path());
+                assert_eq!(policy.entries, entries);
+            }
+        }
     }
 
     #[test]
@@ -451,43 +427,28 @@ mod tests {
 
     #[test]
     fn helper_env_preserves_windows_runtime_vars_without_leaking_secrets() {
-        let env = helper_env_from_vars(
-            [
-                ("PATH", r"C:\Windows\System32"),
-                ("TMP", r"C:\Temp"),
-                ("TEMP", r"C:\Temp"),
-                ("USERPROFILE", r"C:\Users\test"),
-                ("OPENAI_API_KEY", "secret"),
-                ("HTTPS_PROXY", "http://proxy.example"),
-            ]
-            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
-        );
-
-        assert_eq!(
-            env,
-            HashMap::from([
-                ("PATH".to_string(), r"C:\Windows\System32".to_string()),
-                ("TMP".to_string(), r"C:\Temp".to_string()),
-                ("TEMP".to_string(), r"C:\Temp".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn helper_env_preserves_windows_path_key() {
-        let env = helper_env_from_vars(
-            [
-                ("Path", r"C:\Windows\System32"),
-                ("PATH_INJECTION", "bad"),
-                ("OPENAI_API_KEY", "secret"),
-            ]
-            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
-        );
-
-        assert_eq!(
-            env,
-            HashMap::from([("Path".to_string(), r"C:\Windows\System32".to_string())])
-        );
+        for path_key in ["PATH", "Path", "path"] {
+            let env = helper_env_from_vars(
+                [
+                    (path_key, r"C:\Windows\System32"),
+                    ("TMP", r"C:\Temp"),
+                    ("TEMP", r"C:\Temp"),
+                    ("PATH_INJECTION", "bad"),
+                    ("USERPROFILE", r"C:\Users\test"),
+                    ("OPENAI_API_KEY", "secret"),
+                    ("HTTPS_PROXY", "http://proxy.example"),
+                ]
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+            );
+            assert_eq!(
+                env,
+                HashMap::from([
+                    (path_key.to_string(), r"C:\Windows\System32".to_string()),
+                    ("TMP".to_string(), r"C:\Temp".to_string()),
+                    ("TEMP".to_string(), r"C:\Temp".to_string()),
+                ])
+            );
+        }
     }
 
     #[test]
@@ -606,30 +567,6 @@ mod tests {
             assert_eq!(run.await.expect_err("missing cwd"), err);
             blocker.await.expect("worker finished");
         });
-    }
-
-    #[test]
-    fn helper_permissions_include_helper_read_root_without_additional_permissions() {
-        let codex_self_exe = std::env::current_exe().expect("current exe");
-        let runtime_paths = ExecServerRuntimePaths::new(codex_self_exe).expect("runtime paths");
-        let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir().as_path())
-            .expect("absolute cwd");
-        let mut policy = restricted_policy(Vec::new());
-        let readable = AbsolutePathBuf::from_absolute_path(
-            runtime_paths
-                .codex_self_exe
-                .parent()
-                .expect("current exe parent"),
-        )
-        .expect("absolute readable path");
-
-        add_helper_runtime_permissions(
-            &mut policy,
-            &helper_read_roots(&runtime_paths),
-            cwd.as_path(),
-        );
-
-        assert!(policy.can_read_path_with_cwd(readable.as_path(), cwd.as_path()));
     }
 
     fn restricted_policy(entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxPolicy {

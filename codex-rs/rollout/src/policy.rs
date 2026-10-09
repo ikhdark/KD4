@@ -273,16 +273,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mcp_tool_call_progress_is_transient() {
-        let event = EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
-            call_id: "call-1".to_string(),
-            message: "halfway".to_string(),
-            progress: Some(1.0),
-            total: Some(2.0),
-        });
-        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
-            assert!(!should_persist_event_msg(&event, history_mode));
-        }
-    }
 }

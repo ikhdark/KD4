@@ -580,7 +580,7 @@ fn parse_protocol_terminal_response(payload: ExecCommandEndPayload) -> ParsedTer
     ParsedTerminalResponse {
         terminal_id: payload.process_id,
         result: TerminalResult {
-            exit_code: Some(payload.exit_code),
+            exit_code: payload.exit_code,
             stdout: payload.stdout,
             stderr: payload.stderr,
             formatted_output: Some(payload.formatted_output),
@@ -690,7 +690,7 @@ struct ExecCommandEndPayload {
     process_id: Option<String>,
     stdout: String,
     stderr: String,
-    exit_code: i32,
+    exit_code: Option<i32>,
     formatted_output: String,
 }
 

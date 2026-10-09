@@ -5,6 +5,7 @@ use codex_app_server_protocol::HookTrustStatus;
 use codex_app_server_protocol::HooksListEntry;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
@@ -574,6 +575,9 @@ impl BottomPaneView for HooksBrowserView {
             _ if self.keymap.page_down.is_pressed(key_event) => self.page_down(),
             _ if self.keymap.jump_top.is_pressed(key_event) => self.jump_top(),
             _ if self.keymap.jump_bottom.is_pressed(key_event) => self.jump_bottom(),
+            // Holding a navigation key may scroll, but a held activation key
+            // must not toggle the hook on the page it just opened.
+            _ if key_event.kind != KeyEventKind::Press => {}
             _ if self.keymap.accept.is_pressed(key_event)
                 && self.page == HooksBrowserPage::Events =>
             {
@@ -1010,6 +1014,7 @@ mod tests {
     fn short_event_view_keeps_last_selection_visible() {
         let mut view = view();
         view.handle_key_event(KeyEvent::from(KeyCode::End));
+        assert_eq!(view.state.selected_idx, Some(view.page_len() - 1));
         let selected = view.event_rows()[view.state.selected_idx.unwrap()].event_name;
         let area = Rect::new(0, 0, 100, 7);
         let mut buf = Buffer::empty(area);
@@ -1490,6 +1495,52 @@ mod tests {
     }
 
     #[test]
+    fn held_accept_does_not_toggle_a_hook_after_opening_its_event() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let mut view = HooksBrowserView::new(
+            vec![hook(
+                "path:trusted",
+                HookEventName::PreToolUse,
+                HookSource::User,
+                None,
+                "/tmp/check.sh",
+                true,
+                false,
+                0,
+            )],
+            Vec::new(),
+            Vec::new(),
+            AppEventSender::new(tx),
+        );
+        view.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat,
+        ));
+        assert_eq!(view.state.selected_idx, Some(1));
+        view.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Repeat,
+        ));
+        assert_eq!(view.state.selected_idx, Some(0));
+        assert!(rx.try_recv().is_err());
+        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(view.page, HooksBrowserPage::Handlers(HookEventName::PreToolUse));
+
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                view.handle_key_event(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind));
+                assert!(view.entry.hooks[0].enabled);
+                assert!(rx.try_recv().is_err());
+            }
+        }
+        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(!view.entry.hooks[0].enabled);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::SetHookEnabled { key, enabled: false }) if key == "path:trusted"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn toggle_keys_toggle_unmanaged_handler() {
         for key_code in [KeyCode::Char(' '), KeyCode::Enter] {
             assert_unmanaged_toggle_key(key_code);
@@ -1497,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn space_does_not_toggle_managed_handler() {
+    fn toggle_keys_do_not_toggle_managed_handler() {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
         let mut view = HooksBrowserView::new(
             vec![hook(
@@ -1515,83 +1566,58 @@ mod tests {
             AppEventSender::new(tx_raw),
         );
         view.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        view.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
-
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn trust_key_trusts_review_needed_handler_without_changing_enablement() {
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let mut untrusted_hook = hook(
-            "path:untrusted",
-            HookEventName::PreToolUse,
-            HookSource::User,
-            /*plugin_id*/ None,
-            "/tmp/pre-tool-use-check.sh",
-            /*enabled*/ false,
-            /*is_managed*/ false,
-            /*display_order*/ 0,
-        );
-        untrusted_hook.trust_status = HookTrustStatus::Untrusted;
-        let current_hash = untrusted_hook.current_hash.clone();
-        let mut view = HooksBrowserView::new(
-            vec![untrusted_hook],
-            Vec::new(),
-            Vec::new(),
-            AppEventSender::new(tx_raw),
-        );
-        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        view.handle_key_event(KeyEvent::from(KeyCode::Char('t')));
-
-        match rx.try_recv().expect("trust event") {
-            AppEvent::TrustHook {
-                key,
-                current_hash: hash_to_trust,
-            } => {
-                assert_eq!(key, "path:untrusted");
-                assert_eq!(hash_to_trust, current_hash);
-            }
-            other => panic!("expected hook trust event, got {other:?}"),
+        for key in [KeyCode::Char(' '), KeyCode::Enter] {
+            view.handle_key_event(KeyEvent::from(key));
+            assert!(view.entry.hooks[0].enabled);
+            assert_eq!(view.entry.hooks[0].trust_status, HookTrustStatus::Managed);
+            assert!(rx.try_recv().is_err());
         }
     }
 
     #[test]
-    fn trust_key_preserves_disabled_modified_handler() {
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let mut modified_hook = hook(
-            "path:modified",
-            HookEventName::PreToolUse,
-            HookSource::User,
-            /*plugin_id*/ None,
-            "/tmp/pre-tool-use-check.sh",
-            /*enabled*/ false,
-            /*is_managed*/ false,
-            /*display_order*/ 0,
-        );
-        modified_hook.trust_status = HookTrustStatus::Modified;
-        let current_hash = modified_hook.current_hash.clone();
-        let mut view = HooksBrowserView::new(
-            vec![modified_hook],
-            Vec::new(),
-            Vec::new(),
-            AppEventSender::new(tx_raw),
-        );
-        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        view.handle_key_event(KeyEvent::from(KeyCode::Char('t')));
-
-        let hook = view.entry.hooks.first().expect("trusted hook");
-        assert!(!hook.enabled);
-        assert_eq!(hook.trust_status, HookTrustStatus::Trusted);
-        match rx.try_recv().expect("trust event") {
-            AppEvent::TrustHook {
+    fn trust_key_trusts_review_needed_handlers_without_changing_enablement() {
+        for (key, status) in [
+            ("path:untrusted", HookTrustStatus::Untrusted),
+            ("path:modified", HookTrustStatus::Modified),
+        ] {
+            let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+            let mut handler = hook(
                 key,
-                current_hash: hash_to_trust,
-            } => {
-                assert_eq!(key, "path:modified");
-                assert_eq!(hash_to_trust, current_hash);
+                HookEventName::PreToolUse,
+                HookSource::User,
+                /*plugin_id*/ None,
+                "/tmp/pre-tool-use-check.sh",
+                /*enabled*/ false,
+                /*is_managed*/ false,
+                /*display_order*/ 0,
+            );
+            handler.trust_status = status;
+            let current_hash = handler.current_hash.clone();
+            let mut view = HooksBrowserView::new(
+                vec![handler],
+                Vec::new(),
+                Vec::new(),
+                AppEventSender::new(tx_raw),
+            );
+            view.handle_key_event(KeyEvent::from(KeyCode::Enter));
+            view.handle_key_event(KeyEvent::from(KeyCode::Char('t')));
+
+            let handler = view.entry.hooks.first().expect("trusted hook");
+            assert!(!handler.enabled);
+            assert_eq!(handler.trust_status, HookTrustStatus::Trusted);
+            match rx.try_recv().expect("trust event") {
+                AppEvent::TrustHook {
+                    key: trusted_key,
+                    current_hash: hash_to_trust,
+                } => {
+                    assert_eq!(trusted_key, key);
+                    assert_eq!(hash_to_trust, current_hash);
+                }
+                other => panic!("expected hook trust event, got {other:?}"),
             }
-            other => panic!("expected hook trust event, got {other:?}"),
+            assert!(rx.try_recv().is_err());
+            view.handle_key_event(KeyEvent::from(KeyCode::Char('t')));
+            assert!(rx.try_recv().is_err());
         }
     }
 
@@ -1676,6 +1702,7 @@ mod tests {
     #[test]
     fn escape_returns_to_the_selected_event() {
         let mut view = view();
+        assert!(view.prefer_esc_to_handle_key_event());
         view.handle_key_event(KeyEvent::from(KeyCode::Down));
         view.handle_key_event(KeyEvent::from(KeyCode::Enter));
         view.handle_key_event(KeyEvent::from(KeyCode::Esc));
@@ -1685,10 +1712,8 @@ mod tests {
             view.selected_event(),
             Some(HookEventName::PermissionRequest)
         );
-    }
-
-    #[test]
-    fn esc_routes_through_the_view() {
-        assert!(view().prefer_esc_to_handle_key_event());
+        assert!(!view.is_complete());
+        view.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        assert!(view.is_complete());
     }
 }

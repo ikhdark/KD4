@@ -55,6 +55,9 @@ pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const STREAMING_ARTIFACT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
+// The shared cache budget applies to evictable bytes, like the artifact-count
+// limit. Durable protected history still counts against its thread's budget,
+// but must not exhaust admission for every other resumable thread.
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RETENTION_INDEX_ROOTS: usize = 4;
 // Artifacts referenced by durable thread history stay protected, so a root
@@ -447,6 +450,7 @@ struct RetentionIndex {
     threads: BTreeMap<PathBuf, ThreadRetentionIndex>,
     global_order: BTreeSet<(SystemTime, PathBuf)>,
     total_bytes: u64,
+    unprotected_bytes: u64,
     unprotected: usize,
     logical_mutations_since_reconciliation: u64,
     near_limit_reconciled: bool,
@@ -480,6 +484,8 @@ impl RetentionIndex {
         if !record.protected {
             thread.unprotected = thread.unprotected.saturating_add(1);
             self.unprotected = self.unprotected.saturating_add(1);
+            // Bounded by the checked total_bytes above.
+            self.unprotected_bytes += record.bytes;
         }
         self.total_bytes = total_bytes;
         self.global_order
@@ -495,6 +501,7 @@ impl RetentionIndex {
         self.total_bytes = self.total_bytes.saturating_sub(record.bytes);
         if !record.protected {
             self.unprotected = self.unprotected.saturating_sub(1);
+            self.unprotected_bytes = self.unprotected_bytes.saturating_sub(record.bytes);
         }
         let remove_thread = if let Some(thread) = self.threads.get_mut(&record.thread_directory) {
             thread.paths.remove(path);
@@ -529,7 +536,7 @@ impl RetentionIndex {
 
     fn is_near_limit(&self) -> bool {
         let global_near = self.unprotected >= max_retained_artifacts_total().saturating_sub(1)
-            || self.total_bytes
+            || self.unprotected_bytes
                 >= MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(RETENTION_BYTE_GUARD_BAND);
         global_near
             || self.threads.values().any(|thread| {
@@ -2373,7 +2380,7 @@ fn stage_logical_segments_blocking(
         if let Err(err) = write_staged_logical_segment_blocking(&path, chunk) {
             let _ = std::fs::remove_file(&path);
             remove_staged_logical_segments_blocking(&staged);
-            return Err((start, path, err));
+            return Err((canonical_start, path, err));
         }
         staged.push(StagedLogicalSegment {
             index,
@@ -2401,6 +2408,9 @@ fn install_staged_logical_segments_blocking(
     staged: Vec<StagedLogicalSegment>,
     retained_bytes: u64,
 ) -> Result<Vec<LogicalArtifactSegment>, (u64, PathBuf, std::io::Error)> {
+    // Every installed segment is rolled back on failure. Only the prefix
+    // preceding this operation remains recoverable (zero for a new artifact).
+    let retained_prefix = staged.first().map_or(retained_bytes, |segment| segment.range.start);
     let mut installed: Vec<LogicalArtifactSegment> = Vec::new();
     for segment in staged {
         if segment.range.start >= retained_bytes && !segment.range.is_empty() {
@@ -2418,7 +2428,7 @@ fn install_staged_logical_segments_blocking(
                                 installed_segment.index,
                             ));
                         }
-                        return Err((segment.range.start, segment.path, err));
+                        return Err((retained_prefix, segment.path, err));
                     }
                     if let Err(err) = file.sync_all() {
                         for installed_segment in &installed {
@@ -2427,7 +2437,7 @@ fn install_staged_logical_segments_blocking(
                                 installed_segment.index,
                             ));
                         }
-                        return Err((segment.range.start, segment.path, err));
+                        return Err((retained_prefix, segment.path, err));
                     }
                 }
                 Err(err) => {
@@ -2437,7 +2447,7 @@ fn install_staged_logical_segments_blocking(
                             installed_segment.index,
                         ));
                     }
-                    return Err((segment.range.start, segment.path, err));
+                    return Err((retained_prefix, segment.path, err));
                 }
             }
         }
@@ -2447,7 +2457,7 @@ fn install_staged_logical_segments_blocking(
                 let _ =
                     std::fs::remove_file(logical_segment_path(final_path, installed_segment.index));
             }
-            return Err((segment.range.start, segment.path, err));
+            return Err((retained_prefix, segment.path, err));
         }
         installed.push(LogicalArtifactSegment {
             index: segment.index,
@@ -2458,7 +2468,7 @@ fn install_staged_logical_segments_blocking(
         for installed_segment in &installed {
             let _ = std::fs::remove_file(logical_segment_path(final_path, installed_segment.index));
         }
-        return Err((retained_bytes, final_path.to_path_buf(), err));
+        return Err((retained_prefix, final_path.to_path_buf(), err));
     }
     Ok(installed)
 }
@@ -2986,9 +2996,9 @@ fn commit_create_canonical_output_artifact(
             rollback_logical_artifact_creation(&retention_token, &path);
             return CanonicalOutputArtifact {
                 id: Some(id),
-                retained_bytes,
+                retained_bytes: 0,
                 complete: false,
-                unavailable_ranges,
+                unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
                 error: Some(format!("failed to serialize artifact metadata: {err}")),
             };
         }
@@ -2997,9 +3007,9 @@ fn commit_create_canonical_output_artifact(
         rollback_logical_artifact_creation(&retention_token, &path);
         return CanonicalOutputArtifact {
             id: Some(id),
-            retained_bytes,
+            retained_bytes: 0,
             complete: false,
-            unavailable_ranges,
+            unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
             error: Some(format!("failed to write artifact metadata: {err}")),
         };
     }
@@ -3379,9 +3389,13 @@ fn commit_attach_canonical_output_artifact(
         reject_stale_delta(&retention_token);
         return CanonicalOutputArtifact {
             id: Some(id),
-            retained_bytes,
+            retained_bytes: existing.len() as u64,
             complete: false,
-            unavailable_ranges,
+            unavailable_ranges: normalized_unavailable_ranges(
+                canonical.exact_bytes,
+                &canonical.unavailable_ranges,
+                existing.len() as u64,
+            ),
             error: Some(format!("failed to write artifact metadata: {err}")),
         };
     }
@@ -3639,29 +3653,7 @@ fn create_new_protection_marker(marker: &Path, contents: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-#[cfg(test)]
-fn verified_artifact_digest(reader: impl Read, expected_bytes: u64) -> Result<String, String> {
-    // The file can change after its metadata was inspected. Bound both
-    // memory and the read, including one extra byte to detect growth.
-    let mut reader = reader.take(expected_bytes.saturating_add(1));
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut hasher = Sha256::new();
-    let mut verified_bytes = 0_u64;
-    loop {
-        let count = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(format!("failed to verify artifact: {err}")),
-        };
-        verified_bytes += count as u64;
-        hasher.update(&buffer[..count]);
-    }
-    if verified_bytes != expected_bytes {
-        return Err("artifact byte count does not match receipt metadata".to_string());
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
+
 
 /// Verifies an exact artifact without creating a retention protection marker.
 pub(crate) async fn verify_tool_history_artifact(
@@ -6049,32 +6041,7 @@ pub(crate) fn bounded_page_selectors(
     pages
 }
 
-#[cfg(test)]
-pub(crate) async fn read_tool_output_artifact(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    start_line: usize,
-    end_line: usize,
-    max_bytes: usize,
-) -> Result<String, ReadToolOutputError> {
-    let id = artifact_id
-        .parse::<ToolOutputArtifactId>()
-        .map_err(|_| ReadToolOutputError::InvalidArtifactId)?;
-    if id.to_string() != artifact_id {
-        return Err(ReadToolOutputError::InvalidArtifactId);
-    }
-    validate_read_range(start_line, end_line, max_bytes)?;
-    let path = codex_home
-        .join("tool-output")
-        .join(thread_id)
-        .join(format!("{id}.log"));
-    tokio::task::spawn_blocking(move || {
-        read_tool_output_artifact_blocking(&path, id, start_line, end_line, max_bytes)
-    })
-    .await
-    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
-}
+
 
 /// Read the exact retained artifact bytes for crate-private deterministic
 /// tool-history replay. This keeps the same UUID, thread confinement, regular-file,
@@ -6118,126 +6085,9 @@ fn read_exact_tool_output_artifact_blocking(path: &Path) -> Result<Vec<u8>, Read
     result.map(|_| bytes)
 }
 
-#[cfg(test)]
-fn validate_read_range(
-    start_line: usize,
-    end_line: usize,
-    max_bytes: usize,
-) -> Result<(), ReadToolOutputError> {
-    if start_line == 0 {
-        return Err(ReadToolOutputError::InvalidRange(
-            "start_line must be at least 1".to_string(),
-        ));
-    }
-    if end_line < start_line {
-        return Err(ReadToolOutputError::InvalidRange(
-            "end_line must be greater than or equal to start_line".to_string(),
-        ));
-    }
-    if end_line - start_line >= 2_000 {
-        return Err(ReadToolOutputError::InvalidRange(
-            "requested line span must not exceed 2000 lines".to_string(),
-        ));
-    }
-    if max_bytes == 0 || max_bytes > 16_384 {
-        return Err(ReadToolOutputError::InvalidRange(
-            "max_bytes must be between 1 and 16384".to_string(),
-        ));
-    }
-    Ok(())
-}
 
-#[cfg(test)]
-fn read_tool_output_artifact_blocking(
-    path: &Path,
-    id: ToolOutputArtifactId,
-    start_line: usize,
-    end_line: usize,
-    max_bytes: usize,
-) -> Result<String, ReadToolOutputError> {
-    let (mut file, total_bytes) = open_regular_artifact(path)?;
-    file.try_lock_shared()
-        .map_err(|_| ReadToolOutputError::StillWriting)?;
 
-    let mut retained = Vec::with_capacity(max_bytes.min(16 * 1024));
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut current_line = 1_usize;
-    let mut last_line = None;
-    let mut clamped = false;
-    let mut pending_cr = false;
-    let mut done = false;
 
-    while !done {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?;
-        if count == 0 {
-            if pending_cr && current_line >= start_line && current_line <= end_line {
-                push_bounded(&mut retained, b'\r', max_bytes, &mut clamped);
-                last_line = Some(current_line);
-            }
-            break;
-        }
-
-        for &byte in &buffer[..count] {
-            if pending_cr {
-                if byte == b'\n' {
-                    if current_line >= start_line && current_line <= end_line {
-                        push_bounded(&mut retained, b'\n', max_bytes, &mut clamped);
-                        last_line = Some(current_line);
-                    }
-                    pending_cr = false;
-                    if current_line == end_line {
-                        done = true;
-                        break;
-                    }
-                    current_line += 1;
-                    continue;
-                }
-                if current_line >= start_line && current_line <= end_line {
-                    push_bounded(&mut retained, b'\r', max_bytes, &mut clamped);
-                    last_line = Some(current_line);
-                }
-                pending_cr = false;
-            }
-
-            if byte == b'\r' {
-                pending_cr = true;
-            } else if byte == b'\n' {
-                if current_line >= start_line && current_line <= end_line {
-                    push_bounded(&mut retained, b'\n', max_bytes, &mut clamped);
-                    last_line = Some(current_line);
-                }
-                if current_line == end_line {
-                    done = true;
-                    break;
-                }
-                current_line += 1;
-            } else if current_line >= start_line && current_line <= end_line {
-                push_bounded(&mut retained, byte, max_bytes, &mut clamped);
-                last_line = Some(current_line);
-            }
-        }
-    }
-
-    let (text, invalid_utf8) = match String::from_utf8(retained) {
-        Ok(text) => (text, false),
-        Err(err) => (String::from_utf8_lossy(err.as_bytes()).into_owned(), true),
-    };
-    let lines = match last_line {
-        Some(last) => format!("{start_line}–{last}"),
-        None => "none".to_string(),
-    };
-    let mut rendered =
-        format!("artifact {id}, lines {lines}, {total_bytes} retained bytes\n{text}");
-    if invalid_utf8 {
-        rendered.push_str("\n[invalid UTF-8 replaced]");
-    }
-    if clamped {
-        rendered.push_str("\n[range clamped at byte limit]");
-    }
-    Ok(rendered)
-}
 
 fn open_regular_artifact(path: &Path) -> Result<(File, u64), ReadToolOutputError> {
     let mut options = std::fs::OpenOptions::new();
@@ -6309,14 +6159,7 @@ fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-#[cfg(test)]
-fn push_bounded(output: &mut Vec<u8>, byte: u8, max_bytes: usize, clamped: &mut bool) {
-    if output.len() < max_bytes {
-        output.push(byte);
-    } else {
-        *clamped = true;
-    }
-}
+
 
 fn active_tool_history_protection_path(artifact_path: &Path) -> PathBuf {
     artifact_path.with_extension(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
@@ -7009,7 +6852,7 @@ fn enforce_indexed_global_retention_blocking(
             };
             if index.unprotected.saturating_add(reserved_artifacts)
                 <= max_retained_artifacts_total()
-                && index.total_bytes.saturating_add(reserved_bytes)
+                && index.unprotected_bytes.saturating_add(reserved_bytes)
                     <= MAX_RETAINED_ARTIFACT_BYTES_TOTAL
             {
                 return true;
@@ -7238,8 +7081,9 @@ where
             }
         }
         // The in-memory index still counts the removed records.
+        let root = normalized_tool_output_root(&root);
         let mut registry = lock_retention_registry();
-        transition_current_root_to_dirty(&mut registry, &normalized_tool_output_root(&root));
+        transition_current_root_to_dirty(&mut registry, &root);
         Ok(removed)
     })
     .await
@@ -7425,6 +7269,9 @@ fn enforce_retention_scan_locked_blocking(
     reserved_artifacts: usize,
 ) -> RetentionScanProgress {
     let mut progress = RetentionScanProgress::default();
+    let Ok(family_sizes) = logical_artifact_sizes_in_directory(directory) else {
+        return progress;
+    };
     let Ok(mut entries) = std::fs::read_dir(directory) else {
         return progress;
     };
@@ -7440,10 +7287,10 @@ fn enforce_retention_scan_locked_blocking(
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
             progress.candidates_visited = progress.candidates_visited.saturating_add(1);
-            let Ok(metadata) = entry.metadata() else {
+            let Some(bytes) = path.file_stem().and_then(|stem| stem.to_str())
+                .and_then(|stem| family_sizes.get(stem)).copied() else {
                 return progress;
             };
-            let bytes = metadata.len();
             let Some(updated_total) = total_bytes.checked_add(bytes) else {
                 return progress;
             };
@@ -7526,6 +7373,9 @@ fn enforce_global_retention_scan_locked_blocking(
             Ok(None) => break,
             Err(_) => return progress,
         };
+        let Ok(family_sizes) = logical_artifact_sizes_in_directory(&thread_directory) else {
+            return progress;
+        };
         let Ok(mut entries) = std::fs::read_dir(&thread_directory) else {
             return progress;
         };
@@ -7542,17 +7392,22 @@ fn enforce_global_retention_scan_locked_blocking(
                 let Ok(metadata) = entry.metadata() else {
                     return progress;
                 };
-                let bytes = metadata.len();
-                let Some(updated_total) = total_bytes.checked_add(bytes) else {
+                let Some(bytes) = path.file_stem().and_then(|stem| stem.to_str())
+                    .and_then(|stem| family_sizes.get(stem)).copied() else {
                     return progress;
                 };
-                total_bytes = updated_total;
                 let Ok(modified) = metadata.modified() else {
                     return progress;
                 };
                 let Ok(protected) = artifact_is_protected_blocking(&path) else {
                     return progress;
                 };
+                if !protected {
+                    let Some(updated_total) = total_bytes.checked_add(bytes) else {
+                        return progress;
+                    };
+                    total_bytes = updated_total;
+                }
                 paths.push((modified, path.clone(), bytes, protected));
             }
         }
@@ -7603,7 +7458,7 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
             .and_then(|state| match &state.mode {
                 RetentionRootMode::Indexed(index) => Some(RetentionUsage {
                     thread_bytes: index.thread_totals(&directory).0,
-                    global_bytes: index.total_bytes,
+                    global_bytes: index.unprotected_bytes,
                 }),
                 RetentionRootMode::Dirty | RetentionRootMode::Reconciling { .. } => {
                     Some(RetentionUsage {
@@ -7618,17 +7473,26 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
         return usage;
     }
     RetentionUsage {
-        thread_bytes: log_bytes_in_directory_blocking(&directory).unwrap_or(u64::MAX),
+        thread_bytes: log_bytes_in_directory_blocking(&directory, true).unwrap_or(u64::MAX),
         global_bytes: log_bytes_in_tool_output_root_blocking(&root).unwrap_or(u64::MAX),
     }
 }
 
-fn log_bytes_in_directory_blocking(directory: &Path) -> std::io::Result<u64> {
+fn log_bytes_in_directory_blocking(directory: &Path, include_protected: bool) -> std::io::Result<u64> {
+    let family_sizes = logical_artifact_sizes_in_directory(directory)?;
     let mut entries = std::fs::read_dir(directory)?;
     let mut bytes = 0_u64;
     while let Some(entry) = entries.next().transpose()? {
         if entry.path().extension().and_then(|value| value.to_str()) == Some("log") {
-            bytes = bytes.checked_add(entry.metadata()?.len()).ok_or_else(|| {
+            if !include_protected && artifact_is_protected_blocking(&entry.path())? {
+                continue;
+            }
+            let path = entry.path();
+            let family_bytes = path.file_stem().and_then(|stem| stem.to_str())
+                .and_then(|stem| family_sizes.get(stem)).copied().ok_or_else(|| {
+                    std::io::Error::other("artifact family changed during retention scan")
+                })?;
+            bytes = bytes.checked_add(family_bytes).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "thread artifact byte total overflowed",
@@ -7645,7 +7509,7 @@ fn log_bytes_in_tool_output_root_blocking(root: &Path) -> std::io::Result<u64> {
     while let Some(entry) = entries.next().transpose()? {
         if entry.metadata()?.is_dir() {
             bytes = bytes
-                .checked_add(log_bytes_in_directory_blocking(&entry.path())?)
+                .checked_add(log_bytes_in_directory_blocking(&entry.path(), false)?)
                 .ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -7990,6 +7854,24 @@ fn remove_inactive_output_path_blocking(path: PathBuf) -> InactiveRemovalOutcome
     }
 }
 
+// One directory pass accounts for every segment and sidecar. Scan-only roots
+// must not rescan the directory once per artifact (quadratic in family count).
+fn logical_artifact_sizes_in_directory(directory: &Path) -> std::io::Result<BTreeMap<String, u64>> {
+    let mut sizes = BTreeMap::<String, u64>::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(logical_artifact_stem) else {
+            continue;
+        };
+        let bytes = sizes.entry(stem.to_string()).or_default();
+        *bytes = bytes.checked_add(entry.metadata()?.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "logical artifact byte total overflowed")
+        })?;
+    }
+    Ok(sizes)
+}
+
 fn logical_artifact_disk_bytes(path: &Path) -> std::io::Result<u64> {
     let Some(directory) = path.parent() else {
         return Ok(0);
@@ -8326,46 +8208,27 @@ mod tests {
         let id = stored_id(&artifact);
 
         let output =
-            read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 2, 3, 16_384)
+            read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 2, end: 3 }])
                 .await
                 .expect("read artifact");
 
-        assert_eq!(
-            output,
-            format!(
-                "artifact {id}, lines 2–3, {} retained bytes\ntwo\nthree\n",
-                bytes.len()
-            )
-        );
+        assert!(output.complete);
+        assert_eq!(output.results[0].text.as_deref(), Some("two\r\nthree\r\n"));
+        assert_eq!(output.canonical_bytes, bytes.len() as u64);
 
         let through_eof =
-            read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 200, 16_384)
+            read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 200 }])
                 .await
                 .expect("read through eof");
-        assert!(through_eof.starts_with(&format!(
-            "artifact {id}, lines 1–4, {} retained bytes\n",
-            bytes.len()
-        )));
-    }
-
-    #[tokio::test]
-    async fn read_clamps_at_byte_limit_with_trailer() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact = create_raw_output_artifact(temp.path(), "thread", b"abcdef\n").await;
-        let id = stored_id(&artifact);
-
-        let output = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 3)
-            .await
-            .expect("read artifact");
-
-        assert!(output.contains("\nabc\n[range clamped at byte limit]"));
+        assert!(through_eof.complete);
+        assert_eq!(through_eof.results[0].text.as_deref(), Some(std::str::from_utf8(bytes).unwrap()));
     }
 
     #[tokio::test]
     async fn read_rejects_invalid_uuid_and_traversal() {
         let temp = tempfile::tempdir().expect("tempdir");
         for invalid in ["not-a-uuid", "../019fa782-f8e1-7533-a3f7-60d3f9a42997"] {
-            let error = read_tool_output_artifact(temp.path(), "thread", invalid, 1, 1, 16_384)
+            let error = read_tool_output_selectors(temp.path(), "thread", invalid, vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
                 .await
                 .expect_err("invalid id should fail");
             assert_eq!(error, ReadToolOutputError::InvalidArtifactId);
@@ -8386,7 +8249,7 @@ mod tests {
         symlink_file(&outside, thread_directory.join(format!("{id}.log")))
             .expect("native file-symlink support is required to verify reparse rejection");
 
-        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+        let error = read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
             .await
             .expect_err("reparse artifact should fail");
 
@@ -8406,7 +8269,7 @@ mod tests {
         let id = ToolOutputArtifactId::new();
         symlink(&outside, thread_directory.join(format!("{id}.log"))).expect("create file symlink");
 
-        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+        let error = read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
             .await
             .expect_err("symlink artifact should fail");
 
@@ -8420,7 +8283,7 @@ mod tests {
         let id = stored_id(&artifact);
 
         let error =
-            read_tool_output_artifact(temp.path(), "thread-b", &id.to_string(), 1, 1, 16_384)
+            read_tool_output_selectors(temp.path(), "thread-b", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
                 .await
                 .expect_err("cross-thread read should fail");
 
@@ -8438,26 +8301,11 @@ mod tests {
         };
         tokio::fs::remove_file(path).await.expect("evict artifact");
 
-        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+        let error = read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
             .await
             .expect_err("evicted artifact should fail");
 
         assert_eq!(error, ReadToolOutputError::Expired);
-    }
-
-    #[tokio::test]
-    async fn read_replaces_invalid_utf8_and_adds_notice() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact = create_raw_output_artifact(temp.path(), "thread", b"bad:\xff\n").await;
-        let id = stored_id(&artifact);
-
-        let output =
-            read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
-                .await
-                .expect("read artifact");
-
-        assert!(output.contains("bad:\u{fffd}"));
-        assert!(output.ends_with("[invalid UTF-8 replaced]"));
     }
 
     #[tokio::test]
@@ -8490,7 +8338,7 @@ mod tests {
             .await
             .expect("writer state");
 
-        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+        let error = read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
             .await
             .expect_err("locked artifact should not be read");
 

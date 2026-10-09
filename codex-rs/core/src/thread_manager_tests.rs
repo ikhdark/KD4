@@ -175,6 +175,9 @@ fn precomputed_thread_settings_bypass_a_second_history_reduction() {
         Some("fallback-model")
     );
     assert!(reconstruction.precomputed.is_none());
+    let fallback = resolve_persisted_thread_settings(&InitialHistory::New, &mut reconstruction);
+    assert_eq!(fallback.model.as_deref(), Some("fallback-model"));
+    assert_eq!(reconstruction.fallback, PersistedThreadSettings::default());
 }
 
 fn run_thread_manager_test_with_stack<F, Fut>(test_name: &'static str, test: F)
@@ -547,6 +550,56 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
 }
 
 #[tokio::test]
+async fn shutdown_all_threads_bounded_preserves_a_replacement_runtime() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let original = manager.start_thread(config.clone()).await.unwrap();
+    let replacement = manager.start_thread(config).await.unwrap();
+    manager.remove_thread(&replacement.thread_id).await.unwrap();
+
+    let registry_lease = manager
+        .state
+        .acquire_thread_registry_lease(original.thread_id)
+        .await;
+    let mut shutdown = Box::pin(manager.shutdown_all_threads_bounded(Duration::from_secs(10)));
+    // Poll the real shutdown path through its snapshot. The held registry lease
+    // prevents its eventual removal from racing ahead of replacement publication.
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    // Simulate the registry publication of a resumed runtime while retaining two
+    // real, distinct runtimes. Registry removal must compare instance identity,
+    // not remove a new owner merely because its map key is the same.
+    manager
+        .state
+        .threads
+        .write()
+        .await
+        .insert(original.thread_id, Arc::clone(&replacement.thread));
+    drop(registry_lease);
+    let report = tokio::time::timeout(Duration::from_secs(15), shutdown)
+        .await
+        .expect("shutdown must not stall behind replacement publication");
+    assert_eq!(report.completed, vec![original.thread_id]);
+    assert!(report.submit_failed.is_empty());
+    assert!(report.timed_out.is_empty());
+    assert!(Arc::ptr_eq(
+        &manager.get_thread(original.thread_id).await.unwrap(),
+        &replacement.thread,
+    ));
+    manager.remove_thread(&original.thread_id).await.unwrap();
+    replacement.thread.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn thread_created_guard_only_blocks_replacement_of_the_guarded_thread() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -586,17 +639,14 @@ async fn thread_created_guard_only_blocks_replacement_of_the_guarded_thread() {
     .expect("unrelated removal must not wait for another thread's guard");
     assert!(removed_unrelated.is_some());
 
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            manager.remove_thread(&guarded.thread_id),
-        )
-        .await
-        .is_err(),
-        "guarded thread removal must wait for its own guard"
-    );
+    let mut removal = Box::pin(manager.remove_thread(&guarded.thread_id));
+    assert!(futures::poll!(&mut removal).is_pending());
     drop(guard);
-    assert!(manager.remove_thread(&guarded.thread_id).await.is_some());
+    let removed = tokio::time::timeout(Duration::from_secs(1), removal)
+        .await
+        .expect("guard release should unblock the existing removal")
+        .expect("guarded thread should be removed");
+    assert!(Arc::ptr_eq(&removed, &guarded.thread));
 
     guarded
         .thread
@@ -1654,7 +1704,7 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
 }
 
 #[tokio::test]
-async fn rollback_created_thread_persistence_restores_rollout_when_state_delete_fails() {
+async fn rollback_created_thread_persistence_preserves_rollout_when_state_is_unavailable() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -1667,14 +1717,15 @@ async fn rollback_created_thread_persistence_restores_rollout_when_state_delete_
     let rollout_dir = config.codex_home.join("sessions/2025/01/03");
     std::fs::create_dir_all(&rollout_dir).expect("create rollout directory");
     let rollout_path = rollout_dir.join(format!("rollout-2025-01-03T15-00-00-{thread_id}.jsonl"));
-    std::fs::write(&rollout_path, "").expect("write rollout");
+    let original = b"retained rollout bytes\n";
+    std::fs::write(&rollout_path, original).expect("write rollout");
 
     state_db.close().await;
 
     assert!(!rollback_created_thread_persistence(&thread_store, thread_id).await);
-    assert!(
-        rollout_path.exists(),
-        "failed state deletion must restore the staged rollout"
+    assert_eq!(
+        std::fs::read(&rollout_path).expect("failed state access must preserve the rollout"),
+        original
     );
 }
 
@@ -2253,6 +2304,13 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
     });
     let history = InitialHistory::Forked(vec![
         committed_user.clone(),
+        RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+            sampling_request_id: "previous-request".to_string(),
+            physical_attempt_id: "previous-attempt".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            unresolved_context: false,
+            timing_checkpoint: None,
+        }),
         boundary.clone(),
         unfinished_output,
         RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
@@ -2266,13 +2324,13 @@ fn sampling_boundary_fork_excludes_uncommitted_suffix() {
 
     let forked = fork_history_from_snapshot(
         ForkSnapshot::TruncateToLastSamplingBoundary,
-        history,
+        history.clone(),
         InterruptedTurnHistoryMarker::ContextualUser,
     );
 
     assert_eq!(
         serde_json::to_value(forked.get_rollout_items()).expect("serialize forked history"),
-        serde_json::to_value([committed_user, boundary]).expect("serialize expected history")
+        serde_json::to_value(&history.get_rollout_items()[..3]).expect("serialize expected history")
     );
 }
 

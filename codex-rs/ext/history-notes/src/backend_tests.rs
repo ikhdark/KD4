@@ -19,6 +19,7 @@ use wiremock::matchers::path;
 
 use super::ENCRYPTED_TOOL_ARGUMENTS_HEADER;
 use super::HistoryNotesBackend;
+use super::TOOL_OUTPUT_TRUNCATION_POLICY_HEADER;
 
 #[tokio::test]
 async fn routes_through_codex_backend_and_injects_trusted_session_agent_context() {
@@ -70,6 +71,16 @@ async fn routes_through_codex_backend_and_injects_trusted_session_agent_context(
     assert_eq!(response, json!({"encrypted_output": "enc_payload"}));
     let requests = server.received_requests().await.expect("recorded requests");
     assert_eq!(requests.len(), 1);
+    // Wiremock's header matcher splits commas, including the comma in this JSON value.
+    assert_eq!(
+        requests[0]
+            .headers
+            .get(TOOL_OUTPUT_TRUNCATION_POLICY_HEADER)
+            .expect("truncation policy header")
+            .to_str()
+            .expect("UTF-8 truncation policy"),
+        serde_json::to_string(&TruncationPolicy::Bytes(1024)).unwrap()
+    );
     assert!(
         requests[0]
             .headers
@@ -109,10 +120,16 @@ async fn marks_encrypted_history_and_notes_arguments_without_changing_the_json_b
             json!({"path": "notes.md", "text": "encrypted-text"}),
         ),
     ];
-    for (route, _) in &cases {
+    for (route, arguments) in &cases {
+        let mut expected_arguments = arguments.clone();
+        expected_arguments["context"] = json!({
+            "session_id": "session-123",
+            "current_agent_name": "/root",
+        });
         Mock::given(method("POST"))
             .and(path(format!("/backend-api/codex/alpha/{route}")))
             .and(header(ENCRYPTED_TOOL_ARGUMENTS_HEADER, "true"))
+            .and(wiremock::matchers::body_json(expected_arguments))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
             .expect(1)
             .mount(&server)

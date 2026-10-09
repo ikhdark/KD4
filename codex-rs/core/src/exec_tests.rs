@@ -79,13 +79,7 @@ impl Drop for DropFlag {
     }
 }
 
-fn byte_stream_output(text: impl Into<Vec<u8>>) -> StreamOutput<Vec<u8>> {
-    StreamOutput {
-        text: text.into(),
-        truncated_after_lines: None,
-        truncated: false,
-    }
-}
+
 
 #[test]
 fn output_capture_preserves_observed_order_and_requires_excess_for_truncation() {
@@ -653,23 +647,24 @@ fn full_buffer_capture_policy_disables_only_caps() {
 
 #[tokio::test]
 async fn combined_exec_cancellation_waits_inline_for_every_source() {
-    let first = CancellationToken::new();
-    let second = CancellationToken::new();
-    let third = CancellationToken::new();
-    let expiration = ExecExpiration::Cancellation(first)
-        .with_cancellation(second)
-        .with_cancellation(third.clone());
-
-    let ExecExpiration::CancellationSet(cancellations) = &expiration else {
-        panic!("combined cancellation should retain its sources without a relay task");
-    };
-    assert_eq!(cancellations.len(), 3);
-
-    third.cancel();
-    assert_eq!(
-        expiration.wait_with_outcome().await,
-        ExecExpirationOutcome::Cancelled
-    );
+    for cancelled_index in 0..3 {
+        let tokens = std::array::from_fn::<_, 3, _>(|_| CancellationToken::new());
+        let expiration = ExecExpiration::Cancellation(tokens[0].clone())
+            .with_cancellation(tokens[1].clone())
+            .with_cancellation(tokens[2].clone());
+        let ExecExpiration::CancellationSet(cancellations) = &expiration else {
+            panic!("combined cancellation should retain its sources without a relay task");
+        };
+        assert_eq!(cancellations.len(), 3);
+        let wait = expiration.wait_with_outcome();
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        tokens[cancelled_index].cancel();
+        assert_eq!(
+            timeout(Duration::from_secs(1), wait).await.expect("each cancellation source wakes the wait"),
+            ExecExpirationOutcome::Cancelled
+        );
+    }
 }
 
 #[tokio::test]
@@ -798,67 +793,59 @@ async fn forced_direct_exec_termination_reaps_the_child() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn output_drain_readers_complete_normally_before_shared_deadline() -> Result<()> {
-    let stdout = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stdout")) });
-    let stderr = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stderr")) });
-
-    let (stdout, stderr) = await_output_until_deadline(
-        stdout,
-        stderr,
-        tokio::time::Instant::now() + Duration::from_secs(1),
-    )
-    .await?;
-
-    assert_eq!(stdout.text, b"stdout");
-    assert_eq!(stderr.text, b"stderr");
-    Ok(())
-}
-
-#[tokio::test]
-async fn output_drain_preserves_completed_reader_and_aborts_unfinished_reader() -> Result<()> {
-    let aborted = Arc::new(AtomicBool::new(false));
-    let stdout = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stdout")) });
-    let stderr = tokio::spawn({
-        let aborted = Arc::clone(&aborted);
-        async move {
-            let _drop_flag = DropFlag(aborted);
-            std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await
-        }
-    });
-
-    let (stdout, stderr) = await_output_until_deadline(
-        stdout,
-        stderr,
-        tokio::time::Instant::now() + Duration::from_millis(100),
-    )
-    .await?;
-    tokio::task::yield_now().await;
-
-    assert_eq!(stdout.text, b"stdout");
-    assert!(stderr.text.is_empty());
-    assert!(aborted.load(Ordering::Acquire));
-    Ok(())
-}
-
 #[tokio::test(start_paused = true)]
-async fn output_drain_readers_share_one_deadline_window() -> Result<()> {
-    let stdout =
-        tokio::spawn(async { std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await });
-    let stderr =
-        tokio::spawn(async { std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await });
-    let started_at = tokio::time::Instant::now();
-
-    let (stdout, stderr) =
-        await_output_until_deadline(stdout, stderr, started_at + Duration::from_millis(500))
-            .await?;
-
-    assert!(stdout.text.is_empty());
-    assert!(stderr.text.is_empty());
-    // Sequential per-reader windows would take 1s on the paused clock.
-    assert_eq!(started_at.elapsed(), Duration::from_millis(500));
+async fn output_drain_preserves_completed_readers_and_joins_aborted_readers() -> Result<()> {
+    for (stdout_done, stderr_done) in [(true, true), (true, false), (false, true), (false, false)] {
+        let stdout_capture = Arc::new(Mutex::new(OutputCapture::new(None)));
+        let stderr_capture = Arc::new(Mutex::new(OutputCapture::new(None)));
+        let aggregate = Arc::new(Mutex::new(OutputCapture::new(None)));
+        let spawn_reader = |done: bool, capture: &SharedOutputCapture, bytes: &[u8]| {
+            capture.lock().unwrap().append(bytes);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = DropFlag(Arc::clone(&dropped));
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                if !done {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, io::Error>(())
+            });
+            (task, dropped)
+        };
+        let (stdout, stdout_dropped) = spawn_reader(stdout_done, &stdout_capture, b"stdout");
+        let (stderr, stderr_dropped) = spawn_reader(stderr_done, &stderr_capture, b"stderr");
+        let started_at = tokio::time::Instant::now();
+        let (stdout, stderr) = await_captured_output_until_deadline(
+            stdout, stderr, stdout_capture, stderr_capture, Arc::clone(&aggregate),
+            started_at + Duration::from_millis(500),
+        ).await?;
+        let notice = b"\n[... output capture stopped: pipe drain deadline exceeded ...]\n";
+        for (output, done, bytes) in [
+            (stdout, stdout_done, b"stdout"), (stderr, stderr_done, b"stderr"),
+        ] {
+            assert_eq!(output.text, if done { bytes.to_vec() } else {
+                [bytes.as_slice(), notice.as_slice()].concat()
+            });
+            assert_eq!(output.truncated, !done);
+        }
+        assert!(stdout_dropped.load(Ordering::Acquire));
+        assert!(stderr_dropped.load(Ordering::Acquire));
+        let timed_out = !stdout_done || !stderr_done;
+        let aggregate = aggregate.lock().unwrap().snapshot();
+        assert_eq!(aggregate.truncated, timed_out);
+        assert_eq!(aggregate.text, if timed_out { notice.to_vec() } else { Vec::new() });
+        assert_eq!(started_at.elapsed(), if timed_out {
+            Duration::from_millis(500)
+        } else {
+            Duration::ZERO
+        });
+    }
     Ok(())
 }
+
+
+
+
 
 #[tokio::test]
 async fn output_drain_timeout_preserves_captured_prefix_and_marks_it_truncated() -> Result<()> {
@@ -916,41 +903,46 @@ async fn output_drain_timeout_preserves_captured_prefix_and_marks_it_truncated()
 }
 
 #[tokio::test]
-async fn output_drain_simultaneous_failures_return_stdout_error_first() {
-    let stdout =
-        tokio::spawn(async { Err::<StreamOutput<Vec<u8>>, _>(io::Error::other("stdout failure")) });
-    let stderr =
-        tokio::spawn(async { Err::<StreamOutput<Vec<u8>>, _>(io::Error::other("stderr failure")) });
-
-    let error = await_output_until_deadline(
-        stdout,
-        stderr,
-        tokio::time::Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect_err("both output readers should fail");
-
-    assert_eq!(error.to_string(), "stdout failure");
+async fn output_drain_reader_failures_preserve_both_stream_diagnostics() {
+    for cancelled in [false, true] {
+        let stdout_capture = Arc::new(Mutex::new(OutputCapture::new(None)));
+        let stderr_capture = Arc::new(Mutex::new(OutputCapture::new(None)));
+        let aggregate = Arc::new(Mutex::new(OutputCapture::new(None)));
+        stdout_capture.lock().unwrap().append(b"stdout prefix");
+        stderr_capture.lock().unwrap().append(b"stderr prefix");
+        let stdout = tokio::spawn(async move {
+            if cancelled {
+                std::future::pending::<()>().await;
+            }
+            Err(io::Error::other("stdout failure"))
+        });
+        if cancelled {
+            stdout.abort();
+        }
+        let stderr = tokio::spawn(async { Err(io::Error::other("stderr failure")) });
+        let (stdout, stderr) = await_captured_output_until_deadline(
+            stdout, stderr, stdout_capture, stderr_capture, Arc::clone(&aggregate),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ).await.expect("reader failures must not discard execution evidence");
+        let stdout_error = if cancelled { "cancelled" } else { "stdout failure" };
+        for (output, prefix, error) in [
+            (stdout, "stdout prefix", stdout_error),
+            (stderr, "stderr prefix", "stderr failure"),
+        ] {
+            assert!(output.truncated);
+            let text = String::from_utf8(output.text).unwrap();
+            assert!(text.starts_with(prefix));
+            assert!(text.contains(error));
+        }
+        let aggregate = aggregate.lock().unwrap().snapshot();
+        assert!(aggregate.truncated);
+        let text = String::from_utf8(aggregate.text).unwrap();
+        assert!(text.contains(stdout_error));
+        assert!(text.contains("stderr failure"));
+    }
 }
 
-#[tokio::test]
-async fn output_drain_stdout_join_error_precedes_stderr_io_error() {
-    let stdout =
-        tokio::spawn(async { std::future::pending::<io::Result<StreamOutput<Vec<u8>>>>().await });
-    stdout.abort();
-    let stderr =
-        tokio::spawn(async { Err::<StreamOutput<Vec<u8>>, _>(io::Error::other("stderr failure")) });
 
-    let error = await_output_until_deadline(
-        stdout,
-        stderr,
-        tokio::time::Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect_err("both output readers should fail");
-
-    assert!(error.to_string().contains("cancelled"));
-}
 
 #[tokio::test]
 async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result<()> {
@@ -991,7 +983,12 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
     .await?;
 
     assert!(!output.timed_out);
-    assert_eq!(output.stdout.text.len(), byte_count);
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout.text, "a".repeat(byte_count));
+    assert!(!output.stdout.truncated);
+    assert!(output.stderr.text.is_empty());
+    assert_eq!(output.aggregated_output.text, output.stdout.text);
+    assert!(!output.aggregated_output.truncated);
 
     Ok(())
 }

@@ -46,13 +46,13 @@ def attempt(identity="a", **overrides):
 
 class ModelInferenceTest(unittest.TestCase):
     def test_phases_use_offsets_not_absolute_timestamps_or_prefill_labels(self):
-        report = analysis.analyze([attempt()])
+        report = analysis.analyze([attempt(queue_us=13, connection_setup_us=17)])
         phases = report["phaseTiming"]
         metrics = phases["groups"][0]["metrics"]
         for field, expected in {
             "request_construction_us": 80,
-            "queue_us": 10,
-            "connection_setup_us": 10,
+            "queue_us": 13,
+            "connection_setup_us": 17,
             "transport_us": 60,
             "dispatchToFirstProviderEventUs": 100,
             "dispatchToFirstModelOutputUs": 300,
@@ -103,6 +103,7 @@ class ModelInferenceTest(unittest.TestCase):
             {"first_visible_output_us": 1001}, {"stream_established_us": 201},
             {"first_actionable_output_us": float("nan")},
             {"completed_us": -1}, {"dispatch_ready_us": True},
+            {"first_actionable_output_us": 2**2048},
         ):
             with self.subTest(overrides=overrides):
                 report = analysis.analyze([attempt(**overrides)])
@@ -139,11 +140,14 @@ class ModelInferenceTest(unittest.TestCase):
         self.assertEqual(analysis.analyze(records)["stableContext"]["componentCacheHits"], 10)
 
     def test_distribution_sorts_once_and_preserves_interpolation(self):
-        for values in ([], [7], [30, 10], [4, 4, 0, 100]):
+        for values, p50, p95 in (
+            ([], None, None), ([7], 7, 7), ([30, 10], 20, 29),
+            ([4, 4, 0, 100], 4, 85.6),
+        ):
             expected = {
                 "count": len(values),
-                "p50": round(analysis.percentile(values, .5), 3) if values else None,
-                "p95": round(analysis.percentile(values, .95), 3) if values else None,
+                "p50": p50,
+                "p95": p95,
             }
             with mock.patch("builtins.sorted", wraps=sorted) as sorting:
                 self.assertEqual(analysis._distribution(values), expected)
@@ -168,11 +172,60 @@ class ModelInferenceTest(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), payload)
             self.assertIn("physical-attempt phases", human.read_text(encoding="utf-8"))
 
+    def test_analysis_only_excludes_container_identities_without_losing_valid_attempts(self):
+        # IDs and cohort labels identify scalar values. A malformed neighbor
+        # cannot join, deduplicate, or suppress the valid request's evidence.
+        for key in ("sampling_request_id", "attempt_id", "retry_index", "model", "outcome"):
+            for value in ([], {}):
+                with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
+                    source = Path(directory) / "input.jsonl"
+                    source.write_text("\n".join(map(json.dumps, [
+                        attempt("bad", **{key: value}), attempt("good"),
+                    ])), encoding="utf-8")
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        self.assertEqual(snapshot.main([
+                            "--analysis-only", "--model-attempt-jsonl", str(source), "--json",
+                        ]), 0)
+                    report = json.loads(stdout.getvalue())["modelAttemptAnalysis"]
+                    self.assertEqual(report["exclusionCounts"], {"invalid_identity_fields": 1})
+                    self.assertEqual(report["includedLogicalRequests"], 1)
+                    self.assertEqual(report["rows"][0]["sampling_request_id"], "good")
+                    self.assertEqual(report["rows"][0]["decision_latency_us"], 400)
+
+    def test_analysis_only_reports_oversized_measurements_as_unavailable(self):
+        # A syntactically valid JSON integer can exceed floating-point range.
+        # Retain the physical attempt and direct phases, but not its latency.
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.jsonl"
+            source.write_text(json.dumps(attempt(first_actionable_output_us=2**2048)) + "\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(snapshot.main([
+                    "--analysis-only", "--model-attempt-jsonl", str(source), "--json",
+                ]), 0)
+            report = json.loads(stdout.getvalue())["modelAttemptAnalysis"]
+            self.assertEqual(report["totalPhysicalAttempts"], 1)
+            self.assertEqual(report["includedLogicalRequests"], 0)
+            self.assertEqual(report["exclusionCounts"], {"invalid_timing_value": 1})
+            metrics = report["phaseTiming"]["groups"][0]["metrics"]
+            self.assertEqual(metrics["dispatchToFirstActionableOutputUs"]["count"], 0)
+            self.assertEqual(metrics["request_construction_us"]["p50"], 80)
+
     def test_analysis_only_rejects_missing_input_and_conflicting_flags(self):
-        for args in ([], ["--scenario", "python-startup"], ["--hash-binary"]):
-            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
-                snapshot.main(["--analysis-only", *args])
-            self.assertEqual(raised.exception.code, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.jsonl"
+            source.write_text(json.dumps(attempt()) + "\n", encoding="utf-8")
+            for args in (
+                [],
+                ["--model-attempt-jsonl", str(source), "--scenario", "python-startup"],
+                ["--model-attempt-jsonl", str(source), "--hash-binary"],
+            ):
+                stderr = io.StringIO()
+                with self.subTest(args=args), contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                    snapshot.main(["--analysis-only", *args])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("--analysis-only requires --model-attempt-jsonl and excludes --scenario/--hash-binary", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -33,10 +33,13 @@ fn convert_apply_patch_maps_add_variant() {
     let got = convert_apply_patch_to_protocol(&action);
 
     assert_eq!(
-        got.get(path.as_path()),
-        Some(&FileChange::Add {
-            content: "hello\n".to_string()
-        })
+        got,
+        HashMap::from([(
+            path,
+            FileChange::Add {
+                content: "hello\n".to_string(),
+            },
+        )])
     );
 }
 
@@ -66,51 +69,29 @@ async fn convert_apply_patch_maps_delete_variant() {
 
 #[tokio::test]
 async fn convert_apply_patch_maps_update_variant() {
-    let tmp = tempdir().expect("tmp");
-    let path = tmp.path().join("update.txt");
-    std::fs::write(&path, "before\n").expect("write source file");
-    let action = parse_verified_patch(
-        tmp.path(),
-        "*** Begin Patch\n*** Update File: update.txt\n@@\n-before\n+after\n*** End Patch",
-    )
-    .await;
+    for move_path in [None, Some("destination.txt")] {
+        let tmp = tempdir().expect("tmp");
+        let path = tmp.path().join("update.txt");
+        std::fs::write(&path, "before\n").expect("write source file");
+        let move_directive = move_path
+            .map(|path| format!("*** Move to: {path}\n"))
+            .unwrap_or_default();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: update.txt\n{move_directive}@@\n-before\n+after\n*** End Patch"
+        );
+        let action = parse_verified_patch(tmp.path(), &patch).await;
 
-    let got = convert_apply_patch_to_protocol(&action);
+        let got = convert_apply_patch_to_protocol(&action);
 
-    assert_eq!(
-        got,
-        HashMap::from([(
-            path,
-            FileChange::Update {
-                unified_diff: "@@ -1 +1 @@\n-before\n+after\n".to_string(),
-                move_path: None,
-            },
-        )])
-    );
-}
-
-#[tokio::test]
-async fn convert_apply_patch_maps_update_with_move_variant() {
-    let tmp = tempdir().expect("tmp");
-    let source_path = tmp.path().join("source.txt");
-    let destination_path = tmp.path().join("destination.txt");
-    std::fs::write(&source_path, "before\n").expect("write source file");
-    let action = parse_verified_patch(
-        tmp.path(),
-        "*** Begin Patch\n*** Update File: source.txt\n*** Move to: destination.txt\n@@\n-before\n+after\n*** End Patch",
-    )
-    .await;
-
-    let got = convert_apply_patch_to_protocol(&action);
-
-    assert_eq!(
-        got,
-        HashMap::from([(
-            source_path,
-            FileChange::Update {
-                unified_diff: "@@ -1 +1 @@\n-before\n+after\n".to_string(),
-                move_path: Some(destination_path),
-            },
-        )])
-    );
+        assert_eq!(
+            got,
+            HashMap::from([(
+                path,
+                FileChange::Update {
+                    unified_diff: "@@ -1 +1 @@\n-before\n+after\n".to_string(),
+                    move_path: move_path.map(|path| tmp.path().join(path)),
+                },
+            )])
+        );
+    }
 }

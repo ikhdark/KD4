@@ -327,7 +327,9 @@ function Get-AffinityLaneBase {
     # Include package selectors inside Cargo watch's --exec/-x command strings.
     $packages = @(Get-CodexCargoPackageSpecs -CommandArgs ($signature -split "\s+"))
     if ($packages.Count -gt 0) {
-        $base = ConvertTo-SafeLaneName $packages[0]
+        # Core package runs share the named gates' warm lane, regardless of
+        # package ordering, just like the Python reservation entrypoint.
+        $base = if ($packages -ccontains "codex-core") { "core-tests" } else { ConvertTo-SafeLaneName $packages[0] }
         if ($isRelease) {
             return "$base-release"
         }

@@ -944,15 +944,6 @@ mod tests {
     }
 
     #[test]
-    fn get_personality_message_returns_default_when_personality_is_none() {
-        let personality_template = personality_variables();
-        assert_eq!(
-            personality_template.get_personality_message(/*personality*/ None),
-            Some("default".to_string())
-        );
-    }
-
-    #[test]
     fn get_personality_message() {
         let personality_variables = personality_variables();
         assert_eq!(
@@ -1209,24 +1200,6 @@ mod tests {
     }
 
     #[test]
-    fn service_tier_for_request_omits_explicit_default_tier() {
-        let model = ModelInfo {
-            default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
-            service_tiers: vec![ModelServiceTier {
-                id: ServiceTier::Fast.request_value().to_string(),
-                name: "Fast".to_string(),
-                description: "Priority processing.".to_string(),
-            }],
-            ..test_model(/*spec*/ None)
-        };
-
-        assert_eq!(
-            model.service_tier_for_request(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
-            None
-        );
-    }
-
-    #[test]
     fn service_tier_for_request_filters_unsupported_tiers() {
         let model = ModelInfo {
             default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
@@ -1246,21 +1219,10 @@ mod tests {
             model.service_tier_for_request(Some("unsupported".to_string())),
             None
         );
-        assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
-    }
-
-    #[test]
-    fn service_tier_for_request_does_not_apply_catalog_default() {
-        let model = ModelInfo {
-            default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
-            service_tiers: vec![ModelServiceTier {
-                id: ServiceTier::Fast.request_value().to_string(),
-                name: "Fast".to_string(),
-                description: "Priority processing.".to_string(),
-            }],
-            ..test_model(/*spec*/ None)
-        };
-
+        assert_eq!(
+            model.service_tier_for_request(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
+            None
+        );
         assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
     }
 }

@@ -4,13 +4,6 @@ use codex_backend_client::TokenUsageProfileDailyBucket as AccountTokenUsageDaily
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 
-fn graph_width(width: u16) -> u16 {
-    if width == u16::MAX {
-        return width;
-    }
-    (CHART_LEFT_WIDTH + shown_columns(width) * 2 - 1) as u16
-}
-
 #[test]
 fn duplicate_dates_sum_and_negative_values_clamp() {
     let today =
@@ -32,33 +25,19 @@ fn duplicate_dates_sum_and_negative_values_clamp() {
 
     let values = daily_values(&buckets, today);
 
-    assert_eq!(values.iter().sum::<i64>(), 15);
+    let mut expected = vec![0; CELL_COUNT];
+    // Friday in the final displayed week; Thursday's negative value stays zero.
+    expected[CELL_COUNT - 2] = 15;
+    assert_eq!(values, expected);
 }
 
 #[test]
 fn bar_levels_fill_from_bottom() {
-    let levels = bar_levels(&[0, 10]);
+    let levels = bar_levels(&[0, 5, 10]);
 
     assert_eq!(&levels[..DAY_COUNT], &[0; DAY_COUNT]);
-    assert_eq!(&levels[DAY_COUNT..], &[4; DAY_COUNT]);
-}
-
-#[test]
-fn token_activity_view_aliases_parse() {
-    assert_eq!(TokenActivityView::parse(""), Some(TokenActivityView::Daily));
-    assert_eq!(
-        TokenActivityView::parse("day"),
-        Some(TokenActivityView::Daily)
-    );
-    assert_eq!(
-        TokenActivityView::parse("week"),
-        Some(TokenActivityView::Weekly)
-    );
-    assert_eq!(
-        TokenActivityView::parse("cumulative"),
-        Some(TokenActivityView::Cumulative)
-    );
-    assert_eq!(TokenActivityView::parse("year"), None);
+    assert_eq!(&levels[DAY_COUNT..2 * DAY_COUNT], &[0, 0, 0, 4, 4, 4, 4]);
+    assert_eq!(&levels[2 * DAY_COUNT..], &[4; DAY_COUNT]);
 }
 
 #[test]
@@ -98,12 +77,14 @@ fn daily_graph_snapshot_uses_distinct_empty_and_active_cells() {
 
 #[test]
 fn daily_graph_snapshot_stays_left_aligned_in_wide_terminal() {
-    assert_eq!(graph_width(/*width*/ 160), 107);
-    assert_eq!(graph_width(/*width*/ u16::MAX), u16::MAX);
-
     let today =
         NaiveDate::from_ymd_opt(/*year*/ 2026, /*month*/ 5, /*day*/ 29).expect("valid date");
     let lines = chart_lines(TokenActivityView::Daily, &[], today, /*width*/ 160);
+    assert_eq!(lines[1].width(), 107);
+    assert_eq!(
+        chart_lines(TokenActivityView::Daily, &[], today, u16::MAX),
+        lines
+    );
     let rendered = [&lines[0], &lines[1], lines.last().expect("legend line")]
         .into_iter()
         .map(|line| line.to_string().trim_end().to_string())

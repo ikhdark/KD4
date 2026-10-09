@@ -614,27 +614,48 @@ mod tests {
     }
 
     #[test]
-    fn requirements_api_includes_allow_managed_hooks_only() {
+    fn requirements_api_preserves_optional_policies_and_model_defaults() {
+        let absent = map_requirements_toml_to_api(ConfigRequirementsToml::default());
+        assert_eq!(absent.allow_managed_hooks_only, None);
+        assert_eq!(absent.allowed_permission_profiles, None);
+        assert_eq!(absent.default_permissions, None);
+        assert_eq!(absent.allow_appshots, None);
+        assert_eq!(absent.allow_remote_control, None);
+        assert_eq!(absent.models, None);
+        assert_eq!(absent.computer_use, None);
+        assert_eq!(absent.allowed_windows_sandbox_implementations, None);
+        assert_eq!(absent.hooks, None);
+
         let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
             allow_managed_hooks_only: Some(true),
-            ..ConfigRequirementsToml::default()
-        });
-
-        assert_eq!(mapped.allow_managed_hooks_only, Some(true));
-        assert_eq!(mapped.hooks, None);
-    }
-
-    #[test]
-    fn requirements_api_includes_permission_default_and_allowlist() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
             allowed_permission_profiles: Some(BTreeMap::from([
                 ("managed-build".to_string(), false),
                 ("managed-standard".to_string(), true),
             ])),
             default_permissions: Some("managed-standard".to_string()),
+            allow_appshots: Some(false),
+            allow_remote_control: Some(false),
+            models: Some(ModelsRequirementsToml {
+                new_thread: Some(NewThreadModelDefaultsToml {
+                    model: Some("gpt-managed".to_string()),
+                    model_reasoning_effort: Some(ReasoningEffort::Medium),
+                    service_tier: Some("priority".to_string()),
+                }),
+            }),
+            computer_use: Some(ComputerUseRequirementsToml {
+                allow_locked_computer_use: Some(false),
+            }),
+            windows: Some(WindowsRequirementsToml {
+                allowed_sandbox_implementations: Some(vec![
+                    codex_config::types::WindowsSandboxModeToml::Elevated,
+                    codex_config::types::WindowsSandboxModeToml::Unelevated,
+                ]),
+            }),
             ..ConfigRequirementsToml::default()
         });
 
+        assert_eq!(mapped.allow_managed_hooks_only, Some(true));
+        assert_eq!(mapped.hooks, None);
         assert_eq!(
             mapped.allowed_permission_profiles,
             Some(BTreeMap::from([
@@ -646,42 +667,8 @@ mod tests {
             mapped.default_permissions,
             Some("managed-standard".to_string())
         );
-    }
-
-    #[test]
-    fn requirements_api_includes_allow_appshots() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
-            allow_appshots: Some(false),
-            ..ConfigRequirementsToml::default()
-        });
-
         assert_eq!(mapped.allow_appshots, Some(false));
-        assert_eq!(mapped.hooks, None);
-    }
-
-    #[test]
-    fn requirements_api_includes_allow_remote_control() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
-            allow_remote_control: Some(false),
-            ..ConfigRequirementsToml::default()
-        });
-
         assert_eq!(mapped.allow_remote_control, Some(false));
-    }
-
-    #[test]
-    fn requirements_api_includes_new_thread_model_defaults() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
-            models: Some(ModelsRequirementsToml {
-                new_thread: Some(NewThreadModelDefaultsToml {
-                    model: Some("gpt-managed".to_string()),
-                    model_reasoning_effort: Some(ReasoningEffort::Medium),
-                    service_tier: Some("priority".to_string()),
-                }),
-            }),
-            ..ConfigRequirementsToml::default()
-        });
-
         let defaults = mapped
             .models
             .and_then(|models| models.new_thread)
@@ -692,37 +679,12 @@ mod tests {
             Some(ReasoningEffort::Medium)
         );
         assert_eq!(defaults.service_tier.as_deref(), Some("priority"));
-    }
-
-    #[test]
-    fn requirements_api_includes_computer_use_requirements() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
-            computer_use: Some(ComputerUseRequirementsToml {
-                allow_locked_computer_use: Some(false),
-            }),
-            ..ConfigRequirementsToml::default()
-        });
-
         assert_eq!(
             mapped
                 .computer_use
                 .and_then(|requirements| requirements.allow_locked_computer_use),
             Some(false)
         );
-    }
-
-    #[test]
-    fn requirements_api_includes_allowed_windows_sandbox_implementations() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
-            windows: Some(WindowsRequirementsToml {
-                allowed_sandbox_implementations: Some(vec![
-                    codex_config::types::WindowsSandboxModeToml::Elevated,
-                    codex_config::types::WindowsSandboxModeToml::Unelevated,
-                ]),
-            }),
-            ..ConfigRequirementsToml::default()
-        });
-
         assert_eq!(
             mapped.allowed_windows_sandbox_implementations,
             Some(vec![

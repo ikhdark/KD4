@@ -1667,8 +1667,8 @@ fn build_remote_plugin_summary(
         id: plugin_id.as_key(),
         remote_plugin_id: plugin.id.clone(),
         version: plugin.release.version.clone(),
-        local_version: installed_plugin
-            .and_then(|installed| installed.plugin.release.version.clone()),
+        // Account installation does not establish which package exists on this device.
+        local_version: None,
         name: plugin.name.clone(),
         share_context: remote_plugin_share_context(plugin)?,
         installed: installed_plugin.is_some(),

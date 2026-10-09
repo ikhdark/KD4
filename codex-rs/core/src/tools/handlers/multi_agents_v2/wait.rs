@@ -1062,6 +1062,29 @@ fn take_pending_activity(
 mod tests {
 
     #[test]
+    fn stalled_assignment_nudge_is_plaintext_model_input() {
+        use codex_protocol::AgentPath;
+        use codex_protocol::models::AgentMessageInputContent;
+        use codex_protocol::models::ResponseItem;
+
+        let author = AgentPath::root();
+        let recipient = author.join("worker").expect("child path");
+        let message = super::stalled_assignment_nudge(author.clone(), recipient.clone());
+        assert!(message.trigger_turn);
+        assert_eq!(message.encrypted_content, None);
+        let ResponseItem::AgentMessage { author: actual_author, recipient: actual_recipient, content, .. } = message.to_model_input_item() else {
+            panic!("nudge must be an agent message");
+        };
+        assert_eq!(actual_author, author.to_string());
+        assert_eq!(actual_recipient, recipient.to_string());
+        // Host-authored prose is not provider ciphertext. The recipient must
+        // receive readable instructions, not an EncryptedContent item.
+        assert_eq!(content, vec![AgentMessageInputContent::InputText {
+            text: "Coordination nudge: no durable progress has been observed. Report current progress or the concrete blocker; do not restart a stale validation loop.".to_string(),
+        }]);
+    }
+
+    #[test]
     fn retained_delivery_recovery_receipt_survives_projection() {
         use crate::tools::context::ToolOutput;
         let receipt = serde_json::json!({"artifact_id":"prior-result", "thread_id":"prior-thread", "cursor":"123", "recovery_tool":"read_tool_output"});
@@ -1540,23 +1563,33 @@ mod tests {
     #[test]
     fn durable_progress_rejects_missing_and_repeated_cursor_revisions() {
         let cursor = WakeEventId::new();
-        let missing = WakeRead {
-            status: WakeReadStatus::Unknown,
-            reason: None,
-            updated_agents: Vec::new(),
-            latest_event_id: None,
-            lost_to_retention_count: 0,
-            remaining_count: 0,
-            truncated_count: 0,
-            timed_out: false,
-        };
-        assert!(prove_durable_forward_progress(Some(cursor), &missing).is_err());
-
-        let repeated = WakeRead {
-            latest_event_id: Some(cursor),
-            ..missing
-        };
-        assert!(prove_durable_forward_progress(Some(cursor), &repeated).is_err());
+        let valid = test_wake_page(
+            test_wake_events(AssignmentId::new(), codex_agent_task_store::AttemptId::new(), 2),
+            0,
+            0,
+        );
+        assert_eq!(prove_durable_forward_progress(Some(cursor), &valid), Ok(()));
+        let mut missing = valid.clone();
+        missing.latest_event_id = None;
+        let mut repeated = valid.clone();
+        repeated.latest_event_id = Some(cursor);
+        let mut mismatched = valid.clone();
+        mismatched.latest_event_id = Some(WakeEventId::new());
+        let mut duplicate = valid.clone();
+        duplicate.updated_agents[0] = duplicate.updated_agents[1].clone();
+        let mut wrong_bounds = valid;
+        wrong_bounds.truncated_count = 1;
+        for (page, expected_error) in [
+            (test_wake_page(Vec::new(), 0, 0), "contained no advancing event"),
+            (missing, "omitted its cursor revision"),
+            (repeated, "repeated its cursor identity"),
+            (mismatched, "cursor did not identify its final event"),
+            (duplicate, "page repeated an event identity"),
+            (wrong_bounds, "omitted exact retained-event bounds"),
+        ] {
+            let error = prove_durable_forward_progress(Some(cursor), &page).unwrap_err();
+            assert!(error.contains(expected_error), "{error}");
+        }
     }
 
     fn test_wake_events(
@@ -1761,22 +1794,6 @@ mod tests {
             .insert(derived_assignment_id, "revision-2".to_string());
 
         assert!(drain.assignment_ids().contains(&derived_assignment_id));
-    }
-
-    #[test]
-    fn later_page_rejects_changed_repeated_assignment() {
-        let assignment_id = AssignmentId::new();
-        let attempt_id = codex_agent_task_store::AttemptId::new();
-        let first = test_wake_page(test_wake_events(assignment_id, attempt_id, 1), 0, 1);
-        let second = test_wake_page(test_wake_events(assignment_id, attempt_id, 1), 0, 0);
-        let mut drain =
-            WakeEventDrain::new(None, first, test_hydration(assignment_id, "revision-1"))
-                .expect("first page is valid");
-
-        assert!(matches!(
-            drain.push(second, test_hydration(assignment_id, "revision-2")),
-            WakePageAcceptance::FailOpen(_)
-        ));
     }
 
     #[test]
@@ -2325,13 +2342,7 @@ async fn nudge_stalled_assignments(
             let _ = store.release_stalled_nudge(binding.assignment_id).await;
             continue;
         }
-        let mut communication = communication_from_tool_message(
-            author.clone(),
-            receiver_path,
-            "Coordination nudge: no durable progress has been observed. Report current progress or the concrete blocker; do not restart a stale validation loop."
-                .to_string(),
-        );
-        communication.trigger_turn = true;
+        let communication = stalled_assignment_nudge(author.clone(), receiver_path);
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Message, session.thread_id);
         if session
@@ -2351,6 +2362,15 @@ async fn nudge_stalled_assignments(
         }
     }
     nudged
+}
+
+fn stalled_assignment_nudge(author: AgentPath, recipient: AgentPath) -> InterAgentCommunication {
+    communication_from_plaintext_message(
+        author,
+        recipient,
+        "Coordination nudge: no durable progress has been observed. Report current progress or the concrete blocker; do not restart a stale validation loop."
+            .to_string(),
+    )
 }
 
 fn runtime_status_allows_nonproductive_recovery(status: &AgentStatus) -> bool {

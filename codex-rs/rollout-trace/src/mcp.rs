@@ -67,33 +67,23 @@ impl McpCallTraceContext {
 mod tests {
     use serde_json::json;
 
-    use super::MCP_CALL_ID_META_KEY;
     use super::McpCallTraceContext;
 
     #[test]
-    fn disabled_mcp_trace_leaves_request_meta_unchanged() {
-        let meta = Some(json!({"source": "test"}));
-
-        assert_eq!(
-            McpCallTraceContext::disabled().add_request_meta(meta.clone()),
-            meta
-        );
-    }
-
-    #[test]
-    fn enabled_mcp_trace_adds_bridge_correlation_meta() {
-        let trace = McpCallTraceContext::enabled("mcp-call-id".to_string());
-        let meta = trace
-            .add_request_meta(Some(json!({"source": "test"})))
-            .expect("enabled trace keeps request metadata");
-        let object = meta
-            .as_object()
-            .expect("MCP request metadata remains an object");
-
-        assert_eq!(object["source"], json!("test"));
-        assert_eq!(
-            object[MCP_CALL_ID_META_KEY],
-            json!(trace.mcp_call_id().expect("enabled trace has an ID"))
-        );
+    fn mcp_correlation_preserves_metadata_and_uses_the_bridge_wire_key() {
+        let enabled = McpCallTraceContext::enabled("mcp-call-id".to_string());
+        for (meta, expected) in [
+            (None, Some(json!({"codex_bridge_mcp_call_id": "mcp-call-id"}))),
+            (Some(json!({"source": "test", "codex_bridge_mcp_call_id": "old"})),
+             Some(json!({"source": "test", "codex_bridge_mcp_call_id": "mcp-call-id"}))),
+            (Some(json!({"source": "test"})),
+             Some(json!({"source": "test", "codex_bridge_mcp_call_id": "mcp-call-id"}))),
+            (Some(json!(null)), Some(json!(null))),
+            (Some(json!(["value"])), Some(json!(["value"]))),
+            (Some(json!(7)), Some(json!(7))),
+        ] {
+            assert_eq!(McpCallTraceContext::disabled().add_request_meta(meta.clone()), meta);
+            assert_eq!(enabled.add_request_meta(meta), expected);
+        }
     }
 }

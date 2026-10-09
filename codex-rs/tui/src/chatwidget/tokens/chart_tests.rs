@@ -107,10 +107,15 @@ fn duplicate_dates_sum_and_negative_values_clamp() {
 
 #[test]
 fn bar_levels_fill_from_bottom() {
-    let levels = bar_levels(&[0, 10]);
-
-    assert_eq!(&levels[..DAY_COUNT], &[0; DAY_COUNT]);
-    assert_eq!(&levels[DAY_COUNT..], &[4; DAY_COUNT]);
+    assert_eq!(
+        bar_levels(&[0, 1, 4, 7]),
+        vec![
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 4,
+            0, 0, 0, 4, 4, 4, 4,
+            4, 4, 4, 4, 4, 4, 4,
+        ]
+    );
 }
 
 #[test]

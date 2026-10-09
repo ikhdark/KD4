@@ -71,10 +71,9 @@ async fn fork_thread_twice_drops_to_first_message() {
         let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     }
 
-    // Request history from the base conversation to obtain rollout path.
+    codex.flush_rollout().await.expect("flush source rollout");
+    // Read the persisted history only after the recorder has drained.
     let base_path = codex.rollout_path().expect("rollout path");
-
-    // GetHistory flushes before returning the path; no wait needed.
 
     // Compute expected prefixes after each fork by truncating base rollout
     // strictly before the nth user input (0-based).
@@ -93,9 +92,10 @@ async fn fork_thread_twice_drops_to_first_message() {
         pos
     };
     let user_inputs = find_user_input_positions(&base_items);
+    assert_eq!(user_inputs.len(), 3, "all source turns must be persisted");
 
     // After cutting at nth user input (n=1 → second user message), cut strictly before that input.
-    let cut1 = user_inputs.get(1).copied().unwrap_or(0);
+    let cut1 = user_inputs[1];
     let expected_after_first: Vec<RolloutItem> = base_items[..cut1].to_vec();
 
     // After dropping again (n=1 on fork1), compute expected relative to fork1's rollout.
@@ -117,11 +117,11 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     let fork1_path = codex_fork1.rollout_path().expect("rollout path");
 
-    // GetHistory on fork1 flushed; the file is ready.
+    codex_fork1.flush_rollout().await.expect("flush first fork");
     let fork1_items = read_rollout_items(&fork1_path).await;
     assert_fork_rollout(&fork1_items, &expected_after_first);
 
-    // Fork again with n=0 → drops the (new) last user message, leaving only the first.
+    // Fork again before user message zero, leaving no user messages.
     let NewThread {
         thread: codex_fork2,
         ..
@@ -137,13 +137,10 @@ async fn fork_thread_twice_drops_to_first_message() {
         .expect("fork 2");
 
     let fork2_path = codex_fork2.rollout_path().expect("rollout path");
-    // GetHistory on fork2 flushed; the file is ready.
-    let fork1_items = read_rollout_items(&fork1_path).await;
+    codex_fork2.flush_rollout().await.expect("flush second fork");
     let fork1_user_inputs = find_user_input_positions(&fork1_items);
-    let cut_last_on_fork1 = fork1_user_inputs
-        .get(fork1_user_inputs.len().saturating_sub(1))
-        .copied()
-        .unwrap_or(0);
+    assert_eq!(fork1_user_inputs.len(), 1);
+    let cut_last_on_fork1 = fork1_user_inputs[0];
     let expected_after_second: Vec<RolloutItem> = fork1_items[..cut_last_on_fork1].to_vec();
     let fork2_items = read_rollout_items(&fork2_path).await;
     assert_fork_rollout(&fork2_items, &expected_after_second);

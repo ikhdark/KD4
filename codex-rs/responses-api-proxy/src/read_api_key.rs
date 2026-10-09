@@ -225,53 +225,25 @@ mod tests {
     use std::io;
 
     #[test]
-    fn reads_key_with_no_newlines() {
-        let mut sent = false;
-        let result = read_auth_header_with(|buf| {
-            if sent {
-                return Ok(0);
-            }
-            let data = b"sk-abc123";
-            buf[..data.len()].copy_from_slice(data);
-            sent = true;
-            Ok(data.len())
-        })
-        .unwrap();
-
-        assert_eq!(result, "Bearer sk-abc123");
-    }
-
-    #[test]
     fn reads_key_with_short_reads() {
-        let mut chunks: VecDeque<&[u8]> =
-            VecDeque::from(vec![b"sk-".as_ref(), b"abc".as_ref(), b"123\n".as_ref()]);
-        let result = read_auth_header_with(|buf| match chunks.pop_front() {
-            Some(chunk) if !chunk.is_empty() => {
-                buf[..chunk.len()].copy_from_slice(chunk);
-                Ok(chunk.len())
-            }
-            _ => Ok(0),
-        })
-        .unwrap();
+        for input in [
+            vec![b"sk-abc123".as_slice()],
+            vec![b"sk-".as_slice(), b"abc".as_slice(), b"123\n".as_slice()],
+            vec![b"sk-abc123\r\n".as_slice()],
+            vec![b"sk-abc123\r".as_slice(), b"\nignored".as_slice()],
+        ] {
+            let mut chunks: VecDeque<&[u8]> = input.clone().into();
+            let result = read_auth_header_with(|buf| match chunks.pop_front() {
+                Some(chunk) => {
+                    buf[..chunk.len()].copy_from_slice(chunk);
+                    Ok(chunk.len())
+                }
+                None => Ok(0),
+            })
+            .unwrap();
 
-        assert_eq!(result, "Bearer sk-abc123");
-    }
-
-    #[test]
-    fn reads_key_and_trims_newlines() {
-        let mut sent = false;
-        let result = read_auth_header_with(|buf| {
-            if sent {
-                return Ok(0);
-            }
-            let data = b"sk-abc123\r\n";
-            buf[..data.len()].copy_from_slice(data);
-            sent = true;
-            Ok(data.len())
-        })
-        .unwrap();
-
-        assert_eq!(result, "Bearer sk-abc123");
+            assert_eq!(result, "Bearer sk-abc123", "input: {input:?}");
+        }
     }
 
     #[test]
@@ -305,38 +277,24 @@ mod tests {
     }
 
     #[test]
-    fn errors_on_invalid_utf8() {
-        let mut sent = false;
-        let err = read_auth_header_with(|buf| {
-            if sent {
-                return Ok(0);
-            }
-            let data = b"sk-abc\xff";
-            buf[..data.len()].copy_from_slice(data);
-            sent = true;
-            Ok(data.len())
-        })
-        .unwrap_err();
-
-        let message = format!("{err:#}");
-        assert!(message.contains("API key may only contain ASCII letters, numbers, '-' or '_'"));
-    }
-
-    #[test]
     fn errors_on_invalid_characters() {
-        let mut sent = false;
-        let err = read_auth_header_with(|buf| {
-            if sent {
-                return Ok(0);
-            }
-            let data = b"sk-abc!23";
-            buf[..data.len()].copy_from_slice(data);
-            sent = true;
-            Ok(data.len())
-        })
-        .unwrap_err();
+        for data in [b"sk-abc\xff".as_slice(), b"sk-abc!23", b"sk-abc\0", b"sk abc"] {
+            let mut sent = false;
+            let err = read_auth_header_with(|buf| {
+                if sent {
+                    return Ok(0);
+                }
+                buf[..data.len()].copy_from_slice(data);
+                sent = true;
+                Ok(data.len())
+            })
+            .unwrap_err();
 
-        let message = format!("{err:#}");
-        assert!(message.contains("API key may only contain ASCII letters, numbers, '-' or '_'"));
+            assert_eq!(
+                err.to_string(),
+                "API key may only contain ASCII letters, numbers, '-' or '_'",
+                "input: {data:?}"
+            );
+        }
     }
 }

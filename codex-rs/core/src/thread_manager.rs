@@ -1492,21 +1492,26 @@ impl ThreadManager {
                     Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
                     Err(_) => ShutdownOutcome::TimedOut,
                 };
-                (thread_id, outcome)
+                (thread_id, thread, outcome)
             })
             .collect::<FuturesUnordered<_>>();
         let mut report = ThreadShutdownReport::default();
+        let mut completed_threads = Vec::new();
 
-        while let Some((thread_id, outcome)) = shutdowns.next().await {
+        while let Some((thread_id, thread, outcome)) = shutdowns.next().await {
             match outcome {
-                ShutdownOutcome::Complete => report.completed.push(thread_id),
+                ShutdownOutcome::Complete => {
+                    report.completed.push(thread_id);
+                    completed_threads.push((thread_id, thread));
+                }
                 ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
                 ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
             }
         }
 
-        for thread_id in &report.completed {
-            self.state.remove_thread(thread_id).await;
+        for (thread_id, thread) in completed_threads {
+            // A concurrent resume may already have installed a replacement runtime.
+            self.state.remove_thread_if_same(&thread_id, &thread).await;
         }
 
         report
@@ -2709,6 +2714,17 @@ fn implicit_legacy_turn_is_unfinished(
                 RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
             )
         })
+}
+
+/// Reconstruct the client-visible history of an interrupted fork without
+/// introducing model-only interruption guidance. Pathless forks have no rollout
+/// to read back, but must report the same turn boundaries as persisted forks.
+pub fn interrupted_fork_history_for_display(history: InitialHistory) -> InitialHistory {
+    fork_history_from_snapshot(
+        ForkSnapshot::Interrupted,
+        history,
+        InterruptedTurnHistoryMarker::Disabled,
+    )
 }
 
 fn fork_history_from_snapshot(

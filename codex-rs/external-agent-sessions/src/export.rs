@@ -228,6 +228,19 @@ mod tests {
                 phase: None,
             }
         );
+        let token_count = imported
+            .rollout_items
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::TokenCount(event)) => event.info.clone(),
+                _ => None,
+            })
+            .expect("token count event");
+
+        // 13 bytes of user text plus 12 bytes of assistant text, rounded up
+        // at four bytes per token. The trailing user request is a local tail.
+        assert_eq!(token_count.last_token_usage.total_tokens, 7);
+        assert_eq!(token_count.total_token_usage, token_count.last_token_usage);
     }
 
     #[test]
@@ -267,10 +280,8 @@ mod tests {
                 RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => Some(event),
                 _ => None,
             });
-        assert_eq!(
-            last_turn_complete.and_then(|event| event.last_agent_message.as_deref()),
-            None
-        );
+        let last_turn_complete = last_turn_complete.expect("imported turn must complete");
+        assert_eq!(last_turn_complete.last_agent_message, None);
     }
 
     #[test]
@@ -293,16 +304,16 @@ mod tests {
         let imported = load_session_for_import(&path)
             .expect("load")
             .expect("session");
-        let response_message_count = imported
+        let response_messages = imported
             .rollout_items
             .iter()
-            .filter(|item| {
-                matches!(
-                    item,
-                    RolloutItem::ResponseItem(ResponseItem::Message { .. })
-                )
+            .filter_map(|item| match item {
+                RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {
+                    Some((role.as_str(), content.clone()))
+                }
+                _ => None,
             })
-            .count();
+            .collect::<Vec<_>>();
         let visible_message_event_count = imported
             .rollout_items
             .iter()
@@ -313,7 +324,13 @@ mod tests {
             })
             .count();
 
-        assert_eq!(response_message_count, 2);
+        assert_eq!(
+            response_messages,
+            vec![
+                ("user", vec![ContentItem::InputText { text: request }]),
+                ("assistant", vec![ContentItem::OutputText { text: answer }]),
+            ]
+        );
         assert_eq!(visible_message_event_count, 2);
     }
 
@@ -517,39 +534,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn emits_token_usage_through_the_last_assistant_message() {
-        let root = TempDir::new().expect("tempdir");
-        let project_root = root.path().join("repo");
-        std::fs::create_dir_all(&project_root).expect("project root");
-        let path = root.path().join("session.jsonl");
-        std::fs::write(
-            &path,
-            jsonl(&[
-                record("user", "first request", &project_root),
-                record("assistant", "first answer", &project_root),
-                record("user", "second request", &project_root),
-            ]),
-        )
-        .expect("session");
-
-        let imported = load_session_for_import(&path)
-            .expect("load")
-            .expect("session");
-        let token_count = imported
-            .rollout_items
-            .iter()
-            .find_map(|item| match item {
-                RolloutItem::EventMsg(EventMsg::TokenCount(event)) => event.info.clone(),
-                _ => None,
-            })
-            .expect("token count event");
-
-        // 13 bytes of user text plus 12 bytes of assistant text, rounded up
-        // at four bytes per token. The trailing user request is a local tail.
-        assert_eq!(token_count.last_token_usage.total_tokens, 7);
-        assert_eq!(token_count.total_token_usage, token_count.last_token_usage);
-    }
 
     fn record(role: &str, text: &str, cwd: &Path) -> JsonValue {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);

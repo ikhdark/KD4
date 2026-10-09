@@ -6,49 +6,31 @@ use tracing_test::internal::MockWriter;
 
 #[test]
 fn enabled_network_policy_removes_inherited_disabled_marker() {
-    let mut env = HashMap::from([
-        (
-            CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
-            "stale".to_string(),
-        ),
-        ("KEEP_ME".to_string(), "value".to_string()),
-    ]);
-
-    apply_network_sandbox_policy_to_env(&mut env, NetworkSandboxPolicy::Enabled);
-
-    assert_eq!(env.get(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR), None);
-    assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("value"));
-}
-
-#[test]
-fn enabled_network_policy_removes_differently_cased_disabled_marker() {
-    let mut env = HashMap::from([(
-        CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_ascii_lowercase(),
-        "stale".to_string(),
-    )]);
-
-    apply_network_sandbox_policy_to_env(&mut env, NetworkSandboxPolicy::Enabled);
-
-    assert!(
-        env.keys()
-            .all(|key| !key.eq_ignore_ascii_case(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR))
-    );
-}
-
-#[test]
-fn restricted_network_policy_replaces_inherited_disabled_marker() {
-    let mut env = HashMap::from([(
-        CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
-        "stale".to_string(),
-    )]);
-
-    apply_network_sandbox_policy_to_env(&mut env, NetworkSandboxPolicy::Restricted);
-
-    assert_eq!(
-        env.get(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR)
-            .map(String::as_str),
-        Some("1")
-    );
+    for (policy, expected_marker) in [
+        (NetworkSandboxPolicy::Enabled, None),
+        (NetworkSandboxPolicy::Restricted, Some("1")),
+    ] {
+        let mut env = HashMap::from([
+            (
+                CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
+                "stale".to_string(),
+            ),
+            (
+                CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_ascii_lowercase(),
+                "stale-alias".to_string(),
+            ),
+            ("KEEP_ME".to_string(), "value".to_string()),
+        ]);
+        apply_network_sandbox_policy_to_env(&mut env, policy);
+        let mut expected = HashMap::from([("KEEP_ME".to_string(), "value".to_string())]);
+        if let Some(marker) = expected_marker {
+            expected.insert(
+                CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
+                marker.to_string(),
+            );
+        }
+        assert_eq!(env, expected);
+    }
 }
 
 #[test]

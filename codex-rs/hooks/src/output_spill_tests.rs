@@ -92,7 +92,13 @@ async fn spill_scan_preserves_complete_metadata_and_filtering() -> Result<()> {
     }
     std::fs::create_dir_all(dir.path().join("one/directory.txt"))?;
     let actual = sorted_spill_records(collect_spill_files(dir.path()).await?);
-    assert_eq!(actual.len(), 2);
+    assert_eq!(
+        actual,
+        vec![
+            (dir.path().join("one/a.txt"), SystemTime::UNIX_EPOCH, 1),
+            (dir.path().join("two/b.txt"), SystemTime::UNIX_EPOCH, 3),
+        ]
+    );
     assert_eq!(
         actual,
         sorted_spill_records(collect_spill_files_async_reference(dir.path()).await?)
@@ -215,6 +221,7 @@ async fn spill_batches_throttle_cleanup_and_keep_writer_directories() -> Result<
         .await;
     assert!(!expired.exists());
     assert!(expired.parent().context("parent")?.exists());
+    assert_eq!(outputs.len(), 2);
     for output in outputs {
         let path = output
             .lines()
@@ -316,45 +323,47 @@ async fn output_spill_preserves_current_files_inside_active_grace() -> Result<()
 
 #[tokio::test]
 async fn output_spill_quota_prunes_oldest_crash_leftovers_by_count_and_bytes() -> Result<()> {
-    let dir = tempdir()?;
-    let output_dir = dir.path().join(HOOK_OUTPUTS_DIR);
-    let thread_dir = output_dir.join(ThreadId::new().to_string());
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
-    let ages = [5_u64, 4, 3, 2];
-    let old_files = ages
-        .iter()
-        .enumerate()
-        .map(|(index, age_hours)| {
-            let path = thread_dir.join(format!("old-{index}.txt"));
-            write_spill(
-                &path,
-                "12345678",
-                now.checked_sub(Duration::from_secs(age_hours * 60 * 60))
-                    .context("old time")?,
-            )?;
-            Ok(path)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let current = thread_dir.join("current.txt");
-    write_spill(&current, "12345678", now)?;
+    for (max_files, max_bytes, first_retained) in [(3, u64::MAX, 2), (usize::MAX, 16, 3)] {
+        let dir = tempdir()?;
+        let output_dir = dir.path().join(HOOK_OUTPUTS_DIR);
+        let thread_dir = output_dir.join(ThreadId::new().to_string());
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        let old_files = [5_u64, 4, 3, 2]
+            .iter()
+            .enumerate()
+            .map(|(index, age_hours)| {
+                let path = thread_dir.join(format!("old-{index}.txt"));
+                write_spill(
+                    &path,
+                    "12345678",
+                    now.checked_sub(Duration::from_secs(age_hours * 60 * 60))
+                        .context("old time")?,
+                )?;
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let current = thread_dir.join("current.txt");
+        // Older than every candidate and outside active_grace: only explicit
+        // protection can preserve this file when either quota is exceeded.
+        write_spill(&current, "12345678", now - Duration::from_secs(10 * 60 * 60))?;
 
-    prune_crash_leftovers_at(
-        &output_dir,
-        Some(&current),
-        test_policy(
-            Duration::from_secs(30 * 24 * 60 * 60),
-            Duration::from_secs(60 * 60),
-            3,
-            16,
-        ),
-        now,
-    )
-    .await?;
+        prune_crash_leftovers_at(
+            &output_dir,
+            Some(&current),
+            test_policy(
+                Duration::from_secs(30 * 24 * 60 * 60),
+                Duration::from_secs(60 * 60),
+                max_files,
+                max_bytes,
+            ),
+            now,
+        )
+        .await?;
 
-    assert!(!old_files[0].exists());
-    assert!(!old_files[1].exists());
-    assert!(!old_files[2].exists());
-    assert!(old_files[3].exists());
-    assert!(current.exists());
+        for (index, path) in old_files.iter().enumerate() {
+            assert_eq!(path.exists(), index >= first_retained, "{path:?}");
+        }
+        assert!(current.exists());
+    }
     Ok(())
 }

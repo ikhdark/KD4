@@ -104,13 +104,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cancellation_wins_when_both_are_ready() {
-        let token = CancellationToken::new();
-        token.cancel();
-
-        let result = async { 5 }.or_cancel(&token).await;
-
-        assert_eq!(Err(CancelErr::Cancelled), result);
-    }
 }

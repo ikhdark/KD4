@@ -394,7 +394,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn key_event_skips_unmapped() {
         let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
-        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let mut stream = make_stream(broker, draw_rx, terminal_focused.clone());
 
         handle.send(Ok(Event::FocusLost));
         handle.send(Ok(Event::Key(KeyEvent::new(
@@ -403,6 +403,7 @@ mod tests {
         ))));
 
         let next = stream.next().await.unwrap();
+        assert!(!terminal_focused.load(Ordering::Relaxed));
         match next {
             TuiEvent::Key(key) => {
                 assert_eq!(key, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -485,13 +486,17 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn error_or_eof_ends_stream() {
-        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
-        let mut stream = make_stream(broker, draw_rx, terminal_focused);
-
-        handle.send(Err(std::io::Error::other("boom")));
-
-        let next = stream.next().await;
-        assert!(next.is_none());
+        for error in [false, true] {
+            let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+            let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused);
+            if error {
+                handle.send(Err(std::io::Error::other("boom")));
+            } else {
+                broker.state.lock().unwrap().active_event_source_mut().unwrap().rx.close();
+            }
+            assert!(stream.next().await.is_none());
+            assert!(matches!(*broker.state.lock().unwrap(), EventBrokerState::Start));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

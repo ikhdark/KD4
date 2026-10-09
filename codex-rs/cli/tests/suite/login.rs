@@ -102,7 +102,7 @@ fn login_rejects_removed_api_key_argument() -> Result<()> {
 fn tui_add_dir_rejection_precedes_state_database_initialization() -> Result<()> {
     let codex_home = TempDir::new()?;
     let additional_dir = TempDir::new()?;
-    let state_db_path = codex_home.path().join("state_5.sqlite");
+    let state_db_path = codex_state::state_db_path(codex_home.path());
     let mut cmd = codex_command(codex_home.path())?;
 
     cmd.env_remove("CODEX_EXEC_SERVER_URL")
@@ -130,7 +130,7 @@ fn tui_login_restriction_precedes_state_database_initialization() -> Result<()> 
         codex_home.path().join("auth.json"),
         serde_json::to_vec(&json!({"OPENAI_API_KEY": "sk-test"}))?,
     )?;
-    let state_db_path = codex_home.path().join("state_5.sqlite");
+    let state_db_path = codex_state::state_db_path(codex_home.path());
     let mut cmd = codex_command(codex_home.path())?;
 
     cmd.env_remove("CODEX_EXEC_SERVER_URL")
@@ -159,6 +159,7 @@ fn login_with_access_token_rejects_invalid_jwt() -> Result<()> {
         .failure()
         .stderr(contains("Error logging in with access token"));
 
+    assert!(!codex_home.path().join("auth.json").exists());
     Ok(())
 }
 

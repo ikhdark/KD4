@@ -96,6 +96,24 @@ async fn mcp_resource_read_returns_resource_contents() -> Result<()> {
     )
     .await?;
 
+    let read_request_id = mcp
+        .send_mcp_resource_read_request(McpResourceReadParams {
+            thread_id: None,
+            server: "codex_apps".to_string(),
+            uri: TEST_RESOURCE_URI.to_string(),
+        })
+        .await?;
+    let read_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_request_id)),
+    )
+    .await??;
+
+    assert_eq!(
+        to_response::<McpResourceReadResponse>(read_response)?,
+        expected_resource_read_response()
+    );
+
     let thread_start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
@@ -534,62 +552,6 @@ enabled = false
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_resource_read_returns_resource_contents_without_thread() -> Result<()> {
-    let (apps_server_url, _apps_server_calls, apps_server_handle) =
-        start_resource_apps_mcp_server().await?;
-
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join("config.toml"),
-        format!(
-            r#"
-chatgpt_base_url = "{apps_server_url}"
-mcp_oauth_credentials_store = "file"
-
-[features]
-apps = true
-"#
-        ),
-    )?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .chatgpt_user_id("user-123")
-            .chatgpt_account_id("account-123"),
-        AuthCredentialsStoreMode::File,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let read_request_id = mcp
-        .send_mcp_resource_read_request(McpResourceReadParams {
-            thread_id: None,
-            server: "codex_apps".to_string(),
-            uri: TEST_RESOURCE_URI.to_string(),
-        })
-        .await?;
-    let read_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_request_id)),
-    )
-    .await??;
-
-    assert_eq!(
-        to_response::<McpResourceReadResponse>(read_response)?,
-        expected_resource_read_response()
-    );
-
-    apps_server_handle.abort();
-    let _ = apps_server_handle.await;
-    Ok(())
-}
 
 #[tokio::test]
 async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
@@ -647,6 +609,7 @@ async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
         Ok(result) => anyhow::bail!("expected thread-not-found error, got response: {result:?}"),
         Err(error) => error,
     };
+    assert_eq!(error.code, -32600);
     assert!(
         error.message.contains("thread not found"),
         "expected thread-not-found error, got: {error:?}"

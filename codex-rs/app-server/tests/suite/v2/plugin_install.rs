@@ -76,7 +76,12 @@ const TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS: &str =
 #[tokio::test]
 async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_plugins_enabled_config_with_base_url(codex_home.path(), "https://example.invalid/backend-api/")?;
+    let server = MockServer::start().await;
+    write_plugins_enabled_config_with_base_url(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+    )?;
+    let config_before = std::fs::read(codex_home.path().join("config.toml"))?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -153,6 +158,12 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
             );
         }
     }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(codex_home.path().join("config.toml"))?,
+        config_before
+    );
+    assert!(!codex_home.path().join("plugins/cache").exists());
     Ok(())
 }
 
@@ -281,7 +292,10 @@ async fn plugin_install_writes_remote_plugin_to_cloud_and_cache() -> Result<()> 
     let installed_app_manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(installed_path.join(".app.json"))?)?;
     assert_eq!(installed_app_manifest, remote_app_manifest);
-    assert!(installed_path.join("skills/plan-work/SKILL.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(installed_path.join("skills/plan-work/SKILL.md"))?,
+        "# Plan Work\n\nTrack work in Linear.\n"
+    );
     assert!(
         !codex_home
             .path()
@@ -434,6 +448,13 @@ async fn plugin_install_rejects_invalid_remote_releases_before_install() -> Resu
         .await?;
         assert!(!remote_cache_root.exists(), "{remote_plugin_id}");
     }
+    wait_for_remote_plugin_request_count(
+        &server,
+        "GET",
+        "/bundles/linear.tar.gz",
+        /*expected_count*/ 0,
+    )
+    .await?;
     Ok(())
 }
 

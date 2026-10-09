@@ -172,137 +172,47 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn next_reasoning_effort_raises_from_default_anchor() {
-        let choices = vec![
-            ReasoningEffortConfig::Low,
-            ReasoningEffortConfig::Medium,
-            ReasoningEffortConfig::High,
-            ReasoningEffortConfig::XHigh,
-        ];
+    fn next_reasoning_effort_follows_advertised_order_and_stops_at_bounds() {
+        use ReasoningEffortConfig::{High, Low, Medium, XHigh};
+        use ReasoningShortcutDirection::{Lower, Raise};
 
-        assert_eq!(
-            next_reasoning_effort(
-                &choices,
-                Some(ReasoningEffortConfig::Medium),
-                ReasoningShortcutDirection::Raise,
-            ),
-            Some(ReasoningEffortConfig::High)
-        );
-    }
-
-    #[test]
-    fn next_reasoning_effort_lowers_from_default_anchor() {
-        let choices = vec![
-            ReasoningEffortConfig::Low,
-            ReasoningEffortConfig::Medium,
-            ReasoningEffortConfig::High,
-        ];
-
-        assert_eq!(
-            next_reasoning_effort(
-                &choices,
-                Some(ReasoningEffortConfig::Medium),
-                ReasoningShortcutDirection::Lower,
-            ),
-            Some(ReasoningEffortConfig::Low)
-        );
-    }
-
-    #[test]
-    fn next_reasoning_effort_does_not_infer_position_for_unsupported_current() {
-        let choices = vec![ReasoningEffortConfig::Low, ReasoningEffortConfig::High];
-
-        assert_eq!(
-            (
-                next_reasoning_effort(
-                    &choices,
-                    Some(ReasoningEffortConfig::Medium),
-                    ReasoningShortcutDirection::Raise,
-                ),
-                next_reasoning_effort(
-                    &choices,
-                    Some(ReasoningEffortConfig::Medium),
-                    ReasoningShortcutDirection::Lower,
-                ),
-            ),
-            (None, None)
-        );
-    }
-
-    #[test]
-    fn next_reasoning_effort_uses_advertised_order_for_custom_levels() {
-        let custom_effort = ReasoningEffortConfig::Custom("future".to_string());
-        let choices = vec![
-            ReasoningEffortConfig::High,
-            ReasoningEffortConfig::Low,
-            custom_effort.clone(),
-        ];
-
-        assert_eq!(
-            (
-                next_reasoning_effort(
-                    &choices,
-                    Some(ReasoningEffortConfig::High),
-                    ReasoningShortcutDirection::Raise,
-                ),
-                next_reasoning_effort(
-                    &choices,
-                    Some(custom_effort),
-                    ReasoningShortcutDirection::Lower,
-                ),
-            ),
-            (
-                Some(ReasoningEffortConfig::Low),
-                Some(ReasoningEffortConfig::Low),
-            )
-        );
-    }
-
-    #[test]
-    fn next_reasoning_effort_clamps_at_bounds() {
-        let choices = vec![
-            ReasoningEffortConfig::Low,
-            ReasoningEffortConfig::Medium,
-            ReasoningEffortConfig::High,
-        ];
-
-        assert_eq!(
-            next_reasoning_effort(
-                &choices,
-                Some(ReasoningEffortConfig::Low),
-                ReasoningShortcutDirection::Lower,
-            ),
-            None
-        );
-        assert_eq!(
-            next_reasoning_effort(
-                &choices,
-                Some(ReasoningEffortConfig::High),
-                ReasoningShortcutDirection::Raise,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn next_reasoning_effort_single_option_is_noop() {
-        let choices = vec![ReasoningEffortConfig::High];
-
-        assert_eq!(
-            next_reasoning_effort(
-                &choices,
-                Some(ReasoningEffortConfig::High),
-                ReasoningShortcutDirection::Raise,
-            ),
-            None
-        );
-        assert_eq!(
-            next_reasoning_effort(
-                &choices,
-                Some(ReasoningEffortConfig::High),
-                ReasoningShortcutDirection::Lower,
-            ),
-            None
-        );
+        for choices in [
+            vec![Low, Medium, High, XHigh],
+            vec![Low, Medium, High],
+            vec![Low, High],
+            vec![High, Low, ReasoningEffortConfig::Custom("future".to_string())],
+            vec![High],
+            vec![],
+        ] {
+            for (index, current) in choices.iter().enumerate() {
+                for (direction, expected) in [
+                    (Lower, index.checked_sub(1).and_then(|i| choices.get(i))),
+                    (Raise, choices.get(index + 1)),
+                ] {
+                    assert_eq!(
+                        next_reasoning_effort(&choices, Some(current.clone()), direction),
+                        expected.cloned(),
+                        "{choices:?}: {current:?} {direction:?}"
+                    );
+                }
+            }
+            for direction in [Lower, Raise] {
+                assert_eq!(next_reasoning_effort(&choices, None, direction), None);
+                assert_eq!(
+                    next_reasoning_effort(
+                        &choices,
+                        Some(ReasoningEffortConfig::Custom("unsupported".to_string())),
+                        direction,
+                    ),
+                    None
+                );
+            }
+        }
+        for direction in [Lower, Raise] {
+            assert_eq!(
+                next_reasoning_effort(&[Low, High], Some(Medium), direction),
+                None
+            );
+        }
     }
 }

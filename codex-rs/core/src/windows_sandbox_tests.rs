@@ -140,47 +140,26 @@ fn setup_failure_metrics_collapse_dynamic_paths_and_keep_diagnostics() {
 }
 
 #[test]
-fn elevated_flag_works_by_itself() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::WindowsSandboxElevated);
-
-    assert_eq!(
-        WindowsSandboxLevel::from_features(&features),
-        WindowsSandboxLevel::Elevated
-    );
-}
-
-#[test]
-fn restricted_token_flag_works_by_itself() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::WindowsSandbox);
-
-    assert_eq!(
-        WindowsSandboxLevel::from_features(&features),
-        WindowsSandboxLevel::RestrictedToken
-    );
-}
-
-#[test]
-fn no_flags_means_no_sandbox() {
-    let features = Features::with_defaults();
-
-    assert_eq!(
-        WindowsSandboxLevel::from_features(&features),
-        WindowsSandboxLevel::Disabled
-    );
-}
-
-#[test]
-fn elevated_wins_when_both_flags_are_enabled() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::WindowsSandbox);
-    features.enable(Feature::WindowsSandboxElevated);
-
-    assert_eq!(
-        WindowsSandboxLevel::from_features(&features),
-        WindowsSandboxLevel::Elevated
-    );
+fn sandbox_level_respects_feature_flags_and_elevated_precedence() {
+    for (restricted, elevated, expected) in [
+        (false, false, WindowsSandboxLevel::Disabled),
+        (true, false, WindowsSandboxLevel::RestrictedToken),
+        (false, true, WindowsSandboxLevel::Elevated),
+        (true, true, WindowsSandboxLevel::Elevated),
+    ] {
+        let mut features = Features::with_defaults();
+        if restricted {
+            features.enable(Feature::WindowsSandbox);
+        }
+        if elevated {
+            features.enable(Feature::WindowsSandboxElevated);
+        }
+        assert_eq!(
+            WindowsSandboxLevel::from_features(&features),
+            expected,
+            "restricted={restricted}, elevated={elevated}"
+        );
+    }
 }
 
 #[test]

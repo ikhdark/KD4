@@ -16,14 +16,13 @@ use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use tracing_subscriber::layer::SubscriberExt;
 
-static TRACE_CONTEXT_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+use crate::harness::TRACE_CONTEXT_CONFIG_LOCK;
 
 struct CapturedRequest {
     path: String,
@@ -277,6 +276,9 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
 #[test]
 fn otlp_http_exporter_sends_logs_to_collector()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let _trace_context_config_guard = TRACE_CONTEXT_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let collector = Collector::spawn();
     let addr = collector.addr;
 

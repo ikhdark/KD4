@@ -333,118 +333,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_send_event_as_notification() -> Result<()> {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
-        let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
 
-        let thread_id = ThreadId::new();
-        let rollout_file = NamedTempFile::new()?;
-        let event = Event {
-            id: "1".to_string(),
-            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
-                session_id: codex_protocol::SessionId::new(),
-                thread_id,
-                forked_from_id: None,
-                parent_thread_id: None,
-                thread_source: None,
-                thread_name: None,
-                model: "gpt-4o".to_string(),
-                model_provider_id: "test-provider".to_string(),
-                service_tier: None,
-                approval_policy: AskForApproval::Never,
-                permission_profile: PermissionProfile::read_only(),
-                active_permission_profile: None,
-                cwd: test_path_buf("/home/user/project").abs(),
-                reasoning_effort: Some(ReasoningEffort::default()),
-                initial_messages: None,
-                network_proxy: None,
-                rollout_path: Some(rollout_file.path().to_path_buf()),
-            }),
-        };
-
-        outgoing_message_sender
-            .send_event_as_notification(&event, /*meta*/ None)
-            .await;
-
-        let result = outgoing_rx.recv().await.unwrap();
-        let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {
-            panic!("expected Notification for first message");
-        };
-        assert_eq!(method, "codex/event");
-
-        let Ok(expected_params) = serde_json::to_value(&event) else {
-            panic!("Event must serialize");
-        };
-        assert_eq!(params, Some(expected_params));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_send_event_as_notification_with_meta() -> Result<()> {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
-        let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
-
-        let thread_id = ThreadId::new();
-        let rollout_file = NamedTempFile::new()?;
-        let session_configured_event = SessionConfiguredEvent {
-            session_id: codex_protocol::SessionId::new(),
-            thread_id,
-            forked_from_id: None,
-            parent_thread_id: None,
-            thread_source: None,
-            thread_name: None,
-            model: "gpt-4o".to_string(),
-            model_provider_id: "test-provider".to_string(),
-            service_tier: None,
-            approval_policy: AskForApproval::Never,
-            permission_profile: PermissionProfile::read_only(),
-            active_permission_profile: None,
-            cwd: test_path_buf("/home/user/project").abs(),
-            reasoning_effort: Some(ReasoningEffort::default()),
-            initial_messages: None,
-            network_proxy: None,
-            rollout_path: Some(rollout_file.path().to_path_buf()),
-        };
-        let event = Event {
-            id: "1".to_string(),
-            msg: EventMsg::SessionConfigured(session_configured_event.clone()),
-        };
-        let meta = OutgoingNotificationMeta {
-            request_id: Some(RequestId::String("123".into())),
-            thread_id: None,
-        };
-
-        outgoing_message_sender
-            .send_event_as_notification(&event, Some(meta))
-            .await;
-
-        let result = outgoing_rx.recv().await.unwrap();
-        let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {
-            panic!("expected Notification for first message");
-        };
-        assert_eq!(method, "codex/event");
-        let expected_params = json!({
-            "_meta": {
-                "requestId": "123",
-            },
-            "id": "1",
-            "msg": {
-                "type": "session_configured",
-                "session_id": session_configured_event.session_id,
-                "thread_id": session_configured_event.thread_id,
-                "model": "gpt-4o",
-                "model_provider_id": "test-provider",
-                "approval_policy": "never",
-                "permission_profile": session_configured_event.permission_profile,
-                "cwd": test_path_buf("/home/user/project"),
-                "reasoning_effort": session_configured_event.reasoning_effort,
-                "rollout_path": rollout_file.path().to_path_buf(),
-            }
-        });
-        assert_eq!(params.unwrap(), expected_params);
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_send_event_as_notification_with_meta_and_thread_id() -> Result<()> {
@@ -476,13 +365,26 @@ mod tests {
             id: "1".to_string(),
             msg: EventMsg::SessionConfigured(session_configured_event.clone()),
         };
-        let meta = OutgoingNotificationMeta {
-            request_id: Some(RequestId::String("123".into())),
-            thread_id: Some(thread_id),
-        };
+        for (meta, expected_meta) in [
+            (None, None),
+            (
+                Some(OutgoingNotificationMeta {
+                    request_id: Some(RequestId::String("123".into())),
+                    thread_id: None,
+                }),
+                Some(json!({"requestId": "123"})),
+            ),
+            (
+                Some(OutgoingNotificationMeta {
+                    request_id: Some(RequestId::String("123".into())),
+                    thread_id: Some(thread_id),
+                }),
+                Some(json!({"requestId": "123", "threadId": thread_id.to_string()})),
+            ),
+        ] {
 
         outgoing_message_sender
-            .send_event_as_notification(&event, Some(meta))
+            .send_event_as_notification(&event, meta)
             .await;
 
         let result = outgoing_rx.recv().await.unwrap();
@@ -490,11 +392,7 @@ mod tests {
             panic!("expected Notification for first message");
         };
         assert_eq!(method, "codex/event");
-        let expected_params = json!({
-            "_meta": {
-                "requestId": "123",
-                "threadId": thread_id.to_string(),
-            },
+        let mut expected_params = json!({
             "id": "1",
             "msg": {
                 "type": "session_configured",
@@ -509,7 +407,11 @@ mod tests {
                 "rollout_path": rollout_file.path().to_path_buf(),
             }
         });
+        if let Some(expected_meta) = expected_meta {
+            expected_params["_meta"] = expected_meta;
+        }
         assert_eq!(params.unwrap(), expected_params);
+        }
         Ok(())
     }
 

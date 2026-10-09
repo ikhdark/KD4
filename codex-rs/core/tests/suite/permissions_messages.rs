@@ -28,7 +28,6 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
-use std::collections::HashSet;
 use tempfile::TempDir;
 
 fn permissions_texts(request: &ResponsesRequest) -> Vec<String> {
@@ -112,7 +111,7 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(
+    let req1 = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -136,6 +135,9 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
         });
     let test = builder.build(&server).await?;
     submit_text_turn(&test, "first").await?;
+    let initial_permissions = permissions_texts(&req1.single_request());
+    assert_eq!(initial_permissions.len(), 1);
+    assert!(initial_permissions[0].contains("model A approvals"));
 
     core_test_support::submit_thread_settings(
         &test.codex,
@@ -158,40 +160,6 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn permissions_message_sent_once_on_start() -> Result<()> {
-    require_network!();
-
-    let server = start_mock_server().await;
-    let req = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-
-    let mut builder = test_codex().with_config(move |config| {
-        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-    });
-    let test = builder.build(&server).await?;
-
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    assert_eq!(permissions_texts(&req.single_request()).len(), 1);
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permissions_message_added_on_override_change() -> Result<()> {
@@ -463,6 +431,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    initial.codex.flush_rollout().await?;
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed
         .codex
@@ -482,8 +451,6 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     let permissions = permissions_texts(&req3.single_request());
     assert_eq!(permissions.len(), 1);
     assert!(permissions[0].contains("never"));
-    let unique = permissions.into_iter().collect::<HashSet<String>>();
-    assert_eq!(unique.len(), 1);
 
     Ok(())
 }
@@ -566,6 +533,8 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
 
     let permissions_base = permissions_texts(&req2.single_request());
     assert_eq!(permissions_base.len(), 1);
+    assert!(permissions_base[0].contains("never"));
+    initial.codex.flush_rollout().await?;
 
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -681,6 +650,8 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
 
     let permissions = permissions_texts(&req.single_request());
     let normalize_line_endings = |s: &str| s.replace("\r\n", "\n");
+    assert_eq!(permissions.len(), 1);
+    assert!(permissions[0].contains(writable_root.as_path().to_string_lossy().as_ref()));
     let exec_policy = load_exec_policy(&test.config.config_layer_stack).await?;
     let permission_profile = test.config.permissions.effective_permission_profile();
     let expected = PermissionsInstructions::from_permission_profile(

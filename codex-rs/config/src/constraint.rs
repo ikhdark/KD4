@@ -291,54 +291,32 @@ mod tests {
     }
 
     #[test]
-    fn constrained_new_rejects_invalid_initial_value() {
-        let result = Constrained::new(/*initial_value*/ 0, |value| {
+    fn constrained_validation_preserves_values_on_probe_and_rejection() {
+        let positive = |value: &i32| {
             if *value > 0 {
                 Ok(())
             } else {
                 Err(invalid_value(value.to_string(), "positive values"))
             }
-        });
-
-        assert_eq!(result, Err(invalid_value("0", "positive values")));
-    }
-
-    #[test]
-    fn constrained_set_rejects_invalid_value_and_leaves_previous() {
-        let mut constrained = Constrained::new(/*initial_value*/ 1, |value| {
-            if *value > 0 {
-                Ok(())
-            } else {
-                Err(invalid_value(value.to_string(), "positive values"))
-            }
-        })
-        .expect("initial value should be accepted");
-
-        let err = constrained
-            .set(/*value*/ -5)
-            .expect_err("negative values should be rejected");
-        assert_eq!(err, invalid_value("-5", "positive values"));
+        };
+        assert_eq!(
+            Constrained::new(0, positive),
+            Err(invalid_value("0", "positive values"))
+        );
+        let mut constrained = Constrained::new(1, positive).unwrap();
+        assert_eq!(constrained.can_set(&2), Ok(()));
+        assert_eq!(constrained.can_set(&-1), Err(invalid_value("-1", "positive values")));
         assert_eq!(constrained.value(), 1);
-    }
-
-    #[test]
-    fn constrained_can_set_allows_probe_without_setting() {
-        let constrained = Constrained::new(/*initial_value*/ 1, |value| {
-            if *value > 0 {
-                Ok(())
-            } else {
-                Err(invalid_value(value.to_string(), "positive values"))
-            }
-        })
-        .expect("initial value should be accepted");
-
-        constrained
-            .can_set(&2)
-            .expect("can_set should accept positive value");
-        let err = constrained
-            .can_set(&-1)
-            .expect_err("can_set should reject negative value");
-        assert_eq!(err, invalid_value("-1", "positive values"));
+        assert_eq!(constrained.set(-5), Err(invalid_value("-5", "positive values")));
         assert_eq!(constrained.value(), 1);
+        constrained.set(2).unwrap();
+        assert_eq!(constrained.value(), 2);
+
+        // A rejected validator must not replace the working constraint.
+        assert!(constrained.add_validator(|_| Err(ConstraintError::empty_field("blocked"))).is_err());
+        constrained.set(3).unwrap();
+        assert_eq!(constrained.value(), 3);
+        assert_eq!(constrained.set(-1), Err(invalid_value("-1", "positive values")));
+        assert_eq!(constrained.value(), 3);
     }
 }

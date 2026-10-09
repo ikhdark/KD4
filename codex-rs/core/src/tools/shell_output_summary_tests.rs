@@ -1012,25 +1012,6 @@ fn selected_errors_do_not_spend_the_final_status_quota() {
 }
 
 #[test]
-fn large_success_output_keeps_head_tail_and_warning_lines() {
-    let mut lines = Vec::new();
-    for index in 0..700 {
-        lines.push(format!("line {index}"));
-    }
-    lines[200] = "warning: useful warning".to_string();
-    let output = lines.join("\n");
-
-    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, None)).unwrap();
-
-    assert!(summary.contains("Shell output summary:"));
-    assert!(summary.contains("line 0"));
-    assert!(summary.contains("useful warning"));
-    assert!(summary.contains("line 699"));
-    assert!(summary.len() <= SUMMARY_MAX_BYTES + "[summary capped]".len() + 1);
-    assert!(summary.lines().count() <= SUMMARY_MAX_LINES + 1);
-}
-
-#[test]
 fn large_success_output_preserves_source_order() {
     let mut lines = (0..700)
         .map(|index| format!("ordinary line {index}"))
@@ -1046,6 +1027,9 @@ fn large_success_output_preserves_source_order() {
     let tail = summary.find("UNIQUE_TAIL").unwrap();
 
     assert!(head < middle && middle < tail);
+    assert!(summary.contains("Shell output summary:"));
+    assert!(summary.len() <= SUMMARY_MAX_BYTES);
+    assert!(summary.lines().count() <= SUMMARY_MAX_LINES);
 }
 
 #[test]
@@ -1553,7 +1537,9 @@ fn validation_summary_keeps_typescript_and_npm_errors_outside_tail() {
 fn summary_declines_output_that_would_grow() {
     let output = "\n".repeat(601);
     assert_eq!(
-        summarize_shell_output_for_model(&output, 0, false, options(None, None)),
+        // Failure makes this eligible for summarization rather than taking the
+        // successful-diagnostic-free bypass before the size comparison.
+        summarize_shell_output_for_model(&output, 1, false, options(None, None)),
         None
     );
 }

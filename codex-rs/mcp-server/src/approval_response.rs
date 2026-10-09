@@ -48,120 +48,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parses_spec_accept_response_without_content() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "action": "accept"
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Approved);
+    fn approval_response_obeys_action_content_and_legacy_precedence() {
+        for (value, expected) in [
+            (json!({"action": "accept"}), ReviewDecision::Approved),
+            (json!({"action": "accept", "content": {}}), ReviewDecision::Approved),
+            (json!({"action": "accept", "content": {"decision": "denied"}}), ReviewDecision::Denied),
+            (json!({"action": "decline"}), ReviewDecision::Denied),
+            (json!({"action": "cancel"}), ReviewDecision::Denied),
+            (json!({"decision": "approved_for_session"}), ReviewDecision::ApprovedForSession),
+            (json!({}), ReviewDecision::Denied),
+            (json!({"action": "decline", "decision": "approved"}), ReviewDecision::Denied),
+            (json!({"action": "accept", "content": {"decision": "denied"}, "decision": "approved"}), ReviewDecision::Denied),
+            (json!({"action": "accept", "decision": "approved_for_session"}), ReviewDecision::ApprovedForSession),
+            (json!({"action": "cancel", "content": {"decision": "approved"}, "decision": "approved"}), ReviewDecision::Denied),
+            (json!({"content": {"decision": "approved"}}), ReviewDecision::Denied),
+        ] {
+            assert_eq!(review_decision_from_elicitation_response(value.clone()).unwrap(), expected, "{value}");
+        }
     }
 
     #[test]
-    fn parses_spec_accept_response_with_empty_content() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "action": "accept",
-            "content": {}
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Approved);
-    }
-
-    #[test]
-    fn parses_spec_accept_response_with_content_decision() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "action": "accept",
-            "content": {
-                "decision": "denied"
-            }
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Denied);
-    }
-
-    #[test]
-    fn maps_spec_decline_response_to_denied() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "action": "decline"
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Denied);
-    }
-
-    #[test]
-    fn maps_spec_cancel_response_to_denied() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "action": "cancel"
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Denied);
-    }
-
-    #[test]
-    fn preserves_legacy_decision_response() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "decision": "approved_for_session"
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::ApprovedForSession);
-    }
-
-    #[test]
-    fn missing_action_and_decision_defaults_to_denied() {
-        let decision =
-            review_decision_from_elicitation_response(json!({})).expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Denied);
-    }
-
-    #[test]
-    fn decline_overrides_conflicting_legacy_approval() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "action": "decline",
-            "decision": "approved"
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Denied);
-    }
-
-    #[test]
-    fn accepted_content_decision_overrides_conflicting_legacy_approval() {
-        let decision = review_decision_from_elicitation_response(json!({
-            "action": "accept",
-            "content": {
-                "decision": "denied"
-            },
-            "decision": "approved"
-        }))
-        .expect("parse response");
-
-        assert_eq!(decision, ReviewDecision::Denied);
-    }
-
-    #[test]
-    fn invalid_action_is_rejected() {
-        let result = review_decision_from_elicitation_response(json!({
-            "action": "approve"
-        }));
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn invalid_content_decision_is_rejected() {
-        let result = review_decision_from_elicitation_response(json!({
-            "action": "accept",
-            "content": {
-                "decision": "yes"
-            }
-        }));
-
-        assert!(result.is_err());
+    fn malformed_approval_responses_are_rejected() {
+        for (value, expected_error) in [
+            (json!({"action": "approve"}), "unknown variant `approve`"),
+            (json!({"action": "accept", "content": {"decision": "yes"}}), "unknown variant `yes`"),
+            (json!({"action": "accept", "content": []}), "invalid type"),
+        ] {
+            let error = review_decision_from_elicitation_response(value.clone()).unwrap_err();
+            assert!(error.is_data(), "{value}: {error}");
+            assert!(error.to_string().contains(expected_error), "{value}: {error}");
+        }
     }
 }

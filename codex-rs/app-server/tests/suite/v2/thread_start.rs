@@ -1072,7 +1072,7 @@ model_reasoning_effort = "high"
 }
 
 #[tokio::test]
-async fn thread_start_drops_unsupported_service_tier_id() -> Result<()> {
+async fn thread_start_normalizes_service_tiers_and_accepts_metrics_service_name() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
@@ -1084,87 +1084,38 @@ async fn thread_start_drops_unsupported_service_tier_id() -> Result<()> {
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let service_tier_id = "experimental-tier-id".to_string();
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            service_tier: Some(Some(service_tier_id.clone())),
-            ..Default::default()
-        })
-        .await?;
+    for (requested_tier, service_name, expected_tier) in [
+        (Some("experimental-tier-id"), None, None),
+        (
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+            None,
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+        ),
+        (None, Some("my_app_server_client"), None),
+    ] {
+        let req_id = mcp
+            .send_thread_start_request_with_auto_env(ThreadStartParams {
+                service_tier: requested_tier.map(|tier| Some(tier.to_string())),
+                service_name: service_name.map(str::to_string),
+                ..Default::default()
+            })
+            .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { service_tier, .. } = to_response::<ThreadStartResponse>(resp)?;
+        let resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
+        )
+        .await??;
+        let ThreadStartResponse {
+            thread,
+            service_tier,
+            ..
+        } = to_response::<ThreadStartResponse>(resp)?;
 
-    // Unsupported catalog ids are dropped at session config time instead of echoed back.
-    assert_eq!(service_tier, None);
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_start_accepts_default_service_tier() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            service_tier: Some(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
-            ..Default::default()
-        })
-        .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { service_tier, .. } = to_response::<ThreadStartResponse>(resp)?;
-
-    assert_eq!(
-        service_tier,
-        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_start_accepts_metrics_service_name() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            service_name: Some("my_app_server_client".to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
-    assert!(!thread.id.is_empty(), "thread id should not be empty");
+        // Unsupported catalog ids are dropped rather than echoed back.
+        assert_eq!(service_tier.as_deref(), expected_tier);
+        assert!(!thread.id.is_empty(), "thread id should not be empty");
+    }
 
     Ok(())
 }

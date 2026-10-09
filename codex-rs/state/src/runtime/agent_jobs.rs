@@ -1082,6 +1082,25 @@ mod tests {
         let (job_id, item_id, thread_id) = create_running_single_item_job(runtime.as_ref()).await?;
         let changes = runtime.subscribe_agent_job_changes();
 
+        let before = runtime
+            .get_agent_job_item(job_id.as_str(), item_id.as_str())
+            .await?
+            .expect("running item");
+        assert_eq!(before.status, AgentJobItemStatus::Running);
+        assert_eq!(before.assigned_thread_id.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(
+            runtime.get_agent_job(&job_id).await?.expect("running job").status,
+            AgentJobStatus::Running,
+        );
+        assert!(!runtime
+            .report_agent_job_item_result(&job_id, &item_id, "wrong-thread", &json!({"wrong": true}))
+            .await?);
+        assert_eq!(
+            runtime.get_agent_job_item(&job_id, &item_id).await?,
+            Some(before),
+        );
+        assert!(!changes.has_changed()?);
+
         let accepted = runtime
             .report_agent_job_item_result(
                 job_id.as_str(),

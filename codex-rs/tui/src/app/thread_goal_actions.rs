@@ -211,7 +211,9 @@ impl App {
                 // A transport or internal error may arrive after the goal committed. Keep
                 // its attachments unless the server explicitly rejected the request.
                 if goal_set_was_rejected(&err) {
-                    cleanup_materialized_goal_files(app_server, output_dir).await;
+                    if let Some(output_dir) = output_dir.as_ref() {
+                        goal_files::cleanup_uncommitted_goal_files(app_server, output_dir).await;
+                    }
                 } else if let Some(output_dir) = output_dir {
                     tracing::warn!(%output_dir, "retaining goal files after an uncertain goal save");
                 }
@@ -342,17 +344,6 @@ fn goal_set_was_rejected(error: &color_eyre::Report) -> bool {
         .is_some_and(|error| matches!(error.code, -32602..=-32600))
 }
 
-async fn cleanup_materialized_goal_files(
-    app_server: &mut AppServerSession,
-    output_dir: Option<goal_files::GoalFilePath>,
-) {
-    if let Some(output_dir) = output_dir
-        && let Err(err) = app_server.fs_remove_path(&output_dir).await
-    {
-        tracing::warn!("failed to clean up materialized goal files at {output_dir}: {err}");
-    }
-}
-
 fn thread_goal_error_message(action: &str, err: &color_eyre::Report) -> String {
     if is_ephemeral_thread_goal_error(err) {
         EPHEMERAL_THREAD_GOAL_ERROR_MESSAGE.to_string()
@@ -463,22 +454,20 @@ mod tests {
     }
 
     #[test]
-    fn completed_goal_does_not_require_replace_confirmation() {
-        assert!(!should_confirm_before_replacing_goal(&test_goal(
-            ThreadGoalStatus::Complete
-        )));
-    }
-
-    #[test]
-    fn unfinished_goals_require_replace_confirmation() {
-        for status in [
-            ThreadGoalStatus::Active,
-            ThreadGoalStatus::Paused,
-            ThreadGoalStatus::Blocked,
-            ThreadGoalStatus::UsageLimited,
-            ThreadGoalStatus::BudgetLimited,
+    fn only_unfinished_goals_require_replace_confirmation() {
+        for (status, expected) in [
+            (ThreadGoalStatus::Complete, false),
+            (ThreadGoalStatus::Active, true),
+            (ThreadGoalStatus::Paused, true),
+            (ThreadGoalStatus::Blocked, true),
+            (ThreadGoalStatus::UsageLimited, true),
+            (ThreadGoalStatus::BudgetLimited, true),
         ] {
-            assert!(should_confirm_before_replacing_goal(&test_goal(status)));
+            assert_eq!(
+                should_confirm_before_replacing_goal(&test_goal(status)),
+                expected,
+                "goal status: {status:?}"
+            );
         }
     }
 

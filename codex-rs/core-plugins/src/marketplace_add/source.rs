@@ -273,21 +273,86 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn github_shorthand_parses_ref_suffix() {
-        assert_eq!(
-            parse_marketplace_source("owner/repo@main", /*explicit_ref*/ None).unwrap(),
-            MarketplaceSource::Git {
-                url: "https://github.com/owner/repo.git".to_string(),
-                ref_name: Some("main".to_string()),
-            }
-        );
-        assert_eq!(
-            parse_marketplace_source("owner/repo.git", /*explicit_ref*/ None).unwrap(),
-            MarketplaceSource::Git {
-                url: "https://github.com/owner/repo.git".to_string(),
-                ref_name: None,
-            }
-        );
+    fn git_sources_normalize_urls_and_preserve_ref_precedence() {
+        for (source, explicit_ref, expected_url, expected_ref) in [
+            (
+                "owner/repo@main",
+                None,
+                "https://github.com/owner/repo.git",
+                Some("main"),
+            ),
+            (
+                "owner/repo.git",
+                None,
+                "https://github.com/owner/repo.git",
+                None,
+            ),
+            (
+                "owner/repo",
+                None,
+                "https://github.com/owner/repo.git",
+                None,
+            ),
+            (
+                "https://github.com/owner/repo.git",
+                None,
+                "https://github.com/owner/repo.git",
+                None,
+            ),
+            (
+                "https://github.com/owner/repo/",
+                None,
+                "https://github.com/owner/repo.git",
+                None,
+            ),
+            (
+                "https://example.com/team/repo.git#v1",
+                None,
+                "https://example.com/team/repo.git",
+                Some("v1"),
+            ),
+            (
+                "owner/repo@main",
+                Some("release"),
+                "https://github.com/owner/repo.git",
+                Some("release"),
+            ),
+            (
+                "https://gitlab.com/owner/repo",
+                None,
+                "https://gitlab.com/owner/repo",
+                None,
+            ),
+            (
+                "ssh://git@github.com/owner/repo.git#main",
+                None,
+                "ssh://git@github.com/owner/repo.git",
+                Some("main"),
+            ),
+            (
+                "git@github.com:owner/repo.git#main",
+                None,
+                "git@github.com:owner/repo.git",
+                Some("main"),
+            ),
+        ] {
+            let parsed = parse_marketplace_source(source, explicit_ref.map(str::to_string)).unwrap();
+            assert_eq!(
+                parsed,
+                MarketplaceSource::Git {
+                    url: expected_url.to_string(),
+                    ref_name: expected_ref.map(str::to_string),
+                },
+                "{source}"
+            );
+            assert_eq!(
+                parsed.display(),
+                match expected_ref {
+                    Some(reference) => format!("{expected_url}#{reference}"),
+                    None => expected_url.to_string(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -309,74 +374,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn git_url_parses_fragment_ref() {
-        assert_eq!(
-            parse_marketplace_source(
-                "https://example.com/team/repo.git#v1",
-                /*explicit_ref*/ None
-            )
-            .unwrap(),
-            MarketplaceSource::Git {
-                url: "https://example.com/team/repo.git".to_string(),
-                ref_name: Some("v1".to_string()),
-            }
-        );
-    }
 
-    #[test]
-    fn explicit_ref_overrides_source_ref() {
-        assert_eq!(
-            parse_marketplace_source("owner/repo@main", Some("release".to_string())).unwrap(),
-            MarketplaceSource::Git {
-                url: "https://github.com/owner/repo.git".to_string(),
-                ref_name: Some("release".to_string()),
-            }
-        );
-    }
 
-    #[test]
-    fn github_shorthand_and_git_url_normalize_to_same_source() {
-        let shorthand = parse_marketplace_source("owner/repo", /*explicit_ref*/ None).unwrap();
-        let git_url = parse_marketplace_source(
-            "https://github.com/owner/repo.git",
-            /*explicit_ref*/ None,
-        )
-        .unwrap();
 
-        assert_eq!(shorthand, git_url);
-        assert_eq!(
-            shorthand,
-            MarketplaceSource::Git {
-                url: "https://github.com/owner/repo.git".to_string(),
-                ref_name: None,
-            }
-        );
-    }
 
-    #[test]
-    fn github_url_with_trailing_slash_normalizes_without_extra_path_segment() {
-        assert_eq!(
-            parse_marketplace_source("https://github.com/owner/repo/", /*explicit_ref*/ None)
-                .unwrap(),
-            MarketplaceSource::Git {
-                url: "https://github.com/owner/repo.git".to_string(),
-                ref_name: None,
-            }
-        );
-    }
-
-    #[test]
-    fn non_github_https_source_parses_as_git_url() {
-        assert_eq!(
-            parse_marketplace_source("https://gitlab.com/owner/repo", /*explicit_ref*/ None)
-                .unwrap(),
-            MarketplaceSource::Git {
-                url: "https://gitlab.com/owner/repo".to_string(),
-                ref_name: None,
-            }
-        );
-    }
 
     #[test]
     fn file_url_source_is_rejected() {
@@ -455,18 +456,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ssh_url_parses_as_git_url() {
-        assert_eq!(
-            parse_marketplace_source(
-                "ssh://git@github.com/owner/repo.git#main",
-                /*explicit_ref*/ None,
-            )
-            .unwrap(),
-            MarketplaceSource::Git {
-                url: "ssh://git@github.com/owner/repo.git".to_string(),
-                ref_name: Some("main".to_string()),
-            }
-        );
-    }
 }

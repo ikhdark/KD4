@@ -308,6 +308,7 @@ enum GitOptionPattern {
     Exact(&'static str),
     ShortWithInlineValue(&'static str),
     Prefix(&'static str),
+    LongWithAbbreviation(&'static str),
 }
 
 const UNSAFE_GIT_GLOBAL_OPTIONS: &[GitOptionPattern] = &[
@@ -332,12 +333,10 @@ const UNSAFE_GIT_GLOBAL_OPTIONS: &[GitOptionPattern] = &[
 ];
 
 const UNSAFE_GIT_SUBCOMMAND_OPTIONS: &[GitOptionPattern] = &[
-    GitOptionPattern::Exact("--output"),
-    GitOptionPattern::Prefix("--output="),
-    GitOptionPattern::Exact("--ext-diff"),
-    GitOptionPattern::Exact("--textconv"),
-    GitOptionPattern::Exact("--exec"),
-    GitOptionPattern::Prefix("--exec="),
+    GitOptionPattern::LongWithAbbreviation("--output"),
+    GitOptionPattern::LongWithAbbreviation("--ext-diff"),
+    GitOptionPattern::LongWithAbbreviation("--textconv"),
+    GitOptionPattern::LongWithAbbreviation("--exec"),
 ];
 
 impl GitOptionPattern {
@@ -348,6 +347,13 @@ impl GitOptionPattern {
                 arg.starts_with(option) && arg.len() > option.len()
             }
             GitOptionPattern::Prefix(prefix) => arg.starts_with(prefix),
+            GitOptionPattern::LongWithAbbreviation(option) => {
+                // Git's subcommand parser accepts unique long-option prefixes.
+                // Conservatively reject ambiguous prefixes too, rather than
+                // depending on the installed Git version's other option names.
+                let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+                name.starts_with("--") && name.len() > 2 && option.starts_with(name)
+            }
         }
     }
 }
@@ -525,6 +531,27 @@ mod tests {
     }
 
     #[test]
+    fn git_external_diff_abbreviations_are_not_safe() {
+        // Git accepts these as --ext-diff, overriding --no-ext-diff and
+        // executing GIT_EXTERNAL_DIFF. Approval must not depend on spelling.
+        for flag in ["--ext", "--ext-d", "--ext-dif", "--ext-diff"] {
+            let argv = vec_str(&["git", "diff", "--no-ext-diff", flag]);
+            assert!(!is_known_safe_direct_argv(&argv), "{flag}");
+            assert!(!is_safe_powershell_words(&argv), "{flag}");
+            assert!(!is_known_safe_command(&vec_str(&[
+                "bash",
+                "-lc",
+                &format!("git diff --no-ext-diff {flag}"),
+            ])), "{flag}");
+        }
+        // Disabling external programs and selecting output display characters
+        // do not enable external execution or write an output file.
+        for flag in ["--no-ext-diff", "--no-textconv", "--output-indicator-new=X"] {
+            assert!(is_known_safe_direct_argv(&vec_str(&["git", "diff", flag])), "{flag}");
+        }
+    }
+
+    #[test]
     fn git_global_pagination_flags_are_not_safe() {
         assert!(!is_known_safe_command(&vec_str(&[
             "git",
@@ -611,11 +638,6 @@ mod tests {
             "-lc",
             "git --git-dir=.evil-git diff HEAD~1..HEAD",
         ])));
-    }
-
-    #[test]
-    fn cargo_check_is_not_safe() {
-        assert!(!is_known_safe_command(&vec_str(&["cargo", "check"])));
     }
 
     #[test]

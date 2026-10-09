@@ -610,7 +610,10 @@ mod tests {
 
         let output = String::from_utf8(actual).expect("UTF-8 terminal output");
         assert!(output.contains("\x1b]8;;https://example.com/long/path\x07"));
-        assert_eq!(line.line.spans[0].content, destination);
+        assert!(output.contains("\x1b]8;;\x07"));
+        let mut parser = vt100::Parser::new(2, 80, 0);
+        parser.process(output.as_bytes());
+        assert_eq!(parser.screen().contents(), destination);
     }
 
     #[test]
@@ -641,100 +644,34 @@ mod tests {
     }
 
     #[test]
-    fn vt100_blockquote_line_emits_green_fg() {
-        // Set up a small off-screen terminal
-        let width: u16 = 40;
-        let height: u16 = 10;
-        let backend = VT100Backend::new(width, height);
-        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
-        // Place viewport on the last line so history inserts scroll upward
-        let viewport = Rect::new(0, height - 1, width, 1);
-        term.set_viewport_area(viewport);
+    fn vt100_blockquote_preserves_green_on_short_and_wrapped_lines() {
+        for (width, height, text, minimum_rows) in [
+            (40, 10, "Hello world", 1),
+            (20, 8, "This is a long quoted line that should wrap", 2),
+        ] {
+            let backend = VT100Backend::new(width, height);
+            let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+            term.set_viewport_area(Rect::new(0, height - 1, width, 1));
+            let line = Line::from(vec!["> ".into(), text.into()]).style(Color::Green);
+            insert_history_lines(&mut term, vec![line]).expect("insert blockquote");
 
-        // Build a blockquote-like line: apply line-level green style and prefix "> "
-        let mut line: Line<'static> = Line::from(vec!["> ".into(), "Hello world".into()]);
-        line = line.style(Color::Green);
-        insert_history_lines(&mut term, vec![line])
-            .expect("Failed to insert history lines in test");
-
-        let mut saw_colored = false;
-        'outer: for row in 0..height {
-            for col in 0..width {
-                if let Some(cell) = term.backend().vt100().screen().cell(row, col)
-                    && cell.has_contents()
-                    && cell.fgcolor() != vt100::Color::Default
-                {
-                    saw_colored = true;
-                    break 'outer;
-                }
-            }
-        }
-        assert!(
-            saw_colored,
-            "expected at least one colored cell in vt100 output"
-        );
-    }
-
-    #[test]
-    fn vt100_blockquote_wrap_preserves_color_on_all_wrapped_lines() {
-        // Force wrapping by using a narrow viewport width and a long blockquote line.
-        let width: u16 = 20;
-        let height: u16 = 8;
-        let backend = VT100Backend::new(width, height);
-        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
-        // Viewport is the last line so history goes directly above it.
-        let viewport = Rect::new(0, height - 1, width, 1);
-        term.set_viewport_area(viewport);
-
-        // Create a long blockquote with a distinct prefix and enough text to wrap.
-        let mut line: Line<'static> = Line::from(vec![
-            "> ".into(),
-            "This is a long quoted line that should wrap".into(),
-        ]);
-        line = line.style(Color::Green);
-
-        insert_history_lines(&mut term, vec![line])
-            .expect("Failed to insert history lines in test");
-
-        // Parse and inspect the final screen buffer.
-        let screen = term.backend().vt100().screen();
-
-        // Collect rows that are non-empty; these should correspond to our wrapped lines.
-        let mut non_empty_rows: Vec<u16> = Vec::new();
-        for row in 0..height {
-            let mut any = false;
-            for col in 0..width {
-                if let Some(cell) = screen.cell(row, col)
-                    && cell.has_contents()
-                    && cell.contents() != "\0"
-                    && cell.contents() != " "
-                {
-                    any = true;
-                    break;
-                }
-            }
-            if any {
-                non_empty_rows.push(row);
-            }
-        }
-
-        // Expect at least two rows due to wrapping.
-        assert!(
-            non_empty_rows.len() >= 2,
-            "expected wrapped output to span >=2 rows, got {non_empty_rows:?}",
-        );
-
-        // For each non-empty row, ensure all non-space cells are using a non-default fg color.
-        for row in non_empty_rows {
-            for col in 0..width {
-                if let Some(cell) = screen.cell(row, col) {
-                    let contents = cell.contents();
-                    if !contents.is_empty() && contents != " " {
-                        assert!(
-                            cell.fgcolor() != vt100::Color::Default,
-                            "expected non-default fg on row {row} col {col}, got {:?}",
-                            cell.fgcolor()
-                        );
+            let screen = term.backend().vt100().screen();
+            let contents = screen.contents();
+            assert_eq!(
+                contents.split_whitespace().collect::<Vec<_>>(),
+                format!("> {text}").split_whitespace().collect::<Vec<_>>()
+            );
+            let non_empty_rows = (0..height)
+                .filter(|row| (0..width).any(|col| {
+                    screen.cell(*row, col).is_some_and(|cell| !cell.contents().trim().is_empty())
+                }))
+                .collect::<Vec<_>>();
+            assert!(non_empty_rows.len() >= minimum_rows);
+            for row in non_empty_rows {
+                for col in 0..width {
+                    let cell = screen.cell(row, col).expect("screen cell");
+                    if !cell.contents().trim().is_empty() {
+                        assert_eq!(cell.fgcolor(), vt100::Color::Idx(2), "row {row} col {col}");
                     }
                 }
             }

@@ -594,27 +594,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_event_snapshot_drops_resolved_request_user_input_after_user_answer() {
-        let mut store = ThreadEventStore::new(/*capacity*/ 8);
-        store.push_request(request_user_input_request("call-1", "turn-1"));
-
-        store.note_outbound_op(&Op::UserInputAnswer {
-            id: "turn-1".to_string(),
-            call_id: "call-1".to_string(),
-            response: ToolRequestUserInputResponse { disposition: None,
-                answers: HashMap::new(),
-                interrupted: false,
-            },
-        });
-
-        let snapshot = store.snapshot();
-        assert!(
-            snapshot.events.is_empty(),
-            "resolved request_user_input prompt should not replay on thread switch"
-        );
-    }
-
-    #[test]
     fn thread_event_snapshot_drops_resolved_request_user_input_after_server_resolution() {
         let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
@@ -686,6 +665,7 @@ mod tests {
     fn thread_event_snapshot_drops_answered_request_user_input_for_multi_prompt_turn() {
         let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
+        assert_eq!(store.snapshot().events.len(), 1);
 
         store.note_outbound_op(&Op::UserInputAnswer {
             id: "turn-1".to_string(),
@@ -695,6 +675,11 @@ mod tests {
                 interrupted: false,
             },
         });
+
+        assert!(
+            store.snapshot().events.is_empty(),
+            "resolved request_user_input prompt should not replay on thread switch"
+        );
 
         store.push_request(request_user_input_request("call-2", "turn-1"));
 

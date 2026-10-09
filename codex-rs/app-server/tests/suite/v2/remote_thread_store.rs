@@ -28,12 +28,15 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadDeleteParams;
 use codex_app_server_protocol::ThreadDeleteResponse;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -261,11 +264,11 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     .await??;
     client.shutdown().await?;
 
-    let client = start_in_process_client(config, loader_overrides).await?;
+    let mut client = start_in_process_client(config, loader_overrides).await?;
     let reads_before_resume = thread_store.calls().await.read_thread_with_history;
-    // The in-memory store is pathless, so resume currently fails later while
-    // assembling the response. The history-bearing probe must still be reused.
-    let _resume_result = client
+    // A non-local store has no rollout path. Its persisted conversation must
+    // still be resumable, without requiring a second history-bearing read.
+    let resume_result = client
         .sender()
         .request(ClientRequest::ThreadResume {
             request_id: RequestId::Integer(3),
@@ -275,13 +278,60 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
             },
         })
         .await?;
+    let resumed: ThreadResumeResponse =
+        serde_json::from_value(resume_result.expect("pathless resume should succeed"))?;
+    assert_eq!(resumed.thread.id, thread.id);
+    assert_eq!(resumed.thread.path, None);
+    assert_eq!(resumed.thread.turns.len(), 1);
+    assert_eq!(resumed.thread.turns[0].status, TurnStatus::Completed);
+    let items = &resumed.thread.turns[0].items;
+    assert_eq!(items.len(), 2);
+    assert!(matches!(&items[0], ThreadItem::UserMessage { content, .. }
+    if content == &vec![V2UserInput::Text {
+        text: "Materialize the thread".to_string(),
+        text_elements: Vec::new(),
+    }]));
+    assert!(matches!(&items[1], ThreadItem::AgentMessage { text, .. } if text == "Done"));
 
     assert_eq!(
         thread_store.calls().await.read_thread_with_history,
         reads_before_resume + 1
     );
 
+    client
+        .sender()
+        .request(ClientRequest::TurnStart {
+            request_id: RequestId::Integer(4),
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "Continue the resumed thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?
+        .expect("resumed runtime should accept a new turn");
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let Some(event) = client.next_event().await else {
+                anyhow::bail!("in-process app-server stopped before resumed turn/completed");
+            };
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                completed,
+            )) = event
+                && completed.thread_id == thread.id
+            {
+                assert_eq!(completed.turn.status, TurnStatus::Completed);
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
     client.shutdown().await?;
+    assert_no_local_thread_persistence(codex_home.path(), &[ThreadId::from_string(&thread.id)?])
+        .await?;
     Ok(())
 }
 

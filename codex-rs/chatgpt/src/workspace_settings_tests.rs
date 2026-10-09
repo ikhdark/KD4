@@ -174,19 +174,15 @@ async fn expired_workspace_setting_and_failure_fallback_are_not_served_from_cach
 }
 
 #[test]
-fn encode_path_segment_leaves_unreserved_ascii_unchanged() {
-    assert_eq!(
-        encode_path_segment("account-123_ABC.~"),
-        "account-123_ABC.~"
-    );
-}
-
-#[test]
-fn encode_path_segment_escapes_path_separators_and_spaces() {
-    assert_eq!(
-        encode_path_segment("account/123 with space"),
-        "account%2F123%20with%20space"
-    );
+fn encode_path_segment_preserves_unreserved_bytes_and_escapes_other_bytes() {
+    for (input, expected) in [
+        ("account-123_ABC.~", "account-123_ABC.~"),
+        ("account/123 with space", "account%2F123%20with%20space"),
+        ("é?#%", "%C3%A9%3F%23%25"),
+        ("", ""),
+    ] {
+        assert_eq!(encode_path_segment(input), expected, "{input:?}");
+    }
 }
 
 #[tokio::test]

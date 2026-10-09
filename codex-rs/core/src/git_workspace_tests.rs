@@ -88,10 +88,16 @@ async fn completion_boundary_batched_ignores_match_single_path_attribution() {
     std::fs::create_dir(repo.join("ignored")).unwrap();
     std::fs::write(repo.join("ignored/tracked.out"), "tracked").unwrap();
     run_git(repo.as_path(), &["add", "-f", "ignored/tracked.out"]).await;
-    let mut paths = (0..80).map(|index| repo.join(format!("result-{index}.out")).to_path_buf()).collect::<Vec<_>>();
+    let mut paths = (0..80).map(|index| repo.join(format!("result-{index}-{}.out", "x".repeat(100))).to_path_buf()).collect::<Vec<_>>();
+    let expected = paths.iter().cloned().collect::<BTreeSet<_>>();
+    assert!(paths.iter().map(|path| path.strip_prefix(repo.as_path()).unwrap().to_str().unwrap().len() + 1).sum::<usize>() > 8 * 1024,
+        "fixture must cross the production ignore-query batch boundary");
     paths.extend([repo.join("ignored").to_path_buf(), repo.join("ignored/tracked.out").to_path_buf(), repo.join("README.md").to_path_buf()]);
     let ignored = git_ignored_validation_paths(repo.as_path(), &paths).await;
-    for path in &paths {
+    assert_eq!(ignored, expected, "every path in both batches must be classified");
+    // The full-set oracle above covers every output file. Compare the independent
+    // single-path API once per behavior, including both ends of the batch split.
+    for path in [&paths[0], &paths[79], &paths[80], &paths[81], &paths[82]] {
         assert_eq!(ignored.contains(path), git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(path)).await, "{}", path.display());
     }
     assert_eq!(ignored.len(), 80);
@@ -671,34 +677,35 @@ async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
 }
 
 #[tokio::test]
-async fn workspace_content_cache_checks_age_metadata_and_file_identity() {
+async fn workspace_content_capture_rehashes_even_when_metadata_is_preserved() {
     let root = TempDir::new().unwrap();
-    let cache = Arc::new(StdMutex::new(WorkspaceContentCache::default()));
     let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let path = root.path().join("dirty.txt");
     std::fs::write(&path, b"first").unwrap();
     File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
-    let capture = || capture_workspace_metadata_cached(
+    let capture = || capture_workspace_metadata(
         root.path().to_path_buf(),
         vec![WorkspaceGenerationPath { path: "dirty.txt".into(), deleted: false }],
         WorkspaceCaptureControl { deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE, cancellation: CancellationToken::new() },
-        Arc::clone(&cache), SystemTime::now(),
     );
     let first = capture().await.unwrap().manifest;
     assert_eq!(capture().await.unwrap().manifest, first);
-    assert_eq!(cache.lock().unwrap().hits.load(Ordering::Relaxed), 1);
-    // Replacement with the same size and mtime must not reuse the old digest.
-    std::fs::rename(&path, root.path().join("old.txt")).unwrap();
+    // An in-place equal-length write can restore the original modification time
+    // without changing file identity. Fresh evidence must still see its bytes.
     std::fs::write(&path, b"other").unwrap();
     File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+    let rewritten = capture().await.unwrap().manifest;
+    assert_ne!(rewritten, first);
+    // Replacement with the same size and mtime must not reuse the old digest.
+    std::fs::rename(&path, root.path().join("old.txt")).unwrap();
+    std::fs::write(&path, b"third").unwrap();
+    File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
     let replacement = capture().await.unwrap().manifest;
-    assert_ne!(replacement, first);
-    assert_eq!(cache.lock().unwrap().hits.load(Ordering::Relaxed), 1);
+    assert_ne!(replacement, rewritten);
     let future = SystemTime::now() + Duration::from_secs(60);
     File::options().write(true).open(&path).unwrap().set_modified(future).unwrap();
     assert_eq!(capture().await.unwrap().manifest, replacement);
     assert_eq!(capture().await.unwrap().manifest, replacement);
-    assert_eq!(cache.lock().unwrap().hits.load(Ordering::Relaxed), 1);
     std::fs::write(&path, b"longer contents").unwrap();
     assert_ne!(capture().await.unwrap().manifest, replacement);
 }
@@ -882,6 +889,12 @@ fn nul_status_reader_handles_split_renames_conflicts_and_limits() {
     );
     let mut reader = WorkspaceStatusReader::new();
     assert_eq!(reader.push(b"x unknown\0"), None);
+    let mut reader = WorkspaceStatusReader::new();
+    reader.push(b"2 R. N... 100644 100644 100644 a b R100 renamed\0").unwrap();
+    assert!(reader.finish().is_none(), "rename destination without source is incomplete");
+    let mut reader = WorkspaceStatusReader::new();
+    reader.push(b"1 .D N... 100644 100644 000000 a b same\0").unwrap();
+    assert!(reader.push(b"? same\0").is_none(), "conflicting deletion observations cannot certify content");
 }
 
 #[tokio::test]
@@ -932,6 +945,7 @@ async fn failed_workspace_refresh_invalidates_the_latest_identity() {
 #[tokio::test]
 async fn ordinary_workspace_identity_tracks_dirty_content_when_status_is_unchanged() {
     let (_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
     let readme = repo.join("README.md");
     std::fs::write(&readme, "first dirty value\n").expect("first dirty write");
     let original_modified = std::fs::metadata(&readme)
@@ -945,6 +959,7 @@ async fn ordinary_workspace_identity_tracks_dirty_content_when_status_is_unchang
     let first = capture_workspace_evidence_identity(repo.as_path())
         .await
         .expect("first identity");
+    let cached_first = cache.workspace_evidence_identity(repo.as_path()).await.expect("first shared-cache identity");
 
     std::fs::write(&readme, "other dirty value\n").expect("second dirty write");
     std::fs::File::options()
@@ -960,10 +975,14 @@ async fn ordinary_workspace_identity_tracks_dirty_content_when_status_is_unchang
     let second = capture_workspace_evidence_identity(repo.as_path())
         .await
         .expect("second identity");
+    let cached_second = cache.workspace_evidence_identity(repo.as_path()).await.expect("second shared-cache identity");
 
     assert_eq!(first_status, second_status);
     assert_eq!(first.index_identity, second.index_identity);
     assert_ne!(first.worktree_identity, second.worktree_identity);
+    assert!(!cached_first.unavailable && !cached_second.unavailable);
+    assert_eq!(cached_first.index_identity, cached_second.index_identity);
+    assert_ne!(cached_first.worktree_identity, cached_second.worktree_identity);
 }
 
 #[tokio::test]
@@ -1860,6 +1879,17 @@ async fn recursive_source_path_observation_detects_descendant_changes() {
 
 #[test]
 fn path_relationships_preserve_case_on_case_sensitive_filesystems() {
+    for (path, ancestor, expected) in [
+        ("/repo/file", "/", true),
+        ("C:/repo/file", "C:/", true),
+        ("repo/file", "/", false),
+        ("/repository/file", "/repo", false),
+        ("/repo/file", "/repo/", true),
+    ] {
+        assert_eq!(path_is_same_or_descendant_with_case_sensitivity(
+            Path::new(path), Path::new(ancestor), true,
+        ), expected, "{path} beneath {ancestor}");
+    }
     assert!(!path_is_same_or_descendant_with_case_sensitivity(
         Path::new("repo/src/Owner.rs"),
         Path::new("repo/src/owner.rs"),
@@ -2170,7 +2200,12 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                     } else {
                         "# branch.oid abc123\0# branch.head main\0? tracked.txt\0"
                     };
-                    json!({"chunks": [{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(status)}], "nextSeq": 4, "exited": true, "exitCode": 0, "closed": true, "failure": null, "sandboxDenied": false})
+                    let chunks = if request["params"]["afterSeq"].is_null() {
+                        json!([{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(status)}])
+                    } else {
+                        json!([])
+                    };
+                    json!({"chunks": chunks, "nextSeq": 2, "exited": true, "exitCode": 0, "closed": true, "failure": null, "sandboxDenied": false})
                 }
                 "fs/open" => json!({"handleId": request["params"]["handleId"]}),
                 "fs/readFileBounded" => {
@@ -2268,6 +2303,7 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
             .unavailable
     );
     server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

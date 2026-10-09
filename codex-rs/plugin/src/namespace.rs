@@ -57,13 +57,23 @@ mod tests {
         fs::create_dir_all(root.join(".codex-plugin")).unwrap();
         fs::write(
             root.join(".codex-plugin/plugin.json"),
-            r#"{"name":"sample"}"#,
+            r#"{"name":"declared-name"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+        fs::write(
+            root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"shadowed-name"}"#,
         )
         .unwrap();
         assert_eq!(
+            find_plugin_manifest_path(&root),
+            Some(root.join(".codex-plugin/plugin.json"))
+        );
+        assert_eq!(
             plugin_namespace_for_root_uri(LOCAL_FS.as_ref(), &PathUri::from_abs_path(&root.abs()))
                 .await,
-            Some("sample".to_string())
+            Some("declared-name".to_string())
         );
         // Only the root is probed; nearest-ancestor selection belongs to the skills loader.
         assert_eq!(

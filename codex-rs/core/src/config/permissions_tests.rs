@@ -279,9 +279,8 @@ allow_local_binding = true
     )
     .expect("permissions should deserialize");
 
-    let resolved = permissions
-        .resolve_profile("child", |_| None)
-        .expect("child profile should resolve");
+    let resolved =
+        resolve_permission_profile(&permissions, "child").expect("child profile should resolve");
     let expected_profile = toml::from_str::<PermissionProfileToml>(
         r#"
 extends = "base"
@@ -326,8 +325,7 @@ extends = "base"
     )
     .expect("permissions should deserialize");
 
-    let err = permissions
-        .resolve_profile("child", |_| None)
+    let err = resolve_permission_profile(&permissions, "child")
         .expect_err("missing parent should be rejected");
 
     assert_eq!(
@@ -346,8 +344,7 @@ extends = ":danger-full-access"
     )
     .expect("permissions should deserialize");
 
-    let err = permissions
-        .resolve_profile("child", |_| None)
+    let err = resolve_permission_profile(&permissions, "child")
         .expect_err("unsupported built-in parent should be rejected");
 
     assert_eq!(
@@ -369,9 +366,8 @@ extends = "alpha"
     )
     .expect("permissions should deserialize");
 
-    let err = permissions
-        .resolve_profile("alpha", |_| None)
-        .expect_err("cycle should be rejected");
+    let err =
+        resolve_permission_profile(&permissions, "alpha").expect_err("cycle should be rejected");
 
     assert_eq!(
         err.to_string(),
@@ -380,17 +376,15 @@ extends = "alpha"
 }
 
 #[test]
-fn profile_network_proxy_config_keeps_proxy_disabled_for_bare_network_access() {
-    let config = network_proxy_config_from_profile_network(Some(&NetworkToml {
+fn profile_network_proxy_config_keeps_proxy_disabled_for_proxy_policy() {
+    let bare_network = NetworkToml {
         enabled: Some(true),
         ..Default::default()
-    }));
+    };
+    for network in [None, Some(&bare_network)] {
+        assert!(!network_proxy_config_from_profile_network(network).enabled);
+    }
 
-    assert!(!config.enabled);
-}
-
-#[test]
-fn profile_network_proxy_config_keeps_proxy_disabled_for_proxy_policy() {
     let config = network_proxy_config_from_profile_network(Some(&NetworkToml {
         enabled: Some(true),
         proxy_url: Some("http://127.0.0.1:43128".to_string()),
@@ -444,11 +438,13 @@ fn compile_permission_profile_workspace_roots_resolves_enabled_entries() -> std:
     )?;
 
     assert_eq!(
-        workspace_roots,
-        vec![AbsolutePathBuf::resolve_path_against_base(
-            "backend",
-            cwd.path()
-        )]
+        workspace_roots
+            .into_iter()
+            .map(AbsolutePathBuf::into_path_buf)
+            .collect::<Vec<_>>(),
+        // A relative enabled root belongs beneath the supplied policy cwd;
+        // do not derive the oracle with the production path resolver.
+        vec![cwd.path().join("backend")]
     );
     Ok(())
 }
@@ -607,18 +603,21 @@ fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> 
         }]),
         "trailing /** should compile as a subtree path instead of a glob pattern"
     );
+    assert!(startup_warnings.is_empty(), "{startup_warnings:?}");
     Ok(())
 }
 
 #[test]
 fn read_write_glob_patterns_still_reject_non_subpath_globs() {
-    let err = compile_read_write_glob_path("src/**/*.rs", FileSystemAccessMode::Read)
-        .expect_err("non-subpath read/write glob should be rejected");
+    for access in [FileSystemAccessMode::Read, FileSystemAccessMode::Write] {
+        let err = compile_read_write_glob_path("src/**/*.rs", access)
+            .expect_err("non-subpath read/write glob should be rejected");
 
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string()
-            .contains("filesystem glob path `src/**/*.rs` only supports `deny` access"),
-        "{err}"
-    );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("filesystem glob path `src/**/*.rs` only supports `deny` access"),
+            "{err}"
+        );
+    }
 }

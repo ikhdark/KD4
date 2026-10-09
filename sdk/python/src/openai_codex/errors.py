@@ -60,13 +60,15 @@ def _contains_retry_limit_text(message: str) -> bool:
     return "retry limit" in lowered or "too many failed attempts" in lowered
 
 
-def _is_structured_overload(code: int, data: Any) -> bool:
-    return (
+def _structured_overload_retryable(code: int, data: Any) -> bool | None:
+    if (
         code == _OVERLOADED_ERROR_CODE
         and isinstance(data, dict)
         and isinstance(data.get("reason"), str)
-        and data.get("retryable") is True
-    )
+        and isinstance(data.get("retryable"), bool)
+    ):
+        return data["retryable"]
+    return None
 
 
 def _is_server_overloaded(data: Any) -> bool:
@@ -109,7 +111,10 @@ def map_jsonrpc_error(code: int, message: str, data: Any = None) -> JsonRpcError
         return InternalRpcError(code, message, data)
 
     if -32099 <= code <= -32000:
-        if _is_structured_overload(code, data) or _is_server_overloaded(data):
+        retryable = _structured_overload_retryable(code, data)
+        if retryable is False:
+            return CodexRpcError(code, message, data)
+        if retryable is True or _is_server_overloaded(data):
             if _contains_retry_limit_text(message):
                 return RetryLimitExceededError(code, message, data)
             return ServerBusyError(code, message, data)
@@ -123,10 +128,15 @@ def map_jsonrpc_error(code: int, message: str, data: Any = None) -> JsonRpcError
 def is_retryable_error(exc: BaseException) -> bool:
     """True if the exception is a transient overload-style error."""
 
+    if isinstance(exc, JsonRpcError):
+        retryable = _structured_overload_retryable(exc.code, exc.data)
+        if retryable is not None:
+            return retryable
+
     if isinstance(exc, ServerBusyError):
         return True
 
     if isinstance(exc, JsonRpcError):
-        return _is_structured_overload(exc.code, exc.data) or _is_server_overloaded(exc.data)
+        return _is_server_overloaded(exc.data)
 
     return False

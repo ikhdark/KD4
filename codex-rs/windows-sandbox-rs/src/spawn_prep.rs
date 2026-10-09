@@ -540,32 +540,6 @@ mod tests {
         );
     }
 
-    fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool {
-        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-            permission_profile,
-            &[],
-        )
-        .expect("managed permission profile")
-        .should_apply_network_block()
-    }
-
-    #[test]
-    fn no_network_env_rewrite_applies_for_workspace_write() {
-        assert!(should_apply_network_block(
-            &PermissionProfile::workspace_write()
-        ));
-    }
-
-    #[test]
-    fn no_network_env_rewrite_skips_when_network_access_is_allowed() {
-        assert!(!should_apply_network_block(&workspace_profile(
-            NetworkSandboxPolicy::Enabled,
-            &[],
-            /*exclude_tmpdir_env_var*/ false,
-            /*exclude_slash_tmp*/ false,
-        )));
-    }
-
     #[test]
     fn legacy_spawn_env_applies_offline_network_rewrite() {
         let codex_home = TempDir::new().expect("tempdir");
@@ -591,6 +565,32 @@ mod tests {
         assert_eq!(
             env_map.get("HTTP_PROXY"),
             Some(&"http://127.0.0.1:9".to_string())
+        );
+
+        // Exercise the enabled branch through the same real preparation path,
+        // rather than merely checking the profile's boolean accessor.
+        let mut enabled_env = HashMap::from([(
+            "HTTP_PROXY".to_string(),
+            "http://user.proxy:8080".to_string(),
+        )]);
+        let context = prepare_legacy_spawn_context(
+            &workspace_profile(NetworkSandboxPolicy::Enabled, &[], false, false),
+            workspace_roots.as_slice(),
+            codex_home.path(),
+            cwd.path(),
+            &mut enabled_env,
+            &["cmd.exe".to_string()],
+            SpawnPrepOptions {
+                inherit_path: true,
+                add_git_safe_directory: false,
+            },
+        )
+        .expect("online legacy env prep");
+        assert!(!context.permissions.should_apply_network_block());
+        assert_eq!(enabled_env.get("SBX_NONET_ACTIVE"), None);
+        assert_eq!(
+            enabled_env.get("HTTP_PROXY"),
+            Some(&"http://user.proxy:8080".to_string())
         );
     }
 

@@ -136,11 +136,34 @@ def append_env_flag(env: MutableMapping[str, str], key: str, flag: str) -> None:
 
 
 def set_default_lint_env(env: MutableMapping[str, str]) -> None:
+    # Only lint-level options override defaults; a cfg value or a different
+    # lint whose name contains ours is not an explicit level for this lint.
+    raw_flags = env.get("DYLINT_RUSTFLAGS", "")
+    try:
+        flags = iter(shlex.split(raw_flags))
+    except ValueError:
+        # Preserve verbatim forwarding of flags; diagnosing malformed quoting
+        # belongs to the invoked tool, not default-environment setup.
+        flags = iter(raw_flags.split())
+    explicit_lints: set[str] = set()
+    short_levels = {"-A", "-W", "-D", "-F"}
+    long_levels = {"--allow", "--warn", "--deny", "--forbid", "--force-warn"}
+    for flag in flags:
+        value = None
+        if flag in short_levels or flag in long_levels:
+            value = next(flags, "")
+        elif flag[:2] in short_levels:
+            value = flag[2:]
+        elif flag.partition("=")[0] in long_levels:
+            value = flag.partition("=")[2]
+        if value is not None:
+            explicit_lints.update(name.replace("_", "-") for name in value.split(","))
     for strict_lint in STRICT_LINTS:
         # rustc applies the last level given for a lint, so appending `-D` would
         # override an explicit ad hoc level such as `-A <lint>`.
-        if strict_lint not in env.get("DYLINT_RUSTFLAGS", "").replace("_", "-"):
-            append_env_flag(env, "DYLINT_RUSTFLAGS", f"-D {strict_lint}")
+        if strict_lint not in explicit_lints:
+            current = env.get("DYLINT_RUSTFLAGS", "")
+            env["DYLINT_RUSTFLAGS"] = f"{current} -D {strict_lint}".lstrip()
     append_env_flag(env, "DYLINT_RUSTFLAGS", f"-A {NOISE_LINT}")
     if not env.get("CARGO_INCREMENTAL"):
         env["CARGO_INCREMENTAL"] = "0"

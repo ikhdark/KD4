@@ -249,57 +249,6 @@ fn model_provider_from_proto(
     Ok((id, info))
 }
 
-#[cfg(test)]
-fn model_provider_to_proto(
-    id: impl Into<String>,
-    provider: ModelProviderInfo,
-) -> proto::ModelProvider {
-    let ModelProviderInfo {
-        name,
-        base_url,
-        env_key,
-        env_key_instructions,
-        experimental_bearer_token,
-        auth,
-        aws,
-        wire_api,
-        query_params,
-        http_headers,
-        env_http_headers,
-        request_max_retries,
-        stream_max_retries,
-        stream_idle_timeout_ms,
-        websocket_connect_timeout_ms,
-        requires_openai_auth,
-        supports_websockets,
-        supports_standalone_web_search,
-    } = provider;
-
-    proto::ModelProvider {
-        id: id.into(),
-        name,
-        base_url,
-        env_key,
-        env_key_instructions,
-        experimental_bearer_token,
-        auth: auth.map(model_provider_auth_to_proto),
-        wire_api: proto_wire_api(wire_api).into(),
-        query_params: query_params.map(proto_string_map),
-        http_headers: http_headers.map(proto_string_map),
-        env_http_headers: env_http_headers.map(proto_string_map),
-        request_max_retries,
-        stream_max_retries,
-        stream_idle_timeout_ms,
-        websocket_connect_timeout_ms,
-        requires_openai_auth,
-        supports_websockets,
-        supports_standalone_web_search,
-        aws: aws.map(|aws| proto::ModelProviderAwsAuthInfo {
-            profile: aws.profile,
-            region: aws.region,
-        }),
-    }
-}
 
 fn model_provider_auth_from_proto(
     auth: proto::ModelProviderAuthInfo,
@@ -322,36 +271,8 @@ fn model_provider_auth_from_proto(
     })
 }
 
-#[cfg(test)]
-fn model_provider_auth_to_proto(auth: ModelProviderAuthInfo) -> proto::ModelProviderAuthInfo {
-    let ModelProviderAuthInfo {
-        command,
-        args,
-        timeout_ms,
-        refresh_interval_ms,
-        cwd,
-    } = auth;
 
-    proto::ModelProviderAuthInfo {
-        command,
-        args,
-        timeout_ms: timeout_ms.get(),
-        refresh_interval_ms,
-        cwd: cwd.to_string_lossy().into_owned(),
-    }
-}
 
-#[cfg(test)]
-fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap {
-    proto::StringMap { values }
-}
-
-#[cfg(test)]
-fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
-    match wire_api {
-        WireApi::Responses => proto::WireApi::Responses,
-    }
-}
 
 fn parse_error(message: impl Into<String>) -> ThreadConfigLoadError {
     ThreadConfigLoadError::new(
@@ -387,6 +308,7 @@ mod tests {
         sources: Vec<proto::ThreadConfigSource>,
         expected_cwd: String,
         stall: bool,
+        entered: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl TestServer {
@@ -394,6 +316,7 @@ mod tests {
             &self,
             request: Request<proto::LoadThreadConfigRequest>,
         ) -> Result<Response<proto::LoadThreadConfigResponse>, Status> {
+            self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
             if self.stall {
                 std::future::pending::<()>().await;
             }
@@ -453,6 +376,7 @@ mod tests {
                     sources: proto_sources(),
                     expected_cwd,
                     stall: false,
+                    entered: Arc::default(),
                 }))
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = shutdown_rx.await;
@@ -505,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn model_provider_proto_roundtrips_through_domain_type() {
+    fn model_provider_proto_preserves_aws_fields_without_auth() {
         let mut expected = expected_provider();
         expected.auth = None;
         expected.supports_websockets = false;
@@ -515,9 +439,20 @@ mod tests {
             region: Some("us-east-1".to_string()),
         });
         expected.validate().unwrap();
-        let proto = model_provider_to_proto("local", expected.clone());
-        let (id, actual) = model_provider_from_proto(proto).expect("model provider from proto");
-
+        let Some(proto::thread_config_source::Source::Session(mut session)) =
+            proto_sources().remove(0).source
+        else {
+            panic!("session fixture");
+        };
+        let mut provider = session.model_providers.remove(0);
+        provider.auth = None;
+        provider.supports_websockets = false;
+        provider.supports_standalone_web_search = true;
+        provider.aws = Some(proto::ModelProviderAwsAuthInfo {
+            profile: Some("test-profile".to_string()),
+            region: Some("us-east-1".to_string()),
+        });
+        let (id, actual) = model_provider_from_proto(provider).expect("model provider from proto");
         assert_eq!(id, "local");
         assert_eq!(actual, expected);
     }
@@ -538,6 +473,7 @@ mod tests {
         )
         .await;
         stalled_peer.abort();
+        assert!(stalled_peer.await.unwrap_err().is_cancelled());
         let error = result
             .expect("load must finish within its deadline")
             .unwrap_err();
@@ -549,12 +485,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let loader =
             RemoteThreadConfigLoader::new(format!("http://{}", listener.local_addr().unwrap()));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_entered = Arc::clone(&entered);
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(ThreadConfigLoaderServer::new(TestServer {
                     sources: vec![],
                     expected_cwd: String::new(),
                     stall: true,
+                    entered: server_entered,
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
@@ -565,6 +504,11 @@ mod tests {
         )
         .await;
         server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        assert!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            "must reach the RPC, not merely time out during connection"
+        );
         assert_eq!(
             result.expect("RPC deadline").unwrap_err().code(),
             ThreadConfigLoadErrorCode::Timeout
@@ -573,7 +517,12 @@ mod tests {
 
     #[test]
     fn duplicate_provider_ids_are_rejected_at_source_boundary() {
-        let provider = model_provider_to_proto("local", expected_provider());
+        let Some(proto::thread_config_source::Source::Session(mut session)) =
+            proto_sources().remove(0).source
+        else {
+            panic!("session fixture");
+        };
+        let provider = session.model_providers.remove(0);
         let error = thread_config_source_from_proto(proto::ThreadConfigSource {
             source: Some(proto::thread_config_source::Source::Session(
                 proto::SessionThreadConfig {
@@ -589,30 +538,30 @@ mod tests {
     }
 
     #[test]
-    fn remote_errors_preserve_distinct_grpc_statuses() {
-        for code in [
-            tonic::Code::Unavailable,
-            tonic::Code::InvalidArgument,
-            tonic::Code::FailedPrecondition,
+    fn remote_errors_preserve_grpc_status_and_distinguish_timeout_auth_and_cancellation() {
+        use tonic::Code;
+        for (grpc, expected) in [
+            (Code::Unavailable, ThreadConfigLoadErrorCode::RequestFailed),
+            (
+                Code::InvalidArgument,
+                ThreadConfigLoadErrorCode::RequestFailed,
+            ),
+            (
+                Code::FailedPrecondition,
+                ThreadConfigLoadErrorCode::RequestFailed,
+            ),
+            (Code::Cancelled, ThreadConfigLoadErrorCode::RequestFailed),
+            (Code::DeadlineExceeded, ThreadConfigLoadErrorCode::Timeout),
+            (Code::Unauthenticated, ThreadConfigLoadErrorCode::Auth),
+            (Code::PermissionDenied, ThreadConfigLoadErrorCode::Auth),
         ] {
-            let error = remote_status_to_error(Status::new(code, "test"));
-            assert_eq!(error.code(), ThreadConfigLoadErrorCode::RequestFailed);
-            assert_eq!(error.grpc_code(), Some(code));
+            let error = remote_status_to_error(Status::new(grpc, "test"));
+            assert_eq!(error.code(), expected);
+            assert_eq!(error.grpc_code(), Some(grpc));
             assert_eq!(error.status_code(), None);
         }
     }
 
-    #[test]
-    fn server_cancellation_is_not_a_timeout() {
-        assert_eq!(
-            remote_status_to_error(Status::cancelled("cancelled by server")).code(),
-            ThreadConfigLoadErrorCode::RequestFailed
-        );
-        assert_eq!(
-            remote_status_to_error(Status::deadline_exceeded("deadline")).code(),
-            ThreadConfigLoadErrorCode::Timeout
-        );
-    }
 
     fn proto_sources() -> Vec<proto::ThreadConfigSource> {
         let workspace_cwd = workspace_dir().to_string_lossy().into_owned();

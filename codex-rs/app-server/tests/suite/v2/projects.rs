@@ -220,6 +220,8 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         })
         .await?;
     assert_eq!(created.project.name, "Work");
+    assert_eq!(created.project.roots, vec![ProjectRoot { path: root }]);
+    assert_eq!(created.project.metadata, BTreeMap::from([("color".to_string(), "blue".to_string())]));
     assert_eq!(Uuid::parse_str(&created.project.id)?.get_version_num(), 7);
 
     let read: ProjectReadResponse = server
@@ -770,6 +772,7 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
     };
     assert_eq!(response.id, RequestId::Integer(import_id));
     let imported: ProjectImportResponse = serde_json::from_value(response.result)?;
+    assert_eq!(imported.project.id, project_changed.project_id);
 
     server.clear_message_buffer();
     let replayed: ProjectImportResponse = server
@@ -803,7 +806,7 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
             },
         })
         .await?;
-    assert_eq!(listed.data.len(), 1);
+    assert_eq!(listed.data, vec![imported.project.clone()]);
 
     let duplicate_id = server
         .send_project_import_request(ProjectImportParams {
@@ -829,7 +832,7 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
             },
         })
         .await?;
-    assert_eq!(listed.data.len(), 1);
+    assert_eq!(listed.data, vec![imported.project.clone()]);
 
     let ephemeral = server
         .start_thread(ThreadStartParams {
@@ -861,10 +864,9 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
             },
         })
         .await?;
-    assert_eq!(listed.data.len(), 1);
+    assert_eq!(listed.data, vec![imported.project.clone()]);
     Ok(())
 }
-
 #[tokio::test]
 async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Result<()> {
     let responses = create_mock_responses_server_repeating_assistant("Done").await;

@@ -468,10 +468,17 @@ mod tests {
         assert!(rendered.contains("Ollama (Responses)"));
         assert!(!rendered.contains("Ollama (Chat)"));
         assert_eq!(widget.selected_option, 0);
-        widget.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(widget.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)), None);
         assert_eq!(widget.selected_option, 1);
-        widget.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(!widget.is_complete());
+        assert_eq!(widget.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)), None);
         assert_eq!(widget.selected_option, 0);
+        assert!(!widget.is_complete());
+        assert_eq!(
+            widget.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(LMSTUDIO_OSS_PROVIDER_ID.to_string())
+        );
+        assert!(widget.is_complete());
     }
 
     #[tokio::test]

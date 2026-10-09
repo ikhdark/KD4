@@ -498,6 +498,12 @@ fn arc_identity_short_circuits_equivalence_check() {
         }
     ));
     assert_eq!(comparison_count.load(Ordering::Relaxed), 1);
+    let unequal = Arc::new([1_u8, 2, 4]);
+    assert!(!arc_identity_or_equivalent(&shared, &unequal, |left, right| {
+        comparison_count.fetch_add(1, Ordering::Relaxed);
+        left == right
+    }));
+    assert_eq!(comparison_count.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
@@ -1034,6 +1040,11 @@ async fn prepared_router_config_match_accepts_the_shared_turn_snapshot() {
 
     assert!(Arc::ptr_eq(&shared, &turn_context.config));
     assert!(same_config_snapshot(&shared, &turn_context.config));
+    let mut distinct = Arc::new((*shared).clone());
+    assert!(!Arc::ptr_eq(&shared, &distinct));
+    assert!(same_config_snapshot(&shared, &distinct));
+    Arc::make_mut(&mut distinct).service_tier = Some("changed-test-tier".to_string());
+    assert!(!same_config_snapshot(&shared, &distinct));
 }
 
 #[tokio::test]
@@ -1993,53 +2004,36 @@ fn recommended_plugin_candidate(id: &str, name: &str) -> DiscoverableTool {
     .into()
 }
 
-#[test]
-fn recommended_plugins_are_not_injected_for_unrelated_tasks() {
-    let selected = task_relevant_recommended_plugins(
-        &[ContentItem::InputText {
-            text: "fix the parser".to_string(),
-        }],
-        vec![recommended_plugin_candidate("figma", "Figma")],
-    );
 
-    assert!(selected.is_empty());
-}
 
 #[test]
 fn named_recommended_plugin_is_the_only_injected_candidate() {
-    let selected = task_relevant_recommended_plugins(
-        &[ContentItem::InputText {
-            text: "use Figma for this mockup".to_string(),
-        }],
-        vec![
-            recommended_plugin_candidate("figma", "Figma"),
-            recommended_plugin_candidate("notion", "Notion"),
-        ],
-    );
-
-    assert_eq!(
-        selected
-            .iter()
-            .map(DiscoverableTool::name)
-            .collect::<Vec<_>>(),
-        vec!["Figma"]
-    );
+    for (task, expected) in [
+        ("fix the parser", vec![]),
+        ("add a plugin field to the Rust parser", vec![]),
+        ("use Figma for this mockup", vec!["Figma"]),
+        ("use FIGMA and (notion)", vec!["Figma", "Notion"]),
+        ("figmatic and notional changes", vec![]),
+        ("éfigma notioné", vec![]),
+        ("use design-tool", vec!["Figma"]),
+        ("", vec![]),
+    ] {
+        let selected = task_relevant_recommended_plugins(
+            &[ContentItem::InputText { text: task.to_string() }],
+            vec![
+                recommended_plugin_candidate("design-tool", "Figma"),
+                recommended_plugin_candidate("notion", "Notion"),
+            ],
+        );
+        assert_eq!(
+            selected.iter().map(DiscoverableTool::name).collect::<Vec<_>>(),
+            expected,
+            "{task}"
+        );
+    }
 }
 
-#[test]
-fn generic_plugin_mention_does_not_pin_the_catalog() {
-    let selected = task_relevant_recommended_plugins(
-        &[ContentItem::InputText {
-            text: "add a plugin field to the Rust parser".to_string(),
-        }],
-        vec![
-            recommended_plugin_candidate("figma", "Figma"),
-            recommended_plugin_candidate("notion", "Notion"),
-        ],
-    );
 
-    assert!(selected.is_empty());
-}
 
 #[test]
 fn recommended_plugin_catalog_is_bounded_by_rendered_bytes() {
@@ -2346,7 +2340,7 @@ async fn batching_advisory_is_delivered_once_without_loop_or_generation_accounti
             call.ordinal,
             codex_tools::ToolOutputOutcomeContext::new(codex_tools::ToolOutputOutcome::Success),
             Some(crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
-                crate::tools::context::semantic_evidence_for_command_output(id.as_bytes())
+                crate::tools::context::successful_command_evidence(id.as_bytes(), None)
             ))),
             &codex_protocol::models::ResponseInputItem::FunctionCallOutput {
                 call_id: id.clone(),
@@ -2567,12 +2561,17 @@ async fn regular_follow_up_admission_reports_exhaustion_once() {
     let EventMsg::Error(error) = events.try_recv().expect("budget error").msg else {
         panic!("expected budget error");
     };
+    assert_eq!(
+        error.message,
+        format!("This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume.")
+    );
     assert!(error.affects_turn_status());
     assert_eq!(turn.terminal_error.lock().await.as_ref(), Some(&error));
     assert!(!admit_regular_follow_up(&session, &turn, &exhausted, &mut reported).await);
+    report_logical_generation_budget_exhausted(&session, &turn, &mut reported).await;
     assert!(
         events.try_recv().is_err(),
-        "budget error must be emitted once"
+        "budget error must be emitted once through admission and direct reporting"
     );
 }
 
@@ -2718,43 +2717,7 @@ async fn untyped_status_affecting_error_is_recorded_as_terminal() {
     );
 }
 
-#[tokio::test]
-async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
-    let (session, turn_context, events) =
-        crate::session::tests::make_session_and_context_with_rx().await;
-    let mut reported = false;
 
-    report_logical_generation_budget_exhausted(
-        session.as_ref(),
-        turn_context.as_ref(),
-        &mut reported,
-    )
-    .await;
-    report_logical_generation_budget_exhausted(
-        session.as_ref(),
-        turn_context.as_ref(),
-        &mut reported,
-    )
-    .await;
-
-    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
-        .await
-        .expect("generation budget exhaustion emits an error event")
-        .expect("event channel remains open");
-    let EventMsg::Error(error) = event.msg else {
-        panic!("expected generation budget error event");
-    };
-    assert_eq!(
-        error.message,
-        format!("This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume.")
-    );
-    assert!(error.affects_turn_status());
-    assert_eq!(
-        turn_context.terminal_error.lock().await.as_ref(),
-        Some(&error)
-    );
-    assert!(events.try_recv().is_err(), "error must be reported once");
-}
 
 #[tokio::test]
 async fn planning_failure_records_initial_input_and_emits_status_affecting_error() {
@@ -2945,14 +2908,19 @@ fn authoritative_wait_terminal_surface_requires_explicit_owner_projection() {
 
 #[test]
 fn blocked_authoritative_wait_never_enters_terminal_surface() {
-    let blocked = SamplingConvergenceDecision {
-        continuation: ContinuationDisposition::ModelRequired,
-        authoritative_wait: Some(AuthoritativeWaitResolution::Blocked(
-            authoritative_wait_result(Some("must not surface")),
-        )),
-        ..Default::default()
-    };
-    assert_eq!(authoritative_wait_terminal_surface(&blocked, None, 10_000), None);
+    for continuation in [
+        ContinuationDisposition::ModelRequired,
+        ContinuationDisposition::SurfaceExistingResult,
+    ] {
+        let blocked = SamplingConvergenceDecision {
+            continuation,
+            authoritative_wait: Some(AuthoritativeWaitResolution::Blocked(
+                authoritative_wait_result(Some("must not surface")),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(authoritative_wait_terminal_surface(&blocked, None, 10_000), None);
+    }
 }
 
 fn run_turn_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
@@ -5475,6 +5443,12 @@ async fn drain_in_flight_persists_each_ordered_output_before_later_tools_finish(
         .await
         .expect("the drain task should join")
         .expect("both tool outputs should be delivered");
+    let history = session.clone_history().await;
+    let outputs = history.raw_items().iter().filter_map(|item| match item {
+        ResponseItem::ToolSearchOutput { call_id, .. } => call_id.as_deref(),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(outputs, vec!["first", "second"]);
 }
 
 #[tokio::test]
@@ -6066,10 +6040,11 @@ async fn initial_response_item_triggers_compaction_before_the_stream_request_imp
 
     test.submit_turn("seed committed history near the compaction limit")
         .await?;
-    while tokio::time::timeout(Duration::from_millis(10), test.codex.next_event())
-        .await
-        .is_ok()
-    {}
+    while let Ok(event) =
+        tokio::time::timeout(Duration::from_millis(10), test.codex.next_event()).await
+    {
+        event.expect("seed turn event stream remains open");
+    }
     test.codex
         .submit(Op::UserInput {
             items: Vec::new(),
@@ -6185,10 +6160,11 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
     let test = builder.build(&server).await?;
 
     test.submit_turn("seed committed history").await?;
-    while tokio::time::timeout(Duration::from_millis(10), test.codex.next_event())
-        .await
-        .is_ok()
-    {}
+    while let Ok(event) =
+        tokio::time::timeout(Duration::from_millis(10), test.codex.next_event()).await
+    {
+        event.expect("seed turn event stream remains open");
+    }
     pending_plan_builds.store(0, Ordering::SeqCst);
     test.codex
         .submit(Op::UserInput {
@@ -6213,25 +6189,29 @@ async fn oversized_pending_input_compacts_once_when_committed_history_is_also_ov
         .as_str()
         .expect("final request turn id")
         .to_string();
-    loop {
-        match test.codex.next_event().await.expect("turn event").msg {
-            EventMsg::Error(error) => {
-                panic!(
-                    "oversized pending-input turn failed during compaction: {}",
-                    error.message
-                )
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match test.codex.next_event().await.expect("turn event").msg {
+                EventMsg::Error(error) => {
+                    panic!(
+                        "oversized pending-input turn failed during compaction: {}",
+                        error.message
+                    )
+                }
+                EventMsg::TurnComplete(turn) if submitted_turn_id == turn.turn_id => {
+                    assert!(
+                        turn.error.is_none(),
+                        "oversized pending-input turn completed with an error: {:?}",
+                        turn.error
+                    );
+                    break;
+                }
+                _ => {}
             }
-            EventMsg::TurnComplete(turn) if submitted_turn_id == turn.turn_id => {
-                assert!(
-                    turn.error.is_none(),
-                    "oversized pending-input turn completed with an error: {:?}",
-                    turn.error
-                );
-                break;
-            }
-            _ => {}
         }
-    }
+    })
+    .await
+    .expect("the pending-input turn should complete after compaction");
 
     assert_eq!(
         request_log.requests().len(),

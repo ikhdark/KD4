@@ -732,7 +732,9 @@ mod tests {
         };
         assert_eq!(error.to_string(), "extension cancelled");
 
-        let completed = rx.recv().await.expect("item completed event");
+        let completed = rx
+            .try_recv()
+            .expect("item completed event must be queued before the handler returns");
         let EventMsg::ItemCompleted(completed) = completed.msg else {
             panic!("expected item completed event");
         };
@@ -741,11 +743,15 @@ mod tests {
             panic!("expected completed image generation item");
         };
         assert_eq!(completed_item.status, "failed");
-        let end = rx.recv().await.expect("legacy end event");
+        assert_eq!(completed_item.id, "call-extension-cancel");
+        let end = rx
+            .try_recv()
+            .expect("legacy end event must be queued before the handler returns");
         let EventMsg::ImageGenerationEnd(end) = end.msg else {
             panic!("expected image generation end event");
         };
         assert_eq!(end.status, "failed");
+        assert_eq!(end.call_id, "call-extension-cancel");
     }
 
     #[tokio::test]

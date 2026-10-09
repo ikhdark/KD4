@@ -288,20 +288,39 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn server_event_has_only_supported_outbound_variants() {
-        fn event_kind(event: ServerEvent) -> &'static str {
-            match event {
-                ServerEvent::ServerMessage { .. } => "server_message",
-                ServerEvent::ServerMessageChunk { .. } => "server_message_chunk",
-                ServerEvent::Pong { .. } => "pong",
-            }
+    fn server_events_serialize_wire_variants_and_segment_cursors() {
+        let cases = [
+            (
+                ServerEvent::ServerMessage {
+                    message: Box::new(OutgoingMessage::Response(crate::outgoing_message::OutgoingResponse {
+                        id: codex_app_server_protocol::RequestId::Integer(7),
+                        result: serde_json::json!({"ok": true}),
+                    })),
+                },
+                None,
+                serde_json::json!({"type": "server_message", "message": {"id": 7, "result": {"ok": true}}}),
+            ),
+            (
+                ServerEvent::ServerMessageChunk {
+                    segment_id: 1,
+                    segment_count: 2,
+                    message_size_bytes: 4,
+                    message_chunk_base64: "eHk=".to_string(),
+                },
+                Some(1),
+                serde_json::json!({"type": "server_message_chunk", "segment_id": 1, "segment_count": 2,
+                    "message_size_bytes": 4, "message_chunk_base64": "eHk="}),
+            ),
+            (
+                ServerEvent::Pong { status: PongStatus::Active },
+                None,
+                serde_json::json!({"type": "pong", "status": "active"}),
+            ),
+        ];
+        for (event, segment_id, expected) in cases {
+            assert_eq!(event.segment_id(), segment_id);
+            assert_eq!(serde_json::to_value(event).expect("serialize event"), expected);
         }
-
-        let event = ServerEvent::Pong {
-            status: PongStatus::Active,
-        };
-        assert_eq!(event.segment_id(), None);
-        assert_eq!(event_kind(event), "pong");
     }
 
     #[test]

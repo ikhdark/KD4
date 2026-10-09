@@ -20,23 +20,32 @@ mod tests {
 
     #[test]
     fn turn_transition_error_is_detected() {
-        let error = JSONRPCErrorError {
-            code: -1,
-            message: "client request resolved because the turn state was changed".to_string(),
-            data: Some(json!({ "reason": "turnTransition" })),
-        };
-
-        assert_eq!(is_turn_transition_server_request_error(&error), true);
-    }
-
-    #[test]
-    fn unrelated_error_is_not_detected() {
-        let error = JSONRPCErrorError {
-            code: -1,
-            message: "boom".to_string(),
-            data: Some(json!({ "reason": "other" })),
-        };
-
-        assert_eq!(is_turn_transition_server_request_error(&error), false);
+        for (data, expected) in [
+            (Some(json!({ "reason": "turnTransition" })), true),
+            (Some(json!({ "reason": "other" })), false),
+            (Some(json!({ "reason": null })), false),
+            (Some(json!({ "reason": true })), false),
+            (Some(json!({})), false),
+            (Some(json!("turnTransition")), false),
+            (None, false),
+        ] {
+            // Classification must depend on structured data, not human-readable
+            // text or a generic error code shared by unrelated failures.
+            for message in [
+                "boom",
+                "client request resolved because the turn state was changed",
+            ] {
+                let error = JSONRPCErrorError {
+                    code: -1,
+                    message: message.to_string(),
+                    data: data.clone(),
+                };
+                assert_eq!(
+                    is_turn_transition_server_request_error(&error),
+                    expected,
+                    "{error:?}"
+                );
+            }
+        }
     }
 }

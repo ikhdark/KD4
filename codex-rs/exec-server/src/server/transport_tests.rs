@@ -24,28 +24,15 @@ use crate::protocol::InitializeParams;
 use crate::protocol::InitializeResponse;
 
 #[test]
-fn parse_listen_url_accepts_default_websocket_url() {
-    let transport = parse_listen_url(DEFAULT_LISTEN_URL).expect("default listen URL should parse");
-    assert_eq!(
-        transport,
-        ExecServerListenTransport::WebSocket(
-            "127.0.0.1:0"
-                .parse::<SocketAddr>()
-                .expect("valid socket address")
-        )
-    );
-}
-
-#[test]
-fn parse_listen_url_accepts_stdio() {
-    let transport = parse_listen_url("stdio").expect("stdio listen URL should parse");
-    assert_eq!(transport, ExecServerListenTransport::Stdio);
-}
-
-#[test]
-fn parse_listen_url_accepts_stdio_url() {
-    let transport = parse_listen_url("stdio://").expect("stdio listen URL should parse");
-    assert_eq!(transport, ExecServerListenTransport::Stdio);
+fn parse_listen_url_accepts_supported_transports() {
+    for (url, expected) in [
+        (DEFAULT_LISTEN_URL, ExecServerListenTransport::WebSocket("127.0.0.1:0".parse::<SocketAddr>().unwrap())),
+        ("ws://127.0.0.1:1234", ExecServerListenTransport::WebSocket("127.0.0.1:1234".parse::<SocketAddr>().unwrap())),
+        ("stdio", ExecServerListenTransport::Stdio),
+        ("stdio://", ExecServerListenTransport::Stdio),
+    ] {
+        assert_eq!(parse_listen_url(url), Ok(expected), "{url}");
+    }
 }
 
 #[tokio::test]
@@ -92,10 +79,8 @@ async fn stdio_listen_transport_serves_initialize() {
     assert_eq!(id, RequestId::Integer(1));
     let initialize_response: InitializeResponse =
         serde_json::from_value(result).expect("initialize response should decode");
-    assert!(
-        !initialize_response.session_id.is_empty(),
-        "initialize should return a session id"
-    );
+    uuid::Uuid::parse_str(&initialize_response.session_id)
+        .expect("initialize should return a UUID session id");
 
     let initialized = JSONRPCMessage::Notification(JSONRPCNotification {
         method: INITIALIZED_METHOD.to_string(),
@@ -113,37 +98,13 @@ async fn stdio_listen_transport_serves_initialize() {
 }
 
 #[test]
-fn parse_listen_url_accepts_websocket_url() {
-    let transport =
-        parse_listen_url("ws://127.0.0.1:1234").expect("websocket listen URL should parse");
-    assert_eq!(
-        transport,
-        ExecServerListenTransport::WebSocket(
-            "127.0.0.1:1234"
-                .parse::<SocketAddr>()
-                .expect("valid socket address")
-        )
-    );
-}
-
-#[test]
-fn parse_listen_url_rejects_invalid_websocket_url() {
-    let err = parse_listen_url("ws://localhost:1234")
-        .expect_err("hostname bind address should be rejected");
-    assert_eq!(
-        err.to_string(),
-        "invalid websocket --listen URL `ws://localhost:1234`; expected `ws://IP:PORT`"
-    );
-}
-
-#[test]
-fn parse_listen_url_rejects_unsupported_url() {
-    let err =
-        parse_listen_url("http://127.0.0.1:1234").expect_err("unsupported scheme should fail");
-    assert_eq!(
-        err.to_string(),
-        "unsupported --listen URL `http://127.0.0.1:1234`; expected `ws://IP:PORT` or `stdio`"
-    );
+fn parse_listen_url_rejects_invalid_and_unsupported_urls() {
+    for (url, message) in [
+        ("ws://localhost:1234", "invalid websocket --listen URL `ws://localhost:1234`; expected `ws://IP:PORT`"),
+        ("http://127.0.0.1:1234", "unsupported --listen URL `http://127.0.0.1:1234`; expected `ws://IP:PORT` or `stdio`"),
+    ] {
+        assert_eq!(parse_listen_url(url).unwrap_err().to_string(), message);
+    }
 }
 
 async fn write_jsonrpc_line(writer: &mut tokio::io::DuplexStream, message: &JSONRPCMessage) {

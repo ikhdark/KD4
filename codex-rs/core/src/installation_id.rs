@@ -61,8 +61,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_installation_id_generates_and_persists_uuid() {
         let codex_home = TempDir::new().expect("create temp dir");
-        let codex_home_abs = codex_home.path().abs();
-        let persisted_path = codex_home.path().join(INSTALLATION_ID_FILENAME);
+        let home = codex_home.path().join("nested");
+        let codex_home_abs = home.abs();
+        let persisted_path = home.join(INSTALLATION_ID_FILENAME);
 
         let installation_id = resolve_installation_id(&codex_home_abs)
             .await
@@ -73,66 +74,47 @@ mod tests {
             installation_id
         );
         assert!(Uuid::parse_str(&installation_id).is_ok());
-    }
+        assert_eq!(
+            resolve_installation_id(&codex_home_abs).await.unwrap(),
+            installation_id,
+            "resolving a persisted identity must not rotate it"
+        );
 
-    #[tokio::test]
-    async fn resolve_installation_id_reuses_existing_uuid() {
-        let codex_home = TempDir::new().expect("create temp dir");
-        let codex_home_abs = codex_home.path().abs();
-        let existing = Uuid::new_v4().to_string().to_uppercase();
-        std::fs::write(
-            codex_home.path().join(INSTALLATION_ID_FILENAME),
-            existing.clone(),
-        )
-        .expect("write installation id");
+        // Existing IDs are normalized for callers but are not rewritten on disk.
+        let existing = format!("  {}\n", installation_id.to_uppercase());
+        std::fs::write(&persisted_path, &existing).expect("write installation id");
 
         let resolved = resolve_installation_id(&codex_home_abs)
             .await
             .expect("resolve installation id");
 
-        assert_eq!(
-            resolved,
-            Uuid::parse_str(existing.as_str())
-                .expect("parse existing installation id")
-                .to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_installation_id_replaces_oversized_record() {
-        let codex_home = TempDir::new().expect("create temp dir");
-        let existing = Uuid::new_v4().to_string();
-        let path = codex_home.path().join(INSTALLATION_ID_FILENAME);
-        std::fs::write(&path, format!("{existing}{}", " ".repeat(512 * 1024)))
-            .expect("write oversized record");
-        let resolved = resolve_installation_id(&codex_home.path().abs())
-            .await
-            .expect("replace oversized record");
-        assert_ne!(resolved, existing);
-        assert!(Uuid::parse_str(&resolved).is_ok());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), resolved);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 36);
+        assert_eq!(resolved, installation_id);
+        assert_eq!(std::fs::read_to_string(&persisted_path).unwrap(), existing);
     }
 
     #[tokio::test]
     async fn resolve_installation_id_rewrites_invalid_file_contents() {
         let codex_home = TempDir::new().expect("create temp dir");
-        let codex_home_abs = codex_home.path().abs();
-        std::fs::write(
-            codex_home.path().join(INSTALLATION_ID_FILENAME),
-            "not-a-uuid",
-        )
-        .expect("write invalid installation id");
-
-        let resolved = resolve_installation_id(&codex_home_abs)
-            .await
-            .expect("resolve installation id");
-
-        assert!(Uuid::parse_str(&resolved).is_ok());
-        assert_eq!(
-            std::fs::read_to_string(codex_home.path().join(INSTALLATION_ID_FILENAME))
-                .expect("read rewritten installation id"),
-            resolved
-        );
+        let existing = Uuid::new_v4().to_string();
+        let path = codex_home.path().join(INSTALLATION_ID_FILENAME);
+        for contents in [
+            String::new(),
+            "not-a-uuid".to_string(),
+            format!("{existing}{}", " ".repeat(512 * 1024)),
+        ] {
+            std::fs::write(&path, &contents).expect("write invalid record");
+            let resolved = resolve_installation_id(&codex_home.path().abs())
+                .await
+                .expect("replace invalid record");
+            assert_ne!(resolved, existing);
+            assert!(Uuid::parse_str(&resolved).is_ok());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), resolved);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 36);
+            assert_eq!(
+                resolve_installation_id(&codex_home.path().abs()).await.unwrap(),
+                resolved,
+                "repaired identity must survive the next resolution"
+            );
+        }
     }
 }

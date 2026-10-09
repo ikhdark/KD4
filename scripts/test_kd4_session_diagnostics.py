@@ -563,7 +563,7 @@ class SessionDiagnosticsTest(unittest.TestCase):
 
     def test_distributions_missing_fields_and_ranked_costs(self):
         with tempfile.TemporaryDirectory() as temp:
-            report = _report(Path(temp), [100, 200, 300, 400, 1000])
+            report = _report(Path(temp), [400, 1000, 100, 300, 200])
         cohort = report["sessionDiagnostics"]["cohorts"][0]
         self.assertEqual(cohort["population"], "repository_root")
         self.assertEqual(cohort["turns"], 5)
@@ -759,6 +759,11 @@ class SessionDiagnosticsTest(unittest.TestCase):
                 current = copy.deepcopy(baseline["sessionDiagnostics"])
                 current["coverageBlockers"][key] = 1
                 comparison = diagnostics.compare_diagnostics(current, baseline)
+                self.assertEqual(
+                    {row["metric"] for row in comparison["metrics"]},
+                    set(current["cohorts"][0]["metrics"]),
+                )
+                self.assertEqual(comparison["comparedStatistics"], 0)
                 self.assertTrue(
                     all(
                         row["reason"] == "incomplete_session_coverage"
@@ -864,7 +869,7 @@ class SessionDiagnosticsTest(unittest.TestCase):
                 str(root),
                 "--baseline",
                 str(baseline_path),
-                "--summary-json",
+                "--json",
             ]
             completed = subprocess.run(
                 command, capture_output=True, text=True, check=False
@@ -887,7 +892,9 @@ class SessionDiagnosticsTest(unittest.TestCase):
                 row = _elapsed_rows(json.loads(out.getvalue())["baselineComparison"])[0]
                 self.assertEqual(row.get("reason", row["status"]), expected)
             # An explicit gate turns the observational comparison into an exit
-            # status, and unavailable evidence is distinct from passing.
+            # status, and unavailable evidence is distinct from passing. Gates
+            # survive bounded summaries even when individual metrics are omitted.
+            summary_args = command[2:-1] + ["--summary-json"]
             for flags, status, code in (
                 ([], "regression", 1),
                 (["--comparison-threshold", "2"], "passed", 0),
@@ -896,7 +903,7 @@ class SessionDiagnosticsTest(unittest.TestCase):
                 out = io.StringIO()
                 with self.subTest(gate=flags), contextlib.redirect_stdout(out):
                     self.assertEqual(
-                        audit.main(command[2:] + flags + ["--gate-metric", "elapsedMs"]),
+                        audit.main(summary_args + flags + ["--gate-metric", "elapsedMs"]),
                         code,
                     )
                 gate = json.loads(out.getvalue())["baselineComparison"]["gate"]
@@ -904,7 +911,7 @@ class SessionDiagnosticsTest(unittest.TestCase):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(
-                    audit.main(command[2:] + ["--gate-metric", "finalAnswerRecall"]), 3
+                    audit.main(summary_args + ["--gate-metric", "finalAnswerRecall"]), 3
                 )
             for argv in (
                 command[2:] + ["--gate-metric", "bogus"],
@@ -920,6 +927,10 @@ class SessionDiagnosticsTest(unittest.TestCase):
                     audit.main(argv)
                 self.assertEqual(raised.exception.code, 2)
                 self.assertEqual(out.getvalue(), "")
+
+            self.assertEqual(
+                {path: path.read_bytes() for path in root.iterdir()}, original
+            )
 
     def test_regression_gate_uses_metric_direction_and_never_passes_missing_proof(self):
         def comparison(metric, *statuses):
@@ -1098,6 +1109,26 @@ class UsageEfficiencyTest(unittest.TestCase):
         for name in ("totalTokens", "outputTokens", "reasoningTokens", "physicalRequests"):
             self.assertIsNone(disabled["perTurn"][0]["diagnostics"]["metrics"][name])
 
+    def test_token_opt_out_disables_estimate_calibration_through_real_audit(self):
+        timing = _timing()
+        for request, (estimate, actual) in zip(timing["modelRequests"], ((12, 5), (4, 9))):
+            request["requestTokenCategories"].update(
+                localInputEstimate=estimate, providerInputTokens=actual,
+            )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            enabled = self._measured_report(root, timing=timing)
+            disabled = audit.analyze_session_path(root / "rollout.jsonl", root, include_tokens=False)
+        # Absolute errors add: |12 - 5| + |4 - 9| = 12; they do not cancel.
+        self.assertEqual(enabled["perTurn"][0]["diagnostics"]["metrics"]["inputEstimateAbsoluteErrorTokens"], 12)
+        diagnostic = disabled["perTurn"][0]["diagnostics"]
+        self.assertIsNone(diagnostic["metrics"]["inputEstimateAbsoluteErrorTokens"])
+        self.assertEqual(diagnostic["unavailableReasons"]["inputEstimateAbsoluteErrorTokens"], "token_computation_disabled")
+        self.assertEqual(disabled["sessionDiagnostics"]["metrics"]["inputEstimateAbsoluteErrorTokens"], {
+            "unit": "tokens", "samples": 0, "missing": 1,
+        })
+        self.assertEqual(diagnostic["metrics"]["modelActiveMs"], 600)
+
     def test_purpose_partition_rejects_cross_generation_duplicate_usage(self):
         timing = _timing()
         timing["modelRequests"][1]["tokenUsage"] = copy.deepcopy(timing["modelRequests"][0]["tokenUsage"])
@@ -1171,12 +1202,29 @@ class UsageEfficiencyTest(unittest.TestCase):
     def test_ranking_cache_and_full_json_are_consistent(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            report = self._measured_report(root, turns=12)
+            self._measured_report(root, turns=12)
+            source = root / "rollout.jsonl"
+            records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
+            for record in records:
+                payload = record.get("payload", {})
+                if payload.get("type") == "task_complete":
+                    factor = int(payload["turn_id"]) % 6 + 1
+                    for request in payload["timing"]["modelRequests"]:
+                        request["tokenUsage"] = {
+                            name: value * factor for name, value in request["tokenUsage"].items()
+                        }
+            source.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+            report = audit.analyze_session_path(source, root)
             efficiency = report["sessionDiagnostics"]["usageEfficiency"]
-            self.assertEqual(len(efficiency["rankedTurns"]), 10)
+            self.assertEqual(
+                [(row["turnId"], row["totalTokens"]) for row in efficiency["rankedTurns"]],
+                [("11", 1410), ("5", 1410), ("10", 1175), ("4", 1175),
+                 ("3", 940), ("9", 940), ("2", 705), ("8", 705), ("1", 470), ("7", 470)],
+            )
             self.assertEqual(efficiency["omittedRankedTurns"], 2)
-            for _ in range(2):
+            for expected in ("miss", "hit"):
                 cached = audit.analyze_session_path(root / "rollout.jsonl", root, cache_dir=root / "cache")
+                self.assertEqual(cached["analysisCache"]["status"], expected)
                 self.assertEqual(cached["sessionDiagnostics"]["usageEfficiency"], efficiency)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):

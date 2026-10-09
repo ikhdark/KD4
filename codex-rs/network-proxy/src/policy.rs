@@ -483,41 +483,22 @@ mod tests {
     }
 
     #[test]
-    fn normalize_host_lowercases_and_trims() {
-        assert_eq!(normalize_host("  ExAmPlE.CoM  "), "example.com");
-    }
-
-    #[test]
-    fn normalize_host_strips_port_for_host_port() {
-        assert_eq!(normalize_host("example.com:1234"), "example.com");
-    }
-
-    #[test]
-    fn normalize_host_preserves_unbracketed_ipv6() {
-        assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
-    }
-
-    #[test]
-    fn normalize_host_strips_trailing_dot() {
-        assert_eq!(normalize_host("example.com."), "example.com");
-        assert_eq!(normalize_host("ExAmPlE.CoM."), "example.com");
-    }
-
-    #[test]
-    fn normalize_host_strips_trailing_dot_with_port() {
-        assert_eq!(normalize_host("example.com.:443"), "example.com");
-    }
-
-    #[test]
-    fn normalize_host_strips_brackets_for_ipv6() {
-        assert_eq!(normalize_host("[::1]"), "::1");
-        assert_eq!(normalize_host("[::1]:443"), "::1");
-    }
-
-    #[test]
-    fn normalize_host_preserves_ipv6_scope_ids() {
-        assert_eq!(normalize_host("fe80::1%lo0"), "fe80::1%lo0");
-        assert_eq!(normalize_host("[fe80::1%lo0]"), "fe80::1%lo0");
-        assert_eq!(normalize_host("[fe80::1%25lo0]"), "fe80::1%lo0");
+    fn normalize_host_preserves_identity_across_authority_spellings() {
+        for (input, expected) in [
+            ("  ExAmPlE.CoM  ", "example.com"),
+            ("example.com:1234", "example.com"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("example.com.", "example.com"),
+            ("ExAmPlE.CoM.", "example.com"),
+            ("example.com.:443", "example.com"),
+            ("[::1]", "::1"),
+            ("[::1]:443", "::1"),
+            ("fe80::1%lo0", "fe80::1%lo0"),
+            ("[fe80::1%lo0]", "fe80::1%lo0"),
+            ("[fe80::1%25lo0]", "fe80::1%lo0"),
+        ] {
+            assert_eq!(normalize_host(input), expected, "{input}");
+            assert_eq!(normalize_host(expected), expected, "normalization is idempotent");
+        }
     }
 }

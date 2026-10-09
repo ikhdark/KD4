@@ -56,9 +56,10 @@ fn classifies_native_backend_errors() {
     let native: Box<dyn Error + Send + Sync> = Box::new(keyring::windows::Error(1312));
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     assert_eq!(
-        classify(&CredentialStoreError::new(keyring::Error::NoStorageAccess(
+        std::io::Error::from(CredentialStoreError::new(keyring::Error::NoStorageAccess(
             native
-        ))),
+        )))
+        .kind(),
         if cfg!(target_os = "linux") {
             ErrorKind::WouldBlock
         } else {

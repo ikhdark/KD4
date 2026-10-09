@@ -829,20 +829,6 @@ mod tests {
     use ratatui::style::Modifier;
 
     #[test]
-    fn completed_hook_with_warning_uses_default_bold_bullet() {
-        let entries = vec![HookOutputEntry {
-            kind: HookOutputEntryKind::Warning,
-            text: "Heads up from the hook".to_string(),
-        }];
-
-        let bullet = hook_completed_bullet(HookRunStatus::Completed, &entries);
-
-        assert_eq!(bullet.content.as_ref(), "•");
-        assert_eq!(bullet.style.fg, None);
-        assert!(bullet.style.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
     fn completed_hook_short_multiline_context_preserves_display_transcript_and_raw_lines() {
         let cell = completed_hook_cell(
             HookEventName::SessionStart,
@@ -925,9 +911,10 @@ mod tests {
             );
 
             let display = line_texts(&cell.display_lines(/*width*/ 20));
-            assert!(
-                display.iter().any(|line| line == "    fifth"),
-                "expected {kind:?} output to remain complete: {display:?}"
+            assert_eq!(
+                display[2..],
+                ["    second", "    third", "    fourth", "    fifth"],
+                "expected {kind:?} output to remain complete",
             );
             assert!(
                 display
@@ -949,6 +936,9 @@ mod tests {
             }],
         );
 
+        let bullet = &cell.display_lines(80)[0].spans[0];
+        assert_eq!(bullet.content.as_ref(), "•");
+        assert_eq!(bullet.style, Style::default().add_modifier(Modifier::BOLD));
         assert_eq!(
             line_texts(&cell.display_lines(/*width*/ 80)),
             vec![
@@ -960,54 +950,28 @@ mod tests {
     }
 
     #[test]
-    fn pending_hook_does_not_animate_transcript() {
-        let cell =
-            HookCell::new_active(hook_run_summary("hook-1"), /*animations_enabled*/ true);
-
-        assert_eq!(cell.transcript_animation_tick(), None);
-    }
-
-    #[test]
-    fn visible_hook_animates_transcript_when_animations_enabled() {
-        let mut cell =
-            HookCell::new_active(hook_run_summary("hook-1"), /*animations_enabled*/ true);
-        cell.reveal_running_runs_now_for_test();
-        cell.advance_time(Instant::now());
-
-        assert_eq!(cell.transcript_animation_tick(), Some(0));
-    }
-
-    #[test]
-    fn visible_hook_does_not_animate_transcript_when_animations_disabled() {
-        let mut cell = HookCell::new_active(
-            hook_run_summary("hook-1"),
-            /*animations_enabled*/ false,
-        );
-        cell.reveal_running_runs_now_for_test();
-        cell.advance_time(Instant::now());
-
-        assert_eq!(cell.transcript_animation_tick(), None);
-    }
-
-    #[test]
-    fn visible_hook_without_animations_omits_spinner() {
-        let mut cell = HookCell::new_active(
-            hook_run_summary("hook-1"),
-            /*animations_enabled*/ false,
-        );
-        cell.reveal_running_runs_now_for_test();
-        cell.advance_time(Instant::now());
-
-        let rendered: Vec<String> = cell
-            .display_lines(/*width*/ 80)
-            .iter()
-            .map(line_text)
-            .collect();
-
-        assert_eq!(
-            rendered,
-            vec!["Running PostToolUse hook: checking output policy".to_string()]
-        );
+    fn hook_animation_tracks_visibility_and_animation_setting() {
+        for animations_enabled in [false, true] {
+            let mut cell = HookCell::new_active(hook_run_summary("hook-1"), animations_enabled);
+            assert_eq!(cell.transcript_animation_tick(), None);
+            assert!(cell.display_lines(80).is_empty());
+            let deadline = cell.next_timer_deadline().expect("pending reveal deadline");
+            assert!(!cell.advance_time(deadline - Duration::from_millis(1)));
+            assert_eq!(cell.transcript_animation_tick(), None);
+            assert!(cell.advance_time(deadline));
+            assert!(!cell.advance_time(deadline));
+            assert_eq!(cell.transcript_animation_tick().is_some(), animations_enabled);
+            if !animations_enabled {
+                assert_eq!(
+                    line_texts(&cell.display_lines(80)),
+                    ["Running PostToolUse hook: checking output policy"],
+                );
+            }
+            let mut completed = hook_run_summary("hook-1");
+            completed.status = HookRunStatus::Failed;
+            assert!(cell.complete_run(completed));
+            assert_eq!(cell.transcript_animation_tick(), None);
+        }
     }
 
     fn completed_hook_cell(

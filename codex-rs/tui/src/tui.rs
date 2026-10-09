@@ -105,27 +105,15 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn unfocused_notification_condition_is_suppressed_when_focused() {
-        assert!(!should_emit_notification(
-            NotificationCondition::Unfocused,
-            /*terminal_focused*/ true
-        ));
-    }
-
-    #[test]
-    fn always_notification_condition_emits_when_focused() {
-        assert!(should_emit_notification(
-            NotificationCondition::Always,
-            /*terminal_focused*/ true
-        ));
-    }
-
-    #[test]
-    fn unfocused_notification_condition_emits_when_unfocused() {
-        assert!(should_emit_notification(
-            NotificationCondition::Unfocused,
-            /*terminal_focused*/ false
-        ));
+    fn notification_conditions_respect_terminal_focus() {
+        for (condition, focused, expected) in [
+            (NotificationCondition::Unfocused, true, false),
+            (NotificationCondition::Unfocused, false, true),
+            (NotificationCondition::Always, true, true),
+            (NotificationCondition::Always, false, true),
+        ] {
+            assert_eq!(should_emit_notification(condition, focused), expected);
+        }
     }
 
     #[test]

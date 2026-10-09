@@ -15,7 +15,10 @@ fn serialization_accepts_exact_limit_and_rejects_next_byte() {
         params: None,
     });
     let expected = frame_jsonrpc_message(&message).unwrap();
-    let payload_len = expected.len() - super::LENGTH_PREFIX_BYTES;
+    let payload = serde_json::to_vec(&message).unwrap();
+    assert_eq!(&expected[..4], &(payload.len() as u32).to_be_bytes());
+    assert_eq!(&expected[4..], payload.as_slice());
+    let payload_len = payload.len();
     assert_eq!(
         super::frame_jsonrpc_message_with_limit(&message, payload_len).unwrap(),
         expected
@@ -72,6 +75,7 @@ fn releases_large_reassembly_capacity_after_delivery() {
         )),
     });
     let framed = frame_jsonrpc_message(&message).unwrap();
+    assert!(framed.len() > super::MAX_RETAINED_BUFFER_CAPACITY);
     let mut decoder = JsonRpcMessageDecoder::default();
     let mut decoded = Vec::new();
     for record in framed.chunks(NOISE_RECORD_PLAINTEXT_LEN) {
@@ -82,35 +86,15 @@ fn releases_large_reassembly_capacity_after_delivery() {
 }
 
 #[test]
-fn fragments_and_reassembles_large_jsonrpc_message() {
-    let message = JSONRPCMessage::Notification(JSONRPCNotification {
-        method: "large/test".to_string(),
-        params: Some(serde_json::json!({
-            "data": "x".repeat(128 * 1024),
-        })),
-    });
-    let framed = frame_jsonrpc_message(&message).unwrap();
-    assert!(framed.len() > 128 * 1024);
-
-    let mut decoder = JsonRpcMessageDecoder::default();
-    let mut decoded = Vec::new();
-    for record in framed.chunks(NOISE_RECORD_PLAINTEXT_LEN) {
-        decoded.extend(decoder.push(record).unwrap());
+fn rejects_invalid_declared_message_lengths_without_payload() {
+    for length in [0, MAX_JSONRPC_MESSAGE_LEN as u32 + 1] {
+        let mut decoder = JsonRpcMessageDecoder::default();
+        assert!(matches!(
+            decoder.push(&length.to_be_bytes()),
+            Err(ExecServerError::Protocol(message))
+                if message == "Noise relay JSON-RPC message has invalid length"
+        ), "declared length {length}");
     }
-
-    assert_eq!(decoded, vec![message]);
-}
-
-#[test]
-fn rejects_declared_message_length_above_limit_without_payload() {
-    let mut decoder = JsonRpcMessageDecoder::default();
-    let declared_len = (MAX_JSONRPC_MESSAGE_LEN as u32 + 1).to_be_bytes();
-
-    assert!(matches!(
-        decoder.push(&declared_len),
-        Err(ExecServerError::Protocol(message))
-            if message == "Noise relay JSON-RPC message has invalid length"
-    ));
 }
 
 #[test]

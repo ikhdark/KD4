@@ -77,6 +77,19 @@ mod tests {
             KeyCode::Char('D'),
             KeyModifiers::CONTROL,
         )));
+        for character in ['c', 'd'] {
+            assert!(!side_return_shortcut_matches(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+            for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+                assert!(!side_return_shortcut_matches(KeyEvent::new_with_kind(
+                    KeyCode::Char(character),
+                    KeyModifiers::CONTROL,
+                    kind,
+                )));
+            }
+        }
         assert!(!side_return_shortcut_matches(KeyEvent::new_with_kind(
             KeyCode::Esc,
             KeyModifiers::NONE,

@@ -190,46 +190,6 @@ fn completed_task_with_validation(
 }
 
 #[test]
-fn completed_receipt_without_validation_is_not_first_pass_success() {
-    let task = completed_task_with_validation(&[], &[]);
-
-    assert!(!super::terminal_input(&task).first_pass_validation_succeeded);
-}
-
-#[test]
-fn completed_receipt_with_succeeded_validation_is_first_pass_success() {
-    let task = completed_task_with_validation(
-        &["validation-1"],
-        &[("validation-1", ValidationCallStatus::Succeeded)],
-    );
-
-    assert!(super::terminal_input(&task).first_pass_validation_succeeded);
-}
-
-#[test]
-fn succeeded_status_without_current_result_is_not_first_pass_validation() {
-    let mut task = completed_task_with_validation(
-        &["validation-1"],
-        &[("validation-1", ValidationCallStatus::Succeeded)],
-    );
-    task.validation_calls[0].evidence.validation_result = None;
-
-    assert!(!super::terminal_input(&task).first_pass_validation_succeeded);
-}
-
-#[test]
-fn missing_or_failed_validation_is_not_first_pass_success() {
-    let missing = completed_task_with_validation(&["validation-1"], &[]);
-    let failed = completed_task_with_validation(
-        &["validation-1"],
-        &[("validation-1", ValidationCallStatus::Failed)],
-    );
-
-    assert!(!super::terminal_input(&missing).first_pass_validation_succeeded);
-    assert!(!super::terminal_input(&failed).first_pass_validation_succeeded);
-}
-
-#[test]
 fn drift_telemetry_uses_only_the_exact_observed_risk_reason() {
     let mut hint_only = completed_task_with_validation(&[], &[]);
     hint_only.assignment.risk_hints = vec!["watch for concurrent drift".to_string()];
@@ -519,12 +479,22 @@ fn recorder_checks_usage_overflow_before_committing_an_event() {
         recorder.record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 1, 0),
         Err(MetricsError::ArithmeticOverflow)
     );
+    assert_eq!(
+        recorder.record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, 0, 1),
+        Err(MetricsError::ArithmeticOverflow)
+    );
     assert_eq!(recorder.recorded_events(), 1);
+    let metrics = recorder
+        .finish(Duration::from_secs(1), terminal_input())
+        .expect("overflow must leave the previous totals intact")
+        .expect("terminal metrics");
+    assert_eq!(metrics.total_usage, UsageTotals { tokens: u64::MAX, calls: u64::MAX });
 }
 
 #[test]
 fn store_enums_convert_to_closed_metric_labels() {
     for (role, expected) in [
+        (AgentRole::Architect, RoleLabel::Architect),
         (AgentRole::Explorer, RoleLabel::Explorer),
         (AgentRole::Worker, RoleLabel::Worker),
         (AgentRole::Reviewer, RoleLabel::Reviewer),
@@ -629,6 +599,7 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
     assert_eq!(
         [
             RoleLabel::Root.as_str(),
+            RoleLabel::Architect.as_str(),
             RoleLabel::Explorer.as_str(),
             RoleLabel::Worker.as_str(),
             RoleLabel::Reviewer.as_str(),
@@ -638,6 +609,7 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
         ],
         [
             "root",
+            "architect",
             "explorer",
             "worker",
             "reviewer",
@@ -699,6 +671,25 @@ fn first_pass_validation_rejects_stale_or_mismatched_structured_evidence() {
         &[("validation-1", ValidationCallStatus::Succeeded)],
     );
     assert!(super::terminal_input(&task).first_pass_validation_succeeded);
+    for (case, invalid) in [
+        ("no validation", completed_task_with_validation(&[], &[])),
+        ("missing call", completed_task_with_validation(&["validation-1"], &[])),
+        (
+            "failed call",
+            completed_task_with_validation(
+                &["validation-1"],
+                &[("validation-1", ValidationCallStatus::Failed)],
+            ),
+        ),
+    ] {
+        assert!(
+            !super::terminal_input(&invalid).first_pass_validation_succeeded,
+            "{case} must not establish first-pass validation"
+        );
+    }
+    let mut missing_result = task.clone();
+    missing_result.validation_calls[0].evidence.validation_result = None;
+    assert!(!super::terminal_input(&missing_result).first_pass_validation_succeeded);
     let mut stale = task.clone();
     stale.validation_calls[0].evidence.end_epoch = Some(1);
     assert!(!super::terminal_input(&stale).first_pass_validation_succeeded);

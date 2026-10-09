@@ -1674,9 +1674,9 @@ fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey
     }
     let entry = attempt_entry_locked(state, key);
     entry.last_exit_code = Some(exit_code);
+    entry.deterministic_failure = None;
     if exit_code == 0 {
         entry.consecutive_failures = 0;
-        entry.deterministic_failure = None;
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     }
@@ -1805,7 +1805,6 @@ pub(crate) fn persist_synced_file(
 mod tests {
     use super::*;
     use std::process::Command;
-    use tokio_util::sync::CancellationToken;
 
     fn key(command: &str) -> CommandAttemptKey {
         let cwd = if cfg!(windows) { "C:/repo" } else { "/repo" };
@@ -2303,42 +2302,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_before_watcher_registration_is_observed_once() {
-        let ledger = CommandExecutionLedger::default();
-        let execution_id = ledger.allocate_execution_id();
-        let parent = ToolExecutionId("tool-execution-sticky".to_string());
-        ledger
-            .track_running_process_with_execution_id(
-                execution_id,
-                parent.clone(),
-                73,
-                key("sticky-exit"),
-                RawOutputArtifact::unavailable("sticky exit"),
-                uuid::Uuid::new_v4(),
-            )
-            .await
-            .expect("track running process");
-        let exit = CancellationToken::new();
-        exit.cancel();
-
-        // CancellationToken is sticky: registering after exit must still wake.
-        exit.cancelled().await;
-        assert_eq!(
-            ledger
-                .mark_process_exited(73, execution_id, &parent, 0)
-                .await,
-            CompletionApplyResult::Applied
-        );
-        assert_eq!(
-            ledger
-                .mark_process_exited(73, execution_id, &parent, 0)
-                .await,
-            CompletionApplyResult::AlreadyApplied
-        );
-        assert!(ledger.running_process(73).await.is_none());
-    }
-
-    #[tokio::test]
     async fn input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses() {
         let temp = tempfile::tempdir().unwrap();
         let repository = temp.path().join("repo");
@@ -2438,25 +2401,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unclassified_and_retryable_failures_are_never_suppressed() {
-        let classes = [
-            "unclassified-nonzero",
-            "timeout",
-            "lock",
-            "network",
-            "cancellation",
-            "resource-exhaustion",
-            "uncertain-crash",
-            "flaky",
-            "unknown",
-        ];
-        for class in classes {
+    async fn fresh_nonzero_exit_supersedes_an_input_determined_failure() {
+        for background in [false, true] {
             let ledger = CommandExecutionLedger::default();
-            let key = key(class);
+            let attempt = key("ordinary-command");
+            ledger.begin_attempt(&attempt, false).await.unwrap();
+            ledger.record_input_state_determined_failure(
+                &attempt,
+                InputStateDetermined::ApplyPatchImplicitInvocation,
+                RawOutputArtifact::unavailable("prior closed proof"),
+                -1,
+            ).await;
+            assert!(ledger.begin_attempt(&attempt, false).await.is_err());
+            ledger.begin_attempt_with_freshness(&attempt, false, true).await.unwrap();
+            if background {
+                ledger.track_running_process(
+                    42, attempt.clone(), RawOutputArtifact::unavailable("fresh execution"),
+                ).await.unwrap();
+                assert!(ledger.finish_running_process(42, Some(7)).await.accepted());
+            } else {
+                ledger.record_exit(&attempt, 7).await;
+            }
+            // An observed ordinary failure is not the old pre-execution rejection.
+            // The closed proof contract requires ordinary command failures to stay retryable.
+            ledger.begin_attempt(&attempt, false).await
+                .expect("fresh ordinary failure supersedes the old diagnosis");
+            let state = ledger.state.lock().await;
+            assert!(!state.retry.input_failures.contains_key(&attempt.fingerprint()));
+            assert_eq!(state.retry.attempts[&attempt].last_exit_code, Some(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_nonzero_exit_codes_remain_retryable() {
+        for exit_code in [-1, 1, 2, 124, 130, 137] {
+            let ledger = CommandExecutionLedger::default();
+            let key = key("ordinary-command");
             ledger.begin_attempt(&key, false).await.expect("first run");
-            ledger.record_exit(&key, 1).await;
+            ledger.record_exit(&key, exit_code).await;
             ledger.begin_attempt(&key, false).await.expect("retry runs");
-            ledger.record_exit(&key, 1).await;
+            ledger.record_exit(&key, exit_code).await;
             ledger
                 .begin_attempt(&key, false)
                 .await
@@ -2510,18 +2494,19 @@ mod tests {
             .await
             .expect("track running process");
 
-        assert!(
+        assert_eq!(
             ledger
                 .mark_running_process_completed(42, 7)
-                .await
-                .accepted()
+                .await,
+            CompletionApplyResult::Applied
         );
-        assert!(
+        assert_eq!(
             ledger
                 .mark_running_process_completed(42, 7)
-                .await
-                .accepted()
+                .await,
+            CompletionApplyResult::AlreadyApplied
         );
+        assert!(ledger.running_process(42).await.is_none());
         assert!(ledger.finish_running_process(42, Some(7)).await.accepted());
 
         let snapshot = ledger.snapshot(&key).await.expect("tracked entry");

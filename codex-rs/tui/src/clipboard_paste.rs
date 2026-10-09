@@ -276,9 +276,9 @@ mod pasted_paths_tests {
     }
 
     #[test]
-    fn normalize_file_url_windows() {
+    fn normalize_unquoted_windows_path() {
         let input = r"C:\Temp\example.png";
-        let result = normalize_pasted_path(input).expect("should parse file URL");
+        let result = normalize_pasted_path(input).expect("should preserve Windows path");
 
         let expected = PathBuf::from(r"C:\Temp\example.png");
         assert_eq!(result, expected);
@@ -292,17 +292,14 @@ mod pasted_paths_tests {
     }
 
     #[test]
-    fn normalize_simple_quoted_path_fallback() {
-        let input = "\"/home/user/My File.png\"";
-        let result = normalize_pasted_path(input).expect("should trim simple quotes");
-        assert_eq!(result, PathBuf::from("/home/user/My File.png"));
-    }
-
-    #[test]
-    fn normalize_single_quoted_unix_path() {
-        let input = "'/home/user/My File.png'";
-        let result = normalize_pasted_path(input).expect("should trim single quotes via shlex");
-        assert_eq!(result, PathBuf::from("/home/user/My File.png"));
+    fn normalize_quoted_unix_path() {
+        for input in ["\"/home/user/My File.png\"", "'/home/user/My File.png'"] {
+            assert_eq!(
+                normalize_pasted_path(input),
+                Some(PathBuf::from("/home/user/My File.png")),
+                "input: {input}"
+            );
+        }
     }
 
     #[test]
@@ -338,25 +335,18 @@ mod pasted_paths_tests {
     }
 
     #[test]
-    fn normalize_single_quoted_windows_path() {
-        let input = r"'C:\\Users\\Alice\\My File.jpeg'";
+    fn normalize_quoted_windows_path() {
         let unquoted = r"C:\\Users\\Alice\\My File.jpeg";
-        let result =
-            normalize_pasted_path(input).expect("should trim single quotes on windows path");
-
-        let expected = PathBuf::from(unquoted);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn normalize_double_quoted_windows_path() {
-        let input = r#""C:\\Users\\Alice\\My File.jpeg""#;
-        let unquoted = r"C:\\Users\\Alice\\My File.jpeg";
-        let result =
-            normalize_pasted_path(input).expect("should trim double quotes on windows path");
-
-        let expected = PathBuf::from(unquoted);
-        assert_eq!(result, expected);
+        for input in [
+            r"'C:\\Users\\Alice\\My File.jpeg'",
+            r#""C:\\Users\\Alice\\My File.jpeg""#,
+        ] {
+            assert_eq!(
+                normalize_pasted_path(input),
+                Some(PathBuf::from(unquoted)),
+                "input: {input}"
+            );
+        }
     }
 
     #[test]

@@ -124,12 +124,12 @@ mod tests {
     #[test]
     fn malformed_paths_fail_before_mutation() {
         for path in ["", "a..b", "a.", "\"unterminated", "a = 2\nb"] {
-            let mut root = default_empty_table();
-            assert!(
-                apply_toml_override(&mut root, path, TomlValue::Boolean(true)).is_err(),
-                "{path}"
-            );
-            assert_eq!(root, default_empty_table());
+            let original: TomlValue = toml::from_str("keep = 'existing'\n[a]\nb = 42").unwrap();
+            let mut root = original.clone();
+            let error = apply_toml_override(&mut root, path, TomlValue::Boolean(true))
+                .expect_err("malformed override must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{path}");
+            assert_eq!(root, original, "{path}");
         }
     }
 

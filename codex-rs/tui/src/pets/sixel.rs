@@ -303,7 +303,10 @@ mod tests {
         let sixel = encode_rgba(&rgba, /*width*/ 4, /*height*/ 1).unwrap();
         let sixel = String::from_utf8(sixel).unwrap();
 
-        assert!(sixel.contains("#224!4@"));
+        assert_eq!(
+            sixel,
+            format!("{EXPECTED_TRANSPARENT_BACKGROUND_DCS}\"1;1;4;1#224;2;100;0;0#224!4@\x1b\\")
+        );
     }
 
     #[test]

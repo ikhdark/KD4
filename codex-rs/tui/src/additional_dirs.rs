@@ -58,35 +58,21 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn returns_none_for_workspace_write() {
-        let profile = PermissionProfile::workspace_write();
+    fn returns_none_for_profiles_that_allow_additional_dirs() {
         let dirs = vec![PathBuf::from("/tmp/example")];
-        assert_eq!(
-            add_dir_warning_message(&dirs, &profile, Path::new("/tmp/project")),
-            None
-        );
-    }
-
-    #[test]
-    fn returns_none_for_danger_full_access() {
-        let profile = PermissionProfile::Disabled;
-        let dirs = vec![PathBuf::from("/tmp/example")];
-        assert_eq!(
-            add_dir_warning_message(&dirs, &profile, Path::new("/tmp/project")),
-            None
-        );
-    }
-
-    #[test]
-    fn returns_none_for_external_sandbox() {
-        let profile: PermissionProfile = PermissionProfile::External {
-            network: NetworkSandboxPolicy::Enabled,
-        };
-        let dirs = vec![PathBuf::from("/tmp/example")];
-        assert_eq!(
-            add_dir_warning_message(&dirs, &profile, Path::new("/tmp/project")),
-            None
-        );
+        for profile in [
+            PermissionProfile::workspace_write(),
+            PermissionProfile::Disabled,
+            PermissionProfile::External {
+                network: NetworkSandboxPolicy::Enabled,
+            },
+        ] {
+            assert_eq!(
+                add_dir_warning_message(&dirs, &profile, Path::new("/tmp/project")),
+                None,
+                "profile: {profile:?}"
+            );
+        }
     }
 
     #[test]

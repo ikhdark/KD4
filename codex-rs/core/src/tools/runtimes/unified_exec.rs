@@ -708,41 +708,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_attempt_preserves_parent_sandbox_override() {
+    async fn first_attempt_preserves_requested_sandbox_permissions() {
         let manager = UnifiedExecProcessManager::default();
-        let request = test_request(
-            SandboxPermissions::RequireEscalated,
-            ExecApprovalRequirement::NeedsApproval {
-                reason: None,
-                proposed_execpolicy_amendment: None,
-            },
-        );
         let runtime = UnifiedExecRuntime::new(&manager);
-
-        assert_eq!(
-            runtime.sandbox_permissions(&request),
+        for permissions in [
+            SandboxPermissions::UseDefault,
             SandboxPermissions::RequireEscalated,
-            "unified exec should preserve a parent require_escalated request"
-        );
-    }
-
-    #[tokio::test]
-    async fn first_attempt_preserves_additional_permissions_request() {
-        let manager = UnifiedExecProcessManager::default();
-        let request = test_request(
             SandboxPermissions::WithAdditionalPermissions,
-            ExecApprovalRequirement::NeedsApproval {
-                reason: None,
-                proposed_execpolicy_amendment: None,
-            },
-        );
-        let runtime = UnifiedExecRuntime::new(&manager);
-
-        assert_eq!(
-            runtime.sandbox_permissions(&request),
-            SandboxPermissions::WithAdditionalPermissions,
-            "unified exec should keep bounded additional-permissions requests sandboxed"
-        );
+        ] {
+            let request = test_request(
+                permissions,
+                ExecApprovalRequirement::NeedsApproval {
+                    reason: None,
+                    proposed_execpolicy_amendment: None,
+                },
+            );
+            assert_eq!(runtime.sandbox_permissions(&request), permissions);
+        }
     }
 
     #[tokio::test]

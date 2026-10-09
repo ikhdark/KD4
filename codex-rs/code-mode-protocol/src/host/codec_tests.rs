@@ -103,64 +103,32 @@ mod nested_deadline_transport {
         }
     }
 
-    /// The receiver must recover the sender's remaining budget, not restart it.
+    /// Delivery consumes the original budget; repeated decoding must not restart it.
     #[test]
-    fn a_delayed_delivery_is_charged_against_the_original_budget() {
-        let sent = invocation(Some(Instant::now() + Duration::from_millis(1_000)));
-        let wire = WireNestedToolCall::from(sent);
-        assert!(
-            wire.deadline_shared_monotonic_nanos.is_some(),
-            "a supported platform must send the shared monotonic form"
-        );
-
-        // Stand in for transit time between the two processes.
-        std::thread::sleep(Duration::from_millis(250));
-
-        let received = CodeModeNestedToolCall::from(wire)
-            .nested_deadline
-            .expect("the deadline must survive the crossing");
-        let remaining = received.saturating_duration_since(Instant::now());
-        assert!(
-            remaining < Duration::from_millis(900),
-            "transit must be charged to the budget, not refunded: {remaining:?} left of 1000ms"
-        );
-        assert!(
-            remaining > Duration::from_millis(400),
-            "only the elapsed transit may be charged: {remaining:?} left of 1000ms"
-        );
-    }
-
-    /// The exchanged value is a monotonic reading, so re-reading the encoded
-    /// frame later cannot be moved by a wall-clock adjustment: the recovered
-    /// deadline depends only on the monotonic offset.
-    #[test]
-    fn a_wall_clock_adjustment_between_send_and_receipt_does_not_move_the_deadline() {
-        let wire = WireNestedToolCall::from(invocation(Some(
-            Instant::now() + Duration::from_millis(1_000),
-        )));
+    fn delayed_and_repeated_delivery_preserves_the_original_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let wire = WireNestedToolCall::from(invocation(Some(deadline)));
         let monotonic_deadline = wire
             .deadline_shared_monotonic_nanos
-            .expect("shared monotonic form");
-
-        // A wall-clock jump changes SystemTime but not the monotonic source the
-        // deadline is expressed on, so the same frame still decodes to the same
-        // remaining budget.
+            .expect("a supported platform must send the shared monotonic form");
         let first = CodeModeNestedToolCall::from(wire.clone())
             .nested_deadline
-            .expect("deadline");
+            .expect("first deadline");
+
+        // Stand in for transit time between the two processes. Comparing absolute
+        // deadlines, not remaining time, tolerates ordinary scheduler delays.
+        std::thread::sleep(Duration::from_millis(250));
         let second = CodeModeNestedToolCall::from(wire.clone())
             .nested_deadline
-            .expect("deadline");
-        let drift = second.saturating_duration_since(first);
-        assert!(
-            drift < Duration::from_millis(50),
-            "two receipts of one frame must agree on the deadline, drifted {drift:?}"
-        );
-        assert_eq!(
-            wire.deadline_shared_monotonic_nanos,
-            Some(monotonic_deadline),
-            "encoding must not mutate the monotonic reading"
-        );
+            .expect("second deadline");
+        for recovered in [first, second] {
+            let drift = recovered.duration_since(deadline).max(deadline.duration_since(recovered));
+            assert!(
+                drift < Duration::from_millis(50),
+                "delivery must neither refund nor prematurely consume the budget: {drift:?}"
+            );
+        }
+        assert_eq!(wire.deadline_shared_monotonic_nanos, Some(monotonic_deadline));
     }
 
     /// Without a shared source the fallback is charged from receipt. It does

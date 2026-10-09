@@ -217,23 +217,21 @@ mod tests {
     use tokio::time::Duration;
 
     #[tokio::test]
-    async fn run_executes_while_open() {
+    async fn run_executes_only_while_open() {
         let gate = ConnectionRpcGate::new();
         let ran = Arc::new(AtomicBool::new(/*v*/ false));
         let ran_clone = Arc::clone(&ran);
 
-        gate.run(async move {
-            ran_clone.store(/*val*/ true, Ordering::Release);
-        })
-        .await
-        .expect("handler should complete");
+        assert!(
+            gate.run(async move {
+                ran_clone.store(/*val*/ true, Ordering::Release);
+            })
+            .await
+            .expect("handler should complete")
+        );
 
         assert!(ran.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn run_drops_future_without_polling_after_close() {
-        let gate = ConnectionRpcGate::new();
+        assert_eq!(gate.inflight_count(), 0);
         gate.close().await;
         let polled = Arc::new(AtomicBool::new(/*v*/ false));
         let polled_clone = Arc::clone(&polled);
@@ -318,29 +316,44 @@ mod tests {
         let gate = Arc::new(ConnectionRpcGate::new());
         let cancellation = gate.cancellation_token();
         let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
         let gate_for_run = Arc::clone(&gate);
         let run_task = tokio::spawn(async move {
-            let _ = gate_for_run
+            gate_for_run
                 .run(async move {
                     started_tx.send(()).expect("receiver should be open");
-                    cancellation.cancelled().await;
+                    release_rx.await.expect("handler should be released");
                 })
-                .await;
+                .await
         });
 
         started_rx.await.expect("run should start");
-        assert_eq!(gate.shutdown_with_grace(Duration::from_secs(1)).await, 0);
-        run_task.await.expect("run task should complete");
+        let shutdown = gate.shutdown_with_grace(Duration::from_secs(1));
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        assert!(cancellation.is_cancelled());
+        assert_eq!(gate.inflight_count(), 1);
 
         let late_polled = Arc::new(AtomicBool::new(/*v*/ false));
         let late_polled_clone = Arc::clone(&late_polled);
-        let _ = gate
+        let accepted = gate
             .run(async move {
                 late_polled_clone.store(/*val*/ true, Ordering::Release);
             })
-            .await;
+            .await
+            .expect("closed gate must not spawn a late handler");
 
+        assert!(!accepted);
         assert!(!late_polled.load(Ordering::Acquire));
+        assert_eq!(gate.inflight_count(), 1);
+        release_tx.send(()).expect("original handler remains alive");
+        assert_eq!(shutdown.await, 0);
+        assert!(
+            run_task
+                .await
+                .expect("run task should complete")
+                .expect("original handler must not be aborted")
+        );
         assert_eq!(gate.inflight_count(), 0);
     }
 

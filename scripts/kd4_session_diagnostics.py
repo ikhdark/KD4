@@ -393,7 +393,12 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
             metrics["terminalGenerations"] = len({row["generationIndex"] for row in terminal})
         if all(_number(row.get("modelStreamWaitNs")) for row in terminal):
             metrics["terminalModelMs"] = sum(row["modelStreamWaitNs"] for row in terminal) / 1e6
-        categories = [row.get("requestTokenCategories", {}) for row in requests]
+        token_computation_disabled = turn.get("tokens", {}).get("enabled") is False
+        categories = [] if token_computation_disabled else [
+            row.get("requestTokenCategories", {}) for row in requests
+        ]
+        if token_computation_disabled:
+            reasons["inputEstimateAbsoluteErrorTokens"] = "token_computation_disabled"
         if categories and all(
             _number(row.get("localInputEstimate"))
             and _number(row.get("providerInputTokens")) for row in categories

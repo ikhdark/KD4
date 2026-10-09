@@ -1237,13 +1237,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn performance_probe_lossless_forwarding_uses_available_capacity() {
+    async fn lossless_forwarding_reuses_available_capacity() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let mut pending_delivery = VecDeque::new();
         let mut skipped_events = 0;
-        let mut deferred = 0;
-        let started = std::time::Instant::now();
-        for _ in 0..10_000 {
+        for _ in 0..4 {
             assert!(
                 forward_remote_event(
                     &event_tx,
@@ -1261,10 +1259,10 @@ mod tests {
                 .expect("forward event")
                 .is_none()
             );
-            while let Some(event) = pending_delivery.pop_front() {
-                deferred += 1;
-                event_tx.send(event).await.expect("deliver retained event");
-            }
+            assert!(
+                pending_delivery.is_empty(),
+                "available capacity must not require another worker pass"
+            );
             assert!(matches!(
                 event_rx.try_recv().expect("lossless event"),
                 AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
@@ -1272,15 +1270,7 @@ mod tests {
                 )) if notification.delta == "hello"
             ));
         }
-        eprintln!(
-            "remote: 10000 events, {deferred} deferred deliveries, {:?}",
-            started.elapsed()
-        );
         assert_eq!(skipped_events, 0);
-        assert_eq!(
-            deferred, 0,
-            "available capacity must not require another worker pass"
-        );
     }
 
     #[test]

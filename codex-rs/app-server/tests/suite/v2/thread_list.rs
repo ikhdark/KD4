@@ -384,7 +384,7 @@ async fn thread_list_pagination_next_cursor_none_on_last_page() -> Result<()> {
     create_minimal_config(codex_home.path())?;
 
     // Create three rollouts so we can paginate with limit=2.
-    let _a = create_fake_rollout(
+    let a = create_fake_rollout(
         codex_home.path(),
         "2025-01-02T12-00-00",
         "2025-01-02T12:00:00Z",
@@ -392,7 +392,7 @@ async fn thread_list_pagination_next_cursor_none_on_last_page() -> Result<()> {
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
-    let _b = create_fake_rollout(
+    let b = create_fake_rollout(
         codex_home.path(),
         "2025-01-01T13-00-00",
         "2025-01-01T13:00:00Z",
@@ -400,7 +400,7 @@ async fn thread_list_pagination_next_cursor_none_on_last_page() -> Result<()> {
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
-    let _c = create_fake_rollout(
+    let c = create_fake_rollout(
         codex_home.path(),
         "2025-01-01T12-00-00",
         "2025-01-01T12:00:00Z",
@@ -425,7 +425,13 @@ async fn thread_list_pagination_next_cursor_none_on_last_page() -> Result<()> {
         /*archived*/ None,
     )
     .await?;
-    assert_eq!(data1.len(), 2);
+    assert_eq!(
+        data1
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![a.as_str(), b.as_str()]
+    );
     for thread in &data1 {
         assert_eq!(thread.preview, "Hello");
         assert_eq!(thread.model_provider, "mock_provider");
@@ -453,7 +459,13 @@ async fn thread_list_pagination_next_cursor_none_on_last_page() -> Result<()> {
         /*archived*/ None,
     )
     .await?;
-    assert!(data2.len() <= 2);
+    assert_eq!(
+        data2
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![c.as_str()]
+    );
     for thread in &data2 {
         assert_eq!(thread.preview, "Hello");
         assert_eq!(thread.model_provider, "mock_provider");

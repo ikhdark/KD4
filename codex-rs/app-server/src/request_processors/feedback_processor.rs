@@ -312,6 +312,7 @@ mod tests {
     #[test]
     fn windows_sandbox_log_attachment_uses_current_log() {
         let codex_home = tempfile::tempdir().expect("create tempdir");
+        assert!(windows_sandbox_log_attachment(codex_home.path()).is_none());
         let sandbox_dir = codex_windows_sandbox::sandbox_dir(codex_home.path());
         std::fs::create_dir_all(&sandbox_dir).expect("create sandbox dir");
         let sandbox_log_path =

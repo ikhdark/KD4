@@ -260,11 +260,14 @@ fn complete_attribution_wins_consistently_and_incomplete_attribution_is_not_mixe
             {"thread_source":"subagent","turn_trigger":"goal","surface":"cli","model":"tiny","value":0.1}
         ]
     }]})).unwrap();
-    for grouping in [
-        Grouping::Feature,
-        Grouping::Model,
-        Grouping::Surface,
-        Grouping::TaskStart,
+    for (grouping, expected_values) in [
+        (Grouping::Feature, [("subagent", 0.1), ("user", 30.0)]),
+        (Grouping::Model, [("alpha", 30.0), ("tiny", 0.1)]),
+        (Grouping::Surface, [("cli", 0.1), ("desktop_app", 30.0)]),
+        (
+            Grouping::TaskStart,
+            [("start-composer", 30.0), ("start-goal", 0.1)],
+        ),
     ] {
         let normalized = history(response.clone(), Report::Usage, grouping, date, date)
             .unwrap()
@@ -276,6 +279,15 @@ fn complete_attribution_wins_consistently_and_incomplete_attribution_is_not_mixe
                 normalized.data[0].values.len()
             ),
             (AccountAnalyticsUnit::RelativeUsage, 30.1, 2)
+        );
+        assert_eq!(
+            normalized.data[0]
+                .values
+                .iter()
+                .map(|value| (value.key.as_str(), value.value))
+                .collect::<Vec<_>>(),
+            expected_values,
+            "grouping: {grouping:?}"
         );
     }
     let incomplete = serde_json::from_value(json!({"data":[

@@ -4,7 +4,6 @@ use anyhow::Result;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use std::path::PathBuf;
 
 #[test]
 fn started_notification_preserves_response_history_without_copying_it() -> Result<()> {
@@ -14,19 +13,33 @@ fn started_notification_preserves_response_history_without_copying_it() -> Resul
 
     for include_history in [false, true] {
         let cwd = test_path_buf("/tmp").abs();
-        let summary = ConversationSummary {
-            conversation_id: ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0")?,
-            timestamp: None,
-            updated_at: None,
-            path: PathBuf::new(),
+        let thread_id = ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0")?;
+        let mut thread = Thread {
+            project_id: None,
+            id: thread_id.to_string(),
+            extra: None,
+            session_id: thread_id.to_string(),
+            forked_from_id: None,
+            parent_thread_id: None,
             preview: "preview".to_string(),
+            ephemeral: false,
+            history_mode: Default::default(),
             model_provider: "test-provider".to_string(),
-            cwd: cwd.to_path_buf(),
+            created_at: 0,
+            updated_at: 0,
+            recency_at: None,
+            status: ThreadStatus::NotLoaded,
+            path: None,
+            cwd,
             cli_version: "test".to_string(),
-            source: codex_protocol::protocol::SessionSource::VSCode,
+            source: codex_app_server_protocol::SessionSource::VsCode,
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
             git_info: None,
+            name: None,
+            turns: Vec::new(),
         };
-        let mut thread = summary_to_thread(summary, &cwd);
         if include_history {
             thread.turns.push(Turn {
                 id: "turn-1".to_string(),
@@ -59,21 +72,8 @@ fn started_notification_preserves_response_history_without_copying_it() -> Resul
 }
 
 #[test]
-fn extract_conversation_summary_prefers_plain_user_messages() -> Result<()> {
-    let conversation_id = ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0")?;
-    let timestamp = Some("2025-09-05T16:53:11.850Z".to_string());
-    let path = PathBuf::from("rollout.jsonl");
-
+fn rollout_preview_prefers_plain_user_messages() -> Result<()> {
     let head = vec![
-        json!({
-            "session_id": conversation_id.to_string(),
-            "id": conversation_id.to_string(),
-            "timestamp": timestamp,
-            "cwd": "/",
-            "originator": "codex",
-            "cli_version": "0.0.0",
-            "model_provider": "test-provider"
-        }),
         json!({
             "type": "message",
             "role": "user",
@@ -92,7 +92,7 @@ fn extract_conversation_summary_prefers_plain_user_messages() -> Result<()> {
         }),
     ];
 
-    let items = head[1..]
+    let items = head
         .iter()
         .map(|item| serde_json::from_value(item.clone()).map(RolloutItem::ResponseItem))
         .collect::<serde_json::Result<Vec<_>>>()?;
@@ -101,31 +101,5 @@ fn extract_conversation_summary_prefers_plain_user_messages() -> Result<()> {
         "Count to 5"
     );
 
-    let session_meta = serde_json::from_value::<SessionMeta>(head[0].clone())?;
-
-    let summary = extract_conversation_summary(
-        path.clone(),
-        &head,
-        &session_meta,
-        /*git*/ None,
-        "test-provider",
-        timestamp.clone(),
-    )
-    .expect("summary");
-
-    let expected = ConversationSummary {
-        conversation_id,
-        timestamp: timestamp.clone(),
-        updated_at: timestamp,
-        path,
-        preview: "Count to 5".to_string(),
-        model_provider: "test-provider".to_string(),
-        cwd: PathBuf::from("/"),
-        cli_version: "0.0.0".to_string(),
-        source: codex_protocol::protocol::SessionSource::VSCode,
-        git_info: None,
-    };
-
-    assert_eq!(summary, expected);
     Ok(())
 }

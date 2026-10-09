@@ -359,6 +359,8 @@ async fn plain_message_turn_outcomes_preserve_completion_and_failure_without_pro
             .expect("terminal outcome persists");
         assert_eq!(receipt.status, expected);
         assert!(receipt.validation_call_ids.is_empty());
+        assert_eq!(receipt.criterion_results.len(), 1);
+        assert_eq!(receipt.criterion_results[0].criterion_id, "criterion");
         assert!(receipt.criterion_results.iter().all(|result| result.status
             == CriterionStatus::NotRun
             && result.evidence_ref.is_none()));
@@ -823,6 +825,8 @@ async fn missing_typed_receipt_preserves_recorded_validation_without_claiming_ac
     assert_eq!(receipt.status, AgentStatusClaim::NeedsMain);
     assert_eq!(receipt.validation_call_ids, vec!["actual-validation"]);
     assert!(receipt.summary.contains("Failed"));
+    assert_eq!(receipt.criterion_results.len(), 1);
+    assert_eq!(receipt.criterion_results[0].criterion_id, "criterion");
     assert!(receipt.criterion_results.iter().all(|criterion| {
         criterion.status == CriterionStatus::NotRun
             && criterion

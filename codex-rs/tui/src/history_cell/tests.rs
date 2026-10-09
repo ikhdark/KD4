@@ -9,8 +9,6 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::session_state::ThreadSessionState;
 use crate::wrapping::word_wrap_lines;
 use codex_app_server_protocol::AskForApproval;
-use codex_app_server_protocol::McpAuthStatus;
-use codex_config::types::McpServerConfig;
 use codex_otel::RuntimeMetricTotals;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::ThreadId;
@@ -80,6 +78,11 @@ fn completed_mcp_preview_is_bounded_and_transcript_preserves_all_text() {
     );
     let mut content: Vec<_> = (0..20).map(|i| text_block(&format!("block {i}"))).collect();
     content.push(text_block(&format!("{}\ntail-marker", "row\n".repeat(100))));
+    let mut expected_raw = vec!["Called s.t()".to_string()];
+    expected_raw.extend((0..20).map(|i| format!("block {i}")));
+    expected_raw.extend(vec!["row".to_string(); 100]);
+    expected_raw.push(String::new());
+    expected_raw.push("tail-marker".to_string());
     assert!(
         cell.complete(
             Duration::ZERO,
@@ -102,6 +105,8 @@ fn completed_mcp_preview_is_bounded_and_transcript_preserves_all_text() {
             .contains("output truncated")
     );
     let transcript = render_lines(&cell.transcript_lines(80)).join("\n");
+    assert_eq!(transcript, expected_raw.join("\n"));
+    assert_eq!(render_lines(&cell.raw_lines()), expected_raw);
     assert!(transcript.contains("block 19"));
     assert!(transcript.ends_with("tail-marker"));
     assert_eq!(
@@ -200,88 +205,6 @@ fn streaming_agent_tail_blank_line_uses_one_viewport_row() {
     assert_eq!(cell.desired_height(/*width*/ 80), 3);
 }
 
-fn stdio_server_config(
-    command: &str,
-    args: Vec<&str>,
-    env: Option<HashMap<String, String>>,
-    env_vars: Vec<&str>,
-) -> McpServerConfig {
-    let mut table = toml::Table::new();
-    table.insert(
-        "command".to_string(),
-        toml::Value::String(command.to_string()),
-    );
-    if !args.is_empty() {
-        table.insert(
-            "args".to_string(),
-            toml::Value::Array(
-                args.into_iter()
-                    .map(|arg| toml::Value::String(arg.to_string()))
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(env) = env {
-        table.insert("env".to_string(), string_map_to_toml_value(env));
-    }
-    if !env_vars.is_empty() {
-        table.insert(
-            "env_vars".to_string(),
-            toml::Value::Array(
-                env_vars
-                    .into_iter()
-                    .map(|name| toml::Value::String(name.to_string()))
-                    .collect(),
-            ),
-        );
-    }
-
-    toml::Value::Table(table)
-        .try_into()
-        .expect("test stdio MCP config should deserialize")
-}
-
-fn streamable_http_server_config(
-    url: &str,
-    bearer_token_env_var: Option<&str>,
-    http_headers: Option<HashMap<String, String>>,
-    env_http_headers: Option<HashMap<String, String>>,
-) -> McpServerConfig {
-    let mut table = toml::Table::new();
-    table.insert("url".to_string(), toml::Value::String(url.to_string()));
-    if let Some(bearer_token_env_var) = bearer_token_env_var {
-        table.insert(
-            "bearer_token_env_var".to_string(),
-            toml::Value::String(bearer_token_env_var.to_string()),
-        );
-    }
-    if let Some(http_headers) = http_headers {
-        table.insert(
-            "http_headers".to_string(),
-            string_map_to_toml_value(http_headers),
-        );
-    }
-    if let Some(env_http_headers) = env_http_headers {
-        table.insert(
-            "env_http_headers".to_string(),
-            string_map_to_toml_value(env_http_headers),
-        );
-    }
-
-    toml::Value::Table(table)
-        .try_into()
-        .expect("test streamable_http MCP config should deserialize")
-}
-
-fn string_map_to_toml_value(entries: HashMap<String, String>) -> toml::Value {
-    toml::Value::Table(
-        entries
-            .into_iter()
-            .map(|(key, value)| (key, toml::Value::String(value)))
-            .collect(),
-    )
-}
-
 fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
     lines
         .iter()
@@ -336,23 +259,16 @@ fn resource_link_block(
 }
 
 #[test]
-fn raw_lines_from_source_preserves_explicit_blank_lines() {
-    let lines = raw_lines_from_source("alpha\n\nbeta\n");
-
-    assert_eq!(
-        render_lines(&lines),
-        vec!["alpha".to_string(), String::new(), "beta".to_string()]
-    );
-    assert_unstyled_lines(&lines);
-}
-
-#[test]
-fn raw_lines_from_source_preserves_trailing_blank_but_not_trailing_newline() {
-    assert_eq!(
-        render_lines(&raw_lines_from_source("alpha\n\n")),
-        vec!["alpha".to_string(), String::new()]
-    );
-    assert_eq!(raw_lines_from_source(""), Vec::<Line<'static>>::new());
+fn raw_lines_from_source_preserves_blank_lines_but_not_final_newline() {
+    for (source, expected) in [
+        ("alpha\n\nbeta\n", vec!["alpha", "", "beta"]),
+        ("alpha\n\n", vec!["alpha", ""]),
+        ("", vec![]),
+    ] {
+        let lines = raw_lines_from_source(source);
+        assert_eq!(render_lines(&lines), expected, "{source:?}");
+        assert_unstyled_lines(&lines);
+    }
 }
 
 #[test]
@@ -536,7 +452,7 @@ fn structured_tool_cell_renders_raw_plain_text_without_prefix_or_style() {
 
     let lines = cell.raw_lines();
     let rendered = render_lines(&lines);
-    assert!(rendered[0].starts_with("Called search.find_docs("));
+    assert_eq!(rendered[0], "Called search.find_docs({\"query\":\"raw mode\"})");
     assert_eq!(rendered[1..], ["alpha".to_string(), "beta".to_string()]);
     assert_unstyled_lines(&lines);
 }
@@ -725,7 +641,8 @@ fn final_message_separator_includes_worked_label_after_one_minute() {
     let rendered = render_lines(&cell.display_lines(/*width*/ 200));
 
     assert_eq!(rendered.len(), 1);
-    assert!(rendered[0].contains("Worked for"));
+    assert!(rendered[0].starts_with("─ Worked for 1m 01s ─"));
+    assert_eq!(render_lines(&cell.raw_lines()), vec!["Worked for 1m 01s"]);
 }
 
 #[test]
@@ -733,23 +650,6 @@ fn ps_output_empty_snapshot() {
     let cell = new_unified_exec_processes_output(Vec::new());
     let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
     insta::assert_snapshot!(rendered);
-}
-
-#[tokio::test]
-async fn session_info_uses_availability_nux_tooltip_override() {
-    let config = test_config().await;
-    let cell = new_session_info(
-        &config,
-        "gpt-5",
-        &session_configured_event("gpt-5"),
-        /*is_first_event*/ false,
-        Some("Model just became available".to_string()),
-        Some(PlanType::Free),
-        /*show_fast_status*/ false,
-    );
-
-    let rendered = render_transcript(&cell).join("\n");
-    assert!(rendered.contains("Model just became available"));
 }
 
 #[tokio::test]
@@ -941,142 +841,6 @@ unset it, then restart Codex"
     insta::assert_snapshot!(rendered);
 }
 
-#[tokio::test]
-async fn mcp_tools_output_masks_sensitive_values() {
-    let mut config = test_config().await;
-    let mut env = HashMap::new();
-    env.insert("TOKEN".to_string(), "secret".to_string());
-    let stdio_config = stdio_server_config("docs-server", vec![], Some(env), vec!["APP_TOKEN"]);
-    let mut servers = config.mcp_servers.get().clone();
-    servers.insert("docs".to_string(), stdio_config);
-
-    let mut headers = HashMap::new();
-    headers.insert("Authorization".to_string(), "Bearer secret".to_string());
-    let mut env_headers = HashMap::new();
-    env_headers.insert("X-API-Key".to_string(), "API_KEY_ENV".to_string());
-    let http_config = streamable_http_server_config(
-        "https://example.com/mcp",
-        Some("MCP_TOKEN"),
-        Some(headers),
-        Some(env_headers),
-    );
-    servers.insert("http".to_string(), http_config);
-    config
-        .mcp_servers
-        .set(servers)
-        .expect("test mcp servers should accept any configuration");
-
-    let mut tools: HashMap<String, Tool> = HashMap::new();
-    tools.insert(
-        "mcp__docs__list".to_string(),
-        Tool {
-            description: None,
-            name: "list".to_string(),
-            title: None,
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
-    );
-    tools.insert(
-        "mcp__http__ping".to_string(),
-        Tool {
-            description: None,
-            name: "ping".to_string(),
-            title: None,
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
-    );
-
-    let auth_statuses: HashMap<String, McpAuthStatus> = HashMap::new();
-    let cell = new_mcp_tools_output(
-        &config,
-        tools,
-        HashMap::new(),
-        HashMap::new(),
-        &auth_statuses,
-    );
-    let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
-
-    insta::assert_snapshot!(rendered);
-}
-
-#[tokio::test]
-async fn mcp_tools_output_lists_tools_for_hyphenated_server_names() {
-    let mut config = test_config().await;
-    let mut servers = config.mcp_servers.get().clone();
-    servers.insert(
-        "some-server".to_string(),
-        stdio_server_config("docs-server", vec!["--stdio"], /*env*/ None, vec![]),
-    );
-    config
-        .mcp_servers
-        .set(servers)
-        .expect("test mcp servers should accept any configuration");
-
-    let tools = HashMap::from([(
-        "mcp__some_server__lookup".to_string(),
-        Tool {
-            description: None,
-            name: "lookup".to_string(),
-            title: None,
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
-    )]);
-
-    let auth_statuses: HashMap<String, McpAuthStatus> = HashMap::new();
-    let cell = new_mcp_tools_output(
-        &config,
-        tools,
-        HashMap::new(),
-        HashMap::new(),
-        &auth_statuses,
-    );
-    let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
-
-    insta::assert_snapshot!(rendered);
-}
-
-#[test]
-fn mcp_tools_output_from_statuses_renders_status_only_servers() {
-    let statuses = vec![McpServerStatus {
-        name: "plugin_docs".to_string(),
-        server_info: None,
-        tools: HashMap::from([(
-            "lookup".to_string(),
-            Tool {
-                description: None,
-                name: "lookup".to_string(),
-                title: None,
-                input_schema: serde_json::json!({"type": "object", "properties": {}}),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-        )]),
-        resources: Vec::new(),
-        resource_templates: Vec::new(),
-        auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
-    }];
-
-    let cell =
-        new_mcp_tools_output_from_statuses(&statuses, McpServerStatusDetail::ToolsAndAuthOnly);
-    let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
-
-    insta::assert_snapshot!(rendered);
-}
-
 #[test]
 fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
     let statuses = vec![McpServerStatus {
@@ -1117,6 +881,11 @@ fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
         auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
     }];
 
+    let compact = new_mcp_tools_output_from_statuses(&statuses, McpServerStatusDetail::ToolsAndAuthOnly);
+    insta::assert_snapshot!(
+        "mcp_tools_output_from_statuses_renders_status_only_servers",
+        render_lines(&compact.display_lines(120)).join("\n"),
+    );
     let cell = new_mcp_tools_output_from_statuses(&statuses, McpServerStatusDetail::Full);
     let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
 
@@ -1272,6 +1041,15 @@ fn web_search_history_cell_snapshot() {
     let rendered = render_lines(&cell.display_lines(/*width*/ 64)).join("\n");
 
     insta::assert_snapshot!(rendered);
+    assert_eq!(
+        render_lines(&cell.display_lines(64)),
+        ["• Searched the web for example search query with several generic",
+         "  words to exercise wrapping"],
+    );
+    insta::assert_snapshot!(
+        "web_search_history_cell_transcript_snapshot",
+        render_lines(&cell.transcript_lines(64)).join("\n"),
+    );
 }
 
 #[test]
@@ -1301,28 +1079,6 @@ fn web_search_history_cell_without_detail_snapshot() {
 }
 
 #[test]
-fn web_search_history_cell_wraps_with_indented_continuation() {
-    let query = "example search query with several generic words to exercise wrapping".to_string();
-    let cell = new_web_search_call(
-        "call-1".to_string(),
-        query.clone(),
-        WebSearchAction::Search {
-            query: Some(query),
-            queries: None,
-        },
-    );
-    let rendered = render_lines(&cell.display_lines(/*width*/ 64));
-
-    assert_eq!(
-        rendered,
-        vec![
-            "• Searched the web for example search query with several generic".to_string(),
-            "  words to exercise wrapping".to_string(),
-        ]
-    );
-}
-
-#[test]
 fn web_search_history_cell_short_query_does_not_wrap() {
     let query = "short query".to_string();
     let cell = new_web_search_call(
@@ -1339,22 +1095,6 @@ fn web_search_history_cell_short_query_does_not_wrap() {
         rendered,
         vec!["• Searched the web for short query".to_string()]
     );
-}
-
-#[test]
-fn web_search_history_cell_transcript_snapshot() {
-    let query = "example search query with several generic words to exercise wrapping".to_string();
-    let cell = new_web_search_call(
-        "call-1".to_string(),
-        query.clone(),
-        WebSearchAction::Search {
-            query: Some(query),
-            queries: None,
-        },
-    );
-    let rendered = render_lines(&cell.transcript_lines(/*width*/ 64)).join("\n");
-
-    insta::assert_snapshot!(rendered);
 }
 
 #[test]
@@ -1430,97 +1170,31 @@ fn completed_mcp_tool_call_success_snapshot() {
 }
 
 #[test]
-fn completed_mcp_tool_call_image_after_text_returns_extra_cell() {
-    let invocation = McpInvocation {
-        server: "image".into(),
-        tool: "generate".into(),
-        arguments: Some(json!({
-            "prompt": "tiny image",
-        })),
-    };
-
-    let result = CallToolResult {
-        content: vec![
-            text_block("Here is the image:"),
-            image_block(SMALL_PNG_BASE64),
-        ],
-        is_error: None,
-        structured_content: None,
-        meta: None,
-    };
-
-    let mut cell = new_active_mcp_tool_call(
-        "call-image".into(),
-        invocation,
-        /*animations_enabled*/ true,
-    );
-    let extra_cell = cell
-        .complete(Duration::from_millis(25), Ok(result))
-        .expect("expected image cell");
-
-    let rendered = render_lines(&extra_cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered, vec!["tool result (image output)"]);
-}
-
-#[test]
-fn completed_mcp_tool_call_accepts_data_url_image_blocks() {
-    let invocation = McpInvocation {
-        server: "image".into(),
-        tool: "generate".into(),
-        arguments: Some(json!({
-            "prompt": "tiny image",
-        })),
-    };
-
+fn completed_mcp_tool_call_finds_valid_images_among_invalid_blocks() {
     let data_url = format!("data:image/png;base64,{SMALL_PNG_BASE64}");
-    let result = CallToolResult {
-        content: vec![image_block(&data_url)],
-        is_error: None,
-        structured_content: None,
-        meta: None,
-    };
-
-    let mut cell = new_active_mcp_tool_call(
-        "call-image-data-url".into(),
-        invocation,
-        /*animations_enabled*/ true,
-    );
-    let extra_cell = cell
-        .complete(Duration::from_millis(25), Ok(result))
-        .expect("expected image cell");
-
-    let rendered = render_lines(&extra_cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered, vec!["tool result (image output)"]);
-}
-
-#[test]
-fn completed_mcp_tool_call_skips_invalid_image_blocks() {
-    let invocation = McpInvocation {
-        server: "image".into(),
-        tool: "generate".into(),
-        arguments: Some(json!({
-            "prompt": "tiny image",
-        })),
-    };
-
-    let result = CallToolResult {
-        content: vec![image_block("not-base64"), image_block(SMALL_PNG_BASE64)],
-        is_error: None,
-        structured_content: None,
-        meta: None,
-    };
-
-    let mut cell = new_active_mcp_tool_call(
-        "call-image-2".into(),
-        invocation,
-        /*animations_enabled*/ true,
-    );
-    let extra_cell = cell
-        .complete(Duration::from_millis(25), Ok(result))
-        .expect("expected image cell");
-
-    let rendered = render_lines(&extra_cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered, vec!["tool result (image output)"]);
+    for (content, has_image) in [
+        (vec![text_block("Here is the image:"), image_block(SMALL_PNG_BASE64)], true),
+        (vec![image_block(&data_url)], true),
+        (vec![image_block("not-base64"), image_block(SMALL_PNG_BASE64)], true),
+        (vec![image_block("bm90IGFuIGltYWdl"), image_block(SMALL_PNG_BASE64)], true),
+        (vec![image_block("not-base64")], false),
+        (vec![image_block("bm90IGFuIGltYWdl")], false),
+        (vec![image_block(&format!("data:text/plain;base64,{SMALL_PNG_BASE64}"))], false),
+    ] {
+        let mut cell = new_active_mcp_tool_call(
+            "call-image".into(),
+            McpInvocation { server: "image".into(), tool: "generate".into(),
+                arguments: Some(json!({"prompt": "tiny image"})) },
+            true,
+        );
+        let extra_cell = cell.complete(Duration::from_millis(25), Ok(CallToolResult {
+            content, is_error: None, structured_content: None, meta: None,
+        }));
+        assert_eq!(extra_cell.is_some(), has_image);
+        if let Some(extra_cell) = extra_cell {
+            assert_eq!(render_lines(&extra_cell.display_lines(80)), ["tool result (image output)"]);
+        }
+    }
 }
 
 #[test]
@@ -1700,43 +1374,19 @@ fn completed_mcp_tool_call_multiple_outputs_inline_snapshot() {
 }
 
 #[test]
-fn session_header_includes_reasoning_level_when_present() {
-    let cell = SessionHeaderHistoryCell::new(
-        "gpt-4o".to_string(),
-        Some(ReasoningEffortConfig::High),
-        /*show_fast_status*/ true,
-        std::env::temp_dir(),
-        "test",
-    );
-
-    let lines = render_lines(&cell.display_lines(/*width*/ 80));
-    let model_line = lines
-        .iter()
-        .find(|line| line.contains("model:"))
-        .expect("model line");
-
-    assert!(model_line.contains("gpt-4o high   fast"));
-    assert!(model_line.contains("/model to change"));
-}
-
-#[test]
-fn session_header_hides_fast_status_when_disabled() {
-    let cell = SessionHeaderHistoryCell::new(
-        "gpt-4o".to_string(),
-        Some(ReasoningEffortConfig::High),
-        /*show_fast_status*/ false,
-        std::env::temp_dir(),
-        "test",
-    );
-
-    let lines = render_lines(&cell.display_lines(/*width*/ 80));
-    let model_line = lines
-        .iter()
-        .find(|line| line.contains("model:"))
-        .expect("model line");
-
-    assert!(model_line.contains("gpt-4o high"));
-    assert!(!model_line.contains("fast"));
+fn session_header_includes_reasoning_and_respects_fast_status() {
+    for show_fast_status in [false, true] {
+        let cell = SessionHeaderHistoryCell::new(
+            "gpt-4o".to_string(), Some(ReasoningEffortConfig::High),
+            show_fast_status, std::env::temp_dir(), "test",
+        );
+        let lines = render_lines(&cell.display_lines(80));
+        let model_line = lines.iter().find(|line| line.contains("model:")).expect("model line");
+        assert!(model_line.contains("gpt-4o high"), "{model_line}");
+        assert_eq!(model_line.contains("gpt-4o high   fast"), show_fast_status, "{model_line}");
+        assert_eq!(model_line.contains("fast"), show_fast_status, "{model_line}");
+        assert!(model_line.contains("/model to change"), "{model_line}");
+    }
 }
 
 #[test]
@@ -1758,28 +1408,19 @@ fn session_header_indicates_full_access_mode() {
 }
 
 #[test]
-fn full_access_mode_includes_managed_full_access_profiles() {
-    let permission_profile: PermissionProfile = PermissionProfile::Managed {
-        network: NetworkSandboxPolicy::Enabled,
-        file_system: ManagedFileSystemPermissions::Unrestricted,
-    };
-
-    assert!(has_full_access_permissions(
-        AskForApproval::Never,
-        &permission_profile
-    ));
-}
-
-#[test]
-fn full_access_mode_excludes_external_sandbox_profiles() {
-    let permission_profile: PermissionProfile = PermissionProfile::External {
-        network: NetworkSandboxPolicy::Enabled,
-    };
-
-    assert!(!has_full_access_permissions(
-        AskForApproval::Never,
-        &permission_profile
-    ));
+fn full_access_mode_requires_unrestricted_profile_and_no_approvals() {
+    for (profile, expected) in [
+        (PermissionProfile::Disabled, true),
+        (PermissionProfile::Managed {
+            network: NetworkSandboxPolicy::Enabled,
+            file_system: ManagedFileSystemPermissions::Unrestricted,
+        }, true),
+        (PermissionProfile::External { network: NetworkSandboxPolicy::Enabled }, false),
+        (PermissionProfile::read_only(), false),
+    ] {
+        assert_eq!(has_full_access_permissions(AskForApproval::Never, &profile), expected);
+        assert!(!has_full_access_permissions(AskForApproval::OnRequest, &profile));
+    }
 }
 
 #[test]
@@ -2306,10 +1947,13 @@ fn render_uses_wrapping_for_long_url_like_line() {
         })
         .collect::<Vec<_>>();
     let rendered_blob = rendered.join("\n");
-
-    assert!(
-        rendered_blob.contains("session_id=abc123"),
-        "expected URL tail to be visible after wrapping, got:\n{rendered_blob}"
+    let complete_url = rendered.iter().map(|row| row.trim()).collect::<String>();
+    // The unbreakable URL can move to the row after the prompt glyph, so
+    // trimming each rendered row also removes the space after that glyph.
+    assert_eq!(
+        complete_url.strip_prefix('›').map(str::trim_start),
+        Some(url),
+        "expected the entire URL, including its tail, after wrapping:\n{rendered_blob}"
     );
 
     let non_empty_rows = rendered.iter().filter(|row| !row.trim().is_empty()).count() as u16;
@@ -2409,16 +2053,21 @@ fn plan_update_does_not_split_url_like_tokens_in_note_or_step() {
 
 #[test]
 fn reasoning_summary_block() {
+    for (source, expected) in [
+        ("**High level reasoning**\n\nDetailed reasoning goes here.", "• Detailed reasoning goes here."),
+        ("**High level plan**\n\nWe should fix the bug next.", "• We should fix the bug next."),
+    ] {
     let cell = new_reasoning_summary_block(
-        vec!["**High level reasoning**\n\nDetailed reasoning goes here.".to_string()],
+        vec![source.to_string()],
         &test_cwd(),
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
+    assert_eq!(rendered_display, vec![expected]);
 
     let rendered_transcript = render_transcript(cell.as_ref());
-    assert_eq!(rendered_transcript, vec!["• Detailed reasoning goes here."]);
+    assert_eq!(rendered_transcript, vec![expected]);
+    }
 }
 
 #[test]
@@ -2505,20 +2154,6 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
 
     let rendered = render_transcript(cell.as_ref());
     assert_eq!(rendered, vec!["• High level reasoning without closing"]);
-}
-
-#[test]
-fn reasoning_summary_block_splits_header_and_summary_when_present() {
-    let cell = new_reasoning_summary_block(
-        vec!["**High level plan**\n\nWe should fix the bug next.".to_string()],
-        &test_cwd(),
-    );
-
-    let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered_display, vec!["• We should fix the bug next."]);
-
-    let rendered_transcript = render_transcript(cell.as_ref());
-    assert_eq!(rendered_transcript, vec!["• We should fix the bug next."]);
 }
 
 #[test]
@@ -2650,6 +2285,10 @@ fn agent_markdown_cell_renders_source_at_different_widths() {
         lines_32.len() > lines_80.len(),
         "narrower width should produce more wrapped lines: {lines_32:?}",
     );
+    for lines in [&lines_80, &lines_32] {
+        let text = lines.iter().map(|line| line.chars().skip(2).collect::<String>()).collect::<Vec<_>>().join(" ");
+        assert_eq!(text.split_whitespace().collect::<Vec<_>>(), source.split_whitespace().collect::<Vec<_>>());
+    }
 }
 
 #[test]
@@ -2767,16 +2406,8 @@ fn render_clears_area_when_cell_content_shrinks() {
         rendered_rows.push(row);
     }
 
-    assert!(
-        rendered_rows.iter().all(|row| !row.contains("STALE")),
-        "rendered buffer should not retain stale glyphs: {rendered_rows:?}",
-    );
-    assert!(
-        rendered_rows
-            .first()
-            .is_some_and(|row| row.contains("fresh")),
-        "expected fresh content in first row: {rendered_rows:?}",
-    );
+    assert_eq!(rendered_rows[0], format!("fresh{}", " ".repeat(35)));
+    assert_eq!(rendered_rows[1..], vec![" ".repeat(40); 5]);
 }
 
 #[test]

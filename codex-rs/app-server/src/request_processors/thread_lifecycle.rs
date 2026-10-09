@@ -2540,18 +2540,14 @@ mod tests {
         let thread_id = ThreadId::new();
         assert!(pending.begin(thread_id).await);
 
-        let waiter_pending = Arc::clone(&pending);
-        let waiter = tokio::spawn(async move {
-            waiter_pending.wait_until_finished(&thread_id).await;
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
+        let waiter = pending.wait_until_finished(&thread_id);
+        tokio::pin!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
 
         pending.finish(&thread_id).await;
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
-            .expect("resume waiter should continue after teardown")
-            .expect("resume waiter should not panic");
+            .expect("resume waiter should continue after teardown");
     }
 
     #[tokio::test]
@@ -2591,11 +2587,10 @@ mod tests {
         .await
         .expect("admission should subscribe before updating per-thread state");
 
-        let begin_authority = Arc::clone(&authority);
-        let begin = tokio::spawn(async move { begin_authority.begin(thread_id).await });
-        tokio::task::yield_now().await;
+        let begin = authority.begin(thread_id);
+        tokio::pin!(begin);
         assert!(
-            !begin.is_finished(),
+            futures::poll!(&mut begin).is_pending(),
             "unload begin must wait until subscription admission is complete"
         );
 
@@ -2604,7 +2599,7 @@ mod tests {
             admission.await.expect("admission task should not panic"),
             ThreadConnectionAdmission::Admitted(_)
         ));
-        assert!(begin.await.expect("unload begin task should not panic"));
+        assert!(begin.await);
         assert!(
             thread_state_manager.has_subscribers(thread_id).await,
             "the unload listener's final eligibility check must observe the admitted connection"

@@ -162,64 +162,43 @@ mod tests {
     }
 
     #[test]
-    fn merge_connectors_replaces_plugin_placeholder_name_with_accessible_name() {
-        let plugin = plugin_connector_to_app_info("calendar".to_string());
-        let accessible = google_calendar_accessible_connector(&[]);
+    fn merge_connectors_replaces_placeholder_and_dedupes_plugin_names() {
+        for (declared, runtime, expected) in [
+            (vec![], vec![], vec![]),
+            (
+                vec!["sample", "alpha", "sample"],
+                vec!["beta", "alpha"],
+                vec!["alpha", "beta", "sample"],
+            ),
+        ] {
+            let mut plugin = plugin_connector_to_app_info("calendar".to_string());
+            plugin.plugin_display_names = plugin_names(&declared);
+            let accessible = google_calendar_accessible_connector(&runtime);
 
-        let merged = merge_connectors(vec![plugin], vec![accessible]);
+            let merged = merge_connectors(vec![plugin], vec![accessible]);
 
-        assert_eq!(
-            merged,
-            vec![AppInfo {
-                id: "calendar".to_string(),
-                name: "Google Calendar".to_string(),
-                description: Some("Plan events".to_string()),
-                logo_url: Some("https://example.com/logo.png".to_string()),
-                logo_url_dark: Some("https://example.com/logo-dark.png".to_string()),
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: Some("workspace".to_string()),
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                install_url: Some(connector_install_url("calendar", "calendar")),
-                is_accessible: true,
-                is_enabled: true,
-                plugin_display_names: Vec::new(),
-            }]
-        );
-        assert_eq!(connector_mention_slug(&merged[0]), "google-calendar");
-    }
-
-    #[test]
-    fn merge_connectors_unions_and_dedupes_plugin_display_names() {
-        let mut plugin = plugin_connector_to_app_info("calendar".to_string());
-        plugin.plugin_display_names = plugin_names(&["sample", "alpha", "sample"]);
-
-        let accessible = google_calendar_accessible_connector(&["beta", "alpha"]);
-
-        let merged = merge_connectors(vec![plugin], vec![accessible]);
-
-        assert_eq!(
-            merged,
-            vec![AppInfo {
-                id: "calendar".to_string(),
-                name: "Google Calendar".to_string(),
-                description: Some("Plan events".to_string()),
-                logo_url: Some("https://example.com/logo.png".to_string()),
-                logo_url_dark: Some("https://example.com/logo-dark.png".to_string()),
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: Some("workspace".to_string()),
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                install_url: Some(connector_install_url("calendar", "calendar")),
-                is_accessible: true,
-                is_enabled: true,
-                plugin_display_names: plugin_names(&["alpha", "beta", "sample"]),
-            }]
-        );
+            assert_eq!(
+                merged,
+                vec![AppInfo {
+                    id: "calendar".to_string(),
+                    name: "Google Calendar".to_string(),
+                    description: Some("Plan events".to_string()),
+                    logo_url: Some("https://example.com/logo.png".to_string()),
+                    logo_url_dark: Some("https://example.com/logo-dark.png".to_string()),
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: Some("workspace".to_string()),
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: Some(connector_install_url("calendar", "calendar")),
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: plugin_names(&expected),
+                }]
+            );
+            assert_eq!(connector_mention_slug(&merged[0]), "google-calendar");
+        }
     }
 
     #[test]

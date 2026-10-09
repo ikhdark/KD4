@@ -28,14 +28,13 @@ fn set<'a>(items: &'a [&'a str]) -> HashSet<&'a str> {
 
 #[test]
 fn mention_name_predicates_share_namespaced_ascii_grammar() {
+    let allowed = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-:";
     for byte in 0_u8..=u8::MAX {
-        assert_eq!(
-            is_mention_name_char(byte),
-            is_mention_name_char_char(char::from(byte)),
-            "byte {byte:#04x}"
-        );
+        let expected = allowed.contains(&byte);
+        assert_eq!(is_mention_name_char(byte), expected, "byte {byte:#04x}");
+        assert_eq!(is_mention_name_char_char(char::from(byte)), expected, "char {byte:#04x}");
     }
-    assert!(is_mention_name_char_char(':'));
+    assert!(!is_mention_name_char_char('界'));
 }
 
 fn assert_mentions(text: &str, expected_names: &[&str], expected_paths: &[&str]) {
@@ -50,38 +49,23 @@ fn linked_skill_mention(name: &str, unix_path: &str) -> String {
 
 #[test]
 fn skill_injection_renders_as_the_context_fragment() {
-    let skill = SkillInjection {
-        name: "review".to_string(),
-        path: "/tmp/review/SKILL.md".to_string(),
-        contents: "Keep review comments concise.".to_string(),
-        scope: SkillScope::Admin,
-    };
-
-    assert_eq!(skill.role(), "developer");
-    assert_eq!(skill.markers(), ("<skill>", "</skill>"));
-    assert_eq!(
-        skill.body(),
-        "\n<name>review</name>\n<path>/tmp/review/SKILL.md</path>\n<scope>admin</scope>\nKeep review comments concise.\n"
-    );
-}
-
-#[test]
-fn skill_injection_preserves_source_scope_and_role() {
-    for (scope, role, label) in [
-        (SkillScope::System, "system", "system"),
-        (SkillScope::Admin, "developer", "admin"),
-        (SkillScope::Repo, "user", "repo"),
-        (SkillScope::User, "user", "user"),
+    for (scope, role, label, contents) in [
+        (SkillScope::System, "system", "system", "Review carefully."),
+        (SkillScope::Admin, "developer", "admin", "Keep review comments concise."),
+        (SkillScope::Repo, "user", "repo", "Review carefully."),
+        (SkillScope::User, "user", "user", "Review carefully."),
     ] {
         let skill = SkillInjection {
             name: "review".to_string(),
             path: "/tmp/review/SKILL.md".to_string(),
-            contents: "Review carefully.".to_string(),
+            contents: contents.to_string(),
             scope,
         };
-
         assert_eq!(skill.role(), role);
-        assert!(skill.body().contains(&format!("<scope>{label}</scope>")));
+        assert_eq!(skill.markers(), ("<skill>", "</skill>"));
+        assert_eq!(skill.body(), format!(
+            "\n<name>review</name>\n<path>/tmp/review/SKILL.md</path>\n<scope>{label}</scope>\n{contents}\n"
+        ));
     }
 }
 
@@ -180,77 +164,42 @@ async fn selected_host_resolution_is_authoritative_after_file_changes() {
 
 #[test]
 fn text_mentions_skill_requires_exact_boundary() {
-    assert_eq!(
-        true,
-        extract_tool_mentions("use $notion-research-doc please")
-            .names
-            .contains("notion-research-doc")
-    );
-    assert_eq!(
-        true,
-        extract_tool_mentions("($notion-research-doc)")
-            .names
-            .contains("notion-research-doc")
-    );
-    assert_eq!(
-        true,
-        extract_tool_mentions("$notion-research-doc.")
-            .names
-            .contains("notion-research-doc")
-    );
-    assert_eq!(
-        false,
-        extract_tool_mentions("$notion-research-docs")
-            .names
-            .contains("notion-research-doc")
-    );
-    assert_eq!(
-        false,
-        extract_tool_mentions("$notion-research-doc_extra")
-            .names
-            .contains("notion-research-doc")
-    );
-}
-
-#[test]
-fn text_mentions_skill_handles_end_boundary_and_near_misses() {
-    assert_eq!(
-        true,
-        extract_tool_mentions("$alpha-skill")
-            .names
-            .contains("alpha-skill")
-    );
-    assert_eq!(
-        false,
-        extract_tool_mentions("$alpha-skillx")
-            .names
-            .contains("alpha-skill")
-    );
-    assert_eq!(
-        true,
-        extract_tool_mentions("$alpha-skillx and later $alpha-skill ")
-            .names
-            .contains("alpha-skill")
-    );
+    for (text, names) in [
+        ("use $notion-research-doc please", vec!["notion-research-doc"]),
+        ("($notion-research-doc)", vec!["notion-research-doc"]),
+        ("$notion-research-doc.", vec!["notion-research-doc"]),
+        ("$notion-research-docs", vec!["notion-research-docs"]),
+        ("$notion-research-doc_extra", vec!["notion-research-doc_extra"]),
+        ("$alpha-skill", vec!["alpha-skill"]),
+        ("$alpha-skillx", vec!["alpha-skillx"]),
+        ("$alpha-skillx and later $alpha-skill ", vec!["alpha-skillx", "alpha-skill"]),
+    ] {
+        assert_mentions(text, &names, &[]);
+    }
 }
 
 #[test]
 fn text_mentions_skill_handles_many_dollars_without_looping() {
-    let prefix = "$".repeat(256);
-    let text = format!("{prefix} not-a-mention");
-    assert_eq!(
-        false,
-        extract_tool_mentions(&text).names.contains("alpha-skill")
-    );
+    let text = format!("{} not-a-mention", "$".repeat(256));
+    assert_mentions(&text, &[], &[]);
 }
 
 #[test]
 fn extract_tool_mentions_handles_plain_and_linked_mentions() {
-    assert_mentions(
-        "use $alpha and [$beta](/tmp/beta)",
-        &["alpha", "beta"],
-        &["/tmp/beta"],
-    );
+    for (text, names, paths) in [
+        ("use $alpha and [$beta](/tmp/beta)", vec!["alpha", "beta"], vec!["/tmp/beta"]),
+        ("use $PATH and $alpha", vec!["alpha"], vec![]),
+        ("use [$HOME](/tmp/skill)", vec![], vec![]),
+        ("use $XDG_CONFIG_HOME and $beta", vec!["beta"], vec![]),
+        ("[beta](/tmp/beta)", vec![], vec![]),
+        ("[$beta] /tmp/beta", vec!["beta"], vec![]),
+        ("[$beta]()", vec!["beta"], vec![]),
+        ("use [$beta]   ( /tmp/beta )", vec!["beta"], vec!["/tmp/beta"]),
+        ("use $alpha.skill and $beta_extra", vec!["alpha", "beta_extra"], vec![]),
+        ("use $slack:search and $alpha", vec!["alpha", "slack:search"], vec![]),
+    ] {
+        assert_mentions(text, &names, &paths);
+    }
 }
 
 #[test]
@@ -279,43 +228,6 @@ fn extract_tool_mentions_preserves_first_linked_path_per_name() {
     assert_eq!(
         mentions.linked_paths().collect::<Vec<_>>(),
         vec![("alpha", "skill:///tmp/alpha/SKILL.md")]
-    );
-}
-
-#[test]
-fn extract_tool_mentions_skips_common_env_vars() {
-    assert_mentions("use $PATH and $alpha", &["alpha"], &[]);
-    assert_mentions("use [$HOME](/tmp/skill)", &[], &[]);
-    assert_mentions("use $XDG_CONFIG_HOME and $beta", &["beta"], &[]);
-}
-
-#[test]
-fn extract_tool_mentions_requires_link_syntax() {
-    assert_mentions("[beta](/tmp/beta)", &[], &[]);
-    assert_mentions("[$beta] /tmp/beta", &["beta"], &[]);
-    assert_mentions("[$beta]()", &["beta"], &[]);
-}
-
-#[test]
-fn extract_tool_mentions_trims_linked_paths_and_allows_spacing() {
-    assert_mentions("use [$beta]   ( /tmp/beta )", &["beta"], &["/tmp/beta"]);
-}
-
-#[test]
-fn extract_tool_mentions_stops_at_non_name_chars() {
-    assert_mentions(
-        "use $alpha.skill and $beta_extra",
-        &["alpha", "beta_extra"],
-        &[],
-    );
-}
-
-#[test]
-fn extract_tool_mentions_keeps_plugin_skill_namespaces() {
-    assert_mentions(
-        "use $slack:search and $alpha",
-        &["alpha", "slack:search"],
-        &[],
     );
 }
 
@@ -519,29 +431,16 @@ fn collect_explicit_skill_mentions_prefers_resource_path() {
 fn collect_explicit_skill_mentions_skips_missing_path_with_no_fallback() {
     let alpha = make_skill("demo-skill", "/tmp/alpha");
     let beta = make_skill("demo-skill", "/tmp/beta");
-    let skills = vec![alpha, beta];
     let inputs = vec![UserInput::Text {
         text: format!("use {}", linked_skill_mention("demo-skill", "/tmp/missing")),
         text_elements: Vec::new(),
     }];
-    let connector_counts = HashMap::new();
-
-    let selected = collect_mentions(&inputs, &skills, &HashSet::new(), &connector_counts);
-
-    assert_eq!(selected, Vec::new());
+    // The unique-name case must not be masked by ambiguous-name rejection.
+    for skills in [vec![alpha.clone()], vec![alpha, beta]] {
+        assert_eq!(
+            collect_mentions(&inputs, &skills, &HashSet::new(), &HashMap::new()),
+            Vec::new()
+        );
+    }
 }
 
-#[test]
-fn collect_explicit_skill_mentions_skips_missing_path_without_fallback() {
-    let alpha = make_skill("demo-skill", "/tmp/alpha");
-    let skills = vec![alpha];
-    let inputs = vec![UserInput::Text {
-        text: format!("use {}", linked_skill_mention("demo-skill", "/tmp/missing")),
-        text_elements: Vec::new(),
-    }];
-    let connector_counts = HashMap::new();
-
-    let selected = collect_mentions(&inputs, &skills, &HashSet::new(), &connector_counts);
-
-    assert_eq!(selected, Vec::new());
-}

@@ -112,10 +112,14 @@ mod tests {
     #[test]
     fn drain_n_clamps_to_available_lines() {
         let mut state = StreamState::new(/*width*/ None, &test_cwd());
-        state.enqueue(vec![HyperlinkLine::new(Line::from("one"))]);
+        state.enqueue(vec![HyperlinkLine::new(Line::from("one")), HyperlinkLine::new(Line::from("two"))]);
+        assert!(state.drain_n(0).is_empty());
+        assert_eq!(state.queued_len(), 2);
+        assert_eq!(state.drain_n(1), vec![HyperlinkLine::new(Line::from("one"))]);
 
         let drained = state.drain_n(/*max_lines*/ 8);
-        assert_eq!(drained, vec![HyperlinkLine::new(Line::from("one"))]);
+        assert_eq!(drained, vec![HyperlinkLine::new(Line::from("two"))]);
         assert!(state.is_idle());
+        assert!(state.drain_n(usize::MAX).is_empty());
     }
 }

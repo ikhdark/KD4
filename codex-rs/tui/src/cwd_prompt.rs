@@ -314,7 +314,11 @@ mod tests {
     #[test]
     fn cwd_prompt_escape_explicitly_selects_session() {
         let mut screen = new_prompt();
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(screen.highlighted, CwdSelection::Current);
+        assert!(!screen.is_done());
         screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(screen.is_done());
         assert_eq!(
             screen.outcome(),
             CwdPromptOutcome::Selection(CwdSelection::Session)
@@ -335,5 +339,6 @@ mod tests {
         screen.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(screen.selection(), None);
         assert!(screen.is_done());
+        assert_eq!(screen.outcome(), CwdPromptOutcome::Exit);
     }
 }

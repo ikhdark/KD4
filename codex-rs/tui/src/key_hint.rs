@@ -283,14 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_letter_binding_matches_c0_control_char_events() {
-        let binding = ctrl(KeyCode::Char('p'));
-
-        assert!(binding.is_press(KeyEvent::new(KeyCode::Char('\u{0010}'), KeyModifiers::NONE)));
-        assert!(!binding.is_press(KeyEvent::new(KeyCode::Char('\u{0010}'), KeyModifiers::ALT)));
-    }
-
-    #[test]
     fn ctrl_bindings_match_all_supported_c0_control_char_events() {
         let cases = [
             (' ', '\u{0000}'),
@@ -349,18 +341,6 @@ mod tests {
         assert!(
             !ctrl(KeyCode::Char('?'))
                 .is_press(KeyEvent::new(KeyCode::Char('\u{007f}'), KeyModifiers::NONE,))
-        );
-    }
-
-    #[test]
-    fn history_search_ctrl_bindings_match_c0_control_char_events() {
-        assert!(
-            ctrl(KeyCode::Char('r'))
-                .is_press(KeyEvent::new(KeyCode::Char('\u{0012}'), KeyModifiers::NONE))
-        );
-        assert!(
-            ctrl(KeyCode::Char('s'))
-                .is_press(KeyEvent::new(KeyCode::Char('\u{0013}'), KeyModifiers::NONE))
         );
     }
 

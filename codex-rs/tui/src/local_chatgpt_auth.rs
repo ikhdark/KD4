@@ -159,7 +159,7 @@ mod tests {
 
         assert_eq!(auth.chatgpt_account_id, "workspace-1");
         assert_eq!(auth.chatgpt_plan_type.as_deref(), Some("business"));
-        assert!(!auth.access_token.is_empty());
+        assert_eq!(auth.access_token, fake_jwt("user@example.com", "workspace-1", "business"));
     }
 
     #[test]

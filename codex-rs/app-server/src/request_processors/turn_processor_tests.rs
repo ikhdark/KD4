@@ -1,21 +1,23 @@
 use super::*;
 
 #[test]
-fn turn_interrupt_rejects_retained_interrupted_snapshot() {
-    let error = validate_turn_interrupt_target(
-        Some(("turn-1", &TurnStatus::Interrupted)),
-        /*is_running*/ true,
-        "turn-1",
-    )
-    .expect_err("an interrupted presentation snapshot must not be treated as active");
-
+fn turn_interrupt_requires_matching_live_target_or_running_startup_race() {
+    for status in [TurnStatus::Interrupted, TurnStatus::Completed, TurnStatus::Failed] {
+        let error = validate_turn_interrupt_target(Some(("turn-1", &status)), true, "turn-1")
+            .expect_err("a terminal snapshot must not be treated as active");
+        assert_eq!(error.code, -32600);
+        assert_eq!(error.message, "no active turn to interrupt");
+    }
+    let error = validate_turn_interrupt_target(None, false, "turn-1")
+        .expect_err("an idle thread cannot be interrupted");
     assert_eq!(error.message, "no active turn to interrupt");
-}
-
-#[test]
-fn turn_interrupt_allows_running_startup_race_without_snapshot() {
-    validate_turn_interrupt_target(None, /*is_running*/ true, "turn-1")
+    validate_turn_interrupt_target(None, true, "turn-1")
         .expect("core may report running before TurnStarted is projected");
+    validate_turn_interrupt_target(Some(("turn-1", &TurnStatus::InProgress)), false, "turn-1")
+        .expect("a live snapshot can precede core running status");
+    let error = validate_turn_interrupt_target(Some(("turn-2", &TurnStatus::InProgress)), true, "turn-1")
+        .expect_err("an interrupt must not target the successor turn");
+    assert_eq!(error.message, "expected active turn id turn-1 but found turn-2");
 }
 
 #[test]
@@ -476,7 +478,10 @@ fn interrupt_acknowledgements_are_targeted_and_claimed_once() {
 fn map_additional_context_preserves_client_order() {
     let additional_context = IndexMap::from([
         ("dependency".to_string(), additional_context_entry("first")),
-        ("consumer".to_string(), additional_context_entry("second")),
+        ("consumer".to_string(), AdditionalContextEntry {
+            value: "second".to_string(),
+            kind: AdditionalContextKind::Application,
+        }),
     ]);
 
     let mapped = map_additional_context(Some(additional_context)).expect("context should map");
@@ -485,6 +490,10 @@ fn map_additional_context_preserves_client_order() {
         mapped.keys().map(String::as_str).collect::<Vec<_>>(),
         vec!["dependency", "consumer"]
     );
+    assert_eq!(mapped["dependency"].value, "first");
+    assert!(matches!(mapped["dependency"].kind, CoreAdditionalContextKind::Untrusted));
+    assert_eq!(mapped["consumer"].value, "second");
+    assert!(matches!(mapped["consumer"].kind, CoreAdditionalContextKind::Application));
 }
 
 #[test]

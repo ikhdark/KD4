@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used)]
 use std::io;
-use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
@@ -28,69 +27,32 @@ const WORKSPACE_ID_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174000";
 const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001";
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 
-// See spawn.rs for details
-
-fn start_mock_issuer(chatgpt_account_id: &str) -> (SocketAddr, thread::JoinHandle<()>) {
-    // Bind to a random available port
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tiny_http::Server::from_listener(listener, None).unwrap();
-    let chatgpt_account_id = chatgpt_account_id.to_string();
-
-    let handle = thread::spawn(move || {
-        while let Ok(mut req) = server.recv() {
-            let url = req.url().to_string();
-            if url.starts_with("/oauth/token") {
-                // Read body
-                let mut body = String::new();
-                let _ = req.as_reader().read_to_string(&mut body);
-                // Build minimal JWT with plan=pro
-                #[derive(serde::Serialize)]
-                struct Header {
-                    alg: &'static str,
-                    typ: &'static str,
-                }
-                let header = Header {
-                    alg: "none",
-                    typ: "JWT",
-                };
-                let payload = serde_json::json!({
-                    "email": "user@example.com",
-                    "https://api.openai.com/auth": {
-                        "chatgpt_plan_type": "pro",
-                        "chatgpt_account_id": chatgpt_account_id,
-                    }
-                });
-                let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-                let header_bytes = serde_json::to_vec(&header).unwrap();
-                let payload_bytes = serde_json::to_vec(&payload).unwrap();
-                let id_token = format!(
-                    "{}.{}.{}",
-                    b64(&header_bytes),
-                    b64(&payload_bytes),
-                    b64(b"sig")
-                );
-
-                let tokens = serde_json::json!({
-                    "id_token": id_token,
-                    "access_token": "access-123",
-                    "refresh_token": "refresh-123",
-                });
-                let data = serde_json::to_vec(&tokens).unwrap();
-                let mut resp = tiny_http::Response::from_data(data);
-                resp.add_header(
-                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                        .expect("header bytes should be valid"),
-                );
-                let _ = req.respond(resp);
-            } else {
-                let _ = req
-                    .respond(tiny_http::Response::from_string("not found").with_status_code(404));
-            }
-        }
+async fn start_mock_issuer(chatgpt_account_id: &str) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let payload = serde_json::json!({
+        "email": "user@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
     });
-
-    (addr, handle)
+    let id_token = format!(
+        "{}.{}.{}",
+        b64(br#"{"alg":"none","typ":"JWT"}"#),
+        b64(&serde_json::to_vec(&payload).unwrap()),
+        b64(b"sig")
+    );
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/oauth/token"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id_token": id_token,
+            "access_token": "access-123",
+            "refresh_token": "refresh-123",
+        })))
+        .mount(&server)
+        .await;
+    server
 }
 
 #[tokio::test]
@@ -98,8 +60,8 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     require_network!();
 
     let chatgpt_account_id = "12345678-0000-0000-0000-000000000000";
-    let (issuer_addr, issuer_handle) = start_mock_issuer(chatgpt_account_id);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(chatgpt_account_id).await;
+    let issuer = mock_issuer.uri();
 
     let tmp = tempdir()?;
     let codex_home = tmp.path().to_path_buf();
@@ -185,8 +147,6 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     assert_eq!(json["tokens"]["refresh_token"], "refresh-123");
     assert_eq!(json["tokens"]["account_id"], chatgpt_account_id);
 
-    // Stop mock issuer
-    drop(issuer_handle);
     Ok(())
 }
 
@@ -194,8 +154,8 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 async fn hosted_login_redirects_to_configured_open_app_url() -> Result<()> {
     require_network!();
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let issuer = mock_issuer.uri();
     let tmp = tempdir()?;
     let server = run_login_server(ServerOptions {
         codex_home: tmp.path().to_path_buf(),
@@ -240,8 +200,8 @@ async fn hosted_login_redirects_to_configured_open_app_url() -> Result<()> {
 async fn creates_missing_codex_home_dir() -> Result<()> {
     require_network!();
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let issuer = mock_issuer.uri();
 
     let tmp = tempdir()?;
     let codex_home = tmp.path().join("missing-subdir"); // does not exist
@@ -286,8 +246,8 @@ async fn creates_missing_codex_home_dir() -> Result<()> {
 async fn login_server_includes_forced_workspaces_as_one_query_param() -> Result<()> {
     require_network!();
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let issuer = mock_issuer.uri();
 
     let tmp = tempdir()?;
     let codex_home = tmp.path().to_path_buf();
@@ -323,6 +283,12 @@ async fn login_server_includes_forced_workspaces_as_one_query_param() -> Result<
         )]
     );
 
+    server.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), server.block_until_done())
+        .await?
+        .expect_err("cancelled callback server should stop");
+    assert_eq!(error.to_string(), "Login was not completed");
+
     Ok(())
 }
 
@@ -330,8 +296,8 @@ async fn login_server_includes_forced_workspaces_as_one_query_param() -> Result<
 async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
     require_network!();
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_DISALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_DISALLOWED).await;
+    let issuer = mock_issuer.uri();
 
     let tmp = tempdir()?;
     let codex_home = tmp.path().to_path_buf();
@@ -393,8 +359,8 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
 async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error() -> Result<()> {
     require_network!();
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let issuer = mock_issuer.uri();
 
     let tmp = tempdir()?;
     let codex_home = tmp.path().to_path_buf();
@@ -464,8 +430,8 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
 async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<()> {
     require_network!();
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let issuer = mock_issuer.uri();
 
     let tmp = tempdir()?;
     let codex_home = tmp.path().to_path_buf();
@@ -575,8 +541,8 @@ async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() ->
         })
     };
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let issuer = mock_issuer.uri();
     let tmp = tempdir()?;
 
     let mut opts = ServerOptions::new(
@@ -615,8 +581,8 @@ async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() ->
 async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
     require_network!();
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
-    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let mock_issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let issuer = mock_issuer.uri();
 
     let first_tmp = tempdir()?;
     let first_codex_home = first_tmp.path().to_path_buf();

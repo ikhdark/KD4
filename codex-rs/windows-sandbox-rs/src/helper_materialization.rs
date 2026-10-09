@@ -427,22 +427,6 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 
-    #[test]
-    fn copy_from_source_if_needed_copies_missing_destination() {
-        let tmp = TempDir::new().expect("tempdir");
-        let source = tmp.path().join("source.exe");
-        let destination = tmp.path().join("bin").join("helper.exe");
-
-        fs::write(&source, b"runner-v1").expect("write source");
-
-        let outcome = copy_from_source_if_needed(&source, &destination).expect("copy helper");
-
-        assert_eq!(CopyOutcome::ReCopied, outcome);
-        assert_eq!(
-            b"runner-v1".as_slice(),
-            fs::read(&destination).expect("read destination")
-        );
-    }
 
     #[test]
     fn destination_is_fresh_uses_size_and_mtime() {
@@ -469,23 +453,6 @@ mod tests {
         assert!(destination_is_fresh(&source, &destination).expect("fresh metadata"));
     }
 
-    #[test]
-    fn copy_from_source_if_needed_reuses_fresh_destination() {
-        let tmp = TempDir::new().expect("tempdir");
-        let source = tmp.path().join("source.exe");
-        let destination = tmp.path().join("bin").join("helper.exe");
-
-        fs::write(&source, b"runner-v1").expect("write source");
-        copy_from_source_if_needed(&source, &destination).expect("initial copy");
-
-        let outcome = copy_from_source_if_needed(&source, &destination).expect("revalidate helper");
-
-        assert_eq!(CopyOutcome::Reused, outcome);
-        assert_eq!(
-            b"runner-v1".as_slice(),
-            fs::read(&destination).expect("read destination")
-        );
-    }
 
     #[test]
     fn deleted_cached_helper_path_is_invalidated() {
@@ -509,10 +476,16 @@ mod tests {
         fs::write(&source, b"runner-v1").expect("write source");
 
         let (first_path, first_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
-        let (second_path, second_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
-
-        assert_eq!(first_path, second_path);
+        assert_eq!(first_path, codex_home.join(".sandbox-bin").join("source.exe"));
+        assert_eq!(fs::read(&first_path).expect("read first helper"), b"runner-v1");
         assert_eq!(HelperMaterializationStatus::ReCopied, first_status);
+
+        let (second_path, second_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
+        assert_eq!(first_path, second_path);
+        assert_eq!(
+            fs::read(&second_path).expect("read reused helper"),
+            b"runner-v1"
+        );
         assert_eq!(HelperMaterializationStatus::Reused, second_status);
     }
 
@@ -689,15 +662,6 @@ mod tests {
         assert_eq!(entries, vec![destination]);
     }
 
-    #[test]
-    fn helper_bin_dir_is_under_sandbox_bin() {
-        let codex_home = Path::new(r"C:\Users\example\.codex");
-
-        assert_eq!(
-            PathBuf::from(r"C:\Users\example\.codex\.sandbox-bin"),
-            helper_bin_dir(codex_home)
-        );
-    }
 
     #[test]
     fn copy_runner_into_shared_bin_dir() {

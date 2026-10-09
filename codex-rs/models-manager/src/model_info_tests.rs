@@ -81,32 +81,25 @@ fn disabled_personality_preserves_catalog_approval_messages() {
 }
 
 #[test]
-fn model_context_window_override_clamps_to_max_context_window() {
+fn model_context_window_override_preserves_defaults_and_respects_maximum() {
     let mut model = model_info_from_slug("unknown-model");
     model.context_window = Some(273_000);
     model.max_context_window = Some(400_000);
-    let config = ModelsManagerConfig {
-        model_context_window: Some(500_000),
-        ..Default::default()
-    };
-
-    let updated = with_config_overrides(model.clone(), &config);
-    let mut expected = model;
-    expected.context_window = Some(400_000);
-
-    assert_eq!(updated, expected);
-}
-
-#[test]
-fn model_context_window_uses_model_value_without_override() {
-    let mut model = model_info_from_slug("unknown-model");
-    model.context_window = Some(273_000);
-    model.max_context_window = Some(400_000);
-    let config = ModelsManagerConfig::default();
-
-    let updated = with_config_overrides(model.clone(), &config);
-
-    assert_eq!(updated, model);
+    for (requested, effective) in [
+        (None, 273_000),
+        (Some(300_000), 300_000),
+        (Some(400_000), 400_000),
+        (Some(500_000), 400_000),
+    ] {
+        let config = ModelsManagerConfig {
+            model_context_window: requested,
+            ..Default::default()
+        };
+        let updated = with_config_overrides(model.clone(), &config);
+        let mut expected = model.clone();
+        expected.context_window = Some(effective);
+        assert_eq!(updated, expected, "requested window: {requested:?}");
+    }
 }
 
 #[test]

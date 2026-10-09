@@ -1308,22 +1308,37 @@ mod canonical_tests {
     }
 
     #[test]
-    fn telemetry_preview_stops_before_split_utf8_character() {
-        let content = format!("{}😀", "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES - 1));
-
-        assert_eq!(
-            telemetry_preview(&content),
-            format!(
-                "{}\n{TELEMETRY_PREVIEW_TRUNCATION_NOTICE}",
-                "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES - 1)
-            )
-        );
-    }
-
-    #[test]
-    fn telemetry_preview_returns_original_within_limits() {
-        let content = "short output";
-        assert_eq!(telemetry_preview(content), content);
+    fn telemetry_preview_preserves_exact_prefix_at_byte_and_line_limits() {
+        let byte_prefix = "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES);
+        let utf8_prefix = "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES - 1);
+        let line_prefix = (0..TELEMETRY_PREVIEW_MAX_LINES)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let long_lines = (0..(TELEMETRY_PREVIEW_MAX_LINES + 5))
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (content, expected) in [
+            (String::new(), String::new()),
+            ("short output".to_string(), "short output".to_string()),
+            (byte_prefix.clone(), byte_prefix.clone()),
+            (line_prefix.clone(), line_prefix.clone()),
+            (
+                format!("{byte_prefix}xxxxxxxx"),
+                format!("{byte_prefix}\n{TELEMETRY_PREVIEW_TRUNCATION_NOTICE}"),
+            ),
+            (
+                format!("{utf8_prefix}😀"),
+                format!("{utf8_prefix}\n{TELEMETRY_PREVIEW_TRUNCATION_NOTICE}"),
+            ),
+            (
+                long_lines,
+                format!("{line_prefix}\n{TELEMETRY_PREVIEW_TRUNCATION_NOTICE}"),
+            ),
+        ] {
+            assert_eq!(telemetry_preview(&content), expected);
+        }
     }
 
     #[test]
@@ -1359,17 +1374,7 @@ mod canonical_tests {
         assert_eq!(JsonToolOutput::new(value), cloned);
     }
 
-    #[test]
-    fn telemetry_preview_truncates_by_bytes() {
-        let content = "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES + 8);
-        let preview = telemetry_preview(&content);
 
-        assert!(preview.contains(TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
-        assert!(
-            preview.len()
-                <= TELEMETRY_PREVIEW_MAX_BYTES + TELEMETRY_PREVIEW_TRUNCATION_NOTICE.len() + 1
-        );
-    }
 
     #[test]
     fn model_projection_keeps_execution_hooks_and_canonical_result_raw() {
@@ -1391,19 +1396,7 @@ mod canonical_tests {
         assert_eq!(original.log_preview(), raw.to_string());
     }
 
-    #[test]
-    fn telemetry_preview_truncates_by_lines() {
-        let content = (0..(TELEMETRY_PREVIEW_MAX_LINES + 5))
-            .map(|idx| format!("line {idx}"))
-            .collect::<Vec<_>>()
-            .join("\n");
 
-        let preview = telemetry_preview(&content);
-        let lines: Vec<&str> = preview.lines().collect();
-
-        assert!(lines.len() <= TELEMETRY_PREVIEW_MAX_LINES + 1);
-        assert_eq!(lines.last(), Some(&TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
-    }
 
     #[test]
     fn canonical_json_sorts_recursively_and_records_lexical_ranges() {

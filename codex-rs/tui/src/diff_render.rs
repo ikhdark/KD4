@@ -1530,7 +1530,8 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(lines.len() <= PATCH_SUMMARY_MAX_ROWS + 30 * 3 + 1);
+        assert_eq!(lines.len(), PATCH_SUMMARY_MAX_ROWS + 30 * 3);
+        assert_eq!(text.lines().filter(|line| line.ends_with("changed")).count(), PATCH_SUMMARY_MAX_ROWS);
         assert!(text.contains("Edited 30 files (+90000 -0)"));
         for index in 0..30 {
             assert!(text.contains(&format!("file-{index:02}.txt (+3000 -0)")));
@@ -1695,45 +1696,21 @@ mod tests {
     }
 
     #[test]
-    fn ansi16_add_style_uses_foreground_only() {
-        let style = style_add(
-            DiffTheme::Dark,
-            DiffColorLevel::Ansi16,
-            fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
-        );
-        assert_eq!(style.fg, Some(Color::Green));
-        assert_eq!(style.bg, None);
+    fn ansi16_content_and_signs_use_foreground_only() {
+        for theme in [DiffTheme::Dark, DiffTheme::Light] {
+            let backgrounds = fallback_diff_backgrounds(theme, DiffColorLevel::Ansi16);
+            for style in [style_add(theme, DiffColorLevel::Ansi16, backgrounds), style_sign_add(theme, DiffColorLevel::Ansi16, backgrounds)] {
+                assert_eq!(style, Style::default().fg(Color::Green));
+            }
+            for style in [style_del(theme, DiffColorLevel::Ansi16, backgrounds), style_sign_del(theme, DiffColorLevel::Ansi16, backgrounds)] {
+                assert_eq!(style, Style::default().fg(Color::Red));
+            }
+        }
     }
 
-    #[test]
-    fn ansi16_del_style_uses_foreground_only() {
-        let style = style_del(
-            DiffTheme::Dark,
-            DiffColorLevel::Ansi16,
-            fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
-        );
-        assert_eq!(style.fg, Some(Color::Red));
-        assert_eq!(style.bg, None);
-    }
 
-    #[test]
-    fn ansi16_sign_styles_use_foreground_only() {
-        let add_sign = style_sign_add(
-            DiffTheme::Dark,
-            DiffColorLevel::Ansi16,
-            fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
-        );
-        assert_eq!(add_sign.fg, Some(Color::Green));
-        assert_eq!(add_sign.bg, None);
 
-        let del_sign = style_sign_del(
-            DiffTheme::Dark,
-            DiffColorLevel::Ansi16,
-            fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
-        );
-        assert_eq!(del_sign.fg, Some(Color::Red));
-        assert_eq!(del_sign.bg, None);
-    }
+
     fn diff_summary_for_tests(changes: &HashMap<PathBuf, FileChange>) -> Vec<RtLine<'static>> {
         create_diff_summary(changes, &PathBuf::from("/"), /*wrap_cols*/ 80)
     }
@@ -2146,6 +2123,7 @@ mod tests {
             lines.len()
         );
 
+        snapshot_lines_text("syntax_highlighted_insert_wraps_text", &lines);
         snapshot_lines(
             "syntax_highlighted_insert_wraps",
             lines,
@@ -2154,45 +2132,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ui_snapshot_syntax_highlighted_insert_wraps_text() {
-        let long_rust = "fn very_long_function_name(arg_one: String, arg_two: String, arg_three: String, arg_four: String) -> Result<String, Box<dyn std::error::Error>> { Ok(arg_one) }";
 
-        let syntax_spans =
-            highlight_code_to_styled_spans(long_rust, "rust").expect("rust highlighting");
-        let spans = &syntax_spans[0];
-
-        let lines = push_wrapped_diff_line_with_syntax_and_style_context(
-            /*line_number*/ 1,
-            DiffLineType::Insert,
-            long_rust,
-            /*width*/ 80,
-            line_number_width(/*max_line_number*/ 1),
-            spans,
-            current_diff_render_style_context(),
-        );
-
-        snapshot_lines_text("syntax_highlighted_insert_wraps_text", &lines);
-    }
 
     #[test]
-    fn ui_snapshot_diff_gallery_80x24() {
-        snapshot_diff_gallery("diff_gallery_80x24", /*width*/ 80, /*height*/ 24);
+    fn ui_snapshot_diff_gallery_sizes() {
+        for (name, width, height) in [("diff_gallery_80x24", 80, 24), ("diff_gallery_94x35", 94, 35), ("diff_gallery_120x40", 120, 40)] {
+            snapshot_diff_gallery(name, width, height);
+        }
     }
 
-    #[test]
-    fn ui_snapshot_diff_gallery_94x35() {
-        snapshot_diff_gallery("diff_gallery_94x35", /*width*/ 94, /*height*/ 35);
-    }
 
-    #[test]
-    fn ui_snapshot_diff_gallery_120x40() {
-        snapshot_diff_gallery(
-            "diff_gallery_120x40",
-            /*width*/ 120,
-            /*height*/ 40,
-        );
-    }
+
+
 
     #[test]
     fn ui_snapshot_ansi16_insert_delete_no_background() {
@@ -2471,95 +2422,33 @@ mod tests {
     }
 
     #[test]
-    fn windows_terminal_promotes_ansi16_to_truecolor_for_diffs() {
-        assert_eq!(
-            diff_color_level_for_terminal(
-                StdoutColorLevel::Ansi16,
-                TerminalName::WindowsTerminal,
-                /*has_wt_session*/ false,
-                /*has_force_color_override*/ false,
-            ),
-            DiffColorLevel::TrueColor
-        );
+    fn diff_color_policy_respects_terminal_capabilities_and_explicit_overrides() {
+        for (stdout, terminal, wt_session, force, expected) in [
+            (StdoutColorLevel::Ansi16, TerminalName::WindowsTerminal, false, false, DiffColorLevel::TrueColor),
+            (StdoutColorLevel::Ansi16, TerminalName::Unknown, true, false, DiffColorLevel::TrueColor),
+            (StdoutColorLevel::Ansi16, TerminalName::WezTerm, false, false, DiffColorLevel::Ansi16),
+            (StdoutColorLevel::Unknown, TerminalName::WindowsTerminal, true, false, DiffColorLevel::TrueColor),
+            (StdoutColorLevel::Unknown, TerminalName::WindowsTerminal, false, false, DiffColorLevel::Ansi16),
+            (StdoutColorLevel::Ansi16, TerminalName::WindowsTerminal, false, true, DiffColorLevel::Ansi16),
+            (StdoutColorLevel::Ansi256, TerminalName::WindowsTerminal, true, true, DiffColorLevel::Ansi256),
+            (StdoutColorLevel::Ansi256, TerminalName::Unknown, true, false, DiffColorLevel::TrueColor),
+            (StdoutColorLevel::TrueColor, TerminalName::Unknown, false, true, DiffColorLevel::TrueColor),
+        ] {
+            assert_eq!(diff_color_level_for_terminal(stdout, terminal, wt_session, force), expected, "{stdout:?} {terminal:?} wt={wt_session} force={force}");
+        }
     }
 
-    #[test]
-    fn wt_session_promotes_ansi16_to_truecolor_for_diffs() {
-        assert_eq!(
-            diff_color_level_for_terminal(
-                StdoutColorLevel::Ansi16,
-                TerminalName::Unknown,
-                /*has_wt_session*/ true,
-                /*has_force_color_override*/ false,
-            ),
-            DiffColorLevel::TrueColor
-        );
-    }
 
-    #[test]
-    fn non_windows_terminal_keeps_ansi16_diff_palette() {
-        assert_eq!(
-            diff_color_level_for_terminal(
-                StdoutColorLevel::Ansi16,
-                TerminalName::WezTerm,
-                /*has_wt_session*/ false,
-                /*has_force_color_override*/ false,
-            ),
-            DiffColorLevel::Ansi16
-        );
-    }
 
-    #[test]
-    fn wt_session_promotes_unknown_color_level_to_truecolor() {
-        assert_eq!(
-            diff_color_level_for_terminal(
-                StdoutColorLevel::Unknown,
-                TerminalName::WindowsTerminal,
-                /*has_wt_session*/ true,
-                /*has_force_color_override*/ false,
-            ),
-            DiffColorLevel::TrueColor
-        );
-    }
 
-    #[test]
-    fn non_wt_windows_terminal_keeps_unknown_color_level_conservative() {
-        assert_eq!(
-            diff_color_level_for_terminal(
-                StdoutColorLevel::Unknown,
-                TerminalName::WindowsTerminal,
-                /*has_wt_session*/ false,
-                /*has_force_color_override*/ false,
-            ),
-            DiffColorLevel::Ansi16
-        );
-    }
 
-    #[test]
-    fn explicit_force_override_keeps_ansi16_on_windows_terminal() {
-        assert_eq!(
-            diff_color_level_for_terminal(
-                StdoutColorLevel::Ansi16,
-                TerminalName::WindowsTerminal,
-                /*has_wt_session*/ false,
-                /*has_force_color_override*/ true,
-            ),
-            DiffColorLevel::Ansi16
-        );
-    }
 
-    #[test]
-    fn explicit_force_override_keeps_ansi256_on_windows_terminal() {
-        assert_eq!(
-            diff_color_level_for_terminal(
-                StdoutColorLevel::Ansi256,
-                TerminalName::WindowsTerminal,
-                /*has_wt_session*/ true,
-                /*has_force_color_override*/ true,
-            ),
-            DiffColorLevel::Ansi256
-        );
-    }
+
+
+
+
+
+
 
     #[test]
     fn add_diff_uses_path_extension_for_highlighting() {
@@ -2632,6 +2521,9 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].to_string(), "    1 +export module math;");
+        assert_eq!(lines[2].to_string(), "    2 +export int value = 42;");
         assert!(lines.iter().all(|line| {
             line.spans
                 .iter()
@@ -2666,9 +2558,9 @@ mod tests {
     #[test]
     fn detect_lang_for_common_paths() {
         // Standard extensions are detected.
-        assert!(detect_lang_for_path(Path::new("foo.rs")).is_some());
-        assert!(detect_lang_for_path(Path::new("bar.py")).is_some());
-        assert!(detect_lang_for_path(Path::new("app.tsx")).is_some());
+        assert_eq!(detect_lang_for_path(Path::new("foo.rs")).as_deref(), Some("rs"));
+        assert_eq!(detect_lang_for_path(Path::new("bar.py")).as_deref(), Some("py"));
+        assert_eq!(detect_lang_for_path(Path::new("app.tsx")).as_deref(), Some("tsx"));
 
         // Extensionless files return None.
         assert!(detect_lang_for_path(Path::new("Makefile")).is_none());
@@ -2676,25 +2568,20 @@ mod tests {
     }
 
     #[test]
-    fn wrap_styled_spans_single_line() {
-        // Content that fits in one line should produce exactly one chunk.
-        let spans = vec![RtSpan::raw("short")];
-        let result = wrap_styled_spans(&spans, /*max_cols*/ 80);
-        assert_eq!(result.len(), 1);
+    fn wrap_styled_spans_preserves_exact_content_and_styles() {
+        let style = Style::default().fg(Color::Green);
+        for (text, width, expected) in [
+            ("short".to_string(), 80, vec!["short".to_string()]),
+            ("a".repeat(100), 40, vec!["a".repeat(40), "a".repeat(40), "a".repeat(20)]),
+            ("x".repeat(50), 20, vec!["x".repeat(20), "x".repeat(20), "x".repeat(10)]),
+        ] {
+            let actual = wrap_styled_spans(&[RtSpan::styled(text, style)], width);
+            let expected: Vec<_> = expected.into_iter().map(|chunk| vec![RtSpan::styled(chunk, style)]).collect();
+            assert_eq!(actual, expected);
+        }
     }
 
-    #[test]
-    fn wrap_styled_spans_splits_long_content() {
-        // Content wider than max_cols should produce multiple chunks.
-        let long_text = "a".repeat(100);
-        let spans = vec![RtSpan::raw(long_text)];
-        let result = wrap_styled_spans(&spans, /*max_cols*/ 40);
-        assert!(
-            result.len() >= 3,
-            "100 chars at 40 cols should produce at least 3 lines, got {}",
-            result.len()
-        );
-    }
+
 
     #[test]
     fn wrap_styled_spans_flushes_at_span_boundary() {
@@ -2713,6 +2600,7 @@ mod tests {
             2,
             "span ending exactly at max_cols should flush before next span: {result:?}"
         );
+        assert_eq!(result, vec![vec![RtSpan::styled("aaaa", style_a)], vec![RtSpan::styled("bb", style_b)]]);
         // First line should only contain the 'a' span.
         let first_width: usize = result[0].iter().map(|s| s.content.chars().count()).sum();
         assert!(
@@ -2721,19 +2609,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wrap_styled_spans_preserves_styles() {
-        // Verify that styles survive split boundaries.
-        let style = Style::default().fg(Color::Green);
-        let text = "x".repeat(50);
-        let spans = vec![RtSpan::styled(text, style)];
-        let result = wrap_styled_spans(&spans, /*max_cols*/ 20);
-        for chunk in &result {
-            for span in chunk {
-                assert_eq!(span.style, style, "style should be preserved across wraps");
-            }
-        }
-    }
+
 
     #[test]
     fn wrap_styled_spans_tabs_have_visible_width() {

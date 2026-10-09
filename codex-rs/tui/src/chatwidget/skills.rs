@@ -423,6 +423,7 @@ mod tests {
         let skills = vec![skill("shared")];
         let apps = vec![app("shared-app", "Shared")];
         for path in [
+            "app://shared-app",
             "app://missing",
             "skill://missing/SKILL.md",
             "mcp://server/tool",
@@ -432,25 +433,16 @@ mod tests {
                 &HashMap::from([("shared".to_string(), path.to_string())]),
             );
             assert!(find_skill_mentions_with_tool_mentions(&mentions, &skills).is_empty());
-            assert!(find_app_mentions(&mentions, &apps, &HashSet::new()).is_empty());
+            assert_eq!(
+                find_app_mentions(&mentions, &apps, &HashSet::new()),
+                if path == "app://shared-app" { apps.clone() } else { Vec::new() }
+            );
         }
         let mentions = collect_tool_mentions("$shared", &HashMap::new());
         assert_eq!(
             find_skill_mentions_with_tool_mentions(&mentions, &skills),
             skills
         );
-        assert_eq!(find_app_mentions(&mentions, &apps, &HashSet::new()), apps);
-    }
-
-    #[test]
-    fn explicit_app_mention_does_not_select_same_named_skill() {
-        let skills = vec![skill("shared")];
-        let apps = vec![app("shared-app", "Shared")];
-        let mentions = collect_tool_mentions(
-            "$shared",
-            &HashMap::from([("shared".to_string(), "app://shared-app".to_string())]),
-        );
-        assert!(find_skill_mentions_with_tool_mentions(&mentions, &skills).is_empty());
         assert_eq!(find_app_mentions(&mentions, &apps, &HashSet::new()), apps);
     }
 
@@ -475,28 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn find_app_mentions_requires_accessible_enabled_apps_for_slugs() {
-        let apps = vec![
-            app("google_drive", "Google Drive"),
-            AppInfo {
-                is_accessible: false,
-                ..app("arabica_uae", "% Arabica UAE")
-            },
-            AppInfo {
-                is_enabled: false,
-                ..app("linear", "Linear")
-            },
-        ];
-        let mentions = collect_tool_mentions("$google-drive $arabica-uae $linear", &HashMap::new());
-
-        assert_eq!(
-            find_app_mentions(&mentions, &apps, &HashSet::new()),
-            vec![apps[0].clone()]
-        );
-    }
-
-    #[test]
-    fn find_app_mentions_requires_accessible_enabled_apps_for_bound_paths() {
+    fn find_app_mentions_requires_accessible_enabled_apps_for_slugs_and_bound_paths() {
         let apps = vec![
             app("google_drive", "Google Drive"),
             AppInfo {
@@ -513,11 +484,12 @@ mod tests {
             ("arabica-uae".to_string(), "app://arabica_uae".to_string()),
             ("linear".to_string(), "app://linear".to_string()),
         ]);
-        let mentions = collect_tool_mentions("$google-drive $arabica-uae $linear", &mention_paths);
-
-        assert_eq!(
-            find_app_mentions(&mentions, &apps, &HashSet::new()),
-            vec![apps[0].clone()]
-        );
+        for paths in [HashMap::new(), mention_paths] {
+            let mentions = collect_tool_mentions("$google-drive $arabica-uae $linear", &paths);
+            assert_eq!(
+                find_app_mentions(&mentions, &apps, &HashSet::new()),
+                vec![apps[0].clone()]
+            );
+        }
     }
 }

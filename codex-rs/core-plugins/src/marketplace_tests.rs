@@ -1773,6 +1773,10 @@ fn list_marketplaces_keeps_remote_and_local_plugin_sources() {
     let repo_root = tmp.path().join("repo");
 
     fs::create_dir_all(repo_root.join(".git")).unwrap();
+    write_alternate_plugin_manifest(
+        &repo_root.join("plugins/local-plugin"),
+        r#"{"name":"local-plugin","version":"0.9.0"}"#,
+    );
     write_alternate_marketplace(
         &repo_root,
         r#"{
@@ -1822,7 +1826,7 @@ fn list_marketplaces_keeps_remote_and_local_plugin_sources() {
         vec![
             MarketplacePlugin {
                 name: "local-plugin".to_string(),
-                local_version: None,
+                local_version: Some("0.9.0".to_string()),
                 source: MarketplacePluginSource::Local {
                     path: AbsolutePathBuf::try_from(repo_root.join("plugins/local-plugin"))
                         .unwrap(),
@@ -1856,7 +1860,7 @@ fn list_marketplaces_keeps_remote_and_local_plugin_sources() {
             },
             MarketplacePlugin {
                 name: "git-subdir-plugin".to_string(),
-                local_version: Some("1.2.3".to_string()),
+                local_version: None,
                 source: MarketplacePluginSource::Git {
                     url: "https://github.com/owner/repo.git".to_string(),
                     path: Some("plugins/example".to_string()),
@@ -2238,9 +2242,10 @@ fn find_marketplace_plugin_allows_missing_products_field() {
     )
     .unwrap();
 
-    let resolved = find_marketplace_plugin(
+    let resolved = find_installable_marketplace_plugin(
         &AbsolutePathBuf::try_from(repo_root.join(".agents/plugins/marketplace.json")).unwrap(),
         "default-plugin",
+        None,
     )
     .unwrap();
 

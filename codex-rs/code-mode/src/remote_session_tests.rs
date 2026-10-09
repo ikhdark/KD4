@@ -116,43 +116,15 @@ async fn shutdown_releases_final_host_lease() {
 }
 
 #[test]
-fn host_program_override_takes_precedence() {
-    assert_eq!(
-        resolve_host_program(
-            Some("custom-code-mode-host".into()),
-            Ok(PathBuf::from("/opt/codex/bin/codex")),
-        ),
-        PathBuf::from("custom-code-mode-host")
-    );
-}
-
-#[test]
-fn host_program_is_next_to_the_main_executable_even_when_missing() {
-    let executable_name = "codex-code-mode-host.exe";
-
-    assert_eq!(
-        resolve_host_program(
-            /*override_path*/ None,
-            Ok(PathBuf::from("/opt/codex/bin/codex")),
-        ),
-        PathBuf::from("/opt/codex/bin").join(executable_name)
-    );
-}
-
-#[test]
-fn host_program_falls_back_to_its_name_when_main_executable_is_unknown() {
-    let executable_name = "codex-code-mode-host.exe";
-
-    assert_eq!(
-        resolve_host_program(
-            /*override_path*/ None,
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "missing executable"
-            )),
-        ),
-        PathBuf::from(executable_name)
-    );
+fn host_program_resolution_preserves_override_sibling_and_fallback_precedence() {
+    for (override_path, current_exe, expected) in [
+        (Some("custom-code-mode-host".into()), Ok(PathBuf::from("/opt/codex/bin/codex")), PathBuf::from("custom-code-mode-host")),
+        (Some("custom-code-mode-host".into()), Err(io::Error::new(io::ErrorKind::NotFound, "missing executable")), PathBuf::from("custom-code-mode-host")),
+        (None, Ok(PathBuf::from("/opt/codex/bin/codex")), PathBuf::from("/opt/codex/bin").join("codex-code-mode-host.exe")),
+        (None, Err(io::Error::new(io::ErrorKind::NotFound, "missing executable")), PathBuf::from("codex-code-mode-host.exe")),
+    ] {
+        assert_eq!(resolve_host_program(override_path, current_exe), expected);
+    }
 }
 
 #[tokio::test]

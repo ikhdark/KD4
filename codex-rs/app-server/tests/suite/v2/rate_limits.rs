@@ -422,7 +422,7 @@ async fn get_account_rate_limits_preserves_count_when_reset_credit_details_fail(
 }
 
 #[tokio::test]
-async fn send_add_credits_nudge_email_posts_expected_body() -> Result<()> {
+async fn send_add_credits_nudge_email_forwards_body_and_maps_backend_outcomes() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_chatgpt_auth(
         codex_home.path(),
@@ -444,6 +444,7 @@ async fn send_add_credits_nudge_email_posts_expected_body() -> Result<()> {
             "credit_type": "usage_limit",
         })))
         .respond_with(ResponseTemplate::new(200))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -470,109 +471,44 @@ async fn send_add_credits_nudge_email_posts_expected_body() -> Result<()> {
 
     assert_eq!(received.status, AddCreditsNudgeEmailStatus::Sent);
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn send_add_credits_nudge_email_maps_cooldown() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .plan_type("pro"),
-        AuthCredentialsStoreMode::File,
-    )?;
-
-    let server = MockServer::start().await;
-    let server_url = server.uri();
-    write_chatgpt_base_url(codex_home.path(), &server_url)?;
-
-    Mock::given(method("POST"))
-        .and(path("/api/codex/accounts/send_add_credits_nudge_email"))
-        .respond_with(ResponseTemplate::new(429))
-        .mount(&server)
-        .await;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
-            credit_type: AddCreditsNudgeCreditType::Credits,
-        })
-        .await?;
-
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: SendAddCreditsNudgeEmailResponse = to_response(response)?;
-
-    assert_eq!(received.status, AddCreditsNudgeEmailStatus::CooldownActive);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn send_add_credits_nudge_email_surfaces_backend_failure() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .plan_type("pro"),
-        AuthCredentialsStoreMode::File,
-    )?;
-
-    let server = MockServer::start().await;
-    let server_url = server.uri();
-    write_chatgpt_base_url(codex_home.path(), &server_url)?;
-
-    Mock::given(method("POST"))
-        .and(path("/api/codex/accounts/send_add_credits_nudge_email"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server)
-        .await;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
-            credit_type: AddCreditsNudgeCreditType::Credits,
-        })
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INTERNAL_ERROR_CODE);
-    assert!(
-        error
-            .error
-            .message
-            .contains("failed to notify workspace owner"),
-        "unexpected error message: {}",
-        error.error.message
-    );
-    assert_eq!(error.error.data, None);
-
+    server.verify().await;
+    for status in [429, 500] {
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/api/codex/accounts/send_add_credits_nudge_email"))
+            .and(header("authorization", "Bearer chatgpt-token"))
+            .and(header("chatgpt-account-id", "account-123"))
+            .and(wiremock::matchers::body_json(json!({"credit_type": "credits"})))
+            .respond_with(ResponseTemplate::new(status).set_body_string("boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let request_id = mcp
+            .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
+                credit_type: AddCreditsNudgeCreditType::Credits,
+            })
+            .await?;
+        if status == 429 {
+            let response = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+            )
+            .await??;
+            let received: SendAddCreditsNudgeEmailResponse = to_response(response)?;
+            assert_eq!(received.status, AddCreditsNudgeEmailStatus::CooldownActive);
+        } else {
+            let error = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+            )
+            .await??;
+            assert_eq!(error.id, RequestId::Integer(request_id));
+            assert_eq!(error.error.code, INTERNAL_ERROR_CODE);
+            assert!(error.error.message.contains("failed to notify workspace owner"), "{error:?}");
+            assert_eq!(error.error.data, None);
+        }
+        server.verify().await;
+    }
     Ok(())
 }
 

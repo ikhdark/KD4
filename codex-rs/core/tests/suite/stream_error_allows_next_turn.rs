@@ -4,6 +4,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::require_network;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
@@ -38,6 +39,7 @@ async fn continue_after_stream_error() {
         .set_body_raw(
             sse(vec![
                 ev_response_created("resp_ok2"),
+                ev_assistant_message("msg_ok2", "recovered successfully"),
                 ev_completed("resp_ok2"),
             ]),
             "text/event-stream",
@@ -135,5 +137,14 @@ async fn continue_after_stream_error() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert!(completed.error.is_none(), "follow-up failed: {completed:?}");
+    assert_eq!(
+        completed.last_agent_message.as_deref(),
+        Some("recovered successfully")
+    );
 }

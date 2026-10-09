@@ -497,7 +497,7 @@ class SharedTimingAnalysisTest(unittest.TestCase):
     def test_wait_diagnostics_reach_runner_report_without_claiming_cpu_cost(self):
         profile = timing_profile()
         profile["toolCalls"][0].update(
-            toolName="exec_command", retryCount=0, reentryCount=14000, totalDurationMs=1000,
+            toolName="exec_command", retryCount=0, reentryCount=14000, totalDurationMs=2000,
             timerWaits=[{"waitKind": "owner_output_wait", "wakeReason": "completed"}] * 3,
         )
         report = analysis.analyze_runner_evidence(self.evidence(profile))
@@ -507,7 +507,7 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         ])
         self.assertEqual(waits["highReentryCallCount"], 1)
         self.assertEqual(waits["highReentryCalls"][0]["callId"], "tool-1")
-        self.assertEqual(waits["highReentryCalls"][0]["reentriesPerSecond"], 14000)
+        self.assertEqual(waits["highReentryCalls"][0]["reentriesPerSecond"], 7000)
         self.assertIn("not proof", waits["note"])
         # A folded record's sequence counts every wake it covers.
         profile["toolCalls"][0]["timerWaits"] = [
@@ -1009,7 +1009,10 @@ class SharedTimingAnalysisTest(unittest.TestCase):
                 self.assertEqual(
                     [row["durationMs"] for row in report["tools"]], [expected] * 3
                 )
-                self.assertGreater(len(report["failures"]), 0)
+                self.assertEqual(
+                    [(row["kind"], row["toolId"], row["exitCode"]) for row in report["failures"]],
+                    [("tool_execution_failure", call_id, 2) for call_id in ("search", "compound", "mcp")],
+                )
 
     def test_native_tool_activity_distinguishes_missing_evidence_from_observed_zero(
         self,
@@ -1308,7 +1311,13 @@ class SharedTimingAnalysisTest(unittest.TestCase):
     def test_audit_and_runner_share_independent_expected_metrics(self):
         timing = timing_profile()
         original = copy.deepcopy(timing)
-        runner = analysis.analyze_runner_evidence(self.evidence(timing))
+        evidence = self.evidence(timing)
+        # Replayed terminal profiles must not duplicate generations or usage.
+        evidence["events"].append(copy.deepcopy(evidence["events"][0]))
+        runner = analysis.analyze_runner_evidence(evidence)
+        self.assertEqual(runner["coverage"]["nativeTimingProfiles"], 1)
+        self.assertIsNone(runner["tokens"]["inputTokens"])
+        self.assertEqual(runner["tokens"]["observedTotals"]["inputTokens"], 100)
         runtime = runner["runtime"]
         self.assertIsNone(runtime["tokens"]["inputTokens"])
         self.assertIsNone(runtime["tokens"]["outputTokens"])
@@ -1591,6 +1600,33 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         self.assertEqual(report["status"], "completed")
         self.assertEqual(report["failures"], [])
 
+    def test_rollout_terminal_error_reaches_runner_status_through_audit(self):
+        # TurnCompleteEvent.error is terminal failure evidence, regardless of
+        # whether it arrives as a rollout payload or a native turn object.
+        for error in (None, {"message": "provider rejected request"}):
+            for include_tokens in (True, False):
+                with self.subTest(error=error, tokens=include_tokens), tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "rollout.jsonl"
+                    path.write_text(json.dumps({
+                        "type": "event_msg", "payload": {
+                            "type": "task_complete", "turn_id": "failed-turn",
+                            "error": error, "timing": timing_profile(),
+                        },
+                    }), encoding="utf-8")
+                    report = audit.analyze_session_path(
+                        path, Path(temp), include_tokens=include_tokens
+                    )
+                expected = "failed" if error is not None else "completed"
+                self.assertEqual(report["perTurn"][0]["lifecycle"], expected)
+                runner = report["runnerDiagnostics"]
+                self.assertEqual(runner["status"], expected)
+                self.assertEqual(runner["terminalTurns"], {"failed-turn": expected})
+                failures = [row for row in runner["failures"] if row["kind"] == "turn_failed"]
+                self.assertEqual(len(failures), int(error is not None))
+                if failures:
+                    self.assertEqual(failures[0]["evidence"], error)
+                self.assertEqual(audit.bounded_summary(report)["runnerDiagnostics"]["status"], expected)
+
     def test_rg_no_match_is_not_a_tool_failure(self):
         for command, exit_code, output, failed in [
             ('rg -n "needle" src', 1, "", False),
@@ -1643,15 +1679,6 @@ class SharedTimingAnalysisTest(unittest.TestCase):
                 self.assertEqual(
                     report["tools"][0].get("outcome"), None if failed else "no_match"
                 )
-
-    def test_profile_duplicate_is_not_another_generation(self):
-        evidence = self.evidence()
-        evidence["events"] *= 2
-        report = analysis.analyze_runner_evidence(evidence)
-        self.assertEqual(report["logicalGenerations"], 2)
-        self.assertIsNone(report["tokens"]["inputTokens"])
-        self.assertEqual(report["tokens"]["observedTotals"]["inputTokens"], 100)
-        self.assertEqual(report["coverage"]["nativeTimingProfiles"], 1)
 
     def test_retries_need_observed_reason_and_unchanged_state(self):
         request = {
@@ -1895,9 +1922,18 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         self.assertEqual(summary["confidenceCounts"], {"observed": 11, "unknown": 1})
 
     def test_missing_milestones_remain_unknown(self):
-        timing = timing_profile()
-        timing["schemaVersion"] = 24
-        self.assertIsNone(analysis.analyze_timing(timing)["firstUsefulActionMs"])
+        for version, milestones in (
+            (24, {"firstUsefulActionMs": 12.5, "firstDomainActionMs": 12.5}),
+            (25, None), (25, {}), (25, {"firstDomainActionMs": 12.5}),
+        ):
+            with self.subTest(version=version, milestones=milestones):
+                timing = timing_profile()
+                timing["schemaVersion"] = version
+                if milestones is None:
+                    timing.pop("milestones")
+                else:
+                    timing["milestones"] = milestones
+                self.assertIsNone(analysis.analyze_timing(timing)["firstUsefulActionMs"])
 
     def test_invalid_native_profile_cannot_claim_runtime_measurements(self):
         timing = timing_profile()

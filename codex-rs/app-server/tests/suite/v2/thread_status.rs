@@ -13,8 +13,10 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -65,7 +67,7 @@ async fn thread_status_changed_emits_runtime_updates() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
     )
     .await??;
-    let _: TurnStartResponse = to_response(turn_start_resp)?;
+    let started: TurnStartResponse = to_response(turn_start_resp)?;
 
     let mut saw_active_running = false;
     let mut saw_idle_after_turn = false;
@@ -95,21 +97,21 @@ async fn thread_status_changed_emits_runtime_updates() -> Result<()> {
                             saw_idle_after_turn = true;
                         }
                     }
-                    ThreadStatus::SystemError => {
-                        if saw_active_running {
-                            saw_idle_after_turn = true;
-                        }
-                    }
-                    ThreadStatus::NotLoaded => {
-                        if saw_active_running {
-                            saw_idle_after_turn = true;
-                        }
+                    status @ (ThreadStatus::SystemError | ThreadStatus::NotLoaded) => {
+                        anyhow::bail!("successful turn unexpectedly entered {status:?}");
                     }
                 }
             }
-            JSONRPCMessage::Notification(JSONRPCNotification { method, .. })
-                if method == "turn/completed" =>
+            JSONRPCMessage::Notification(JSONRPCNotification {
+                method,
+                params: Some(params),
+            }) if method == "turn/completed" =>
             {
+                let notification: TurnCompletedNotification = serde_json::from_value(params)?;
+                assert_eq!(notification.thread_id, thread.id);
+                assert_eq!(notification.turn.id, started.turn.id);
+                assert_eq!(notification.turn.status, TurnStatus::Completed);
+                assert_eq!(notification.turn.error, None);
                 saw_turn_completed = true;
             }
             _ => {}

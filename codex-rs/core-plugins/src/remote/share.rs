@@ -453,7 +453,7 @@ async fn get_created_workspace_plugins_page(
     auth: &CodexAuth,
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
-    let url = format!("{}/ps/plugins/workspace/created", config.chatgpt_base_url);
+    let url = remote_plugin_service_url(config, &["ps", "plugins", "workspace", "created"])?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(page_token) = page_token {
@@ -470,10 +470,8 @@ async fn create_workspace_plugin_upload(
     size_bytes: usize,
     remote_plugin_id: Option<&str>,
 ) -> Result<RemoteWorkspacePluginUploadUrlResponse, RemotePluginCatalogError> {
-    let url = format!(
-        "{}/public/plugins/workspace/upload-url",
-        config.chatgpt_base_url
-    );
+    let url =
+        remote_plugin_service_url(config, &["public", "plugins", "workspace", "upload-url"])?;
     let request = authenticated_request(client.post(&url), auth)?.json(
         &RemoteWorkspacePluginUploadUrlRequest {
             filename,

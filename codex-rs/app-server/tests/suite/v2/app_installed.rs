@@ -87,7 +87,27 @@ async fn installed_apps_force_refresh_only_refreshes_tools_snapshot() -> Result<
     assert_eq!(fixture.list_tools_calls(), 0);
     assert_eq!(fixture.workspace_settings_calls(), 1);
 
+    let seeded = send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
+    assert_eq!(seeded.apps.len(), 3);
+    assert_eq!(fixture.list_tools_calls(), 1);
+    let tools = fixture
+        .state
+        .tools
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    fixture.set_tools(Vec::new());
+    let empty = send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
+    assert_eq!(empty, AppsInstalledResponse { apps: Vec::new() });
+    assert_eq!(fixture.list_tools_calls(), 2);
+
+    let cached_empty = send_installed_request(&mut app_server, /*force_refresh*/ false).await?;
+    assert_eq!(cached_empty, empty);
+    assert_eq!(fixture.list_tools_calls(), 2);
+
+    fixture.set_tools(tools);
     let refreshed = send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
+    assert_eq!(refreshed, seeded);
     assert_eq!(
         refreshed.apps,
         vec![
@@ -111,22 +131,33 @@ async fn installed_apps_force_refresh_only_refreshes_tools_snapshot() -> Result<
             },
         ]
     );
-    assert_eq!(fixture.list_tools_calls(), 1);
+    assert_eq!(fixture.list_tools_calls(), 3);
     assert_eq!(fixture.workspace_settings_calls(), 1);
 
     let cached = send_installed_request(&mut app_server, /*force_refresh*/ false).await?;
     assert_eq!(cached, refreshed);
-    assert_eq!(fixture.list_tools_calls(), 1);
+    assert_eq!(fixture.list_tools_calls(), 3);
     assert_eq!(fixture.workspace_settings_calls(), 1);
 
-    fixture.set_tools(Vec::new());
-    let empty = send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
-    assert_eq!(empty, AppsInstalledResponse { apps: Vec::new() });
-    assert_eq!(fixture.list_tools_calls(), 2);
+    // Keep failure enabled through teardown: startup can reconnect once before
+    // the failed force-refresh request cancels its temporary manager.
+    fixture.fail_list_tools();
+    let request_id = app_server
+        .send_apps_installed_request(AppsInstalledParams {
+            thread_id: None,
+            force_refresh: true,
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32603);
 
-    let cached_empty = send_installed_request(&mut app_server, /*force_refresh*/ false).await?;
-    assert_eq!(cached_empty, empty);
-    assert_eq!(fixture.list_tools_calls(), 2);
+    let retained = send_installed_request(&mut app_server, /*force_refresh*/ false).await?;
+    assert_eq!(retained, refreshed);
+    assert!(matches!(fixture.list_tools_calls(), 4..=5));
     assert_eq!(fixture.workspace_settings_calls(), 1);
     assert_eq!(fixture.directory_calls(), 0);
     Ok(())
@@ -236,6 +267,15 @@ async fn installed_apps_global_disable_retains_tool_derived_identities() -> Resu
         let mut app_server = start_app_server(codex_home.path()).await?;
         send_installed_request(&mut app_server, /*force_refresh*/ true).await?
     };
+    assert_eq!(
+        committed
+            .apps
+            .iter()
+            .map(|app| app.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "blocked", "disabled"]
+    );
+    assert!(committed.apps[0].enabled && committed.apps[0].callable);
     let mut expected_disabled = committed;
     for app in &mut expected_disabled.apps {
         app.enabled = false;
@@ -302,33 +342,6 @@ async fn installed_apps_thread_id_uses_effective_thread_config() -> Result<()> {
     alpha.callable = false;
     assert_eq!(response, expected);
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn installed_apps_failed_force_refresh_retains_previous_snapshot() -> Result<()> {
-    let fixture = InstalledAppsFixture::start().await?;
-    let codex_home = configured_codex_home(fixture.base_url())?;
-    let mut app_server = start_app_server(codex_home.path()).await?;
-
-    let committed = send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
-    fixture.fail_next_list_tools();
-    let request_id = app_server
-        .send_apps_installed_request(AppsInstalledParams {
-            thread_id: None,
-            force_refresh: true,
-        })
-        .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        app_server.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_eq!(error.error.code, -32603);
-
-    let retained = send_installed_request(&mut app_server, /*force_refresh*/ false).await?;
-    assert_eq!(retained, committed);
-    assert_eq!(fixture.list_tools_calls(), 2);
     Ok(())
 }
 
@@ -429,7 +442,7 @@ impl ServerHandler for InstalledAppsMcpServer {
         let state = Arc::clone(&self.state);
         async move {
             state.list_tools_calls.fetch_add(1, Ordering::SeqCst);
-            let should_fail = state.fail_next.swap(false, Ordering::SeqCst);
+            let should_fail = state.fail_list_tools.load(Ordering::SeqCst);
             if should_fail {
                 return Err(rmcp::ErrorData::internal_error(
                     "injected tools/list failure",
@@ -457,7 +470,7 @@ struct InstalledAppsServerState {
     workspace_settings_calls: AtomicUsize,
     workspace_plugins_enabled: AtomicBool,
     fail_workspace_settings: AtomicBool,
-    fail_next: AtomicBool,
+    fail_list_tools: AtomicBool,
 }
 
 struct InstalledAppsFixture {
@@ -496,7 +509,7 @@ impl InstalledAppsFixture {
             workspace_settings_calls: AtomicUsize::new(0),
             workspace_plugins_enabled: AtomicBool::new(true),
             fail_workspace_settings: AtomicBool::new(false),
-            fail_next: AtomicBool::new(false),
+            fail_list_tools: AtomicBool::new(false),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -561,8 +574,8 @@ impl InstalledAppsFixture {
             .store(enabled, Ordering::SeqCst);
     }
 
-    fn fail_next_list_tools(&self) {
-        self.state.fail_next.store(true, Ordering::SeqCst);
+    fn fail_list_tools(&self) {
+        self.state.fail_list_tools.store(true, Ordering::SeqCst);
     }
 }
 

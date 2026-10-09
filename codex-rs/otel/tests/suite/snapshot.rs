@@ -68,14 +68,18 @@ fn observable_gauge_is_collected_on_every_delta_snapshot() -> Result<()> {
     let config = MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter)
         .with_runtime_reader();
     let metrics = MetricsClient::new(config)?;
+    let value = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1));
+    let observed = std::sync::Arc::clone(&value);
     metrics.register_observable_gauge_with_description(
         "codex.active",
         "Number of active operations.",
-        || 1,
+        move || observed.load(std::sync::atomic::Ordering::SeqCst),
         &[("component", "test")],
     )?;
 
-    for snapshot in [metrics.snapshot()?, metrics.snapshot()?] {
+    for expected in [1, 7] {
+        value.store(expected, std::sync::atomic::Ordering::SeqCst);
+        let snapshot = metrics.snapshot()?;
         let gauge = find_metric(&snapshot, "codex.active").expect("gauge metric missing");
         let point = match gauge.data() {
             AggregatedMetrics::I64(MetricData::Gauge(gauge)) => {
@@ -83,7 +87,7 @@ fn observable_gauge_is_collected_on_every_delta_snapshot() -> Result<()> {
             }
             _ => panic!("unexpected gauge metric data type"),
         };
-        assert_eq!(point.value(), 1);
+        assert_eq!(point.value(), expected);
         assert_eq!(
             attributes_to_map(point.attributes()),
             BTreeMap::from([("component".to_string(), "test".to_string())])

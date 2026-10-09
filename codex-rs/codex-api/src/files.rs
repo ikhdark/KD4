@@ -828,8 +828,17 @@ mod tests {
             format!("{}/download/file_123", server.uri())
         );
         assert_eq!(uploaded.file_name, "hello.txt");
+        assert_eq!(uploaded.file_size_bytes, 5);
         assert_eq!(uploaded.mime_type, Some("text/plain".to_string()));
         assert_eq!(finalize_attempts.load(Ordering::SeqCst), 2);
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 4);
+        let upload = &requests[1];
+        assert_eq!(upload.method, Method::PUT);
+        assert_eq!(upload.body, b"hello");
+        assert_eq!(upload.headers["x-ms-blob-type"], "BlockBlob");
+        assert!(!upload.headers.contains_key("authorization"));
+        assert!(!upload.headers.contains_key("chatgpt-account-id"));
         assert_eq!(
             http_clients.cached_route_count(),
             1,

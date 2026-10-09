@@ -111,83 +111,24 @@ fn token_budget_retains_nearly_the_full_budget() {
 
 #[test]
 fn split_string_works() {
-    assert_eq!(
-        split_string(
-            "hello world",
-            /*beginning_bytes*/ 5,
-            /*end_bytes*/ 5
-        ),
-        (1, "hello", "world")
-    );
-    assert_eq!(
-        split_string("abc", /*beginning_bytes*/ 0, /*end_bytes*/ 0),
-        (3, "", "")
-    );
-}
-
-#[test]
-fn split_string_handles_empty_string() {
-    assert_eq!(
-        split_string("", /*beginning_bytes*/ 4, /*end_bytes*/ 4),
-        (0, "", "")
-    );
-}
-
-#[test]
-fn split_string_only_keeps_prefix_when_tail_budget_is_zero() {
-    assert_eq!(
-        split_string("abcdef", /*beginning_bytes*/ 3, /*end_bytes*/ 0),
-        (3, "abc", "")
-    );
-}
-
-#[test]
-fn split_string_only_keeps_suffix_when_prefix_budget_is_zero() {
-    assert_eq!(
-        split_string("abcdef", /*beginning_bytes*/ 0, /*end_bytes*/ 3),
-        (3, "", "def")
-    );
-}
-
-#[test]
-fn split_string_handles_overlapping_budgets_without_removal() {
-    assert_eq!(
-        split_string("abcdef", /*beginning_bytes*/ 4, /*end_bytes*/ 4),
-        (0, "abcd", "ef")
-    );
-}
-
-#[test]
-fn split_string_respects_utf8_boundaries() {
-    assert_eq!(
-        split_string("😀abc😀", /*beginning_bytes*/ 5, /*end_bytes*/ 5),
-        (1, "😀a", "c😀")
-    );
-
-    assert_eq!(
-        split_string(
-            "😀😀😀😀😀",
-            /*beginning_bytes*/ 1,
-            /*end_bytes*/ 1
-        ),
-        (5, "", "")
-    );
-    assert_eq!(
-        split_string(
-            "😀😀😀😀😀",
-            /*beginning_bytes*/ 7,
-            /*end_bytes*/ 7
-        ),
-        (3, "😀", "😀")
-    );
-    assert_eq!(
-        split_string(
-            "😀😀😀😀😀",
-            /*beginning_bytes*/ 8,
-            /*end_bytes*/ 8
-        ),
-        (1, "😀😀", "😀😀")
-    );
+    for (input, prefix_bytes, suffix_bytes, expected) in [
+        ("hello world", 5, 5, (1, "hello", "world")),
+        ("abc", 0, 0, (3, "", "")),
+        ("", 4, 4, (0, "", "")),
+        ("abcdef", 3, 0, (3, "abc", "")),
+        ("abcdef", 0, 3, (3, "", "def")),
+        ("abcdef", 4, 4, (0, "abcd", "ef")),
+        ("😀abc😀", 5, 5, (1, "😀a", "c😀")),
+        ("😀😀😀😀😀", 1, 1, (5, "", "")),
+        ("😀😀😀😀😀", 7, 7, (3, "😀", "😀")),
+        ("😀😀😀😀😀", 8, 8, (1, "😀😀", "😀😀")),
+    ] {
+        assert_eq!(
+            split_string(input, prefix_bytes, suffix_bytes),
+            expected,
+            "{input:?}, prefix={prefix_bytes}, suffix={suffix_bytes}"
+        );
+    }
 }
 
 #[test]

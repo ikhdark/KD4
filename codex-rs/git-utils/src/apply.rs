@@ -734,7 +734,7 @@ pub fn parse_git_apply_output(
         LazyLock::new(|| regex_ci("^Checking patch\\s+(?P<path>.+?)\\.\\.\\.$"));
     static UNMERGED_LINE: LazyLock<Regex> = LazyLock::new(|| regex_ci("^U\\s+(?P<path>.+)$"));
     static PATCH_FAILED: LazyLock<Regex> =
-        LazyLock::new(|| regex_ci("^error:\\s+patch failed:\\s+(?P<path>.+?)(?::\\d+)?(?:\\s|$)"));
+        LazyLock::new(|| regex_ci("^error:\\s+patch failed:\\s+(?P<path>.+?):\\d+$"));
     static DOES_NOT_APPLY: LazyLock<Regex> =
         LazyLock::new(|| regex_ci("^error:\\s+(?P<path>.+?):\\s+patch does not apply$"));
     static THREE_WAY_START: LazyLock<Regex> = LazyLock::new(|| {
@@ -944,6 +944,11 @@ mod tests {
             .current_dir(cwd)
             .output()
             .expect("spawn ok");
+        assert!(
+            out.status.success(),
+            "fixture command failed: {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -968,49 +973,30 @@ mod tests {
     }
 
     #[test]
-    fn extract_paths_handles_quoted_headers() {
-        let diff = "diff --git \"a/hello world.txt\" \"b/hello world.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello world.txt\n@@ -0,0 +1 @@\n+hi\n";
-        let paths = extract_paths_from_patch(diff);
-        assert_eq!(paths, vec!["hello world.txt".to_string()]);
-    }
-
-    #[test]
-    fn extract_paths_ignores_dev_null_header() {
-        let diff = "diff --git a/dev/null b/ok.txt\nnew file mode 100644\n--- /dev/null\n+++ b/ok.txt\n@@ -0,0 +1 @@\n+hi\n";
-        let paths = extract_paths_from_patch(diff);
-        assert_eq!(paths, vec!["ok.txt".to_string()]);
-    }
-
-    #[test]
-    fn extract_paths_unescapes_c_style_in_quoted_headers() {
-        let diff = "diff --git \"a/hello\\tworld.txt\" \"b/hello\\tworld.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello\tworld.txt\n@@ -0,0 +1 @@\n+hi\n";
-        let paths = extract_paths_from_patch(diff);
-        assert_eq!(paths, vec!["hello\tworld.txt".to_string()]);
-    }
-
-    #[test]
-    fn extract_paths_decodes_octal_utf8_as_one_path() {
-        let diff = "diff --git \"a/\\303\\251.txt\" \"b/\\303\\251.txt\"\n--- \"a/\\303\\251.txt\"\n+++ \"b/\\303\\251.txt\"\n@@ -1 +1 @@\n-old\n+new\n";
-        let paths = extract_paths_from_patch(diff);
-        assert_eq!(paths, vec!["é.txt".to_string()]);
+    fn extract_paths_preserves_quoted_escaped_and_dev_null_headers() {
+        for (diff, expected) in [
+            ("diff --git \"a/hello world.txt\" \"b/hello world.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello world.txt\n@@ -0,0 +1 @@\n+hi\n", "hello world.txt"),
+            ("diff --git a/dev/null b/ok.txt\nnew file mode 100644\n--- /dev/null\n+++ b/ok.txt\n@@ -0,0 +1 @@\n+hi\n", "ok.txt"),
+            ("diff --git \"a/hello\\tworld.txt\" \"b/hello\\tworld.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello\tworld.txt\n@@ -0,0 +1 @@\n+hi\n", "hello\tworld.txt"),
+            ("diff --git \"a/\\303\\251.txt\" \"b/\\303\\251.txt\"\n--- \"a/\\303\\251.txt\"\n+++ \"b/\\303\\251.txt\"\n@@ -1 +1 @@\n-old\n+new\n", "é.txt"),
+        ] {
+            assert_eq!(extract_paths_from_patch(diff), vec![expected.to_string()], "{diff}");
+        }
     }
 
     #[test]
     fn parse_output_unescapes_quoted_paths() {
-        let stderr = "error: patch failed: \"hello\\tworld.txt\":1\n";
-        let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
-        assert_eq!(applied, Vec::<String>::new());
-        assert_eq!(conflicted, Vec::<String>::new());
-        assert_eq!(skipped, vec!["hello\tworld.txt".to_string()]);
-    }
-
-    #[test]
-    fn parse_output_decodes_octal_utf8_paths() {
-        let stderr = "error: patch failed: \"\\303\\251.txt\":1\n";
-        let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
-        assert_eq!(applied, Vec::<String>::new());
-        assert_eq!(conflicted, Vec::<String>::new());
-        assert_eq!(skipped, vec!["é.txt".to_string()]);
+        for (stderr, expected) in [
+            ("error: patch failed: hello world.txt:1\n", "hello world.txt"),
+            ("error: patch failed: \"hello world.txt\":1\n", "hello world.txt"),
+            ("error: patch failed: \"hello\\tworld.txt\":1\n", "hello\tworld.txt"),
+            ("error: patch failed: \"\\303\\251.txt\":1\n", "é.txt"),
+        ] {
+            let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
+            assert!(applied.is_empty());
+            assert!(conflicted.is_empty());
+            assert_eq!(skipped, vec![expected.to_string()], "{stderr}");
+        }
     }
 
     #[test]
@@ -1142,6 +1128,10 @@ mod tests {
             );
             if preflight {
                 assert!(!root.join("new.txt").exists());
+                assert_eq!(
+                    read_file_normalized(&root.join("file.txt")),
+                    "one\ntwo\nthree\nfour\nLOCAL\n"
+                );
             } else {
                 assert_eq!(
                     read_file_normalized(&root.join("file.txt")),
@@ -1195,12 +1185,11 @@ mod tests {
         };
         let r = apply_git_patch(&req).expect("run apply");
         assert_eq!(r.exit_code, 0, "exit code 0");
-        // File exists now
-        assert!(root.join("hello.txt").exists());
+        assert_eq!(read_file_normalized(&root.join("hello.txt")), "hello\nworld\n");
     }
 
     #[test]
-    fn apply_modify_conflict() {
+    fn apply_rejects_conflicting_context_without_base_blob() {
         let _g = env_lock().lock().unwrap();
         let repo = init_repo();
         let root = repo.path();
@@ -1220,6 +1209,36 @@ mod tests {
         };
         let r = apply_git_patch(&req).expect("run apply");
         assert_ne!(r.exit_code, 0, "non-zero exit on conflict");
+        assert_eq!(r.skipped_paths, vec!["file.txt"]);
+        assert!(r.applied_paths.is_empty());
+        assert_eq!(read_file_normalized(&root.join("file.txt")), "line1\nlocal2\nline3\n");
+    }
+
+    #[test]
+    fn apply_reports_complete_conflicting_path_with_spaces() {
+        let _g = env_lock().lock().unwrap();
+        let repo = init_repo();
+        let root = repo.path();
+        let name = "hello world.txt";
+        std::fs::write(root.join(name), "one\nold\nthree\n").unwrap();
+        let _ = run(root, &["git", "add", name]);
+        let _ = run(root, &["git", "commit", "-m", "seed"]);
+        std::fs::write(root.join(name), "one\nlocal\nthree\n").unwrap();
+        let result = apply_git_patch(&ApplyGitRequest {
+            cwd: root.to_path_buf(),
+            diff: "diff --git a/hello world.txt b/hello world.txt\n--- a/hello world.txt\n+++ b/hello world.txt\n@@ -1,3 +1,3 @@\n one\n-old\n+new\n three\n".to_string(),
+            revert: false,
+            preflight: false,
+        })
+        .expect("apply conflicting patch");
+
+        assert_ne!(result.exit_code, 0);
+        // Diagnostics must identify the file actually targeted, not a prefix
+        // ending at its first space or an additional nonexistent file.
+        assert_eq!(result.skipped_paths, vec![name]);
+        assert!(result.applied_paths.is_empty());
+        assert!(result.conflicted_paths.is_empty());
+        assert_eq!(read_file_normalized(&root.join(name)), "one\nlocal\nthree\n");
     }
 
     #[test]
@@ -1237,6 +1256,9 @@ mod tests {
         };
         let r = apply_git_patch(&req).expect("run apply");
         assert_ne!(r.exit_code, 0, "non-zero exit on missing index");
+        assert_eq!(r.skipped_paths, vec!["ghost.txt"]);
+        assert!(r.applied_paths.is_empty());
+        assert!(!root.join("ghost.txt").exists());
     }
 
     #[test]

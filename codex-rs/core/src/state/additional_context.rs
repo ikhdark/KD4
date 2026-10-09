@@ -274,7 +274,8 @@ mod tests {
         })]);
         assert!(AdditionalContextStore::validate_application_context(&values).is_ok());
         let rendered = AdditionalContextStore::default().merge(values.clone());
-        assert!(serde_json::to_string(&rendered).unwrap().contains("Never modify X."));
+        assert_eq!(rendered.len(), 1);
+        assert!(input_text(&rendered[0]).contains(&values["policy"].value));
         values["policy"].value = "x".repeat(ADDITIONAL_CONTEXT_AGGREGATE_BYTE_BUDGET);
         assert!(AdditionalContextStore::validate_application_context(&values).is_err());
     }
@@ -329,6 +330,7 @@ mod tests {
 
         let fragments = store.merge(values);
 
+        assert_eq!(fragments.len(), 2);
         assert!(input_text(&fragments[0]).contains("z-first"));
         assert!(input_text(&fragments[1]).contains("a-second"));
     }

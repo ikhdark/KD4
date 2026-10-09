@@ -531,11 +531,16 @@ pub(crate) async fn backfill_sessions_until(
                         "failed to extract rollout {}: {err}",
                         rollout.path.display()
                     );
-                    // Opening already retries transient failures, so an empty, torn, or
-                    // unknown-format file fails identically on every pass; retrying it would
-                    // hold the backfill, and with it every startup gate, pending forever.
-                    stats.failed = stats.failed.saturating_add(1);
-                    true
+                    // Invalid content cannot be repaired by retrying this pass, but exhausted
+                    // I/O retries do not prove a rollout is permanently unreadable. Keep the
+                    // contiguous checkpoint before it so a later worker can recover it.
+                    let retryable_io = err
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|err| err.kind() != std::io::ErrorKind::InvalidData);
+                    if !retryable_io {
+                        stats.failed = stats.failed.saturating_add(1);
+                    }
+                    !retryable_io
                 }
             };
             if settled {

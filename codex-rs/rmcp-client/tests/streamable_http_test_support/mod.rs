@@ -316,6 +316,7 @@ pub(crate) async fn spawn_streamable_http_server() -> anyhow::Result<(Child, Str
         .kill_on_drop(true)
         .env("MCP_STREAMABLE_HTTP_BIND_ADDR", "127.0.0.1:0")
         .env("MCP_TEST_ECHO_SELECTED", "selected-environment-value")
+        .env_remove("MCP_TEST_VALUE")
         .env_remove("MCP_TEST_ECHO_MISSING_07a5ec54")
         .stdout(Stdio::piped())
         .spawn()?;

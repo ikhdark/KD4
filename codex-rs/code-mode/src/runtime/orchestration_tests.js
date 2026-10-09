@@ -264,12 +264,14 @@ try {
     check(error.message.includes(`exit_code=${code ?? "unknown"}`) &&
       error.evidence.terminal === value, "command failure omitted exit code or evidence");
   }
+  let unexpectedPolls = 0;
+  tools.write_stdin = async () => { ++unexpectedPolls; throw Error("unsafe receipt was polled"); };
   for (const value of [{ ...done, exit_code: 9 }, { ...done, session_id: 7 },
     { ...live(), error: "cancelled" }, { ...live(), pending_deferred_completions: [1] },
     { ...live(), pending_deferred_completions: 1 }, { ...live(), session_capabilities: {} },
     { ...live(), execution_state: "cancelled" }]) {
     const error = await rejected(() => await_command(value));
-    check(error.evidence.observations[0] === value && polls === 3, "unsafe automatic continuation");
+    check(error.evidence.observations[0] === value && unexpectedPolls === 0, "unsafe automatic continuation");
   }
   for (const value of [
     {...done, execution_state:"running"}, {...done, execution_state:"unknown"},
@@ -277,7 +279,7 @@ try {
     {...done, pending_deferred_completions:{}}, {...done, pending_deferred_completions:0},
   ]) {
     const error = await rejected(() => await_command(value));
-    check(error.evidence.terminal === value && polls === 3, "ambiguous terminal state accepted");
+    check(error.evidence.terminal === value && unexpectedPolls === 0, "ambiguous terminal state accepted");
   }
   check((await rejected(() => await_command(live(), { on_progress: () => false }))).evidence,
     "semantic decision bypassed");

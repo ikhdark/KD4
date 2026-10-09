@@ -1354,21 +1354,33 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_triggers_selection() {
-        let (tx, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx);
-        let mut view = make_overlay(make_exec_request(), tx, Features::with_defaults());
-        assert!(!view.is_complete());
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-        // We expect at least one thread-scoped approval op message in the queue.
-        let mut saw_op = false;
-        while let Ok(ev) = rx.try_recv() {
-            if matches!(ev, AppEvent::SubmitThreadOp { .. }) {
-                saw_op = true;
-                break;
+    fn approve_shortcut_and_enter_submit_exactly_one_matching_decision() {
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            let (tx, mut rx) = unbounded_channel::<AppEvent>();
+            let request = make_exec_request();
+            let expected_thread_id = request.thread_id();
+            let mut view = make_overlay(
+                request,
+                AppEventSender::new(tx),
+                Features::with_defaults(),
+            );
+            assert!(!view.is_complete());
+            view.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(view.is_complete());
+            assert!(matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_))));
+            match rx.try_recv().expect("approval decision") {
+                AppEvent::SubmitThreadOp { thread_id, op } => {
+                    assert_eq!(thread_id, expected_thread_id);
+                    assert_eq!(op, Op::ExecApproval {
+                        id: "test".to_string(),
+                        turn_id: None,
+                        decision: CommandExecutionApprovalDecision::Accept,
+                    });
+                }
+                event => panic!("unexpected event: {event:?}"),
             }
+            assert!(rx.try_recv().is_err(), "approval must not emit duplicate decisions");
         }
-        assert!(saw_op, "expected approval decision to emit an op");
     }
 
     #[test]
@@ -1729,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn network_exec_options_use_expected_labels_and_hide_execpolicy_amendment() {
+    fn network_exec_options_use_expected_labels_for_available_decisions() {
         let network_context = NetworkApprovalContext {
             host: "example.com".to_string(),
             protocol: NetworkApprovalProtocol::Https,
@@ -1790,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn additional_permissions_exec_options_hide_execpolicy_amendment() {
+    fn additional_permissions_exec_options_preserve_available_decisions() {
         let keymap = crate::keymap::RuntimeKeymap::defaults();
         let additional_permissions = AdditionalPermissionProfile {
             network: None,
@@ -1899,7 +1911,12 @@ mod tests {
     fn permissions_session_shortcut_submits_session_scope() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let mut view = make_overlay(make_permissions_request(), tx, Features::with_defaults());
+        let request = make_permissions_request();
+        let ApprovalRequest::Permissions { permissions, .. } = &request else {
+            unreachable!()
+        };
+        let expected_permissions = permissions.clone();
+        let mut view = make_overlay(request, tx, Features::with_defaults());
 
         view.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
 
@@ -1911,6 +1928,7 @@ mod tests {
             } = ev
             {
                 assert_eq!(response.scope, PermissionGrantScope::Session);
+                assert_eq!(response.permissions, expected_permissions);
                 saw_op = true;
                 break;
             }
@@ -2361,29 +2379,5 @@ mod tests {
         assert_eq!(n_decision, Some(McpServerElicitationAction::Decline));
     }
 
-    #[test]
-    fn enter_sets_last_selected_index_without_dismissing() {
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut view = make_overlay(make_exec_request(), tx, Features::with_defaults());
-        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(
-            view.is_complete(),
-            "exec approval should complete without queued requests"
-        );
-
-        let mut decision = None;
-        while let Ok(ev) = rx.try_recv() {
-            if let AppEvent::SubmitThreadOp {
-                op: Op::ExecApproval { decision: d, .. },
-                ..
-            } = ev
-            {
-                decision = Some(d);
-                break;
-            }
-        }
-        assert_eq!(decision, Some(CommandExecutionApprovalDecision::Accept));
-    }
 }

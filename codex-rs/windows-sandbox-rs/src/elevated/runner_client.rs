@@ -573,21 +573,22 @@ mod tests {
     #[test]
     fn startup_reader_delivers_frame_and_leaves_following_frame_unread() {
         let (read, mut write) = startup_test_pipe();
+        for process_id in [42, 73] {
         let message = crate::ipc_framed::FramedMessage {
             version: crate::ipc_framed::IPC_PROTOCOL_VERSION,
             message: crate::ipc_framed::Message::SpawnReady {
-                payload: crate::ipc_framed::SpawnReady { process_id: 42 },
+                payload: crate::ipc_framed::SpawnReady { process_id },
             },
         };
         crate::ipc_framed::write_frame(&mut write, &message).unwrap();
-        crate::ipc_framed::write_frame(&mut write, &message).unwrap();
-        for _ in 0..2 {
+        }
+        for expected_id in [42, 73] {
             let received = super::read_frame_with_timeout(&read, std::time::Duration::from_secs(2))
                 .unwrap()
                 .unwrap();
             assert!(matches!(
                 received.message,
-                crate::ipc_framed::Message::SpawnReady { .. }
+                crate::ipc_framed::Message::SpawnReady { payload } if payload.process_id == expected_id
             ));
         }
     }

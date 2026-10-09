@@ -150,11 +150,6 @@ fn address_has_port(address: &str, port: u16) -> bool {
         == Some(port)
 }
 
-#[cfg(test)]
-fn parse_pid_lines(output: &str) -> Vec<u32> {
-    sorted_unique_pids(output.lines().filter_map(|line| line.trim().parse().ok()))
-}
-
 fn sorted_unique_pids(pids: impl IntoIterator<Item = u32>) -> Vec<u32> {
     let mut pids = pids.into_iter().collect::<Vec<_>>();
     pids.sort_unstable();
@@ -239,16 +234,6 @@ mod tests {
                 .all(|(name, _)| !name.to_string_lossy().eq_ignore_ascii_case("PATH"))
         );
         Ok(())
-    }
-
-    #[test]
-    fn pid_collection_is_sorted_and_deduplicated() {
-        assert_eq!(sorted_unique_pids([9, 4, 9, 2]), vec![2, 4, 9]);
-    }
-
-    #[test]
-    fn pid_line_parser_ignores_invalid_values_and_deduplicates() {
-        assert_eq!(parse_pid_lines("9\ninvalid\n4\n9\n"), vec![4, 9]);
     }
 
     #[test]
@@ -358,6 +343,8 @@ mod tests {
   TCP    127.0.0.1:4222         127.0.0.1:50000        ESTABLISHED     300
   TCP    127.0.0.1:14222        0.0.0.0:0              LISTENING       500
   tcp    127.0.0.1:4222         0.0.0.0:0              listening       400
+  TCP    127.0.0.1:4222         0.0.0.0:0              LISTENING       invalid
+  TCP    127.0.0.1:4222         0.0.0.0:0              LISTENING       4294967296
   UDP    0.0.0.0:4222           *:*                                    600
 "#;
 

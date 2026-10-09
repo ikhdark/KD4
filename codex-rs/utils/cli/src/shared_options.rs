@@ -256,7 +256,10 @@ mod tests {
                 child.dangerously_bypass_approvals_and_sandbox,
                 expected_bypass
             );
-            assert_eq!(child.sandbox_mode.is_some(), !expected_bypass);
+            assert_eq!(
+                child.sandbox_mode.map(codex_protocol::config_types::SandboxMode::from),
+                (!expected_bypass).then_some(codex_protocol::config_types::SandboxMode::ReadOnly)
+            );
         }
     }
 

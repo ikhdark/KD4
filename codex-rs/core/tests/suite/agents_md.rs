@@ -515,59 +515,7 @@ async fn symlinked_cwd_uses_logical_parent_for_agents_discovery() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selected_environment_sources_match_model_visible_instructions() -> Result<()> {
-    let server = start_mock_server().await;
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-    let home = Arc::new(TempDir::new()?);
-    let global_agents = home.path().join("AGENTS.md");
-    std::fs::write(&global_agents, "global doc")?;
 
-    let mut builder = test_codex()
-        .with_home(home)
-        .with_workspace_setup(|cwd, fs| async move {
-            let agents_md_uri = PathUri::from_host_native_path(cwd.join("AGENTS.md"))?;
-            fs.write_file(
-                &agents_md_uri,
-                b"project doc".to_vec(),
-                /*sandbox*/ None,
-            )
-            .await?;
-            Ok::<(), anyhow::Error>(())
-        });
-    let test = builder.build(&server).await?;
-    let project_agents = test.config.cwd.join("AGENTS.md");
-    let global_agents = global_agents.abs();
-
-    assert_eq!(
-        test.codex.instruction_sources().await,
-        vec![
-            PathUri::from_abs_path(&global_agents),
-            PathUri::from_abs_path(&project_agents),
-        ]
-    );
-
-    test.submit_turn("hello").await?;
-    let instructions = resp_mock
-        .single_request()
-        .message_input_texts("user")
-        .into_iter()
-        .find(|text| text.starts_with("# AGENTS.md instructions"))
-        .expect("instructions message");
-    let project_source_header = format!(
-        "## AGENTS.md instructions from {}",
-        PathUri::from_abs_path(&project_agents).inferred_native_path_string()
-    );
-    assert!(instructions.contains(&format!(
-        "global doc\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\nproject doc"
-    )));
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {

@@ -89,10 +89,18 @@ async fn epistemic_remote_receipts_require_local_claim_authentication() {
 
 #[test]
 fn epistemic_search_receipt_binds_identity_order_and_count() {
-    let pair = tool_search_pair("identity", 0);
+    let mut pair = tool_search_pair("identity", 0);
+    let ResponseItem::ToolSearchOutput { tools, .. } = &mut pair[1] else {
+        panic!("expected search output");
+    };
+    tools.push(serde_json::json!({"name":"second-tool"}));
     let (item, _) = tool_search_receipt_item(&pair[1], None).unwrap();
     let original = tool_search_receipt(&item).unwrap();
     assert!(original.is_valid("identity", "completed", "client"));
+    assert_eq!(original.ordered_tool_identities, ["tool-identity", "second-tool"]);
+    let mut reordered = original.clone();
+    reordered.ordered_tool_identities.reverse();
+    assert!(!reordered.is_valid("identity", "completed", "client"));
     for identities in [vec!["invented.admin".to_string()], Vec::new(),
         vec!["tool-identity".to_string(), "extra".to_string()]] {
         let mut changed = original.clone();
@@ -548,8 +556,10 @@ fn read_status_keeps_environments_and_legacy_observations_separate() {
     assert_eq!(snapshots.len(), 4);
     assert!(snapshots.iter().all(|row| row["coverage"] == "partial" && row["obtained_bytes"] == 5));
     let filtered = state.read_status(&[path], Some("env-a"), &[]);
-    assert!(filtered["paths"][0]["snapshots"].as_array().unwrap().iter()
-        .all(|row| row["environment_id"] != "env-b"));
+    let snapshots = filtered["paths"][0]["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 3);
+    assert_eq!(snapshots.iter().filter(|row| row["environment_id"] == "env-a").count(), 1);
+    assert_eq!(snapshots.iter().filter(|row| row["environment_id"].is_null()).count(), 2);
 }
 
 #[test]
@@ -1841,7 +1851,7 @@ fn workspace_evidence_captured_across_unobserved_revision_change_is_stale() {
         WorkspaceEvidenceObservation::from_response_item_with_freshness(
             Some(captured.clone()),
             &output,
-            BTreeSet::new(),
+            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-after/source.rs"), false)]),
             /*source_dependencies_current*/ false,
         )
         .expect("raced workspace observation"),
@@ -1849,7 +1859,9 @@ fn workspace_evidence_captured_across_unobserved_revision_change_is_stale() {
 
     let projection = state.project_with_workspace_identity(canonical, Some(&captured));
     let (_, stale_output) = textual_output_identity(&projection.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
+    assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
+    assert_eq!(notice["valid_for_current_workspace"], false);
 }
 
 #[test]
@@ -1858,26 +1870,30 @@ fn later_duplicate_registration_cannot_revive_invalidated_workspace_evidence() {
     let output = text_output(call_id, "old file contents".to_string());
     let captured = workspace_identity("captured");
     let changed = workspace_identity("changed");
+    let dependencies = BTreeSet::from([SourceDependencyV1::new(Path::new("/repo/source.rs"), false)]);
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(Some(captured), &output, BTreeSet::new())
+        WorkspaceEvidenceObservation::from_response_item(Some(captured.clone()), &output, dependencies.clone())
             .expect("initial workspace observation"),
     );
+    assert_eq!(state.project_with_workspace_identity(Arc::clone(&canonical), Some(&captured)).items, canonical);
     assert!(state.invalidate_source_dependencies(None, None));
 
     state.register_workspace_evidence(
         WorkspaceEvidenceObservation::from_response_item(
             Some(changed.clone()),
             &output,
-            BTreeSet::new(),
+            dependencies,
         )
         .expect("later duplicate observation"),
     );
 
     let projection = state.project_with_workspace_identity(canonical, Some(&changed));
     let (_, stale_output) = textual_output_identity(&projection.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
+    assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
+    assert_eq!(notice["observed_revision"], serde_json::to_value(captured).unwrap());
 }
 
 #[test]
@@ -2013,13 +2029,19 @@ fn workspace_evidence_is_stale_in_a_different_repository() {
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(Some(captured), &output, BTreeSet::new())
-            .expect("text evidence observation"),
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(captured.clone()), &output,
+            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured/source.rs"), false)]),
+        )
+        .expect("text evidence observation"),
     );
+    assert_eq!(state.project_with_workspace_identity(Arc::clone(&canonical), Some(&captured)).items, canonical);
 
     let stale = state.project_with_workspace_identity(canonical, Some(&different_repository));
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
+    assert_eq!(notice["reason_code"], "workspace_identity_changed");
+    assert_eq!(notice["valid_for_current_workspace"], false);
 }
 
 #[test]
@@ -3810,18 +3832,15 @@ fn tool_history_receipt_requires_nonempty_model_output() {
 
 #[test]
 fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-1";
-    let bounded = "small bounded output".to_string();
+    let bounded = bounded_output();
     let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
     let mut state = ToolHistoryState::default();
     state.register(candidate(call_id, bounded.clone()));
 
-    assert!(
-        state
-            .project(Arc::clone(&canonical))
-            .substitutions
-            .is_empty()
-    );
+    assert!(state.candidates[call_id].admission_receipt().is_some());
+    assert!(state.candidates[call_id].receipt().is_none());
     assert!(!state.mark_consumed(
         &[text_output(call_id, "tampered".to_string())],
         ModelGenerationId {
@@ -3829,6 +3848,13 @@ fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
             ordinal: 1,
         },
     ));
+
+    assert!(state.mark_consumed(
+        &canonical,
+        ModelGenerationId { turn_id: "turn-1".into(), ordinal: 1 },
+    ));
+    assert!(state.candidates[call_id].receipt().is_some());
+    assert_eq!(state.project(Arc::clone(&canonical)).substitutions.len(), 1);
 
     let mut incomplete = candidate(call_id, bounded);
     incomplete.complete = false;
@@ -3840,6 +3866,8 @@ fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
             ordinal: 2,
         },
     ));
+    assert!(state.candidates[call_id].admission_receipt().is_none());
+    assert!(state.candidates[call_id].receipt().is_none());
     assert!(state.project(canonical).substitutions.is_empty());
 }
 
@@ -4981,6 +5009,9 @@ fn legacy_result_only_supersession_identity_does_not_collapse_actions() {
     let bounded = bounded_output();
     let mut first = candidate("call-1", bounded.clone());
     first.supersession_identity = Some(format!("functions.exec:{}", sha256(b"same result")));
+    first.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "turn-1".into(), ordinal: 0,
+    });
     let mut second = candidate("call-2", bounded.clone());
     second.supersession_identity = first.supersession_identity.clone();
     let canonical: Arc<[ResponseItem]> = Arc::from([
@@ -5281,25 +5312,24 @@ fn recovered_evidence_does_not_promote_its_mixed_purpose_carrier() {
 }
 
 #[test]
-fn compaction_artifact_reference_survives_history_replacement() {
+fn compaction_artifact_references_survive_history_replacement() {
     let call_id = "call-1";
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, bounded_output()));
-    let compacted_summary = text_output(
-        "compaction-summary",
-        serde_json::to_string(&ToolHistoryArtifactPinV1 {
-            version: 1,
-            kind: "tool_history_artifact_pin".to_string(),
-            artifact_id: "artifact-1".to_string(),
-            bytes: 96_000,
-            sha256: sha256(b"canonical artifact"),
-        })
-        .expect("serialize artifact pin"),
-    );
-
-    state.retain_for_history(&[compacted_summary]);
-
-    assert!(state.candidates.contains_key(call_id));
+    let record = candidate(call_id, bounded_output());
+    let pin = serde_json::to_string(&ToolHistoryArtifactPinV1 {
+        version: 1,
+        kind: "tool_history_artifact_pin".to_string(),
+        artifact_id: "artifact-1".to_string(),
+        bytes: 96_000,
+        sha256: sha256(b"canonical artifact"),
+    })
+    .expect("serialize artifact pin");
+    let receipt = record.admission_receipt().unwrap().1.to_string();
+    for summary in [pin, receipt] {
+        let mut state = ToolHistoryState::default();
+        state.register(record.clone());
+        state.retain_for_history(&[text_output("compaction-summary", summary)]);
+        assert!(state.candidates.contains_key(call_id));
+    }
 }
 
 #[test]
@@ -5365,22 +5395,6 @@ fn compaction_pins_exact_inline_output_but_rejects_same_count_changed_identifier
             .artifact_pin_payload_for_items(&[text_output("different-call", output.to_string())])
             .is_none()
     );
-}
-
-#[test]
-fn compaction_tool_history_receipt_survives_history_replacement() {
-    let call_id = "call-1";
-    let candidate = candidate(call_id, bounded_output());
-    let (_, receipt, _) = candidate
-        .admission_receipt()
-        .expect("complete candidate has an admission receipt");
-    let receipt = receipt.to_string();
-    let mut state = ToolHistoryState::default();
-    state.register(candidate);
-
-    state.retain_for_history(&[text_output("compaction-summary", receipt)]);
-
-    assert!(state.candidates.contains_key(call_id));
 }
 
 #[test]
@@ -6059,18 +6073,18 @@ fn receipt_and_candidate_fingerprints_are_cached_and_reused() {
 #[test]
 fn affected_path_index_preserves_source_dependency_overlap_semantics() {
     let dependencies = [
-        SourceDependencyV1 {
+        (SourceDependencyV1 {
             path: "src/exact.rs".to_string(),
             recursive: false,
-        },
-        SourceDependencyV1 {
+        }, true),
+        (SourceDependencyV1 {
             path: "src/tree".to_string(),
             recursive: true,
-        },
-        SourceDependencyV1 {
+        }, true),
+        (SourceDependencyV1 {
             path: "src/tree/leaf.rs".to_string(),
             recursive: false,
-        },
+        }, false),
     ];
     let affected_paths = BTreeSet::from([
         "docs/unrelated.md".to_string(),
@@ -6078,13 +6092,14 @@ fn affected_path_index_preserves_source_dependency_overlap_semantics() {
         "src/tree/child.rs".to_string(),
     ]);
 
-    for dependency in dependencies {
+    for (dependency, expected) in dependencies {
         let linear_result = affected_paths
             .iter()
             .any(|path| source_dependency_overlaps(&dependency, path));
+        assert_eq!(linear_result, expected, "{dependency:?}");
         assert_eq!(
             affected_paths_overlap_dependency(&affected_paths, &dependency),
-            linear_result,
+            expected,
             "indexed lookup changed overlap semantics for {dependency:?}"
         );
     }
@@ -6095,6 +6110,44 @@ fn affected_path_index_preserves_source_dependency_overlap_semantics() {
             recursive: false,
         }
     ));
+}
+
+#[test]
+fn root_source_dependencies_overlap_descendants_without_matching_relative_paths() {
+    // A filesystem root contains every rooted descendant, but a nonrecursive
+    // observation does not acquire descendants and sibling prefixes are distinct.
+    for (path, recursive, changed, expected) in [
+        ("/", true, "/scope/file.rs", true),
+        ("/", false, "/scope/file.rs", false),
+        ("/", true, "scope/file.rs", false),
+        ("/scope/file.rs", false, "/", true),
+        ("scope/file.rs", false, "/", false),
+        ("/scope", true, "/scope-other/file.rs", false),
+        ("/scope", true, "/scope/file.rs", true),
+    ] {
+        let dependency = SourceDependencyV1 { path: path.into(), recursive };
+        assert_eq!(source_dependency_overlaps(&dependency, changed), expected);
+        assert_eq!(
+            affected_paths_overlap_dependency(&BTreeSet::from([changed.into()]), &dependency),
+            expected,
+            "path={path}, recursive={recursive}, changed={changed}",
+        );
+    }
+
+    let path = PathBuf::from("/scope/file.rs");
+    let output = serde_json::json!({"path":path, "source_sha256":"snapshot",
+        "canonical_bytes":1, "delivered_ranges":[[0,1]]}).to_string();
+    let mut record = candidate("root-read", output);
+    record.tool_identity = "read_file".into();
+    record.source_dependencies = BTreeSet::from([SourceDependencyV1 {
+        path: "/".into(), recursive: true,
+    }]);
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    assert_eq!(state.read_status(&[path.clone()], None, &[])["paths"][0]["status"], "observed");
+    assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([path.clone()])), None));
+    assert!(!state.candidates["root-read"].source_dependencies_current);
+    assert_eq!(state.read_status(&[path], None, &[])["paths"][0]["snapshots"][0]["freshness"], "invalidated");
 }
 
 #[test]

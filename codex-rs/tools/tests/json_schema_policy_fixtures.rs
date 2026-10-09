@@ -47,6 +47,7 @@ struct ExpectedValue {
 #[test]
 fn json_schema_policy_fixtures_convert_to_responses_tools() {
     for fixture in FIXTURE_PATHS.into_iter().map(load_fixture::<FixtureFile>) {
+        assert!(!fixture.tools.is_empty(), "{} fixture must exercise tools", fixture.source);
         for fixture_tool in &fixture.tools {
             let responses_tool = convert_fixture_tool(&fixture, fixture_tool);
             let parameters = serde_json::to_value(&responses_tool.parameters)
@@ -95,6 +96,11 @@ fn json_schema_policy_fixtures_convert_to_responses_tools() {
             }
 
             for pointer in &fixture_tool.expected_pruned {
+                assert!(
+                    fixture_tool.input_schema.pointer(pointer).is_some(),
+                    "{} fixture should contain expected pruned definition {pointer}",
+                    fixture_tool.name
+                );
                 assert!(
                     parameters.pointer(pointer).is_none(),
                     "{} should prune unreachable definition {pointer}",

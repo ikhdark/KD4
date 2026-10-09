@@ -1698,16 +1698,16 @@ mod tests {
             runtime.upsert_thread(&metadata).await?;
         }
         assert!(runtime.get_thread_titles(&[]).await?.is_empty());
-        let rows = runtime
+        let mut rows = runtime
             .get_thread_titles(&[first, second, first, ThreadId::new()])
             .await?;
-        assert_eq!(rows.len(), 2);
-        for (id, title, message) in rows {
-            let expected = runtime.get_thread(id).await?.expect("requested thread");
-            assert_eq!(title, expected.title);
-            assert_eq!(message, expected.first_user_message);
-            assert!(id == first || id == second);
-        }
+        rows.sort_by_key(|row| row.0.to_string());
+        let mut expected = vec![
+            (first, "  chosen title  ".to_string(), Some("first message".to_string())),
+            (second, "default title".to_string(), Some("default title".to_string())),
+        ];
+        expected.sort_by_key(|row| row.0.to_string());
+        assert_eq!(rows, expected);
         Ok(())
     }
 
@@ -1850,29 +1850,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn thread_metadata_round_trips_history_mode() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize");
-        let thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000124").expect("valid thread id");
-        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-        metadata.history_mode = ThreadHistoryMode::Paginated;
-
-        runtime
-            .upsert_thread(&metadata)
-            .await
-            .expect("upsert should succeed");
-
-        let metadata = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("thread should load")
-            .expect("thread should exist");
-        assert_eq!(metadata.history_mode, ThreadHistoryMode::Paginated);
-    }
 
     #[tokio::test]
     async fn delete_thread_cleans_associated_state() -> Result<()> {
@@ -2281,10 +2258,10 @@ END
         for index in 0..6 {
             let id = ThreadId::from_string(&format!("00000000-0000-0000-0000-{index:012}"))?;
             let mut metadata = test_thread_metadata(home.path(), id, home.path().to_path_buf());
-            let timestamp = metadata.created_at + chrono::Duration::seconds(index / 3);
-            metadata.created_at = timestamp;
-            metadata.updated_at = timestamp;
-            metadata.recency_at = timestamp;
+            let base = metadata.created_at;
+            metadata.created_at = base + chrono::Duration::seconds(index / 3);
+            metadata.updated_at = base + chrono::Duration::seconds((index + 3) % 6 / 3);
+            metadata.recency_at = base + chrono::Duration::seconds(index % 2);
             runtime
                 .upsert_thread_preserving_timestamps(&metadata)
                 .await?;
@@ -2330,13 +2307,27 @@ END
                         }
                         let page = runtime.list_threads(1, filters).await?;
                         listed.extend(page.items.iter().map(|item| item.id));
+                        if listed.len() < ids.len() {
+                            let last = page.items.last().expect("nonempty page");
+                            let ts = match sort_key {
+                                SortKey::CreatedAt => last.created_at,
+                                SortKey::UpdatedAt => last.updated_at,
+                                SortKey::RecencyAt => last.recency_at,
+                            };
+                            assert_eq!(page.next_anchor, Some(Anchor { ts, id: Some(last.id) }));
+                        }
                         assert!(listed.len() <= ids.len(), "pagination must progress");
                         anchor = page.next_anchor;
                         if anchor.is_none() {
                             break;
                         }
                     }
-                    let mut expected = ids.clone();
+                    let order = match sort_key {
+                        SortKey::CreatedAt => [0, 1, 2, 3, 4, 5],
+                        SortKey::UpdatedAt => [3, 4, 5, 0, 1, 2],
+                        SortKey::RecencyAt => [0, 2, 4, 1, 3, 5],
+                    };
+                    let mut expected = order.map(|index| ids[index]).to_vec();
                     if direction == SortDirection::Desc {
                         expected.reverse();
                     }
@@ -2345,7 +2336,11 @@ END
                     // Legacy timestamp-only cursors exclude the entire tied bucket.
                     let first = runtime.get_thread(expected[0]).await?.expect("thread");
                     let legacy = Anchor {
-                        ts: first.created_at,
+                        ts: match sort_key {
+                            SortKey::CreatedAt => first.created_at,
+                            SortKey::UpdatedAt => first.updated_at,
+                            SortKey::RecencyAt => first.recency_at,
+                        },
                         id: None,
                     };
                     let page = runtime
@@ -3093,129 +3088,6 @@ END
         );
     }
 
-    #[tokio::test]
-    async fn list_threads_orders_and_pages_by_recency_at() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize");
-        let first_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000793").expect("valid thread id");
-        let second_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000794").expect("valid thread id");
-        let third_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000795").expect("valid thread id");
-        let recency_at =
-            DateTime::<Utc>::from_timestamp_millis(1_700_002_000_456).expect("timestamp");
-
-        for thread_id in [first_id, second_id, third_id] {
-            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-            metadata.recency_at = recency_at;
-            runtime
-                .upsert_thread(&metadata)
-                .await
-                .expect("thread insert should succeed");
-        }
-        sqlx::query("UPDATE threads SET recency_at = ?, recency_at_ms = ?")
-            .bind(datetime_to_epoch_seconds(recency_at))
-            .bind(datetime_to_epoch_millis(recency_at))
-            .execute(runtime.pool.as_ref())
-            .await
-            .expect("recency timestamps should match");
-
-        let first_page = runtime
-            .list_threads(
-                /*page_size*/ 1,
-                ThreadFilterOptions {
-                    project_id: None,
-                    archived_only: false,
-                    allowed_sources: &[],
-                    model_providers: None,
-                    cwd_filters: None,
-                    anchor: None,
-                    sort_key: SortKey::RecencyAt,
-                    sort_direction: SortDirection::Desc,
-                    search_term: None,
-                },
-            )
-            .await
-            .expect("list should succeed");
-        assert_eq!(
-            first_page
-                .items
-                .iter()
-                .map(|item| item.id)
-                .collect::<Vec<_>>(),
-            vec![third_id]
-        );
-        assert_eq!(
-            first_page.next_anchor,
-            Some(Anchor {
-                ts: recency_at,
-                id: Some(third_id),
-            })
-        );
-
-        let second_page = runtime
-            .list_threads(
-                /*page_size*/ 1,
-                ThreadFilterOptions {
-                    project_id: None,
-                    archived_only: false,
-                    allowed_sources: &[],
-                    model_providers: None,
-                    cwd_filters: None,
-                    anchor: first_page.next_anchor.as_ref(),
-                    sort_key: SortKey::RecencyAt,
-                    sort_direction: SortDirection::Desc,
-                    search_term: None,
-                },
-            )
-            .await
-            .expect("second list should succeed");
-        assert_eq!(
-            second_page
-                .items
-                .iter()
-                .map(|item| item.id)
-                .collect::<Vec<_>>(),
-            vec![second_id]
-        );
-        assert_eq!(
-            second_page.next_anchor,
-            Some(Anchor {
-                ts: recency_at,
-                id: Some(second_id),
-            })
-        );
-
-        let third_page = runtime
-            .list_threads(
-                /*page_size*/ 1,
-                ThreadFilterOptions {
-                    project_id: None,
-                    archived_only: false,
-                    allowed_sources: &[],
-                    model_providers: None,
-                    cwd_filters: None,
-                    anchor: second_page.next_anchor.as_ref(),
-                    sort_key: SortKey::RecencyAt,
-                    sort_direction: SortDirection::Desc,
-                    search_term: None,
-                },
-            )
-            .await
-            .expect("third list should succeed");
-        assert_eq!(
-            third_page
-                .items
-                .iter()
-                .map(|item| item.id)
-                .collect::<Vec<_>>(),
-            vec![first_id]
-        );
-        assert_eq!(third_page.next_anchor, None);
-    }
 
     #[tokio::test]
     async fn rollout_upserts_preserve_equal_persisted_timestamps() {

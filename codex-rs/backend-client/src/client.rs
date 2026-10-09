@@ -1028,31 +1028,52 @@ mod tests {
         assert_eq!(snapshots[0].individual_limit, None);
     }
 
-    #[test]
-    fn preferred_snapshot_selection_matches_get_rate_limits_behavior() {
-        let snapshots = [
-            RateLimitSnapshot {
-                limit_id: Some("codex_other".to_string()),
-                limit_name: Some("codex_other".to_string()),
-                primary: Some(RateLimitWindow {
-                    used_percent: 90.0,
-                    window_minutes: Some(60),
-                    resets_at: Some(1),
-                }),
-                secondary: None,
-                credits: None,
-                individual_limit: None,
-                spend_control_reached: None,
-                plan_type: Some(AccountPlanType::Pro),
-                rate_limit_reached_type: None,
-            },
+    #[tokio::test]
+    async fn get_rate_limits_returns_primary_backend_snapshot() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/codex/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_seconds": 3600,
+                        "reset_after_seconds": 60,
+                        "reset_at": 123
+                    }
+                },
+                "additional_rate_limits": [{
+                    "limit_name": "Other",
+                    "metered_feature": "codex_other",
+                    "rate_limit": {
+                        "allowed": false,
+                        "limit_reached": true,
+                        "primary_window": {
+                            "used_percent": 90,
+                            "limit_window_seconds": 60,
+                            "reset_after_seconds": 1,
+                            "reset_at": 456
+                        }
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&server.uri(), PathStyle::CodexApi);
+
+        assert_eq!(
+            client.get_rate_limits().await.expect("primary rate limits"),
             RateLimitSnapshot {
                 limit_id: Some("codex".to_string()),
-                limit_name: Some("codex".to_string()),
+                limit_name: None,
                 primary: Some(RateLimitWindow {
                     used_percent: 10.0,
                     window_minutes: Some(60),
-                    resets_at: Some(2),
+                    resets_at: Some(123),
                 }),
                 secondary: None,
                 credits: None,
@@ -1060,15 +1081,8 @@ mod tests {
                 spend_control_reached: None,
                 plan_type: Some(AccountPlanType::Pro),
                 rate_limit_reached_type: None,
-            },
-        ];
-
-        let preferred = snapshots
-            .iter()
-            .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
-            .cloned()
-            .unwrap_or_else(|| snapshots[0].clone());
-        assert_eq!(preferred.limit_id.as_deref(), Some("codex"));
+            }
+        );
     }
 
     #[test]

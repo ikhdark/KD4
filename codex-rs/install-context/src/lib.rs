@@ -419,6 +419,26 @@ mod tests {
             context.bundled_resource(TEST_RESOURCE_NAME),
             Some(canonical_resources_dir.join(TEST_RESOURCE_NAME))
         );
+        assert_eq!(
+            context.rg_command(),
+            canonical_resources_dir.join(default_rg_command()).into_path_buf()
+        );
+
+        fs::remove_dir_all(&resources_dir)?;
+        let context = InstallContext::from_exe_with_codex_home(
+            Some(&exe_path),
+            None,
+            Some(codex_home.path()),
+        );
+        assert_eq!(
+            context.method,
+            InstallMethod::Standalone {
+                release_dir: AbsolutePathBuf::from_absolute_path(release_dir.canonicalize()?)?,
+                resources_dir: None,
+            }
+        );
+        assert_eq!(context.rg_command(), default_rg_command());
+        assert_eq!(context.bundled_resource(TEST_RESOURCE_NAME), None);
         Ok(())
     }
 
@@ -445,25 +465,6 @@ mod tests {
             assert_eq!(context.method, InstallMethod::Other, "{relative_dir}");
             assert_eq!(UpdateAction::from_install_context(&context), None);
         }
-        Ok(())
-    }
-
-    #[test]
-    fn standalone_rg_falls_back_when_resources_are_missing() -> std::io::Result<()> {
-        let codex_home = tempfile::tempdir()?;
-        let release_dir = codex_home
-            .path()
-            .join("packages/standalone/releases/1.2.3-x86_64-pc-windows-msvc");
-        fs::create_dir_all(&release_dir)?;
-        let exe_path = release_dir.join("codex.exe");
-        fs::write(&exe_path, "")?;
-
-        let context = InstallContext::from_exe_with_codex_home(
-            /*current_exe*/ Some(&exe_path),
-            /*method_override*/ None,
-            /*codex_home*/ Some(codex_home.path()),
-        );
-        assert_eq!(context.rg_command(), default_rg_command());
         Ok(())
     }
 
@@ -516,6 +517,15 @@ mod tests {
             context.bundled_resource(TEST_RESOURCE_NAME),
             Some(canonical_resources_dir.join(TEST_RESOURCE_NAME))
         );
+        fs::remove_dir_all(&path_dir)?;
+        fs::remove_dir_all(&resources_dir)?;
+        let context = InstallContext::from_exe_with_codex_home(Some(&exe_path), None, None);
+        assert_eq!(context.method, InstallMethod::Other);
+        let layout = context.package_layout.as_ref().expect("package layout");
+        assert_eq!(layout.path_dir, None);
+        assert_eq!(layout.resources_dir, None);
+        assert_eq!(context.rg_command(), default_rg_command());
+        assert_eq!(context.bundled_resource(TEST_RESOURCE_NAME), None);
         Ok(())
     }
 
@@ -605,24 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn standalone_package_rg_falls_back_when_codex_path_is_missing() -> std::io::Result<()> {
-        let package_dir = tempfile::tempdir()?;
-        let bin_dir = package_dir.path().join(BIN_DIRNAME);
-        fs::create_dir_all(&bin_dir)?;
-        fs::write(package_dir.path().join(PACKAGE_METADATA_FILENAME), "{}")?;
-        let exe_path = bin_dir.join("codex.exe");
-        fs::write(&exe_path, "")?;
-
-        let context = InstallContext::from_exe_with_codex_home(
-            /*current_exe*/ Some(&exe_path),
-            /*method_override*/ None,
-            /*codex_home*/ None,
-        );
-        assert_eq!(context.rg_command(), default_rg_command());
-        Ok(())
-    }
-
-    #[test]
     fn bundled_file_lookups_ignore_directories() -> std::io::Result<()> {
         let package_dir = tempfile::tempdir()?;
         let bin_dir = package_dir.path().join(BIN_DIRNAME);
@@ -646,41 +638,29 @@ mod tests {
     }
 
     #[test]
-    fn package_manager_method_overrides_take_precedence() {
-        let pnpm_context = InstallContext::from_exe(
-            /*current_exe*/ Some(Path::new(r"C:\Codex\codex.exe")),
-            /*method_override*/ Some(InstallMethod::Pnpm),
+    fn package_manager_method_overrides_take_precedence() -> std::io::Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let release_dir = codex_home.path().join("packages/standalone/releases/1.2.3");
+        fs::create_dir_all(&release_dir)?;
+        let exe_path = release_dir.join("codex.exe");
+        fs::write(&exe_path, "")?;
+        let detected = InstallContext::from_exe_with_codex_home(
+            Some(&exe_path),
+            None,
+            Some(codex_home.path()),
         );
-        assert_eq!(
-            pnpm_context,
-            InstallContext {
-                method: InstallMethod::Pnpm,
-                package_layout: None,
-            }
-        );
+        assert!(matches!(detected.method, InstallMethod::Standalone { .. }));
 
-        let npm_context = InstallContext::from_exe(
-            /*current_exe*/ Some(Path::new(r"C:\Codex\codex.exe")),
-            /*method_override*/ Some(InstallMethod::Npm),
-        );
-        assert_eq!(
-            npm_context,
-            InstallContext {
-                method: InstallMethod::Npm,
-                package_layout: None,
-            }
-        );
-
-        let bun_context = InstallContext::from_exe(
-            /*current_exe*/ Some(Path::new(r"C:\Codex\codex.exe")),
-            /*method_override*/ Some(InstallMethod::Bun),
-        );
-        assert_eq!(
-            bun_context,
-            InstallContext {
-                method: InstallMethod::Bun,
-                package_layout: None,
-            }
-        );
+        for method in [InstallMethod::Pnpm, InstallMethod::Npm, InstallMethod::Bun] {
+            let context = InstallContext::from_exe_with_codex_home(
+                Some(&exe_path),
+                Some(method.clone()),
+                Some(codex_home.path()),
+            );
+            assert_eq!(context.method, method);
+            assert_eq!(context.package_layout, None);
+            assert_eq!(UpdateAction::from_install_context(&context), None);
+        }
+        Ok(())
     }
 }

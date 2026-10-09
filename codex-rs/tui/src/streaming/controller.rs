@@ -934,6 +934,10 @@ mod tests {
         ctrl.flush_render_for_frame();
         assert_eq!(ctrl.core.streaming_render_count, 2);
         assert_eq!(ctrl.core.rendered_source_len, ctrl.core.raw_source.len());
+        assert_eq!(
+            hyperlink_lines_to_plain_strings(&ctrl.core.rendered_lines),
+            ["first line", "second line", "third line"]
+        );
     }
 
     /// Local CPU/queue probe, not provider TTFT or an end-to-end benchmark.
@@ -1019,7 +1023,12 @@ mod tests {
         ctrl.push("first line\n");
         assert_eq!(ctrl.core.streaming_render_count, 1);
 
-        let _ = ctrl.finalize();
+        let (cell, source) = ctrl.finalize();
+        assert_eq!(source.as_deref(), Some("first line\n"));
+        assert_eq!(
+            lines_to_plain_strings(&cell.expect("finalized content").transcript_lines(80)),
+            ["• first line"]
+        );
 
         assert_eq!(
             ctrl.core.finalize_render_count, 0,
@@ -1095,12 +1104,14 @@ mod tests {
         let mut ctrl = stream_controller(Some(80));
         assert!(!ctrl.has_live_tail());
 
-        ctrl.core.rendered_lines = vec![Line::from("tail line").into()];
-        ctrl.core.enqueued_stable_len = 0;
+        ctrl.push("A | B\n");
         assert!(ctrl.has_live_tail());
+        assert_eq!(hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()), ["A | B"]);
 
-        ctrl.core.enqueued_stable_len = 1;
+        ctrl.push("not a table delimiter\n");
+        ctrl.flush_render_for_frame();
         assert!(!ctrl.has_live_tail());
+        assert_eq!(ctrl.queued_lines(), 2);
     }
 
     #[test]
@@ -1108,12 +1119,14 @@ mod tests {
         let mut ctrl = plan_stream_controller(Some(80));
         assert!(!ctrl.has_live_tail());
 
-        ctrl.core.rendered_lines = vec![Line::from("tail line").into()];
-        ctrl.core.enqueued_stable_len = 0;
+        ctrl.push("A | B\n");
         assert!(ctrl.has_live_tail());
+        assert_eq!(hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()), ["A | B"]);
 
-        ctrl.core.enqueued_stable_len = 1;
+        ctrl.push("not a table delimiter\n");
+        ctrl.flush_render_for_frame();
         assert!(!ctrl.has_live_tail());
+        assert_eq!(ctrl.queued_lines(), 2);
     }
 
     #[test]
@@ -1122,12 +1135,17 @@ mod tests {
         ctrl.push("| A | B |\n");
         ctrl.push("| --- | --- |\n");
         ctrl.push("| partial");
+        ctrl.flush_render_for_frame();
 
         let tail = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
         assert!(
             !tail.contains("partial"),
             "expected live tail to remain newline-gated: {tail:?}",
         );
+        ctrl.push(" | value |\n");
+        ctrl.flush_render_for_frame();
+        let tail = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
+        assert!(tail.contains("partial") && tail.contains("value"), "{tail:?}");
     }
 
     #[test]
@@ -1987,51 +2005,18 @@ mod tests {
     }
 
     #[test]
-    fn table_holdback_state_detects_header_plus_delimiter() {
-        let source = "| Key | Description |\n| --- | --- |\n";
-        assert!(matches!(
-            table_holdback_state(source),
-            TableHoldbackState::Confirmed { .. }
-        ));
-    }
-
-    #[test]
-    fn table_holdback_state_detects_single_column_header_plus_delimiter() {
-        let source = "| Only |\n| --- |\n";
-        assert!(matches!(
-            table_holdback_state(source),
-            TableHoldbackState::Confirmed { .. }
-        ));
-    }
-
-    #[test]
-    fn table_holdback_state_ignores_table_like_lines_inside_unclosed_long_fence() {
-        let source = "````sh\n```cmd\n| Key | Description |\n| --- | --- |\n````\n";
-        assert!(
-            matches!(table_holdback_state(source), TableHoldbackState::None),
-            "table holdback should ignore pipe lines inside an open non-markdown fence",
-        );
-    }
-
-    #[test]
-    fn table_holdback_state_treats_indented_fence_text_as_plain_content() {
-        let source = "    ```sh\n| Key | Description |\n| --- | --- |\n";
-        assert!(
-            matches!(
-                table_holdback_state(source),
-                TableHoldbackState::Confirmed { .. }
-            ),
-            "indented fence-like text should not open a fence and should not block table detection",
-        );
-    }
-
-    #[test]
-    fn table_holdback_state_ignores_table_like_lines_inside_blockquoted_other_fence() {
-        let source = "> ```sh\n> | Key | Value |\n> | --- | --- |\n> ```\n";
-        assert!(
-            matches!(table_holdback_state(source), TableHoldbackState::None),
-            "table holdback should ignore pipe lines inside non-markdown blockquoted fences",
-        );
+    fn holdback_scanner_detects_tables_only_outside_non_markdown_fences() {
+        for (source, expected) in [
+            ("| Key | Description |\n| --- | --- |\n", TableHoldbackState::Confirmed { table_start: 0 }),
+            ("| Only |\n| --- |\n", TableHoldbackState::Confirmed { table_start: 0 }),
+            ("\x60\x60\x60\x60sh\n\x60\x60\x60cmd\n| Key | Description |\n| --- | --- |\n\x60\x60\x60\x60\n", TableHoldbackState::None),
+            ("    \x60\x60\x60sh\n| Key | Description |\n| --- | --- |\n", TableHoldbackState::Confirmed { table_start: 10 }),
+            ("> \x60\x60\x60sh\n> | Key | Value |\n> | --- | --- |\n> \x60\x60\x60\n", TableHoldbackState::None),
+        ] {
+            let mut scanner = TableHoldbackScanner::new();
+            scanner.push_source_chunk(source);
+            assert_eq!(scanner.state(), expected, "{source}");
+        }
     }
 
     #[test]
@@ -2135,43 +2120,6 @@ mod tests {
     }
 
     #[test]
-    fn controller_set_width_partial_wrapped_emit_keeps_wrapped_remainder() {
-        let mut ctrl = stream_controller(Some(18));
-        ctrl.push("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu\n");
-
-        let (first_emit, idle) = ctrl.on_commit_tick();
-        assert!(first_emit.is_some(), "expected first wrapped line emission");
-        assert!(!idle, "expected remaining wrapped content after one tick");
-        assert!(
-            ctrl.queued_lines() > 0,
-            "expected queued wrapped remainder before resize"
-        );
-
-        ctrl.set_width(Some(80));
-
-        let (cell, _source) = ctrl.finalize();
-        let remaining = cell
-            .map(|c| lines_to_plain_strings(&c.transcript_lines(u16::MAX)))
-            .unwrap_or_default();
-        let mut all_lines = lines_to_plain_strings(
-            &first_emit
-                .expect("first wrapped line")
-                .transcript_lines(u16::MAX),
-        );
-        all_lines.extend(remaining);
-        let text = all_lines
-            .into_iter()
-            .map(|line| line.chars().skip(2).collect::<String>())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(
-            text.split_whitespace().collect::<Vec<_>>(),
-            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
-                .split_whitespace()
-                .collect::<Vec<_>>()
-        );
-    }
-    #[test]
     fn partial_stream_reflow_preserves_every_emitted_and_pending_line() {
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu\n";
         for change_mode in [false, true] {
@@ -2197,6 +2145,10 @@ mod tests {
                 .map(|line| line.chars().skip(2).collect())
                 .collect();
             assert_eq!(actual, collect_streamed_lines(&[text], Some(18)));
+            assert_eq!(
+                actual.join(" ").split_whitespace().collect::<Vec<_>>(),
+                text.split_whitespace().collect::<Vec<_>>()
+            );
             assert_eq!(source.as_deref(), Some(text));
         }
     }

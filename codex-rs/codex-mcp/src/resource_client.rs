@@ -310,13 +310,25 @@ mod tests {
         let client = McpResourceClient::new(|| None::<(Arc<()>, Arc<McpConnectionManager>)>);
 
         assert!(client.cache_key() == client.cache_key());
+        assert!(client.server_cache_key("not-installed").is_none());
         assert!(!client.has_server("not-installed").await);
-        assert!(client.list_resources("not-installed", None).await.is_err());
-        assert!(
+        for cursor in [None, Some("cursor".to_string())] {
+            assert_eq!(
+                client
+                    .list_resources("not-installed", cursor)
+                    .await
+                    .expect_err("missing runtime must reject resource listing")
+                    .to_string(),
+                "MCP runtime is not installed"
+            );
+        }
+        assert_eq!(
             client
                 .read_resource("not-installed", "test://resource")
                 .await
-                .is_err()
+                .expect_err("missing runtime must reject resource reads")
+                .to_string(),
+            "MCP runtime is not installed"
         );
     }
 }

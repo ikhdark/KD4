@@ -1003,11 +1003,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn harness_connection_sends_keepalive_and_receives_relay_data() -> anyhow::Result<()> {
+    async fn harness_connection_preserves_relay_lifecycle_after_malformed_text() -> anyhow::Result<()> {
         let (client_websocket, mut server_websocket) = websocket_pair().await?;
         let mut connection =
             harness_connection_from_websocket(client_websocket, "test".to_string());
         let stream_id = read_resume_stream_id(&mut server_websocket).await?;
+        server_websocket.send(Message::Text("nope".into())).await?;
+        assert!(matches!(
+            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+            Some(JsonRpcConnectionEvent::MalformedMessage { reason })
+                if reason == "relay exec-server transport expects binary protobuf frames"
+        ));
         read_keepalive_ping(&mut server_websocket).await?;
         server_websocket
             .send(Message::Pong(b"keepalive".to_vec().into()))
@@ -1029,42 +1035,14 @@ mod tests {
             Some(JsonRpcConnectionEvent::Message(actual)) if actual == message
         ));
 
+        server_websocket.close(None).await?;
+        assert!(matches!(
+            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+            Some(JsonRpcConnectionEvent::Disconnected { reason: None })
+        ));
+        assert!(*connection.disconnected_rx.borrow());
         drop(connection);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn multiplexed_environment_sends_keepalive() -> anyhow::Result<()> {
-        let (client_websocket, mut server_websocket) = websocket_pair().await?;
-        let runtime_paths = crate::ExecServerRuntimePaths::new(std::env::current_exe()?)
-            .map_err(anyhow::Error::from)?;
-        let environment_task = tokio::spawn(run_multiplexed_environment(
-            client_websocket,
-            ConnectionProcessor::new(runtime_paths),
-            "test-environment".to_string(),
-            "test-registration".to_string(),
-            NoiseChannelIdentity::generate()?,
-            AllowHarnessKeyValidator,
-        ));
-
-        read_keepalive_ping(&mut server_websocket).await?;
-
-        environment_task.abort();
-        let _ = environment_task.await;
-        Ok(())
-    }
-
-    #[derive(Clone)]
-    struct AllowHarnessKeyValidator;
-
-    impl HarnessKeyValidator for AllowHarnessKeyValidator {
-        async fn validate_harness_key(
-            &self,
-            _harness_public_key: &NoiseChannelPublicKey,
-            _authorization: &str,
-        ) -> Result<(), ExecServerError> {
-            Ok(())
-        }
     }
 
     #[tokio::test]
@@ -1111,41 +1089,6 @@ mod tests {
             incoming_rx.recv().await,
             Some(JsonRpcConnectionEvent::Message(actual)) if actual == expected_message
         ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn harness_connection_reports_text_frames_as_malformed() -> anyhow::Result<()> {
-        let (client_websocket, mut server_websocket) = websocket_pair().await?;
-        let mut connection =
-            harness_connection_from_websocket(client_websocket, "test".to_string());
-
-        read_resume_stream_id(&mut server_websocket).await?;
-        server_websocket.send(Message::Text("nope".into())).await?;
-        assert!(matches!(
-            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
-            Some(JsonRpcConnectionEvent::MalformedMessage { reason })
-                if reason == "relay exec-server transport expects binary protobuf frames"
-        ));
-
-        drop(connection);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn harness_connection_reports_server_close() -> anyhow::Result<()> {
-        let (client_websocket, mut server_websocket) = websocket_pair().await?;
-        let mut connection =
-            harness_connection_from_websocket(client_websocket, "test".to_string());
-
-        read_resume_stream_id(&mut server_websocket).await?;
-        server_websocket.close(None).await?;
-        assert!(matches!(
-            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
-            Some(JsonRpcConnectionEvent::Disconnected { reason: None })
-        ));
-
-        drop(connection);
         Ok(())
     }
 

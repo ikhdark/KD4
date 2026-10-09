@@ -51,12 +51,8 @@ impl ExternalAuth for ExternalCredentials {
 }
 
 #[tokio::test]
-async fn failed_recovery_preserves_unauthorized_status() {
+async fn unauthorized_recovery_preserves_status_and_is_bounded() {
     assert_unauthorized_after_recovery(RefreshOutcome::Rejected, /*expected_requests*/ 1).await;
-}
-
-#[tokio::test]
-async fn persistent_unauthorized_stops_after_successful_recovery() {
     assert_unauthorized_after_recovery(RefreshOutcome::Accepted, /*expected_requests*/ 2).await;
 }
 

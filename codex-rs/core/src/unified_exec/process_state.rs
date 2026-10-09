@@ -31,15 +31,37 @@ mod tests {
     use super::ProcessState;
     #[test]
     fn audit_observation_failure_does_not_establish_exit() {
-        let failed = ProcessState::default().failed("transport lost".into());
-        assert!(!failed.has_exited);
-        assert_eq!(failed.failure_message.as_deref(), Some("transport lost"));
-        assert!(failed.exited(Some(0)).has_exited);
-        assert!(
-            failed
-                .exited(Some(0))
-                .failed("later error".into())
-                .has_exited
-        );
+        for sandbox_denied in [false, true] {
+            let initial = ProcessState {
+                sandbox_denied,
+                ..ProcessState::default()
+            };
+            let failed = initial.failed("transport lost".into());
+            assert_eq!(
+                failed,
+                ProcessState {
+                    failure_message: Some("transport lost".into()),
+                    ..initial.clone()
+                }
+            );
+            for exit_code in [None, Some(0), Some(17)] {
+                let exited = failed.exited(exit_code);
+                assert_eq!(
+                    exited,
+                    ProcessState {
+                        has_exited: true,
+                        exit_code,
+                        ..failed.clone()
+                    }
+                );
+                assert_eq!(
+                    exited.failed("later error".into()),
+                    ProcessState {
+                        failure_message: Some("later error".into()),
+                        ..exited.clone()
+                    }
+                );
+            }
+        }
     }
 }

@@ -443,38 +443,6 @@ async fn upload_staged_openai_file(
     ))
 }
 
-#[cfg(test)]
-async fn build_uploaded_argument_value(
-    step_context: &StepContext,
-    auth: Option<&CodexAuth>,
-    field_name: &str,
-    index: Option<usize>,
-    file_path: &str,
-) -> Result<JsonValue, String> {
-    let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) else {
-        return Err("ChatGPT auth is required to upload files for Codex Apps tools".to_string());
-    };
-    let staged = stage_openai_file(
-        step_context,
-        field_name,
-        index,
-        file_path,
-        OPENAI_FILE_UPLOAD_LIMIT_BYTES,
-    )
-    .await?;
-    let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
-    let turn_context = step_context.turn.as_ref();
-    let http_client_factory = turn_context.config.http_client_factory();
-    let http_clients = openai_file_http_client_pool(&http_client_factory);
-    upload_staged_openai_file(
-        &turn_context.config.chatgpt_base_url,
-        upload_auth.as_ref(),
-        &http_clients,
-        staged,
-    )
-    .await
-    .map(|(rewritten, _file_id)| rewritten)
-}
 
 #[cfg(test)]
 mod tests {
@@ -511,6 +479,7 @@ mod tests {
         let cwd = PathUri::from_abs_path(&cwd);
 
         assert!(validate_relative_file_path(&cwd, "nested/report.csv").is_ok());
+        assert!(validate_relative_file_path(&cwd, "").is_err());
         assert!(validate_relative_file_path(&cwd, "../secret.txt").is_err());
         assert!(validate_relative_file_path(&cwd, "nested/../../secret.txt").is_err());
         let absolute = match cwd.infer_path_convention().expect("path convention") {
@@ -518,6 +487,11 @@ mod tests {
             PathConvention::Windows => r"C:\\Windows\\win.ini",
         };
         assert!(validate_relative_file_path(&cwd, absolute).is_err());
+        if cwd.infer_path_convention() == Some(PathConvention::Windows) {
+            for path in [r"..\secret.txt", r"nested\..\secret.txt", r"\secret.txt", "C:secret.txt"] {
+                assert!(validate_relative_file_path(&cwd, path).is_err(), "{path}");
+            }
+        }
     }
 
     #[test]
@@ -536,6 +510,11 @@ mod tests {
             OPENAI_FILE_UPLOAD_LIMIT_BYTES - 1,
             "a rejected reservation must not consume budget"
         );
+        budget.record_file(1).expect("exact limit is allowed");
+        assert_eq!(budget.remaining_bytes(), 0);
+        budget.record_file(0).expect("empty files do not consume budget");
+        assert!(budget.record_file(1).is_err());
+        assert_eq!(budget.staged_bytes, OPENAI_FILE_UPLOAD_LIMIT_BYTES);
     }
 
     #[tokio::test]
@@ -558,90 +537,13 @@ mod tests {
         assert_eq!(rewritten, arguments);
     }
 
+
     #[tokio::test]
-    async fn build_uploaded_argument_value_uploads_environment_file() {
-        use wiremock::Mock;
-        use wiremock::MockServer;
-        use wiremock::ResponseTemplate;
-        use wiremock::matchers::body_json;
-        use wiremock::matchers::header;
-        use wiremock::matchers::method;
-        use wiremock::matchers::path;
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/backend-api/files"))
-            .and(header("chatgpt-account-id", "account_id"))
-            .and(body_json(serde_json::json!({
-                "file_name": "file_report.csv",
-                "file_size": 5,
-                "use_case": "codex",
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "file_id": "file_123",
-                "upload_url": format!("{}/upload/file_123", server.uri()),
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path("/upload/file_123"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/backend-api/files/file_123/uploaded"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "status": "success",
-                "download_url": format!("{}/download/file_123", server.uri()),
-                "file_name": "file_report.csv",
-                "mime_type": "text/csv",
-                "file_size_bytes": 5,
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let (_, mut turn_context) = make_session_and_context().await;
-        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-        let dir = tempdir().expect("temp dir");
-        let local_path = dir.path().join("file_report.csv");
-        tokio::fs::write(&local_path, b"hello")
-            .await
-            .expect("write local file");
-        set_primary_environment_cwd(&mut turn_context, dir.path());
-
-        let mut config = (*turn_context.config).clone();
-        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
-        turn_context.config = Arc::new(config);
-        let step_context = StepContext::for_test(Arc::new(turn_context));
-
-        let rewritten = build_uploaded_argument_value(
-            &step_context,
-            Some(&auth),
-            "file",
-            /*index*/ None,
-            "file_report.csv",
-        )
-        .await
-        .expect("rewrite should upload the local file");
-
-        assert_eq!(
-            rewritten,
-            serde_json::json!({
-                "download_url": format!("{}/download/file_123", server.uri()),
-                "file_id": "file_123",
-                "mime_type": "text/csv",
-                "file_name": "file_report.csv",
-            })
+    async fn rewrite_rejects_oversized_file() {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         );
-    }
-
-    #[tokio::test]
-    async fn build_uploaded_argument_value_rejects_oversized_file_before_reading() {
-        let (_, mut turn_context) = make_session_and_context().await;
-        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
         let dir = tempdir().expect("temp dir");
         let file_path = dir.path().join("oversized.bin");
         let file = std::fs::File::create(&file_path).expect("create sparse file");
@@ -650,12 +552,11 @@ mod tests {
         set_primary_environment_cwd(&mut turn_context, dir.path());
         let step_context = StepContext::for_test(Arc::new(turn_context));
 
-        let error = build_uploaded_argument_value(
+        let error = rewrite_mcp_tool_arguments_for_openai_files(
+            &session,
             &step_context,
-            Some(&auth),
-            "file",
-            /*index*/ None,
-            "oversized.bin",
+            Some(serde_json::json!({"file": "oversized.bin"})),
+            Some(&["file".to_string()]),
         )
         .await
         .expect_err("oversized file should be rejected");
@@ -692,6 +593,7 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/upload/file_123"))
+            .and(wiremock::matchers::body_bytes(b"hello".to_vec()))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -727,7 +629,7 @@ mod tests {
         let rewritten = rewrite_mcp_tool_arguments_for_openai_files(
             &session,
             &step_context,
-            Some(serde_json::json!({"file": "file_report.csv"})),
+            Some(serde_json::json!({"file": "file_report.csv", "caption": "unchanged"})),
             Some(&["file".to_string()]),
         )
         .await
@@ -736,6 +638,7 @@ mod tests {
         assert_eq!(
             rewritten,
             Some(serde_json::json!({
+                "caption": "unchanged",
                 "file": {
                     "download_url": format!("{}/download/file_123", server.uri()),
                     "file_id": "file_123",

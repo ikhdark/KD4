@@ -170,6 +170,10 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             for call in write_archive.call_args_list:
                 self.assertEqual(call.kwargs["entries"], archive_entries)
                 self.assertEqual(call.kwargs["compression"], "fast")
+            self.assertEqual(archive_a.read_bytes(), b"archive")
+            self.assertEqual(archive_b.read_bytes(), b"archive")
+            self.assertTrue(package_dir.is_dir())
+            self.assertFalse(staged_package_dir.exists())
 
     def test_without_skip_build_delegates_to_cargo_builder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -476,6 +480,11 @@ class CliPreflightTest(unittest.TestCase):
             archive_path = release_dir / "codex-package-x86_64-pc-windows-msvc.tar.gz"
             release_dir.mkdir()
             archive_path.write_bytes(b"archive")
+            other_name = "codex-package-aarch64-pc-windows-msvc.tar.gz"
+            (release_dir / "codex-package_SHA256SUMS").write_text(
+                f"{'0' * 64}  {archive_path.name}\n{'b' * 64}  {other_name}\n",
+                encoding="utf-8",
+            )
             (package_dir / "codex-package.json").write_text(
                 json.dumps(
                     {
@@ -493,6 +502,7 @@ class CliPreflightTest(unittest.TestCase):
             checksums = (release_dir / "codex-package_SHA256SUMS").read_text()
             self.assertEqual(
                 checksums,
+                f"{'b' * 64}  {other_name}\n"
                 f"{hashlib.sha256(b'archive').hexdigest()}  {archive_path.name}\n",
             )
             provenance = json.loads(
@@ -501,6 +511,9 @@ class CliPreflightTest(unittest.TestCase):
                 ).read_text()
             )
             self.assertEqual(provenance["version"], "1.2.3")
+            self.assertEqual(provenance["target"], "x86_64-pc-windows-msvc")
+            self.assertEqual(provenance["bundleId"], "a" * 64)
+            self.assertEqual(provenance["buildIdentity"], {"source": "test"})
             self.assertEqual(
                 provenance["artifacts"],
                 [
@@ -587,7 +600,12 @@ class CliPreflightTest(unittest.TestCase):
                         mock.patch.object(cli, "resolve_source_outputs") as build,
                     ):
                         with self.assertRaisesRegex(
-                            RuntimeError, "version|ripgrep|zstd"
+                            RuntimeError,
+                            {
+                                "version": "invalid version",
+                                "ripgrep": "ripgrep executable does not exist",
+                                "zstd": "missing zstd",
+                            }[failure],
                         ):
                             cli.main()
                         build.assert_not_called()

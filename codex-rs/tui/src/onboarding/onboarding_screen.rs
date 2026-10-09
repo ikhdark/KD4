@@ -702,51 +702,24 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_printable_quit_key_during_api_key_entry() {
-        let suppressed = suppress_quit_while_typing_api_key(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-            ApiKeyEntryContext {
-                active: true,
-                has_text: true,
-            },
-        );
-        assert!(suppressed);
-    }
-
-    #[test]
-    fn does_not_suppress_printable_quit_key_when_api_key_input_is_empty() {
-        let suppressed = suppress_quit_while_typing_api_key(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-            ApiKeyEntryContext {
-                active: true,
-                has_text: false,
-            },
-        );
-        assert!(!suppressed);
-    }
-
-    #[test]
-    fn does_not_suppress_control_quit_key_during_api_key_entry() {
-        let suppressed = suppress_quit_while_typing_api_key(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-            ApiKeyEntryContext {
-                active: true,
-                has_text: true,
-            },
-        );
-        assert!(!suppressed);
-    }
-
-    #[test]
-    fn does_not_suppress_when_not_in_api_key_entry() {
-        let suppressed = suppress_quit_while_typing_api_key(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            ApiKeyEntryContext {
-                active: false,
-                has_text: true,
-            },
-        );
-        assert!(!suppressed);
+    fn quit_suppression_requires_active_nonempty_text_entry_and_printable_key() {
+        for (code, modifiers, active, has_text, expected) in [
+            (KeyCode::Char('q'), KeyModifiers::NONE, true, true, true),
+            (KeyCode::Char('q'), KeyModifiers::NONE, true, false, false),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL, true, true, false),
+            (KeyCode::Char('x'), KeyModifiers::NONE, false, true, false),
+            (KeyCode::Char('q'), KeyModifiers::ALT, true, true, false),
+            (KeyCode::Esc, KeyModifiers::NONE, true, true, false),
+        ] {
+            assert_eq!(
+                suppress_quit_while_typing_api_key(
+                    KeyEvent::new(code, modifiers),
+                    ApiKeyEntryContext { active, has_text },
+                ),
+                expected,
+                "{code:?}, {modifiers:?}, active={active}, has_text={has_text}"
+            );
+        }
     }
 
     #[tokio::test]

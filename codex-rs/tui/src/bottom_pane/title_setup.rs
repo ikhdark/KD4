@@ -444,89 +444,20 @@ mod tests {
     }
 
     #[test]
-    fn activity_is_canonical_and_accepts_spinner_legacy_id() {
-        assert_eq!(TerminalTitleItem::Spinner.to_string(), "activity");
-        assert_eq!(
-            "activity".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Spinner)
-        );
-        assert_eq!(
-            "spinner".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Spinner)
-        );
-    }
-
-    #[test]
-    fn project_name_is_canonical_and_accepts_project_legacy_id() {
-        assert_eq!(TerminalTitleItem::Project.to_string(), "project-name");
-        assert_eq!(
-            "project-name".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Project)
-        );
-        assert_eq!(
-            "project".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Project)
-        );
-    }
-
-    #[test]
-    fn thread_title_is_canonical_and_accepts_thread_legacy_id() {
-        assert_eq!(TerminalTitleItem::Thread.to_string(), "thread-title");
-        assert_eq!(
-            "thread-title".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Thread)
-        );
-        assert_eq!(
-            "thread".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Thread)
-        );
-    }
-
-    #[test]
-    fn model_is_canonical_and_accepts_model_name_legacy_id() {
-        assert_eq!(TerminalTitleItem::Model.to_string(), "model");
-        assert_eq!(
-            "model".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Model)
-        );
-        assert_eq!(
-            "model-name".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Model)
-        );
-    }
-
-    #[test]
-    fn run_state_is_canonical_and_accepts_status_legacy_id() {
-        assert_eq!(TerminalTitleItem::Status.to_string(), "run-state");
-        assert_eq!(
-            "run-state".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Status)
-        );
-        assert_eq!(
-            "status".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Status)
-        );
-    }
-
-    #[test]
-    fn model_with_reasoning_has_distinct_id() {
-        assert_eq!(
-            TerminalTitleItem::ModelWithReasoning.to_string(),
-            "model-with-reasoning"
-        );
-        assert_eq!(
-            "model-with-reasoning".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::ModelWithReasoning)
-        );
-    }
-
-    #[test]
-    fn reasoning_is_selectable_id() {
-        assert_eq!(TerminalTitleItem::Reasoning.to_string(), "reasoning");
-        assert_eq!(
-            "reasoning".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Reasoning)
-        );
+    fn title_ids_preserve_canonical_names_and_legacy_aliases() {
+        for (item, canonical, alias) in [
+            (TerminalTitleItem::Spinner, "activity", "spinner"),
+            (TerminalTitleItem::Project, "project-name", "project"),
+            (TerminalTitleItem::Thread, "thread-title", "thread"),
+            (TerminalTitleItem::Model, "model", "model-name"),
+            (TerminalTitleItem::Status, "run-state", "status"),
+            (TerminalTitleItem::ModelWithReasoning, "model-with-reasoning", "model-with-reasoning"),
+            (TerminalTitleItem::Reasoning, "reasoning", "reasoning"),
+        ] {
+            assert_eq!(item.to_string(), canonical);
+            assert_eq!(canonical.parse::<TerminalTitleItem>(), Ok(item), "{canonical}");
+            assert_eq!(alias.parse::<TerminalTitleItem>(), Ok(item), "{alias}");
+        }
     }
 
     #[test]

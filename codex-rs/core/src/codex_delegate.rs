@@ -456,6 +456,7 @@ async fn shutdown_delegate(codex: &Codex) {
                 trace: None,
             },
             mailbox_admission: None,
+            preparation_permit: None,
         });
     }
     codex.tx_sub.close();
@@ -513,6 +514,12 @@ async fn forward_ops(
         ) {
             break;
         }
+    }
+    // Closing alone retains buffered submissions as long as a proxy sender
+    // survives. Release their admission permits and acknowledgements as well.
+    rx_ops.close();
+    while let Ok(queued) = rx_ops.try_recv() {
+        drop(queued);
     }
     cancel_token_ops.cancel();
 }

@@ -240,32 +240,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compose_agents_summary_includes_global_agents_path() {
+    async fn compose_agents_summary_includes_global_and_override_paths() {
         let codex_home = TempDir::new().expect("temp codex home");
         let cwd = TempDir::new().expect("temp cwd");
-        let global_agents_path = codex_home.path().join("global.md");
         let config = test_config(&codex_home, &cwd).await;
-
-        assert_eq!(
-            compose_agents_summary(
-                &config,
-                &[PathUri::from_abs_path(&global_agents_path.abs())]
-            ),
-            format_directory_display(&global_agents_path, /*max_width*/ None)
-        );
-    }
-
-    #[tokio::test]
-    async fn compose_agents_summary_names_global_agents_override() {
-        let codex_home = TempDir::new().expect("temp codex home");
-        let cwd = TempDir::new().expect("temp cwd");
-        let override_path = codex_home.path().join("override.md");
-        let config = test_config(&codex_home, &cwd).await;
-
-        assert_eq!(
-            compose_agents_summary(&config, &[PathUri::from_abs_path(&override_path.abs())]),
-            format_directory_display(&override_path, /*max_width*/ None)
-        );
+        for name in ["global.md", "override.md"] {
+            let path = codex_home.path().join(name);
+            assert_eq!(
+                compose_agents_summary(&config, &[PathUri::from_abs_path(&path.abs())]),
+                format_directory_display(&path, /*max_width*/ None)
+            );
+        }
     }
 
     #[tokio::test]
@@ -302,7 +287,7 @@ mod tests {
             Some(format_directory_display(&global_agents_path, /*max_width*/ None).as_str())
         );
         let project_path = paths.next().expect("project agents path");
-        assert!(project_path.ends_with("project.md"));
+        assert_eq!(project_path, "project.md");
         assert_eq!(paths.next(), None);
     }
 }

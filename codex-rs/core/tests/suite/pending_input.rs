@@ -252,7 +252,12 @@ async fn wait_for_agent_message(codex: &CodexThread, text: &str) {
 }
 
 async fn wait_for_turn_complete(codex: &CodexThread) {
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate requires terminal completion");
+    };
+    assert_eq!(completed.error, None);
 }
 
 async fn wait_for_sleep_item_started(codex: &CodexThread, call_id: &str, duration_ms: u64) {
@@ -1202,6 +1207,18 @@ async fn steered_user_input_arrives_when_tool_output_triggers_compact_before_nex
 
     let compact_body: Value = from_slice(&requests[1]).expect("parse compact request");
     let steered_body: Value = from_slice(&requests[2]).expect("parse steered request");
+    // The summarizer must not consume the unread tool result or its paired call.
+    // Both survive in replacement history for the first post-compaction request.
+    assert!(
+        !compact_body["input"]
+            .as_array()
+            .expect("compaction input array")
+            .iter()
+            .any(|item| item["call_id"] == "call-1")
+    );
+    let tool_output = function_call_output_text(&steered_body, "call-1")
+        .expect("post-compaction input must retain the actual large shell output");
+    assert!(tool_output.contains(&"0".repeat(1000)));
 
     let compact_user_texts = message_input_texts(&compact_body, "user");
     assert!(

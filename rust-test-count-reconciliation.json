@@ -1,0 +1,202 @@
+{
+  "provisional": false,
+  "phase": "source_review_complete_focused_validation_passed_except_missing_dylint_link",
+  "started_utc": "2026-10-09T09:26:06.002658+00:00",
+  "finished_utc": "2026-10-09T09:26:06.243502+00:00",
+  "baseline_sha256": "ee0807e44d946c45ea2421e994d69018e575f3a69850d3ed8001c043564125b7",
+  "scope_count": 2513,
+  "read_count": 2513,
+  "baseline_attributes": 17944,
+  "current_attributes": 16572,
+  "delta": -1372,
+  "current_attribute_kinds": {
+    "test": 16392,
+    "test_case": 180
+  },
+  "failures": [],
+  "unstable_during_read": [],
+  "ordered_content_sha256": "f4f9fb2521b336eafe293b52f1e4f61f1fb69a8bbc397e8fe1220e9e2e7361d2",
+  "ordered_content_hash_encoding": "SHA256 UTF-8 compact JSON ordered [path, raw byte length, raw SHA256, lexical count] rows",
+  "rule": "#\\s*\\[\\s*(?:(?:[A-Za-z_]\\w*)::)*(?:test|rstest|test_case|test_matrix)\\b",
+  "changed_attribute_file_count": 509,
+  "count_meaning": "Exact original lexical attribute regex; not Rust test definitions or executed cases. Includes qualified test attributes and rstest/test_case/test_matrix attributes, possibly multiple per function and text in comments/strings. Does not expand generated/macro tests. Original 2513 paths only; new paths outside inventory excluded.",
+  "producer": {
+    "root_rollout": "C:\\Users\\kuh\\Desktop\\LOCAL-KD\\sessions\\2026\\10\\09\\rollout-2026-10-09T00-23-57-01a11f1e-3a6b-70c3-8f0f-5967ea471565.jsonl",
+    "record_index": 63,
+    "inventory_query": "path categories only; counting regex came from separate producer"
+  },
+  "freshness": "Captured after root confirmed the final narrowed paste-discard/navigation repair settled and independently reviewed. Non-atomic per-file reads; size/mtime checked before/after each read and across scan, no instability observed. Root reports final composer/request-input owner validation passed 238 tests (run 8191a876-1f77-4d24-86ba-a1d191209de5); prior other five failed-test repairs passed and remained unchanged. This lexical count is not runtime test proof; argument_comment_lint validation remains blocked by missing dylint-link. Later source changes require count reconciliation.",
+  "coverage_reconciliation": {
+    "original_files": 2513,
+    "original_bytes": 55901676,
+    "completed_review_files": 2513,
+    "gaps": [],
+    "assignment_partition": "Ten original assignment inventories are disjoint and exactly cover the original inventory; inventory presence alone was not accepted as review proof.",
+    "evidence": "Union of explicit reviewed arrays, successor completion receipts, and recovered complete-scope messages. services_a record345, services_c record1691, tui_chat record1858; tui_other record1854 exact remaining3 completed by tui_large_completion.json; services_b records1467/1576/1903 exact remaining45 completed by core-plugins-review-progress.json. App recovered reviewed paths plus successor app receipts; root reviewed188 plus transferred windows62/protocol40/MCP53.",
+    "final_session": "core_session-progress reviewed155 + finish-session-progress reviewed2 + session-compact-progress coverage4 =161; final successor has no unread ranges.",
+    "limitation": "Reconciliation of authenticated historical worker review receipts, not an independent reread or executable validation of all Rust sources. Later edits require affected review/validation reconciliation."
+  },
+  "windows": {
+    "original_file_count_reported": 11,
+    "original_unique_modified_files_recovered": 10,
+    "correction": "resolved_permissions.rs appears in both original patch groups; 4+7 edits span10 distinct files.",
+    "original_filters": 14,
+    "continuation_filters": 14,
+    "combined_filters": 28,
+    "unique_modified_files": 20,
+    "attribute_delta": -20,
+    "combined_files": [
+      {
+        "file": "stdio_bridge_tests.rs",
+        "filters": [
+          "input_forwarder_sends_chunks_and_reports_eof",
+          "output_forwarder_writes_all_chunks"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "logging.rs",
+        "filters": [
+          "preview_does_not_panic_on_utf8_boundary"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "wrapper_tests.rs",
+        "filters": [
+          "windows_wrapper_args_round_trip"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "resolved_permissions.rs",
+        "filters": [
+          "permission_profile_workspace_write_uses_windows_temp_env_vars",
+          "token_mode_follows_profile_writable_roots"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "lib.rs",
+        "filters": [
+          "retained_capture_marks_truncation_only_after_observing_excess_bytes",
+          "network_block_follows_profile_network_policy",
+          "stopped_capture_reader_bounds_continuous_writer_drain"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "setup_error.rs",
+        "filters": [
+          "redact_username_segments_preserves_nonmatching_segments"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "bin/setup_main/win/setup_runtime_bin_tests.rs",
+        "filters": [
+          "runtime_paths_include_only_available_runtime_roots"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "identity.rs",
+        "filters": [
+          "remove_sandbox_users_file_deletes_existing_file"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "unified_exec/tests.rs",
+        "filters": [
+          "finish_driver_spawn_honors_stdin_open_without_process_exit"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "elevated/runner_client.rs",
+        "filters": [
+          "startup_reader_delivers_frame_and_leaves_following_frame_unread"
+        ],
+        "origin": "original_worker"
+      },
+      {
+        "file": "allow.rs",
+        "filters": [
+          "tmp_env_roots_follow_profile_exclusion"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "spawn_prep.rs",
+        "filters": [
+          "legacy_spawn_env_applies_offline_network_rewrite"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "sandbox_utils.rs",
+        "filters": [
+          "injects_worktree_root_without_overwriting_existing_config"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "path_normalization.rs",
+        "filters": [
+          "canonical_path_key_normalizes_case_and_separators"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "setup.rs",
+        "filters": [
+          "setup_completion_requires_ready_artifacts",
+          "setup_marker_request_mismatch_reason_tracks_offline_firewall_fields"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "helper_materialization.rs",
+        "filters": [
+          "public_resolution_reports_reused_materialization"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "wfp.rs",
+        "filters": [
+          "proxy_ports_are_normalized_within_fixed_filter_slots",
+          "static_ale_port_blocks_exclude_loopback_proxy_ports"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "bin/setup_main/win/firewall.rs",
+        "filters": [
+          "local_policy_modify_state_distinguishes_query_failure_from_ineffective_policy",
+          "production_firewall_rule_network_scopes_are_accepted_by_firewall_com"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "bin/setup_main/win/sandbox_users.rs",
+        "filters": [
+          "secrets_writer_persists_distinct_encrypted_credentials"
+        ],
+        "origin": "continuation"
+      },
+      {
+        "file": "bin/setup_main/win.rs",
+        "filters": [
+          "payload_defaults_and_optional_settings_are_preserved",
+          "deny_path_outside_active_roots_falls_back_to_all_active_root_sids"
+        ],
+        "origin": "continuation"
+      }
+    ],
+    "lib_filter": "test(input_forwarder_sends_chunks_and_reports_eof) | test(output_forwarder_writes_all_chunks) | test(preview_does_not_panic_on_utf8_boundary) | test(windows_wrapper_args_round_trip) | test(permission_profile_workspace_write_uses_windows_temp_env_vars) | test(token_mode_follows_profile_writable_roots) | test(retained_capture_marks_truncation_only_after_observing_excess_bytes) | test(network_block_follows_profile_network_policy) | test(stopped_capture_reader_bounds_continuous_writer_drain) | test(redact_username_segments_preserves_nonmatching_segments) | test(remove_sandbox_users_file_deletes_existing_file) | test(finish_driver_spawn_honors_stdin_open_without_process_exit) | test(startup_reader_delivers_frame_and_leaves_following_frame_unread) | test(tmp_env_roots_follow_profile_exclusion) | test(legacy_spawn_env_applies_offline_network_rewrite) | test(injects_worktree_root_without_overwriting_existing_config) | test(canonical_path_key_normalizes_case_and_separators) | test(setup_completion_requires_ready_artifacts) | test(setup_marker_request_mismatch_reason_tracks_offline_firewall_fields) | test(public_resolution_reports_reused_materialization) | test(proxy_ports_are_normalized_within_fixed_filter_slots) | test(static_ale_port_blocks_exclude_loopback_proxy_ports)",
+    "setup_binary_filter": "test(runtime_paths_include_only_available_runtime_roots) | test(local_policy_modify_state_distinguishes_query_failure_from_ineffective_policy) | test(production_firewall_rule_network_scopes_are_accepted_by_firewall_com) | test(secrets_writer_persists_distinct_encrypted_credentials) | test(payload_defaults_and_optional_settings_are_preserved) | test(deny_path_outside_active_roots_falls_back_to_all_active_root_sids)",
+    "validation": "Filter names checked against source; no runtime validation run by worker."
+  }
+}

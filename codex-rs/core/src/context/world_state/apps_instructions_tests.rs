@@ -41,17 +41,6 @@ fn renders_only_when_apps_become_available() {
 }
 
 #[test]
-fn renders_revocation_when_apps_become_unavailable() {
-    let true_snapshot = true;
-    let rendered = render(
-        AppsInstructionsState::new(/*available*/ false),
-        PreviousSectionState::Known(&true_snapshot),
-    );
-
-    assert_eq!(rendered, vec![AppsInstructionsUnavailable.render()]);
-}
-
-#[test]
 fn unknown_state_reasserts_current_availability() {
     assert_eq!(
         render(

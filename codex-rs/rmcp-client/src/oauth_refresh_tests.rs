@@ -158,6 +158,23 @@ async fn concurrent_operations_near_expiry_share_one_token_refresh() -> anyhow::
     );
     first?;
     second?;
+    let requests = server.received_requests().await.unwrap();
+    let tool_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.url.path() == "/mcp"
+                && request.method == "POST"
+                && request.body_json::<Value>().unwrap()["method"] == "tools/list"
+        })
+        .collect();
+    assert_eq!(tool_requests.len(), 2);
+    let expected_authorization = format!("Bearer {REFRESHED_ACCESS_TOKEN}");
+    for request in tool_requests {
+        assert_eq!(
+            request.headers.get("authorization").unwrap().to_str()?,
+            expected_authorization
+        );
+    }
     server.verify().await;
     Ok(())
 }

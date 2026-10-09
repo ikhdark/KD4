@@ -1,0 +1,101 @@
+{
+  "owner": "remaining_mcp",
+  "status": "complete",
+  "full_semantic_review_files": 53,
+  "scope": {
+    "codex-mcp": 20,
+    "rmcp-client": 33
+  },
+  "unread": [],
+  "test_function_delta": -4,
+  "production_changes": false,
+  "modified_test_filters": {
+    "codex-mcp": [
+      "auth_elicitation::tests::builds_auth_elicitation_plan",
+      "resource_client::tests::unavailable_runtime_is_reported_without_panicking",
+      "connection_manager::tests::shutdown_clients_force_explicit_graceful_failures",
+      "mcp::tests::mcp_prompt_auto_approval_honors_approved_tools_in_all_permission_modes"
+    ],
+    "rmcp-client": [
+      "executor_process_transport::tests::stdout_messages_larger_than_a_diagnostic_line_are_delivered",
+      "rmcp_client::tests::active_time_timeout_pauses_while_elicitation_is_pending",
+      "perform_oauth_login::tests::parse_oauth_callback_preserves_values_for_supported_paths",
+      "rmcp_client::oauth_refresh_tests::concurrent_operations_near_expiry_share_one_token_refresh"
+    ]
+  },
+  "removed_tests": [
+    "mcp_prompt_auto_approval_rejects_auto_mode_in_default_permission_mode (exact duplicate of retained approval matrix)",
+    "managed_clients_store_a_concrete_tool_timeout (asserted only self-constructed fixture)",
+    "parse_oauth_callback_accepts_default_path",
+    "parse_oauth_callback_accepts_custom_path",
+    "parse_oauth_callback_accepts_callback_id_path"
+  ],
+  "added_tests": [
+    "parse_oauth_callback_preserves_values_for_supported_paths (3 original paths +2 value encodings)"
+  ],
+  "changes": [
+    "Exact missing-runtime errors for absent/present cursor; missing server cache key.",
+    "Auth plan connector ID/URL/status metadata +non-error exclusion.",
+    "Exact forced client identity during graceful shutdown failure.",
+    "Full large stdout payload + replay dedup.",
+    "Paused Tokio clock for active-time timeout regression.",
+    "OAuth callback exact code/state and decoding.",
+    "Both concurrent tool-list calls must use refreshed bearer; existing exactly-one refresh retained."
+  ],
+  "validation": "Source-level patch/consumer review only; no Cargo/build/Git/global format. Parent owns tests. Hash comparison across reviewed53 found only own8 expected changed files.",
+  "reviewed_files": [
+    "codex-rs/codex-mcp/src/lib.rs",
+    "codex-rs/codex-mcp/src/server.rs",
+    "codex-rs/codex-mcp/src/runtime.rs",
+    "codex-rs/codex-mcp/src/tools.rs",
+    "codex-rs/codex-mcp/src/elicitation.rs",
+    "codex-rs/codex-mcp/src/auth_elicitation.rs",
+    "codex-rs/codex-mcp/src/resource_client.rs",
+    "codex-rs/codex-mcp/src/codex_apps.rs",
+    "codex-rs/codex-mcp/src/catalog.rs",
+    "codex-rs/codex-mcp/src/catalog_tests.rs",
+    "codex-rs/codex-mcp/src/plugin_config.rs",
+    "codex-rs/codex-mcp/src/plugin_config_tests.rs",
+    "codex-rs/codex-mcp/src/mcp/auth.rs",
+    "codex-rs/codex-mcp/src/mcp/mod.rs",
+    "codex-rs/codex-mcp/src/mcp/mod_tests.rs",
+    "codex-rs/codex-mcp/src/codex_apps_cache.rs",
+    "codex-rs/codex-mcp/src/codex_apps_cache_tests.rs",
+    "codex-rs/codex-mcp/src/connection_manager.rs",
+    "codex-rs/codex-mcp/src/connection_manager_tests.rs",
+    "codex-rs/codex-mcp/src/rmcp_client.rs",
+    "codex-rs/rmcp-client/src/lib.rs",
+    "codex-rs/rmcp-client/src/startup_error.rs",
+    "codex-rs/rmcp-client/src/utils.rs",
+    "codex-rs/rmcp-client/src/program_resolver.rs",
+    "codex-rs/rmcp-client/src/stdio_server_launcher.rs",
+    "codex-rs/rmcp-client/src/executor_process_transport.rs",
+    "codex-rs/rmcp-client/src/executor_process_transport_tests.rs",
+    "codex-rs/rmcp-client/tests/foreign_stdio_cwd.rs",
+    "codex-rs/rmcp-client/src/rmcp_client.rs",
+    "codex-rs/rmcp-client/src/elicitation_client_service.rs",
+    "codex-rs/rmcp-client/src/logging_client_handler.rs",
+    "codex-rs/rmcp-client/src/http_client_adapter.rs",
+    "codex-rs/rmcp-client/src/http_client_adapter/www_authenticate.rs",
+    "codex-rs/rmcp-client/src/http_client_adapter/www_authenticate_tests.rs",
+    "codex-rs/rmcp-client/src/streamable_http_retry.rs",
+    "codex-rs/rmcp-client/src/streamable_http_retry_tests.rs",
+    "codex-rs/rmcp-client/src/retry_latency_tests.rs",
+    "codex-rs/rmcp-client/src/oauth_http_client.rs",
+    "codex-rs/rmcp-client/src/auth_status.rs",
+    "codex-rs/rmcp-client/src/perform_oauth_login.rs",
+    "codex-rs/rmcp-client/src/oauth.rs",
+    "codex-rs/rmcp-client/src/oauth/store_lock.rs",
+    "codex-rs/rmcp-client/src/oauth/test_support.rs",
+    "codex-rs/rmcp-client/src/oauth/tests/store_lock_tests.rs",
+    "codex-rs/rmcp-client/src/oauth_refresh_tests.rs",
+    "codex-rs/rmcp-client/src/bin/rmcp_test_server.rs",
+    "codex-rs/rmcp-client/src/bin/test_stdio_server.rs",
+    "codex-rs/rmcp-client/src/bin/test_streamable_http_server.rs",
+    "codex-rs/rmcp-client/tests/resources.rs",
+    "codex-rs/rmcp-client/tests/streamable_http_oauth_startup.rs",
+    "codex-rs/rmcp-client/tests/streamable_http_recovery.rs",
+    "codex-rs/rmcp-client/tests/streamable_http_remote.rs",
+    "codex-rs/rmcp-client/tests/streamable_http_test_support/mod.rs"
+  ]
+}

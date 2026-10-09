@@ -457,8 +457,17 @@ mod tests {
             {
                 let mut receive = Box::pin(stream.recv());
                 assert!(futures::poll!(receive.as_mut()).is_pending());
+                // Queue behind terminal retrieval but ahead of its cleanup.
+                // Blocking the first lock alone never consumes the terminal
+                // outcome and therefore cannot test cancellation-safe retention.
+                let mut cleanup_blocker = Box::pin(inner.http_body_streams.lock());
+                assert!(futures::poll!(cleanup_blocker.as_mut()).is_pending());
+                drop(guard);
+                assert!(futures::poll!(receive.as_mut()).is_pending());
+                let cleanup_guard = cleanup_blocker.await;
+                drop(receive);
+                drop(cleanup_guard);
             }
-            drop(guard);
             let outcome = stream.recv().await;
             if let Some(expected) = expected_error {
                 assert!(

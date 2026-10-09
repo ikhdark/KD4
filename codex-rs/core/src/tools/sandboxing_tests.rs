@@ -64,17 +64,6 @@ fn approval_cache_is_namespaced_by_tool_and_key_schema() {
     );
 }
 
-#[test]
-fn bash_permission_request_payload_omits_missing_description() {
-    assert_eq!(
-        PermissionRequestPayload::bash("echo hi".to_string(), /*description*/ None),
-        PermissionRequestPayload {
-            tool_name: HookToolName::bash(),
-            tool_input: json!({ "command": "echo hi" }),
-        }
-    );
-}
-
 #[tokio::test]
 async fn cached_approval_serializes_once_and_reuses_session_grants() {
     struct CountedKey<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -143,7 +132,14 @@ async fn unserializable_approval_keys_never_hit_the_cache() {
 }
 
 #[test]
-fn bash_permission_request_payload_includes_description_when_present() {
+fn bash_permission_request_payload_preserves_optional_description() {
+    assert_eq!(
+        PermissionRequestPayload::bash("echo hi".to_string(), /*description*/ None),
+        PermissionRequestPayload {
+            tool_name: HookToolName::bash(),
+            tool_input: json!({ "command": "echo hi" }),
+        }
+    );
     assert_eq!(
         PermissionRequestPayload::bash(
             "echo hi".to_string(),

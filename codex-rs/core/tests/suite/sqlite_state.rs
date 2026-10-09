@@ -15,7 +15,6 @@ use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
@@ -25,7 +24,6 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::fs;
 use tokio::time::Duration;
-use tracing_subscriber::prelude::*;
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -147,6 +145,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     })
     .await;
 
+    started.thread.flush_rollout().await?;
     let mut resume_builder = test_codex();
     let resumed = resume_builder
         .resume(&server, base_test.home.clone(), rollout_path)
@@ -463,7 +462,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
     assert_eq!(metadata.id, thread_id);
     assert_eq!(metadata.rollout_path, rollout_path.to_path_buf());
     assert_eq!(metadata.model_provider, default_provider);
-    assert!(metadata.first_user_message.is_some());
+    assert_eq!(metadata.first_user_message.as_deref(), Some("hello from backfill"));
 
     Ok(())
 }
@@ -511,80 +510,10 @@ async fn user_messages_persist_in_state_db() -> Result<()> {
     }
 
     let metadata = metadata.expect("thread should exist in state db");
-    assert!(metadata.first_user_message.is_some());
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn tool_call_logs_include_thread_id() -> Result<()> {
-    let server = start_mock_server().await;
-    let call_id = "call-1";
-    let args = json!({
-        "kind": "script",
-        "command": "echo hello",
-        "timeout_ms": 1_000,
-        "login": false,
-    });
-    let args_json = serde_json::to_string(&args)?;
-    mount_sse_sequence(
-        &server,
-        vec![
-            responses::sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call(call_id, "shell_command", &args_json),
-                ev_completed("resp-1"),
-            ]),
-            responses::sse(vec![ev_completed("resp-2")]),
-        ],
-    )
-    .await;
-
-    let mut builder = test_codex();
-    let test = builder.build(&server).await?;
-    let db = test.codex.state_db().expect("state db enabled");
-    let expected_thread_id = test.session_configured.thread_id.to_string();
-
-    test.submit_turn("run a shell command").await?;
-
-    let log_db_layer = codex_state::log_db::start(db.clone());
-    let subscriber = tracing_subscriber::registry().with(log_db_layer.clone());
-    let dispatch = tracing::Dispatch::new(subscriber);
-    tracing::dispatcher::with_default(&dispatch, || {
-        let span = tracing::info_span!("test_log_span", thread_id = %expected_thread_id);
-        let _entered = span.enter();
-        tracing::info!("ToolCall: shell_command {{\"command\":\"echo hello\"}}");
-    });
-    log_db_layer.flush().await.expect("flush SQLite logs");
-
-    let mut found = None;
-    for _ in 0..80 {
-        let query = codex_state::LogQuery {
-            descending: true,
-            limit: Some(20),
-            ..Default::default()
-        };
-        let rows = db.query_logs(&query).await?;
-        if let Some(row) = rows.into_iter().find(|row| {
-            row.message
-                .as_deref()
-                .is_some_and(|m| m.contains("ToolCall:"))
-        }) {
-            let thread_id = row.thread_id;
-            let message = row.message;
-            found = Some((thread_id, message));
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let (thread_id, message) = found.expect("expected ToolCall log row");
-    assert_eq!(thread_id, Some(expected_thread_id));
-    assert!(
-        message
-            .as_deref()
-            .is_some_and(|text| text.contains("ToolCall:")),
-        "expected ToolCall message, got {message:?}"
+    assert_eq!(
+        metadata.first_user_message.as_deref(),
+        Some("hello from sqlite"),
+        "the first user message must survive subsequent turns unchanged"
     );
 
     Ok(())

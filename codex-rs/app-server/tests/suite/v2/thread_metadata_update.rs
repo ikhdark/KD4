@@ -203,7 +203,7 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_stored_thread() -
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
-    let _state_db = init_state_db(codex_home.path()).await?;
+    let state_db = init_state_db(codex_home.path()).await?;
 
     let preview = "Stored thread preview";
     let thread_id = create_fake_rollout(
@@ -252,6 +252,13 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_stored_thread() -
             origin_url: None,
         })
     );
+    let persisted = state_db
+        .get_thread(ThreadId::from_string(&thread_id)?)
+        .await?
+        .expect("metadata update must repair the SQLite row");
+    assert_eq!(persisted.git_branch.as_deref(), Some("feature/stored-thread"));
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
+    assert_eq!(persisted.created_at.timestamp(), updated.created_at);
 
     Ok(())
 }
@@ -336,6 +343,13 @@ async fn thread_metadata_update_repairs_loaded_thread_without_resetting_summary(
             origin_url: None,
         })
     );
+    let persisted = state_db
+        .get_thread(thread_uuid)
+        .await?
+        .expect("metadata update must restore the deleted SQLite row");
+    assert_eq!(persisted.git_branch.as_deref(), Some("feature/loaded-thread"));
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
+    assert_eq!(persisted.created_at.timestamp(), updated.created_at);
 
     Ok(())
 }
@@ -345,7 +359,7 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_archived_thread()
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
-    let _state_db = init_state_db(codex_home.path()).await?;
+    let state_db = init_state_db(codex_home.path()).await?;
 
     let preview = "Archived thread preview";
     let thread_id = create_fake_rollout(
@@ -404,6 +418,14 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_archived_thread()
             origin_url: None,
         })
     );
+    let persisted = state_db
+        .get_thread(ThreadId::from_string(&thread_id)?)
+        .await?
+        .expect("metadata update must repair the archived SQLite row");
+    assert_eq!(persisted.git_branch.as_deref(), Some("feature/archived-thread"));
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
+    assert_eq!(persisted.created_at.timestamp(), updated.created_at);
+    assert!(persisted.archived_at.is_some());
 
     Ok(())
 }

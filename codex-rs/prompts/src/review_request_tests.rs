@@ -14,32 +14,24 @@ fn review_prompt_template_renders_base_branch_variant() {
 
 #[test]
 fn review_prompt_template_renders_commit_variant() {
-    assert_eq!(
-        review_prompt(
-            &ReviewTarget::Commit {
-                sha: "deadbeef".to_string(),
-                title: None,
-            },
-            &AbsolutePathBuf::current_dir().expect("cwd"),
-        )
-        .expect("commit prompt should render"),
-        "Review the code changes introduced by commit deadbeef. Provide prioritized, actionable findings."
-    );
-}
-
-#[test]
-fn review_prompt_template_renders_commit_variant_with_title() {
-    assert_eq!(
-        review_prompt(
-            &ReviewTarget::Commit {
-                sha: "deadbeef".to_string(),
-                title: Some("Fix bug".to_string()),
-            },
-            &AbsolutePathBuf::current_dir().expect("cwd"),
-        )
-        .expect("commit prompt should render"),
-        "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized, actionable findings."
-    );
+    let cwd = AbsolutePathBuf::current_dir().expect("cwd");
+    for (title, expected) in [
+        (None, "Review the code changes introduced by commit deadbeef. Provide prioritized, actionable findings."),
+        (Some("Fix bug"), "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized, actionable findings."),
+    ] {
+        assert_eq!(
+            review_prompt(
+                &ReviewTarget::Commit {
+                    sha: "deadbeef".to_string(),
+                    title: title.map(str::to_string),
+                },
+                &cwd,
+            )
+            .expect("commit prompt should render"),
+            expected,
+            "title: {title:?}"
+        );
+    }
 }
 
 #[test]

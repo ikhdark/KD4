@@ -385,7 +385,7 @@ function flattenConfigOverrides(
 
 function toTomlValue(value: CodexConfigValue, path: string): string {
   if (typeof value === "string") {
-    return JSON.stringify(value);
+    return toTomlString(value);
   } else if (typeof value === "number") {
     if (!Number.isFinite(value)) {
       throw new Error(`Codex config override at ${path} must be a finite number`);
@@ -416,9 +416,14 @@ function toTomlValue(value: CodexConfigValue, path: string): string {
   }
 }
 
+function toTomlString(value: string): string {
+  // JSON permits literal DEL, but TOML basic strings require it to be escaped.
+  return JSON.stringify(value).replace(/\u007f/g, "\\u007f");
+}
+
 const TOML_BARE_KEY = /^[A-Za-z0-9_-]+$/;
 function formatTomlKey(key: string): string {
-  return TOML_BARE_KEY.test(key) ? key : JSON.stringify(key);
+  return TOML_BARE_KEY.test(key) ? key : toTomlString(key);
 }
 
 function isPlainObject(value: unknown): value is CodexConfigObject {

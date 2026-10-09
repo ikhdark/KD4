@@ -80,15 +80,15 @@ async fn submit_user_turn(
     Ok(())
 }
 
-fn assert_no_matched_rules_invariant(output_item: &Value) {
+fn assert_blank_script_rejected(output_item: &Value, tool_name: &str, script_field: &str) {
     let output = output_item
         .get("output")
         .and_then(Value::as_str)
         .expect("function call output should include a string output payload");
-    assert!(
-        !output.contains("invariant failed: matched_rules must be non-empty"),
-        "unexpected invariant panic surfaced in output: {output}"
+    let expected = format!(
+        "{tool_name} schema error in `script` branch at `$.{script_field}`: the supplied field was blank; provide a non-blank string, or omit this field when using another command branch."
     );
+    assert!(output.contains(&expected), "unexpected blank-script result: {output}");
 }
 
 #[tokio::test]
@@ -453,7 +453,7 @@ async fn shell_command_blank_scripts_with_collaboration_mode_do_not_panic() -> R
         });
         let output_item =
             blank_script_call_output(&server, &test, "shell_command", call_id, args).await?;
-        assert_no_matched_rules_invariant(&output_item);
+        assert_blank_script_rejected(&output_item, "shell_command", "command");
     }
 
     Ok(())
@@ -481,7 +481,7 @@ async fn unified_exec_blank_scripts_with_collaboration_mode_do_not_panic() -> Re
         });
         let output_item =
             blank_script_call_output(&server, &test, "exec_command", call_id, args).await?;
-        assert_no_matched_rules_invariant(&output_item);
+        assert_blank_script_rejected(&output_item, "exec_command", "cmd");
     }
 
     Ok(())

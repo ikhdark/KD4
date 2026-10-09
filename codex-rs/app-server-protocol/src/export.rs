@@ -483,16 +483,6 @@ fn filter_experimental_type_fields_ts_contents(
     Ok(prune_unused_type_imports(content))
 }
 
-#[cfg(test)]
-fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
-    filter_experimental_schema_with_metadata(
-        bundle,
-        &experimental_fields(),
-        &experimental_methods(),
-        &experimental_method_types(),
-    );
-    Ok(())
-}
 
 fn experimental_methods() -> HashSet<&'static str> {
     EXPERIMENTAL_CLIENT_METHODS
@@ -2286,7 +2276,6 @@ fn index_ts_entries(paths: &[&Path], has_v2_ts: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::v2;
     use crate::schema_fixtures::read_schema_fixture_subtree;
     use anyhow::Context;
     use anyhow::Result;
@@ -2768,31 +2757,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn stable_schema_filter_removes_mock_thread_start_field() -> Result<()> {
-        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
-        fs::create_dir(&output_dir)?;
-        let schema = write_json_schema_with_return::<v2::ThreadStartParams>(
-            &output_dir,
-            "ThreadStartParams",
-        )?;
-        let mut bundle = build_schema_bundle(vec![schema])?;
-        filter_experimental_schema(&mut bundle)?;
-
-        let definitions = bundle["definitions"]
-            .as_object()
-            .expect("schema bundle should include definitions");
-        let (_, def_schema) = definitions
-            .iter()
-            .find(|(name, _)| definition_matches_type(name, "ThreadStartParams"))
-            .expect("ThreadStartParams definition should exist");
-        let properties = def_schema["properties"]
-            .as_object()
-            .expect("ThreadStartParams should have properties");
-        assert_eq!(properties.contains_key("mockExperimentalField"), false);
-        let _cleanup = fs::remove_dir_all(&output_dir);
-        Ok(())
-    }
 
     #[test]
     fn build_schema_bundle_rewrites_root_helper_refs_to_namespaced_defs() -> Result<()> {
@@ -3208,20 +3172,6 @@ permissionProfile?: string | null};
         Ok(())
     }
 
-    #[test]
-    fn stable_schema_filter_removes_mock_experimental_method() -> Result<()> {
-        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
-        fs::create_dir(&output_dir)?;
-        let schema =
-            write_json_schema_with_return::<crate::ClientRequest>(&output_dir, "ClientRequest")?;
-        let mut bundle = build_schema_bundle(vec![schema])?;
-        filter_experimental_schema(&mut bundle)?;
-
-        let bundle_str = serde_json::to_string(&bundle)?;
-        assert_eq!(bundle_str.contains("mock/experimentalMethod"), false);
-        let _cleanup = fs::remove_dir_all(&output_dir);
-        Ok(())
-    }
 
     #[test]
     fn generate_json_filters_experimental_fields_and_methods() -> Result<()> {
@@ -3256,6 +3206,7 @@ permissionProfile?: string | null};
         let bundle_json =
             fs::read_to_string(output_dir.join("codex_app_server_protocol.schemas.json"))?;
         assert_eq!(bundle_json.contains("mockExperimentalField"), false);
+        assert!(!bundle_json.contains("mock/experimentalMethod"));
         assert_eq!(bundle_json.contains("additionalPermissions"), false);
         assert_eq!(bundle_json.contains("MockExperimentalMethodParams"), false);
         assert_eq!(
@@ -3265,6 +3216,7 @@ permissionProfile?: string | null};
         let flat_v2_bundle_json =
             fs::read_to_string(output_dir.join("codex_app_server_protocol.v2.schemas.json"))?;
         assert_eq!(flat_v2_bundle_json.contains("mockExperimentalField"), false);
+        assert!(!flat_v2_bundle_json.contains("mock/experimentalMethod"));
         assert_eq!(flat_v2_bundle_json.contains("additionalPermissions"), false);
         assert_eq!(
             flat_v2_bundle_json.contains("MockExperimentalMethodParams"),

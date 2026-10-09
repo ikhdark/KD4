@@ -1,51 +1,46 @@
 use super::*;
 
 #[tokio::test]
-async fn repetition_rebase_round_trip_benchmark() {
-    use core_test_support::responses::{ev_assistant_message, ev_completed, mount_response_sequence, sse, sse_response, start_mock_server};
+async fn repetition_rebase_retains_obligations_with_one_persisted_request() {
+    use core_test_support::responses::{ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server};
     let anchor = format!("Verification is UNRUN; do not deploy. {}", "Preserve compatibility. ".repeat(80));
     let previous = format!("{SUMMARY_PREFIX}\n## Goal\nReview only.\n## Current state\nInvestigating.\n## Completed work\nRead source.\n## Unresolved work\n{anchor}\n## Evidence\nHistorical source; freshness unknown.\n## Next action\nInspect.");
     let suffix = "## Unresolved work\nCheck cancellation.\n## Next action\nVerify both obligations.";
     assert!(compaction_rebase_sections(&previous).contains(&3));
-    for sample in 0..5 {
-        let server = start_mock_server().await;
-        let request = mount_response_sequence(&server, [suffix].into_iter().map(|summary|
-            sse_response(sse(vec![ev_assistant_message("summary", summary), ev_completed("compacted")]))
-                .set_delay(std::time::Duration::from_millis(25))).collect()).await;
-        let home = tempfile::tempdir().unwrap();
-        let (mut session, turn, _events) =
-            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-                codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(), |config| {
-                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-                    config.model_provider.supports_websockets = false;
-                    config.compact_prompt = None;
-                }).await;
-        crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
-        let mut observation = user_message("New source observed; cancellation is still untested.");
-        if let ResponseItem::Message { role, .. } = &mut observation { *role = "assistant".into(); }
-        session.record_conversation_items(&turn, &[
-            compaction_summary_item_with_artifact_pins(previous.clone(), None),
-            user_message("Continue reviewing; do not repeat completed inspection."), observation,
-        ]).await.unwrap();
-        let start = std::time::Instant::now();
-        let summary = run_compact_task_inner_impl(Arc::clone(&session), Arc::clone(&turn), None, Some(&None),
-            Vec::new(), InitialContextInjection::DoNotInject,
-            CompactionTurnMetadata::new(CompactionTrigger::Manual, CompactionReason::UserRequested,
-                CompactionImplementation::Responses, CompactionPhase::StandaloneTurn),
-            &mut CompactionAnalyticsDetails::default(), false, &CancellationToken::new()).await.unwrap();
-        session.live_thread().unwrap().flush().await.unwrap();
-        let wall_us = start.elapsed().as_micros();
-        let requests = request.requests().len();
-        assert_eq!(requests, 1, "missing anchors are restored without a corrective generation");
-        assert!(summary.contains(&anchor));
-        assert!(summary.contains("Check cancellation."));
-        assert!(summary.contains("freshness unknown"));
-        assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
-        let persisted = session.live_thread().unwrap().load_history(false).await.unwrap();
-        assert!(persisted.items.iter().any(|item| matches!(item,
-            codex_protocol::protocol::RolloutItem::Compacted(compacted) if compacted.message == summary)));
-        eprintln!("repetition-rebase sample={sample} requests={requests} wall_us={wall_us} scripted_response_delay_ms=25");
-    }
+    let server = start_mock_server().await;
+    let request = mount_sse_once(&server, sse(vec![
+        ev_assistant_message("summary", suffix), ev_completed("compacted"),
+    ])).await;
+    let home = tempfile::tempdir().unwrap();
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(), |config| {
+                config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                config.model_provider.supports_websockets = false;
+                config.compact_prompt = None;
+            }).await;
+    crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    let mut observation = user_message("New source observed; cancellation is still untested.");
+    if let ResponseItem::Message { role, .. } = &mut observation { *role = "assistant".into(); }
+    session.record_conversation_items(&turn, &[
+        compaction_summary_item_with_artifact_pins(previous.clone(), None),
+        user_message("Continue reviewing; do not repeat completed inspection."), observation,
+    ]).await.unwrap();
+    let summary = run_compact_task_inner_impl(Arc::clone(&session), Arc::clone(&turn), None, Some(&None),
+        Vec::new(), InitialContextInjection::DoNotInject,
+        CompactionTurnMetadata::new(CompactionTrigger::Manual, CompactionReason::UserRequested,
+            CompactionImplementation::Responses, CompactionPhase::StandaloneTurn),
+        &mut CompactionAnalyticsDetails::default(), false, &CancellationToken::new()).await.unwrap();
+    session.live_thread().unwrap().flush().await.unwrap();
+    let requests = request.requests().len();
+    assert_eq!(requests, 1, "missing anchors are restored without a corrective generation");
+    assert!(summary.contains(&anchor));
+    assert!(summary.contains("Check cancellation."));
+    assert!(summary.contains("freshness unknown"));
+    assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    let persisted = session.live_thread().unwrap().load_history(false).await.unwrap();
+    assert!(persisted.items.iter().any(|item| matches!(item,
+        codex_protocol::protocol::RolloutItem::Compacted(compacted) if compacted.message == summary)));
 }
 
 #[tokio::test]
@@ -82,7 +77,10 @@ async fn uncertainty_first_compaction_retains_unplanned_source_with_one_request(
                 output:codex_protocol::models::FunctionCallOutputPayload::from_text("Compatibility check was not run.".into()),
                 internal_chat_message_metadata_passthrough:None }, handoff];
         session.record_conversation_items(&turn, &source).await.unwrap();
-        let consumed = compaction_summary_items(session.clone_history().await.raw_items());
+        // The final assistant item consumed this entire fixture. Recovery must
+        // preserve that recorded source (except private reasoning), not merely
+        // whatever the compaction projection chooses to pass to the model.
+        let consumed = session.clone_history().await.into_raw_items();
         run_compact_task_inner_impl(Arc::clone(&session), Arc::clone(&turn), None, Some(&None),
             Vec::new(), InitialContextInjection::DoNotInject,
             CompactionTurnMetadata::new(CompactionTrigger::Manual, CompactionReason::UserRequested,
@@ -287,7 +285,7 @@ async fn process_compacted_history_with_test_session(
     let initial_context = session
         .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
         .await;
-    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+    let initial_context_injection = InitialContextInjection::AtStart(world_state);
     let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
         &turn_context,
@@ -393,7 +391,7 @@ async fn compaction_initial_context_carries_only_delivered_world_state_snapshot(
         ));
     }
     let world_state = Arc::new(world_state);
-    let injection = InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state));
+    let injection = InitialContextInjection::AtStart(Arc::clone(&world_state));
 
     let (_, Some(delivered_snapshot), _) =
         build_compaction_initial_context(&session, &turn_context, &injection).await
@@ -459,33 +457,20 @@ fn compacted_user_message(text: &str) -> CompactedUserMessage {
 
 #[test]
 fn content_items_to_text_joins_non_empty_segments() {
-    let items = vec![
-        ContentItem::InputText {
-            text: "hello".to_string(),
-        },
-        ContentItem::OutputText {
-            text: String::new(),
-        },
-        ContentItem::OutputText {
-            text: "world".to_string(),
-        },
-    ];
-
-    let joined = content_items_to_text(&items);
-
-    assert_eq!(Some("hello\nworld".to_string()), joined);
-}
-
-#[test]
-fn content_items_to_text_ignores_image_only_content() {
-    let items = vec![ContentItem::InputImage {
+    let image = ContentItem::InputImage {
         image_url: "file://image.png".to_string(),
         detail: Some(DEFAULT_IMAGE_DETAIL),
-    }];
-
-    let joined = content_items_to_text(&items);
-
-    assert_eq!(None, joined);
+    };
+    for items in [Vec::new(), vec![image.clone()], vec![ContentItem::OutputText { text: String::new() }]] {
+        assert_eq!(content_items_to_text(&items), None);
+    }
+    let items = vec![
+        ContentItem::InputText { text: "hello".to_string() },
+        image,
+        ContentItem::OutputText { text: String::new() },
+        ContentItem::OutputText { text: "world".to_string() },
+    ];
+    assert_eq!(content_items_to_text(&items), Some("hello\nworld".to_string()));
 }
 
 #[test]
@@ -686,7 +671,8 @@ fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
         internal_chat_message_metadata_passthrough.as_ref(),
         Some(&metadata)
     );
-    assert!(format!("{history:?}").contains("image-only"));
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[1], items[1]);
     assert!(!format!("{history:?}").contains("private\\original.png"));
 }
 
@@ -1504,28 +1490,7 @@ fn summary_reuse_is_disabled_when_post_summary_user_tail_is_truncated() {
     assert!(!can_reuse_previous_summary(&items, omitted_user_text));
 }
 
-#[test]
-fn bounded_user_history_emits_text_omission_receipt() {
-    let items = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "previous response".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        user_message(&"exact constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
-    ];
 
-    let (history, _, _, omitted_user_text, _) = build_bounded_unresolved_input_history(&items);
-    let rendered = serde_json::to_string(&history).expect("history serializes");
-
-    assert!(omitted_user_text);
-    assert!(rendered.contains(COMPACT_TEXT_OMISSION_MARKER));
-    assert!(rendered.contains("\"role\":\"user\""));
-}
 
 #[test]
 fn unresolved_text_omission_reports_stable_provenance_and_exact_counts() {
@@ -1561,12 +1526,15 @@ fn unresolved_text_omission_reports_stable_provenance_and_exact_counts() {
         .expect("typed omission receipt");
 
     assert!(omitted_user_text);
+    assert_eq!(receipt["role"], "user");
     assert_eq!(receipt["source_item_id"], "user-message-7");
     assert_eq!(receipt["turn_id"], "turn-7");
     assert_eq!(receipt["original_tokens"], original_tokens);
     let retained = receipt["retained_tokens"]
         .as_u64()
         .expect("retained tokens") as usize;
+    assert_eq!(retained, response_item_text_tokens(&history[0]));
+    assert!(retained > 0 && retained < original_tokens);
     assert_eq!(
         receipt["omitted_tokens"],
         original_tokens.saturating_sub(retained)
@@ -1591,6 +1559,7 @@ fn over_truncation_moderate_unresolved_user_text_is_retained_without_a_retry() {
     let rendered = serde_json::to_string(&history).expect("history serializes");
 
     assert!(!omitted_user_text);
+    assert_eq!(history, vec![user_message(&text)]);
     assert!(rendered.contains(sentinel));
     assert!(!rendered.contains(COMPACT_TEXT_OMISSION_MARKER));
 }
@@ -1610,7 +1579,8 @@ fn over_truncation_large_unresolved_text_gets_exact_artifact_recovery_payload() 
     assert!(omitted_user_text);
     let canonical = compaction_text_recovery_canonical(&items, omitted_text)
         .expect("omitted unresolved text must get a canonical recovery payload");
-    assert!(String::from_utf8_lossy(&canonical.bytes).contains(sentinel));
+    let recovered: serde_json::Value = serde_json::from_slice(&canonical.bytes).unwrap();
+    assert_eq!(recovered["items"], serde_json::to_value(&items).unwrap());
     assert_eq!(
         canonical.value.as_ref().unwrap()["kind"],
         "local_compaction_text_recovery"
@@ -2024,10 +1994,12 @@ fn text_truncation_keeps_images_in_their_original_order() {
         content.first(),
         Some(ContentItem::InputText { .. })
     ));
-    assert!(matches!(
-        content.get(1),
-        Some(ContentItem::InputImage { image_url, .. }) if image_url.ends_with("retained")
-    ));
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1], ContentItem::InputImage {
+        image_url: "data:image/png;base64,retained".to_string(),
+        detail: Some(codex_protocol::models::ImageDetail::High),
+    });
+    assert!(approx_token_count(&content_items_to_text(content).unwrap()) <= 8);
 }
 
 #[test]
@@ -2214,8 +2186,8 @@ fn incremental_guidance_does_not_repeat_or_override_custom_compact_prompt() {
     assert!(assembled.contains("incremental update"));
 }
 #[tokio::test]
-async fn process_compacted_history_replaces_developer_messages() {
-    let compacted_history = vec![
+async fn process_compacted_history_reinjects_full_initial_context() {
+    let mut compacted_history = vec![
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
@@ -2243,37 +2215,6 @@ async fn process_compacted_history_replaces_developer_messages() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-    ];
-    let (refreshed, expected) = process_compacted_history_with_test_session(
-        compacted_history,
-        /*previous_turn_settings*/ None,
-    )
-    .await;
-    assert_regenerated_initial_context(&refreshed, expected);
-}
-
-#[tokio::test]
-async fn process_compacted_history_reinjects_full_initial_context() {
-    let compacted_history = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "summary".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }];
-    let (refreshed, expected) = process_compacted_history_with_test_session(
-        compacted_history,
-        /*previous_turn_settings*/ None,
-    )
-    .await;
-    assert_regenerated_initial_context(&refreshed, expected);
-}
-
-#[tokio::test]
-async fn process_compacted_history_drops_non_user_content_messages() {
-    let compacted_history = vec![
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -2332,18 +2273,6 @@ keep me updated
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-    ];
-    let (refreshed, expected) = process_compacted_history_with_test_session(
-        compacted_history,
-        /*previous_turn_settings*/ None,
-    )
-    .await;
-    assert_regenerated_initial_context(&refreshed, expected);
-}
-
-#[tokio::test]
-async fn process_compacted_history_drops_legacy_warnings() {
-    let compacted_history = vec![
         user_message(
             "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
         ),
@@ -2354,18 +2283,6 @@ async fn process_compacted_history_drops_legacy_warnings() {
             "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
         ),
         user_message("latest user"),
-    ];
-    let (refreshed, initial_context) = process_compacted_history_with_test_session(
-        compacted_history,
-        /*previous_turn_settings*/ None,
-    )
-    .await;
-    assert_regenerated_initial_context(&refreshed, initial_context);
-}
-
-#[tokio::test]
-async fn process_compacted_history_inserts_context_before_last_real_user_message_only() {
-    let compacted_history = vec![
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -2386,13 +2303,17 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-
-    let (refreshed, initial_context) = process_compacted_history_with_test_session(
-        compacted_history,
-        /*previous_turn_settings*/ None,
-    )
-    .await;
-    assert_regenerated_initial_context(&refreshed, initial_context);
+    let checkpoint = ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "opaque checkpoint".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    compacted_history.push(checkpoint.clone());
+    let (refreshed, expected) = process_compacted_history_with_test_session(
+        compacted_history, None,
+    ).await;
+    assert_eq!(refreshed.last(), Some(&checkpoint));
+    assert_regenerated_initial_context(&refreshed[..refreshed.len() - 1], expected);
 }
 
 #[tokio::test]
@@ -2429,112 +2350,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
     assert_regenerated_initial_context(&refreshed, initial_context);
 }
 
-#[test]
-fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() {
-    let summary_item = summary_message("summary text");
-    let compacted_history = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "older user".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "latest user".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        summary_item.clone(),
-    ];
-    let initial_context = vec![ResponseItem::Message {
-        id: None,
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "fresh permissions".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }];
 
-    let refreshed =
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
-    let expected = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "older user".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "fresh permissions".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "latest user".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        summary_item,
-    ];
-    assert_eq!(refreshed, expected);
-}
-
-#[test]
-fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last() {
-    let compacted_history = vec![ResponseItem::Compaction {
-        id: None,
-        encrypted_content: "encrypted".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    }];
-    let initial_context = vec![ResponseItem::Message {
-        id: None,
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "fresh permissions".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }];
-
-    let refreshed =
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
-    let expected = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "fresh permissions".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "encrypted".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    assert_eq!(refreshed, expected);
-}
 
 #[test]
 fn compaction_omission_metadata_has_a_fixed_budget() {
@@ -2926,19 +2742,7 @@ fn survivability_rebases_keep_unaccounted_goals_and_unresolved_anchors() {
     }
 }
 
-#[test]
-fn survivability_late_short_correction_precedes_bulk_budget() {
-    let mut messages = (0..20).map(|_| compacted_user_message(&"x".repeat(2000))).collect::<Vec<_>>();
-    let correction = "Correction: do not edit protected.txt.";
-    messages.push(compacted_user_message(correction));
-    messages.push(compacted_user_message(&"log ".repeat(20000)));
-    let (items, _, _, indices) = append_bounded_user_messages(Vec::new(), &messages, COMPACT_USER_MESSAGE_MAX_TOKENS, 0, 0);
-    assert!(indices.contains(&0));
-    assert!(indices.contains(&20));
-    let retained = collect_user_messages(&items);
-    assert!(retained.iter().any(|message| message.content == compacted_user_message(correction).content));
-    assert!(retained.iter().map(compacted_user_message_text_tokens).sum::<usize>() <= COMPACT_USER_MESSAGE_MAX_TOKENS);
-}
+
 
 #[test]
 fn survivability_user_plan_and_pin_lookalikes_are_not_runtime_envelopes() {

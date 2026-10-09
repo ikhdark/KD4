@@ -153,6 +153,10 @@ async fn failed_refresh_retains_last_success_until_recovery_or_removal() {
     let path = home.path().join(DEFAULT_AGENTS_MD_FILENAME);
     fs::write(&path, "initial").expect("write initial instructions");
     let initial = provider.load_user_instructions().await;
+    assert_eq!(
+        initial,
+        expected(&home, DEFAULT_AGENTS_MD_FILENAME, "initial", Vec::new()),
+    );
 
     fs::remove_file(&path).expect("remove initial file");
     create_symlink_loop(&path);

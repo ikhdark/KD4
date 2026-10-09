@@ -239,7 +239,7 @@ Messages may target your full agent path, such as `/root/...`.
 "#;
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "agents";
 const LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
-const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` as direct collaboration tool calls, not from inside `functions.exec`. Follow each tool's current schema for targets and parameters.
+const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` through their currently advertised tool entrypoints. Tools exposed under the `tools` namespace inside `functions.exec` may be called there; direct-only tools must be called directly. Use tool discovery when an entrypoint is missing, and follow each tool's current schema for targets and parameters. A missing direct entrypoint is not a blocker when the tool is available inside `functions.exec`.
 
 All agents share the same working directory and filesystem:
 - edits are visible immediately to every agent;
@@ -1952,7 +1952,12 @@ pub(crate) fn set_project_trust_level_inner(
             .and_then(|i| i.as_table())
             .is_none();
     if needs_proj_table {
-        projects_tbl.insert(project_key.as_str(), toml_edit::table());
+        let project_table = projects_tbl
+            .get(project_key.as_str())
+            .and_then(|item| item.as_inline_table())
+            .map(|table| table.clone().into_table())
+            .unwrap_or_default();
+        projects_tbl.insert(project_key.as_str(), toml_edit::Item::Table(project_table));
     }
     let Some(proj_tbl) = projects_tbl
         .get_mut(project_key.as_str())

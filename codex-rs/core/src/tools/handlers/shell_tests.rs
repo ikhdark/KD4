@@ -212,6 +212,8 @@ mod pure {
 
         assert!(first.is_some());
         assert_eq!(first, repeated);
+        let changed = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"modified\n"));
+        assert_ne!(first, changed, "different canonical bytes must change the evidence");
     }
 
     #[test]
@@ -616,6 +618,27 @@ async fn shell_command_validation_deadline_defaults_preserve_explicit_overrides(
     for (command, timeout, expected) in [
         ("cargo test -p example", None, 300_000),
         ("pnpm build", None, 300_000),
+        // These are the repository's documented Rust validation entrypoints.
+        (
+            "python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib",
+            None,
+            300_000,
+        ),
+        (
+            "just --set rust_validation_wait_seconds 5 core-gate multi-session-transport",
+            None,
+            300_000,
+        ),
+        (
+            "echo python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib",
+            None,
+            10_000,
+        ),
+        (
+            "python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib",
+            Some(1_234),
+            1_234,
+        ),
         ("echo cargo test", None, 10_000),
         ("cargo test", Some(1_234), 1_234),
         ("cargo test", Some(0), 0),
@@ -758,6 +781,7 @@ fn shell_command_handler_respects_explicit_login_flag() {
             .derive_exec_args("echo login shell", /*use_login_shell*/ true)
             .expect("PowerShell args")
     );
+    assert!(!login_command.iter().any(|arg| arg == "-NoProfile"));
 
     let non_login_command = ShellCommandHandler::base_command(
         &shell,
@@ -770,6 +794,7 @@ fn shell_command_handler_respects_explicit_login_flag() {
             .derive_exec_args("echo non login shell", /*use_login_shell*/ false)
             .expect("PowerShell args")
     );
+    assert!(non_login_command.iter().any(|arg| arg == "-NoProfile"));
 }
 
 #[tokio::test]
@@ -1296,10 +1321,6 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
 #[tokio::test]
 async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
     shell_command_output_budget_case(256, None).await;
-}
-
-#[tokio::test]
-async fn shell_command_caller_budget_retains_exact_output() {
     for budget in [0, 500, 1000] {
         shell_command_output_budget_case(80_000, Some(budget)).await;
     }

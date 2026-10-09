@@ -651,53 +651,21 @@ mod tests {
     }
 
     #[test]
-    fn feedback_view_bad_result() {
-        let view = make_view(FeedbackCategory::BadResult);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_bad_result", rendered);
-    }
-
-    #[test]
-    fn feedback_view_good_result() {
-        let view = make_view(FeedbackCategory::GoodResult);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_good_result", rendered);
-    }
-
-    #[test]
-    fn feedback_view_bug() {
-        let view = make_view(FeedbackCategory::Bug);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_bug", rendered);
-    }
-
-    #[test]
-    fn feedback_view_other() {
-        let view = make_view(FeedbackCategory::Other);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_other", rendered);
-    }
-
-    #[test]
-    fn feedback_view_safety_check() {
-        let view = make_view(FeedbackCategory::SafetyCheck);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_safety_check", rendered);
-    }
-
-    #[test]
-    fn feedback_view_without_logs() {
-        let (tx_raw, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let view = FeedbackNoteView::new(
-            FeedbackCategory::Bug,
-            /*turn_id*/ None,
-            tx,
-            /*include_logs*/ false,
-        );
-        let rendered = render(&view, /*width*/ 60);
-
-        insta::assert_snapshot!("feedback_view_with_connectivity_diagnostics", rendered);
+    fn feedback_note_category_snapshots() {
+        for (category, include_logs, name) in [
+            (FeedbackCategory::BadResult, true, "feedback_view_bad_result"),
+            (FeedbackCategory::GoodResult, true, "feedback_view_good_result"),
+            (FeedbackCategory::Bug, true, "feedback_view_bug"),
+            (FeedbackCategory::Other, true, "feedback_view_other"),
+            (FeedbackCategory::SafetyCheck, true, "feedback_view_safety_check"),
+            // Preserve the existing snapshot identity for the no-logs note.
+            (FeedbackCategory::Bug, false, "feedback_view_with_connectivity_diagnostics"),
+        ] {
+            let mut view = make_view(category);
+            view.include_logs = include_logs;
+            let rendered = render(&view, /*width*/ 60);
+            insta::assert_snapshot!(name, rendered);
+        }
     }
 
     #[test]
@@ -773,55 +741,38 @@ mod tests {
     }
 
     #[test]
-    fn submit_feedback_emits_submit_event_with_trimmed_note() {
-        let (tx_raw, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut view = FeedbackNoteView::new(
-            FeedbackCategory::Bug,
-            Some("turn-123".to_string()),
-            tx,
-            /*include_logs*/ true,
-        );
-        view.textarea.insert_str("  something broke  ");
-
-        view.submit();
-
-        let event = rx.try_recv().expect("submit feedback event");
-        assert!(matches!(
-            event,
-            AppEvent::SubmitFeedback {
-                category: FeedbackCategory::Bug,
-                reason: Some(reason),
-                turn_id: Some(turn_id),
-                include_logs: true,
-            } if reason == "something broke" && turn_id == "turn-123"
-        ));
-        assert_eq!(view.is_complete(), true);
-    }
-
-    #[test]
-    fn submit_feedback_omits_empty_note() {
-        let (tx_raw, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut view = FeedbackNoteView::new(
-            FeedbackCategory::GoodResult,
-            /*turn_id*/ None,
-            tx,
-            /*include_logs*/ false,
-        );
-
-        view.submit();
-
-        let event = rx.try_recv().expect("submit feedback event");
-        assert!(matches!(
-            event,
-            AppEvent::SubmitFeedback {
-                category: FeedbackCategory::GoodResult,
-                reason: None,
-                turn_id: None,
-                include_logs: false,
+    fn enter_submits_trimmed_optional_note_and_preserves_feedback_options() {
+        for (category, turn_id, include_logs, note, expected_reason) in [
+            (FeedbackCategory::Bug, Some("turn-123"), true, "  something broke  ", Some("something broke")),
+            (FeedbackCategory::GoodResult, None, false, "", None),
+            (FeedbackCategory::GoodResult, None, false, " \n\t ", None),
+        ] {
+            let (tx_raw, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+            let mut view = FeedbackNoteView::new(
+                category,
+                turn_id.map(str::to_string),
+                AppEventSender::new(tx_raw),
+                include_logs,
+            );
+            view.textarea.insert_str(note);
+            view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            match rx.try_recv().expect("submit feedback event") {
+                AppEvent::SubmitFeedback {
+                    category: actual_category,
+                    reason,
+                    turn_id: actual_turn_id,
+                    include_logs: actual_include_logs,
+                } => {
+                    assert_eq!(actual_category, category);
+                    assert_eq!(reason.as_deref(), expected_reason);
+                    assert_eq!(actual_turn_id.as_deref(), turn_id);
+                    assert_eq!(actual_include_logs, include_logs);
+                }
+                event => panic!("unexpected event: {event:?}"),
             }
-        ));
+            assert!(view.is_complete());
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -850,48 +801,25 @@ mod tests {
     }
 
     #[test]
-    fn issue_url_available_for_bug_bad_result_safety_check_and_other() {
-        let bug_url = issue_url_for_category(
+    fn issue_urls_match_category_and_audience() {
+        for category in [
             FeedbackCategory::Bug,
-            "thread-1",
-            FeedbackAudience::OpenAiEmployee,
-        );
-        let expected_slack_url = "http://go/codex-feedback-internal".to_string();
-        assert_eq!(bug_url.as_deref(), Some(expected_slack_url.as_str()));
-
-        let bad_result_url = issue_url_for_category(
             FeedbackCategory::BadResult,
-            "thread-2",
-            FeedbackAudience::OpenAiEmployee,
-        );
-        assert!(bad_result_url.is_some());
-
-        let other_url = issue_url_for_category(
             FeedbackCategory::Other,
-            "thread-3",
-            FeedbackAudience::OpenAiEmployee,
-        );
-        assert!(other_url.is_some());
-
-        let safety_check_url = issue_url_for_category(
             FeedbackCategory::SafetyCheck,
-            "thread-4",
-            FeedbackAudience::OpenAiEmployee,
-        );
-        assert!(safety_check_url.is_some());
-
-        assert!(
-            issue_url_for_category(
-                FeedbackCategory::GoodResult,
-                "t",
-                FeedbackAudience::OpenAiEmployee
-            )
-            .is_none()
-        );
-        let bug_url_non_employee =
-            issue_url_for_category(FeedbackCategory::Bug, "t", FeedbackAudience::External);
-        let expected_external_url = "https://github.com/openai/codex/issues/new?template=3-cli.yml&steps=Uploaded%20thread:%20t";
-        assert_eq!(bug_url_non_employee.as_deref(), Some(expected_external_url));
+            FeedbackCategory::GoodResult,
+        ] {
+            for (audience, expected_url) in [
+                (FeedbackAudience::OpenAiEmployee, "http://go/codex-feedback-internal"),
+                (FeedbackAudience::External, "https://github.com/openai/codex/issues/new?template=3-cli.yml&steps=Uploaded%20thread:%20t"),
+            ] {
+                assert_eq!(
+                    issue_url_for_category(category, "t", audience).as_deref(),
+                    (category != FeedbackCategory::GoodResult).then_some(expected_url),
+                    "{category:?}, {audience:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -961,8 +889,10 @@ mod tests {
                 ),
                 /*width*/ 120,
             );
-            assert!(rendered.contains("Please open an issue using the following URL:"));
-            assert!(rendered.contains("thread-4"));
+            assert_eq!(
+                rendered,
+                "• Feedback recorded (no logs). Please open an issue using the following URL:\n\n  https://github.com/openai/codex/issues/new?template=3-cli.yml&steps=Uploaded%20thread:%20thread-4\n\n  Or mention your thread ID thread-4 in an existing issue."
+            );
         }
     }
 }

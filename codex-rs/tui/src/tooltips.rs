@@ -302,24 +302,20 @@ mod tests {
     use rand::rngs::StdRng;
 
     #[test]
-    fn random_tooltip_returns_some_tip_when_available() {
-        let mut rng = StdRng::seed_from_u64(42);
+    fn random_tooltip_selects_from_pool_reproducibly() {
         assert_eq!(
             ALL_TOOLTIPS.len(),
             TOOLTIPS.len() + experimental_tooltips().len()
         );
-        assert!(pick_tooltip(&mut rng).is_some());
-    }
-
-    #[test]
-    fn random_tooltip_is_reproducible_with_seed() {
-        let expected = {
-            let mut rng = StdRng::seed_from_u64(7);
-            pick_tooltip(&mut rng)
-        };
-
-        let mut rng = StdRng::seed_from_u64(7);
-        assert_eq!(expected, pick_tooltip(&mut rng));
+        for seed in [7, 42] {
+            let mut first = StdRng::seed_from_u64(seed);
+            let mut second = StdRng::seed_from_u64(seed);
+            for _ in 0..8 {
+                let tip = pick_tooltip(&mut first).expect("available tooltip");
+                assert!(ALL_TOOLTIPS.contains(&tip));
+                assert_eq!(Some(tip), pick_tooltip(&mut second));
+            }
+        }
     }
 
     #[test]

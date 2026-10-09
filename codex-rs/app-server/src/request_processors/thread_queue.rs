@@ -676,51 +676,23 @@ mod tests {
     fn thread_queue_preserves_input_and_deduplicates_client_retries() {
         let mut queue = Queue::default();
         let first = add(&mut queue, "first");
-        assert_eq!(add(&mut queue, "first"), first);
-        assert_eq!(queue.submissions.len(), 1);
-        assert!(
-            queue
-                .add(ThreadQueueAddParams {
-                    thread_id: "unused".to_string(),
-                    client_user_message_id: Some("first".to_string()),
-                    input: input("different"),
-                })
-                .is_err()
-        );
-        assert_eq!(queue.submissions, vec![first]);
-    }
-
-    #[test]
-    fn consumed_submission_retry_preserves_identity_and_rejects_different_input() {
-        let mut queue = Queue::default();
-        let first = add(&mut queue, "first");
+        let params = ThreadQueueAddParams {
+            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
+        };
+        let (retry, changed) = queue.add(params.clone()).unwrap();
+        assert_eq!(retry, first);
+        assert!(!changed);
+        assert!(queue.add(ThreadQueueAddParams { input: input("different"), ..params.clone() }).is_err());
+        assert_eq!(queue.submissions, vec![first.clone()]);
         queue.accepted.push(AcceptedSubmission {
             submission: queue.submissions.remove(0), turn_id: "accepted-turn".into(),
         });
         let mut restored: Queue = serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
-        let params = ThreadQueueAddParams {
-            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
-        };
         let (retry, changed) = restored.add(params.clone()).unwrap();
         assert_eq!(retry, first);
         assert!(!changed);
         assert!(restored.submissions.is_empty());
         assert!(restored.add(ThreadQueueAddParams { input: input("different"), ..params }).is_err());
-    }
-
-    #[test]
-    fn queue_noops_preserve_pagination_revision() {
-        let mut queue = Queue::default();
-        let first = add(&mut queue, "first");
-        add(&mut queue, "second");
-        let mut params = ThreadQueueListParams { thread_id: "unused".into(), cursor: None, limit: Some(1) };
-        params.cursor = queue.page(&params).unwrap().next_cursor;
-        let (_, changed) = queue.add(ThreadQueueAddParams {
-            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
-        }).unwrap();
-        assert!(!changed);
-        assert!(!queue.reorder(&[first.id]).unwrap());
-        assert!(queue.page(&params).is_ok());
     }
 
     #[test]
@@ -756,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_queue_pagination_rejects_stale_and_invalid_cursors() {
+    fn thread_queue_pagination_accepts_noops_and_rejects_stale_or_invalid_cursors() {
         let mut queue = Queue::default();
         let first = add(&mut queue, "first");
         let second = add(&mut queue, "second");
@@ -766,15 +738,23 @@ mod tests {
             limit: Some(1),
         };
         let page = queue.page(&params).expect("first page");
-        assert_eq!(page.data, vec![first]);
+        assert_eq!(page.data, vec![first.clone()]);
         params.cursor = page.next_cursor;
+        assert_eq!(params.cursor.as_deref(), Some("0:1"));
+        let (_, changed) = queue.add(ThreadQueueAddParams {
+            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
+        }).unwrap();
+        assert!(!changed);
+        assert!(!queue.reorder(&[first.id]).unwrap());
         let page = queue.page(&params).expect("last page");
         assert_eq!(page.data, vec![second]);
         assert_eq!(page.next_cursor, None);
         queue.revision += 1;
         assert!(queue.page(&params).is_err());
-        params.cursor = Some("garbage".to_string());
-        assert!(queue.page(&params).is_err());
+        for cursor in ["garbage", "x:1", "1:x", "1:3"] {
+            params.cursor = Some(cursor.to_string());
+            assert!(queue.page(&params).is_err(), "cursor={cursor}");
+        }
     }
 
     #[test]

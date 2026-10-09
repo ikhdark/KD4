@@ -1927,32 +1927,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_message_without_overrides_uses_durable_task_capsule() {
-        let args = spawn_args();
-        assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
-            Ok(Some(SpawnAgentForkMode::TaskCapsule))
-        ));
-    }
-
-    #[test]
-    fn legacy_message_with_model_override_uses_durable_task_capsule() {
-        let mut args = spawn_args();
-        args.model = Some("child-model".to_string());
-        assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
-            Ok(Some(SpawnAgentForkMode::TaskCapsule))
-        ));
-    }
-
-    #[test]
-    fn legacy_explicit_none_uses_durable_task_capsule() {
-        let mut args = spawn_args();
-        args.fork_turns = Some("none".to_string());
-        assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
-            Ok(Some(SpawnAgentForkMode::TaskCapsule))
-        ));
+    fn worker_default_fork_modes_use_durable_task_capsule() {
+        for typed in [false, true] {
+            for model in [None, Some("child-model")] {
+                for fork_turns in [None, Some("none"), Some(" NoNe "), Some(" ")] {
+                    let mut args = spawn_args();
+                    if typed {
+                        args.message = None;
+                        args.assignment = Some(typed_assignment());
+                        args.agent_type = Some("worker".to_string());
+                    }
+                    args.model = model.map(str::to_string);
+                    args.fork_turns = fork_turns.map(str::to_string);
+                    assert!(matches!(
+                        args.fork_mode(AgentRole::Worker, false),
+                        Ok(Some(SpawnAgentForkMode::TaskCapsule))
+                    ), "typed={typed}, model={model:?}, fork_turns={fork_turns:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1986,31 +1979,6 @@ mod tests {
                     && message.contains("configured limit 5")
                     && message.contains("none")
                     && message.contains("1 through 5")
-        ));
-    }
-
-    #[test]
-    fn typed_worker_omitted_fork_turns_selects_task_capsule() {
-        let mut args = spawn_args();
-        args.message = None;
-        args.assignment = Some(typed_assignment());
-        args.agent_type = Some("worker".to_string());
-        assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
-            Ok(Some(SpawnAgentForkMode::TaskCapsule))
-        ));
-    }
-
-    #[test]
-    fn typed_worker_explicit_none_selects_task_capsule() {
-        let mut args = spawn_args();
-        args.message = None;
-        args.assignment = Some(typed_assignment());
-        args.agent_type = Some("worker".to_string());
-        args.fork_turns = Some("none".to_string());
-        assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
-            Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }
 

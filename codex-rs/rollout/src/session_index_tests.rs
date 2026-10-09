@@ -500,14 +500,18 @@ async fn find_thread_meta_by_name_str_ignores_historical_name_after_rename() -> 
         .join(format!("rollout-2024-01-01T00-00-00-{current_id}.jsonl"));
     std::fs::create_dir_all(current_rollout_path.parent().expect("rollout parent"))?;
     write_rollout_with_metadata(&current_rollout_path, current_id)?;
+    let renamed_rollout_path = current_rollout_path.with_file_name(
+        format!("rollout-2024-01-01T00-00-01-{renamed_id}.jsonl"),
+    );
+    write_rollout_with_metadata(&renamed_rollout_path, renamed_id)?;
     let lines = vec![
         SessionIndexEntry {
-            id: renamed_id,
+            id: current_id,
             thread_name: "same".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
         },
         SessionIndexEntry {
-            id: current_id,
+            id: renamed_id,
             thread_name: "same".to_string(),
             updated_at: "2024-01-02T00:00:00Z".to_string(),
         },

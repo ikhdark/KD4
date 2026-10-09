@@ -1370,78 +1370,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_run_analytics_payload_uses_completed_turn_id() {
+    async fn hook_run_analytics_payload_resolves_completed_or_current_turn_id() {
         let (_session, turn_context) = make_session_and_context().await;
-        let completed = HookCompletedEvent {
-            turn_id: Some("turn-from-hook".to_string()),
-            run: sample_hook_run(HookRunStatus::Blocked, HookSource::Project),
-        };
-
-        let (tracking, hook) =
-            hook_run_analytics_payload("thread-123".to_string(), &turn_context, &completed);
-
-        assert_eq!(tracking.thread_id, "thread-123");
-        assert_eq!(tracking.turn_id, "turn-from-hook");
-        assert_eq!(tracking.model_slug, turn_context.model_info.slug);
-        assert_eq!(hook.event_name, HookEventName::Stop);
-        assert_eq!(hook.hook_source, HookSource::Project);
-        assert_eq!(hook.status, HookRunStatus::Blocked);
-    }
-
-    #[tokio::test]
-    async fn hook_run_analytics_payload_falls_back_to_turn_context_id() {
-        let (_session, turn_context) = make_session_and_context().await;
-        let completed = HookCompletedEvent {
-            turn_id: None,
-            run: sample_hook_run(HookRunStatus::Failed, HookSource::Unknown),
-        };
-
-        let (tracking, hook) =
-            hook_run_analytics_payload("thread-123".to_string(), &turn_context, &completed);
-
-        assert_eq!(tracking.turn_id, turn_context.sub_id);
-        assert_eq!(hook.hook_source, HookSource::Unknown);
-        assert_eq!(hook.status, HookRunStatus::Failed);
+        for (turn_id, status, source) in [
+            (Some("turn-from-hook"), HookRunStatus::Blocked, HookSource::Project),
+            (None, HookRunStatus::Failed, HookSource::Unknown),
+        ] {
+            let completed = HookCompletedEvent {
+                turn_id: turn_id.map(str::to_string),
+                run: sample_hook_run(status, source),
+            };
+            let (tracking, hook) =
+                hook_run_analytics_payload("thread-123".to_string(), &turn_context, &completed);
+            assert_eq!(tracking.thread_id, "thread-123");
+            assert_eq!(tracking.turn_id, turn_id.unwrap_or(&turn_context.sub_id));
+            assert_eq!(tracking.model_slug, turn_context.model_info.slug);
+            assert_eq!(hook.event_name, HookEventName::Stop);
+            assert_eq!(hook.hook_source, source);
+            assert_eq!(hook.status, status);
+        }
     }
 
     #[test]
     fn hook_run_metric_tags_match_analytics_shape() {
-        let run = sample_hook_run(HookRunStatus::Blocked, HookSource::Project);
-
-        assert_eq!(
-            hook_run_metric_tags(&run),
-            [
-                ("hook_name", "Stop"),
-                ("source", "project"),
-                ("status", "blocked"),
-            ]
-        );
-
-        let cloud_requirements =
-            sample_hook_run(HookRunStatus::Blocked, HookSource::CloudRequirements);
-
-        assert_eq!(
-            hook_run_metric_tags(&cloud_requirements),
-            [
-                ("hook_name", "Stop"),
-                ("source", "cloud_requirements"),
-                ("status", "blocked"),
-            ]
-        );
-    }
-
-    #[test]
-    fn hook_run_metric_tags_include_expanded_hook_sources() {
-        let run = sample_hook_run(HookRunStatus::Completed, HookSource::LegacyManagedConfigMdm);
-
-        assert_eq!(
-            hook_run_metric_tags(&run),
-            [
-                ("hook_name", "Stop"),
-                ("source", "legacy_managed_config_mdm"),
-                ("status", "completed"),
-            ]
-        );
+        for (status, source, status_label, source_label) in [
+            (HookRunStatus::Blocked, HookSource::Project, "blocked", "project"),
+            (HookRunStatus::Blocked, HookSource::CloudRequirements, "blocked", "cloud_requirements"),
+            (HookRunStatus::Completed, HookSource::LegacyManagedConfigMdm, "completed", "legacy_managed_config_mdm"),
+            (HookRunStatus::Running, HookSource::Unknown, "running", "unknown"),
+            (HookRunStatus::Failed, HookSource::Project, "failed", "project"),
+            (HookRunStatus::Stopped, HookSource::Project, "stopped", "project"),
+        ] {
+            assert_eq!(
+                hook_run_metric_tags(&sample_hook_run(status, source)),
+                [("hook_name", "Stop"), ("source", source_label), ("status", status_label)]
+            );
+        }
     }
 
     fn sample_hook_run(status: HookRunStatus, source: HookSource) -> HookRunSummary {

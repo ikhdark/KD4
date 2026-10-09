@@ -594,11 +594,12 @@ pub struct LineMarkedTruncation {
 }
 
 impl LineMarkedTruncation {
-    /// The first marked run, bounded like [`first_omitted_line_range`].
+    /// The complete first marked run. These coordinates are already known,
+    /// unlike the bounded alignment inferred by [`first_omitted_line_range`].
+    /// The recovery reader bounds delivery and supplies continuation; clipping
+    /// the known range here would discard the rest of its recovery scope.
     pub fn first_omitted_line_range(&self) -> Option<(usize, usize)> {
-        self.omitted_lines
-            .first()
-            .map(|&(start, end)| (start, end.min(start + OMITTED_RANGE_MAX_LINES - 1)))
+        self.omitted_lines.first().copied()
     }
 }
 
@@ -715,9 +716,20 @@ fn validation_invocation(mut words: &[&str]) -> bool {
                 )
             }
             ("rustc" | "pytest" | "vitest" | "tsc" | "eslint" | "ruff" | "mypy", _) => true,
-            ("python" | "python3" | "py", ["-m", "unittest" | "pytest", ..]) => true,
-            ("python" | "python3" | "py", [script, ..]) => {
-                script.rsplit(['/', '\\']).next() == Some("rust_test_runner.py")
+            ("python" | "python3" | "py", args) => {
+                // The repository runner is invoked with Python's isolated and
+                // no-bytecode flags. They do not change which script runs.
+                let first = args
+                    .iter()
+                    .position(|arg| !matches!(*arg, "-i" | "-b"))
+                    .unwrap_or(args.len());
+                match &args[first..] {
+                    ["-m", "unittest" | "pytest", ..] => true,
+                    [script, ..] => {
+                        script.rsplit(['/', '\\']).next() == Some("rust_test_runner.py")
+                    }
+                    _ => false,
+                }
             }
             ("just", args) => just_validation_invocation(args),
             ("npm" | "pnpm" | "yarn", ["test" | "build" | "lint" | "typecheck", ..])
@@ -752,6 +764,12 @@ fn just_validation_invocation(mut args: &[&str]) -> bool {
                 }
             }
             "-q" | "--quiet" | "-v" | "--verbose" | "--no-dotenv" => args = rest,
+            "--set" => {
+                let [_, _, remaining @ ..] = rest else {
+                    return false;
+                };
+                args = remaining;
+            }
             value
                 if value.starts_with("--justfile=")
                     || value.starts_with("--working-directory=") =>

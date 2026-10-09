@@ -808,15 +808,21 @@ def analyze(path):
 
 
 def bounded(s, limit=OUT_LIMIT):
+    if limit < 0:
+        raise ValueError("output limit must be nonnegative")
     if len(s) <= limit:
         return s
-    head = s[: int(limit * 0.75)]
-    tail = s[-int(limit * 0.25) :]
+    head_length = limit * 3 // 4
+    tail_length = limit - head_length
+    head = s[:head_length]
+    tail = s[-tail_length:] if tail_length else ""
     return f"{head}\n...[{len(s) - limit} chars omitted]...\n{tail}"
 
 
 def dump_narrative(path, out_path, start_idx=0):
     output_limit = int(os.environ.get("NARR_OUT_LIMIT", OUT_LIMIT))
+    if output_limit < 0:
+        raise ValueError("NARR_OUT_LIMIT must be nonnegative")
     rows = [row for row, _ in read_rollout_records(Path(path))]
     with open(out_path, "w", encoding="utf-8") as w:
         P = lambda *a: print(*a, file=w)

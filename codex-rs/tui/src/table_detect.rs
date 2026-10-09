@@ -278,32 +278,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_table_segments_basic() {
-        assert_eq!(
-            parse_table_segments("| A | B | C |"),
-            Some(vec!["A", "B", "C"])
-        );
-    }
-
-    #[test]
-    fn parse_table_segments_no_outer_pipes() {
-        assert_eq!(parse_table_segments("A | B | C"), Some(vec!["A", "B", "C"]));
-    }
-
-    #[test]
-    fn parse_table_segments_no_leading_pipe() {
-        assert_eq!(
-            parse_table_segments("A | B | C |"),
-            Some(vec!["A", "B", "C"])
-        );
-    }
-
-    #[test]
-    fn parse_table_segments_no_trailing_pipe() {
-        assert_eq!(
-            parse_table_segments("| A | B | C"),
-            Some(vec!["A", "B", "C"])
-        );
+    fn parse_table_segments_accepts_optional_outer_pipes() {
+        for line in ["| A | B | C |", "A | B | C", "A | B | C |", "| A | B | C"] {
+            assert_eq!(parse_table_segments(line), Some(vec!["A", "B", "C"]), "{line:?}");
+        }
     }
 
     #[test]
@@ -313,13 +291,9 @@ mod tests {
 
     #[test]
     fn parse_table_segments_without_pipe_returns_none() {
-        assert_eq!(parse_table_segments("just text"), None);
-    }
-
-    #[test]
-    fn parse_table_segments_empty_returns_none() {
-        assert_eq!(parse_table_segments(""), None);
-        assert_eq!(parse_table_segments("   "), None);
+        for line in ["just text", "", "   "] {
+            assert_eq!(parse_table_segments(line), None, "{line:?}");
+        }
     }
 
     #[test]
@@ -332,16 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn is_table_delimiter_segment_valid() {
+    fn is_table_delimiter_segment_accepts_only_alignment_markers() {
         assert!(is_table_delimiter_segment("---"));
         assert!(is_table_delimiter_segment(":---"));
         assert!(is_table_delimiter_segment("---:"));
         assert!(is_table_delimiter_segment(":---:"));
         assert!(is_table_delimiter_segment(":-------:"));
-    }
-
-    #[test]
-    fn is_table_delimiter_segment_invalid() {
         assert!(!is_table_delimiter_segment(""));
         assert!(!is_table_delimiter_segment(":"));
         assert!(!is_table_delimiter_segment("abc"));
@@ -349,26 +319,19 @@ mod tests {
     }
 
     #[test]
-    fn is_table_delimiter_line_valid() {
+    fn is_table_delimiter_line_requires_every_cell_to_be_an_alignment_marker() {
         assert!(is_table_delimiter_line("| --- | --- |"));
         assert!(is_table_delimiter_line("|:---:|---:|"));
         assert!(is_table_delimiter_line("--- | --- | ---"));
-    }
-
-    #[test]
-    fn is_table_delimiter_line_invalid() {
         assert!(!is_table_delimiter_line("| A | B |"));
         assert!(!is_table_delimiter_line("| : | :: |"));
+        assert!(!is_table_delimiter_line("| --- | B |"));
     }
 
     #[test]
-    fn is_table_header_line_valid() {
+    fn is_table_header_line_requires_a_nonempty_cell() {
         assert!(is_table_header_line("| A | B |"));
         assert!(is_table_header_line("Name | Value"));
-    }
-
-    #[test]
-    fn is_table_header_line_all_empty_segments() {
         assert!(!is_table_header_line("| | |"));
     }
 
@@ -377,51 +340,22 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn fence_tracker_outside_by_default() {
-        let tracker = FenceTracker::new();
-        assert_eq!(tracker.kind(), FenceKind::Outside);
-    }
-
-    #[test]
-    fn fence_tracker_opens_and_closes_backtick_fence() {
-        let mut tracker = FenceTracker::new();
-        tracker.advance("```rust");
-        assert_eq!(tracker.kind(), FenceKind::Other);
-
-        tracker.advance("let x = 1;");
-        assert_eq!(tracker.kind(), FenceKind::Other);
-
-        tracker.advance("```");
-        assert_eq!(tracker.kind(), FenceKind::Outside);
-    }
-
-    #[test]
-    fn fence_tracker_opens_and_closes_tilde_fence() {
-        let mut tracker = FenceTracker::new();
-        tracker.advance("~~~python");
-        assert_eq!(tracker.kind(), FenceKind::Other);
-        tracker.advance("~~~");
-        assert_eq!(tracker.kind(), FenceKind::Outside);
-    }
-
-    #[test]
-    fn fence_tracker_markdown_fence() {
-        let mut tracker = FenceTracker::new();
-        tracker.advance("```md");
-        assert_eq!(tracker.kind(), FenceKind::Markdown);
-        tracker.advance("| A | B |");
-        assert_eq!(tracker.kind(), FenceKind::Markdown);
-        tracker.advance("```");
-        assert_eq!(tracker.kind(), FenceKind::Outside);
-    }
-
-    #[test]
-    fn fence_tracker_markdown_case_insensitive() {
-        let mut tracker = FenceTracker::new();
-        tracker.advance("```Markdown");
-        assert_eq!(tracker.kind(), FenceKind::Markdown);
-        tracker.advance("```");
-        assert_eq!(tracker.kind(), FenceKind::Outside);
+    fn fence_tracker_opens_preserves_and_closes_each_fence_kind() {
+        for (open, body, close, kind) in [
+            ("```rust", "let x = 1;", "```", FenceKind::Other),
+            ("~~~python", "pass", "~~~", FenceKind::Other),
+            ("```md", "| A | B |", "```", FenceKind::Markdown),
+            ("```Markdown", "| A | B |", "```", FenceKind::Markdown),
+        ] {
+            let mut tracker = FenceTracker::new();
+            assert_eq!(tracker.kind(), FenceKind::Outside);
+            tracker.advance(open);
+            assert_eq!(tracker.kind(), kind, "{open}");
+            tracker.advance(body);
+            assert_eq!(tracker.kind(), kind, "{open}");
+            tracker.advance(close);
+            assert_eq!(tracker.kind(), FenceKind::Outside, "{open}");
+        }
     }
 
     #[test]
@@ -482,24 +416,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_fence_marker_backtick() {
+    fn parse_fence_marker_requires_at_least_three_matching_markers() {
         assert_eq!(parse_fence_marker("```rust"), Some(('`', 3)));
         assert_eq!(parse_fence_marker("````"), Some(('`', 4)));
-    }
-
-    #[test]
-    fn parse_fence_marker_tilde() {
         assert_eq!(parse_fence_marker("~~~python"), Some(('~', 3)));
-    }
-
-    #[test]
-    fn parse_fence_marker_too_short() {
         assert_eq!(parse_fence_marker("``"), None);
         assert_eq!(parse_fence_marker("~~"), None);
-    }
-
-    #[test]
-    fn parse_fence_marker_not_fence() {
         assert_eq!(parse_fence_marker("hello"), None);
         assert_eq!(parse_fence_marker(""), None);
     }

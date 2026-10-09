@@ -502,22 +502,35 @@ mod tests {
     }
 
     #[test]
-    fn block_decision_without_reason_is_invalid() {
-        let parsed = parse_completed(
-            &handler(),
-            run_result(Some(0), r#"{"decision":"block"}"#, ""),
-            Some("turn-1".to_string()),
-        );
-
-        assert_eq!(parsed.data, StopHandlerData::default());
-        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "Stop hook returned decision:block without a non-empty reason".to_string(),
-            }]
-        );
+    fn block_decision_requires_a_nonempty_reason() {
+        for (event_name, label) in [
+            (HookEventName::Stop, "Stop"),
+            (HookEventName::SubagentStop, "SubagentStop"),
+        ] {
+            let mut handler = handler();
+            handler.event_name = event_name;
+            for stdout in [
+                r#"{"decision":"block"}"#,
+                r#"{"decision":"block","reason":""}"#,
+                r#"{"decision":"block","reason":"   "}"#,
+                r#"{"decision":"block","reason":null}"#,
+            ] {
+                let parsed = parse_completed(
+                    &handler,
+                    run_result(Some(0), stdout, ""),
+                    Some("turn-1".to_string()),
+                );
+                assert_eq!(parsed.data, StopHandlerData::default());
+                assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+                assert_eq!(
+                    parsed.completed.run.entries,
+                    vec![HookOutputEntry {
+                        kind: HookOutputEntryKind::Error,
+                        text: format!("{label} hook returned decision:block without a non-empty reason"),
+                    }]
+                );
+            }
+        }
     }
 
     #[test]
@@ -590,24 +603,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn block_decision_with_blank_reason_fails_instead_of_blocking() {
-        let parsed = parse_completed(
-            &handler(),
-            run_result(Some(0), "{\"decision\":\"block\",\"reason\":\"   \"}", ""),
-            Some("turn-1".to_string()),
-        );
 
-        assert_eq!(parsed.data, StopHandlerData::default());
-        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "Stop hook returned decision:block without a non-empty reason".to_string(),
-            }]
-        );
-    }
 
     #[test]
     fn invalid_stdout_fails_instead_of_silently_nooping() {

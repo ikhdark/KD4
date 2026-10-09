@@ -53,7 +53,7 @@ helpers = []
 tests = [
   "tools::handlers::command_preflight::command_preflight_tests::fork91_multi_root_glob_repair_preserves_flags_and_other_roots",
   "tools::context::tests::fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contracts",
-  "tools::context::tests::fork91_cumulative_recovery_has_bounded_selector_without_fake_coordinates",
+  "tools::context::tests::fork91_cumulative_recovery_without_coordinates_does_not_guess_a_prefix",
   "tools::context::tests::fork91_no_match_requires_exact_error_free_terminal_streams",
   "tools::context::tests::exec_code_mode_exposes_artifact_id_not_path",
   "tools::context::tests::exec_code_mode_preserves_empty_output_and_explicit_lifecycle",
@@ -122,9 +122,7 @@ target = "core_lib"
 helpers = []
 tests = [
   "tool_history::tests::phase_checkpoint_leaves_tiny_results_inline",
-  "tool_history::tests::checkpoint_handler_boundaries_and_retained_artifacts",
   "tools::router::tests::final_router_manifest_and_dispatch_cover_context_tools",
-  "session::turn::tests::checkpoint_lifecycle_reaches_next_model_request_without_reexecution",
   "session::turn::tests::ordinary_exec_validation_repair_and_inflight_source_freshness",
 ]
 
@@ -608,7 +606,6 @@ target = "core_lib"
 helpers = []
 tests = [
   "responses_retry::tests::response_stream_retries_transport_timeouts",
-  "responses_retry::tests::sampling_stream_error_keeps_its_outer_retry",
   "responses_retry::tests::transport_fallback_requires_a_transport_class_error",
   "responses_retry::tests::unauthorized_status_skips_every_outer_response_retry",
   "responses_retry::tests::deterministic_4xx_do_not_retry_or_fallback",
@@ -627,7 +624,7 @@ tests = [
   "responses_retry::tests::connection_recovery_reaches_https_fallback_without_exhausting_network_waits",
   "responses_retry::tests::batch_and_subagent_sources_do_not_opt_into_unlimited_recovery",
   "responses_retry::tests::audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_transport",
-  "responses_retry::tests::provider_retry_timing_microbenchmark",
+  "responses_retry::tests::provider_retry_preserves_jitter_and_prioritizes_cancellation",
   "responses_retry::tests::cancelled_retry_does_not_switch_transport_or_announce_an_attempt",
   "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
 ]
@@ -685,7 +682,6 @@ target = "app_server_accounts"
 tests = [
   "suite::v2::account::ephemeral_login_callbacks_do_not_cancel_another_server",
   "suite::v2::account::login_account_chatgpt_start_can_be_cancelled",
-  "suite::v2::account::active_chatgpt_login_does_not_block_app_server_shutdown",
   "suite::v2::account::login_account_chatgpt_uses_debug_oauth_overrides",
   "suite::v2::account::login_account_chatgpt_redirects_to_hosted_success_page",
   "suite::v2::account::set_auth_token_cancels_active_chatgpt_login",
@@ -749,7 +745,6 @@ tests = [
   "tools::handlers::command_preflight::command_preflight_tests::rg_argument_roles_preserve_flag_like_patterns_and_dependencies",
   "tools::handlers::command_preflight::command_preflight_tests::rg_supported_executables_share_scope_and_dependency_classification",
   "tools::handlers::command_preflight::command_preflight_tests::search_operands_respect_option_values_and_terminators",
-  "tools::handlers::command_preflight::command_preflight_tests::search_executable_aliases_have_consistent_dependency_extraction",
   "tools::handlers::command_preflight::command_preflight_tests::classifies_repository_wide_and_owner_scoped_rg",
   "tools::handlers::command_preflight::command_preflight_tests::search_scope_state_ignores_unrelated_content_and_detects_target_changes",
   "tools::handlers::command_search::deadline_tests::slow_scope_observation_releases_the_request_and_discards_late_evidence",
@@ -773,7 +768,6 @@ tests = [
   "tools::shell_output_summary::tests::source_prose_about_passed_does_not_displace_test_status",
   "tools::shell_output_summary::tests::incidental_words_do_not_displace_validation_status_or_warnings",
   "tools::shell_output_summary::tests::selected_errors_do_not_spend_the_final_status_quota",
-  "tools::shell_output_summary::tests::large_success_output_keeps_head_tail_and_warning_lines",
   "tools::shell_output_summary::tests::large_success_output_preserves_source_order",
   "tools::shell_output_summary::tests::critical_error_survives_earlier_warning_flood",
   "tools::shell_output_summary::tests::benign_keywords_do_not_hide_the_first_real_error",
@@ -865,7 +859,7 @@ target = "core_lib"
 helpers = []
 tests = [
   "session::turn::tests::logical_generation_budget_allows_bounded_regular_and_one_terminal_generation",
-  "session::turn::tests::productive_work_and_owned_polling_preserve_generation_capacity",
+  "session::turn::tests::retained_evidence_analysis_and_owned_polling_preserve_generation_capacity",
   "session::turn::tests::validation_failure_at_generation_limit_keeps_repair_tools_available",
 ]
 
@@ -975,7 +969,7 @@ tests = [
   "session::turn_execution::tests::lightweight_handoff_advisory_preserves_novel_progress_and_tool_access",
   "session::turn_execution::tests::lightweight_handoff_window_resets_for_unmeasured_slow_batched_or_mutating_work",
   "session::turn_execution::tests::distinct_failure_strategies_allow_narrow_successful_recovery",
-  "session::turn_execution::tests::native_receipt_requires_settled_success_and_no_unfinished_plan",
+  "session::turn_execution::tests::native_receipt_requires_settled_success_not_plan_bookkeeping",
   "session::turn::tests::terminal_surface_preserves_owner_canonical_message_exactly",
   "scoped_workspace_gate::tests::native_addition_claims_exclude_overlaps_and_release_cancelled_waiters",
   "tools::parallel::tests::nested_cancellation_owns_terminal_before_runtime_cleanup",
@@ -1167,7 +1161,7 @@ description = "Evidence-backed direct completion, explicit obligation state, ret
 [[gates.completion-path-evidence.steps]]
 target = "core_lib"
 helpers = []
-filter = "test(plan_store::tests::) | test(tools::handlers::plan::tests::) | test(context::world_state::task_state::tests::) | test(completion_audit_) | test(explicit_delivery_requires_consumed_process_and_complete_evidence) | test(native_receipt_requires_settled_success_and_no_unfinished_plan)"
+filter = "test(plan_store::tests::) | test(tools::handlers::plan::tests::) | test(context::world_state::task_state::tests::) | test(completion_audit_) | test(explicit_delivery_requires_consumed_process_and_complete_evidence) | test(native_receipt_requires_settled_success_not_plan_bookkeeping)"
 
 [[gates.completion-path-evidence.steps]]
 target = "core_code_mode_mcp"

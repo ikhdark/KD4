@@ -361,6 +361,11 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             kd4_perf_snapshot.percentile([1.0, 2.0, 3.0, 4.0], 0.95),
             3.85,
         )
+        self.assertEqual(kd4_perf_snapshot.percentile([4.0, 1.0], 0), 1.0)
+        self.assertEqual(kd4_perf_snapshot.percentile([4.0, 1.0], 1), 4.0)
+        for values, fraction in (([], 0.5), ([1.0], -0.1), ([1.0], 1.1)):
+            with self.subTest(values=values, fraction=fraction), self.assertRaises(ValueError):
+                kd4_perf_snapshot.percentile(values, fraction)
 
     def test_sample_statistics_share_one_ordering(self) -> None:
         builtin_sorted = sorted
@@ -447,11 +452,17 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             category="test",
         )
 
-        result = kd4_perf_snapshot.measure_scenario(scenario)
+        with mock.patch.object(kd4_perf_snapshot, "_run_scenario") as launch:
+            result = kd4_perf_snapshot.measure_scenario(scenario)
+        launch.assert_not_called()
 
         self.assertEqual(result.status, "skipped")
         self.assertFalse(result.passed)
         self.assertTrue(result.required)
+        self.assertEqual(result.samples, ())
+        for field in ("cold_ms", "warm_p50_ms", "warm_p95_ms", "p50_ms", "p95_ms", "min_ms", "max_ms"):
+            self.assertIsNone(getattr(result, field), field)
+        self.assertIn("definitely-not-a-kd4-command", result.reason)
 
     def test_install_dir_override_is_independent_of_checkout_location(self) -> None:
         install_dir = Path("C:/custom/local-codex")
@@ -697,6 +708,12 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             kd4_model_attempt_analysis.spearman([1.0, 1.0, 2.0], [1.0, 1.0, 3.0]),
             1.0,
         )
+        # Average ranks are [1.5, 1.5, 3, 4] and [1, 2, 3, 4] below;
+        # asymmetric ties distinguish average ranks from minimum/dense ranks.
+        self.assertEqual(
+            kd4_model_attempt_analysis.spearman([1, 1, 2, 3], [1, 2, 3, 4]),
+            0.948683,
+        )
         self.assertIsNone(kd4_model_attempt_analysis.spearman([1.0, 1.0], [2.0, 3.0]))
 
     def test_model_attempt_percentiles_describe_observed_samples(self) -> None:
@@ -902,26 +919,106 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             "active": True,
             "local_reused": True,
         }
+        retry = {**attempt, "attempt_id": "retry", "retry_index": 1,
+                 "fresh_response_id_established": False}
+        retry_component = {**component, "attempt_id": "retry", "retry_index": 1,
+                           "local_reused": False, "approx_tokens": 500,
+                           "serialized_bytes": 2000}
+        orphan = {**component, "retry_index": 9}
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "attempts.jsonl"
             path.write_text(
-                json.dumps(attempt) + "\n" + json.dumps(component) + "\n",
+                "\n".join(map(json.dumps, [component, retry, orphan, attempt, retry_component, component])) + "\n",
                 encoding="utf-8",
             )
             records, diagnostics = kd4_model_attempt_analysis.load_jsonl([path])
 
-        self.assertEqual(diagnostics, {})
+        self.assertEqual(diagnostics, {
+            "duplicate_context_component_collapsed": 1, "orphan_context_component": 1,
+        })
+        self.assertEqual(
+            {row["attempt_id"]: row["_stable_context_components"] for row in records},
+            {"attempt": [component], "retry": [retry_component]},
+        )
         stable = kd4_model_attempt_analysis.analyze(records)["stableContext"]
-        self.assertEqual(stable["averageActiveContextTokens"], 1000.0)
+        self.assertEqual(stable["measuredContextAttempts"], 2)
+        self.assertEqual(stable["missingContextAttempts"], 0)
+        self.assertEqual(stable["averageActiveContextTokens"], 750.0)
         self.assertEqual(stable["peakActiveContextTokens"], 1000.0)
         self.assertEqual(stable["localReusedBytes"], 4000.0)
+        self.assertEqual(stable["localConstructedBytes"], 2000.0)
         self.assertEqual(stable["providerCachedShare"], 0.75)
         self.assertEqual(stable["successfulRebases"], 1)
-        self.assertEqual(stable["componentVersions"][0]["requestAppearances"], 1)
+        self.assertEqual(stable["componentVersions"][0]["requestAppearances"], 2)
         self.assertEqual(
             stable["componentVersions"][0]["cumulativeLogicalExposureTokens"],
-            1000.0,
+            1500.0,
         )
+
+    def test_conflicting_component_measurements_never_choose_an_export_order(self):
+        component = {
+            "event.name": "codex.model_context_component",
+            "sampling_request_id": "request", "attempt_id": "a", "retry_index": 0,
+            "component_kind": "repository", "contract_version": 1,
+            "semantic_id": "repo", "content_hash": "same-content",
+            "serialized_bytes": 400, "approx_tokens": 100,
+            "active": True, "local_reused": False,
+        }
+        request = {
+            "event.name": "codex.model_attempt", "sampling_request_id": "request",
+            "attempt_id": "a", "retry_index": 0,
+        }
+        unaffected = {**request, "sampling_request_id": "other", "attempt_id": "b"}
+        # A duplicate is the same observation, not merely the same join key.
+        # Conflicting versions must quarantine the request just like conflicting
+        # physical attempts, rather than selecting whichever export came first.
+        for field, value in (("approx_tokens", 200), ("serialized_bytes", 800),
+                             ("active", False), ("local_reused", True), ("contract_version", 2)):
+            conflict = {**component, field: value}
+            for versions in ((component, conflict), (conflict, component)):
+                with self.subTest(field=field, versions=versions), tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "attempts.jsonl"
+                    path.write_text("\n".join(map(json.dumps, [request, *versions, unaffected])), encoding="utf-8")
+                    records, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+                    self.assertEqual(records, [unaffected])
+                    self.assertEqual(exclusions["conflicting_context_component_duplicate"], 1)
+                    self.assertEqual(exclusions["conflicted_logical_request_attempts"], 1)
+                    self.assertNotIn("duplicate_context_component_collapsed", exclusions)
+                    self.assertIsNone(kd4_model_attempt_analysis.analyze(records)["stableContext"]["averageActiveContextTokens"])
+
+    def test_incomplete_component_identities_preserve_legacy_attempts(self):
+        # Absent/empty identity is not evidence of a shared logical request.
+        # Reject unjoinable components, never quarantine unrelated legacy rows.
+        missing = object()
+        invalid_fields = [
+            (field, value)
+            for field in ("sampling_request_id", "attempt_id")
+            for value in (missing, None, "")
+        ] + [("retry_index", value) for value in (missing, None, True, -1)]
+        for field, value in invalid_fields:
+            attempt = {
+                "event.name": "codex.model_attempt", "sampling_request_id": "request",
+                "attempt_id": "a", "retry_index": 0,
+            }
+            if value is missing:
+                attempt.pop(field)
+            else:
+                attempt[field] = value
+            unrelated = {**attempt, "attempt_id": "unrelated"}
+            component = {
+                **attempt, "event.name": "codex.model_context_component",
+                "component_kind": "repository", "contract_version": 1,
+                "semantic_id": "repo", "content_hash": "same-content",
+                "serialized_bytes": 400, "approx_tokens": 100, "active": True,
+            }
+            conflict = {**component, "approx_tokens": 200}
+            for versions in ((component, conflict), (conflict, component)):
+                with self.subTest(field=field, value=value, versions=versions), tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "attempts.jsonl"
+                    path.write_text("\n".join(map(json.dumps, [attempt, unrelated, *versions])), encoding="utf-8")
+                    records, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+                    self.assertEqual(records, [attempt, unrelated])
+                    self.assertEqual(exclusions, {"invalid_context_component_identity": 2})
 
     def test_stable_context_exposure_counts_retries_independent_of_provider_cache(
         self,

@@ -46,14 +46,15 @@ describe("Codex", () => {
         },
         expect.objectContaining({
           type: "turn.completed",
-          usage: {
+          usage: expect.objectContaining({
             cached_input_tokens: 12,
             input_tokens: 42,
             output_tokens: 5,
             reasoning_output_tokens: 0,
-          },
+          }),
         }),
       ]);
+      expect(thread.id).toBe((events[0] as { thread_id: string }).thread_id);
       expect(thread.id).toEqual(expect.any(String));
     } finally {
       cleanup();

@@ -2206,115 +2206,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_override_is_used_when_provided() {
-        let git_ref = resolve_git_ref_with_git_info(
-            Some(&"feature/override".to_string()),
-            &StubGitInfo::new(/*default_branch*/ None, /*current_branch*/ None),
-        )
-        .await;
-
-        assert_eq!(git_ref, "feature/override");
-    }
-
-    #[tokio::test]
-    async fn trims_override_whitespace() {
-        let git_ref = resolve_git_ref_with_git_info(
-            Some(&"  feature/spaces  ".to_string()),
-            &StubGitInfo::new(/*default_branch*/ None, /*current_branch*/ None),
-        )
-        .await;
-
-        assert_eq!(git_ref, "feature/spaces");
-    }
-
-    #[tokio::test]
-    async fn prefers_current_branch_when_available() {
-        let git_ref = resolve_git_ref_with_git_info(
-            /*branch_override*/ None,
-            &StubGitInfo::new(
-                Some("default-main".to_string()),
-                Some("feature/current".to_string()),
+    async fn git_ref_resolution_preserves_precedence_and_fallbacks() {
+        for (override_branch, default_branch, current_branch, expected) in [
+            (Some("feature/override"), None, None, "feature/override"),
+            (Some("  feature/spaces  "), None, None, "feature/spaces"),
+            (
+                None,
+                Some("default-main"),
+                Some("feature/current"),
+                "feature/current",
             ),
-        )
-        .await;
-
-        assert_eq!(git_ref, "feature/current");
-    }
-
-    #[tokio::test]
-    async fn falls_back_to_current_branch_when_default_is_missing() {
-        let git_ref = resolve_git_ref_with_git_info(
-            /*branch_override*/ None,
-            &StubGitInfo::new(/*default_branch*/ None, Some("develop".to_string())),
-        )
-        .await;
-
-        assert_eq!(git_ref, "develop");
-    }
-
-    #[tokio::test]
-    async fn falls_back_to_main_when_no_git_info_is_available() {
-        let git_ref = resolve_git_ref_with_git_info(
-            /*branch_override*/ None,
-            &StubGitInfo::new(/*default_branch*/ None, /*current_branch*/ None),
-        )
-        .await;
-
-        assert_eq!(git_ref, "main");
-    }
-
-    #[test]
-    fn format_task_status_lines_with_diff_and_label() {
-        let now = Utc::now();
-        let task = TaskSummary {
-            id: TaskId("task_1".to_string()),
-            title: "Example task".to_string(),
-            status: TaskStatus::Ready,
-            updated_at: now,
-            environment_id: Some("env-1".to_string()),
-            environment_label: Some("Env".to_string()),
-            summary: DiffSummary {
-                files_changed: 3,
-                lines_added: 5,
-                lines_removed: 2,
-            },
-            is_review: false,
-            attempt_total: None,
-        };
-        let lines = format_task_status_lines(&task, now, /*colorize*/ false);
-        assert_eq!(
-            lines,
-            vec![
-                "[READY] Example task".to_string(),
-                "Env  •  0s ago".to_string(),
-                "+5/-2 • 3 files".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn format_task_status_lines_without_diff_falls_back() {
-        let now = Utc::now();
-        let task = TaskSummary {
-            id: TaskId("task_2".to_string()),
-            title: "No diff task".to_string(),
-            status: TaskStatus::Pending,
-            updated_at: now,
-            environment_id: Some("env-2".to_string()),
-            environment_label: None,
-            summary: DiffSummary::default(),
-            is_review: false,
-            attempt_total: Some(1),
-        };
-        let lines = format_task_status_lines(&task, now, /*colorize*/ false);
-        assert_eq!(
-            lines,
-            vec![
-                "[PENDING] No diff task".to_string(),
-                "env-2  •  0s ago".to_string(),
-                "no diff".to_string(),
-            ]
-        );
+            (None, None, Some("develop"), "develop"),
+            (None, None, None, "main"),
+            (Some(" \t "), Some("default-main"), None, "default-main"),
+            (
+                Some("override"),
+                Some("default-main"),
+                Some("current"),
+                "override",
+            ),
+        ] {
+            let override_branch = override_branch.map(str::to_string);
+            let git_ref = resolve_git_ref_with_git_info(
+                override_branch.as_ref(),
+                &StubGitInfo::new(
+                    default_branch.map(str::to_string),
+                    current_branch.map(str::to_string),
+                ),
+            )
+            .await;
+            assert_eq!(
+                git_ref, expected,
+                "override: {override_branch:?}, default: {default_branch:?}, current: {current_branch:?}"
+            );
+        }
     }
 
     #[test]
@@ -2434,6 +2359,12 @@ mod tests {
                         "turn_status": "completed",
                         "output_items": [{"type": "output_diff", "diff": "sibling diff"}]
                     }]}))
+                } else if request.starts_with("GET /api/codex/tasks/cancelled HTTP/") {
+                    ("200 OK", serde_json::json!({
+                        "current_assistant_turn": {
+                            "id": "cancelled-turn", "turn_status": "cancelled"
+                        }
+                    }))
                 } else {
                     assert!(request.starts_with("GET /api/codex/tasks/failed HTTP/"));
                     ("503 Service Unavailable", serde_json::json!({}))
@@ -2475,6 +2406,19 @@ mod tests {
                     .is_err()
             );
             assert_eq!(request_count.load(Ordering::SeqCst), 7);
+            // The UI has a distinct Cancelled label: a stopped attempt must not
+            // be displayed as still pending after the HTTP boundary.
+            let cancelled = codex_cloud_tasks_client::CloudBackend::get_task_text(
+                &backend,
+                TaskId("cancelled".to_string()),
+            )
+            .await
+            .expect("cancelled task details");
+            assert_eq!(
+                cancelled.attempt_status,
+                codex_cloud_tasks_client::AttemptStatus::Cancelled
+            );
+            assert_eq!(request_count.load(Ordering::SeqCst), 8);
         })
         .await;
         server.shutdown().await;
@@ -2490,7 +2434,19 @@ mod tests {
         }];
         let first = select_attempt(&attempts, Some(1)).expect("attempt 1");
         assert_eq!(first.diff, "diff --git a/file b/file\n");
-        assert!(select_attempt(&attempts, Some(2)).is_err());
+        assert_eq!(select_attempt(&attempts, None).unwrap().diff, first.diff);
+        assert_eq!(
+            select_attempt(&attempts, Some(0)).unwrap_err().to_string(),
+            "attempt must be at least 1"
+        );
+        assert_eq!(
+            select_attempt(&attempts, Some(2)).unwrap_err().to_string(),
+            "Attempt 2 not available; only 1 attempt(s) found"
+        );
+        assert_eq!(
+            select_attempt(&[], None).unwrap_err().to_string(),
+            "No attempts available"
+        );
     }
 
     #[test]

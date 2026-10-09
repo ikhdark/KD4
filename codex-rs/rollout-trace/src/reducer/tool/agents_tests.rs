@@ -38,14 +38,16 @@ fn child_thread_metadata_creates_spawn_origin_without_delivery_edge() -> anyhow:
         RawPayloadKind::SessionMetadata,
         &json!({
             "nickname": "James",
-            "agent_role": "explorer",
-            "task_name": "repo_file_counter",
+            "agent_role": "fallback-role",
+            "task_name": "fallback-task",
+            "agent_path": "/root/fallback",
             "model": "gpt-test",
             "session_source": {
                 "subagent": {
                     "thread_spawn": {
                         "parent_thread_id": "019d0000-0000-7000-8000-000000000001",
                         "agent_path": "/root/repo_file_counter",
+                        "task_name": "repo_file_counter",
                         "agent_nickname": "James",
                         "agent_role": "explorer"
                     }
@@ -55,12 +57,13 @@ fn child_thread_metadata_creates_spawn_origin_without_delivery_edge() -> anyhow:
     )?;
     writer.append(RawTraceEventPayload::ThreadStarted {
         thread_id: "019d0000-0000-7000-8000-000000000002".to_string(),
-        agent_path: "/root/repo_file_counter".to_string(),
+        agent_path: "/root/stale".to_string(),
         metadata_payload: Some(metadata),
     })?;
 
     let replayed = replay_bundle(temp.path())?;
     let thread = &replayed.threads["019d0000-0000-7000-8000-000000000002"];
+    assert_eq!(thread.agent_path, "/root/repo_file_counter");
     assert_eq!(thread.nickname, Some("James".to_string()));
     assert_eq!(thread.default_model, Some("gpt-test".to_string()));
     assert_eq!(

@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn pre_tool_use_command_input_serializes_turn_tool_calls_only_when_present() {
-        let input = PreToolUseCommandInput {
+        let mut input = PreToolUseCommandInput {
             session_id: "session-1".to_string(),
             turn_id: "turn-1".to_string(),
             agent_id: None,
@@ -1219,8 +1219,11 @@ mod tests {
             turn_tool_calls: vec!["task".to_string(), "exec_command".to_string()],
         };
 
-        let value = serde_json::to_value(input).expect("serialize hook input");
+        let value = serde_json::to_value(&input).expect("serialize hook input");
         assert_eq!(value["turn_tool_calls"], json!(["task", "exec_command"]));
+        input.turn_tool_calls.clear();
+        let value = serde_json::to_value(&input).expect("serialize hook input without prior calls");
+        assert!(value.get("turn_tool_calls").is_none());
 
         let schema: Value =
             serde_json::from_slice(&schema_json::<PreToolUseCommandInput>().expect("schema"))

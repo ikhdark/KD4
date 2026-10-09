@@ -150,6 +150,9 @@ mod tests {
                     "{error}"
                 );
                 assert!(!error.contains("must be valid JSON"), "{error}");
+                if value == "-1" {
+                    assert!(error.contains("-1"), "{error}");
+                }
                 if field == "yield_time_ms" {
                     assert!(!error.contains("max_output_tokens"), "{error}");
                 }
@@ -159,8 +162,13 @@ mod tests {
 
     #[test]
     fn duplicate_fields_are_rejected_as_duplicates_even_when_values_match() {
-        for field in ["yield_time_ms", "max_output_tokens"] {
-            let source = format!("// @exec: {{\"{field}\":1,\"{field}\":1}}\ntext('must not run')");
+        for (field, second) in [
+            ("yield_time_ms", 1),
+            ("yield_time_ms", 2),
+            ("max_output_tokens", 1),
+            ("max_output_tokens", 2),
+        ] {
+            let source = format!("// @exec: {{\"{field}\":1,\"{field}\":{second}}}\ntext('must not run')");
             let error = parse_exec_source(&source).expect_err(&source);
             assert!(
                 error.starts_with("exec pragma has an invalid field value:"),

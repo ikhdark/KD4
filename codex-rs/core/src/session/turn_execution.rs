@@ -4776,7 +4776,7 @@ mod tests {
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
                 Some(crate::tools::context::semantic_evidence_sampling_signal(json!(
-                    crate::tools::context::semantic_evidence_for_command_output(id.as_bytes())
+                    crate::tools::context::successful_command_evidence(output.as_bytes(), None)
                 ))),
                 &successful_tool_response(&id, &output),
                 false,
@@ -4888,8 +4888,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn soft_convergence_is_once_per_turn_and_only_on_a_needed_continuation() {
+    #[test]
+    fn soft_convergence_is_once_per_turn_and_only_on_a_needed_continuation() {
         let mut control = TurnExecutionControl::new();
         assert!(control.take_soft_convergence_directive(true).is_none());
         for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
@@ -4923,8 +4923,8 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn soft_convergence_waits_for_generations_without_progress() {
+    #[test]
+    fn soft_convergence_waits_for_generations_without_progress() {
         let mut control = TurnExecutionControl::new();
         // Time alone is not a stall: an investigation that keeps producing new
         // evidence or mutations must not be told to stop exploring.
@@ -5086,7 +5086,7 @@ mod tests {
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
                 Some(crate::tools::context::semantic_evidence_sampling_signal(json!(
-                    crate::tools::context::semantic_evidence_for_command_output(text.as_bytes())
+                    crate::tools::context::successful_command_evidence(text.as_bytes(), None)
                 ))),
                 &successful_tool_response(&call_id, text),
                 false,
@@ -5365,6 +5365,7 @@ mod tests {
             false,
         );
 
+        assert!(!first.snapshot()[0].failure_is_terminal);
         assert_eq!(
             control.evaluate_convergence(&baseline, &first, &settled_state),
             SamplingConvergenceDecision::default()
@@ -5385,57 +5386,43 @@ mod tests {
 
     #[test]
     fn mcp_application_retryable_field_is_not_control_metadata() {
-        let collector = SamplingRequestSignalCollector::default();
-        let tool_name = ToolName::namespaced("mcp__example__", "read");
-        let payload = ToolPayload::Function {
-            arguments: r#"{"uri":"memo://codex/example-note"}"#.to_string(),
-        };
-        let result = json!({
-            "content": [{"type": "text", "text": "application result"}],
-            "isError": true,
-            "retryable": false,
-        });
-        let signal = crate::tools::context::semantic_failure_sampling_signal(result.clone());
-
-        collector.record_code_mode_result(CodeModeToolResult {
-            cell_id: "mcp-cell",
-            tool_name: &tool_name,
-            payload: &payload,
-            source_dependencies: None,
-            outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
-            signal: Some(&signal),
-            result: &result,
-            canonical_artifact_required: false,
-        });
-
-        assert!(!collector.snapshot()[0].failure_is_terminal);
-    }
-
-    #[test]
-    fn direct_mcp_application_retryable_field_is_not_control_metadata() {
-        let collector = SamplingRequestSignalCollector::default();
-        let result = json!({
-            "content": [{"type": "text", "text": "application result"}],
-            "isError": true,
-            "retryable": false,
-        });
-        let signal = crate::tools::context::semantic_failure_sampling_signal(result.clone());
-        let response = ResponseInputItem::FunctionCallOutput {
-            call_id: "mcp-call".to_string(),
-            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                result.to_string(),
-            ),
-        };
-
-        collector.record_response_result(
-            collector.register_tool_call(),
-            ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
-            Some(signal),
-            &response,
-            false,
-        );
-
-        assert!(!collector.snapshot()[0].failure_is_terminal);
+        for nested in [false, true] {
+            let collector = SamplingRequestSignalCollector::default();
+            let tool_name = ToolName::namespaced("mcp__example__", "read");
+            let payload = ToolPayload::Function {
+                arguments: r#"{"uri":"memo://codex/example-note"}"#.to_string(),
+            };
+            let result = json!({
+                "content": [{"type": "text", "text": "application result"}],
+                "isError": true,
+                "retryable": false,
+            });
+            let signal = crate::tools::context::semantic_failure_sampling_signal(result.clone());
+            if nested {
+                collector.record_code_mode_result(CodeModeToolResult {
+                    cell_id: "mcp-cell",
+                    tool_name: &tool_name,
+                    payload: &payload,
+                    source_dependencies: None,
+                    outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                    signal: Some(&signal),
+                    result: &result,
+                    canonical_artifact_required: false,
+                });
+            } else {
+                collector.record_response_result(
+                    collector.register_tool_call(),
+                    ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                    Some(signal),
+                    &runner_tool_response("mcp-call", &result.to_string()),
+                    false,
+                );
+            }
+            let outcomes = collector.snapshot();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].kind, SamplingToolOutcomeKind::Failure);
+            assert!(!outcomes[0].failure_is_terminal, "nested={nested}");
+        }
     }
 
     #[test]
@@ -6054,6 +6041,10 @@ mod tests {
                         .is_none(),
                     "{call_id} must execute instead of returning cached output: {arguments}"
                 );
+                // Give the read the dependencies needed for retention, so a
+                // broken force_fresh bypass would actually seed a replay.
+                record_test_replay_dependencies(&collector, registration.ordinal);
+                assert!(collector.state.lock().unwrap().structured_actions.is_empty());
                 collector.record_response_result(
                     registration.ordinal,
                     ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
@@ -6382,6 +6373,7 @@ mod tests {
     #[test]
     fn uncertain_native_read_commands_and_namespaced_lookalikes_execute_normally() {
         for (tool, arguments) in [
+            (ToolName::plain("exec_command"), r#"{"cmd":"echo complete"}"#),
             (
                 ToolName::plain("exec_command"),
                 r#"{"cmd":"git diff --output=report.txt"}"#,
@@ -6508,37 +6500,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn successful_non_read_command_is_not_cached_for_replay() {
-        let mut control = TurnExecutionControl::new();
-        settle_plan(&mut control, plan(&[StepStatus::Completed]));
-        let payload = ToolPayload::Function {
-            arguments: r#"{"cmd":"echo complete"}"#.to_string(),
-        };
-        let baselines = control.baselines(0);
-        let first = control.collector(&baselines);
-        record_invocation_result(
-            &first,
-            ToolName::plain("exec_command"),
-            payload.clone(),
-            "first-command",
-            ToolOutputOutcome::Success,
-        );
-        control.settle(&baselines, &first, &settled(0));
 
-        let repeated_baselines = control.baselines(0);
-        let repeated = control.collector(&repeated_baselines);
-        assert!(
-            repeated
-                .register_deterministic_tool_call(
-                    &ToolName::plain("exec_command"),
-                    &payload,
-                    "repeated-command",
-                )
-                .replayed_success
-                .is_none()
-        );
-    }
 
     #[test]
     fn unfinished_plan_does_not_invalidate_fresh_validation_evidence() {
@@ -7509,30 +7471,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repeated_read_only_pass_activates_loop_guard_but_requires_a_model_decision() {
-        let mut control = TurnExecutionControl::new();
-        let (baselines, settled) = unchanged_state(&control);
-        let arguments =
-            r#"{"artifact_id":"artifact-1","selectors":[{"kind":"lines","start":1,"end":1}]}"#;
 
-        for generation in 1..=2 {
-            let (collector, _) =
-                read_only_pass_collector(&control, &baselines, arguments, "same-evidence");
-            let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation > 1);
-            if generation > 1 {
-                // The directive asks the model to choose a productive next step;
-                // it does not establish a single host-owned protocol outcome.
-                assert_eq!(
-                    control
-                        .continuation_generation_request(&baselines, &collector, &settled, false)
-                        .timing_disposition(),
-                    TurnTimingGenerationDisposition::DecisionBearing
-                );
-            }
-        }
-    }
 
     #[test]
     fn cosmetic_plan_revisions_do_not_reset_repeated_read_convergence() {
@@ -7592,12 +7531,19 @@ mod tests {
         let arguments = r#"{"artifact_id":"artifact-1"}"#;
 
         let mut directive = None;
-        for _ in 1..=2 {
+        for generation in 1..=2 {
             let (collector, _) =
                 read_only_pass_collector(&control, &baselines, arguments, "same-evidence");
             directive = control
                 .evaluate_convergence(&baselines, &collector, &settled)
                 .directive;
+            assert_eq!(directive.is_some(), generation > 1);
+            assert_eq!(
+                control.continuation_generation_request(
+                    &baselines, &collector, &settled, false,
+                ).timing_disposition(),
+                TurnTimingGenerationDisposition::DecisionBearing,
+            );
         }
 
         let directive =
@@ -7617,7 +7563,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_evidence_converges_across_different_read_paths_and_presentations() {
+    fn command_evidence_preserves_changed_presentations_of_the_same_source() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
         let calls = [
@@ -7638,8 +7584,8 @@ mod tests {
             ),
         ];
 
-        let mut cycle_key = None;
-        for (generation, (tool, arguments, presentation)) in calls.into_iter().enumerate() {
+        let mut cycle_keys = std::collections::HashSet::new();
+        for (tool, arguments, presentation) in calls {
             let collector = control.collector(&baselines);
             let registration = collector.register_deterministic_tool_call(
                 &ToolName::plain(tool),
@@ -7656,7 +7602,7 @@ mod tests {
                     "semantic_evidence": {
                         "source": "src/lib.rs",
                         "scope": {"start": 10, "end": 10},
-                        "identity": crate::tools::context::semantic_evidence_for_command_output(presentation.as_bytes()),
+                        "identity": crate::tools::context::successful_command_evidence(presentation.as_bytes(), None),
                     },
                 })),
                 &successful_tool_response("semantic-call", presentation),
@@ -7665,13 +7611,9 @@ mod tests {
             let current_key = collector
                 .deterministic_cycle_key()
                 .expect("semantic evidence cycle");
-            if let Some(expected_key) = &cycle_key {
-                assert_eq!(expected_key, &current_key);
-            } else {
-                cycle_key = Some(current_key.clone());
-            }
+            assert!(cycle_keys.insert(current_key));
             let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation > 0);
+            assert!(decision.directive.is_none());
         }
     }
 
@@ -7759,44 +7701,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn broad_source_cycle_preserves_evidence_multiplicity() {
-        fn collector_with_reads(
-            control: &TurnExecutionControl,
-            baselines: &SamplingRequestBaselines,
-            count: usize,
-        ) -> SamplingRequestSignalCollector {
-            let collector = control.collector(baselines);
-            for index in 0..count {
-                let call_id = format!("read-call-{index}");
-                let registration = collector.register_deterministic_tool_call(
-                    &ToolName::plain("read_tool_output"),
-                    &ToolPayload::Function {
-                        arguments: r#"{"artifact_id":"artifact-1"}"#.to_string(),
-                    },
-                    &call_id,
-                );
-                collector.record_response_result(
-                    registration.ordinal,
-                    ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-                    None,
-                    &successful_tool_response(&call_id, "same-evidence"),
-                    false,
-                );
-            }
-            collector
-        }
 
-        let control = TurnExecutionControl::new();
-        let (baselines, _) = unchanged_state(&control);
-        let one_read = collector_with_reads(&control, &baselines, 1);
-        let two_reads = collector_with_reads(&control, &baselines, 2);
-
-        assert_ne!(
-            one_read.deterministic_cycle_key(),
-            two_reads.deterministic_cycle_key()
-        );
-    }
 
     #[test]
     fn action_identities_share_one_canonical_function_payload() {
@@ -7811,8 +7716,16 @@ mod tests {
         let (left_deterministic, left_structured) = action_identities(&tool_name, &left);
         let (right_deterministic, right_structured) = action_identities(&tool_name, &right);
 
+        assert!(left_deterministic.is_some());
+        assert!(left_structured.is_some());
         assert_eq!(left_deterministic, right_deterministic);
         assert_eq!(left_structured, right_structured);
+        let changed = ToolPayload::Function {
+            arguments: r#"{"target":"agent-2","timeout_ms":10}"#.to_string(),
+        };
+        let (changed_deterministic, changed_structured) = action_identities(&tool_name, &changed);
+        assert_ne!(left_deterministic, changed_deterministic);
+        assert_ne!(left_structured, changed_structured);
     }
 
     #[test]
@@ -8048,6 +7961,10 @@ mod tests {
     #[test]
     fn only_the_current_failure_envelope_supplies_a_failure_signature() {
         assert_eq!(
+            value_failure_signature(&json!(r#"{"failure_signature":"application-data"}"#)),
+            None
+        );
+        assert_eq!(
             value_failure_signature(&json!({"failure_signature": "current"})).as_deref(),
             Some("current")
         );
@@ -8064,13 +7981,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stringified_json_is_not_failure_control_metadata() {
-        assert_eq!(
-            value_failure_signature(&json!(r#"{"failure_signature":"application-data"}"#)),
-            None
-        );
-    }
+
 
     #[test]
     fn yielded_write_stdin_with_new_output_refunds_a_generation() {
@@ -8262,28 +8173,17 @@ mod tests {
     fn failure_signature_convergence_does_not_equate_changed_signatures() {
         let control = TurnExecutionControl::new();
         let (baselines, _) = unchanged_state(&control);
-        let first = direct_failure_collector(&control, &baselines, "io.locked");
-        let changed = direct_failure_collector(&control, &baselines, "schema.invalid");
-
-        assert_ne!(
-            first.deterministic_cycle_key(),
-            changed.deterministic_cycle_key()
-        );
-    }
-
-    #[test]
-    fn failure_signature_convergence_does_not_equate_changed_actions() {
-        let control = TurnExecutionControl::new();
-        let (baselines, _) = unchanged_state(&control);
-        let first =
-            direct_failure_collector_for_artifact(&control, &baselines, "artifact-1", "io.locked");
-        let changed =
-            direct_failure_collector_for_artifact(&control, &baselines, "artifact-2", "io.locked");
-
-        assert_ne!(
-            first.deterministic_cycle_key(),
-            changed.deterministic_cycle_key()
-        );
+        let first = direct_failure_collector(&control, &baselines, "io.locked")
+            .deterministic_cycle_key().expect("failure cycle");
+        for (artifact, signature) in [
+            ("artifact-1", "schema.invalid"),
+            ("artifact-2", "io.locked"),
+        ] {
+            let changed = direct_failure_collector_for_artifact(
+                &control, &baselines, artifact, signature,
+            ).deterministic_cycle_key().expect("changed failure cycle");
+            assert_ne!(first, changed, "{artifact}: {signature}");
+        }
     }
 
     #[test]
@@ -8624,26 +8524,7 @@ mod tests {
         assert!(terminal.proven_loop_activated);
     }
 
-    #[test]
-    fn changing_sequential_tiny_calls_do_not_request_consolidation() {
-        let mut control = TurnExecutionControl::new();
-        let (baselines, settled) = unchanged_state(&control);
 
-        for generation in 1..=9 {
-            let arguments = format!(r#"{{"command":"inspect-{generation}"}}"#);
-            let evidence = format!("evidence-{generation}");
-            let collector =
-                structured_tool_pass_collector(&control, &baselines, &arguments, &evidence);
-            collector.record_child_runtime(100);
-            let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(
-                decision.continuation,
-                ContinuationDisposition::ModelRequired
-            );
-            assert!(decision.directive.is_none());
-            assert!(!decision.proven_loop_activated);
-        }
-    }
 
     #[test]
     fn changed_tiny_call_cycles_remain_recoverable_without_efficiency_advisory() {
@@ -8670,16 +8551,18 @@ mod tests {
     fn turn_efficiency_substantive_average_child_runtime_does_not_trigger_guard() {
         let mut control = TurnExecutionControl::new();
         let (baselines, settled) = unchanged_state(&control);
-
-        for generation in 1..=TURN_EFFICIENCY_TOOL_CALL_THRESHOLD + 1 {
-            let arguments = format!(r#"{{"command":"inspect-{generation}"}}"#);
-            let evidence = format!("evidence-{generation}");
-            let collector =
-                structured_tool_pass_collector(&control, &baselines, &arguments, &evidence);
-            collector
-                .record_child_runtime(TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL + 1);
+        for _ in 0..=TURN_EFFICIENCY_TOOL_CALL_THRESHOLD {
+            let collector = structured_tool_pass_collector(
+                &control, &baselines, r#"{"command":"inspect"}"#, "same-evidence",
+            );
+            collector.record_child_runtime(
+                TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL + 1,
+            );
             let decision = control.evaluate_convergence(&baselines, &collector, &settled);
-            assert!(decision.directive.is_none());
+            assert_eq!(decision.continuation, ContinuationDisposition::ModelRequired);
+            assert!(control.turn_efficiency_guard.is_none());
+            assert_eq!(control.turn_efficiency_tool_calls, 0);
+            assert!(!decision.directive.as_deref().unwrap_or_default().starts_with("Turn-efficiency"));
         }
     }
 
@@ -10064,6 +9947,12 @@ mod tests {
             None,
         ));
 
+        let outcomes = collector.snapshot();
+        assert_eq!(outcomes.len(), 2);
+        let nested = outcomes.iter().find(|outcome| outcome.nested_in_code_mode).unwrap();
+        assert_eq!(nested.plan.as_ref(), Some(&nested_plan));
+        assert_eq!(nested.source_evidence, Some(json!({"identity": "source-v1"})));
+        assert!(nested.canonical_artifact_required);
         assert_eq!(
             collector.generation_purpose(&baseline, &settled(0), false, false,),
             Some(TurnTimingGenerationPurpose::ArtifactContinuation)

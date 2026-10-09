@@ -119,98 +119,40 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn active_goal_usage_prefers_token_budget() {
-        assert_eq!(
-            active_goal_usage(
-                Some(50_000),
-                /*tokens_used*/ 12_500,
-                /*time_used_seconds*/ 90
-            ),
-            Some("12.5K / 50K".to_string())
-        );
+    fn goal_usage_formats_budgeted_and_unbudgeted_states() {
+        for (budget, active, stopped, complete) in [
+            (Some(50_000), Some("12.5K / 50K"), Some("63.9K / 50K tokens"), "40K tokens"),
+            (None, Some("2m"), None, "10h 12m"),
+        ] {
+            assert_eq!(
+                active_goal_usage(budget, 12_500, 120),
+                active.map(str::to_string)
+            );
+            assert_eq!(
+                stopped_goal_budget_usage(budget, 63_876),
+                stopped.map(str::to_string)
+            );
+            assert_eq!(completed_goal_usage(budget, 40_000, 36_720), complete);
+        }
     }
 
     #[test]
-    fn active_goal_usage_reports_time_without_budget() {
-        assert_eq!(
-            active_goal_usage(
-                /*token_budget*/ None, /*tokens_used*/ 12_500,
-                /*time_used_seconds*/ 120,
-            ),
-            Some("2m".to_string())
-        );
-    }
-
-    #[test]
-    fn stopped_goal_budget_usage_reports_budgeted_tokens() {
-        assert_eq!(
-            stopped_goal_budget_usage(Some(50_000), /*tokens_used*/ 63_876),
-            Some("63.9K / 50K tokens".to_string())
-        );
-    }
-
-    #[test]
-    fn stopped_goal_budget_usage_omits_unbudgeted_usage() {
-        assert_eq!(
-            stopped_goal_budget_usage(/*token_budget*/ None, /*tokens_used*/ 12_500),
-            None
-        );
-    }
-
-    #[test]
-    fn completed_goal_usage_reports_tokens_when_budgeted() {
-        assert_eq!(
-            completed_goal_usage(
-                Some(50_000),
-                /*tokens_used*/ 40_000,
-                /*time_used_seconds*/ 120,
-            ),
-            "40K tokens".to_string()
-        );
-    }
-
-    #[test]
-    fn completed_goal_usage_reports_time_without_token_budget() {
-        assert_eq!(
-            completed_goal_usage(
-                /*token_budget*/ None, /*tokens_used*/ 40_000,
-                /*time_used_seconds*/ 36_720,
-            ),
-            "10h 12m".to_string()
-        );
-    }
-
-    #[test]
-    fn active_goal_status_includes_current_turn_elapsed_time() {
+    fn active_goal_status_counts_only_time_after_observation_and_turn_start() {
         let observed_at = Instant::now();
         let state = active_goal_state(observed_at, /*time_used_seconds*/ 60);
-
-        assert_eq!(
-            state.indicator(
-                observed_at + Duration::from_secs(60),
-                Some(observed_at - Duration::from_secs(120)),
-            ),
-            Some(GoalStatusIndicator::Active {
-                usage: Some("2m".to_string())
-            })
-        );
-    }
-
-    #[test]
-    fn active_goal_status_does_not_count_idle_time_before_turn_start() {
-        let observed_at = Instant::now();
-        let active_turn_started_at = observed_at + Duration::from_secs(120);
-        let state = active_goal_state(observed_at, /*time_used_seconds*/ 60);
-
-        assert_eq!(
-            state.indicator(
-                active_turn_started_at + Duration::from_secs(60),
-                Some(active_turn_started_at),
-            ),
-            Some(GoalStatusIndicator::Active {
-                usage: Some("2m".to_string())
-            })
-        );
+        for (now, started_at, expected) in [
+            (observed_at + Duration::from_secs(60), Some(observed_at - Duration::from_secs(120)), "2m"),
+            (observed_at + Duration::from_secs(180), Some(observed_at + Duration::from_secs(120)), "2m"),
+            (observed_at, Some(observed_at + Duration::from_secs(120)), "1m"),
+            (observed_at + Duration::from_secs(60), None, "1m"),
+        ] {
+            assert_eq!(
+                state.indicator(now, started_at),
+                Some(GoalStatusIndicator::Active {
+                    usage: Some(expected.to_string())
+                })
+            );
+        }
     }
 
     fn active_goal_state(observed_at: Instant, time_used_seconds: i64) -> GoalStatusState {

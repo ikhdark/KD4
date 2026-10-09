@@ -17,7 +17,6 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
-use core_test_support::assert_regex_match;
 use core_test_support::managed_network_requirements_loader;
 use core_test_support::require_network;
 use core_test_support::responses::ResponsesRequest;
@@ -788,6 +787,11 @@ async fn exec_command_retained_session_lifecycle_completes_without_stale_process
     assert_eq!(emitting_request.executor_admitted_tool_call_count, 1);
     assert_eq!(emitting_request.executor_max_concurrent_tool_calls, 1);
 
+    assert!(
+        test.codex.list_background_terminals().await.is_empty(),
+        "terminal polling must remove the retained process before turn completion"
+    );
+
     Ok(())
 }
 
@@ -953,6 +957,13 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
             "unexpected terminal status for {call_id}: {output:?}"
         );
         assert!(output.process_id.is_none(), "{call_id} must finish inline");
+
+        if expected_exit_code == 0 {
+            assert!(
+                output.output.contains("test result: ok. 1 passed; 0 failed"),
+                "the success fixture must execute, not pass with zero selected tests: {output:?}"
+            );
+        }
 
         let lifecycle = lifecycle_by_id
             .get(call_id)
@@ -1418,15 +1429,16 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
         PermissionProfile::Disabled,
     )
     .await?;
-    let completion = loop {
-        if let EventMsg::TurnComplete(event) =
-            wait_for_event_with_timeout(&codex.codex, |_| true, UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT)
-                .await
-        {
-            break event;
-        }
+    let EventMsg::TurnComplete(completion) = wait_for_event_with_timeout(
+        &codex.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
+    )
+    .await else {
+        unreachable!("event predicate requires TurnComplete")
     };
 
+    assert!(completion.error.is_none(), "{completion:?}");
     assert_eq!(completion.last_agent_message.as_deref(), Some("complete"));
     let requests = responses.requests();
     assert_eq!(requests.len(), 3);
@@ -1442,8 +1454,11 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
         })
         .and_then(extract_output_text)
         .expect("final model request should contain the owner-wait result");
+    let owner_wait_output = parse_unified_exec_output(owner_wait_output)?;
+    assert_eq!(owner_wait_output.exit_code, Some(0));
+    assert!(owner_wait_output.process_id.is_none());
     assert!(
-        owner_wait_output.contains("POLL_DONE"),
+        owner_wait_output.output.contains("POLL_DONE"),
         "the terminal command output must be present in the request that resumes the model; actual output: {owner_wait_output:?}",
     );
 
@@ -1735,7 +1750,9 @@ async fn unified_exec_runs_on_windows() -> Result<()> {
     let outputs = collect_tool_outputs(&bodies)?;
     let output = outputs.get(call_id).expect("missing output");
 
-    assert_regex_match(".*hello windows.*", &output.output);
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.process_id.is_none());
+    assert_eq!(output.output.trim(), "hello windows");
 
     Ok(())
 }

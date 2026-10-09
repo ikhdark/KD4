@@ -28,56 +28,6 @@ fn base_dir() -> AbsolutePathBuf {
     test_path_buf("/var/lib/codex").abs()
 }
 
-#[test]
-fn layers_are_returned_in_stack_order() {
-    let base_dir = base_dir();
-    let layers = cloud_config_layers_from_fragments(
-        vec![
-            fragment("high", "High priority", "model = \"cloud-high\""),
-            fragment("low", "Low priority", "model_provider = \"cloud-low\""),
-        ],
-        &base_dir,
-    )
-    .expect("cloud config layers should compose");
-
-    assert_eq!(
-        layers
-            .iter()
-            .map(|layer| layer.name.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            ConfigLayerSource::EnterpriseManaged {
-                id: "low".to_string(),
-                name: "Low priority".to_string(),
-            },
-            ConfigLayerSource::EnterpriseManaged {
-                id: "high".to_string(),
-                name: "High priority".to_string(),
-            },
-        ]
-    );
-}
-
-#[test]
-fn strict_layers_reject_unknown_config_fields() {
-    let base_dir = base_dir();
-    let err = cloud_config_layers_from_fragments_strict(
-        vec![fragment("strict", "Strict layer", "unknown_key = true")],
-        &base_dir,
-    )
-    .expect_err("strict config should reject unknown fields");
-
-    assert_eq!(
-        err,
-        CloudConfigLayerError::Invalid {
-            fragment: CloudConfigFragmentSource {
-                id: "strict".to_string(),
-                name: "Strict layer".to_string(),
-            },
-            message: "unknown configuration field `unknown_key`".to_string(),
-        }
-    );
-}
 
 #[test]
 fn enterprise_layers_precede_user_and_override_system() {

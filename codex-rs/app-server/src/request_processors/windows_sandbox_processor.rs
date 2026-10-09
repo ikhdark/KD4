@@ -333,6 +333,14 @@ sandbox = "elevated"
 
     #[test]
     fn windows_sandbox_grant_read_root_skips_already_readable_profiles() {
+        let restricted = PermissionProfile::from_runtime_permissions(
+            &codex_protocol::permissions::FileSystemSandboxPolicy::restricted(Vec::new()),
+            NetworkSandboxPolicy::Restricted,
+        );
+        assert!(
+            windows_sandbox_read_root_grant_required(&restricted)
+                .expect("restricted read roots require a grant")
+        );
         assert!(
             !windows_sandbox_read_root_grant_required(&PermissionProfile::Disabled)
                 .expect("disabled sandbox has unrestricted read access")
@@ -372,7 +380,7 @@ sandbox = "elevated"
 
     #[test]
     fn setup_profile_rejects_named_and_inline_profile_together() {
-        let params = WindowsSandboxSetupStartParams {
+        let mut params = WindowsSandboxSetupStartParams {
             mode: WindowsSandboxSetupMode::Elevated,
             cwd: None,
             permission_profile_id: Some("managed-default".to_string()),
@@ -384,56 +392,38 @@ sandbox = "elevated"
 
         assert_eq!(err.code, INVALID_REQUEST_ERROR_CODE);
         assert!(err.message.contains("mutually exclusive"), "{err:?}");
+        params.permission_profile_id = None;
+        assert!(validate_windows_sandbox_setup_profile(&params).is_ok());
+        params.permission_profile = None;
+        assert!(validate_windows_sandbox_setup_profile(&params).is_ok());
+        params.permission_profile_id = Some("managed-default".to_string());
+        assert!(validate_windows_sandbox_setup_profile(&params).is_ok());
     }
 
     #[test]
-    fn determine_windows_sandbox_readiness_reports_not_configured_when_disabled() {
-        let response = determine_windows_sandbox_readiness_from_state(
-            WindowsSandboxLevel::Disabled,
-            /*sandbox_setup_is_complete*/ false,
-        );
-
-        assert_eq!(response.status, WindowsSandboxReadiness::NotConfigured);
-    }
-
-    #[test]
-    fn determine_windows_sandbox_readiness_reports_ready_for_unelevated_mode() {
-        let response = determine_windows_sandbox_readiness_from_state(
-            WindowsSandboxLevel::RestrictedToken,
-            /*sandbox_setup_is_complete*/ false,
-        );
-
-        assert_eq!(response.status, WindowsSandboxReadiness::Ready);
-    }
-
-    #[test]
-    fn determine_windows_sandbox_readiness_reports_ready_for_complete_elevated_mode() {
-        let response = determine_windows_sandbox_readiness_from_state(
-            WindowsSandboxLevel::Elevated,
-            /*sandbox_setup_is_complete*/ true,
-        );
-
-        assert_eq!(response.status, WindowsSandboxReadiness::Ready);
-    }
-
-    #[test]
-    fn determine_windows_sandbox_readiness_reports_update_required_when_elevated_setup_is_stale() {
-        let response = determine_windows_sandbox_readiness_from_state(
-            WindowsSandboxLevel::Elevated,
-            /*sandbox_setup_is_complete*/ false,
-        );
-
-        assert_eq!(response.status, WindowsSandboxReadiness::UpdateRequired);
-    }
-
-    #[test]
-    fn determine_windows_sandbox_readiness_reports_unsupported_off_windows() {
-        let response = determine_windows_sandbox_readiness_for_platform(
-            /*is_windows*/ false,
-            WindowsSandboxLevel::Elevated,
-            /*sandbox_setup_is_complete*/ true,
-        );
-
-        assert_eq!(response.status, WindowsSandboxReadiness::Unsupported);
+    fn determine_windows_sandbox_readiness_covers_platform_and_setup_states() {
+        for is_windows in [false, true] {
+            for complete in [false, true] {
+                for (level, expected) in [
+                    (WindowsSandboxLevel::Disabled, WindowsSandboxReadiness::NotConfigured),
+                    (WindowsSandboxLevel::RestrictedToken, WindowsSandboxReadiness::Ready),
+                    (
+                        WindowsSandboxLevel::Elevated,
+                        if complete {
+                            WindowsSandboxReadiness::Ready
+                        } else {
+                            WindowsSandboxReadiness::UpdateRequired
+                        },
+                    ),
+                ] {
+                    assert_eq!(
+                        determine_windows_sandbox_readiness_for_platform(is_windows, level, complete)
+                            .status,
+                        if is_windows { expected } else { WindowsSandboxReadiness::Unsupported },
+                        "is_windows={is_windows}, level={level:?}, complete={complete}"
+                    );
+                }
+            }
+        }
     }
 }

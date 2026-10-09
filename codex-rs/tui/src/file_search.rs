@@ -171,6 +171,22 @@ mod tests {
             matches!(rx.try_recv().expect("current results"), AppEvent::FileSearchResult { query, matches, walk_complete }
             if query == "current" && matches.is_empty() && !walk_complete)
         );
+        manager.state.lock().unwrap().session_token = 1;
+        reporter.send_snapshot(&file_search::FileSearchSnapshot {
+            query: "current".to_string(),
+            ..Default::default()
+        });
+        assert!(rx.try_recv().is_err(), "replaced sessions must not publish");
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.session_token = 0;
+            state.latest_query.clear();
+        }
+        reporter.send_snapshot(&file_search::FileSearchSnapshot::default());
+        assert!(rx.try_recv().is_err(), "cleared queries must not publish");
+        drop(manager);
+        reporter.send_snapshot(&file_search::FileSearchSnapshot::default());
+        assert!(rx.try_recv().is_err(), "dropped managers must not publish");
     }
 
     #[tokio::test]

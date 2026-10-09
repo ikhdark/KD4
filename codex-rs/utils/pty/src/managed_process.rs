@@ -609,25 +609,15 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn native_resume_skips_thread_snapshot() {
-        check_suspended_resume(Some(nt_resume_process().expect("native resume export")), true).await;
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn resume_falls_back_when_native_export_is_missing() {
-        check_suspended_resume(None, false).await;
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn resume_falls_back_when_native_resume_fails() {
+    async fn native_resume_and_both_fallback_routes_resume_the_suspended_child() {
         unsafe extern "system" fn failed_resume(
             _process: winapi::um::winnt::HANDLE,
         ) -> winapi::shared::ntdef::NTSTATUS {
             winapi::shared::ntstatus::STATUS_ACCESS_DENIED
         }
 
+        check_suspended_resume(Some(nt_resume_process().expect("native resume export")), true).await;
+        check_suspended_resume(None, false).await;
         check_suspended_resume(Some(failed_resume), false).await;
     }
 

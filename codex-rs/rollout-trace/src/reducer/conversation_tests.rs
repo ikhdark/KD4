@@ -95,6 +95,29 @@ fn json_identity_uses_content_beyond_the_preview() -> anyhow::Result<()> {
 }
 
 #[test]
+fn only_the_builtin_exec_is_labeled_as_javascript() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    let payload = writer.write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input": [
+        {"type":"custom_tool_call", "name":"exec", "call_id":"builtin", "input":"text(1)"},
+        {"type":"custom_tool_call", "name":"exec", "namespace":null, "call_id":"null", "input":"text(2)"},
+        {"type":"custom_tool_call", "name":"exec", "namespace":"external", "call_id":"external", "input":"print('python')"}
+    ]}))?;
+    append_inference_start(&writer, "inference-1", "turn-1", payload)?;
+    let rollout = replay_bundle(temp.path())?;
+    let parts = rollout.inference_calls["inference-1"].request_item_ids.iter()
+        .map(|id| rollout.conversation_items[id].body.parts.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(parts, vec![
+        vec![ConversationPart::Code { language: "javascript".into(), source: "text(1)".into() }],
+        vec![ConversationPart::Code { language: "javascript".into(), source: "text(2)".into() }],
+        vec![ConversationPart::Text { text: "print('python')".into() }],
+    ]);
+    Ok(())
+}
+
+#[test]
 fn reused_call_id_rejects_changed_callee() -> anyhow::Result<()> {
     for field in ["name", "namespace"] {
         let temp = TempDir::new()?;
@@ -457,9 +480,10 @@ fn incremental_request_carries_prior_request_and_response_items_forward() -> any
         rollout.threads["thread-root"].conversation_item_ids,
         second.request_item_ids,
     );
+    let usage = first.usage.as_ref().expect("recorded usage");
     assert_eq!(
-        first.usage.as_ref().map(|usage| usage.input_tokens),
-        Some(10),
+        (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_output_tokens),
+        (10, 1, 5, 2),
     );
 
     Ok(())
@@ -945,12 +969,10 @@ fn unknown_previous_response_id_is_reducer_error() -> anyhow::Result<()> {
 
 #[test]
 fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
-    assert_compaction_boundary_reuse("compaction")
-}
-
-#[test]
-fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
-    assert_compaction_boundary_reuse("context_compaction")
+    for item_type in ["compaction", "context_compaction", "compaction_summary"] {
+        assert_compaction_boundary_reuse(item_type)?;
+    }
+    Ok(())
 }
 
 fn assert_compaction_boundary_reuse(item_type: &str) -> anyhow::Result<()> {

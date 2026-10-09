@@ -192,57 +192,6 @@ async fn websocket_fallback_recovers_first_abrupt_close_and_stays_on_http() -> R
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Result<()> {
-    require_network!();
-
-    let server = responses::start_mock_server().await;
-    Mock::given(method("GET"))
-        .and(path_regex(".*/responses$"))
-        .respond_with(ResponseTemplate::new(426))
-        .mount(&server)
-        .await;
-
-    let response_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-
-    let mut builder = test_codex().with_config({
-        let base_url = format!("{}/v1", server.uri());
-        move |config| {
-            config.model_provider.base_url = Some(base_url);
-            config.model_provider.wire_api = WireApi::Responses;
-            config.model_provider.supports_websockets = true;
-            // If we don't treat 426 specially, the sampling loop would retry the WebSocket
-            // handshake before switching to the HTTP transport.
-            config.model_provider.stream_max_retries = Some(2);
-            config.model_provider.request_max_retries = Some(0);
-        }
-    });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("hello").await?;
-
-    let requests = server.received_requests().await.unwrap_or_default();
-    let websocket_attempts = requests
-        .iter()
-        .filter(|req| req.method == Method::GET && req.url.path().ends_with("/responses"))
-        .count();
-    let http_attempts = requests
-        .iter()
-        .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
-        .count();
-
-    // The startup prewarm request sees 426 and immediately switches the session to HTTP fallback,
-    // so the first turn goes straight to HTTP with no additional websocket connect attempt.
-    assert_eq!(websocket_attempts, 1);
-    assert_eq!(http_attempts, 1);
-    assert_eq!(response_mock.requests().len(), 1);
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
@@ -417,6 +366,14 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.submit_turn("first").await?;
+    let first_requests = server.received_requests().await.expect("captured requests");
+    assert_eq!(first_requests.iter().filter(|req| {
+        req.method == Method::GET && req.url.path().ends_with("/responses")
+    }).count(), 1);
+    assert_eq!(first_requests.iter().filter(|req| {
+        req.method == Method::POST && req.url.path().ends_with("/responses")
+    }).count(), 1);
+    assert_eq!(response_mock.requests().len(), 1);
     test.submit_turn("second").await?;
 
     let requests = server.received_requests().await.unwrap_or_default();

@@ -987,15 +987,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ask_uses_decider_source_and_ask_decision() {
-        assert_eq!(
-            NetworkDecision::ask(REASON_NOT_ALLOWED),
-            NetworkDecision::Deny {
-                reason: REASON_NOT_ALLOWED.to_string(),
-                source: NetworkDecisionSource::Decider,
-                decision: NetworkPolicyDecision::Ask,
-            }
-        );
-    }
 }

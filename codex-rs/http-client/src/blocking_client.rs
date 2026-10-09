@@ -48,12 +48,11 @@ impl BlockingHttpClientBuilder {
         self.request_timeout(Some(timeout))
     }
 
-    /// Replaces the transport root set with the certificate encoded by `pem`.
+    /// Replaces the transport root set with the certificates encoded by `pem`.
     ///
     /// Process custom CA environment variables are not added to this exclusive root set.
-    pub fn tls_certs_only_pem(mut self, pem: &[u8]) -> Result<Self, HttpError> {
-        let certificate = reqwest::Certificate::from_pem(pem)?;
-        self.tls_certs_only = Some(vec![certificate]);
+    pub fn tls_certs_only_pem(mut self, pem: &[u8]) -> Result<Self, io::Error> {
+        self.tls_certs_only = Some(crate::custom_ca::parse_explicit_root_certificates(pem)?);
         Ok(self)
     }
 

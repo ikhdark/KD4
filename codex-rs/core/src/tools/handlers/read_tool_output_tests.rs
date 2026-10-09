@@ -868,6 +868,13 @@ fn terminal_recovery_results_complete_after_the_validation_pass() {
         usize::MAX,);
 
     assert_eq!(state.next_step(), ContinuationStep::Complete);
+    let result = state.finish();
+    assert!(!result.output.complete, "stopping traversal does not complete unavailable selections");
+    assert_eq!(result.output.results.iter().map(|row| row.status).collect::<Vec<_>>(), vec![
+        ToolOutputSelectorStatus::Ok,
+        ToolOutputSelectorStatus::SelectorTooLarge,
+        ToolOutputSelectorStatus::AggregateOmitted,
+    ]);
 }
 
 #[test]
@@ -1172,19 +1179,24 @@ fn continuation_identity_drift_stops_without_mutating_the_aggregate() {
         Some(second_selector.clone()),
         "first page",
     )]);
-    let mut drifted_page = recovery_output(vec![continuation_result(
+    let page = recovery_output(vec![continuation_result(
         second_selector.clone(),
         None,
         "second page",
     )]);
-    drifted_page.canonical_sha256 = "different-revision".to_string();
-    let mut state = RecoveryContinuationState::new(initial.clone(), usize::MAX);
-
-    assert_eq!(
-        state.accept_page(0, &second_selector, drifted_page),
-        Err(ContinuationStopReason::IdentityDrift)
-    );
-    assert_eq!(state.finish().output, initial);
+    for changed in ["hash", "artifact", "continuation"] {
+        let mut drifted_page = page.clone();
+        let mut selector = second_selector.clone();
+        match changed {
+            "hash" => drifted_page.canonical_sha256 = "different-revision".to_string(),
+            "artifact" => drifted_page.artifact_id = "different-artifact".to_string(),
+            _ => selector = page_selector(20),
+        }
+        let mut state = RecoveryContinuationState::new(initial.clone(), usize::MAX);
+        assert_eq!(state.accept_page(0, &selector, drifted_page),
+            Err(ContinuationStopReason::IdentityDrift), "{changed}");
+        assert_eq!(state.finish().output, initial, "{changed}");
+    }
 }
 
 #[test]
@@ -1624,19 +1636,6 @@ fn continuation_page_error_preserves_retryability_and_cause() {
 }
 
 #[test]
-fn default_range_is_exactly_two_hundred_lines() {
-    let args = ReadToolOutputArgs {
-        artifact_id: uuid::Uuid::now_v7().to_string(),
-        selectors: None,
-        start_line: Some(17),
-        end_line: None,
-        ranges: None,
-        max_bytes: None,
-    };
-    assert_eq!(resolved_line_range(&args).unwrap(), (17, 216));
-}
-
-#[test]
 fn legacy_single_range_uses_the_canonical_line_invariants() {
     for (start_line, end_line) in [(0, Some(1)), (3, Some(2))] {
         let args = ReadToolOutputArgs {
@@ -1650,7 +1649,7 @@ fn legacy_single_range_uses_the_canonical_line_invariants() {
         assert!(resolved_selectors(&args).is_err());
     }
 
-    let args = ReadToolOutputArgs {
+    let mut args = ReadToolOutputArgs {
         artifact_id: uuid::Uuid::now_v7().to_string(),
         selectors: None,
         start_line: Some(3),
@@ -1662,6 +1661,15 @@ fn legacy_single_range_uses_the_canonical_line_invariants() {
         resolved_selectors(&args).unwrap(),
         vec![ToolOutputSelector::Lines { start: 3, end: 3 }]
     );
+    args.start_line = Some(17);
+    args.end_line = None;
+    assert_eq!(resolved_selectors(&args).unwrap(),
+        vec![ToolOutputSelector::Lines { start: 17, end: 216 }]);
+    args.start_line = None;
+    assert_eq!(resolved_selectors(&args).unwrap(),
+        vec![ToolOutputSelector::Lines { start: 1, end: 200 }]);
+    args.start_line = Some(usize::MAX);
+    assert!(resolved_selectors(&args).is_err());
 }
 
 #[test]
@@ -1806,7 +1814,7 @@ fn three_exact_ranges_become_one_bounded_owner_batch() {
 }
 
 #[test]
-fn legacy_ranges_are_sorted_merged_and_capped_at_sixteen() {
+fn legacy_ranges_are_sorted_merged_and_capped_at_the_declared_limit() {
     let mut args = ReadToolOutputArgs {
         artifact_id: uuid::Uuid::now_v7().to_string(),
         selectors: None,

@@ -936,27 +936,8 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     };
     assert!(!router.tool_supports_parallel(&different_server_call));
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()> {
-    let (_, turn) = make_session_and_context().await;
-    let turn = Arc::new(turn);
-    let step_context = StepContext::for_test(Arc::clone(&turn));
-    let router = ToolRouter::from_context(
-        step_context.as_ref(),
-        ToolRouterParams {
-            tool_suggest_candidates: None,
-            deferred_mcp_tools: None,
-            mcp_tools: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: turn.dynamic_tools.as_slice(),
-            exposure_identity: Default::default(),
-        },
-        &Default::default(),
-    );
-
+    // Hosted tools have no local executor and must not inherit parallel support.
+    assert!(!router.has_registered_tool(&ToolName::plain("web_search")));
     assert!(!router.tool_supports_parallel(&ToolCall {
         tool_name: ToolName::plain("web_search"),
         call_id: "call-web-search".to_string(),
@@ -2640,7 +2621,12 @@ async fn code_mode_activation_keeps_provider_schemas_but_registers_dispatch_tool
     let additions = manifest["activated_additional_schemas"]
         .as_array()
         .expect("activated additions are an array");
-    assert!(serde_json::Value::from(additions.clone()).to_string().contains("deferred_reader"));
+    assert_eq!(
+        additions,
+        &vec![serde_json::to_value(
+            router.registry.registered_tool(&name).unwrap().spec()
+        ).unwrap()]
+    );
     let visible = manifest["model_visible"].as_array().expect("model-visible schemas");
     assert!(
         additions.iter().all(|spec| !visible.contains(spec)),

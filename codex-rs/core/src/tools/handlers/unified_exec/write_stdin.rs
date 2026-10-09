@@ -419,12 +419,18 @@ mod tests {
 
     #[test]
     fn accepts_full_unsigned_session_id_range() {
-        let args: WriteStdinArgs =
-            serde_json::from_str(r#"{"session_id":2374420115,"chars":"","yield_time_ms":1000}"#)
-                .expect("session id returned by exec_command should deserialize");
-
-        assert_eq!(args.session_id, 2_374_420_115);
-        assert_eq!(args.yield_time_ms, Some(1_000));
+        for session_id in [0, 2_374_420_115_u64, u64::from(u32::MAX)] {
+            let args: WriteStdinArgs = serde_json::from_value(serde_json::json!({
+                "session_id": session_id, "chars": "", "yield_time_ms": 1000,
+            })).expect("session id returned by exec_command should deserialize");
+            assert_eq!(u64::from(args.session_id), session_id);
+            assert_eq!(args.yield_time_ms, Some(1_000));
+        }
+        for session_id in [serde_json::json!(-1), serde_json::json!(u64::from(u32::MAX) + 1), serde_json::json!(1.5)] {
+            assert!(serde_json::from_value::<WriteStdinArgs>(serde_json::json!({
+                "session_id": session_id,
+            })).is_err());
+        }
     }
 
     #[test]
@@ -440,10 +446,6 @@ mod tests {
             );
         }
         assert_eq!(owner_wait_yield_time_ms("", None, false), 300_000);
-    }
-
-    #[test]
-    fn nested_default_poll_returns_before_its_cell_yields() {
         // The code-mode cell hands control back after five silent minutes; an
         // equal poll default always lost that race and cost a `wait` call.
         let nested = owner_wait_yield_time_ms("", None, true);

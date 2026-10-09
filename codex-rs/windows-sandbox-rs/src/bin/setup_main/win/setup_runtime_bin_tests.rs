@@ -3,26 +3,22 @@ use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 
 #[test]
-fn runtime_paths_include_desktop_and_primary_runtime_roots() {
+fn runtime_paths_include_only_available_runtime_roots() {
     let local_app_data = PathBuf::from(r"C:\Users\user\AppData\Local");
     let user_profile = PathBuf::from(r"C:\Users\user");
-
-    assert_eq!(
-        runtime_paths(Some(local_app_data), Some(user_profile)),
-        vec![
-            PathBuf::from(r"C:\Users\user\AppData\Local\OpenAI\Codex\bin"),
-            PathBuf::from(r"C:\Users\user\AppData\Local\OpenAI\Codex\runtimes"),
-            PathBuf::from(r"C:\Users\user\.cache\codex-runtimes"),
-        ]
-    );
-}
-
-#[test]
-fn primary_runtime_path_does_not_depend_on_local_app_data() {
-    let user_profile = PathBuf::from(r"C:\Users\user");
-
-    assert_eq!(
-        runtime_paths(/*local_app_data*/ None, Some(user_profile)),
-        vec![PathBuf::from(r"C:\Users\user\.cache\codex-runtimes")]
-    );
+    let desktop = vec![
+        PathBuf::from(r"C:\Users\user\AppData\Local\OpenAI\Codex\bin"),
+        PathBuf::from(r"C:\Users\user\AppData\Local\OpenAI\Codex\runtimes"),
+    ];
+    let primary = PathBuf::from(r"C:\Users\user\.cache\codex-runtimes");
+    let mut both = desktop.clone();
+    both.push(primary.clone());
+    for (local, profile, expected) in [
+        (Some(local_app_data.clone()), Some(user_profile.clone()), both),
+        (Some(local_app_data), None, desktop),
+        (None, Some(user_profile), vec![primary]),
+        (None, None, vec![]),
+    ] {
+        assert_eq!(runtime_paths(local, profile), expected);
+    }
 }

@@ -441,7 +441,9 @@ fn custom_tool_call_body(item: &Value, raw_payload: &RawPayloadRef) -> Conversat
     let Some(input) = item.get("input").and_then(Value::as_str) else {
         return json_body(item, raw_payload);
     };
-    if item.get("name").and_then(Value::as_str) == Some("exec") {
+    if item.get("name").and_then(Value::as_str) == Some("exec")
+        && item.get("namespace").is_none_or(Value::is_null)
+    {
         ConversationBody {
             parts: vec![ConversationPart::Code {
                 language: "javascript".to_string(),

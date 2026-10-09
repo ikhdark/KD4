@@ -111,7 +111,20 @@ async fn search_rollout_matches_with_query(
     else {
         return scan_rollout_matches(root.as_path(), query).await;
     };
-    let mut matches = plain_matches;
+    let mut matches = HashMap::new();
+    for (path, snippet) in plain_matches {
+        if snippet.is_some() {
+            insert_rollout_match(&mut matches, path, snippet);
+            continue;
+        }
+        // A payload reference is only a candidate. Search its canonical hydrated lines
+        // after ripgrep has exited, so storage cannot block draining the child pipes.
+        let (matched, snippet) =
+            inspect_rollout_match(&path, &query.json_matcher, &query.text_matcher).await?;
+        if matched {
+            insert_rollout_match(&mut matches, path, snippet);
+        }
+    }
     for (path, snippet) in scan_compressed_rollout_matches(root.as_path(), query).await? {
         insert_rollout_match(&mut matches, path, snippet);
     }
@@ -174,8 +187,11 @@ fn rollout_ripgrep_command(rg_command: &Path, root: &Path, json_search_term: &st
         .arg("--no-ignore")
         .arg("--glob")
         .arg("*.jsonl")
-        .arg("--")
+        .arg("-e")
         .arg(json_search_term)
+        .arg("-e")
+        .arg(super::payload_artifact::KIND)
+        .arg("--")
         .arg(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -576,17 +592,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn insert_rollout_match_upgrades_missing_snippet_without_replacing_first_snippet() {
-        let path = PathBuf::from("rollout.jsonl");
-        let mut matches = RolloutSearchMatches::new();
 
-        insert_rollout_match(&mut matches, path.clone(), None);
-        insert_rollout_match(&mut matches, path.clone(), Some("first".to_string()));
-        insert_rollout_match(&mut matches, path.clone(), Some("later".to_string()));
-
-        assert_eq!(matches.get(&path), Some(&Some("first".to_string())));
-    }
 
     #[tokio::test]
     async fn compressed_scan_retains_metadata_only_match() {
@@ -633,8 +639,11 @@ mod tests {
                 "--no-ignore",
                 "--glob",
                 "*.jsonl",
-                "--",
+                "-e",
                 "needle",
+                "-e",
+                "rollout_payload_artifact",
+                "--",
                 "sessions",
             ]
         );
@@ -644,6 +653,7 @@ mod tests {
     async fn read_ripgrep_rollout_matches_keeps_one_path_and_first_snippet() {
         let root = Path::new("sessions");
         let path = "2026/07/09/rollout-test.jsonl";
+        let metadata_line = user_rollout_line("needle", "unrelated conversation");
         let first_line = user_rollout_line("2026-07-09T00:00:00Z", "first needle");
         let later_line = user_rollout_line("2026-07-09T00:00:01Z", "later needle");
         let output = (0..1_000)
@@ -651,6 +661,8 @@ mod tests {
                 ripgrep_match(
                     path,
                     if index == 0 {
+                        metadata_line.as_str()
+                    } else if index == 1 {
                         first_line.as_str()
                     } else {
                         later_line.as_str()
@@ -735,5 +747,43 @@ mod tests {
             parse_ripgrep_rollout_match(&ripgrep_match("notes.jsonl", &line), &root, &regex),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn payload_artifact_search_matches_inline_and_fallback_semantics() -> io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("sessions");
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("rollout-2026-01-01T00-00-00-00000000-0000-0000-0000-000000000001.jsonl");
+        let line = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "cwd": home.path(), "originator": "metadata-needle".repeat(1024),
+                "cli_version": "test", "source": "cli"
+            }
+        });
+        let serialized = serde_json::to_vec(&line)?;
+        let item: RolloutLine = serde_json::from_slice(&serialized)?;
+        assert!(super::super::payload_artifact::is_artifact_candidate(&item.item));
+        let reference = super::super::payload_artifact::store_line(&path, &serialized)?;
+        assert!(!String::from_utf8_lossy(&reference).contains("metadata-needle"));
+        std::fs::write(&path, &reference)?;
+        // The public path search retains metadata-only matches, but a reference alone
+        // must never count as a hit. The ordinary conversation after it remains visible.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        writeln!(file, "{}", user_rollout_line("2026-01-01T00:00:01Z", "later conversation"))?;
+        drop(file);
+        for (term, expected) in [
+            ("metadata-needle", HashMap::from([(path.clone(), None)])),
+            ("later conversation", HashMap::from([(path.clone(), Some("later conversation".to_string()))])),
+            ("not-present", HashMap::new()),
+        ] {
+            assert_eq!(search_rollout_matches(Path::new("rg"), home.path(), false, term).await?, expected);
+            assert_eq!(search_rollout_matches(&home.path().join("missing-rg"), home.path(), false, term).await?, expected);
+        }
+        Ok(())
     }
 }

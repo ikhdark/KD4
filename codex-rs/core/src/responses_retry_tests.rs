@@ -27,10 +27,6 @@ fn unexpected_status(status: StatusCode) -> CodexErr {
 #[test]
 fn response_stream_retries_transport_timeouts() {
     assert!(should_retry_response_stream(&CodexErr::RequestTimeout));
-}
-
-#[test]
-fn sampling_stream_error_keeps_its_outer_retry() {
     assert!(should_retry_response_stream(&CodexErr::Stream(
         "disconnected".to_string(),
         None
@@ -335,7 +331,13 @@ async fn transport_fallback_honors_the_original_retry_after_deadline() {
     );
     assert!(!session.services.model_client.responses_websocket_enabled());
     assert!(
-        turn_context.turn_timing_state.complete_snapshot().profile.exclusive.retry_only_ns > 0,
+        turn_context
+            .turn_timing_state
+            .complete_snapshot()
+            .profile
+            .exclusive
+            .retry_only_ns
+            > 0,
         "fallback Retry-After waiting must be attributed to retry backoff"
     );
 }
@@ -591,56 +593,37 @@ fn audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_trans
     assert!(!should_switch_fallback_transport(&unknown));
 }
 
-/// Narrow scheduling benchmark; no provider traffic or wall-clock sleeps.
 #[tokio::test(start_paused = true)]
-async fn provider_retry_timing_microbenchmark() {
-    let error = CodexErr::Stream("benchmark".into(), None);
-    let mut saturated_distinct = 0;
+async fn provider_retry_preserves_jitter_and_prioritizes_cancellation() {
+    let error = CodexErr::Stream("retry".into(), None);
     for retry in [1, 5, 6, 100] {
-        let started = std::time::Instant::now();
-        let mut delays = (0..4096)
+        let mut delays = (0..32)
             .map(|_| response_stream_retry_delay(&error, retry))
             .collect::<Vec<_>>();
-        let elapsed = started.elapsed();
         delays.sort_unstable();
         let minimum = delays[0];
         let maximum = delays[delays.len() - 1];
         delays.dedup();
         assert!(maximum <= MAX_RESPONSE_STREAM_RETRY_DELAY);
-        // The old policy applied a second cap after jitter and collapsed all
-        // saturated delays. Keep that formula as the benchmark's reference.
-        let mut baseline = (0..4096)
-            .map(|_| crate::retry::backoff(retry).min(MAX_RESPONSE_STREAM_RETRY_DELAY))
-            .collect::<Vec<_>>();
-        baseline.sort_unstable();
-        baseline.dedup();
         if retry == 100 {
-            saturated_distinct = delays.len();
-            assert_eq!(baseline.len(), 1);
             assert!(minimum >= MAX_RESPONSE_STREAM_RETRY_DELAY.mul_f64(0.9));
+            assert!(delays.len() > 1, "saturated retries must retain jitter");
         }
-        println!("retry={retry} samples=4096 baseline_distinct={} distinct={} min_us={} max_us={} compute_us={}",
-            baseline.len(), delays.len(), minimum.as_micros(), maximum.as_micros(), elapsed.as_micros());
     }
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     let deadline = tokio::time::Instant::now() - Duration::from_secs(1);
-    let mut allowed_after_cancel = 0;
-    let mut baseline_allowed_after_cancel = 0;
-    for _ in 0..1024 {
-        // Reference the former unbiased selection when both branches are ready.
-        baseline_allowed_after_cancel += tokio::select! {
-            _ = cancellation.cancelled() => 0,
-            _ = tokio::time::sleep_until(deadline) => 1,
-        };
-        if wait_for_retry_deadline(deadline, &cancellation).await.is_ok() {
-            allowed_after_cancel += 1;
-        }
+    // Exercise both-ready selection repeatedly to catch accidental unbiased selection.
+    for _ in 0..32 {
+        assert!(
+            matches!(
+                wait_for_retry_deadline(deadline, &cancellation).await,
+                Err(CodexErr::TurnAborted)
+            ),
+            "cancellation must win expired deadlines"
+        );
     }
-    println!("cancelled_expired_deadline samples=1024 baseline_allowed={baseline_allowed_after_cancel} allowed={allowed_after_cancel}");
-    assert!(saturated_distinct > 1, "saturated retries must retain jitter");
-    assert_eq!(allowed_after_cancel, 0, "cancellation must win expired deadlines");
 }
 
 #[tokio::test]

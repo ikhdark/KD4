@@ -353,6 +353,15 @@ mod tests {
         assert!(is_full_git_sha("0123456789abcdef0123456789abcdef01234567"));
         assert!(!is_full_git_sha("main"));
         assert!(!is_full_git_sha("0123456"));
+        assert_eq!(
+            git_remote_revision(
+                "not-a-repository",
+                Some("0123456789ABCDEF0123456789ABCDEF01234567"),
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
     }
 
     #[test]
@@ -372,24 +381,27 @@ mod tests {
     }
 
     #[test]
-    fn strips_windows_verbatim_disk_prefix_for_git() {
-        assert_eq!(
-            strip_windows_verbatim_path_prefix(r"\\?\C:\Users\alice\marketplace"),
-            Some(r"C:\Users\alice\marketplace".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_windows_verbatim_unc_prefix_for_git() {
-        assert_eq!(
-            strip_windows_verbatim_path_prefix(r"\\?\UNC\server\share\marketplace"),
-            Some(r"\\server\share\marketplace".to_string())
-        );
-    }
-
-    #[test]
-    fn leaves_non_verbatim_path_without_rewrite() {
-        assert_eq!(strip_windows_verbatim_path_prefix(r"C:\Users\alice"), None);
+    fn git_paths_strip_only_windows_verbatim_prefixes() {
+        for (path, expected) in [
+            (
+                r"\\?\C:\Users\alice\marketplace",
+                Some(r"C:\Users\alice\marketplace"),
+            ),
+            (
+                r"\\?\UNC\server\share\marketplace",
+                Some(r"\\server\share\marketplace"),
+            ),
+            (r"C:\Users\alice", None),
+        ] {
+            assert_eq!(
+                strip_windows_verbatim_path_prefix(path),
+                expected.map(str::to_string)
+            );
+            assert_eq!(
+                super::git_path_arg(std::path::Path::new(path)),
+                std::path::PathBuf::from(expected.unwrap_or(path))
+            );
+        }
     }
 
     fn command_env<'a>(

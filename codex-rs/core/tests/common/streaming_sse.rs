@@ -466,40 +466,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn none_gate_streams_immediately() {
-        let chunks = vec![StreamingSseChunk {
-            gate: None,
-            body: "event: immediate\n\n".to_string(),
-        }];
-        let (server, _) = start_streaming_sse_server(vec![chunks]).await;
-        let mut stream = connect(server.uri()).await;
-        send_request(
-            &mut stream,
-            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
-        )
-        .await;
-        let (headers, remainder) = read_until(&mut stream, "\r\n\r\n").await;
-        let (headers, _) = split_response(&headers);
-        assert_eq!(status_code(headers), 200);
-        let immediate = format!("{remainder}{}", read_to_end(&mut stream).await);
-        assert_eq!(immediate, "event: immediate\n\n");
-        server.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn post_responses_with_no_queue_returns_500() {
+    async fn invalid_requests_return_distinct_errors() {
         let (server, _) = start_streaming_sse_server(Vec::new()).await;
-        let mut stream = connect(server.uri()).await;
-        send_request(
-            &mut stream,
-            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
-        )
-        .await;
-        let response = read_to_end(&mut stream).await;
-        let (headers, body) = split_response(&response);
-        assert_eq!(status_code(headers), 500);
-        assert_eq!(header_value(headers, "content-type"), Some("text/plain"));
-        assert_eq!(body, "no responses queued");
+        for (request, status, expected_body) in [
+            ("POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n", 500, "no responses queued"),
+            ("GET /v1/unknown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 404, "not found"),
+            ("BAD\r\n\r\n", 400, "bad request"),
+        ] {
+            let mut stream = connect(server.uri()).await;
+            send_request(&mut stream, request).await;
+            let response = read_to_end(&mut stream).await;
+            let (headers, body) = split_response(&response);
+            assert_eq!(status_code(headers), status);
+            assert_eq!(header_value(headers, "content-type"), Some("text/plain"));
+            assert_eq!(body, expected_body);
+        }
         server.shutdown().await;
     }
 
@@ -599,35 +580,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn unknown_route_returns_404() {
-        let (server, _) = start_streaming_sse_server(Vec::new()).await;
-        let mut stream = connect(server.uri()).await;
-        send_request(
-            &mut stream,
-            "GET /v1/unknown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        )
-        .await;
-        let response = read_to_end(&mut stream).await;
-        let (headers, body) = split_response(&response);
-        assert_eq!(status_code(headers), 404);
-        assert_eq!(header_value(headers, "content-type"), Some("text/plain"));
-        assert_eq!(body, "not found");
-        server.shutdown().await;
-    }
 
-    #[tokio::test]
-    async fn malformed_request_returns_400() {
-        let (server, _) = start_streaming_sse_server(Vec::new()).await;
-        let mut stream = connect(server.uri()).await;
-        send_request(&mut stream, "BAD\r\n\r\n").await;
-        let response = read_to_end(&mut stream).await;
-        let (headers, body) = split_response(&response);
-        assert_eq!(status_code(headers), 400);
-        assert_eq!(header_value(headers, "content-type"), Some("text/plain"));
-        assert_eq!(body, "bad request");
-        server.shutdown().await;
-    }
 
     #[tokio::test]
     async fn responses_post_drains_request_body() {
@@ -662,6 +615,12 @@ data: {"type":"response.completed","response":{"id":"resp-1"}}
 
         let bytes = resp.bytes().await.expect("read response body");
         assert_eq!(bytes, response_body.as_bytes());
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[0]).expect("recorded JSON request"),
+            payload,
+        );
 
         let completion = completions.remove(0);
         let completed_at = completion.await.expect("completion timestamp");

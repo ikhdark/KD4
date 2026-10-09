@@ -77,7 +77,10 @@ impl PartialEq for ToolOutputSchema {
                 OutputSchemaStorage::McpCallToolResult(left),
                 OutputSchemaStorage::McpCallToolResult(right),
             ) => match (left, right) {
-                (Some(left), Some(right)) => left == right,
+                // Lazy schemas keep the producer's ordering, but materialized
+                // schemas canonicalize set-valued keywords. Equality must not
+                // depend on storage representation (or violate transitivity).
+                (Some(left), Some(right)) => left == right || self.to_value() == other.to_value(),
                 (None, None) => true,
                 (Some(schema), None) | (None, Some(schema)) => schema.is_empty(),
             },

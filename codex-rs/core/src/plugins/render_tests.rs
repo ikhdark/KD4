@@ -2,27 +2,6 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn render_plugins_section_returns_none_for_empty_plugins() {
-    assert_eq!(render_plugins_section(&[]), None);
-}
-
-#[test]
-fn render_plugins_section_keeps_plugin_usage_guidance_without_listing_plugins() {
-    let rendered = render_plugins_section(&[PluginCapabilitySummary {
-        config_name: "sample@test".to_string(),
-        display_name: "sample".to_string(),
-        description: Some("inspect sample data".to_string()),
-        has_skills: true,
-        ..PluginCapabilitySummary::default()
-    }])
-    .expect("plugin section should render");
-
-    let expected = "<plugins_instructions>\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; use the contributed capability, not the bundle. Prefer a named plugin's relevant capability, loading or discovering it through its existing route when needed. If unavailable, explain the limitation; use a fallback only if it preserves the requested source and scope.\n</plugins_instructions>";
-
-    assert_eq!(rendered, expected);
-}
-
-#[test]
 fn explicit_plugin_instructions_use_namespace_for_skill_prefix() {
     let rendered = render_explicit_plugin_instructions(
         &PluginCapabilitySummary {

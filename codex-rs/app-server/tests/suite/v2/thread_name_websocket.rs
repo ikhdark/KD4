@@ -194,3 +194,166 @@ async fn assert_legacy_thread_name(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()> {
+    use codex_app_server_protocol::ThreadArchiveParams;
+    use codex_app_server_protocol::ThreadArchiveResponse;
+    use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::ThreadUnarchiveParams;
+    use codex_app_server_protocol::ThreadUnarchiveResponse;
+    use codex_app_server_protocol::ThreadUnsubscribeParams;
+    use codex_app_server_protocol::ThreadUnsubscribeResponse;
+    use codex_app_server_protocol::ThreadUnsubscribeStatus;
+    use codex_app_server_protocol::TurnCompletedNotification;
+    use codex_app_server_protocol::TurnStartParams;
+    use codex_app_server_protocol::TurnStartResponse;
+    use codex_app_server_protocol::TurnStatus;
+    use codex_app_server_protocol::UserInput;
+
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let thread_id = create_rollout(codex_home.path(), "2025-01-05T12-10-00")?;
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+
+    // Two independent subprocesses would hide stale subscription-table entries.
+    let result = timeout(DEFAULT_READ_TIMEOUT, async {
+        let mut primary = connect_websocket(bind_addr).await?;
+        let mut secondary = connect_websocket(bind_addr).await?;
+        initialize_both_clients(&mut primary, &mut secondary).await?;
+
+        send_request(
+            &mut primary,
+            "thread/resume",
+            10,
+            Some(serde_json::to_value(
+                ThreadResumeParams {
+                    thread_id: thread_id.clone(),
+                    ..Default::default()
+                },
+            )?),
+        )
+        .await?;
+        let initial: ThreadResumeResponse =
+            to_response(read_response_for_id(&mut primary, 10).await?)?;
+        assert_eq!(initial.thread.id, thread_id);
+
+        send_request(
+            &mut primary,
+            "thread/archive",
+            11,
+            Some(serde_json::to_value(
+                ThreadArchiveParams {
+                    thread_id: thread_id.clone(),
+                },
+            )?),
+        )
+        .await?;
+        let (archived, _) = read_response_and_notification_for_method(
+            &mut primary,
+            11,
+            "thread/archived",
+        )
+        .await?;
+        let _: ThreadArchiveResponse = to_response(archived)?;
+
+        send_request(
+            &mut primary,
+            "thread/unarchive",
+            12,
+            Some(serde_json::to_value(
+                ThreadUnarchiveParams {
+                    thread_id: thread_id.clone(),
+                },
+            )?),
+        )
+        .await?;
+        let (unarchived, _) = read_response_and_notification_for_method(
+            &mut primary,
+            12,
+            "thread/unarchived",
+        )
+        .await?;
+        let unarchived: ThreadUnarchiveResponse = to_response(unarchived)?;
+        assert_eq!(unarchived.thread.id, thread_id);
+        assert_eq!(unarchived.thread.status, ThreadStatus::NotLoaded);
+
+        send_request(
+            &mut secondary,
+            "thread/resume",
+            13,
+            Some(serde_json::to_value(
+                ThreadResumeParams {
+                    thread_id: thread_id.clone(),
+                    ..Default::default()
+                },
+            )?),
+        )
+        .await?;
+        let resumed: ThreadResumeResponse =
+            to_response(read_response_for_id(&mut secondary, 13).await?)?;
+        assert_eq!(resumed.thread.id, thread_id);
+        assert_eq!(resumed.thread.status, ThreadStatus::Idle);
+
+        send_request(
+            &mut secondary,
+            "turn/start",
+            14,
+            Some(serde_json::to_value(
+                TurnStartParams {
+                    thread_id: thread_id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "secondary turn".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+            )?),
+        )
+        .await?;
+        let (started, completed) = read_response_and_notification_for_method(
+            &mut secondary,
+            14,
+            "turn/completed",
+        )
+        .await?;
+        let started: TurnStartResponse = to_response(started)?;
+        let completed: TurnCompletedNotification =
+            serde_json::from_value(completed.params.context("turn/completed params")?)?;
+        assert_eq!(completed.thread_id, thread_id);
+        assert_eq!(completed.turn.id, started.turn.id);
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+        assert_eq!(completed.turn.error, None);
+
+        assert!(
+            timeout(
+                Duration::from_millis(250),
+                read_notification_for_method(&mut primary, "turn/started"),
+            )
+            .await
+            .is_err(),
+            "archived subscriber must not receive the resumed thread's turn"
+        );
+        send_request(
+            &mut primary,
+            "thread/unsubscribe",
+            15,
+            Some(serde_json::to_value(
+                ThreadUnsubscribeParams { thread_id },
+            )?),
+        )
+        .await?;
+        let unsubscribed: ThreadUnsubscribeResponse =
+            to_response(read_response_for_id(&mut primary, 15).await?)?;
+        assert_eq!(unsubscribed.status, ThreadUnsubscribeStatus::NotSubscribed);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    result?
+}

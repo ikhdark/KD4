@@ -619,25 +619,16 @@ mod tests {
     }
 
     #[test]
-    fn thread_row_parses_reasoning_effort() {
-        let metadata = ThreadMetadata::try_from(thread_row(Some("high")))
-            .expect("thread metadata should parse");
-
-        assert_eq!(
-            metadata,
-            expected_thread_metadata(Some(ReasoningEffort::High))
-        );
-    }
-
-    #[test]
-    fn thread_row_preserves_model_defined_reasoning_effort_values() {
-        let metadata = ThreadMetadata::try_from(thread_row(Some("future")))
-            .expect("thread metadata should parse");
-
-        assert_eq!(
-            metadata,
-            expected_thread_metadata(Some(ReasoningEffort::Custom("future".to_string())))
-        );
+    fn thread_row_parses_known_custom_and_absent_reasoning_effort() {
+        for (wire, expected) in [
+            (Some("high"), Some(ReasoningEffort::High)),
+            (Some("future"), Some(ReasoningEffort::Custom("future".to_string()))),
+            (None, None),
+        ] {
+            let metadata = ThreadMetadata::try_from(thread_row(wire))
+                .expect("thread metadata should parse");
+            assert_eq!(metadata, expected_thread_metadata(expected), "{wire:?}");
+        }
     }
 
     #[test]

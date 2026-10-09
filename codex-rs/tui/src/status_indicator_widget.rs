@@ -529,10 +529,14 @@ mod tests {
         widget.pause_timer_at(baseline + Duration::from_secs(5));
         let paused_elapsed = widget.elapsed_seconds_at(baseline + Duration::from_secs(10));
         assert_eq!(paused_elapsed, before_pause);
+        widget.pause_timer_at(baseline + Duration::from_secs(10));
+        assert_eq!(widget.elapsed_seconds_at(baseline + Duration::from_secs(10)), 5);
 
         widget.resume_timer_at(baseline + Duration::from_secs(10));
         let after_resume = widget.elapsed_seconds_at(baseline + Duration::from_secs(13));
         assert_eq!(after_resume, before_pause + 3);
+        widget.resume_timer_at(baseline + Duration::from_secs(13));
+        assert_eq!(widget.elapsed_seconds_at(baseline + Duration::from_secs(14)), 9);
     }
 
     #[test]

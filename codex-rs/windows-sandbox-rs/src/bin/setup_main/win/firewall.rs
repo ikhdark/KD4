@@ -471,7 +471,15 @@ fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) ->
                     format!("SetRemoteAddresses failed: {err:?}"),
                 ))
             })?;
-        if let Some(remote_ports) = spec.remote_ports {
+        // Existing TCP/UDP rules may still contain a previous proxy exception.
+        // None means all ports, not "leave the old scope unchanged". Other
+        // protocols do not support a RemotePorts property.
+        let remote_ports = spec.remote_ports.or_else(|| {
+            (spec.protocol == NET_FW_IP_PROTOCOL_TCP.0
+                || spec.protocol == NET_FW_IP_PROTOCOL_UDP.0)
+                .then_some("*")
+        });
+        if let Some(remote_ports) = remote_ports {
             rule.SetRemotePorts(&BSTR::from(remote_ports))
                 .map_err(|err| {
                     anyhow::Error::new(SetupFailure::new(
@@ -628,6 +636,16 @@ mod tests {
 
     #[test]
     fn production_firewall_rule_network_scopes_are_accepted_by_firewall_com() {
+        for (allowed, expected) in [
+            (vec![], "1-65535"),
+            (vec![0, 1, 1, 2, 65535], "3-65534"),
+            (vec![1, 3, 65535], "2,4-65534"),
+        ] {
+            assert_eq!(
+                blocked_loopback_tcp_remote_ports(&allowed).as_deref(),
+                Some(expected)
+            );
+        }
         // SAFETY: The reserved pointer is null; this test initializes COM on its own thread and
         // balances success with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -713,35 +731,54 @@ mod tests {
     }
 
     #[test]
-    fn local_policy_modify_state_accepts_effective_policy() {
+    fn broad_firewall_update_clears_previous_port_exceptions() {
+        // SAFETY: Initialize and balance COM on this test thread. Rules are never
+        // added to machine policy; each temporary interface is dropped first.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
+        let result = (|| -> Result<()> {
+            for protocol in [NET_FW_IP_PROTOCOL_TCP.0, NET_FW_IP_PROTOCOL_UDP.0] {
+                // SAFETY: COM is initialized on this thread; the returned interface owns
+                // its reference, and all property arguments live through their calls.
+                unsafe {
+                    let rule: INetFwRule3 =
+                        CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER)?;
+                    let mut spec = BlockRuleSpec {
+                        internal_name: "test",
+                        friendly_desc: "test",
+                        protocol,
+                        offline_sid: "S-1-5-18",
+                        remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
+                        remote_ports: Some("1-8079,8081-65535"),
+                    };
+                    configure_rule_network_scope(&rule, &spec)?;
+                    assert_eq!(rule.RemotePorts()?.to_string(), "1-8079,8081-65535");
+                    spec.remote_ports = None;
+                    configure_rule_network_scope(&rule, &spec)?;
+                    assert_eq!(rule.RemotePorts()?.to_string(), "*");
+                }
+            }
+            Ok(())
+        })();
+        // SAFETY: All interfaces have been dropped before balancing initialization.
+        unsafe { CoUninitialize() };
+        result.expect("existing rules must return to blocking every port");
+    }
+
+    #[test]
+    fn local_policy_modify_state_distinguishes_query_failure_from_ineffective_policy() {
         assert!(validate_local_policy_modify_result(S_OK, NET_FW_MODIFY_STATE_OK).is_ok());
-    }
-
-    #[test]
-    fn local_policy_modify_state_rejects_ineffective_policy() {
-        let err = validate_local_policy_modify_result(S_OK, NET_FW_MODIFY_STATE_GP_OVERRIDE)
-            .expect_err("group-policy override should fail sandbox firewall setup");
-        let failure = err
-            .downcast_ref::<SetupFailure>()
-            .expect("expected setup failure");
-
-        assert_eq!(
-            failure.code,
-            SetupErrorCode::HelperFirewallPolicyIneffective
-        );
-    }
-
-    #[test]
-    fn local_policy_modify_state_rejects_partial_profile_coverage() {
-        let err = validate_local_policy_modify_result(S_FALSE, NET_FW_MODIFY_STATE_OK)
-            .expect_err("partial profile coverage should fail sandbox firewall setup");
-        let failure = err
-            .downcast_ref::<SetupFailure>()
-            .expect("expected setup failure");
-
-        assert_eq!(
-            failure.code,
-            SetupErrorCode::HelperFirewallPolicyIneffective
-        );
+        for (result, state, expected) in [
+            (S_OK, NET_FW_MODIFY_STATE_GP_OVERRIDE, SetupErrorCode::HelperFirewallPolicyIneffective),
+            (S_FALSE, NET_FW_MODIFY_STATE_OK, SetupErrorCode::HelperFirewallPolicyIneffective),
+            (windows::core::HRESULT::from_win32(5), NET_FW_MODIFY_STATE_OK, SetupErrorCode::HelperFirewallPolicyAccessFailed),
+        ] {
+            let err = validate_local_policy_modify_result(result, state)
+                .expect_err("ineffective or unavailable policy must fail closed");
+            let failure = err
+                .downcast_ref::<SetupFailure>()
+                .expect("expected setup failure");
+            assert_eq!(failure.code, expected);
+        }
     }
 }

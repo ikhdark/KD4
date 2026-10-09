@@ -144,6 +144,11 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
             for requests, message in [
                 ([REQUEST_JSON + " ", TOOL_OUTPUT_JSON], "exact request hash mismatch"),
                 ([REQUEST_JSON, TOOL_OUTPUT_JSON.replace("websocket", "changed")], "tool result mismatch"),
+                *(
+                    ([REQUEST_JSON, json.dumps({**json.loads(TOOL_OUTPUT_JSON), "input": invalid})],
+                     "input must be a list of objects")
+                    for invalid in (None, {}, [None])
+                ),
             ]:
                 websocket = FakeWebSocket(requests)
                 with contextlib.redirect_stderr(io.StringIO()) as errors:
@@ -200,11 +205,15 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
 
     def test_scripted_exchange_reuses_cached_event_json(self) -> None:
         websocket = FakeWebSocket([REQUEST_JSON, TOOL_OUTPUT_JSON])
+        out = io.StringIO()
 
-        with mock.patch.object(
-            server, "_dump_json", side_effect=AssertionError("event serialization")
+        with (
+            mock.patch.object(
+                server, "_dump_json", side_effect=AssertionError("event serialization")
+            ),
+            contextlib.redirect_stdout(out),
         ):
-            run_bounded(
+            completed = run_bounded(
                 server._handle_connection(
                     websocket,
                     quiet=True,
@@ -216,6 +225,8 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
             [json.loads(event) for event in websocket.sent]
         )
         self.assertEqual(websocket.close_calls, [(1000, "")])
+        self.assertTrue(completed)
+        self.assertEqual(out.getvalue(), "")
 
     def test_prewarm_does_not_consume_the_scripted_exchange(self) -> None:
         warmup = '{"type":"response.create","generate":false}'
@@ -381,21 +392,6 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         self.assertEqual(second["input_tokens"], 0)
         self.assertIsNot(first, second)
 
-    def test_quiet_mode_suppresses_hot_path_logging(self) -> None:
-        websocket = FakeWebSocket([REQUEST_JSON, TOOL_OUTPUT_JSON])
-        out = io.StringIO()
-
-        with contextlib.redirect_stdout(out):
-            run_bounded(
-                server._handle_connection(
-                    websocket,
-                    quiet=True,
-                    log_json="off",
-                )
-            )
-
-        self.assertEqual(out.getvalue(), "")
-
     def test_compact_request_logging_avoids_pretty_json(self) -> None:
         websocket = FakeWebSocket(
             ['{"type":"response.create","b":2,"a":1}', TOOL_OUTPUT_JSON]
@@ -551,8 +547,13 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
             run_bounded(server._serve(0, quiet=True, max_sessions=0))
 
     def test_parser_rejects_non_positive_max_sessions(self) -> None:
-        with self.assertRaises(SystemExit):
+        with (
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as error,
+        ):
             server._build_arg_parser().parse_args(["--max-sessions", "0"])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("argument --max-sessions: must be >= 1", stderr.getvalue())
 
     def test_parser_and_serve_reject_invalid_ports(self) -> None:
         for value in ("-1", "65536"):

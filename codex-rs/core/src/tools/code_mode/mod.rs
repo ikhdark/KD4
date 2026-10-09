@@ -1507,7 +1507,7 @@ fn format_runtime_response(
         );
         if let Some((start, end)) = omitted_lines {
             output.essential_inline.insert("cell_output_recovery_selector".into(),
-                serde_json::json!({"kind":"lines", "start":start, "end":end.min(start.saturating_add(199))}));
+                serde_json::json!({"kind":"lines", "start":start, "end":end}));
         }
     }
     match required_terminal {
@@ -3389,13 +3389,19 @@ mod tests {
     fn packet_metrics_are_drained_between_responses() {
         let service = test_service();
         let cell = CellId::new("cell".to_string());
-        service.record_packet_call(&cell, true, 128, Vec::new());
+        let feedback = vec![FunctionCallOutputContentItem::InputText {
+            text: "hook feedback".to_string(),
+        }];
+        service.record_packet_call(&cell, true, 128, feedback.clone());
         let first = service.finish_packet("cell", false);
+        assert_eq!(first.post_tool_use_feedback, feedback);
         assert_eq!(first.nested_call_count, 1);
         assert_eq!(first.batchable_observation_count, 1);
         assert_eq!(first.result_bytes, 128);
         let drained = service.finish_packet("cell", false);
+        assert!(drained.post_tool_use_feedback.is_empty());
         assert_eq!(drained.nested_call_count, 0);
+        assert_eq!(drained.batchable_observation_count, 0);
         assert_eq!(drained.result_bytes, 0);
         for _ in 0..6 {
             service.record_packet_call(&cell, true, 128, Vec::new());
@@ -3465,29 +3471,6 @@ mod tests {
         assert!(canonical.contains("nested_result_recovery_directory"));
         assert!(canonical.contains(&body), "exact settled output survives outer truncation");
         service.finish_cell_dispatch(&cell);
-    }
-
-    #[test]
-    fn post_tool_feedback_is_drained_once_with_code_mode_packet() {
-        let service = test_service();
-        let cell = CellId::new("feedback-cell".to_string());
-        let feedback = vec![FunctionCallOutputContentItem::InputText {
-            text: "hook feedback".to_string(),
-        }];
-
-        service.record_packet_call(&cell, false, 32, feedback.clone());
-        assert_eq!(
-            service
-                .finish_packet("feedback-cell", false)
-                .post_tool_use_feedback,
-            feedback
-        );
-        assert!(
-            service
-                .finish_packet("feedback-cell", false)
-                .post_tool_use_feedback
-                .is_empty()
-        );
     }
 
     #[test]

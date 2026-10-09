@@ -89,6 +89,7 @@ class FailureDiagnosticTest(RunnerTestCase):
         self.assertIn("[line shortened]", excerpt)
         self.assertIn("remaining log omitted", excerpt)
         self.assertIn("terminal status", excerpt)
+        self.assertNotIn("\x1b", excerpt)
         self.assertIn("λ" * 6000, path.read_text(encoding="utf-8"))
 
     def test_no_diagnostic_keeps_the_existing_tail(self):

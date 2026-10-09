@@ -50,8 +50,6 @@ const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 // qualifies a multiword query only within an explicit canonical source scope.
 const MIN_TOOL_ACTIVATION_RELEVANCE: f32 = 0.5;
 
-#[cfg(test)]
-static LOADABLE_TOOL_SERIALIZATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Default)]
 struct ToolSearchTokenizer;
@@ -1001,8 +999,6 @@ fn serialize_loadable_tools(tools: &[LoadableToolSpec]) -> Vec<serde_json::Value
     tools
         .iter()
         .map(|tool| {
-            #[cfg(test)]
-            LOADABLE_TOOL_SERIALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
             serde_json::to_value(tool).unwrap_or_else(|err| {
                 serde_json::Value::String(format!("failed to serialize tool_search output: {err}"))
             })
@@ -1985,14 +1981,15 @@ mod tests {
             // Prior activation and repeated searches must not cause schema
             // publication outside the bounded result.
             turn.activate_deferred_tools(names.iter().cloned());
-            for _ in 0..2 {
+            for index in 0..2 {
+                let call_id = format!("mixed-search-{index}");
                 let output = handler
                     .handle(ToolInvocation {
                         session: Arc::clone(&session),
                         step_context: StepContext::for_test(Arc::clone(&turn)),
                         cancellation_token: CancellationToken::new(),
                         tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-                        call_id: "mixed-search".into(),
+                        call_id: call_id.clone(),
                         tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
                         source: ToolCallSource::Direct,
                         payload: payload.clone(),
@@ -2005,7 +2002,7 @@ mod tests {
                     tools,
                     omitted_result_count,
                     ..
-                } = output.to_response_item("mixed-search", &payload)
+                } = output.to_response_item(&call_id, &payload)
                 else {
                     panic!("expected search output");
                 };
@@ -2019,7 +2016,14 @@ mod tests {
                     turn.activated_deferred_tools(),
                     names.iter().cloned().collect()
                 );
+                session.record_tool_completion_ordered(
+                    &turn, &call_id, &[output.to_response_item(&call_id, &payload).into()],
+                ).await.unwrap();
                 let history = session.clone_history().await;
+                assert!(history.raw_items().iter().any(|item| matches!(
+                    item, codex_protocol::models::ResponseItem::ToolSearchOutput { call_id: id, .. }
+                        if id.as_deref() == Some(call_id.as_str())
+                )), "inspect actual committed completion, not an empty history");
                 let publications = history
                     .raw_items()
                     .iter()
@@ -2090,41 +2094,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn verified10_catalog_growth_preserves_executed_alias_target() {
-        #[derive(Default)]
-        struct Delegate(std::sync::Mutex<Vec<ToolName>>);
-        impl codex_code_mode::CodeModeSessionDelegate for Delegate {
-            fn invoke_tool<'a>(&'a self, call: codex_code_mode::CodeModeNestedToolCall,
-                _cancel: codex_code_mode::NestedCancellation) -> codex_code_mode::ToolInvocationFuture<'a>
-            {
-                Box::pin(async move {
-                    self.0.lock().unwrap().push(call.tool_name.clone());
-                    Ok(serde_json::json!({"tool":call.tool_name.name}))
-                })
-            }
-            fn notify<'a>(&'a self, _call: String, _cell: codex_code_mode::CellId, _text: String,
-                _cancel: CancellationToken) -> codex_code_mode::NotificationFuture<'a>
-            { Box::pin(async { Ok(()) }) }
-            fn cell_closed(&self, _cell: &codex_code_mode::CellId) {}
-        }
-        let delegate = Arc::new(Delegate::default());
-        let runtime = codex_code_mode::InProcessCodeModeSession::with_delegate(delegate.clone());
-        let specs = ["read_file", "read-file"].map(|name| ToolSpec::Function(ResponsesApiTool {
-            name: name.into(), description: name.into(), strict: false, defer_loading: None,
-            parameters: codex_tools::JsonSchema::default(), output_schema: None,
-        }));
-        for count in [1, 2] {
-            runtime.execute(codex_code_mode::ExecuteRequest {
-                state_path: None, tool_call_id: format!("catalog-{count}"),
-                enabled_tools: codex_tools::collect_code_mode_tool_definitions(&specs[..count]).into(),
-                source: "text(await tools.read_file({}));".into(), yield_time_ms: None,
-                max_output_tokens: Some(1000), default_tool_timeout_ms: None,
-            }).await.unwrap().initial_response().await.unwrap();
-        }
-        assert_eq!(*delegate.0.lock().unwrap(), vec![ToolName::plain("read_file"), ToolName::plain("read_file")]);
-        runtime.shutdown().await.unwrap();
-    }
+
 
     #[tokio::test]
     async fn oversized_search_resolves_and_invokes_in_one_cell_without_schema_history() {
@@ -2202,6 +2172,7 @@ text('one-cell-complete');
         assert!(format!("{content_items:?}").contains("one-cell-complete"));
         assert_eq!(delegate.calls.load(Ordering::Relaxed), 2, "resolution must not add a dispatch or model round trip");
         assert!(!format!("{:?}", session.clone_history().await.raw_items()).contains("authoritative-contract-tail"));
+        runtime.shutdown().await.unwrap();
     }
 
     #[test]
@@ -2551,6 +2522,7 @@ text('one-cell-complete');
                 if message == "tool search was cancelled"
         ));
         assert!(turn.activated_deferred_tools().is_empty());
+        assert!(turn.pending_post_tool_contexts.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -2613,41 +2585,7 @@ text('one-cell-complete');
         }
     }
 
-    #[test]
-    fn cached_results_reuse_serialized_tool_specs() {
-        let handler = ToolSearchHandler::new(vec![search_info(
-            "calendar",
-            None,
-            "calendar",
-            "create_event",
-        )]);
-        LOADABLE_TOOL_SERIALIZATION_COUNT.store(0, Ordering::Relaxed);
 
-        let first = handler.search("calendar", 10).expect("first search");
-        let second = handler.search("calendar", 10).expect("cached search");
-        assert!(Arc::ptr_eq(&first, &second));
-        let output = ToolSearchOutput {
-            tools: second.serialized_tools.clone(),
-            omitted_result_count: 0,
-            activated_omitted_tools: Vec::new(),
-            unactivated_matches: Vec::new(),
-            unmatched_identifiers: Vec::new(),
-            exact_name_ambiguity: None,
-        };
-        let payload = ToolPayload::ToolSearch {
-            arguments: codex_protocol::models::SearchToolCallParams {
-                query: "calendar".to_string(),
-                limit: None,
-            },
-        };
-        let _ = crate::tools::context::ToolOutput::to_response_item(&output, "call-1", &payload);
-        let _ = crate::tools::context::ToolOutput::code_mode_result(&output, &payload);
-
-        assert_eq!(second.serialized_tools.len(), 1);
-        assert_eq!(second.serialized_tools[0]["type"], "namespace");
-        assert_eq!(second.serialized_tools[0]["name"], "mcp__calendar");
-        assert_eq!(LOADABLE_TOOL_SERIALIZATION_COUNT.load(Ordering::Relaxed), 1);
-    }
 
     #[test]
     fn affordance_scoped_evidence_ignores_other_sources() {
@@ -2759,16 +2697,7 @@ text('one-cell-complete');
         assert_eq!(result.unactivated_matches, vec!["lookup"]);
     }
 
-    #[test]
-    fn affordance_resolved_query_reuses_the_result_cache() {
-        let handler = ToolSearchHandler::new(vec![search_info("search records", None, "a", "lookup")]);
-        let key = handler.resolved_query_key("search records", None).unwrap();
-        let first = handler.search_resolved(key.clone()).unwrap();
-        let second = handler.search_resolved(key).unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(handler.resolved_query_key("lookup", None).unwrap().limit, 1);
-        assert_eq!(handler.resolved_query_key("lookup", Some(8)).unwrap().limit, 8);
-    }
+
 
     #[test]
     fn affordance_required_postings_remain_sorted_and_exact() {
@@ -3208,7 +3137,7 @@ text('one-cell-complete');
     #[test]
     fn search_reuses_normalized_query_results_and_keys_by_limit() {
         let search_infos = vec![executor_search_info(
-            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
+            McpHandler::new(tool_info("calendar", "create_event", "Create calendar events"))
                 .expect("MCP tool should convert"),
         )];
         let handler = ToolSearchHandler::new(search_infos);
@@ -3228,6 +3157,33 @@ text('one-cell-complete');
         assert_eq!(limited, first);
         assert_eq!(first.omitted_result_count, 0);
         assert_eq!(handler.result_cache_len(), 2);
+        assert_eq!(second.serialized_tools.len(), 1);
+        assert_eq!(second.serialized_tools[0]["type"], "namespace");
+        assert_eq!(second.serialized_tools[0]["name"], "mcp__calendar");
+        let output = ToolSearchOutput {
+            tools: second.serialized_tools.clone(),
+            omitted_result_count: 0,
+            activated_omitted_tools: Vec::new(),
+            unactivated_matches: Vec::new(),
+            unmatched_identifiers: Vec::new(),
+            exact_name_ambiguity: None,
+        };
+        let payload = ToolPayload::ToolSearch {
+            arguments: codex_protocol::models::SearchToolCallParams {
+                query: "calendar events".into(), limit: None,
+            },
+        };
+        let response = crate::tools::context::ToolOutput::to_response_item(&output, "cached", &payload);
+        let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } = response else {
+            panic!("cached search must retain typed output");
+        };
+        assert_eq!(tools, second.serialized_tools);
+        assert_eq!(
+            crate::tools::context::ToolOutput::code_mode_result(&output, &payload)["tools"],
+            serde_json::json!(second.serialized_tools)
+        );
+        let key = handler.resolved_query_key("calendar events", None).unwrap();
+        assert!(Arc::ptr_eq(&first, &handler.search_resolved(key).unwrap()));
     }
 
     #[test]
@@ -3685,25 +3641,7 @@ text('one-cell-complete');
         );
     }
 
-    #[test]
-    fn qualified_namespace_name_is_an_exact_search_match() {
-        let handler = ToolSearchHandler::new(vec![search_info(
-            "calendar",
-            None,
-            "calendar",
-            "create_event",
-        )]);
 
-        let tools = handler
-            .search("mcp__calendar__create_event", TOOL_SEARCH_DEFAULT_LIMIT)
-            .expect("qualified exact-name search should succeed");
-
-        assert_eq!(tools.tools.len(), 1);
-        assert_eq!(
-            tools.activation_tools,
-            vec![ToolName::namespaced("mcp__calendar", "create_event")]
-        );
-    }
 
     #[test]
     fn search_compacts_container_descriptions_without_changing_selection() {

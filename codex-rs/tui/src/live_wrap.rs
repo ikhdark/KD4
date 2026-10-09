@@ -208,6 +208,15 @@ mod tests {
                 }
             ]
         );
+        let displayed = rb.display_rows();
+        assert_eq!(displayed.last().unwrap().text, "a test");
+        assert_eq!(
+            displayed
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<String>(),
+            "hello whirl this is a test"
+        );
     }
 
     #[test]
@@ -225,6 +234,13 @@ mod tests {
                 text: "😀😀 ".to_string(),
                 explicit_break: false
             }]
+        );
+        assert_eq!(
+            rb.display_rows().last(),
+            Some(&Row {
+                text: "你好".to_string(),
+                explicit_break: false,
+            })
         );
     }
 
@@ -250,6 +266,26 @@ mod tests {
             vec!["ABCDEFG", "HIJKLMN", "OPQRSTU"]
         );
         assert_eq!(all_rows, chunk_rows);
+        let expected = vec![
+            Row {
+                text: "ABCDEFG".into(),
+                explicit_break: false,
+            },
+            Row {
+                text: "HIJKLMN".into(),
+                explicit_break: false,
+            },
+            Row {
+                text: "OPQRSTU".into(),
+                explicit_break: false,
+            },
+            Row {
+                text: "VWXYZ".into(),
+                explicit_break: false,
+            },
+        ];
+        assert_eq!(rb_all.display_rows(), expected);
+        assert_eq!(rb_chunks.display_rows(), expected);
     }
 
     #[test]

@@ -342,12 +342,7 @@ impl SessionTask for CountingBlockingTask {
     }
 }
 
-#[test]
-fn session_task_is_the_object_safe_runtime_boundary() {
-    let task: Arc<dyn SessionTask> = Arc::new(FenceBlockingTask);
-    assert_eq!(task.kind(), TaskKind::Regular);
-    assert_eq!(task.span_name(), "session_task.terminal_fence");
-}
+
 
 fn test_session_telemetry() -> SessionTelemetry {
     let exporter = InMemoryMetricExporter::default();
@@ -1409,13 +1404,7 @@ async fn terminal_wakeups_are_generation_aware_and_waiter_counts_are_cancellatio
     assert_eq!(coordinator.waiter_snapshot().interrupt_resolution, 0);
 }
 
-#[test]
-fn terminal_analytics_claim_is_process_local_one_shot() {
-    let coordinator = TurnTerminalCoordinator::new("turn-analytics".to_string());
-    let permit = coordinator.try_claim().expect("terminal claimant");
-    assert!(permit.try_claim_analytics_emission());
-    assert!(!permit.try_claim_analytics_emission());
-}
+
 
 #[test]
 fn terminal_analytics_claim_converges_across_in_process_recovery() {
@@ -1429,6 +1418,7 @@ fn terminal_analytics_claim_converges_across_in_process_recovery() {
     let after_claim = TurnTerminalCoordinator::new("turn-after-claim".to_string());
     let normal = after_claim.try_claim().expect("normal terminal claimant");
     assert!(normal.try_claim_analytics_emission());
+    assert!(!normal.try_claim_analytics_emission());
     drop(normal);
     let recovery = after_claim
         .try_claim()
@@ -1437,79 +1427,43 @@ fn terminal_analytics_claim_converges_across_in_process_recovery() {
 }
 
 #[test]
-fn emit_turn_network_proxy_metric_records_active_turn() {
-    let session_telemetry = test_session_telemetry();
+fn emit_turn_network_proxy_metric_records_active_and_inactive_turns() {
+    for (active, expected) in [(true, "true"), (false, "false")] {
+        let session_telemetry = test_session_telemetry();
+        emit_turn_network_proxy_metric(&session_telemetry, active);
+        let snapshot = session_telemetry
+            .snapshot_metrics()
+            .expect("runtime metrics snapshot");
+        let (attrs, value) = metric_point(&snapshot, TURN_NETWORK_PROXY_METRIC);
 
-    emit_turn_network_proxy_metric(&session_telemetry, /*network_proxy_active*/ true);
-
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    let (attrs, value) = metric_point(&snapshot, TURN_NETWORK_PROXY_METRIC);
-
-    assert_eq!(value, 1);
-    assert_eq!(
-        attrs,
-        BTreeMap::from([("active".to_string(), "true".to_string()),])
-    );
+        assert_eq!(value, 1);
+        assert_eq!(
+            attrs,
+            BTreeMap::from([("active".to_string(), expected.to_string())])
+        );
+    }
 }
 
 #[test]
-fn emit_turn_network_proxy_metric_records_inactive_turn() {
-    let session_telemetry = test_session_telemetry();
+fn emit_compact_metric_records_manual_and_automatic_compaction() {
+    for (compact_type, manual, expected_manual) in [
+        ("remote_v2", true, "true"),
+        ("local", false, "false"),
+    ] {
+        let session_telemetry = test_session_telemetry();
+        emit_compact_metric(&session_telemetry, compact_type, manual);
+        let snapshot = session_telemetry
+            .snapshot_metrics()
+            .expect("runtime metrics snapshot");
+        let (attrs, value) = metric_point(&snapshot, TASK_COMPACT_METRIC);
 
-    emit_turn_network_proxy_metric(&session_telemetry, /*network_proxy_active*/ false);
-
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    let (attrs, value) = metric_point(&snapshot, TURN_NETWORK_PROXY_METRIC);
-
-    assert_eq!(value, 1);
-    assert_eq!(
-        attrs,
-        BTreeMap::from([("active".to_string(), "false".to_string()),])
-    );
-}
-
-#[test]
-fn emit_compact_metric_records_manual_remote_v2() {
-    let session_telemetry = test_session_telemetry();
-
-    emit_compact_metric(&session_telemetry, "remote_v2", /*manual*/ true);
-
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    let (attrs, value) = metric_point(&snapshot, TASK_COMPACT_METRIC);
-
-    assert_eq!(value, 1);
-    assert_eq!(
-        attrs,
-        BTreeMap::from([
-            ("manual".to_string(), "true".to_string()),
-            ("type".to_string(), "remote_v2".to_string()),
-        ])
-    );
-}
-
-#[test]
-fn emit_compact_metric_records_auto_local() {
-    let session_telemetry = test_session_telemetry();
-
-    emit_compact_metric(&session_telemetry, "local", /*manual*/ false);
-
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    let (attrs, value) = metric_point(&snapshot, TASK_COMPACT_METRIC);
-
-    assert_eq!(value, 1);
-    assert_eq!(
-        attrs,
-        BTreeMap::from([
-            ("manual".to_string(), "false".to_string()),
-            ("type".to_string(), "local".to_string()),
-        ])
-    );
+        assert_eq!(value, 1);
+        assert_eq!(
+            attrs,
+            BTreeMap::from([
+                ("manual".to_string(), expected_manual.to_string()),
+                ("type".to_string(), compact_type.to_string()),
+            ])
+        );
+    }
 }

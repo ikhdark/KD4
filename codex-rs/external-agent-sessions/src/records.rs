@@ -458,10 +458,10 @@ mod tests {
         let summary = summarize_session(&path).unwrap().unwrap();
         assert_eq!(summary.migration.cwd, root.path());
         assert_eq!(summary.migration.title.as_deref(), Some("final title"));
-        assert_eq!(
-            summary.latest_timestamp,
-            parse_timestamp("2026-06-03T12:01:00Z").unwrap()
-        );
+        // Independently computed Unix seconds for 2026-06-03 12:01:00 UTC.
+        // Reusing parse_timestamp here would also accept a parser that returns
+        // the same incorrect timestamp for every record.
+        assert_eq!(summary.latest_timestamp, 1_780_488_060);
     }
 
     #[test]

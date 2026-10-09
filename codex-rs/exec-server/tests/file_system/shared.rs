@@ -140,7 +140,7 @@ async fn file_system_create_directory_creates_nested_directories(
 #[test_case(FileSystemImplementation::Local ; "local")]
 #[test_case(FileSystemImplementation::Remote ; "remote")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn file_system_write_file_writes_bytes(
+async fn file_system_write_and_read_preserve_bytes_and_text(
     implementation: FileSystemImplementation,
 ) -> Result<()> {
     let context = create_file_system_context(implementation).await?;
@@ -156,7 +156,16 @@ async fn file_system_write_file_writes_bytes(
         )
         .await
         .with_context(|| format!("mode={implementation}"))?;
-    assert_eq!(std::fs::read(file_path)?, b"hello from trait");
+    assert_eq!(std::fs::read(&file_path)?, b"hello from trait");
+    let path = PathUri::from_host_native_path(&file_path)?;
+    assert_eq!(
+        file_system.read_file(&path, None).await?,
+        b"hello from trait"
+    );
+    assert_eq!(
+        file_system.read_file_text(&path, None).await?,
+        "hello from trait"
+    );
 
     Ok(())
 }
@@ -181,31 +190,6 @@ fn path_uri_join_and_parent_preserve_lexical_paths() -> Result<()> {
         joined_parent_traversal,
         PathUri::from_host_native_path(source_dir.join("../outside"))?
     );
-    Ok(())
-}
-
-#[test_case(FileSystemImplementation::Local ; "local")]
-#[test_case(FileSystemImplementation::Remote ; "remote")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn file_system_read_file_returns_bytes(
-    implementation: FileSystemImplementation,
-) -> Result<()> {
-    let context = create_file_system_context(implementation).await?;
-    let file_system = context.file_system;
-
-    let tmp = TempDir::new()?;
-    let file_path = tmp.path().join("note.txt");
-    std::fs::write(&file_path, "hello from trait")?;
-
-    let contents = file_system
-        .read_file(
-            &PathUri::from_host_native_path(&file_path)?,
-            /*sandbox*/ None,
-        )
-        .await
-        .with_context(|| format!("mode={implementation}"))?;
-    assert_eq!(contents, b"hello from trait");
-
     Ok(())
 }
 
@@ -289,31 +273,6 @@ async fn file_system_round_trips_payloads_above_default_websocket_frame_limit(
         bounded.as_deref() == Some(contents.as_slice()),
         "read_file_bounded lost bytes mode={implementation}"
     );
-
-    Ok(())
-}
-
-#[test_case(FileSystemImplementation::Local ; "local")]
-#[test_case(FileSystemImplementation::Remote ; "remote")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn file_system_read_file_text_returns_string(
-    implementation: FileSystemImplementation,
-) -> Result<()> {
-    let context = create_file_system_context(implementation).await?;
-    let file_system = context.file_system;
-
-    let tmp = TempDir::new()?;
-    let file_path = tmp.path().join("note.txt");
-    std::fs::write(&file_path, "hello from trait")?;
-
-    let contents = file_system
-        .read_file_text(
-            &PathUri::from_host_native_path(&file_path)?,
-            /*sandbox*/ None,
-        )
-        .await
-        .with_context(|| format!("mode={implementation}"))?;
-    assert_eq!(contents, "hello from trait");
 
     Ok(())
 }

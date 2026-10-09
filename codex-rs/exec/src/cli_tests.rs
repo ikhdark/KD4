@@ -76,9 +76,9 @@ fn parses_config_isolation_flags() {
 
 #[test]
 fn removed_full_auto_flag_is_rejected() {
-    let result = Cli::try_parse_from(["codex-exec", "--full-auto", "summarize"]);
-
-    assert!(result.is_err());
+    let error = Cli::try_parse_from(["codex-exec", "--full-auto", "summarize"])
+        .expect_err("removed flag must be rejected");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[test]

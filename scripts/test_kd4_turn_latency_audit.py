@@ -520,6 +520,49 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             self.assertEqual(accounting["reportedSuppressedContinuations"], 24)
             self.assertIsNone(accounting["provenAvoidedModelRequests"])
 
+    def test_tokens_off_skips_cost_fit_and_reasoning_share_but_keeps_byte_shares(self):
+        timing = _timing()
+        timing["modelRequests"] = [
+            {"generationIndex": index, "modelStreamWaitNs": output * 100_000_000,
+             "tokenUsage": {"inputTokens": 100, "cachedInputTokens": 0,
+                            "visibleOutputTokens": output - 2, "reasoningTokens": 2}}
+            for index, output in enumerate((10, 20, 30))
+        ]
+        timing["counters"].update(modelRequestCount=3, logicalGenerationCount=3)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _event({"type": "task_started", "turn_id": "tokens"}),
+                _response({"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "done"},
+                ]}, "2026-08-17T00:00:00Z"),
+                _event({"type": "task_complete", "turn_id": "tokens", "timing": timing}),
+            ]), encoding="utf-8")
+            enabled = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+            # Three measured points lie exactly on wait = 0.1s * output tokens;
+            # six reasoning tokens are 10% of the sixty recorded output tokens.
+            self.assertEqual(enabled["requestCostModel"], {
+                "requests": 3, "fixedSeconds": 0.0,
+                "perOutputTokenMs": 100.0, "correlation": 1.0,
+            })
+            self.assertEqual(enabled["outputChannels"]["reasoningTokenShare"], 0.1)
+            output = io.StringIO()
+            with mock.patch.object(kd4_turn_latency_audit, "_request_cost_model",
+                                   side_effect=AssertionError("token cost fit called")), \
+                 contextlib.redirect_stdout(output):
+                status = kd4_turn_latency_audit.main([str(path), "--tokens", "off", "--json"])
+        self.assertEqual(status, 0)
+        disabled = json.loads(output.getvalue())
+        self.assertFalse(disabled["tokenAnalysisEnabled"])
+        self.assertIsNone(disabled["requestCostModel"])
+        self.assertEqual(disabled["outputChannels"], {
+            "visibleByteShares": {"prose": 1.0}, "reasoningTokenShare": None,
+        })
+        rendered = kd4_turn_latency_audit.render_report(disabled)
+        self.assertNotIn("request cost:", rendered)
+        self.assertNotIn(" of output tokens", rendered)
+        self.assertIn("visible output (byte shares): prose=100%", rendered)
+
     def test_unmeasured_residual_and_honest_continuation_metrics(self) -> None:
         timing = _timing()
         timing["counters"]["residualDeterministicGenerationCount"] = None
@@ -580,7 +623,8 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         event = self.startup_event()
         restarted = self.startup_event(
             startup_timing_started_at_unix_ms=2000,
-            startup_timing_completed_at_unix_ms=2100,
+            startup_timing_completed_at_unix_ms=2200,
+            startup_timing_duration_ns="200000000",
         )
         unrelated = {**event, "target": "unrelated"}
         with tempfile.TemporaryDirectory() as temp:
@@ -613,9 +657,9 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                     startup["durationSummariesNs"]["inclusiveDurationNs"],
                     {
                         "count": 2,
-                        "total": 200_000_000,
+                        "total": 300_000_000,
                         "min": 100_000_000,
-                        "max": 100_000_000,
+                        "max": 200_000_000,
                     },
                 )
                 self.assertEqual(
@@ -638,7 +682,10 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             self.assertIn(
                 "startup timing: 2/2 valid captured profiles", stdout.getvalue()
             )
-            self.assertIn("inclusiveDurationNs: mean=100.000ms", stdout.getvalue())
+            self.assertIn(
+                "inclusiveDurationNs: mean=150.000ms min=100.000ms max=200.000ms",
+                stdout.getvalue(),
+            )
             self.assertIn("must not be added or subtracted", stdout.getvalue())
 
     def test_startup_log_excludes_invalid_unknown_and_conflicting_profiles(self):
@@ -1650,28 +1697,31 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         )
 
     def test_lifecycle_overflow_and_incomplete_attribution_block_finalize(self) -> None:
-        decision = kd4_turn_latency_audit._audit_decision(
-            {
-                "coverage": {
-                    "validCompleteProfiles": 1,
-                    "parseErrorCount": 0,
-                    "terminalTurnsWithUnresolvedToolCalls": 0,
-                    "startedTurnsWithoutTerminal": 0,
-                },
-                "populations": {"all": kd4_turn_latency_audit._population_report([])},
-                "commandOrchestration": (
-                    kd4_turn_latency_audit._command_orchestration_report([])
-                ),
-                "toolRelay": {
-                    "timingOverflowCalls": 1,
-                    "incompleteLifecycleCalls": 1,
-                },
-            }
-        )
-
-        self.assertFalse(decision["readyToFinalize"])
-        self.assertIn("tool_lifecycle_timing_overflow", decision["blockerCodes"])
-        self.assertIn("incomplete_tool_lifecycle_attribution", decision["blockerCodes"])
+        for overflow, incomplete, blockers in (
+            (0, 0, []),
+            (1, 0, ["tool_lifecycle_timing_overflow"]),
+            (0, 1, ["incomplete_tool_lifecycle_attribution"]),
+            (1, 1, ["tool_lifecycle_timing_overflow", "incomplete_tool_lifecycle_attribution"]),
+        ):
+            with self.subTest(overflow=overflow, incomplete=incomplete):
+                decision = kd4_turn_latency_audit._audit_decision({
+                    "coverage": {
+                        "validCompleteProfiles": 1,
+                        "parseErrorCount": 0,
+                        "terminalTurnsWithUnresolvedToolCalls": 0,
+                        "startedTurnsWithoutTerminal": 0,
+                    },
+                    "populations": {"all": kd4_turn_latency_audit._population_report([])},
+                    "commandOrchestration": (
+                        kd4_turn_latency_audit._command_orchestration_report([])
+                    ),
+                    "toolRelay": {
+                        "timingOverflowCalls": overflow,
+                        "incompleteLifecycleCalls": incomplete,
+                    },
+                })
+                self.assertEqual(decision["readyToFinalize"], not blockers)
+                self.assertEqual(decision["blockerCodes"], blockers)
 
     def test_detailed_timing_matches_duplicate_call_ids_without_reuse(self) -> None:
         records = [
@@ -2687,9 +2737,11 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                     "2026-08-17T00:00:00Z",
                 ),
             ]
-            for ordinal in range(10):
-                started_second = ordinal * 5
-                completed_second = started_second + 6
+            # Distinct, unsorted durations make top-N membership and descending
+            # order observable instead of accepting either sort direction.
+            for ordinal, duration in enumerate((6, 15, 7, 12, 8, 11, 9, 14, 10, 13)):
+                started_second = ordinal * 3
+                completed_second = started_second + duration
                 lines.extend(
                     [
                         _response(
@@ -2713,7 +2765,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                                         "type": "input_text",
                                         "text": (
                                             "Script completed\n"
-                                            "Wall time 6.0 seconds\n"
+                                            f"Wall time {duration}.0 seconds\n"
                                             "Output:\nprivate output"
                                         ),
                                     }
@@ -2751,11 +2803,15 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(len(orchestration["topSlowToolCalls"]), 8)
         self.assertEqual(orchestration["omittedSlowToolCalls"], 2)
         self.assertEqual(
+            [row["roundTripNs"] for row in orchestration["topSlowToolCalls"]],
+            [seconds * 1_000_000_000 for seconds in (15, 14, 13, 12, 11, 10, 9, 8)],
+        )
+        self.assertEqual(
             orchestration["topSlowToolCalls"][0]["tool"], "exec>exec_command"
         )
         self.assertEqual(
             orchestration["topSlowToolCalls"][0]["reportedExecWallNs"],
-            6_000_000_000,
+            15_000_000_000,
         )
         self.assertNotIn("private command", json.dumps(report))
         self.assertNotIn("private output", json.dumps(report))
@@ -3243,20 +3299,32 @@ class SavedTimingReportTest(unittest.TestCase):
                     self.assertEqual(output, "")
 
     def test_replay_rejects_live_options_and_output_without_running_producer(self):
+        saved = json.dumps(self.report)
+        self.destination.write_text(saved, encoding="utf-8")
         for options in ([str(self.source)], ["--tokens", "off"], ["--repo-root", str(self.root)],
                         ["--cache-dir", str(self.root)], ["--startup-log", str(self.source)],
+                        ["--runner-evidence", str(self.source)], ["--sessions-root", str(self.root)],
+                        ["--diagnostic-evidence", str(self.source)], ["--refresh"],
                         ["--output", str(self.destination)]):
             with self.subTest(options=options), mock.patch.object(kd4_turn_latency_audit, "analyze_session_path") as analyze:
                 status, output, error = self.invoke("--from-report", str(self.destination), *options)
                 self.assertEqual(status, 2, error)
                 self.assertEqual(output, "")
+                self.assertIn(
+                    "unrecognized arguments" if options[0] == "--output"
+                    else "--from-report cannot be combined with live-analysis options",
+                    error,
+                )
                 analyze.assert_not_called()
+                self.assertEqual(self.destination.read_text(encoding="utf-8"), saved)
         status, output, error = self.invoke(str(self.source), "--output", str(self.destination), "--json")
         self.assertEqual(status, 2, error)
-        self.assertFalse(self.destination.exists())
+        self.assertEqual(output, "")
+        self.assertIn("unrecognized arguments", error)
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), saved)
 
     def test_replay_preserves_gate_exit_status_and_saved_bytes(self):
-        for gate_status, expected in kd4_turn_latency_audit._GATE_EXIT_CODES.items():
+        for gate_status, expected in (("passed", 0), ("regression", 1), ("insufficient_evidence", 3)):
             with self.subTest(status=gate_status):
                 self.report["baselineComparison"] = {"gate": {"status": gate_status}}
                 data = json.dumps(self.report)

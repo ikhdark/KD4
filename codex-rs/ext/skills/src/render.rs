@@ -251,6 +251,19 @@ mod tests {
 
     #[test]
     fn truncate_utf8_to_bytes_stops_before_split_character() {
-        assert_eq!(truncate_utf8_to_bytes("a😀z", 4), ("a".to_string(), true));
+        for (budget, expected, truncated) in [
+            (0, "", true),
+            (1, "a", true),
+            (4, "a", true),
+            (5, "a😀", true),
+            (6, "a😀z", false),
+            (usize::MAX, "a😀z", false),
+        ] {
+            assert_eq!(
+                truncate_utf8_to_bytes("a😀z", budget),
+                (expected.to_string(), truncated),
+                "byte budget {budget}"
+            );
+        }
     }
 }

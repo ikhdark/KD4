@@ -162,4 +162,29 @@ fn plugin_install_elicitation_telemetry_metadata_requires_install_tool_suggestio
         plugin_install_elicitation_telemetry_metadata(&enable_event),
         None
     );
+
+    for key in ["codex_approval_kind", "suggest_type", "tool_type", "tool_id", "tool_name"] {
+        for replacement in [None, Some(json!("")), Some(json!("   ")), Some(json!(17))] {
+            let mut malformed = event.clone();
+            let EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                request: codex_protocol::approvals::ElicitationRequest::Form {
+                    meta: Some(Value::Object(meta)),
+                    ..
+                },
+                ..
+            }) = &mut malformed else {
+                panic!("expected form fixture");
+            };
+            if let Some(replacement) = replacement {
+                meta.insert(key.to_string(), replacement);
+            } else {
+                meta.remove(key);
+            }
+            assert_eq!(
+                plugin_install_elicitation_telemetry_metadata(&malformed),
+                None,
+                "invalid {key} must not produce installation telemetry"
+            );
+        }
+    }
 }

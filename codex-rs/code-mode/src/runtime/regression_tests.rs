@@ -30,22 +30,7 @@ async fn python_string_index_error_has_a_javascript_hint() {
     }
 }
 
-#[test]
-fn critical_path_resolver_benchmark() {
-    let catalog = EnabledToolCatalog::new((0..512).map(|index| EnabledToolMetadata {
-        global_name: format!("ns__tool_{index}"),
-        tool_name: ToolName::new(Some("ns".into()), format!("tool_{index}")),
-        description: "".into(), kind: CodeModeToolKind::Function, default_timeout_ms: None,
-    }).collect()).unwrap();
-    for query in ["ns__tool_511", "ns.tool_511", "missing"] {
-        let started = std::time::Instant::now();
-        for _ in 0..20_000 {
-            let result = catalog.resolve_requested_name(std::hint::black_box(query));
-            assert_eq!(result, if query == "missing" { None } else { Some(511) });
-        }
-        eprintln!("critical_path_resolver query={query} calls=20000 elapsed_us={}", started.elapsed().as_micros());
-    }
-}
+
 
 #[test]
 fn affordance_resolver_preserves_all_alias_collisions_without_formatting() {
@@ -426,14 +411,17 @@ async fn printed_settled_errors_are_bounded_without_mutating_script_evidence() {
     assert_eq!(batch[1]["value"], "kept");
     assert_eq!(text(next(&mut rx).await), "true");
     assert!(text(next(&mut rx).await).contains("[error details truncated]"));
-    for _ in 0..2 {
+    for sparse_array in [true, false] {
         let printed = text(next(&mut rx).await);
         assert!(printed.len() < 1000);
         let value: JsonValue = serde_json::from_str(&printed).unwrap();
         assert_eq!(value["reason"]["message"], "bounded evidence");
         assert_eq!(value["sibling"], "kept");
-        if value["reason"]["evidence"]["original_length"] == 1_000_000 {
+        if sparse_array {
+            assert_eq!(value["reason"]["evidence"]["original_length"], 1_000_000);
             assert_eq!(value["reason"]["evidence"]["entries"]["999999"], "last original position");
+        } else {
+            assert_eq!(value["reason"]["evidence"]["details_omitted"], true);
         }
     }
     assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text:None, .. }));

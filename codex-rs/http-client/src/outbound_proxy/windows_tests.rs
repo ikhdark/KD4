@@ -170,43 +170,29 @@ fn proxy_bypass_matches_whitespace_separated_winhttp_entries() {
 }
 
 #[test]
-fn automatic_proxy_info_honors_matching_bypass() {
+fn automatic_proxy_info_applies_bypass_only_to_matching_hosts() {
     let proxy_info = ProxyInfo {
         access_type: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
         proxy: Some("proxy.example:8080".to_string()),
         proxy_bypass: Some("<local>;*.corp".to_string()),
     };
-    let origin = RequestOrigin {
-        scheme: "https".to_string(),
-        host: "service.corp".to_string(),
-        port: 443,
-    };
-
-    assert_eq!(
-        proxy_info_decision(&proxy_info, &origin),
-        SystemProxyDecision::Direct
-    );
-}
-
-#[test]
-fn automatic_proxy_info_uses_proxy_when_bypass_does_not_match() {
-    let proxy_info = ProxyInfo {
-        access_type: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
-        proxy: Some("proxy.example:8080".to_string()),
-        proxy_bypass: Some("<local>;*.corp".to_string()),
-    };
-    let origin = RequestOrigin {
-        scheme: "https".to_string(),
-        host: "api.example.com".to_string(),
-        port: 443,
-    };
-
-    assert_eq!(
-        proxy_info_decision(&proxy_info, &origin),
-        SystemProxyDecision::Proxy {
-            url: "http://proxy.example:8080".to_string(),
-        }
-    );
+    for (host, expected) in [
+        ("intranet", SystemProxyDecision::Direct),
+        ("service.corp", SystemProxyDecision::Direct),
+        (
+            "api.example.com",
+            SystemProxyDecision::Proxy {
+                url: "http://proxy.example:8080".to_string(),
+            },
+        ),
+    ] {
+        let origin = RequestOrigin {
+            scheme: "https".to_string(),
+            host: host.to_string(),
+            port: 443,
+        };
+        assert_eq!(proxy_info_decision(&proxy_info, &origin), expected, "{host}");
+    }
 }
 
 #[test]

@@ -613,6 +613,9 @@ pub(crate) struct Session {
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     /// Serializes turn replacement and startup through RunningTask installation.
     pub(crate) task_start_gate: Semaphore,
+    /// Bounds ordinary submissions across channels and deferred preparation,
+    /// without preventing controls from reaching a blocked preparation.
+    pub(crate) submission_preparation_slots: Arc<Semaphore>,
     /// Stores reserved-ID admissions without keeping a mutex guard across startup awaits.
     pub(crate) task_start_state: Mutex<TaskStartState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
@@ -1972,6 +1975,7 @@ impl Session {
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
                 task_start_gate: Semaphore::new(/*permits*/ 1),
+                submission_preparation_slots: Arc::new(Semaphore::new(SUBMISSION_CHANNEL_CAPACITY)),
                 task_start_state: Mutex::new(TaskStartState::default()),
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),

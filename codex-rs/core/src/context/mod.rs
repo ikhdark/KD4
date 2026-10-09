@@ -101,17 +101,31 @@ mod escaping_tests {
 
     #[test]
     fn escaping_preserves_ordered_replacement_and_source_bytes() {
-        for text in [
-            "", "ordinary λ source &lt;tag&gt; <other>",
-            "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
+        // Literal oracles follow the fragment contract: only each selected
+        // delimiter's angle brackets are escaped, in the supplied order. In
+        // particular an earlier replacement can remove a later match, while
+        // unrelated syntax, existing entities and Unicode remain unchanged.
+        for (text, expected) in [
+            ("", ["", "", "", "", ""]),
+            ("ordinary λ source &lt;tag&gt; <other>", [
+                "ordinary λ source &lt;tag&gt; <other>",
+                "ordinary λ source &lt;tag&gt; <other>",
+                "ordinary λ source &lt;tag&gt; <other>",
+                "ordinary λ source &lt;tag&gt; &lt;other>",
+                "ordinary λ source &lt;tag&gt; <other>",
+            ]),
+            ("<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>", [
+                "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
+                "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
+                "&lt;INSTRUCTIONS&gt;λ&lt;/INSTRUCTIONS&gt;&lt;INSTRUCTIONS&gt;",
+                "&lt;INSTRUCTIONS>λ&lt;/INSTRUCTIONS>&lt;INSTRUCTIONS>",
+                "&lt;INSTRUCTIONS&gt;λ</INSTRUCTIONS>&lt;INSTRUCTIONS&gt;",
+            ]),
         ] {
-            for delimiters in [
+            for (delimiters, expected) in [
                 vec![], vec![""], vec!["<INSTRUCTIONS>", "</INSTRUCTIONS>"],
                 vec!["<", "<INSTRUCTIONS>"], vec!["<INSTRUCTIONS>", "&lt;"],
-            ] {
-                let expected = delimiters.iter().fold(text.to_string(), |text, delimiter| {
-                    text.replace(delimiter, &delimiter.replace('<', "&lt;").replace('>', "&gt;"))
-                });
+            ].into_iter().zip(expected) {
                 assert_eq!(escape_fragment_delimiters(text, &delimiters), expected);
             }
         }

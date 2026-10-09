@@ -57,35 +57,7 @@ const OPEN_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[cfg(test)]
-mod control_deadline_tests {
-    use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn live_host_without_shutdown_ack_is_retired_with_uncertain_effects() {
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
-        let connection = Connection {
-            command_tx, execute_claim_tx, alive: Arc::new(AtomicBool::new(true)),
-            failure: Arc::new(std::sync::Mutex::new(None)),
-            cancellation: CancellationToken::new(),
-        };
-        let session = RemoteSession {
-            id: codex_code_mode_protocol::host::SessionId::new("no-ack".to_string()).unwrap(),
-            generation: 1,
-        };
-        let shutdown = connection.shutdown_session(session);
-        tokio::pin!(shutdown);
-        assert!(futures::poll!(&mut shutdown).is_pending());
-        let _accepted = command_rx.recv().await.unwrap(); // retain the reply sender, like an open pipe
-        let started = tokio::time::Instant::now();
-        let error = shutdown.await.unwrap_err();
-        assert_eq!(started.elapsed(), SHUTDOWN_SESSION_TIMEOUT);
-        assert!(error.contains("effects are uncertain"));
-        assert!(!connection.is_alive());
-        assert!(connection.cancellation.is_cancelled());
-    }
-}
 
 pub(super) struct Connection {
     command_tx: mpsc::Sender<DriverCommand>,

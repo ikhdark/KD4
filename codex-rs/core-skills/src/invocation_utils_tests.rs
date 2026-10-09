@@ -1,14 +1,12 @@
 use super::SkillLoadOutcome;
 use super::SkillMetadata;
-use super::canonicalize_if_exists;
-use super::detect_skill_doc_read;
-use super::detect_skill_script_run;
+use super::build_implicit_skill_path_indexes;
+use super::detect_implicit_skill_invocation_for_command;
 use super::script_run_token;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 fn test_skill_metadata(skill_doc_path: AbsolutePathBuf) -> SkillMetadata {
@@ -25,107 +23,44 @@ fn test_skill_metadata(skill_doc_path: AbsolutePathBuf) -> SkillMetadata {
     }
 }
 
-fn test_path_display(unix_path: &str) -> String {
-    test_path_buf(unix_path).display().to_string()
-}
-
 #[test]
 fn script_run_detection_matches_runner_plus_extension() {
-    let tokens = vec![
-        "python3".to_string(),
-        "-u".to_string(),
-        "scripts/fetch_comments.py".to_string(),
-    ];
-
-    assert_eq!(script_run_token(&tokens).is_some(), true);
-}
-
-#[test]
-fn script_run_detection_excludes_python_c() {
-    let tokens = vec![
-        "python3".to_string(),
-        "-c".to_string(),
-        "print(1)".to_string(),
-    ];
-
-    assert_eq!(script_run_token(&tokens).is_some(), false);
-}
-
-#[test]
-fn skill_doc_read_detection_matches_absolute_paths_in_read_commands() {
-    let skill_doc_path = test_path_buf("/tmp/skill-test/SKILL.md").abs();
-    let normalized_skill_doc_path = canonicalize_if_exists(&skill_doc_path);
-    let skill = test_skill_metadata(skill_doc_path);
-    let outcome = SkillLoadOutcome {
-        implicit_skills_by_scripts_dir: Arc::new(HashMap::new()),
-        implicit_skills_by_doc_path: Arc::new(HashMap::from([(normalized_skill_doc_path, skill)])),
-        ..Default::default()
-    };
-
-    for tokens in [
-        vec![
-            "cat".to_string(),
-            test_path_display("/tmp/skill-test/SKILL.md"),
-            "|".to_string(),
-            "head".to_string(),
-        ],
-        vec![
-            "nl".to_string(),
-            "-ba".to_string(),
-            test_path_display("/tmp/skill-test/SKILL.md"),
-        ],
+    for (tokens, expected) in [
+        (vec!["python3", "-u", "scripts/fetch_comments.py"], Some("scripts/fetch_comments.py")),
+        (vec!["python3", "-c", "print(1)"], None),
+        (vec!["not-python", "scripts/fetch_comments.py"], None),
+        (vec!["python3"], None),
+        (vec!["PWSH.exe", "--", "scripts/check.PS1"], Some("scripts/check.PS1")),
     ] {
-        let found = detect_skill_doc_read(&outcome, &tokens, &test_path_buf("/tmp").abs());
-        assert_eq!(
-            found.map(|value| value.name),
-            Some("test-skill".to_string()),
-            "command: {tokens:?}"
-        );
+        let tokens = tokens.into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(script_run_token(&tokens), expected, "{tokens:?}");
     }
 }
 
 #[test]
-fn skill_script_run_detection_matches_relative_path_from_skill_root() {
-    let skill_doc_path = test_path_buf("/tmp/skill-test/SKILL.md").abs();
-    let scripts_dir = canonicalize_if_exists(&test_path_buf("/tmp/skill-test/scripts").abs());
-    let skill = test_skill_metadata(skill_doc_path);
+fn command_detection_resolves_script_and_document_paths() {
+    let skill = test_skill_metadata(test_path_buf("/tmp/skill-test/SKILL.md").abs());
+    let (scripts, docs) = build_implicit_skill_path_indexes(vec![skill.clone()]);
     let outcome = SkillLoadOutcome {
-        implicit_skills_by_scripts_dir: Arc::new(HashMap::from([(scripts_dir, skill)])),
-        implicit_skills_by_doc_path: Arc::new(HashMap::new()),
+        implicit_skills_by_scripts_dir: Arc::new(scripts),
+        implicit_skills_by_doc_path: Arc::new(docs),
         ..Default::default()
     };
-    let tokens = vec![
-        "python3".to_string(),
-        "scripts/fetch_comments.py".to_string(),
-    ];
-
-    let found = detect_skill_script_run(&outcome, &tokens, &test_path_buf("/tmp/skill-test").abs());
-
-    assert_eq!(
-        found.map(|value| value.name),
-        Some("test-skill".to_string())
-    );
-}
-
-#[test]
-fn skill_script_run_detection_matches_absolute_path_from_any_workdir() {
-    let skill_doc_path = test_path_buf("/tmp/skill-test/SKILL.md").abs();
-    let scripts_dir = canonicalize_if_exists(&test_path_buf("/tmp/skill-test/scripts").abs());
-    let skill = test_skill_metadata(skill_doc_path);
-    let outcome = SkillLoadOutcome {
-        implicit_skills_by_scripts_dir: Arc::new(HashMap::from([(scripts_dir, skill)])),
-        implicit_skills_by_doc_path: Arc::new(HashMap::new()),
-        ..Default::default()
-    };
-    let tokens = vec![
-        "python3".to_string(),
-        test_path_display("/tmp/skill-test/scripts/fetch_comments.py"),
-    ];
-
-    let found = detect_skill_script_run(&outcome, &tokens, &test_path_buf("/tmp/other").abs());
-
-    assert_eq!(
-        found.map(|value| value.name),
-        Some("test-skill".to_string())
-    );
+    let doc = skill.path_to_skills_md.to_string_lossy().replace('\\', "/");
+    let script = test_path_buf("/tmp/skill-test/scripts/fetch_comments.py")
+        .to_string_lossy().replace('\\', "/");
+    for (command, cwd, expected) in [
+        (format!("cat \"{doc}\" | head"), "/tmp", Some(skill.clone())),
+        (format!("nl -ba \"{doc}\""), "/tmp", Some(skill.clone())),
+        ("python3 scripts/fetch_comments.py".to_string(), "/tmp/skill-test", Some(skill.clone())),
+        (format!("python3 \"{script}\""), "/tmp/other", Some(skill.clone())),
+        ("python3 scripts/fetch_comments.py".to_string(), "/tmp/other", None),
+        ("cat unrelated.md".to_string(), "/tmp/skill-test", None),
+    ] {
+        assert_eq!(
+            detect_implicit_skill_invocation_for_command(&outcome, &command, &test_path_buf(cwd).abs()),
+            expected,
+            "{command} from {cwd}"
+        );
+    }
 }

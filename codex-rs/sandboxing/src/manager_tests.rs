@@ -28,45 +28,91 @@ use std::collections::HashMap;
 use tempfile::TempDir;
 
 #[test]
-fn danger_full_access_defaults_to_no_sandbox_without_network_requirements() {
-    let sandbox = select_initial(
-        &FileSystemSandboxPolicy::unrestricted(),
-        NetworkSandboxPolicy::Enabled,
-        SandboxablePreference::Auto,
-        WindowsSandboxLevel::Disabled,
-        /*has_managed_network_requirements*/ false,
-    );
-    assert_eq!(sandbox, SandboxType::None);
+fn sandbox_selection_respects_policy_preference_and_backend_availability() {
+    let unrestricted = FileSystemSandboxPolicy::unrestricted();
+    let restricted = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::Root,
+        },
+        access: FileSystemAccessMode::Read,
+    }]);
+    for (policy, network, pref, level, managed, expected) in [
+        (
+            &unrestricted,
+            NetworkSandboxPolicy::Enabled,
+            SandboxablePreference::Auto,
+            WindowsSandboxLevel::Disabled,
+            false,
+            SandboxType::None,
+        ),
+        (
+            &unrestricted,
+            NetworkSandboxPolicy::Enabled,
+            SandboxablePreference::Auto,
+            WindowsSandboxLevel::Elevated,
+            false,
+            SandboxType::None,
+        ),
+        (
+            &unrestricted,
+            NetworkSandboxPolicy::Enabled,
+            SandboxablePreference::Auto,
+            WindowsSandboxLevel::Elevated,
+            true,
+            SandboxType::WindowsRestrictedToken,
+        ),
+        (
+            &restricted,
+            NetworkSandboxPolicy::Enabled,
+            SandboxablePreference::Auto,
+            WindowsSandboxLevel::Elevated,
+            false,
+            SandboxType::WindowsRestrictedToken,
+        ),
+        (
+            &unrestricted,
+            NetworkSandboxPolicy::Enabled,
+            SandboxablePreference::Require,
+            WindowsSandboxLevel::Elevated,
+            false,
+            SandboxType::WindowsRestrictedToken,
+        ),
+        (
+            &unrestricted,
+            NetworkSandboxPolicy::Enabled,
+            SandboxablePreference::Forbid,
+            WindowsSandboxLevel::Elevated,
+            false,
+            SandboxType::None,
+        ),
+        (
+            &unrestricted,
+            NetworkSandboxPolicy::Enabled,
+            SandboxablePreference::Require,
+            WindowsSandboxLevel::Disabled,
+            false,
+            SandboxType::None,
+        ),
+        (
+            &restricted,
+            NetworkSandboxPolicy::Restricted,
+            SandboxablePreference::Forbid,
+            WindowsSandboxLevel::Elevated,
+            true,
+            SandboxType::None,
+        ),
+    ] {
+        assert_eq!(
+            select_initial(policy, network, pref, level, managed),
+            expected,
+            "policy: {policy:?}, network: {network:?}, preference: {pref:?}, level: {level:?}, managed: {managed}"
+        );
+    }
 }
 
-#[test]
-fn danger_full_access_uses_platform_sandbox_with_network_requirements() {
-    let sandbox = select_initial(
-        &FileSystemSandboxPolicy::unrestricted(),
-        NetworkSandboxPolicy::Enabled,
-        SandboxablePreference::Auto,
-        WindowsSandboxLevel::Elevated,
-        /*has_managed_network_requirements*/ true,
-    );
-    assert_eq!(sandbox, SandboxType::WindowsRestrictedToken);
-}
 
-#[test]
-fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
-    let sandbox = select_initial(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::Root,
-            },
-            access: FileSystemAccessMode::Read,
-        }]),
-        NetworkSandboxPolicy::Enabled,
-        SandboxablePreference::Auto,
-        WindowsSandboxLevel::Elevated,
-        /*has_managed_network_requirements*/ false,
-    );
-    assert_eq!(sandbox, SandboxType::WindowsRestrictedToken);
-}
+
+
 
 #[test]
 fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_policy() {
@@ -442,37 +488,7 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
     );
 }
 
-#[test]
-fn sandbox_preferences_and_disabled_backend_have_distinct_results() {
-    for (pref, level, expected) in [
-        (
-            SandboxablePreference::Require,
-            WindowsSandboxLevel::Elevated,
-            SandboxType::WindowsRestrictedToken,
-        ),
-        (
-            SandboxablePreference::Forbid,
-            WindowsSandboxLevel::Elevated,
-            SandboxType::None,
-        ),
-        (
-            SandboxablePreference::Require,
-            WindowsSandboxLevel::Disabled,
-            SandboxType::None,
-        ),
-    ] {
-        assert_eq!(
-            select_initial(
-                &FileSystemSandboxPolicy::unrestricted(),
-                NetworkSandboxPolicy::Enabled,
-                pref,
-                level,
-                false
-            ),
-            expected
-        );
-    }
-}
+
 
 #[test]
 fn restricted_token_accepts_native_writable_roots_without_legacy_cwd() {

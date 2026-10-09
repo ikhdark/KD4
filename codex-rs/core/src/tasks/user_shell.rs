@@ -636,15 +636,19 @@ async fn collect_remote_user_shell_output(
     let mut stderr = crate::unified_exec::head_tail_buffer::HeadTailBuffer::default();
     let mut aggregated = crate::unified_exec::head_tail_buffer::HeadTailBuffer::default();
     let mut exit_code = None;
+    let mut closed = false;
+    let mut output_gap = false;
 
     loop {
         let response = process
-            .read(after_seq, Some(64 * 1024), Some(1_000))
+            .read(after_seq, Some(64 * 1024), Some(if closed { 0 } else { 1_000 }))
             .await
             .map_err(|err| UserShellExecError::Failed(format!("{err:?}")))?;
         if let Some(failure) = response.failure {
             return Err(UserShellExecError::Failed(failure));
         }
+        output_gap |= response.output_gap.is_some();
+        let drained = response.chunks.is_empty();
         for chunk in response.chunks {
             after_seq = Some(chunk.seq);
             let bytes = chunk.chunk.into_inner();
@@ -672,19 +676,25 @@ async fn collect_remote_user_shell_output(
         }
         after_seq = response.next_seq.checked_sub(1).or(after_seq);
         exit_code = response.exit_code.or(exit_code);
-        if response.closed {
+        closed = response.closed;
+        // Process closure does not imply that this bounded read returned its
+        // final page. Preserve the original caller's cancellation/deadline.
+        if closed && drained {
+            let loss_notice = if output_gap {
+                b"\n[remote executor output was lost; retained output is incomplete]\n".as_slice()
+            } else {
+                &[]
+            };
+            let retained_stream = |buffer: &crate::unified_exec::head_tail_buffer::HeadTailBuffer| StreamOutput {
+                text: String::from_utf8_lossy(&buffer.to_bytes_with_loss_notice(loss_notice)).into_owned(),
+                truncated_after_lines: None,
+                truncated: output_gap || buffer.omitted_bytes() > 0,
+            };
             return Ok(ExecToolCallOutput {
                 exit_code: exit_code.unwrap_or(-1),
-                stdout: StreamOutput::new(
-                    String::from_utf8_lossy(&stdout.to_bytes_with_loss_notice(&[])).into_owned(),
-                ),
-                stderr: StreamOutput::new(
-                    String::from_utf8_lossy(&stderr.to_bytes_with_loss_notice(&[])).into_owned(),
-                ),
-                aggregated_output: StreamOutput::new(
-                    String::from_utf8_lossy(&aggregated.to_bytes_with_loss_notice(&[]))
-                        .into_owned(),
-                ),
+                stdout: retained_stream(&stdout),
+                stderr: retained_stream(&stderr),
+                aggregated_output: retained_stream(&aggregated),
                 duration: started_at.elapsed(),
                 timed_out: false,
             });

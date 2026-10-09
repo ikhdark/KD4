@@ -73,6 +73,18 @@ fn legacy_error_completion_message_stays_below_manual_review_threshold() {
         format_subagent_notification_message("worker", &AgentStatus::Errored("\0".repeat(10_000)));
 
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
+    let body = message
+        .strip_prefix("<subagent_notification>")
+        .and_then(|body| body.strip_suffix("</subagent_notification>"))
+        .expect("notification envelope must survive truncation");
+    let notification: serde_json::Value =
+        serde_json::from_str(body).expect("valid notification JSON");
+    assert_eq!(notification["agent_path"], "worker");
+    assert!(
+        notification["status"]["errored"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
 }
 
 #[test]
@@ -93,9 +105,12 @@ fn typed_completion_message_stays_bounded_and_points_to_durable_receipt() {
 fn completion_preserves_exact_receipt_and_attempt_under_truncation() {
     let receipt = "Receipt: get_agent_task({\"assignment_id\":\"assignment-123\"})\nProducer attempt: attempt-456";
     let message = format_inter_agent_completion_message(
-        AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(),
-        &AgentStatus::Completed(Some("result ".repeat(10_000))), Some(receipt),
-    ).unwrap();
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").unwrap(),
+        &AgentStatus::Completed(Some("result ".repeat(10_000))),
+        Some(receipt),
+    )
+    .unwrap();
     assert!(message.contains(receipt));
     assert!(!message.contains("returned by spawn_agent"));
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);

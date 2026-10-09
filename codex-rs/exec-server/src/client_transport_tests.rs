@@ -197,12 +197,10 @@ fn assert_websocket_deadline_covers_tls_preparation(noise: bool) -> Result<()> {
 
 #[test]
 fn websocket_deadline_covers_tls_preparation_without_network_side_effects() -> Result<()> {
-    assert_websocket_deadline_covers_tls_preparation(false)
-}
-
-#[test]
-fn noise_websocket_deadline_covers_tls_preparation_without_network_side_effects() -> Result<()> {
-    assert_websocket_deadline_covers_tls_preparation(true)
+    for noise in [false, true] {
+        assert_websocket_deadline_covers_tls_preparation(noise)?;
+    }
+    Ok(())
 }
 
 #[test]

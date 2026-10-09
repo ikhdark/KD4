@@ -536,7 +536,7 @@ async fn exec_resume_accepts_global_flags_after_subcommand() -> anyhow::Result<(
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
-    let _response_mock = mount_exec_responses(&server, /*count*/ 2).await;
+    let response_mock = mount_exec_responses(&server, /*count*/ 2).await;
 
     // Seed a session.
     test.cmd_with_server(&server)
@@ -559,6 +559,10 @@ async fn exec_resume_accepts_global_flags_after_subcommand() -> anyhow::Result<(
         .arg("echo resume-with-global-flags-after-subcommand")
         .assert()
         .success();
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.2-codex");
 
     Ok(())
 }

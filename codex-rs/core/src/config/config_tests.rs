@@ -328,20 +328,28 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
 
 #[tokio::test]
 async fn show_raw_agent_reasoning_runtime_override_wins_over_config() -> std::io::Result<()> {
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            show_raw_agent_reasoning: Some(false),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            show_raw_agent_reasoning: Some(true),
-            ..Default::default()
-        },
-        tempdir()?.abs(),
-    )
-    .await?;
+    for configured in [None, Some(false), Some(true)] {
+        for overridden in [None, Some(false), Some(true)] {
+            let config = Config::load_from_base_config_with_overrides(
+                ConfigToml {
+                    show_raw_agent_reasoning: configured,
+                    ..Default::default()
+                },
+                ConfigOverrides {
+                    show_raw_agent_reasoning: overridden,
+                    ..Default::default()
+                },
+                tempdir()?.abs(),
+            )
+            .await?;
 
-    assert!(config.show_raw_agent_reasoning);
+            assert_eq!(
+                config.show_raw_agent_reasoning,
+                overridden.or(configured).unwrap_or(false),
+                "configured={configured:?}, overridden={overridden:?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3252,61 +3260,41 @@ async fn permissions_profiles_allow_unknown_special_paths_with_nested_entries()
 }
 
 #[tokio::test]
-async fn permissions_profiles_allow_missing_filesystem_with_warning() -> std::io::Result<()> {
-    let config = load_workspace_permission_profile(PermissionProfileToml {
-        description: None,
-        extends: None,
-        workspace_roots: None,
-        filesystem: None,
-        network: None,
-    })
-    .await?;
-
-    assert_eq!(
-        config.permissions.file_system_sandbox_policy(),
-        FileSystemSandboxPolicy::restricted(Vec::new())
-    );
-    assert_eq!(
-        &config.legacy_sandbox_policy(),
-        &SandboxPolicy::ReadOnly {
-            network_access: false,
-        }
-    );
-    assert!(
-        config.startup_warnings.iter().any(|warning| warning.contains(
-            "Permissions profile `dev` does not define any recognized filesystem entries for this version of Codex."
-        )),
-        "{:?}",
-        config.startup_warnings
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn permissions_profiles_allow_empty_filesystem_with_warning() -> std::io::Result<()> {
-    let config = load_workspace_permission_profile(PermissionProfileToml {
-        description: None,
-        extends: None,
-        workspace_roots: None,
-        filesystem: Some(FilesystemPermissionsToml {
+async fn permissions_profiles_allow_missing_or_empty_filesystem_with_warning() -> std::io::Result<()> {
+    for filesystem in [
+        None,
+        Some(FilesystemPermissionsToml {
             glob_scan_max_depth: None,
             entries: BTreeMap::new(),
         }),
-        network: None,
-    })
-    .await?;
+    ] {
+        let config = load_workspace_permission_profile(PermissionProfileToml {
+            description: None,
+            extends: None,
+            workspace_roots: None,
+            filesystem,
+            network: None,
+        })
+        .await?;
 
-    assert_eq!(
-        config.permissions.file_system_sandbox_policy(),
-        FileSystemSandboxPolicy::restricted(Vec::new())
-    );
-    assert!(
-        config.startup_warnings.iter().any(|warning| warning.contains(
-            "Permissions profile `dev` does not define any recognized filesystem entries for this version of Codex."
-        )),
-        "{:?}",
-        config.startup_warnings
-    );
+        assert_eq!(
+            config.permissions.file_system_sandbox_policy(),
+            FileSystemSandboxPolicy::restricted(Vec::new())
+        );
+        assert_eq!(
+            &config.legacy_sandbox_policy(),
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            }
+        );
+        assert!(
+            config.startup_warnings.iter().any(|warning| warning.contains(
+                "Permissions profile `dev` does not define any recognized filesystem entries for this version of Codex."
+            )),
+            "{:?}",
+            config.startup_warnings
+        );
+    }
     Ok(())
 }
 
@@ -8585,6 +8573,7 @@ fn test_set_default_oss_provider() -> std::io::Result<()> {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("Invalid OSS provider"));
     assert!(error.to_string().contains("invalid_provider"));
+    assert_eq!(std::fs::read_to_string(&config_path)?, content);
 
     Ok(())
 }
@@ -9715,14 +9704,18 @@ max_concurrent_threads_per_session = 17
     let concurrency_guidance = "There are 17 available concurrency slots, meaning that up to 17 agents can be active at once, including you.";
     let expected_suffix =
         format!("{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\n{concurrency_guidance}");
-    assert!(
-        [
-            config.root_agent_usage_hint_text,
-            config.subagent_usage_hint_text,
-        ]
-        .into_iter()
-        .all(|hint| hint.is_some_and(|hint| hint.ends_with(expected_suffix.as_str())))
-    );
+    for hint in [
+        config.root_agent_usage_hint_text,
+        config.subagent_usage_hint_text,
+    ] {
+        let hint = hint.expect("root and subagent defaults must include usage guidance");
+        assert!(hint.ends_with(expected_suffix.as_str()));
+        assert!(hint.contains(
+            "Tools exposed under the `tools` namespace inside `functions.exec` may be called there"
+        ));
+        assert!(hint.contains("direct-only tools must be called directly"));
+        assert!(!hint.contains("not from inside `functions.exec`"));
+    }
 }
 
 #[test]
@@ -9831,201 +9824,61 @@ max_threads = 3
 #[tokio::test]
 async fn multi_agent_v2_rejects_invalid_wait_timeouts() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-min_wait_timeout_ms = 0
-max_wait_timeout_ms = 0
-default_wait_timeout_ms = 0
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("wait timeout values below the floor should be rejected");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.min_wait_timeout_ms must be at least 60000"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-min_wait_timeout_ms = -1
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("negative min_wait_timeout_ms should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.min_wait_timeout_ms must be at least 60000"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-min_wait_timeout_ms = 3600001
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("too large min_wait_timeout_ms should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.min_wait_timeout_ms must be at most 3600000"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-max_wait_timeout_ms = -1
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("negative max_wait_timeout_ms should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.max_wait_timeout_ms must be at least 60000"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-max_wait_timeout_ms = 3600001
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("too large max_wait_timeout_ms should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.max_wait_timeout_ms must be at most 3600000"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-default_wait_timeout_ms = -1
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("negative default_wait_timeout_ms should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.default_wait_timeout_ms must be at least 60000"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-min_wait_timeout_ms = 120000
-max_wait_timeout_ms = 60000
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("min greater than max should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.min_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-min_wait_timeout_ms = 120000
-max_wait_timeout_ms = 180000
-default_wait_timeout_ms = 60000
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("default less than min should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.default_wait_timeout_ms must be at least features.multi_agent_v2.min_wait_timeout_ms"
-    );
-
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features.multi_agent_v2]
-enabled = true
-min_wait_timeout_ms = 60000
-max_wait_timeout_ms = 120000
-default_wait_timeout_ms = 180000
-"#,
-    )?;
-
-    let err = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await
-        .expect_err("default greater than max should be rejected");
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "features.multi_agent_v2.default_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms"
-    );
-
+    for (settings, expected_message) in [
+        (
+            "min_wait_timeout_ms = 0\nmax_wait_timeout_ms = 0\ndefault_wait_timeout_ms = 0",
+            "features.multi_agent_v2.min_wait_timeout_ms must be at least 60000",
+        ),
+        (
+            "min_wait_timeout_ms = -1",
+            "features.multi_agent_v2.min_wait_timeout_ms must be at least 60000",
+        ),
+        (
+            "min_wait_timeout_ms = 3600001",
+            "features.multi_agent_v2.min_wait_timeout_ms must be at most 3600000",
+        ),
+        (
+            "max_wait_timeout_ms = -1",
+            "features.multi_agent_v2.max_wait_timeout_ms must be at least 60000",
+        ),
+        (
+            "max_wait_timeout_ms = 3600001",
+            "features.multi_agent_v2.max_wait_timeout_ms must be at most 3600000",
+        ),
+        (
+            "default_wait_timeout_ms = -1",
+            "features.multi_agent_v2.default_wait_timeout_ms must be at least 60000",
+        ),
+        (
+            "min_wait_timeout_ms = 120000\nmax_wait_timeout_ms = 60000",
+            "features.multi_agent_v2.min_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms",
+        ),
+        (
+            "min_wait_timeout_ms = 120000\nmax_wait_timeout_ms = 180000\ndefault_wait_timeout_ms = 60000",
+            "features.multi_agent_v2.default_wait_timeout_ms must be at least features.multi_agent_v2.min_wait_timeout_ms",
+        ),
+        (
+            "min_wait_timeout_ms = 60000\nmax_wait_timeout_ms = 120000\ndefault_wait_timeout_ms = 180000",
+            "features.multi_agent_v2.default_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms",
+        ),
+        (
+            "default_wait_timeout_ms = 3600001",
+            "features.multi_agent_v2.default_wait_timeout_ms must be at most 3600000",
+        ),
+    ] {
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            format!("[features.multi_agent_v2]\nenabled = true\n{settings}\n"),
+        )?;
+        let err = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .build()
+            .await
+            .expect_err("invalid wait timeout settings should be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{settings}");
+        assert_eq!(err.to_string(), expected_message, "{settings}");
+    }
     Ok(())
 }
 

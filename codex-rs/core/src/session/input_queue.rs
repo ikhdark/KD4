@@ -1028,27 +1028,6 @@ mod tests {
 
         activity_rx.changed().await.expect("steer update");
         assert_eq!(*activity_rx.borrow_and_update(), InputQueueActivity::Steer);
-    }
-
-    #[tokio::test]
-    async fn input_queue_reports_already_pending_steer() {
-        let input_queue = InputQueue::new();
-        let turn_state = Mutex::new(TurnState::default());
-        input_queue
-            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                &turn_state,
-                &[TurnInput::UserInput {
-                    content: vec![UserInput::Text {
-                        text: "already pending".to_string(),
-                        text_elements: Vec::new(),
-                    }],
-                    client_id: None,
-                }],
-                || {},
-            )
-            .await
-            .expect("steer input should fit");
-
         let (_activity_rx, pending_activity) = input_queue
             .subscribe_code_mode_activity(Some(&turn_state), /*has_internal_completion*/ false)
             .await;
@@ -1106,9 +1085,10 @@ mod tests {
     async fn a_parked_waiter_re_derives_steering_after_a_completion_wake() {
         let input_queue = InputQueue::new();
         let turn_state = Mutex::new(TurnState::default());
-        let (_activity_rx, _) = input_queue
+        let (mut activity_rx, pending) = input_queue
             .subscribe_code_mode_activity(Some(&turn_state), /*has_internal_completion*/ false)
             .await;
+        assert_eq!(pending, None);
 
         input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
@@ -1127,6 +1107,11 @@ mod tests {
         // The completion publishes last, so the watch's latest value is the
         // low-priority one.
         input_queue.publish_internal_completion();
+        activity_rx.changed().await.expect("completion wakes the parked subscriber");
+        assert_eq!(
+            *activity_rx.borrow_and_update(),
+            InputQueueActivity::InternalCompletion
+        );
 
         assert_eq!(
             input_queue

@@ -668,7 +668,8 @@ impl BottomPane {
             if needs_redraw || view_complete {
                 self.request_redraw();
             }
-        } else {
+        } else if self.composer.input_enabled() {
+            // Reject new terminal input without interfering with already accepted paste bursts.
             let needs_redraw = self.composer.handle_paste(pasted);
             if has_pasted_text {
                 self.record_composer_activity_at(Instant::now());
@@ -799,7 +800,7 @@ impl BottomPane {
         self.composer.cursor()
     }
 
-    pub(crate) fn composer_draft_snapshot(&self) -> ComposerDraftSnapshot {
+    pub(crate) fn composer_draft_snapshot(&mut self) -> ComposerDraftSnapshot {
         self.composer.draft_snapshot()
     }
 
@@ -1984,6 +1985,8 @@ mod tests {
                     *id = call_id.to_string();
                 }
                 pane.push_approval_request(request, &features);
+                assert_eq!(pane.view_stack.len(), 1);
+                assert!(pane.delayed_approval_requests.is_empty());
             }
             for (thread, call_id, label) in [
                 (first_thread, "approval-first", "First thread"),
@@ -2022,28 +2025,12 @@ mod tests {
                 !pane.has_active_view(),
                 "all requests individually resolved"
             );
+            assert_eq!(pane.on_ctrl_c(), CancellationEvent::NotHandled);
+            assert!(rx.try_recv().is_err());
         }
     }
 
-    #[test]
-    fn ctrl_c_on_modal_is_consumed_once() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
-        let mut pane = BottomPane::new(BottomPaneParams {
-            app_event_tx: tx,
-            frame_requester: FrameRequester::test_dummy(),
-            has_input_focus: true,
-            enhanced_keys_supported: false,
-            placeholder_text: "Ask Codex to do anything".to_string(),
-            disable_paste_burst: true,
-            animations_enabled: true,
-            skills: Some(Vec::new()),
-        });
-        pane.push_approval_request(exec_request(), &features);
-        assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
-        assert_eq!(CancellationEvent::NotHandled, pane.on_ctrl_c());
-    }
+
 
     #[test]
     fn ctrl_c_cancels_history_search_without_clearing_draft() {
@@ -2071,52 +2058,9 @@ mod tests {
 
     // live ring removed; related tests deleted.
 
-    #[test]
-    fn overlay_not_shown_above_approval_modal() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
-        let mut pane = BottomPane::new(BottomPaneParams {
-            app_event_tx: tx,
-            frame_requester: FrameRequester::test_dummy(),
-            has_input_focus: true,
-            enhanced_keys_supported: false,
-            placeholder_text: "Ask Codex to do anything".to_string(),
-            disable_paste_burst: false,
-            animations_enabled: true,
-            skills: Some(Vec::new()),
-        });
 
-        // Create an approval modal (active view).
-        pane.push_approval_request(exec_request(), &features);
 
-        // Render and verify the top row does not include an overlay.
-        let area = Rect::new(0, 0, 60, 6);
-        let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf);
 
-        let mut r0 = String::new();
-        for x in 0..area.width {
-            r0.push(buf[(x, 0)].symbol().chars().next().unwrap_or(' '));
-        }
-        assert!(
-            !r0.contains("Working"),
-            "overlay should not render above modal"
-        );
-    }
-
-    #[test]
-    fn approval_request_shows_immediately_without_recent_typing() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
-        let mut pane = test_pane(tx);
-
-        pane.push_approval_request(exec_request(), &features);
-
-        assert_eq!(pane.view_stack.len(), 1);
-        assert!(pane.delayed_approval_requests.is_empty());
-    }
 
     #[test]
     fn approval_request_is_delayed_after_recent_typing() {
@@ -2188,34 +2132,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn delayed_approval_shortcut_works_after_idle_deadline() {
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
-        let mut pane = test_pane(tx);
-        let now = Instant::now();
-        pane.last_composer_activity_at = Some(now);
-        pane.push_approval_request(exec_request(), &features);
 
-        pane.pre_draw_tick_at(now + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
-        pane.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-
-        let mut approval_decision = None;
-        while let Ok(event) = rx.try_recv() {
-            if let AppEvent::SubmitThreadOp {
-                op: Op::ExecApproval { decision, .. },
-                ..
-            } = event
-            {
-                approval_decision = Some(decision);
-            }
-        }
-        assert_eq!(
-            approval_decision,
-            Some(CommandExecutionApprovalDecision::Accept)
-        );
-    }
 
     #[test]
     fn dismiss_app_server_request_prunes_delayed_approval() {
@@ -2301,6 +2218,7 @@ mod tests {
             pane.push_approval_request(exec_request_with_id(id), &features);
         }
         assert_eq!(pane.delayed_approval_requests.len(), 3);
+        assert!(!pane.has_active_view());
 
         pane.pre_draw_tick_at(now + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
         for _ in 0..3 {
@@ -2308,12 +2226,13 @@ mod tests {
         }
 
         assert_eq!(
-            submitted_exec_decisions(&mut rx)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>(),
-            ["first", "second", "third"]
-        );
+            submitted_exec_decisions(&mut rx),
+            ["first", "second", "third"].map(|id| (
+                id.to_string(),
+                CommandExecutionApprovalDecision::Accept,
+            ))
+        );        assert!(!pane.has_active_view());
+        assert!(pane.delayed_approval_requests.is_empty());
     }
 
     #[test]
@@ -2448,8 +2367,11 @@ mod tests {
         // Start a running task so the status indicator is active above the composer.
         pane.set_task_running(/*running*/ true);
 
+        assert!(render_snapshot(&pane, Rect::new(0, 0, 60, 6)).contains("Working"));
+
         // Push an approval modal (e.g., command approval) which should hide the status view.
         pane.push_approval_request(exec_request(), &features);
+        assert!(!render_snapshot(&pane, Rect::new(0, 0, 60, 6)).contains("Working"));
 
         // Simulate pressing 'n' (No) on the modal.
         use crossterm::event::KeyCode;
@@ -2465,8 +2387,6 @@ mod tests {
         );
 
         // Render and ensure the top row includes the Working header and a composer line below.
-        // Give the animation thread a moment to tick.
-        std::thread::sleep(Duration::from_millis(120));
         let area = Rect::new(0, 0, 40, 6);
         let mut buf = Buffer::empty(area);
         pane.render(area, &mut buf);
@@ -2728,12 +2648,15 @@ mod tests {
         ]);
 
         assert_eq!(pane.composer_text(), "");
+        pane.set_composer_text("draft text".to_string(), Vec::new(), Vec::new());
         let width = 48;
         let height = pane.desired_height(width);
         let area = Rect::new(0, 0, width, height);
         let snapshot = render_snapshot(&pane, area);
-        assert!(snapshot.contains("[Image #1]"));
-        assert!(snapshot.contains("[Image #2]"));
+        let first = snapshot.find("[Image #1]").expect("first remote image");
+        let second = snapshot.find("[Image #2]").expect("second remote image");
+        let draft = snapshot.find("draft text").expect("composer draft");
+        assert!(first < second && second < draft, "{snapshot}");
     }
 
     #[test]
@@ -3117,6 +3040,56 @@ mod tests {
         ));
 
         assert_eq!(handle_calls.get(), 1);
+    }
+
+    #[test]
+    fn disabled_composer_rejects_new_pastes_without_discarding_held_input() {
+        let dir = tempfile::tempdir().expect("temporary image directory");
+        let image_path = dir.path().join("paste.png");
+        image::ImageBuffer::from_fn(1, 1, |_, _| image::Rgba([1u8, 2, 3, 255]))
+            .save(&image_path)
+            .expect("save image");
+
+        for shutdown in [false, true] {
+            let (tx, mut rx) = unbounded_channel::<AppEvent>();
+            let mut pane = BottomPane::new(BottomPaneParams {
+                app_event_tx: AppEventSender::new(tx),
+                frame_requester: FrameRequester::test_dummy(),
+                has_input_focus: true,
+                enhanced_keys_supported: false,
+                placeholder_text: String::new(),
+                disable_paste_burst: false,
+                animations_enabled: false,
+                skills: None,
+            });
+            pane.composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
+            pane.composer.move_cursor_to_end();
+            pane.composer.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+            assert!(pane.composer.is_in_paste_burst());
+            if shutdown {
+                pane.show_shutdown_in_progress();
+            } else {
+                pane.set_composer_input_enabled(false, None);
+            }
+
+            for pasted in [
+                "@hidden".to_string(),
+                "x".repeat(10_000),
+                image_path.to_string_lossy().into_owned(),
+            ] {
+                pane.handle_paste(pasted);
+                assert_eq!(pane.composer.current_text(), "draft");
+                assert!(pane.composer.local_image_paths().is_empty());
+                assert!(pane.composer.text_elements().is_empty());
+                assert_eq!(pane.last_composer_activity_at, None);
+                assert!(rx.try_recv().is_err());
+            }
+
+            // The input accepted before disabling remains available to the normal burst flush.
+            pane.composer.set_disable_paste_burst(true);
+            assert_eq!(pane.composer.current_text_with_pending(), "drafta");
+            assert!(!pane.composer.is_in_paste_burst());
+        }
     }
 
     #[test]

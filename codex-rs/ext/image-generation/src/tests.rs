@@ -452,91 +452,47 @@ async fn referenced_paths_reject_an_unreadable_primary_environment() {
 }
 
 #[test]
-fn generated_output_returns_image_input_and_output_hint() {
-    let output_hint =
+fn generated_output_preserves_image_and_hint_across_delivery_surfaces() {
+    let saved_hint =
         extension_image_generation_output_hint("/tmp", "/tmp/call-1.png").expect("hint should fit");
-    let output = GeneratedImageOutput {
-        result: RESULT.to_string(),
-        output_hint: Some(output_hint.clone()),
-    };
+    let fallback_hint = "If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.";
+    let oversized_hint = extension_image_generation_output_hint("/tmp", "x".repeat(1024));
+    assert_eq!(oversized_hint.as_deref(), Some(fallback_hint));
 
-    let ResponseInputItem::FunctionCallOutput {
-        output: response_output,
-        ..
-    } = output.to_response_item("call-1", &function_payload())
-    else {
-        panic!("imagegen should return function tool output");
-    };
-    let FunctionCallOutputBody::ContentItems(content_items) = response_output.body else {
-        panic!("imagegen output should contain generated image bytes");
-    };
-    assert_eq!(
-        content_items,
-        vec![
-            FunctionCallOutputContentItem::InputImage {
-                image_url: format!("data:image/png;base64,{RESULT}"),
-                detail: Some(DEFAULT_IMAGE_DETAIL),
-            },
-            FunctionCallOutputContentItem::InputText { text: output_hint },
-        ]
-    );
-}
-
-#[test]
-fn generated_output_returns_generated_image_helper_input_in_code_mode() {
-    let output = GeneratedImageOutput {
-        result: RESULT.to_string(),
-        output_hint: Some("generated image save hint".to_string()),
-    };
-
-    assert_eq!(
-        output.code_mode_result(&function_payload()),
-        serde_json::json!({
-            "image_url": format!("data:image/png;base64,{RESULT}"),
-            "output_hint": "generated image save hint",
-        })
-    );
-}
-
-#[test]
-fn generated_output_preserves_copy_instruction_for_oversized_paths() {
-    let long_path = "x".repeat(1024);
-    let output = GeneratedImageOutput {
-        result: RESULT.to_string(),
-        output_hint: extension_image_generation_output_hint("/tmp", long_path),
-    };
-
-    let expected_hint = "If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.";
-    assert_eq!(
-        output.code_mode_result(&function_payload()),
-        serde_json::json!({
-            "image_url": format!("data:image/png;base64,{RESULT}"),
-            "output_hint": expected_hint,
-        })
-    );
-
-    let ResponseInputItem::FunctionCallOutput {
-        output: response_output,
-        ..
-    } = output.to_response_item("call-1", &function_payload())
-    else {
-        panic!("imagegen should return function tool output");
-    };
-    let FunctionCallOutputBody::ContentItems(content_items) = response_output.body else {
-        panic!("imagegen output should contain generated image bytes");
-    };
-    assert_eq!(
-        content_items,
-        vec![
-            FunctionCallOutputContentItem::InputImage {
-                image_url: format!("data:image/png;base64,{RESULT}"),
-                detail: Some(DEFAULT_IMAGE_DETAIL),
-            },
-            FunctionCallOutputContentItem::InputText {
-                text: expected_hint.to_string(),
-            },
-        ]
-    );
+    for hint in [
+        Some(saved_hint),
+        Some("generated image save hint".to_string()),
+        oversized_hint,
+        None,
+    ] {
+        let output = GeneratedImageOutput {
+            result: RESULT.to_string(),
+            output_hint: hint.clone(),
+        };
+        let image_url = format!("data:image/png;base64,{RESULT}");
+        let mut expected_json = serde_json::json!({"image_url": image_url});
+        let mut content = vec![FunctionCallOutputContentItem::InputImage {
+            image_url,
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        }];
+        if let Some(hint) = hint {
+            expected_json["output_hint"] = hint.clone().into();
+            content.push(FunctionCallOutputContentItem::InputText { text: hint });
+        }
+        assert_eq!(output.code_mode_result(&function_payload()), expected_json);
+        assert_eq!(
+            output.to_response_item("call-1", &function_payload()),
+            ResponseInputItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::ContentItems(content),
+                    success: Some(true),
+                },
+            }
+        );
+        assert_eq!(output.log_preview(), "[generated image]");
+        assert!(output.success_for_logging());
+    }
 }
 
 fn input_image(image: &str) -> ContentItem {

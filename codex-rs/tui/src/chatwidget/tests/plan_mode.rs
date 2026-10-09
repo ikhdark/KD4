@@ -17,6 +17,7 @@ async fn plan_mode_nudge_shows_only_for_eligible_default_mode_drafts() {
     chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
     chat.pre_draw_tick();
     assert!(chat.bottom_pane.plan_mode_nudge_visible());
+    assert_chatwidget_snapshot!("plan_mode_nudge_narrow", render_bottom_popup(&chat, 36));
 
     chat.set_composer_text("/plan".to_string(), Vec::new(), Vec::new());
     chat.pre_draw_tick();
@@ -111,27 +112,9 @@ async fn plan_mode_nudge_snapshot() {
     assert_chatwidget_snapshot!("plan_mode_nudge", render_bottom_popup(&chat, /*width*/ 80));
 }
 
-#[tokio::test]
-async fn plan_mode_nudge_narrow_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-    chat.set_composer_text("make a plan".to_string(), Vec::new(), Vec::new());
-    chat.pre_draw_tick();
 
-    assert_chatwidget_snapshot!(
-        "plan_mode_nudge_narrow",
-        render_bottom_popup(&chat, /*width*/ 36)
-    );
-}
 
-#[tokio::test]
-async fn plan_implementation_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-    chat.on_plan_item_completed("- Step 1\n- Step 2\n".to_string());
-    chat.open_plan_implementation_prompt();
 
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("plan_implementation_popup", popup);
-}
 
 #[tokio::test]
 async fn plan_implementation_popup_context_usage_snapshot() {
@@ -146,16 +129,7 @@ async fn plan_implementation_popup_context_usage_snapshot() {
     assert_chatwidget_snapshot!("plan_implementation_popup_context_usage", popup);
 }
 
-#[tokio::test]
-async fn plan_implementation_popup_no_selected_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-    chat.on_plan_item_completed("- Step 1\n- Step 2\n".to_string());
-    chat.open_plan_implementation_prompt();
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
 
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("plan_implementation_popup_no_selected", popup);
-}
 
 #[tokio::test]
 async fn plan_implementation_popup_yes_emits_submit_message_event() {
@@ -187,7 +161,9 @@ async fn plan_implementation_popup_clear_context_emits_clear_submit_event() {
     let _ = drain_insert_history(&mut rx);
     chat.open_plan_implementation_prompt();
 
+    assert_chatwidget_snapshot!("plan_implementation_popup", render_bottom_popup(&chat, 80));
     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    assert_chatwidget_snapshot!("plan_implementation_popup_no_selected", render_bottom_popup(&chat, 80));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     let event = rx.try_recv().expect("expected AppEvent");
@@ -373,6 +349,7 @@ async fn reasoning_selection_in_plan_mode_without_effort_change_does_not_open_sc
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().all(|event| !matches!(event, AppEvent::OpenPlanReasoningScopePrompt { .. })));
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -502,6 +479,7 @@ async fn reasoning_selection_in_plan_mode_model_switch_does_not_open_scope_promp
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().all(|event| !matches!(event, AppEvent::OpenPlanReasoningScopePrompt { .. })));
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -946,6 +924,7 @@ async fn plan_implementation_popup_skips_when_messages_queued() {
     chat.bottom_pane.set_task_running(/*running*/ true);
     chat.queue_user_message("Queued message".into());
 
+    chat.on_plan_item_completed("- Proposed plan\n".to_string());
     chat.on_task_complete(
         Some("Plan details".to_string()),
         /*duration_ms*/ None,
@@ -1111,6 +1090,7 @@ async fn plan_implementation_popup_skips_when_rate_limit_prompt_pending() {
         }],
     });
     chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 92.0)));
+    chat.on_plan_item_completed("- Proposed plan\n".to_string());
     chat.on_task_complete(
         /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
     );
@@ -1594,29 +1574,7 @@ async fn set_reasoning_effort_does_not_override_active_plan_override() {
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
 }
 
-#[tokio::test]
-async fn collab_mode_is_sent_after_enabling() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
-    chat.thread_id = Some(ThreadId::new());
 
-    chat.bottom_pane
-        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            collaboration_mode:
-                Some(CollaborationMode {
-                    mode: ModeKind::Default,
-                    ..
-                }),
-            personality: None,
-            ..
-        } => {}
-        other => {
-            panic!("expected Op::UserTurn, got {other:?}")
-        }
-    }
-}
 
 #[tokio::test]
 async fn collab_mode_applies_default_preset() {

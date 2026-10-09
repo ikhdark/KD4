@@ -855,10 +855,9 @@ pub(super) async fn submission_loop(
         .execution_permit_thread_cleanup(sess.thread_id);
     // A single owned future preserves settings/start order. Control messages
     // can bypass slow preparation; dropping that future prevents cancelled
-    // preparation from installing a task later. The deferred queue is bounded
-    // by the submission channel's own capacity.
+    // preparation from installing a task later. Ordinary admission permits bound
+    // the deferred queue, so receiving controls never stops when it fills.
     let mut ordered = std::collections::VecDeque::new();
-    let deferred_limit = rx_sub.capacity().unwrap_or(1024).max(1);
     let mut pending: Option<(String, bool, futures::future::BoxFuture<'static, bool>)> = None;
     let mut shutdown_received = false;
     loop {
@@ -888,7 +887,7 @@ pub(super) async fn submission_loop(
                     if should_exit { shutdown_received = true; break; }
                     continue;
                 }
-                received = rx_sub.recv(), if ordered.len() < deferred_limit => received,
+                received = rx_sub.recv() => received,
             }
         } else {
             rx_sub.recv().await
@@ -896,17 +895,7 @@ pub(super) async fn submission_loop(
         let Ok(queued) = queued else {
             break;
         };
-        let control = matches!(
-            queued.submission.op,
-            Op::Interrupt
-                | Op::Shutdown
-                | Op::ExecApproval { .. }
-                | Op::PatchApproval { .. }
-                | Op::UserInputAnswer { .. }
-                | Op::RequestPermissionsResponse { .. }
-                | Op::DynamicToolResponse { .. }
-                | Op::ResolveElicitation { .. }
-        );
+        let control = super::is_submission_control(&queued.submission.op);
         if !control {
             ordered.push_back(queued);
             continue;
@@ -941,6 +930,13 @@ pub(super) async fn submission_loop(
             shutdown_received = true;
             break;
         }
+    }
+    // Closing does not drop async-channel's buffered values. Drain them so
+    // outstanding acknowledgements and admission permits cannot remain pinned
+    // by a caller retaining its sender after shutdown.
+    rx_sub.close();
+    while let Ok(queued) = rx_sub.try_recv() {
+        ordered.push_back(queued);
     }
     // Teardown owns preparation as well as installed tasks, including EOF.
     if let Some((id, cancellable, preparation)) = pending.take() {
@@ -1007,6 +1003,7 @@ async fn dispatch_submission(
     let super::QueuedSubmission {
         submission: sub,
         mailbox_admission,
+        preparation_permit: _preparation_permit,
     } = queued;
     let _execution_permit_cleanup = sess
         .services
@@ -1136,6 +1133,134 @@ pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+    use futures::FutureExt;
+
+    fn user_submission(id: &str) -> Submission {
+        Submission {
+            id: id.to_string(),
+            op: Op::UserInput {
+                items: Vec::new(),
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: ThreadSettingsOverrides::default(),
+            },
+            client_user_message_id: None,
+            trace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn saturated_preparation_admission_still_delivers_controls() {
+        let (session, context, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let gate = session.task_start_gate.acquire().await.unwrap();
+        // One active preparation and a full deferred channel-sized batch. Hold
+        // the remaining slots so this also exercises exhausted admission.
+        let reserved = Arc::clone(&session.submission_preparation_slots)
+            .acquire_many_owned((super::super::SUBMISSION_CHANNEL_CAPACITY - 9) as u32)
+            .await
+            .unwrap();
+        let (sender, receiver) = async_channel::bounded(8);
+        let codex = super::super::Codex {
+            tx_sub: sender,
+            rx_event: events.clone(),
+            agent_status: session.agent_status.subscribe(),
+            session: Arc::clone(&session),
+            session_loop_termination: futures::future::ready(()).boxed().shared(),
+        };
+        codex.enqueue_submission(user_submission("blocked")).await.unwrap();
+        let mut dispatcher = Box::pin(submission_loop(
+            Arc::clone(&session), Arc::clone(&context.config), receiver,
+        ));
+        assert!(futures::poll!(dispatcher.as_mut()).is_pending());
+        for index in 0..8 {
+            codex.enqueue_submission(user_submission(&format!("deferred-{index}")))
+                .await.unwrap();
+        }
+        assert!(futures::poll!(dispatcher.as_mut()).is_pending());
+        assert_eq!(session.submission_preparation_slots.available_permits(), 0);
+        let mut waiting = Box::pin(codex.enqueue_submission(user_submission("not-admitted")));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(waiting);
+
+        let active = crate::state::ActiveTurn::default();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        active.turn_state.lock().await
+            .try_insert_pending_dynamic_tool("tool".to_string(), context.sub_id.clone(), reply_tx)
+            .unwrap();
+        *session.active_turn.lock().await = Some(active);
+        let response = DynamicToolResponse { content_items: Vec::new(), success: true };
+        codex.submit(Op::DynamicToolResponse {
+            turn_id: context.sub_id.clone(), id: "tool".to_string(), response: response.clone(),
+        }).await.unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = reply_rx => result.unwrap(),
+                _ = dispatcher.as_mut() => panic!("dispatcher exited"),
+            }
+        }).await.expect("a full deferred queue must not block an approval reply");
+        assert_eq!(delivered, response);
+        *session.active_turn.lock().await = None;
+        codex.submit(Op::Interrupt).await.unwrap();
+        let aborted = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut aborted = Vec::new();
+            while aborted.len() < 9 {
+                tokio::select! {
+                    event = events.recv() => {
+                        if let EventMsg::TurnAborted(event) = event.unwrap().msg {
+                            aborted.push(event.turn_id.unwrap());
+                        }
+                    }
+                    _ = dispatcher.as_mut() => panic!("dispatcher exited"),
+                }
+            }
+            aborted
+        }).await.expect("interrupt must cancel every admitted preparation");
+        let expected = std::iter::once("blocked".to_string())
+            .chain((0..8).map(|index| format!("deferred-{index}"))).collect::<Vec<_>>();
+        assert_eq!(aborted, expected);
+        assert_eq!(session.submission_preparation_slots.available_permits(), 9);
+        drop(reserved);
+        drop(gate);
+        assert!(futures::poll!(dispatcher.as_mut()).is_pending());
+        assert!(session.active_turn.lock().await.is_none());
+        codex.submit(Op::Shutdown).await.unwrap();
+        codex.enqueue_submission(user_submission("after-shutdown")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dispatcher).await.unwrap();
+        assert_eq!(session.submission_preparation_slots.available_permits(), super::super::SUBMISSION_CHANNEL_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn preparation_admission_releases_cancelled_sends_and_observes_receiver_close() {
+        let (session, _, events) = crate::session::tests::make_session_and_context_with_rx().await;
+        let reserved = Arc::clone(&session.submission_preparation_slots)
+            .acquire_many_owned((super::super::SUBMISSION_CHANNEL_CAPACITY - 1) as u32)
+            .await.unwrap();
+        let (sender, receiver) = async_channel::bounded(1);
+        let codex = super::super::Codex {
+            tx_sub: sender, rx_event: events,
+            agent_status: session.agent_status.subscribe(), session: Arc::clone(&session),
+            session_loop_termination: futures::future::ready(()).boxed().shared(),
+        };
+        codex.submit(Op::Interrupt).await.unwrap();
+        let mut sending = Box::pin(codex.enqueue_submission(user_submission("cancelled-send")));
+        assert!(futures::poll!(sending.as_mut()).is_pending());
+        assert_eq!(session.submission_preparation_slots.available_permits(), 0);
+        drop(sending);
+        assert_eq!(session.submission_preparation_slots.available_permits(), 1);
+        drop(receiver.recv().await.unwrap());
+        codex.enqueue_submission(user_submission("queued")).await.unwrap();
+        let mut waiting = Box::pin(codex.enqueue_submission(user_submission("waiting")));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        receiver.close();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap(), Err(CodexErr::InternalAgentDied)));
+        assert!(matches!(codex.enqueue_submission(user_submission("closed")).await, Err(CodexErr::InternalAgentDied)));
+        // Closing retains buffered values; the dispatcher drains them on teardown.
+        drop(receiver.recv().await.unwrap());
+        assert_eq!(session.submission_preparation_slots.available_permits(), 1);
+        drop(reserved);
+    }
 
     #[tokio::test]
     async fn preparation_acknowledgement_reports_cancellation_or_actual_result() {
@@ -1173,6 +1298,7 @@ mod dispatch_tests {
                 trace: None,
             },
             mailbox_admission: None,
+            preparation_permit: None,
         };
         sender
             .send(submit(

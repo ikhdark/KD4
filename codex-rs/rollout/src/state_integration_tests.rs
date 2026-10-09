@@ -209,7 +209,7 @@ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result
     metadata.title = "math".to_string();
     runtime.upsert_thread(&metadata).await?;
 
-    reconcile_rollout(
+    assert!(reconcile_rollout(
         Some(runtime.as_ref()),
         rollout_path.as_path(),
         "test-provider",
@@ -217,7 +217,7 @@ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result
         &[],
         /*archived_only*/ Some(false),
     )
-    .await;
+    .await);
 
     let persisted = runtime
         .get_thread(thread_id)

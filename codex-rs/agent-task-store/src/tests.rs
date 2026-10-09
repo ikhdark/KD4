@@ -1494,6 +1494,8 @@ fn architecture_contract_for_worker(scope: &str) -> ArchitectureContractV1 {
 
 #[tokio::test]
 async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_projection() {
+    use sha2::Digest;
+
     let fixture = Fixture::new().await;
     let architect_draft = AssignmentDraft {
         root_session_id: "architecture-root".to_string(),
@@ -1525,6 +1527,11 @@ async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_proj
         .create_assignment(fixture.repo.path(), architect_draft)
         .await
         .expect("architect assignment");
+    let expected_contract = architecture_contract_for_worker("src");
+    let mut unnormalized = expected_contract.clone();
+    unnormalized.objective = format!("  {}\n", unnormalized.objective);
+    unnormalized.stop_condition = format!(" {} ", unnormalized.stop_condition);
+    unnormalized.acceptance_criteria[0].id = " criterion-1 ".to_string();
     let receipt = fixture
         .store
         .submit_agent_receipt(
@@ -1543,7 +1550,7 @@ async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_proj
                 blockers: Vec::new(),
                 risks: Vec::new(),
                 next_action: None,
-                architecture_contract: Some(architecture_contract_for_worker("src")),
+                architecture_contract: Some(unnormalized),
             },
         )
         .await
@@ -1551,8 +1558,11 @@ async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_proj
     let sealed = receipt
         .architecture_contract
         .expect("sealed architecture contract");
-    assert_eq!(sealed.contract.schema_version, 1);
-    assert_eq!(sealed.contract_sha256.len(), 64);
+    assert_eq!(sealed.contract, expected_contract);
+    assert_eq!(
+        sealed.contract_sha256,
+        format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&expected_contract).unwrap()))
+    );
 
     let mut worker = worker_draft("architecture-root", "src");
     worker.dependencies = vec![architect.assignment_id];
@@ -2024,17 +2034,30 @@ fn ids_and_scope_validation_are_strict() {
 fn reviewer_and_verifier_invariants_are_enforced() {
     let repo = TempDir::new().expect("repository tempdir");
     let target = AssignmentId::new();
-    let mut draft = worker_draft("root", "src");
-    draft.role = AgentRole::Reviewer;
-    draft.capability_profile = CapabilityProfile::ReadSearchDiff;
-    draft.dependencies = vec![target];
-    draft.relation = Some(AssignmentRelation {
-        kind: RelationKind::Review,
-        target_assignment_ids: vec![target],
-    });
-    assert!(draft.clone().normalize(repo.path()).is_err());
-    draft.write_scope.clear();
-    assert!(draft.normalize(repo.path()).is_ok());
+    for role in [AgentRole::Reviewer, AgentRole::Verifier] {
+        let valid = relation_draft("root", role, target);
+        assert!(valid.clone().normalize(repo.path()).is_ok());
+        let mut writes = valid.clone();
+        writes.write_scope = vec![RepoScope { path: "src".into(), recursive: true }];
+        assert!(matches!(
+            writes.normalize(repo.path()),
+            Err(StoreError::InvalidAssignment(message)) if message.contains("empty write scope")
+        ));
+        let mut missing_dependency = valid.clone();
+        missing_dependency.dependencies.clear();
+        let mut missing_relation = valid.clone();
+        missing_relation.relation = None;
+        let mut wrong_relation = valid.clone();
+        wrong_relation.relation.as_mut().unwrap().kind = RelationKind::Integration;
+        let mut extra_target = valid;
+        extra_target.relation.as_mut().unwrap().target_assignment_ids.push(target);
+        for invalid in [missing_dependency, missing_relation, wrong_relation, extra_target] {
+            assert!(matches!(
+                invalid.normalize(repo.path()),
+                Err(StoreError::InvalidAssignment(message)) if message.contains("requires exactly one")
+            ), "{role:?}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -3606,6 +3629,18 @@ async fn agent_task_bindings_persist_and_are_root_session_scoped() {
         })
         .await
         .expect("binding persists");
+    let (foreign, foreign_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("other-binding-root", "src"))
+        .await
+        .expect("foreign root assignment");
+    fixture.store.bind_agent_task(AgentTaskBindingDraft {
+        assignment_id: foreign.assignment_id,
+        attempt_id: foreign_attempt.attempt_id,
+        agent_path: expected.agent_path.clone(),
+        task_name: expected.task_name.clone(),
+        thread_id: expected.thread_id.clone(),
+    }).await.expect("binding names may repeat in another root");
     assert_eq!(
         fixture
             .store
@@ -4393,8 +4428,12 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
         .await
         .expect("wake read");
     assert_eq!(first.updated_agents.len(), MAX_WAKE_EVENTS_PER_READ);
-    assert!(first.truncated_count > 0);
-    assert!(first.lost_to_retention_count > 0);
+    // One acceptance event plus the 260 explicit observations precede this read.
+    // A retained tail of MAX_WAKE_EVENTS_PER_ROOT therefore drops this many events.
+    assert_eq!(
+        first.lost_to_retention_count,
+        (261 - MAX_WAKE_EVENTS_PER_ROOT) as u64
+    );
     assert_eq!(
         first.remaining_count,
         (MAX_WAKE_EVENTS_PER_ROOT - MAX_WAKE_EVENTS_PER_READ) as u64
@@ -4434,6 +4473,7 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
     let mut cursor = None;
     let mut retained_ids = HashSet::new();
     let mut retained_events = 0;
+    let mut retained_summaries = Vec::new();
     for _ in 0..10 {
         let page = restarted
             .read_wake_events("wake-root".to_string(), cursor)
@@ -4464,12 +4504,22 @@ async fn wake_stream_is_bounded_non_draining_and_rebuilt() {
                 retained_ids.insert(event.event_id),
                 "wake pagination must not duplicate events"
             );
+            assert_eq!(event.attempt_id, attempt.attempt_id);
+            assert_eq!(event.reason, ObservationKind::Reading);
+            retained_summaries.push(event.summary.clone());
         }
         retained_events += page.updated_agents.len();
         cursor = page.latest_event_id;
     }
     assert_eq!(retained_events, MAX_WAKE_EVENTS_PER_ROOT);
     assert_eq!(retained_ids.len(), MAX_WAKE_EVENTS_PER_ROOT);
+    assert_eq!(
+        retained_summaries,
+        (260 - MAX_WAKE_EVENTS_PER_ROOT..260)
+            .map(|index| format!("observation {index}"))
+            .collect::<Vec<_>>(),
+        "reconstruction and pagination preserve the ordered tail of submitted observations"
+    );
 }
 
 #[tokio::test]
@@ -5031,15 +5081,25 @@ fn risk_gate_and_waiver_rules_are_deterministic() {
     };
     let decision = evaluate_risk_gate(&facts);
     assert!(decision.review_required);
-    assert_eq!(decision.reasons.len(), 4);
+    assert_eq!(decision.reasons, vec![
+        "persistence risk",
+        "more than five non-generated changed files",
+        "more than 400 non-generated changed lines",
+        "missing successful focused validation",
+    ]);
     assert!(GateKind::Review.is_waivable());
     assert!(GateKind::Verification.is_waivable());
     assert!(!GateKind::Mutation.is_waivable());
     assert!(!GateKind::Ownership.is_waivable());
-}
-
-#[test]
-fn risk_gate_uses_canonical_concurrent_drift_reason() {
+    assert!(!GateKind::Risk.is_waivable());
+    let boundary = evaluate_risk_gate(&RiskFacts {
+        non_generated_changed_files: 5,
+        non_generated_changed_lines: 400,
+        focused_validation_succeeded: true,
+        ..RiskFacts::default()
+    });
+    assert!(!boundary.review_required);
+    assert!(boundary.reasons.is_empty());
     let decision = evaluate_risk_gate(&RiskFacts {
         focused_validation_succeeded: true,
         drift: true,

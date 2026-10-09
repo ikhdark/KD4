@@ -62,7 +62,7 @@ async fn command_approval_holds_an_elicitation_until_response() {
     session
         .notify_approval("call-1", ReviewDecision::Approved)
         .await;
-    request.await.expect("approval task");
+    assert_eq!(request.await.expect("approval task"), ReviewDecision::Approved);
     wait_until_released(&mut pause_state).await;
 }
 
@@ -93,7 +93,7 @@ async fn patch_approval_holds_an_elicitation_until_response() {
     session
         .notify_approval("call-1", ReviewDecision::Approved)
         .await;
-    request.await.expect("approval task");
+    assert_eq!(request.await.expect("approval task"), ReviewDecision::Approved);
     wait_until_released(&mut pause_state).await;
 }
 
@@ -139,7 +139,13 @@ async fn permission_request_holds_an_elicitation_until_response() {
             },
         )
         .await;
-    request.await.expect("permission request task");
+    assert_eq!(
+        request.await.expect("permission request task"),
+        Some(RequestPermissionsResponse {
+            permissions: RequestPermissionProfile::default(),
+            scope: PermissionGrantScope::Turn,
+        })
+    );
     wait_until_released(&mut pause_state).await;
 }
 

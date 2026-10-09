@@ -285,9 +285,13 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
                 saw_replaced_abort = true;
             }
             EventMsg::ExecCommandEnd(ev) if ev.source == ExecCommandSource::UserShell => {
+                assert_eq!(ev.exit_code, Some(0));
+                assert_eq!(ev.stdout.trim(), "user-shell");
                 saw_user_shell_end = true;
             }
-            EventMsg::TurnComplete(_) => {
+            EventMsg::TurnComplete(completion) => {
+                assert_eq!(completion.error, None);
+                assert_eq!(completion.last_agent_message.as_deref(), Some("done"));
                 saw_turn_complete = true;
                 break;
             }

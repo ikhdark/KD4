@@ -186,5 +186,36 @@ async fn account_analytics_decodes_each_endpoint_and_accepts_new_string_values()
                 .unwrap(),
             expected
         );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let mut query: Vec<(String, String)> =
+            requests[0].url.query_pairs().into_owned().collect();
+        let mut expected_query = vec![
+            ("start_date".to_string(), "2026-01-03".to_string()),
+            ("end_date".to_string(), "2026-01-09".to_string()),
+        ];
+        if let AnalyticsReport::EnterpriseCredits { breakdown } = report {
+            expected_query.push(("breakdown".to_string(), breakdown.to_string()));
+        } else {
+            expected_query.push(("group_by".to_string(), "day".to_string()));
+        }
+        match report {
+            AnalyticsReport::EnterpriseTokens => expected_query.extend([
+                ("breakdown_by".to_string(), "model".to_string()),
+                ("modes".to_string(), "codex".to_string()),
+                ("modes".to_string(), "work".to_string()),
+            ]),
+            AnalyticsReport::Messages => {
+                expected_query.push(("workspace_user".to_string(), "true".to_string()));
+            }
+            AnalyticsReport::Skills { limit } => expected_query.extend([
+                ("workspace_user".to_string(), "true".to_string()),
+                ("top_skill_limit".to_string(), limit.to_string()),
+            ]),
+            _ => {}
+        }
+        query.sort();
+        expected_query.sort();
+        assert_eq!(query, expected_query, "report: {report:?}");
     }
 }

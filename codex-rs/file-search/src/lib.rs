@@ -32,13 +32,6 @@ use std::thread;
 use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
-#[cfg(test)]
-use nucleo::Utf32Str;
-#[cfg(test)]
-use nucleo::pattern::AtomKind;
-#[cfg(test)]
-use nucleo::pattern::Pattern;
-
 const FILE_SEARCH_MAX_WALK_DEPTH: usize = 64;
 const FILE_SEARCH_MAX_WALK_DIRECTORIES: usize = 10_000;
 const FILE_SEARCH_MAX_WALK_ENTRIES: usize = 50_000;
@@ -296,16 +289,6 @@ where
         Ordering::Equal => path_of(a).cmp(path_of(b)),
         other => other,
     }
-}
-
-#[cfg(test)]
-fn create_pattern(pattern: &str) -> Pattern {
-    Pattern::new(
-        pattern,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-    )
 }
 
 struct SessionInner {
@@ -900,17 +883,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn verify_score_is_none_for_non_match() {
-        let mut utf32buf = Vec::<char>::new();
-        let line = "hello";
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let haystack: Utf32Str<'_> = Utf32Str::new(line, &mut utf32buf);
-        let pattern = create_pattern("zzz");
-        let score = pattern.score(haystack, &mut matcher);
-        assert_eq!(score, None);
-    }
-
-    #[test]
     fn tie_breakers_sort_by_path_when_scores_equal() {
         let mut matches = vec![
             (100, "b_path".to_string()),
@@ -945,17 +917,18 @@ mod tests {
             ..Default::default()
         }, None).unwrap().matches.into_iter().map(|m| m.full_path()).collect::<Vec<_>>();
         let first = search(roots.to_vec());
+        assert_eq!(
+            first,
+            (0..5)
+                .map(|index| roots[0].join(format!("same{index:02}.txt")))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(first, search(roots.into_iter().rev().collect()));
-        assert_eq!(first.len(), 5);
     }
 
     #[test]
-    fn file_name_from_path_uses_basename() {
+    fn file_name_from_path_uses_basename_or_full_path_fallback() {
         assert_eq!(file_name_from_path("foo/bar.txt"), "bar.txt");
-    }
-
-    #[test]
-    fn file_name_from_path_falls_back_to_full_path() {
         assert_eq!(file_name_from_path(""), "");
     }
 
@@ -1429,16 +1402,23 @@ mod tests {
         .expect("session");
 
         session.update_query("file-00");
-        thread::sleep(Duration::from_millis(20));
-        let first_snapshot = reporter.snapshot();
+        assert!(reporter.wait_for_updates_at_least(1, Duration::from_secs(5)));
         session.update_query("file-01");
-        thread::sleep(Duration::from_millis(20));
-        let second_snapshot = reporter.snapshot();
-        let _ = reporter.wait_for_complete(Duration::from_secs(5));
+        assert!(reporter.wait_until(
+            &reporter.updates,
+            &reporter.update_cv,
+            Duration::from_secs(5),
+            |updates| updates.last().is_some_and(|snapshot| {
+                snapshot.query == "file-01"
+                    && snapshot.walk_complete
+                    && snapshot.scanned_file_count == 201
+            }),
+        ));
         let completed_snapshot = reporter.snapshot();
-
-        assert!(second_snapshot.scanned_file_count >= first_snapshot.scanned_file_count);
-        assert!(completed_snapshot.scanned_file_count >= second_snapshot.scanned_file_count);
+        assert_eq!(completed_snapshot.scanned_file_count, 201);
+        assert!(reporter.updates().windows(2).all(|pair| {
+            pair[1].scanned_file_count >= pair[0].scanned_file_count
+        }));
     }
 
     #[test]
@@ -1568,24 +1548,31 @@ mod tests {
         )
         .expect("session");
 
-        session.update_query("asdf");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+        for (first, appended) in [("asdf", "asdfa"), ("zzzzzzzz", "zzzzzzzzq")] {
+            reporter.clear();
+            session.update_query(first);
+            assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+            let snapshot = reporter.snapshot();
+            assert_eq!(snapshot.query, first);
+            assert!(snapshot.matches.is_empty());
+            assert_eq!(snapshot.total_match_count, 0);
 
-        let completed_snapshot = reporter.snapshot();
-        assert_eq!(completed_snapshot.matches, Vec::new());
-        assert_eq!(completed_snapshot.total_match_count, 0);
-
-        reporter.clear();
-
-        session.update_query("asdfa");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-        assert!(!reporter.updates().is_empty());
+            reporter.clear();
+            session.update_query(appended);
+            assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+            assert_eq!(reporter.updates().len(), 1);
+            let snapshot = reporter.snapshot();
+            assert_eq!(snapshot.query, appended);
+            assert!(snapshot.matches.is_empty());
+            assert_eq!(snapshot.total_match_count, 0);
+            assert!(snapshot.walk_complete);
+        }
     }
 
     #[test]
     fn dropping_session_does_not_cancel_siblings_with_shared_cancel_flag() {
-        let root_a = create_temp_tree(/*file_count*/ 200);
-        let root_b = create_temp_tree(/*file_count*/ 4_000);
+        let root_a = create_temp_tree(/*file_count*/ 1);
+        let root_b = create_temp_tree(/*file_count*/ 40);
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
         let reporter_a = Arc::new(RecordingReporter::default());
@@ -1602,44 +1589,23 @@ mod tests {
             vec![root_b.path().to_path_buf()],
             FileSearchOptions::default(),
             reporter_b.clone(),
-            Some(cancel_flag),
+            Some(cancel_flag.clone()),
         )
         .expect("session_b");
 
         session_a.update_query("file-0");
-        session_b.update_query("file-1");
-
-        thread::sleep(Duration::from_millis(5));
+        session_b.update_query("file-");
         drop(session_a);
+        assert!(!cancel_flag.load(Ordering::Relaxed));
 
         let completed = reporter_b.wait_for_complete(Duration::from_secs(5));
-        assert_eq!(completed, true);
-    }
-
-    #[test]
-    fn session_emits_updates_when_query_changes() {
-        let dir = create_temp_tree(/*file_count*/ 200);
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            /*cancel_flag*/ None,
-        )
-        .expect("session");
-
-        session.update_query("zzzzzzzz");
-        let completed = reporter.wait_for_complete(Duration::from_secs(5));
         assert!(completed);
-
-        reporter.clear();
-
-        session.update_query("zzzzzzzzq");
-        let completed = reporter.wait_for_complete(Duration::from_secs(5));
-        assert!(completed);
-
-        let updates = reporter.updates();
-        assert_eq!(updates.len(), 1);
+        let snapshot = reporter_b.snapshot();
+        assert_eq!(snapshot.query, "file-");
+        assert!(snapshot.walk_complete);
+        assert_eq!(snapshot.scanned_file_count, 41);
+        assert_eq!(snapshot.total_match_count, 40);
+        assert_eq!(snapshot.matches.len(), 20);
     }
 
     #[test]

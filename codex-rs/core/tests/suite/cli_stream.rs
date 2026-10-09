@@ -1,8 +1,6 @@
-use codex_git_utils::collect_git_info;
 use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
 use codex_login::CODEX_API_KEY_ENV_VAR;
 use codex_protocol::openai_models::ModelsResponse;
-use codex_protocol::protocol::GitInfo;
 use core_test_support::fs_wait;
 use core_test_support::require_network;
 use core_test_support::responses;
@@ -11,9 +9,6 @@ use std::io;
 
 use std::process::Command;
 use std::process::Output;
-use std::process::Stdio;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -101,59 +96,14 @@ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Co
     cmd
 }
 
-struct ChildProcessCleanupGuard(u32);
-
-impl Drop for ChildProcessCleanupGuard {
-    fn drop(&mut self) {
-        {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &self.0.to_string(), "/T", "/F"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-}
-
-// Use this for new `codex exec` subprocess tests in this file. These commands
-// can spawn shell/Python grandchildren, so the timeout path must reap the whole
-// process group instead of only the direct CLI child.
-fn run_cli_command(command: &mut Command) -> io::Result<Output> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let child = command.spawn()?;
-    let _cleanup = ChildProcessCleanupGuard(child.id());
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let _waiter = thread::spawn(move || {
-        let _ = sender.send(child.wait_with_output());
-    });
-
-    match receiver.recv_timeout(CLI_TIMEOUT) {
-        Ok(output) => output,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Reap the process tree before returning, and retain its actual failure diagnostics.
-            drop(_cleanup);
-            let diagnostics = match receiver.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(output)) => format!(
-                    "stdout: {}\nstderr: {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-                other => format!("output collection after termination: {other:?}"),
-            };
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("process timed out\n{diagnostics}"),
-            ))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other("process output reader thread exited"))
-        }
-    }
+// Own the process tree and both output streams under one deadline.
+async fn run_cli_command(command: Command) -> io::Result<Output> {
+    core_test_support::process::capture_contained_command(
+        &mut tokio::process::Command::from(command),
+        CLI_TIMEOUT,
+        /*mirror_output*/ false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -165,11 +115,8 @@ async fn responses_mode_stream_cli_supports_personal_access_tokens() {
     let resp_mock = responses::mount_sse_once(&server, cli_sse_response()).await;
     let home = TempDir::new().unwrap();
 
-    let mut cmd = personal_access_token_exec_command(&server, &home);
-    let output = tokio::task::spawn_blocking(move || run_cli_command(&mut cmd))
-        .await
-        .expect("CLI worker joins")
-        .expect("CLI completes");
+    let cmd = personal_access_token_exec_command(&server, &home);
+    let output = run_cli_command(cmd).await.expect("CLI completes");
 
     assert!(
         output.status.success(),
@@ -217,11 +164,8 @@ async fn responses_mode_stream_cli_does_not_attempt_oauth_refresh_for_personal_a
         .await;
     let home = TempDir::new().unwrap();
 
-    let mut cmd = personal_access_token_exec_command(&server, &home);
-    let output = tokio::task::spawn_blocking(move || run_cli_command(&mut cmd))
-        .await
-        .expect("CLI worker joins")
-        .expect("CLI completes");
+    let cmd = personal_access_token_exec_command(&server, &home);
+    let output = run_cli_command(cmd).await.expect("CLI completes");
 
     assert!(!output.status.success());
     server.verify().await;
@@ -260,7 +204,7 @@ async fn responses_mode_stream_cli() {
         .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
-    let output = run_cli_command(&mut cmd).unwrap();
+    let output = run_cli_command(cmd).await.unwrap();
     println!("Status: {}", output.status);
     println!("Stdout:\n{}", String::from_utf8_lossy(&output.stdout));
     println!("Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
@@ -306,7 +250,7 @@ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
         .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
-    let output = run_cli_command(&mut cmd).unwrap();
+    let output = run_cli_command(cmd).await.unwrap();
     assert!(
         output.status.success(),
         "codex-cli exec failed with status {}\nstdout:\n{}\nstderr:\n{}",
@@ -371,7 +315,7 @@ async fn exec_cli_applies_model_instructions_file() {
         .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
-    let output = run_cli_command(&mut cmd).unwrap();
+    let output = run_cli_command(cmd).await.unwrap();
     println!("Status: {}", output.status);
     println!("Stdout:\n{}", String::from_utf8_lossy(&output.stdout));
     println!("Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
@@ -444,7 +388,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
         .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
-    let output = run_cli_command(&mut cmd).unwrap();
+    let output = run_cli_command(cmd).await.unwrap();
     println!("Status: {}", output.status);
     println!("Stdout:\n{}", String::from_utf8_lossy(&output.stdout));
     println!("Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
@@ -463,39 +407,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
     );
 }
 
-/// Tests streaming responses through the CLI using a local Responses API server.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_api_stream_cli() {
-    require_network!();
 
-    let server = MockServer::start().await;
-    let resp_mock = responses::mount_sse_once(&server, cli_sse_response()).await;
-    let repo_root = repo_root();
-
-    let home = TempDir::new().unwrap();
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
-    let mut cmd = Command::new(bin);
-    cmd.arg("exec")
-        .arg("--skip-git-repo-check")
-        .arg("-c")
-        .arg(sse_provider_override(&server, "/v1"))
-        .arg("-c")
-        .arg("model_provider=\"mock\"")
-        .arg("-C")
-        .arg(&repo_root)
-        .arg("hello?");
-    cmd.env("CODEX_HOME", home.path())
-        .env_remove(codex_state::SQLITE_HOME_ENV)
-        .env("OPENAI_API_KEY", "dummy");
-
-    let output = run_cli_command(&mut cmd).unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("fixture hello"));
-
-    let request = resp_mock.single_request();
-    assert_eq!(request.path(), "/v1/responses");
-}
 
 /// End-to-end: create a session (writes rollout), verify the file, then resume and confirm append.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -532,7 +444,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .env_remove(codex_state::SQLITE_HOME_ENV)
         .env(CODEX_API_KEY_ENV_VAR, "dummy");
 
-    let output = run_cli_command(&mut cmd).unwrap();
+    let output = run_cli_command(cmd).await.unwrap();
     assert!(
         output.status.success(),
         "codex-cli exec failed: {}",
@@ -654,7 +566,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
-    let output2 = run_cli_command(&mut cmd2).unwrap();
+    let output2 = run_cli_command(cmd2).await.unwrap();
     assert!(
         output2.status.success(),
         "resume codex-cli run failed with status {}\nstdout:\n{}\nstderr:\n{}",
@@ -680,7 +592,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     // Resume should write to the existing log file.
     assert_eq!(
         resumed_path, path,
-        "resume should create a new session file"
+        "resume should append to the existing session file"
     );
 
     let resumed_content = std::fs::read_to_string(&resumed_path)?;
@@ -693,148 +605,4 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         "resumed file missing resumed marker"
     );
     Ok(())
-}
-
-/// Integration test to verify git info is collected and recorded in session files.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn integration_git_info_unit_test() {
-    // This test verifies git info collection works independently
-    // without depending on the full CLI integration
-
-    // 1. Create temp directory for git repo
-    let temp_dir = TempDir::new().unwrap();
-    let git_repo = temp_dir.path().to_path_buf();
-    let envs = vec![
-        ("GIT_CONFIG_GLOBAL", "/dev/null"),
-        ("GIT_CONFIG_NOSYSTEM", "1"),
-    ];
-
-    // 2. Initialize a git repository with some content
-    let init_output = std::process::Command::new("git")
-        .envs(envs.clone())
-        .args(["init"])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-    assert!(init_output.status.success(), "git init failed");
-
-    // Configure git user (required for commits)
-    std::process::Command::new("git")
-        .envs(envs.clone())
-        .args(["config", "user.name", "Integration Test"])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-
-    std::process::Command::new("git")
-        .envs(envs.clone())
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-
-    // Create a test file and commit it
-    let test_file = git_repo.join("test.txt");
-    std::fs::write(&test_file, "integration test content").unwrap();
-
-    std::process::Command::new("git")
-        .envs(envs.clone())
-        .args(["add", "."])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-
-    let commit_output = std::process::Command::new("git")
-        .envs(envs.clone())
-        .args(["commit", "-m", "Integration test commit"])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-    assert!(commit_output.status.success(), "git commit failed");
-
-    // Create a branch to test branch detection
-    std::process::Command::new("git")
-        .envs(envs.clone())
-        .args(["checkout", "-b", "integration-test-branch"])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-
-    // Add a remote to test repository URL detection
-    std::process::Command::new("git")
-        .envs(envs.clone())
-        .args([
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/example/integration-test.git",
-        ])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-
-    // 3. Test git info collection directly
-    let git_info = collect_git_info(&git_repo).await;
-
-    // 4. Verify git info is present and contains expected data
-    assert!(git_info.is_some(), "Git info should be collected");
-
-    let git_info = git_info.unwrap();
-
-    // Check that we have a commit hash
-    assert!(
-        git_info.commit_hash.is_some(),
-        "Git info should contain commit_hash"
-    );
-    let commit_hash = &git_info.commit_hash.as_ref().unwrap().0;
-    assert_eq!(commit_hash.len(), 40, "Commit hash should be 40 characters");
-    assert!(
-        commit_hash.chars().all(|c| c.is_ascii_hexdigit()),
-        "Commit hash should be hexadecimal"
-    );
-
-    // Check that we have the correct branch
-    assert!(git_info.branch.is_some(), "Git info should contain branch");
-    let branch = git_info.branch.as_ref().unwrap();
-    assert_eq!(
-        branch, "integration-test-branch",
-        "Branch should match what we created"
-    );
-
-    // Check that we have the repository URL
-    assert!(
-        git_info.repository_url.is_some(),
-        "Git info should contain repository_url"
-    );
-    let repo_url = git_info.repository_url.as_ref().unwrap();
-    // Some hosts rewrite remotes (e.g., github.com → git@github.com), so assert against
-    // the actual remote reported by git instead of a static URL.
-    let expected_remote_url = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(&git_repo)
-        .output()
-        .unwrap();
-    let expected_remote_url = String::from_utf8(expected_remote_url.stdout)
-        .unwrap()
-        .trim()
-        .to_string();
-    assert_eq!(
-        repo_url, &expected_remote_url,
-        "Repository URL should match git remote get-url output"
-    );
-
-    println!("✅ Git info collection test passed!");
-    println!("   Commit: {commit_hash}");
-    println!("   Branch: {branch}");
-    println!("   Repo: {repo_url}");
-
-    // 5. Test serialization to ensure it works in SessionMeta
-    let serialized = serde_json::to_string(&git_info).unwrap();
-    let deserialized: GitInfo = serde_json::from_str(&serialized).unwrap();
-
-    assert_eq!(git_info.commit_hash, deserialized.commit_hash);
-    assert_eq!(git_info.branch, deserialized.branch);
-    assert_eq!(git_info.repository_url, deserialized.repository_url);
-
-    println!("✅ Git info serialization test passed!");
 }

@@ -70,56 +70,36 @@ fn remote_marketplace_with_plugin(
 }
 
 #[test]
-fn remote_plugin_completion_requires_requested_plugin_even_without_connectors() {
-    let marketplaces = vec![remote_marketplace_with_plugin(
-        "other@openai-curated-remote",
-        "plugin_other",
-        true,
-    )];
-
-    assert!(!verified_remote_plugin_install_completed(
-        Some(&marketplaces),
-        "calendar@openai-curated-remote",
-        Some("plugin_calendar"),
-        true,
-    ));
-}
-
-#[test]
-fn remote_plugin_completion_accepts_present_plugin_without_connectors() {
-    let matching_config_id = vec![remote_marketplace_with_plugin(
-        "calendar@openai-curated-remote",
-        "plugin_other",
-        true,
-    )];
-    let matching_remote_id = vec![remote_marketplace_with_plugin(
-        "renamed-calendar@openai-curated-remote",
-        "plugin_calendar",
-        true,
-    )];
-
-    assert!(verified_remote_plugin_install_completed(
-        Some(&matching_config_id),
-        "calendar@openai-curated-remote",
-        Some("plugin_calendar"),
-        true,
-    ));
-    assert!(verified_remote_plugin_install_completed(
-        Some(&matching_remote_id),
-        "calendar@openai-curated-remote",
-        Some("plugin_calendar"),
-        true,
-    ));
-}
-
-#[test]
-fn remote_plugin_completion_rejects_catalog_refresh_failure_with_connectors_accessible() {
-    assert!(!verified_remote_plugin_install_completed(
-        None,
-        "calendar@openai-curated-remote",
-        Some("plugin_calendar"),
-        true,
-    ));
+fn remote_plugin_completion_requires_installed_identity_and_connectors() {
+    for (config_id, remote_id, identity_matches) in [
+        ("other@openai-curated-remote", "plugin_other", false),
+        ("calendar@openai-curated-remote", "plugin_other", true),
+        ("renamed-calendar@openai-curated-remote", "plugin_calendar", true),
+    ] {
+        for installed in [false, true] {
+            let marketplaces = vec![remote_marketplace_with_plugin(config_id, remote_id, installed)];
+            for connectors_completed in [false, true] {
+                assert_eq!(
+                    verified_remote_plugin_install_completed(
+                        Some(&marketplaces),
+                        "calendar@openai-curated-remote",
+                        Some("plugin_calendar"),
+                        connectors_completed,
+                    ),
+                    identity_matches && installed && connectors_completed,
+                    "config={config_id}, remote={remote_id}, installed={installed}, connectors={connectors_completed}",
+                );
+            }
+        }
+    }
+    for marketplaces in [None, Some([].as_slice())] {
+        assert!(!verified_remote_plugin_install_completed(
+            marketplaces,
+            "calendar@openai-curated-remote",
+            Some("plugin_calendar"),
+            true,
+        ));
+    }
 }
 
 #[test]

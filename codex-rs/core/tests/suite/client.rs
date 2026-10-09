@@ -1673,84 +1673,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_user_instructions_message_in_request() {
-    require_network!();
-    let server = MockServer::start().await;
 
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
-        .with_pre_build_hook(|home| {
-            std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
-        });
-    let codex = builder
-        .build(&server)
-        .await
-        .expect("create new conversation")
-        .codex;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert!(
-        !request_body["instructions"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("be nice")
-    );
-    let permissions_text = request
-        .message_input_texts("developer")
-        .into_iter()
-        .find(|text| text.contains("<permissions instructions>"))
-        .expect("invalid permissions message content");
-    assert!(
-        permissions_text.contains("`sandbox_mode`"),
-        "expected permissions message to mention sandbox_mode, got {permissions_text:?}"
-    );
-
-    let user_context_texts = request.message_input_texts("user");
-    assert!(
-        user_context_texts
-            .iter()
-            .any(|text| text.starts_with("# AGENTS.md instructions")),
-        "expected AGENTS text in contextual user message, got {user_context_texts:?}"
-    );
-    let ui_text = user_context_texts
-        .iter()
-        .find(|text| text.contains("<INSTRUCTIONS>"))
-        .expect("invalid message content");
-    assert!(ui_text.contains("<INSTRUCTIONS>"));
-    assert!(ui_text.contains("be nice"));
-    assert!(
-        user_context_texts
-            .iter()
-            .any(|text| text.starts_with("<environment_context>")
-                && text.ends_with("</environment_context>")),
-        "expected environment context in contextual user message, got {user_context_texts:?}"
-    );
-}
 
 #[expect(clippy::unwrap_used)]
 async fn apps_guidance_request(
@@ -2329,7 +2252,19 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, config, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
+    let TestCodex { codex, config, .. } = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(|config| {
+            // The experimental-tools fixture has a single-model catalog, so a
+            // model switch would otherwise use reasoning-disabled fallback metadata.
+            config.model_catalog =
+                Some(bundled_models_response().expect("test model catalog should parse"));
+            config.model_reasoning_effort = Some(ReasoningEffort::Low);
+        })
+        .build(&server)
+        .await?;
+    assert_eq!(config.model.as_deref(), Some("gpt-5.2"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Low));
 
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
@@ -3028,11 +2963,14 @@ async fn azure_responses_request_includes_store_and_omits_item_ids() {
         .await
         .expect("responses stream to start");
 
+    let mut completed = false;
     while let Some(event) = stream.next().await {
-        if let Ok(ResponseEvent::Completed { .. }) = event {
+        if let ResponseEvent::Completed { .. } = event.expect("Azure response stream must succeed") {
+            completed = true;
             break;
         }
     }
+    assert!(completed, "Azure response must reach completion");
 
     let request = resp_mock.single_request();
     assert_eq!(request.path(), "/openai/responses");

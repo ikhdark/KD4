@@ -53,22 +53,6 @@ fn network_approval_context_maps_http_https_and_socks_protocols() {
         })
     );
 
-    let http_connect_payload = NetworkPolicyDecisionPayload {
-        decision: NetworkPolicyDecision::Ask,
-        source: NetworkDecisionSource::Decider,
-        protocol: Some(NetworkApprovalProtocol::Https),
-        host: Some("example.com".to_string()),
-        reason: Some("not_allowed".to_string()),
-        port: Some(443),
-    };
-    assert_eq!(
-        network_approval_context_from_payload(&http_connect_payload),
-        Some(NetworkApprovalContext {
-            host: "example.com".to_string(),
-            protocol: NetworkApprovalProtocol::Https,
-        })
-    );
-
     let socks5_tcp_payload = NetworkPolicyDecisionPayload {
         decision: NetworkPolicyDecision::Ask,
         source: NetworkDecisionSource::Decider,

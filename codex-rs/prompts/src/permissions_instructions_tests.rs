@@ -346,6 +346,9 @@ fn missing_catalog_key_and_non_on_request_policy_use_legacy_approval_text() {
         /*exec_permission_approvals_enabled*/ false,
         /*request_permissions_tool_enabled*/ false,
     );
+    let messages = ApprovalMessages {
+        on_request: Some("catalog override must not apply to never".to_string()),
+    };
     let never = approval_text(
         AskForApproval::Never,
         Some(&messages),
@@ -531,7 +534,7 @@ fn granular_policy_includes_request_permissions_tool_only_when_that_prompt_can_s
 }
 
 #[test]
-fn granular_policy_lists_request_permissions_category_without_tool_section_when_tool_unavailable() {
+fn granular_policy_omits_request_permissions_category_and_tool_section_when_tool_unavailable() {
     let text = approval_text(
         AskForApproval::Granular(GranularApprovalConfig {
             sandbox_approval: false,

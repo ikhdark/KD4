@@ -149,6 +149,42 @@ apps = true
 }
 
 #[test]
+fn origins_exclude_replaced_subtrees_and_preserve_surviving_siblings() {
+    let low = ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("items = [{ old = 1 }, { removed = 2 }]\nempty = [1]\nobject = { old = 3 }\nscalar = 4\nkeep = { inherited = 5 }\n").unwrap(),
+    );
+    let high = ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("items = [{ new = 6 }]\nempty = []\nobject = 7\nscalar = { new = 8 }\nkeep = { added = 9 }\n").unwrap(),
+    );
+    let low_metadata = low.metadata();
+    let high_metadata = high.metadata();
+    let disabled = ConfigLayerEntry::new_disabled(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("keep = false\n").unwrap(),
+        "untrusted",
+    );
+    let stack = ConfigLayerStack::new(
+        vec![low, high, disabled],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    ).unwrap();
+    // The documented overlay contract replaces lists/scalars, merges tables,
+    // and ignores disabled layers. These are the five remaining scalar leaves.
+    assert_eq!(stack.effective_config(), toml::from_str::<TomlValue>(
+        "items = [{ new = 6 }]\nempty = []\nobject = 7\nscalar = { new = 8 }\nkeep = { inherited = 5, added = 9 }\n"
+    ).unwrap());
+    assert_eq!(stack.origins(), HashMap::from([
+        ("items.0.new".to_string(), high_metadata.clone()),
+        ("object".to_string(), high_metadata.clone()),
+        ("scalar.new".to_string(), high_metadata.clone()),
+        ("keep.added".to_string(), high_metadata),
+        ("keep.inherited".to_string(), low_metadata),
+    ]));
+}
+
+#[test]
 fn top_level_key_presence_ignores_disabled_layers() {
     let disabled_apps = ConfigLayerEntry::new_disabled(
         ConfigLayerSource::SessionFlags,

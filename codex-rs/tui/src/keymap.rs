@@ -2094,14 +2094,72 @@ mod tests {
     }
 
     #[test]
-    fn parses_canonical_binding() {
+    fn parses_supported_bindings_and_rejects_invalid_specs() {
         let binding = parse_keybinding("ctrl-alt-shift-a").expect("binding should parse");
         assert_eq!(binding.parts().0, KeyCode::Char('a'));
         assert_eq!(
             binding.parts().1,
             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
         );
-    }
+    
+
+        assert_eq!(
+            parse_keybinding("f1").map(|binding| binding.parts()),
+            Some((KeyCode::F(1), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_keybinding("f24").map(|binding| binding.parts()),
+            Some((KeyCode::F(24), KeyModifiers::NONE))
+        );
+        for spec in ["", "f0", "f25", "f256", "ctrl-alt", "meta-enter"] {
+            assert_eq!(parse_keybinding(spec), None, "{spec}");
+        }
+    
+
+        let cases = [
+            ("tab", KeyCode::Tab),
+            ("backspace", KeyCode::Backspace),
+            ("esc", KeyCode::Esc),
+            ("delete", KeyCode::Delete),
+            ("insert", KeyCode::Insert),
+            ("up", KeyCode::Up),
+            ("down", KeyCode::Down),
+            ("left", KeyCode::Left),
+            ("right", KeyCode::Right),
+            ("home", KeyCode::Home),
+            ("end", KeyCode::End),
+            ("page-up", KeyCode::PageUp),
+            ("page-down", KeyCode::PageDown),
+            ("space", KeyCode::Char(' ')),
+            ("minus", KeyCode::Char('-')),
+        ];
+
+        for (spec, expected_key) in cases {
+            assert_eq!(
+                parse_keybinding(spec).map(|binding| binding.parts()),
+                Some((expected_key, KeyModifiers::NONE)),
+                "failed to parse {spec}"
+            );
+        }
+    
+
+        assert_eq!(parse_keybinding("ctrl"), None);
+        assert_eq!(parse_keybinding("ff"), None);
+    
+
+        assert_eq!(
+            parse_keybinding("alt-minus").map(|binding| binding.parts()),
+            Some((KeyCode::Char('-'), KeyModifiers::ALT))
+        );
+        assert_eq!(
+            parse_keybinding("alt--").map(|binding| binding.parts()),
+            Some((KeyCode::Char('-'), KeyModifiers::ALT))
+        );
+        assert_eq!(
+            parse_keybinding("-").map(|binding| binding.parts()),
+            Some((KeyCode::Char('-'), KeyModifiers::NONE))
+        );
+        }
 
     #[test]
     fn rejects_shadowing_composer_binding_in_app_scope() {
@@ -2179,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn supports_string_or_array_bindings() {
+    fn resolves_binding_arrays_and_deduplicates_in_order() {
         let mut keymap = TuiKeymap::default();
         keymap.composer.submit = Some(KeybindingsSpec::Many(vec![
             KeybindingSpec("ctrl-enter".to_string()),
@@ -2195,11 +2253,12 @@ mod tests {
         ]));
 
         let runtime = RuntimeKeymap::from_config(&keymap).expect("valid multi-binding");
-        assert_eq!(runtime.composer.submit.len(), 2);
-    }
+        assert_eq!(runtime.composer.submit, vec![
+            key_hint::ctrl(KeyCode::Enter),
+            KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        ]);
+    
 
-    #[test]
-    fn deduplicates_repeated_bindings_while_preserving_first_seen_order() {
         let mut keymap = TuiKeymap::default();
         keymap.composer.submit = Some(KeybindingsSpec::Many(vec![
             KeybindingSpec("ctrl-enter".to_string()),
@@ -2215,7 +2274,8 @@ mod tests {
                 KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
             ]
         );
-    }
+        }
+
 
     #[test]
     fn falls_back_to_global_binding_when_context_override_is_not_set() {
@@ -2227,6 +2287,12 @@ mod tests {
             runtime.composer.queue,
             vec![key_hint::ctrl(KeyCode::Char('q'))]
         );
+        keymap.composer.queue = Some(one("f12"));
+        let runtime = RuntimeKeymap::from_config(&keymap).expect("context override");
+        assert_eq!(runtime.composer.queue, vec![key_hint::plain(KeyCode::F(12))]);
+        keymap.composer.queue = Some(KeybindingsSpec::Many(vec![]));
+        let runtime = RuntimeKeymap::from_config(&keymap).expect("explicit unbinding");
+        assert!(runtime.composer.queue.is_empty(), "must not fall back to global");
     }
 
     #[test]
@@ -2248,14 +2314,9 @@ mod tests {
     }
 
     #[test]
-    fn default_copy_binding_is_ctrl_o() {
-        let runtime = RuntimeKeymap::defaults();
-        assert_eq!(runtime.app.copy, vec![key_hint::ctrl(KeyCode::Char('o'))]);
-    }
-
-    #[test]
-    fn defaults_include_reassignable_main_surface_actions() {
-        let runtime = RuntimeKeymap::defaults();
+    fn defaults_preserve_supported_actions_and_aliases_without_conflicts() {
+        let runtime = RuntimeKeymap::defaults();        assert_eq!(runtime.app.copy, vec![key_hint::ctrl(KeyCode::Char('o'))]);
+    
 
         assert_eq!(
             runtime.app.clear_terminal,
@@ -2293,11 +2354,7 @@ mod tests {
             vec![key_hint::ctrl(KeyCode::Char('s'))]
         );
         assert_eq!(runtime.editor.kill_whole_line, Vec::new());
-    }
-
-    #[test]
-    fn defaults_include_list_page_and_jump_actions() {
-        let runtime = RuntimeKeymap::defaults();
+    
 
         assert_eq!(
             runtime.list.move_up,
@@ -2350,7 +2407,130 @@ mod tests {
             runtime.list.jump_bottom,
             vec![key_hint::plain(KeyCode::End)]
         );
-    }
+    
+
+        assert_eq!(
+            runtime.vim_normal.enter_insert,
+            vec![
+                key_hint::plain(KeyCode::Char('i')),
+                key_hint::plain(KeyCode::Insert)
+            ]
+        );
+        assert_eq!(
+            runtime.vim_normal.move_left,
+            vec![
+                key_hint::plain(KeyCode::Char('h')),
+                key_hint::plain(KeyCode::Left)
+            ]
+        );
+        assert_eq!(
+            runtime.vim_normal.move_right,
+            vec![
+                key_hint::plain(KeyCode::Char('l')),
+                key_hint::plain(KeyCode::Right)
+            ]
+        );
+        assert_eq!(
+            runtime.vim_normal.move_up,
+            vec![
+                key_hint::plain(KeyCode::Char('k')),
+                key_hint::plain(KeyCode::Up)
+            ]
+        );
+        assert_eq!(
+            runtime.vim_normal.move_down,
+            vec![
+                key_hint::plain(KeyCode::Char('j')),
+                key_hint::plain(KeyCode::Down)
+            ]
+        );
+    
+        assert_eq!(
+            runtime.app.toggle_raw_output,
+            vec![key_hint::alt(KeyCode::Char('r'))]
+        );
+    
+        assert_eq!(
+            runtime.editor.insert_newline,
+            vec![
+                key_hint::ctrl(KeyCode::Char('j')),
+                key_hint::ctrl(KeyCode::Char('m')),
+                key_hint::plain(KeyCode::Enter),
+                key_hint::shift(KeyCode::Enter),
+                key_hint::alt(KeyCode::Enter),
+            ]
+        );
+    
+        assert!(
+            runtime
+                .editor
+                .delete_forward_word
+                .contains(&key_hint::alt(KeyCode::Char('d')))
+        );
+    
+
+        assert!(
+            runtime
+                .editor
+                .delete_backward
+                .contains(&key_hint::shift(KeyCode::Backspace))
+        );
+        assert!(
+            runtime
+                .editor
+                .delete_forward
+                .contains(&key_hint::shift(KeyCode::Delete))
+        );
+        assert!(
+            runtime
+                .editor
+                .delete_backward_word
+                .contains(&key_hint::ctrl(KeyCode::Backspace))
+        );
+        assert!(
+            runtime
+                .editor
+                .delete_backward_word
+                .contains(&KeyBinding::new(
+                    KeyCode::Backspace,
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ))
+        );
+        assert!(
+            runtime
+                .editor
+                .delete_forward_word
+                .contains(&key_hint::ctrl(KeyCode::Delete))
+        );
+        assert!(
+            runtime
+                .editor
+                .delete_forward_word
+                .contains(&KeyBinding::new(
+                    KeyCode::Delete,
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ))
+        );
+    
+        assert!(
+            runtime
+                .composer
+                .toggle_shortcuts
+                .contains(&key_hint::shift(KeyCode::Char('?')))
+        );
+    
+        assert!(runtime.approval.open_fullscreen.contains(&KeyBinding::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+    
+
+        runtime
+            .validate_conflicts()
+            .expect("default keymap should be conflict free");
+        }
+
+
 
     #[test]
     fn configured_main_surface_bindings_prune_reasoning_fallback_aliases() {
@@ -2548,46 +2728,6 @@ mod tests {
         expect_conflict(&keymap, "motion_left", "select_inner_text_object");
     }
 
-    #[test]
-    fn vim_normal_defaults_include_insert_and_arrow_aliases() {
-        let runtime = RuntimeKeymap::defaults();
-
-        assert_eq!(
-            runtime.vim_normal.enter_insert,
-            vec![
-                key_hint::plain(KeyCode::Char('i')),
-                key_hint::plain(KeyCode::Insert)
-            ]
-        );
-        assert_eq!(
-            runtime.vim_normal.move_left,
-            vec![
-                key_hint::plain(KeyCode::Char('h')),
-                key_hint::plain(KeyCode::Left)
-            ]
-        );
-        assert_eq!(
-            runtime.vim_normal.move_right,
-            vec![
-                key_hint::plain(KeyCode::Char('l')),
-                key_hint::plain(KeyCode::Right)
-            ]
-        );
-        assert_eq!(
-            runtime.vim_normal.move_up,
-            vec![
-                key_hint::plain(KeyCode::Char('k')),
-                key_hint::plain(KeyCode::Up)
-            ]
-        );
-        assert_eq!(
-            runtime.vim_normal.move_down,
-            vec![
-                key_hint::plain(KeyCode::Char('j')),
-                key_hint::plain(KeyCode::Down)
-            ]
-        );
-    }
 
     #[test]
     fn invalid_global_copy_binding_reports_global_path() {
@@ -2795,69 +2935,9 @@ mod tests {
         expect_conflict(&keymap, "close", "fixed.transcript_edit_previous");
     }
 
-    #[test]
-    fn parses_function_keys_and_rejects_out_of_range_function_keys() {
-        assert_eq!(
-            parse_keybinding("f1").map(|binding| binding.parts()),
-            Some((KeyCode::F(1), KeyModifiers::NONE))
-        );
-        assert_eq!(
-            parse_keybinding("f24").map(|binding| binding.parts()),
-            Some((KeyCode::F(24), KeyModifiers::NONE))
-        );
-        assert_eq!(parse_keybinding("f25"), None);
-    }
 
-    #[test]
-    fn parses_all_named_non_character_keys() {
-        let cases = [
-            ("tab", KeyCode::Tab),
-            ("backspace", KeyCode::Backspace),
-            ("esc", KeyCode::Esc),
-            ("delete", KeyCode::Delete),
-            ("insert", KeyCode::Insert),
-            ("up", KeyCode::Up),
-            ("down", KeyCode::Down),
-            ("left", KeyCode::Left),
-            ("right", KeyCode::Right),
-            ("home", KeyCode::Home),
-            ("end", KeyCode::End),
-            ("page-up", KeyCode::PageUp),
-            ("page-down", KeyCode::PageDown),
-            ("space", KeyCode::Char(' ')),
-            ("minus", KeyCode::Char('-')),
-        ];
 
-        for (spec, expected_key) in cases {
-            assert_eq!(
-                parse_keybinding(spec).map(|binding| binding.parts()),
-                Some((expected_key, KeyModifiers::NONE)),
-                "failed to parse {spec}"
-            );
-        }
-    }
 
-    #[test]
-    fn rejects_modifier_only_and_nonnumeric_function_key_specs() {
-        assert_eq!(parse_keybinding("ctrl"), None);
-        assert_eq!(parse_keybinding("ff"), None);
-    }
-
-    #[test]
-    fn parses_minus_alias_and_legacy_literal_minus() {
-        assert_eq!(
-            parse_keybinding("alt-minus").map(|binding| binding.parts()),
-            Some((KeyCode::Char('-'), KeyModifiers::ALT))
-        );
-        assert_eq!(
-            parse_keybinding("alt--").map(|binding| binding.parts()),
-            Some((KeyCode::Char('-'), KeyModifiers::ALT))
-        );
-        assert_eq!(
-            parse_keybinding("-").map(|binding| binding.parts()),
-            Some((KeyCode::Char('-'), KeyModifiers::NONE))
-        );
-    }
 
     #[test]
     fn explicit_empty_array_unbinds_action() {
@@ -2867,14 +2947,6 @@ mod tests {
         assert!(runtime.composer.toggle_shortcuts.is_empty());
     }
 
-    #[test]
-    fn raw_output_toggle_defaults_to_alt_r() {
-        let runtime = RuntimeKeymap::defaults();
-        assert_eq!(
-            runtime.app.toggle_raw_output,
-            vec![key_hint::alt(KeyCode::Char('r'))]
-        );
-    }
 
     #[test]
     fn raw_output_toggle_can_be_remapped() {
@@ -2889,99 +2961,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_editor_insert_newline_includes_current_aliases() {
-        let runtime = RuntimeKeymap::defaults();
-        assert_eq!(
-            runtime.editor.insert_newline,
-            vec![
-                key_hint::ctrl(KeyCode::Char('j')),
-                key_hint::ctrl(KeyCode::Char('m')),
-                key_hint::plain(KeyCode::Enter),
-                key_hint::shift(KeyCode::Enter),
-                key_hint::alt(KeyCode::Enter),
-            ]
-        );
-    }
 
-    #[test]
-    fn default_editor_delete_forward_word_includes_alt_d() {
-        let runtime = RuntimeKeymap::defaults();
-        assert!(
-            runtime
-                .editor
-                .delete_forward_word
-                .contains(&key_hint::alt(KeyCode::Char('d')))
-        );
-    }
 
-    #[test]
-    fn default_editor_deletion_includes_modified_backspace_delete_aliases() {
-        let runtime = RuntimeKeymap::defaults();
 
-        assert!(
-            runtime
-                .editor
-                .delete_backward
-                .contains(&key_hint::shift(KeyCode::Backspace))
-        );
-        assert!(
-            runtime
-                .editor
-                .delete_forward
-                .contains(&key_hint::shift(KeyCode::Delete))
-        );
-        assert!(
-            runtime
-                .editor
-                .delete_backward_word
-                .contains(&key_hint::ctrl(KeyCode::Backspace))
-        );
-        assert!(
-            runtime
-                .editor
-                .delete_backward_word
-                .contains(&KeyBinding::new(
-                    KeyCode::Backspace,
-                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
-                ))
-        );
-        assert!(
-            runtime
-                .editor
-                .delete_forward_word
-                .contains(&key_hint::ctrl(KeyCode::Delete))
-        );
-        assert!(
-            runtime
-                .editor
-                .delete_forward_word
-                .contains(&KeyBinding::new(
-                    KeyCode::Delete,
-                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
-                ))
-        );
-    }
 
-    #[test]
-    fn default_composer_toggle_shortcuts_includes_shift_question_mark() {
-        let runtime = RuntimeKeymap::defaults();
-        assert!(
-            runtime
-                .composer
-                .toggle_shortcuts
-                .contains(&key_hint::shift(KeyCode::Char('?')))
-        );
-    }
-
-    #[test]
-    fn default_approval_open_fullscreen_includes_ctrl_shift_a() {
-        let runtime = RuntimeKeymap::defaults();
-        assert!(runtime.approval.open_fullscreen.contains(&KeyBinding::new(
-            KeyCode::Char('a'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT
-        )));
-    }
 
     #[test]
     fn primary_binding_returns_first_or_none() {
@@ -2996,10 +2979,4 @@ mod tests {
         assert_eq!(primary_binding(&[]), None);
     }
 
-    #[test]
-    fn defaults_pass_conflict_validation() {
-        RuntimeKeymap::defaults()
-            .validate_conflicts()
-            .expect("default keymap should be conflict free");
-    }
 }

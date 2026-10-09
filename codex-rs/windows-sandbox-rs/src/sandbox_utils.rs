@@ -93,50 +93,41 @@ mod tests {
     }
 
     #[test]
-    fn injects_safe_directory_for_git_directory() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repo");
-        let nested = repo.join("nested");
-        fs::create_dir_all(repo.join(".git")).expect("create .git");
-        fs::create_dir_all(&nested).expect("create nested dir");
+    fn injects_worktree_root_without_overwriting_existing_config() {
+        for git_is_file in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let repo = temp.path().join("repo");
+            let nested = repo.join("nested");
+            fs::create_dir_all(&nested).expect("create nested dir");
+            if git_is_file {
+                fs::write(
+                    repo.join(".git"),
+                    "gitdir: C:/Users/example/repo/.git/worktrees/codex3\n",
+                )
+                .expect("write .git file");
+            } else {
+                fs::create_dir(repo.join(".git")).expect("create .git");
+            }
 
-        let mut env_map = HashMap::new();
-        inject_git_safe_directory(&mut env_map, &nested);
+            for existing_count in [0, 1] {
+                let mut expected = HashMap::new();
+                if existing_count == 1 {
+                    expected.extend([
+                        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+                        ("GIT_CONFIG_KEY_0".to_string(), "existing.key".to_string()),
+                        ("GIT_CONFIG_VALUE_0".to_string(), "existing value".to_string()),
+                    ]);
+                }
+                let mut env_map = expected.clone();
+                inject_git_safe_directory(&mut env_map, &nested);
 
-        let expected = HashMap::from([
-            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-            ("GIT_CONFIG_KEY_0".to_string(), "safe.directory".to_string()),
-            (
-                "GIT_CONFIG_VALUE_0".to_string(),
-                safe_directory_value(&repo),
-            ),
-        ]);
-        assert_eq!(env_map, expected);
-    }
-
-    #[test]
-    fn injects_worktree_root_for_gitfile() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repo");
-        let nested = repo.join("nested");
-        fs::create_dir_all(&nested).expect("create nested dir");
-        fs::write(
-            repo.join(".git"),
-            "gitdir: C:/Users/example/repo/.git/worktrees/codex3\n",
-        )
-        .expect("write .git file");
-
-        let mut env_map = HashMap::new();
-        inject_git_safe_directory(&mut env_map, &nested);
-
-        let expected = HashMap::from([
-            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-            ("GIT_CONFIG_KEY_0".to_string(), "safe.directory".to_string()),
-            (
-                "GIT_CONFIG_VALUE_0".to_string(),
-                safe_directory_value(&repo),
-            ),
-        ]);
-        assert_eq!(env_map, expected);
+                expected.extend([
+                    ("GIT_CONFIG_COUNT".to_string(), (existing_count + 1).to_string()),
+                    (format!("GIT_CONFIG_KEY_{existing_count}"), "safe.directory".to_string()),
+                    (format!("GIT_CONFIG_VALUE_{existing_count}"), safe_directory_value(&repo)),
+                ]);
+                assert_eq!(env_map, expected, "gitfile={git_is_file}, count={existing_count}");
+            }
+        }
     }
 }

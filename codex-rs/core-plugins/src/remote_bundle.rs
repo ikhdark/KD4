@@ -789,6 +789,10 @@ mod tests {
 
     #[test]
     fn download_size_limit_rejects_oversized_bundle() {
+        for bytes in [0, 4] {
+            enforce_download_size_limit("https://example.com/linear.tar.gz", bytes, 4)
+                .expect("a bundle at or below the limit should be accepted");
+        }
         let err = enforce_download_size_limit(
             "https://example.com/linear.tar.gz",
             /*bytes*/ 5,
@@ -798,7 +802,8 @@ mod tests {
 
         assert!(matches!(
             err,
-            RemotePluginBundleInstallError::DownloadTooLarge { .. }
+            RemotePluginBundleInstallError::DownloadTooLarge { url, max_bytes: 4 }
+                if url == "https://example.com/linear.tar.gz"
         ));
     }
 
@@ -995,7 +1000,10 @@ mod tests {
                     store.active_plugin_version(&plugin_id),
                     Some("1.2.3".to_string())
                 );
-                assert!(!metadata_path.join("new.txt").as_path().exists());
+                assert!(
+                    !base_root.join("2.0.0").as_path().exists(),
+                    "rollback must remove the replacement version, not just restore metadata"
+                );
             } else {
                 assert!(
                     !base_root.as_path().exists(),
@@ -1168,8 +1176,10 @@ mod tests {
 
         assert!(matches!(
             err,
-            RemotePluginBundleInstallError::ExtractedBundleTooLarge { .. }
+            RemotePluginBundleInstallError::ExtractedBundleTooLarge { bytes: 8, max_bytes: 6 }
         ));
+        assert_eq!(std::fs::read(destination.path().join("a.txt")).unwrap(), b"1234");
+        assert!(!destination.path().join("b.txt").exists());
     }
 
     #[test]

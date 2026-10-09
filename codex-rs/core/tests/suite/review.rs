@@ -426,7 +426,7 @@ async fn review_op_with_plain_text_reports_invalid_result() {
 
 /// Ensure review flow suppresses assistant-specific streaming/completion events:
 /// - AgentMessageContentDelta
-/// - ItemCompleted for TurnItem::AgentMessage
+/// - ItemCompleted for the delegate's TurnItem::AgentMessage
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
@@ -477,6 +477,11 @@ async fn review_filters_agent_message_related_events() {
         EventMsg::AgentMessageContentDelta(_) => {
             panic!("unexpected AgentMessageContentDelta surfaced during review")
         }
+        EventMsg::ItemCompleted(completed)
+            if matches!(&completed.item, TurnItem::AgentMessage(message) if message.id == "msg-1") =>
+        {
+            panic!("delegate assistant completion surfaced during review")
+        }
         _ => false,
     })
     .await;
@@ -492,7 +497,7 @@ async fn review_filters_agent_message_related_events() {
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
-async fn review_does_not_emit_agent_message_on_structured_output() {
+async fn review_emits_one_rendered_agent_message_on_structured_output() {
     require_network!();
 
     let review_json = serde_json::json!({
@@ -537,11 +542,11 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
     // AgentMessage (no streaming assistant messages).
     let mut saw_entered = false;
     let mut saw_exited = false;
-    let mut agent_messages = 0;
+    let mut agent_messages = Vec::new();
     wait_for_event(&codex, |event| match event {
         EventMsg::TurnComplete(_) => true,
-        EventMsg::AgentMessage(_) => {
-            agent_messages += 1;
+        EventMsg::AgentMessage(message) => {
+            agent_messages.push(message.message.clone());
             false
         }
         EventMsg::EnteredReviewMode(_) => {
@@ -555,7 +560,8 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
         _ => false,
     })
     .await;
-    assert_eq!(1, agent_messages, "expected exactly one AgentMessage event");
+    let expected: ReviewOutputEvent = serde_json::from_str(&review_json).unwrap();
+    assert_eq!(agent_messages, vec![render_review_output_text(&expected)]);
     assert!(saw_entered && saw_exited, "missing review lifecycle events");
 
     let _codex_home_guard = codex_home;
@@ -784,6 +790,12 @@ async fn review_input_isolated_from_parent_history() {
     assert_eq!(request.path(), "/v1/responses");
     let body = request.body_json();
     let input = body["input"].as_array().expect("input array");
+    for parent_text in ["parent: earlier user message", "parent: assistant reply"] {
+        assert!(
+            !serde_json::to_string(input).unwrap().contains(parent_text),
+            "review input leaked parent history: {parent_text}"
+        );
+    }
     assert!(
         input.len() >= 2,
         "expected at least environment context and review prompt"
@@ -814,6 +826,7 @@ async fn review_input_isolated_from_parent_history() {
     assert_eq!(instructions, REVIEW_PROMPT);
 
     // Also verify that a user interruption note was recorded in the rollout.
+    codex.flush_rollout().await.expect("flush review rollout");
     let path = codex.rollout_path().expect("rollout path");
     let text = std::fs::read_to_string(&path).expect("read rollout file");
     let mut saw_interruption_message = false;

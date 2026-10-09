@@ -55,80 +55,36 @@ fn final_message_write_reports_closed_stdout_instead_of_panicking() {
 }
 
 #[test]
-fn suppresses_final_stdout_message_when_both_streams_are_terminals() {
-    assert!(!should_print_final_message_to_stdout(
-        Some("hello"),
-        /*stdout_is_terminal*/ true,
-        /*stderr_is_terminal*/ true
-    ));
+fn final_message_destinations_respect_terminal_and_rendered_state() {
+    for (stdout_tty, stderr_tty, expected_stdout, expected_tty) in [
+        (false, false, true, false),
+        (false, true, true, false),
+        (true, false, true, false),
+        (true, true, false, true),
+    ] {
+        assert_eq!(should_print_final_message_to_stdout(Some("hello"), stdout_tty, stderr_tty), expected_stdout);
+        assert!(!should_print_final_message_to_stdout(None, stdout_tty, stderr_tty));
+        for rendered in [false, true] {
+            assert_eq!(should_print_final_message_to_tty(Some("hello"), rendered, stdout_tty, stderr_tty), expected_tty && !rendered);
+            assert!(!should_print_final_message_to_tty(None, rendered, stdout_tty, stderr_tty));
+        }
+    }
 }
 
 #[test]
-fn prints_final_stdout_message_when_stdout_is_not_terminal() {
-    assert!(should_print_final_message_to_stdout(
-        Some("hello"),
-        /*stdout_is_terminal*/ false,
-        /*stderr_is_terminal*/ true
-    ));
-}
-
-#[test]
-fn prints_final_stdout_message_when_stderr_is_not_terminal() {
-    assert!(should_print_final_message_to_stdout(
-        Some("hello"),
-        /*stdout_is_terminal*/ true,
-        /*stderr_is_terminal*/ false
-    ));
-}
-
-#[test]
-fn suppresses_final_stdout_message_when_missing() {
-    assert!(!should_print_final_message_to_stdout(
-        /*final_message*/ None, /*stdout_is_terminal*/ false,
-        /*stderr_is_terminal*/ false
-    ));
-}
-
-#[test]
-fn prints_final_tty_message_when_not_yet_rendered() {
-    assert!(should_print_final_message_to_tty(
-        Some("hello"),
-        /*final_message_rendered*/ false,
-        /*stdout_is_terminal*/ true,
-        /*stderr_is_terminal*/ true
-    ));
-}
-
-#[test]
-fn suppresses_final_tty_message_when_already_rendered() {
-    assert!(!should_print_final_message_to_tty(
-        Some("hello"),
-        /*final_message_rendered*/ true,
-        /*stdout_is_terminal*/ true,
-        /*stderr_is_terminal*/ true
-    ));
-}
-
-#[test]
-fn reasoning_text_prefers_summary_when_raw_reasoning_is_hidden() {
-    let text = reasoning_text(
-        &["summary".to_string()],
-        &["raw".to_string()],
-        /*show_raw_agent_reasoning*/ false,
-    );
-
-    assert_eq!(text.as_deref(), Some("summary"));
-}
-
-#[test]
-fn reasoning_text_uses_raw_content_when_enabled() {
-    let text = reasoning_text(
-        &["summary".to_string()],
-        &["raw".to_string()],
-        /*show_raw_agent_reasoning*/ true,
-    );
-
-    assert_eq!(text.as_deref(), Some("raw"));
+fn reasoning_text_selects_and_joins_available_content() {
+    for (summary, content, raw, expected) in [
+        (vec!["summary"], vec!["raw"], false, Some("summary")),
+        (vec!["summary"], vec!["raw"], true, Some("raw")),
+        (vec!["one", "two"], vec![], true, Some("one\ntwo")),
+        (vec![], vec!["one", "two"], true, Some("one\ntwo")),
+        (vec![], vec!["raw"], false, None),
+        (vec![], vec![], true, None),
+    ] {
+        let summary = summary.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let content = content.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(reasoning_text(&summary, &content, raw).as_deref(), expected);
+    }
 }
 
 #[test]
@@ -266,59 +222,15 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
     );
 }
 
-#[test]
-fn turn_completed_recovers_final_message_from_turn_items() {
-    let mut processor = EventProcessorWithHumanOutput {
-        bold: Style::new(),
-        cyan: Style::new(),
-        dimmed: Style::new(),
-        green: Style::new(),
-        italic: Style::new(),
-        magenta: Style::new(),
-        red: Style::new(),
-        yellow: Style::new(),
-        show_agent_reasoning: true,
-        show_raw_agent_reasoning: false,
-        last_message_path: None,
-        final_message: None,
-        final_message_rendered: false,
-        emit_final_message_on_shutdown: false,
-        last_total_token_usage: None,
-    };
 
-    let status = processor.process_server_notification(ServerNotification::TurnCompleted(
-        codex_app_server_protocol::TurnCompletedNotification {
-            surfaced_result: None,
-            thread_id: "thread-1".to_string(),
-            timing: None,
-            turn: Turn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: vec![ThreadItem::AgentMessage {
-                    id: "msg-1".to_string(),
-                    text: "final answer".to_string(),
-                    phase: None,
-                }],
-                status: TurnStatus::Completed,
-                error: None,
-                started_at: None,
-                completed_at: Some(0),
-                duration_ms: None,
-                timing: None,
-                surfaced_result: None,
-            },
-        },
-    ));
-
-    assert_eq!(
-        status,
-        crate::event_processor::CodexStatus::InitiateShutdown
-    );
-    assert_eq!(processor.final_message.as_deref(), Some("final answer"));
-}
 
 #[test]
 fn turn_completed_overwrites_stale_final_message_from_turn_items() {
+    for (previous, rendered, expected_rendered) in [
+        (None, false, false),
+        (Some("stale answer"), true, false),
+        (Some("final answer"), true, true),
+    ] {
     let mut processor = EventProcessorWithHumanOutput {
         bold: Style::new(),
         cyan: Style::new(),
@@ -331,8 +243,8 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
         show_agent_reasoning: true,
         show_raw_agent_reasoning: false,
         last_message_path: None,
-        final_message: Some("stale answer".to_string()),
-        final_message_rendered: true,
+        final_message: previous.map(str::to_owned),
+        final_message_rendered: rendered,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
     };
@@ -366,7 +278,9 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
         crate::event_processor::CodexStatus::InitiateShutdown
     );
     assert_eq!(processor.final_message.as_deref(), Some("final answer"));
-    assert!(!processor.final_message_rendered);
+    assert_eq!(processor.final_message_rendered, expected_rendered);
+    assert!(processor.emit_final_message_on_shutdown);
+    }
 }
 
 #[test]
@@ -419,6 +333,7 @@ fn turn_completed_preserves_streamed_final_message_when_turn_items_are_empty() {
 
 #[test]
 fn turn_failed_clears_stale_final_message() {
+    for turn_status in [TurnStatus::Failed, TurnStatus::Interrupted] {
     let mut processor = EventProcessorWithHumanOutput {
         bold: Style::new(),
         cyan: Style::new(),
@@ -446,7 +361,7 @@ fn turn_failed_clears_stale_final_message() {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
-                status: TurnStatus::Failed,
+                status: turn_status,
                 error: None,
                 started_at: None,
                 completed_at: Some(0),
@@ -464,56 +379,10 @@ fn turn_failed_clears_stale_final_message() {
     assert_eq!(processor.final_message, None);
     assert!(!processor.final_message_rendered);
     assert!(!processor.emit_final_message_on_shutdown);
+    }
 }
 
-#[test]
-fn turn_interrupted_clears_stale_final_message() {
-    let mut processor = EventProcessorWithHumanOutput {
-        bold: Style::new(),
-        cyan: Style::new(),
-        dimmed: Style::new(),
-        green: Style::new(),
-        italic: Style::new(),
-        magenta: Style::new(),
-        red: Style::new(),
-        yellow: Style::new(),
-        show_agent_reasoning: true,
-        show_raw_agent_reasoning: false,
-        last_message_path: None,
-        final_message: Some("partial answer".to_string()),
-        final_message_rendered: true,
-        emit_final_message_on_shutdown: true,
-        last_total_token_usage: None,
-    };
 
-    let status = processor.process_server_notification(ServerNotification::TurnCompleted(
-        codex_app_server_protocol::TurnCompletedNotification {
-            surfaced_result: None,
-            thread_id: "thread-1".to_string(),
-            timing: None,
-            turn: Turn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
-                status: TurnStatus::Interrupted,
-                error: None,
-                started_at: None,
-                completed_at: Some(0),
-                duration_ms: None,
-                timing: None,
-                surfaced_result: None,
-            },
-        },
-    ));
-
-    assert_eq!(
-        status,
-        crate::event_processor::CodexStatus::InitiateShutdown
-    );
-    assert_eq!(processor.final_message, None);
-    assert!(!processor.final_message_rendered);
-    assert!(!processor.emit_final_message_on_shutdown);
-}
 
 #[test]
 fn canonical_message_retains_rendered_state_only_when_unchanged() {

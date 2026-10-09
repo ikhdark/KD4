@@ -1189,7 +1189,10 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_blocks_in_limited_mode() {
         let policy = {
-            let mut policy = NetworkProxyConfig::default();
+            let mut policy = NetworkProxyConfig {
+                allow_local_binding: true,
+                ..NetworkProxyConfig::default()
+            };
             policy.set_allowed_domains(vec!["example.com".to_string()]);
             policy
         };
@@ -1236,17 +1239,27 @@ mod tests {
             .unwrap();
         req.extensions_mut().insert(state);
 
-        let (response, _request) = http_connect_accept(
+        let (response, request) = http_connect_accept(
             /*policy_decider*/ None, /*environment_id*/ None, req,
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            request.extensions().get::<ConnectMitmMode>().copied(),
+            Some(ConnectMitmMode::Disabled)
+        );
+        let target = &request.extensions().get::<ProxyTarget>().unwrap().0;
+        assert_eq!(target.host.to_string(), "example.com");
+        assert_eq!(target.port, 443);
     }
 
     #[tokio::test]
     async fn http_connect_accept_passes_environment_id_to_decider() {
-        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
+            allow_local_binding: true,
+            ..NetworkProxyConfig::default()
+        }));
         let seen_environment_id = Arc::new(Mutex::new(None));
         let decider: Arc<dyn NetworkPolicyDecider> = Arc::new({
             let seen_environment_id = seen_environment_id.clone();
@@ -1284,6 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_defers_brokered_host_mitm_until_protocol_detection() {
         let mut policy = NetworkProxyConfig {
+            allow_local_binding: true,
             credential_broker: true,
             mitm: true,
             ..NetworkProxyConfig::default()
@@ -1377,6 +1391,7 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_blocks_hooked_host_in_full_mode_without_mitm_state() {
         let mut policy = NetworkProxyConfig {
+            allow_local_binding: true,
             mitm: true,
             mitm_hooks: vec![crate::mitm_hook::MitmHookConfig {
                 host: "api.github.com".to_string(),
@@ -1471,12 +1486,17 @@ mod tests {
             .await
             .expect("client should write CONNECT request");
 
-        let mut buf = [0_u8; 256];
-        let bytes_read = timeout(Duration::from_secs(2), stream.read(&mut buf))
+        let response = timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                assert!(response.len() < 8192, "CONNECT response header limit");
+                response.push(stream.read_u8().await.expect("complete CONNECT response"));
+            }
+            response
+        })
             .await
-            .expect("proxy should respond before timeout")
-            .expect("client should read proxy response");
-        let response = String::from_utf8_lossy(&buf[..bytes_read]);
+            .expect("proxy should respond before timeout");
+        let response = String::from_utf8_lossy(&response);
         assert!(
             response.starts_with("HTTP/1.1 200 OK\r\n"),
             "unexpected proxy response: {response:?}"

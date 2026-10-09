@@ -148,70 +148,38 @@ async fn collect_stdout_and_exit(
 }
 
 #[test]
-fn finish_driver_spawn_keeps_stdin_open_when_requested() {
+fn finish_driver_spawn_honors_stdin_open_without_process_exit() {
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(1);
-        let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
-        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
-        drop(exit_tx);
-
-        let spawned = super::finish_driver_spawn(
-            ProcessDriver {
-                writer_tx,
-                stdout_rx: stdout_rx.into(),
-                stderr_rx: None,
-                exit_rx,
-                terminator: None,
-                writer_handle: None,
-                resizer: None,
-            },
-            /*stdin_open*/ true,
-        );
-
-        spawned
-            .session
-            .writer_sender()
-            .send(b"open".to_vec())
-            .await
-            .expect("stdin should stay open");
-        assert_eq!(writer_rx.recv().await, Some(b"open".to_vec()));
+        for stdin_open in [false, true] {
+            let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(1);
+            let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
+            let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+            let spawned = super::finish_driver_spawn(
+                ProcessDriver {
+                    writer_tx,
+                    stdout_rx: stdout_rx.into(),
+                    stderr_rx: None,
+                    exit_rx,
+                    terminator: None,
+                    writer_handle: None,
+                    resizer: None,
+                },
+                stdin_open,
+            );
+            let sent = spawned.session.writer_sender().send(b"input".to_vec()).await;
+            assert_eq!(sent.is_ok(), stdin_open);
+            if stdin_open {
+                assert_eq!(writer_rx.recv().await, Some(b"input".to_vec()));
+            } else {
+                assert_eq!(writer_rx.recv().await, None);
+            }
+            drop(exit_tx);
+        }
     });
 }
 
-#[test]
-fn finish_driver_spawn_closes_stdin_when_not_requested() {
-    let runtime = current_thread_runtime();
-    runtime.block_on(async move {
-        let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(1);
-        let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
-        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
-        drop(exit_tx);
 
-        let spawned = super::finish_driver_spawn(
-            ProcessDriver {
-                writer_tx,
-                stdout_rx: stdout_rx.into(),
-                stderr_rx: None,
-                exit_rx,
-                terminator: None,
-                writer_handle: None,
-                resizer: None,
-            },
-            /*stdin_open*/ false,
-        );
-
-        assert!(
-            spawned
-                .session
-                .writer_sender()
-                .send(b"closed".to_vec())
-                .await
-                .is_err(),
-            "stdin should be closed when streaming input is disabled"
-        );
-    });
-}
 
 #[test]
 fn runner_stdin_writer_sends_close_stdin_after_input_eof() {

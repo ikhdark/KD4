@@ -514,37 +514,31 @@ mod tests {
     }
 
     #[test]
-    fn build_http_client_accepts_custom_ca_certificate() {
-        let ca_certificate = AbsolutePathBuf::try_from(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../http-client/tests/fixtures/test-ca.pem"),
-        )
-        .expect("absolute CA certificate path");
-        let tls = OtelTlsConfig {
-            ca_certificate: Some(ca_certificate),
-            ..OtelTlsConfig::default()
-        };
-
-        let client = build_http_client(&tls, OTEL_EXPORTER_OTLP_TIMEOUT);
-
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn build_async_http_client_accepts_custom_ca_certificate() {
-        let ca_certificate = AbsolutePathBuf::try_from(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../http-client/tests/fixtures/test-ca.pem"),
-        )
-        .expect("absolute CA certificate path");
-        let tls = OtelTlsConfig {
-            ca_certificate: Some(ca_certificate),
-            ..OtelTlsConfig::default()
-        };
-
-        let client = build_async_http_client(Some(&tls), OTEL_EXPORTER_OTLP_TIMEOUT);
-
-        assert!(client.is_ok());
+    fn http_clients_validate_configured_ca_certificates() {
+        for (path, valid) in [
+            ("../http-client/tests/fixtures/test-ca.pem", true),
+            ("Cargo.toml", false),
+        ] {
+            let ca_certificate = AbsolutePathBuf::try_from(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path),
+            )
+            .expect("absolute CA certificate path");
+            let tls = OtelTlsConfig {
+                ca_certificate: Some(ca_certificate),
+                ..OtelTlsConfig::default()
+            };
+            for result in [
+                build_http_client(&tls, OTEL_EXPORTER_OTLP_TIMEOUT).map(|_| ()),
+                build_async_http_client(Some(&tls), OTEL_EXPORTER_OTLP_TIMEOUT).map(|_| ()),
+            ] {
+                if valid {
+                    result.expect("configured CA should load");
+                } else {
+                    let error = result.expect_err("configured CA must not be ignored");
+                    assert!(error.to_string().contains("failed to parse certificate"), "{error}");
+                }
+            }
+        }
     }
 
     #[test]

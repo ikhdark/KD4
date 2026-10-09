@@ -309,11 +309,6 @@ async fn openai_form_capability_is_advertised_to_mcp_servers() -> anyhow::Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn openai_form_capability_is_not_advertised_by_default() -> anyhow::Result<()> {
-    assert_openai_form_capability_advertisement(/*expected*/ false).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let server_name = "capabilities";

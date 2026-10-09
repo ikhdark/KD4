@@ -298,7 +298,7 @@ async fn nested_exec_command_preserves_explicit_output_caps() {
         let payload = ToolPayload::Function {
             arguments: serde_json::json!({
                 "program": "python",
-                "args": ["-c", "print('output line\\n' * 1000, end='')"],
+                "args": ["-c", "import sys; sys.stdout.buffer.write(b'output line\\n' * 1000)"],
                 "yield_time_ms": 30000,
                 "max_output_tokens": cap,
             }).to_string(),
@@ -315,10 +315,24 @@ async fn nested_exec_command_preserves_explicit_output_caps() {
                 cancellation_cause: None,
             };
         }
+        let home = invocation.step_context.turn.config.codex_home.clone();
+        let thread_id = invocation.session.thread_id.to_string();
         let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
         let result = output.code_mode_result(&payload);
         assert_eq!(result["exit_code"], 0);
         assert_eq!(result["output_reduced"], reduced, "nested={nested}, cap={cap:?}");
+        if let Some(cap) = cap {
+            // The documented approximation is UTF-8 bytes / 4, rounded up.
+            assert!(result["output"].as_str().unwrap().len().div_ceil(4) <= cap);
+            assert_eq!(output.projection_metadata().unwrap().requested_limit, Some(cap));
+        }
+        if reduced {
+            let id = result["raw_output_artifact_id"].as_str().expect("reduced output is recoverable");
+            let retained = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+                &home, &thread_id, id,
+            ).await.expect("read the advertised artifact through the real recovery owner");
+            assert_eq!(retained, b"output line\n".repeat(1000));
+        }
         if !reduced {
             assert_eq!(result["output"].as_str().unwrap().lines().count(), 1000);
         }
@@ -879,6 +893,8 @@ async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
     // The manager already reserved its return margin; the handler must not
     // spend it starting more empty observations.
     assert_eq!(observations, 1);
+    assert_eq!(snapshot.retry_count, 0);
+    assert_eq!(snapshot.reentry_count, 0);
 }
 
 #[tokio::test]
@@ -1224,7 +1240,7 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
                 .canonical_result(&payload)
                 .expect("canonical command output");
             let text = String::from_utf8_lossy(&canonical.bytes);
-            if program == "rg" && args[0] == "missing-needle" {
+            if expected_output.is_empty() {
                 assert!(
                     text.is_empty(),
                     "search miss must have no matched lines: {text}"
@@ -1484,7 +1500,7 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
         arguments: serde_json::json!({
             "kind": "argv",
             "program": "rg",
-            "args": ["-n", "after", search_target],
+            "args": ["--no-config", "--no-ignore-global", "--no-ignore-parent", "-n", "after", search_target],
             "workdir": alternate_repository.path(),
         })
         .to_string(),
@@ -1499,6 +1515,10 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
                 payload.clone(),
             )
             .await;
+            let cached = run_exec_command_for_test(
+                &session, &turn, "alternate-repository-cached-miss", payload.clone(),
+            ).await;
+            assert!(cached.log_preview().contains("execution was suppressed"));
             tokio::fs::write(&search_target, "after\n")
                 .await
                 .expect("mutate alternate repository search target");
@@ -1976,7 +1996,7 @@ async fn ignored_deadlines_execute_once_and_report_the_adjustment() {
     for field in ["timeout_ms"] {
         let mut arguments = serde_json::json!({
             "program": "python",
-            "args": ["-c", format!("open({marker_literal}, 'w').write('started')")],
+            "args": ["-c", format!("open({marker_literal}, 'a').write('started')")],
         });
         arguments[field] = serde_json::json!(60_000);
         let invocation = invocation_for_payload_without_sandbox(
@@ -2216,8 +2236,15 @@ async fn intercepted_apply_patch_success_reports_terminal_completion_and_post_ho
         .expect("valid intercepted patch should succeed");
     let code_mode = output.code_mode_result(&payload);
     assert_eq!(code_mode["exit_code"], 0);
+    assert_eq!(code_mode["execution_state"], "exited");
+    assert_eq!(code_mode["process_exited"], true);
+    assert!(code_mode.get("session_id").is_none());
+    assert_eq!(
+        code_mode["wall_time_seconds"],
+        output.projection_metadata().unwrap().essential_inline["wall_time_seconds"]
+    );
     assert!(
-        code_mode["wall_time_seconds"]
+        output.projection_metadata().unwrap().essential_inline["wall_time_seconds"]
             .as_f64()
             .is_some_and(|wall_time| wall_time > 0.0)
     );
@@ -2418,7 +2445,11 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     let artifact = tokio::fs::read(&artifact_path)
         .await
         .expect("read raw output artifact");
-    assert!(artifact.len() > segment_bytes * 2);
+    let expected = [
+        b"BEGIN\n".to_vec(), vec![b'A'; segment_bytes], b"\nMIDDLE_MARKER\n".to_vec(),
+        vec![b'B'; segment_bytes], b"\nEND\n".to_vec(),
+    ].concat();
+    assert_eq!(artifact, expected, "every producer byte must survive retention");
     assert!(artifact.starts_with(b"BEGIN"));
     assert!(
         artifact
@@ -2725,192 +2756,54 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
 }
 
 #[tokio::test]
-async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_shot_commands() {
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
-    };
-    let output = ExecCommandToolOutput {
-        output_ranges: None,
-        process_output: None,
-        error: None,
-        validation: None,
-        event_call_id: "call-43".to_string(),
-        chunk_id: "chunk-1".to_string(),
-        wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"three".to_vec(),
-        truncation_policy: TEST_TRUNCATION_POLICY,
-        max_output_tokens: None,
-        process_id: None,
-        session_capabilities: None,
-        exit_code: Some(0),
-        process_exited: true,
-        search_no_match: false,
-        original_token_count: None,
-        hook_command: Some("echo three".to_string()),
-        raw_output_artifact: None,
-        repair_notice: None,
-        pending_deferred_completions: Vec::new(),
-    };
-    let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
-    let handler = ExecCommandHandler::default();
-    assert_eq!(
-        handler.post_tool_use_payload(&invocation, &output),
-        Some(crate::tools::registry::PostToolUsePayload {
-            tool_name: HookToolName::exec_command(),
-            tool_use_id: "call-43".to_string(),
-            tool_input: serde_json::json!({ "command": "echo three" }),
-            tool_response: serde_json::json!("three"),
-        })
-    );
-}
-
-#[tokio::test]
-async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completion() {
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({ "cmd": "echo three", "tty": true }).to_string(),
-    };
-    let output = ExecCommandToolOutput {
-        output_ranges: None,
-        process_output: None,
-        error: None,
-        validation: None,
-        event_call_id: "call-44".to_string(),
-        chunk_id: "chunk-1".to_string(),
-        wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"three".to_vec(),
-        truncation_policy: TEST_TRUNCATION_POLICY,
-        max_output_tokens: None,
-        process_id: None,
-        session_capabilities: None,
-        exit_code: Some(0),
-        process_exited: true,
-        search_no_match: false,
-        original_token_count: None,
-        hook_command: Some("echo three".to_string()),
-        raw_output_artifact: None,
-        repair_notice: None,
-        pending_deferred_completions: Vec::new(),
-    };
-    let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
-    let handler = ExecCommandHandler::default();
-
-    assert_eq!(
-        handler.post_tool_use_payload(&invocation, &output),
-        Some(crate::tools::registry::PostToolUsePayload {
-            tool_name: HookToolName::exec_command(),
-            tool_use_id: "call-44".to_string(),
-            tool_input: serde_json::json!({ "command": "echo three" }),
-            tool_response: serde_json::json!("three"),
-        })
-    );
-}
-
-#[tokio::test]
-async fn exec_command_post_tool_use_payload_skips_running_sessions() {
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
-    };
-    let output = ExecCommandToolOutput {
-        output_ranges: None,
-        process_output: None,
-        error: None,
-        validation: None,
-        event_call_id: "event-45".to_string(),
-        chunk_id: "chunk-1".to_string(),
-        wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"three".to_vec(),
-        truncation_policy: TEST_TRUNCATION_POLICY,
-        max_output_tokens: None,
-        process_id: Some(45),
-        session_capabilities: None,
-        exit_code: None,
-        process_exited: false,
-        search_no_match: false,
-        original_token_count: None,
-        hook_command: Some("echo three".to_string()),
-        raw_output_artifact: None,
-        repair_notice: None,
-        pending_deferred_completions: Vec::new(),
-    };
-    let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
-    let handler = ExecCommandHandler::default();
-    assert_eq!(handler.post_tool_use_payload(&invocation, &output), None);
-}
-
-#[tokio::test]
-async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_command_on_completion() {
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "session_id": 45,
-            "chars": "",
-        })
-        .to_string(),
-    };
-    let output = ExecCommandToolOutput {
-        output_ranges: None,
-        process_output: None,
-        error: None,
-        validation: None,
-        event_call_id: "exec-call-45".to_string(),
-        chunk_id: "chunk-2".to_string(),
-        wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"finished\n".to_vec(),
-        truncation_policy: TEST_TRUNCATION_POLICY,
-        max_output_tokens: None,
-        process_id: None,
-        session_capabilities: None,
-        exit_code: Some(0),
-        process_exited: true,
-        search_no_match: false,
-        original_token_count: None,
-        hook_command: Some("sleep 1; echo finished".to_string()),
-        raw_output_artifact: None,
-        repair_notice: None,
-        pending_deferred_completions: Vec::new(),
-    };
-    let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
-    let handler = WriteStdinHandler::default();
-
-    assert_eq!(
-        handler.post_tool_use_payload(&invocation, &output),
-        Some(crate::tools::registry::PostToolUsePayload {
-            tool_name: HookToolName::exec_command(),
-            tool_use_id: "exec-call-45".to_string(),
-            tool_input: serde_json::json!({ "command": "sleep 1; echo finished" }),
-            tool_response: serde_json::json!("finished\n"),
-        })
-    );
-}
-
-#[tokio::test]
-async fn empty_write_stdin_poll_does_not_increment_retry_or_reentry_counters() {
-    let invocation = invocation_for_payload(
-        "write_stdin",
-        "ordinary-poll",
-        ToolPayload::Function {
-            arguments: serde_json::json!({
-                "session_id": u32::MAX,
-                "chars": "",
-                "yield_time_ms": 10,
+async fn exec_command_post_tool_use_payload_requires_completion_for_each_tty_mode() {
+    for (tty, running) in [(false, false), (true, false), (false, true), (true, true)] {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({ "cmd": "echo three", "tty": tty }).to_string(),
+        };
+        let output = ExecCommandToolOutput {
+            output_ranges: None,
+            process_output: None,
+            error: None,
+            validation: None,
+            event_call_id: "call-43".to_string(),
+            chunk_id: "chunk-1".to_string(),
+            wall_time: std::time::Duration::from_millis(498),
+            raw_output: b"three".to_vec(),
+            truncation_policy: TEST_TRUNCATION_POLICY,
+            max_output_tokens: None,
+            process_id: running.then_some(45),
+            session_capabilities: None,
+            exit_code: (!running).then_some(0),
+            process_exited: !running,
+            search_no_match: false,
+            original_token_count: None,
+            hook_command: Some("echo three".to_string()),
+            raw_output_artifact: None,
+            repair_notice: None,
+            pending_deferred_completions: Vec::new(),
+        };
+        let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
+        let handler = ExecCommandHandler::default();
+        assert_eq!(
+            handler.post_tool_use_payload(&invocation, &output),
+            (!running).then(|| crate::tools::registry::PostToolUsePayload {
+                tool_name: HookToolName::exec_command(),
+                tool_use_id: "call-43".to_string(),
+                tool_input: serde_json::json!({ "command": "echo three" }),
+                tool_response: serde_json::json!("three"),
             })
-            .to_string(),
-        },
-    )
-    .await;
-    let timing = Arc::new(crate::tools::tool_dispatch_trace::ToolDispatchTiming::new(
-        tokio::time::Instant::now(),
-        false,
-    ));
-    let _ = crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
-        Arc::clone(&timing),
-        WriteStdinHandler::default().handle(invocation),
-    )
-    .await;
-
-    let snapshot = timing.snapshot(tokio::time::Instant::now());
-    assert_eq!(snapshot.retry_count, 0);
-    assert_eq!(snapshot.reentry_count, 0);
+        );
+    }
 }
+
+
+
+
+
+
+
+
 
 #[tokio::test]
 async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separate() {

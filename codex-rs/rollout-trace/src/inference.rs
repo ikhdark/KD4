@@ -458,48 +458,16 @@ mod tests {
     use crate::replay_bundle;
 
     #[test]
-    fn disabled_attempt_adds_no_request_headers() {
-        let mut headers = HeaderMap::new();
-
-        InferenceTraceAttempt::disabled().add_request_headers(&mut headers);
-
-        assert!(headers.is_empty());
-    }
-
-    #[test]
-    fn enabled_attempt_adds_inference_request_header() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let writer = Arc::new(TraceWriter::create(
-            temp.path(),
-            "trace-1".to_string(),
-            "rollout-1".to_string(),
-            "thread-root".to_string(),
-        )?);
-        let context = InferenceTraceContext::enabled(
-            writer,
-            "thread-root".to_string(),
-            "turn-1".to_string(),
-            "gpt-test".to_string(),
-            "test-provider".to_string(),
-        );
-        let attempt = context.start_attempt();
-        let mut headers = HeaderMap::new();
-
-        attempt.add_request_headers(&mut headers);
-
-        let header = headers
-            .get(INFERENCE_CALL_ID_HEADER)
-            .expect("inference header present");
-        assert_eq!(Some(header.to_str()?), attempt.inference_call_id());
-        assert!(Uuid::parse_str(header.to_str()?).is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn disabled_context_does_not_build_request_metadata() {
+    fn disabled_context_does_not_build_metadata_or_change_headers() {
         let context = InferenceTraceContext::disabled()
             .with_request_metadata(|| panic!("disabled captures must not prepare metadata"));
-        assert!(!context.start_attempt().is_enabled());
+        let attempt = context.start_attempt();
+        assert!(!attempt.is_enabled());
+        let mut headers = HeaderMap::new();
+        headers.insert("existing", HeaderValue::from_static("preserved"));
+        let expected = headers.clone();
+        attempt.add_request_headers(&mut headers);
+        assert_eq!(headers, expected);
     }
 
     #[test]
@@ -531,6 +499,14 @@ mod tests {
         let context =
             context.with_request_metadata(|| json!({"parallel_tool_calls": true}));
         let attempt = context.start_attempt();
+        let mut headers = HeaderMap::new();
+        headers.insert("existing", HeaderValue::from_static("preserved"));
+        attempt.add_request_headers(&mut headers);
+        let header = headers.get("x-codex-inference-call-id").expect("trace wire header");
+        assert!(Uuid::parse_str(header.to_str()?).is_ok());
+        assert_eq!(Some(header.to_str()?), attempt.inference_call_id());
+        assert_eq!(headers["existing"], "preserved");
+        assert_eq!(headers.len(), 2);
         attempt.record_started_with_metadata(
             &json!({
                 "model": "gpt-test",
@@ -552,6 +528,7 @@ mod tests {
             .expect("recorded inference call");
 
         assert_eq!(rollout.inference_calls.len(), 1);
+        assert_eq!(inference.inference_call_id, header.to_str()?);
         assert_eq!(inference.thread_id, "thread-root");
         assert_eq!(inference.codex_turn_id, "turn-1");
         assert_eq!(inference.execution.status, ExecutionStatus::Completed);

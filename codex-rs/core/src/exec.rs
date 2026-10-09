@@ -1349,38 +1349,7 @@ async fn await_captured_output_until_deadline(
     Ok((stdout?, stderr?))
 }
 
-#[cfg(test)]
-async fn await_output_until_deadline(
-    mut stdout_handle: tokio::task::JoinHandle<io::Result<StreamOutput<Vec<u8>>>>,
-    mut stderr_handle: tokio::task::JoinHandle<io::Result<StreamOutput<Vec<u8>>>>,
-    deadline: tokio::time::Instant,
-) -> io::Result<(StreamOutput<Vec<u8>>, StreamOutput<Vec<u8>>)> {
-    async fn await_output(
-        handle: &mut tokio::task::JoinHandle<io::Result<StreamOutput<Vec<u8>>>>,
-        deadline: tokio::time::Instant,
-    ) -> io::Result<StreamOutput<Vec<u8>>> {
-        match tokio::time::timeout_at(deadline, &mut *handle).await {
-            Ok(join_result) => match join_result {
-                Ok(output) => output,
-                Err(join_error) => Err(io::Error::other(join_error)),
-            },
-            Err(_) => {
-                handle.abort();
-                Ok(StreamOutput {
-                    text: Vec::new(),
-                    truncated_after_lines: None,
-                    truncated: true,
-                })
-            }
-        }
-    }
 
-    let (stdout, stderr) = tokio::join!(
-        await_output(&mut stdout_handle, deadline),
-        await_output(&mut stderr_handle, deadline),
-    );
-    Ok((stdout?, stderr?))
-}
 
 #[cfg(test)]
 async fn read_output<R: AsyncRead + Unpin + Send + 'static>(

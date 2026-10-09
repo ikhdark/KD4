@@ -509,13 +509,14 @@ mod tests {
     }
 
     #[test]
-    fn bypass_hook_trust_suppresses_startup_review() {
-        assert!(!review_is_needed(/*bypass_hook_trust*/ true, &entry()));
-    }
-
-    #[test]
-    fn untrusted_hooks_need_review_without_bypass() {
-        assert!(review_is_needed(/*bypass_hook_trust*/ false, &entry()));
+    fn startup_review_requires_untrusted_hooks_without_bypass() {
+        let mut entry = entry();
+        assert!(!review_is_needed(/*bypass_hook_trust*/ true, &entry));
+        assert!(review_is_needed(/*bypass_hook_trust*/ false, &entry));
+        entry.hooks.clear();
+        for bypass in [false, true] {
+            assert!(!review_is_needed(bypass, &entry));
+        }
     }
 
     #[test]

@@ -57,6 +57,52 @@ const RESOURCE_URI: &str = "memo://codex/example-note";
 const SIMULATED_NO_RESPONSE_MESSAGE: &str =
     "http/request failed: error sending request for url (simulated no response)";
 
+// These are the external test server's declared fixtures, not a previous client response.
+fn expected_fixture_tools() -> ListToolsResult {
+    serde_json::from_value(serde_json::json!({"tools": [{
+        "name": "echo",
+        "description": "Echo back the provided message and include environment data.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message": {"type": "string"}, "env_var": {"type": "string"}},
+            "required": ["message"], "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"echo": {"type": "string"}, "env": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            "required": ["echo", "env"], "additionalProperties": false
+        },
+        "annotations": {"readOnlyHint": true}
+    }]})).expect("valid tool fixture")
+}
+
+fn assert_resource_fixtures(
+    resources: &rmcp::model::ListResourcesResult,
+    templates: &rmcp::model::ListResourceTemplatesResult,
+    resource: &rmcp::model::ReadResourceResult,
+) {
+    let expected_resources: rmcp::model::ListResourcesResult =
+        serde_json::from_value(serde_json::json!({"resources": [{
+            "uri": RESOURCE_URI, "name": "example-note", "title": "Example Note",
+            "description": "A sample MCP resource exposed for integration tests.",
+            "mimeType": "text/plain"
+        }]})).expect("valid resource fixture");
+    let expected_templates: rmcp::model::ListResourceTemplatesResult =
+        serde_json::from_value(serde_json::json!({"resourceTemplates": [{
+            "uriTemplate": "memo://codex/{slug}", "name": "codex-memo", "title": "Codex Memo",
+            "description": "Template for memo://codex/{slug} resources used in tests.",
+            "mimeType": "text/plain"
+        }]})).expect("valid template fixture");
+    let expected_resource: rmcp::model::ReadResourceResult =
+        serde_json::from_value(serde_json::json!({"contents": [{
+            "uri": RESOURCE_URI, "mimeType": "text/plain",
+            "text": "This is a sample MCP resource served by the rmcp test server."
+        }]})).expect("valid resource contents fixture");
+    assert_eq!(resources, &expected_resources);
+    assert_eq!(templates, &expected_templates);
+    assert_eq!(resource, &expected_resource);
+}
+
 #[tokio::test]
 async fn streamable_http_rejects_unrepresentable_headers_before_sending() -> anyhow::Result<()> {
     let server = wiremock::MockServer::start().await;
@@ -394,6 +440,7 @@ async fn streamable_http_tools_list_retries_transient_http_status() -> anyhow::R
             /*timeout*/ Some(Duration::from_secs(5)),
         )
         .await?;
+    assert_eq!(expected, expected_fixture_tools());
     arm_session_post_failure(
         &base_url,
         /*status*/ 502,
@@ -425,6 +472,7 @@ async fn streamable_http_tools_list_retries_json_rpc_transient_status() -> anyho
             /*timeout*/ Some(Duration::from_secs(5)),
         )
         .await?;
+    assert_eq!(expected, expected_fixture_tools());
     arm_session_post_json_rpc_failure(&base_url, /*status*/ 502, /*remaining*/ 1).await?;
 
     let result = client
@@ -456,6 +504,8 @@ async fn streamable_http_resource_reads_retry_transient_http_status() -> anyhow:
             Some(Duration::from_secs(5)),
         )
         .await?;
+
+    assert_resource_fixtures(&expected_resources, &expected_templates, &expected_resource);
 
     arm_session_post_failure(&base_url, /*status*/ 502, /*remaining*/ 1, &[]).await?;
     assert_eq!(
@@ -504,6 +554,8 @@ async fn streamable_http_resource_reads_retry_json_rpc_transient_status() -> any
             Some(Duration::from_secs(5)),
         )
         .await?;
+
+    assert_resource_fixtures(&expected_resources, &expected_templates, &expected_resource);
 
     arm_session_post_json_rpc_failure(&base_url, /*status*/ 502, /*remaining*/ 1).await?;
     assert_eq!(

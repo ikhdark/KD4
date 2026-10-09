@@ -332,10 +332,12 @@ mod tests {
         let mut state = AgentNavigationState::default();
         let main_thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000101").expect("valid thread");
+        // Spawn order must differ from ID order: the documented traversal
+        // contract is first-seen order, not lexicographic sorting.
         let first_agent_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000102").expect("valid thread");
-        let second_agent_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000103").expect("valid thread");
+        let second_agent_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000102").expect("valid thread");
 
         state.upsert(
             main_thread_id,
@@ -374,12 +376,20 @@ mod tests {
             state.ordered_thread_ids(),
             vec![main_thread_id, first_agent_id, second_agent_id]
         );
+        let updated = state.get(&first_agent_id).expect("updated agent");
+        assert_eq!(updated.agent_nickname.as_deref(), Some("Robie"));
+        assert_eq!(updated.agent_role.as_deref(), Some("worker"));
+        assert!(updated.is_closed);
     }
 
     #[test]
     fn adjacent_thread_id_wraps_in_spawn_order() {
         let (state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
 
+        assert_eq!(
+            state.adjacent_thread_id(Some(main_thread_id), AgentNavigationDirection::Next),
+            Some(first_agent_id)
+        );
         assert_eq!(
             state.adjacent_thread_id(Some(second_agent_id), AgentNavigationDirection::Next),
             Some(main_thread_id)

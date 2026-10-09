@@ -127,12 +127,14 @@ fn test_deserialize_websocket_connect_timeout() {
     let provider_toml = r#"
 name = "OpenAI"
 base_url = "https://api.openai.com/v1"
-websocket_connect_timeout_ms = 15000
+websocket_connect_timeout_ms = 12345
 supports_websockets = true
         "#;
 
     let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
-    assert_eq!(provider.websocket_connect_timeout_ms, Some(15_000));
+    assert_eq!(provider.websocket_connect_timeout_ms, Some(12_345));
+    assert_eq!(provider.websocket_connect_timeout(), Duration::from_millis(12_345));
+    assert!(provider.supports_websockets);
 }
 
 #[test]
@@ -143,21 +145,26 @@ fn test_supports_remote_compaction_for_openai() {
 }
 
 #[test]
-fn test_personal_access_token_uses_chatgpt_codex_base_url() {
-    let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)
-        .to_api_provider(Some(AuthMode::PersonalAccessToken))
-        .expect("OpenAI provider should build API provider");
+fn test_auth_mode_selects_base_url_unless_explicitly_configured() {
+    for (auth_mode, expected) in [
+        (Some(AuthMode::PersonalAccessToken), CHATGPT_CODEX_BASE_URL),
+        (Some(AuthMode::Headers), CHATGPT_CODEX_BASE_URL),
+        (Some(AuthMode::Chatgpt), CHATGPT_CODEX_BASE_URL),
+        (Some(AuthMode::ChatgptAuthTokens), CHATGPT_CODEX_BASE_URL),
+        (Some(AuthMode::AgentIdentity), CHATGPT_CODEX_BASE_URL),
+        (None, "https://api.openai.com/v1"),
+    ] {
+        let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+            .to_api_provider(auth_mode)
+            .expect("OpenAI provider should build API provider");
+        assert_eq!(api_provider.base_url, expected, "{auth_mode:?}");
 
-    assert_eq!(api_provider.base_url, CHATGPT_CODEX_BASE_URL);
-}
-
-#[test]
-fn test_header_auth_uses_chatgpt_codex_base_url() {
-    let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)
-        .to_api_provider(Some(AuthMode::Headers))
-        .expect("OpenAI provider should build API provider");
-
-    assert_eq!(api_provider.base_url, CHATGPT_CODEX_BASE_URL);
+        let explicit = "https://example.com/custom";
+        let api_provider = ModelProviderInfo::create_openai_provider(Some(explicit.to_string()))
+            .to_api_provider(auth_mode)
+            .expect("custom URL should build API provider");
+        assert_eq!(api_provider.base_url, explicit, "{auth_mode:?}");
+    }
 }
 
 #[test]

@@ -159,8 +159,7 @@ while (output.session_id) {{
 if (output.raw_output_artifact_id) {{
   const recovered = await tools.read_tool_output({{
     artifact_id: output.raw_output_artifact_id,
-    start_line: 1,
-    end_line: 1,
+    selectors: [{{ kind: "lines", start: 1, end: 1 }}],
   }});
   output.output = recovered.results.map(part => part.text ?? "").join("");
 }}

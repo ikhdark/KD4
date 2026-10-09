@@ -409,6 +409,8 @@ pub(crate) fn load_marketplace_with_declared_names(
         let local_version = plugin
             .manifest
             .as_ref()
+            // Git/npm fallback metadata describes an advertised package, not a local checkout.
+            .filter(|_| !plugin.source.is_install_materialized())
             .and_then(|manifest| manifest.version.clone());
         let keywords = plugin
             .manifest

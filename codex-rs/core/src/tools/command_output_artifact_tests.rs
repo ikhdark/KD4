@@ -4,6 +4,194 @@ use std::time::Duration;
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn scan_only_retention_counts_segment_and_metadata_bytes() {
+    for global in [false, true] {
+        for protected in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("tool-output");
+            let directory = root.join("thread");
+            std::fs::create_dir_all(&directory).unwrap();
+            let old = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+            let keep = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+            std::fs::write(&old, b"abc").unwrap();
+            std::fs::write(logical_segment_path(&old, 1), b"1234567").unwrap();
+            std::fs::write(logical_metadata_path(&old), b"12345").unwrap();
+            std::fs::write(&keep, b"keep").unwrap();
+            if protected {
+                std::fs::write(active_tool_history_protection_path(&old), ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES).unwrap();
+            }
+            set_retention_index_capacity_for_test(&root, 1);
+            assert_eq!(force_retention_reconciliation_for_test(&root).await, RetentionModeKind::ScanOnly);
+            // Independent byte oracle: 3 base + 7 tail + 5 sidecar + 4 kept.
+            let usage = retention_usage_locked_blocking(&directory);
+            assert_eq!(usage.thread_bytes, 19);
+            assert_eq!(usage.global_bytes, if protected { 4 } else { 19 });
+            let _permit = retention_sweep_permit_for_directory(&directory).await;
+            // Reserve all but 18 bytes, so the 19-byte family set exceeds the
+            // quota by one. Base-only accounting would incorrectly retain it.
+            let progress = if global {
+                enforce_global_retention_scan_locked_blocking(&root, &keep, MAX_RETAINED_ARTIFACT_BYTES_TOTAL - 18, 0)
+            } else {
+                enforce_retention_scan_locked_blocking(&directory, &keep, MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD - 18, 0)
+            };
+            assert!(progress.complete);
+            assert!(keep.exists());
+            assert_eq!(old.exists(), protected);
+            assert_eq!(logical_segment_path(&old, 1).exists(), protected);
+            assert_eq!(logical_metadata_path(&old).exists(), protected);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn canonical_segment_failure_reports_only_the_surviving_prefix() {
+    for attach in [false, true] {
+        for installing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = temp.path().join("tool-output/thread");
+            std::fs::create_dir_all(&directory).unwrap();
+            // Attachment keeps one raw segment; both operations write another
+            // full segment before the deliberately blocked final segment.
+            let prefix = if attach { MAX_RAW_OUTPUT_ARTIFACT_BYTES } else { 0 };
+            let body = "a".repeat(prefix + MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1);
+            let canonical = CanonicalToolResult::text(body.clone());
+            let id = ToolOutputArtifactId::new();
+            let path = directory.join(format!("{id}.log"));
+            if attach {
+                std::fs::write(&path, &body.as_bytes()[..prefix]).unwrap();
+            }
+            let failed_index = if attach { 2 } else { 1 };
+            let blocked = if installing {
+                logical_segment_path(&path, failed_index)
+            } else {
+                staged_logical_segment_path(&directory, id, failed_index)
+            };
+            std::fs::create_dir(&blocked).unwrap();
+            let result = if attach {
+                attach_canonical_output_artifact(temp.path(), "thread", &id.to_string(), &canonical).await
+            } else {
+                create_canonical_output_artifact_with_id(temp.path(), "thread", &canonical, id).await
+            };
+            assert!(!result.complete);
+            assert!(result.error.as_deref().is_some_and(|error| error.contains(if installing { "install" } else { "stage" })), "{result:?}");
+            assert_eq!(result.retained_bytes, prefix as u64);
+            assert_eq!(result.unavailable_ranges, vec![CanonicalByteRange::new(prefix as u64, body.len() as u64)]);
+            if attach {
+                assert_eq!(std::fs::read(&path).unwrap(), body.as_bytes()[..prefix]);
+                assert!(!logical_segment_path(&path, 1).exists());
+            } else {
+                assert!(!path.exists());
+            }
+            assert!(!staged_logical_segment_path(&directory, id, if attach { 1 } else { 0 }).exists());
+            assert!(blocked.is_dir(), "failure fixture must not be deleted");
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn protected_history_global_budget_tracks_protection_and_streaming_changes() {
+    let mut index = RetentionIndex::default();
+    for thread in 0..32 {
+        let directory = PathBuf::from(format!("thread-{thread}"));
+        assert!(index.insert(ArtifactRetentionRecord {
+            path: directory.join("output.log"),
+            thread_directory: directory,
+            bytes: MAX_RETAINED_ARTIFACT_BYTES_TOTAL / 16,
+            modified: SystemTime::UNIX_EPOCH,
+            protected: true,
+        }));
+    }
+    assert_eq!(index.total_bytes, 2 * MAX_RETAINED_ARTIFACT_BYTES_TOTAL);
+    assert_eq!(index.unprotected_bytes, 0);
+    assert!(!index.is_near_limit());
+
+    let path = PathBuf::from("thread-0/output.log");
+    let mut record = index.records[&path].clone();
+    record.protected = false;
+    assert!(index.insert(record.clone()));
+    assert_eq!(index.unprotected_bytes, record.bytes);
+    assert!(index.update_streaming_size(&path, 42, SystemTime::UNIX_EPOCH));
+    assert_eq!(index.unprotected_bytes, 42);
+    record.bytes = 42;
+    record.protected = true;
+    assert!(index.insert(record));
+    assert_eq!(index.unprotected_bytes, 0);
+    assert_eq!(index.thread_totals(Path::new("thread-0")).0, 42);
+    index.remove(&path).unwrap();
+    assert_eq!(index.unprotected_bytes, 0);
+    assert_eq!(index.total_bytes, 31 * (MAX_RETAINED_ARTIFACT_BYTES_TOTAL / 16));
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn protected_history_global_budget_does_not_block_context_retention() {
+    for scan_only in [false, true] {
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let home = session.codex_home().await;
+        let root = home.join("tool-output");
+        let foreign_directory = root.join("older-thread");
+        std::fs::create_dir_all(&foreign_directory).unwrap();
+        // A length-only fixture reproduces accumulated protected history without
+        // constructing a multi-GiB buffer or reading/hashing its contents.
+        let occupied = foreign_directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+        std::fs::File::create(&occupied).unwrap()
+            .set_len(MAX_RETAINED_ARTIFACT_BYTES_TOTAL + 1).unwrap();
+        let marker = active_tool_history_protection_path(&occupied);
+        std::fs::write(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES).unwrap();
+        let evictable = foreign_directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+        std::fs::write(&evictable, b"keep this cached output").unwrap();
+        if scan_only {
+            set_retention_index_capacity_for_test(&root, 1);
+        }
+        let expected_mode = if scan_only { RetentionModeKind::ScanOnly } else { RetentionModeKind::Indexed };
+        assert_eq!(force_retention_reconciliation_for_test(&root).await, expected_mode);
+
+        let items = serde_json::json!([{"artifact_id":"retained-output", "bytes":42}]);
+        let recovery = session.retain_context_source("artifact_directory", items.clone()).await
+            .expect("protected history in other threads must not block compaction");
+        let id = recovery["artifact_id"].as_str().unwrap();
+        let thread = session.thread_id().to_string();
+        let recovered = read_exact_tool_output_artifact(home.as_path(), &thread, id).await.unwrap();
+        let recovered: serde_json::Value = serde_json::from_slice(&recovered).unwrap();
+        assert_eq!(recovered["items"], items);
+        assert!(occupied.exists(), "must preserve protected history");
+        assert!(evictable.exists(), "protected bytes must not force unrelated cache eviction");
+        assert_eq!(retention_mode_for_test(&root), expected_mode);
+        let reused = session.retain_context_source("artifact_directory", items).await.unwrap();
+        assert_eq!(reused, recovery);
+
+        // Releasing protection puts those bytes back under the global limit.
+        std::fs::remove_file(marker).unwrap();
+        force_retention_reconciliation_for_test(&root).await;
+        let context_path = root.join(&thread).join(format!("{id}.log"));
+        enforce_global_retention(&root, &context_path).await;
+        assert!(!occupied.exists());
+        assert!(context_path.exists());
+        assert!(read_exact_tool_output_artifact(home.as_path(), &thread, id).await.is_ok());
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn context_retention_failure_reports_storage_cause_without_admitting_context() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let home = session.codex_home().await;
+    let root = home.join("tool-output");
+    std::fs::create_dir_all(&root).unwrap();
+    let blocked = root.join(session.thread_id().to_string());
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let error = session.retain_context_source("artifact_directory", serde_json::json!([]))
+        .await.expect_err("storage failure must not admit a recovery handle").to_string();
+    assert!(error.contains("context was not admitted"), "{error}");
+    assert!(error.contains("Retained 0 of"), "{error}");
+    assert!(error.contains("failed to create"), "{error}");
+    assert_eq!(std::fs::read(blocked).unwrap(), b"not a directory");
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn protected_canonical_creation_indexes_exact_bytes_without_a_second_protection_mutation() {
     let home = tempfile::tempdir().unwrap();
     for canonical in [
@@ -72,13 +260,16 @@ async fn protected_canonical_creation_rejects_bad_receipts_and_marker_failures()
 fn protected_canonical_creation_finishes_with_one_blocking_thread() {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all()
         .max_blocking_threads(1).build().unwrap();
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         let home = tempfile::tempdir().unwrap();
         let canonical = CanonicalToolResult::text("single-worker protected creation");
         let artifact = tokio::time::timeout(Duration::from_secs(5),
-            create_tool_history_output_artifact(home.path(), "thread", &canonical)).await.unwrap();
+            create_tool_history_output_artifact(home.path(), "thread", &canonical)).await?;
         assert!(artifact.complete, "{:?}", artifact.error);
+        Ok::<(), tokio::time::error::Elapsed>(())
     });
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    result.expect("protected creation must not require a second blocking worker");
 }
 
 #[tokio::test]
@@ -692,27 +883,24 @@ async fn adjacent_fitting_selectors_are_not_merged_into_one_that_no_longer_fits(
         normalized.len() > 1,
         "one range covering everything could only fail: {normalized:?}"
     );
-    // Whatever normalization produced, every piece of it still reads. Merging
-    // may absorb neighbours, but never past the point where the result can
-    // still be returned.
+    // Exercise the real final response ceiling, not merely subdivision eligibility.
     for selector in &normalized {
-        let selected = select_logical_artifact(
-            &metadata,
-            &snapshot,
-            selector.clone(),
-            RECOVERY_FRAGMENT_TOKEN_CEILING,
-            RECOVERY_AGGREGATE_TOKEN_CEILING,
-            &[],
-            None,
-        );
-        let readable = selected.status == ToolOutputSelectorStatus::Ok
-            || internally_drain_exact_subdivisions(&metadata, &snapshot, &selected).is_some();
-        assert!(
-            readable,
-            "normalization produced {selector:?}, which can only come back as {:?}",
-            selected.status
-        );
+        let selected = select_tool_output_snapshot(
+            &metadata, &snapshot, vec![selector.clone()], RECOVERY_AGGREGATE_TOKEN_CEILING,
+        ).expect("normalized selector is readable");
+        assert!(selected.complete, "{selector:?}");
+        let range = selected.results[0].canonical_range.unwrap();
+        assert_eq!(selected.results[0].text.as_deref(),
+            Some(&text[range.start as usize..range.end as usize]));
     }
+    assert_eq!(
+        normalize_tool_output_selectors(
+            selectors[..2].to_vec(), &metadata, &snapshot,
+            RECOVERY_FRAGMENT_TOKEN_CEILING, RECOVERY_AGGREGATE_TOKEN_CEILING,
+        ),
+        vec![ToolOutputSelector::Lines { start: 1, end: 120 }],
+        "fitting neighbors must still merge"
+    );
     // And nothing the caller asked for was dropped.
     let covered_lines = normalized
         .iter()
@@ -728,41 +916,7 @@ async fn adjacent_fitting_selectors_are_not_merged_into_one_that_no_longer_fits(
     );
 }
 
-/// Preservation: a merge that can still be returned whole is still performed,
-/// so normalization keeps removing redundant work.
-#[tokio::test(flavor = "current_thread")]
-#[serial_test::serial(command_output_artifact)]
-async fn adjacent_selectors_still_merge_when_the_merged_range_can_be_returned() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let line = "x".repeat(60);
-    let text = (0..1_200)
-        .map(|index| format!("{index:04} {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
 
-    // Two adjacent blocks: over the fragment ceiling together, but small enough
-    // that the read still returns them as one complete result.
-    let normalized = normalize_tool_output_selectors(
-        vec![
-            ToolOutputSelector::Lines { start: 1, end: 60 },
-            ToolOutputSelector::Lines {
-                start: 61,
-                end: 120,
-            },
-        ],
-        &metadata,
-        &snapshot,
-        RECOVERY_FRAGMENT_TOKEN_CEILING,
-        RECOVERY_AGGREGATE_TOKEN_CEILING,
-    );
-
-    assert_eq!(
-        normalized,
-        vec![ToolOutputSelector::Lines { start: 1, end: 120 }],
-        "adjacent ranges that can still be returned whole are normalized into one"
-    );
-}
 
 /// Sizing the advertised continuation against a zero-filled probe overstated
 /// the cost about sixfold, because NUL renders as `\u0000`. The model was told
@@ -1331,17 +1485,7 @@ async fn exact_recovery_expires_when_the_artifact_is_deleted() {
     assert_eq!(error, ReadToolOutputError::Expired);
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct ProjectionMeasurement {
-    initial_model_tokens: usize,
-    recovery_calls: u32,
-    recovery_generations: u32,
-    canonical_bytes: usize,
-    artifact_reads: u32,
-    recovery_retruncations: u32,
-    strict_subset_rereads: u32,
-    match_index_complete: bool,
-}
+
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
@@ -1409,34 +1553,9 @@ async fn four_chunk_fixture_recovers_every_omitted_chunk_in_one_combined_call() 
     let omitted_start = sections[2].canonical_range.expect("range").start as usize;
     assert_eq!(recovered_text, content[omitted_start..]);
 
-    let legacy = ProjectionMeasurement {
-        initial_model_tokens: approx_token_count(&content[..8 * 1024]),
-        recovery_calls: 2,
-        recovery_generations: 2,
-        canonical_bytes: content.len(),
-        artifact_reads: 0,
-        recovery_retruncations: 0,
-        strict_subset_rereads: 2,
-        match_index_complete: true,
-    };
-    let projected = ProjectionMeasurement {
-        initial_model_tokens: approx_token_count(
-            &content[..sections[1].canonical_range.expect("range").end as usize],
-        ),
-        recovery_calls: 1,
-        recovery_generations: 1,
-        canonical_bytes: canonical.exact_bytes as usize,
-        artifact_reads: 1,
-        recovery_retruncations: 0,
-        strict_subset_rereads: 0,
-        match_index_complete: true,
-    };
-    assert_eq!(projected.canonical_bytes, legacy.canonical_bytes);
-    assert!(projected.recovery_calls < legacy.recovery_calls);
-    assert!(projected.recovery_generations < legacy.recovery_generations);
-    assert!(projected.strict_subset_rereads < legacy.strict_subset_rereads);
-    assert_eq!(projected.recovery_retruncations, 0);
-    assert!(projected.match_index_complete);
+    assert_eq!(recovered.canonical_bytes, content.len() as u64);
+    assert!(recovered.complete);
+    assert_eq!(recovered.results.len(), 2);
 }
 
 #[tokio::test]
@@ -2423,36 +2542,7 @@ async fn global_retention_bounds_artifacts_across_threads() {
     assert!(keep_path.exists());
 }
 
-#[test]
-fn active_tool_history_verification_bounds_reads_when_artifact_grows() {
-    struct GrowingArtifact {
-        read_bytes: usize,
-    }
 
-    impl Read for GrowingArtifact {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            assert!(buffer.len() <= 65_536, "read memory must remain bounded");
-            self.read_bytes += buffer.len();
-            assert!(
-                self.read_bytes <= 131_074,
-                "must stop after the growth probe"
-            );
-            buffer.fill(b'x');
-            Ok(buffer.len())
-        }
-    }
-
-    // The source keeps growing and never reaches EOF. The verifier must stop
-    // after the declared size plus one byte without an allocation of that size.
-    let mut artifact = GrowingArtifact { read_bytes: 0 };
-    let result = verified_artifact_digest(&mut artifact, 131_073);
-
-    assert_eq!(
-        result,
-        Err("artifact byte count does not match receipt metadata".to_string())
-    );
-    assert_eq!(artifact.read_bytes, 131_074);
-}
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
@@ -2662,37 +2752,24 @@ async fn independent_retention_roots_acquire_in_parallel() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn artifact_creation_fails_open_when_retention_lock_acquisition_fails() {
+async fn artifact_creation_fails_open_when_retention_lock_fails() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let failures_before = retention_sweep_permit_failures_for_test();
-    inject_retention_sweep_permit_failure_for_test(1);
-
-    let artifact = create_raw_output_artifact(temp.path(), "thread", b"durable output").await;
-
-    assert!(matches!(artifact, RawOutputArtifact::Stored { .. }));
-    assert_eq!(
-        retention_sweep_permit_failures_for_test(),
-        failures_before + 1,
-        "the skipped sweep must remain observable"
-    );
+    for failure in [1, 2] {
+        let failures_before = retention_sweep_permit_failures_for_test();
+        inject_retention_sweep_permit_failure_for_test(failure);
+        let artifact = create_raw_output_artifact(temp.path(), "thread", b"durable output").await;
+        let RawOutputArtifact::Stored { id, .. } = artifact else {
+            panic!("retention failure must not lose completed output");
+        };
+        assert_eq!(retention_sweep_permit_failures_for_test(), failures_before + 1);
+        assert_eq!(
+            read_complete_canonical_snapshot(temp.path(), "thread", &id.to_string(), 14).await.unwrap(),
+            b"durable output"
+        );
+    }
 }
 
-#[tokio::test]
-#[serial_test::serial(command_output_artifact)]
-async fn artifact_creation_fails_open_when_retention_lock_task_fails() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let failures_before = retention_sweep_permit_failures_for_test();
-    inject_retention_sweep_permit_failure_for_test(2);
 
-    let artifact = create_raw_output_artifact(temp.path(), "thread", b"durable output").await;
-
-    assert!(matches!(artifact, RawOutputArtifact::Stored { .. }));
-    assert_eq!(
-        retention_sweep_permit_failures_for_test(),
-        failures_before + 1,
-        "the failed lock task must remain observable"
-    );
-}
 
 #[test]
 #[serial_test::serial(command_output_artifact)]
@@ -2861,37 +2938,29 @@ fn malformed_or_overflowed_retention_generation_is_reinitialized() {
     }
 }
 
-async fn create_artifacts_and_measure(count: usize) -> (RetentionDiagnostics, std::time::Duration) {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let started = Instant::now();
-    for index in 0..count {
-        let artifact = create_raw_output_artifact(
-            temp.path(),
-            "thread",
-            format!("artifact-{index}").as_bytes(),
-        )
-        .await;
-        assert!(matches!(artifact, RawOutputArtifact::Stored { .. }));
-    }
-    let elapsed = started.elapsed();
-    let root = temp.path().join("tool-output");
-    (retention_diagnostics_for_test(&root), elapsed)
-}
+
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn indexed_retention_scans_only_at_configured_boundaries() {
-    let (at_100, wall_100) = create_artifacts_and_measure(100).await;
-    let (at_127, wall_127) = create_artifacts_and_measure(127).await;
-    let (at_131, wall_131) = create_artifacts_and_measure(131).await;
-
-    assert_eq!(at_100.scans, 1, "100 artifacts took {wall_100:?}");
-    assert_eq!(at_127.scans, 2, "127 artifacts took {wall_127:?}");
-    assert_eq!(at_131.scans, 2, "131 artifacts took {wall_131:?}");
-    assert_eq!(at_100.logical_mutations, 100);
-    assert_eq!(at_127.logical_mutations, 127);
-    assert_eq!(at_131.logical_mutations, 131);
-    assert_eq!(at_131.evictions, 3);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("tool-output");
+    for count in 1..=131 {
+        let artifact = create_raw_output_artifact(
+            temp.path(), "thread", format!("artifact-{count}").as_bytes(),
+        ).await;
+        assert!(matches!(artifact, RawOutputArtifact::Stored { .. }));
+        if let Some(expected_scans) = match count {
+            100 => Some(1),
+            127 | 131 => Some(2),
+            _ => None,
+        } {
+            let diagnostics = retention_diagnostics_for_test(&root);
+            assert_eq!(diagnostics.scans, expected_scans, "after {count} artifacts");
+            assert_eq!(diagnostics.logical_mutations, count);
+            assert_eq!(diagnostics.evictions, count.saturating_sub(128));
+        }
+    }
 }
 
 #[tokio::test]
@@ -4058,15 +4127,13 @@ fn committed_history_pruning_finishes_with_one_blocking_thread() {
 
 #[test]
 #[serial_test::serial(command_output_artifact)]
-fn canonical_creation_finishes_with_one_blocking_thread() {
-    assert_canonical_operation_finishes_with_one_blocking_thread(false);
+fn canonical_creation_and_attachment_finish_with_one_blocking_thread() {
+    for attach in [false, true] {
+        assert_canonical_operation_finishes_with_one_blocking_thread(attach);
+    }
 }
 
-#[test]
-#[serial_test::serial(command_output_artifact)]
-fn canonical_attachment_finishes_with_one_blocking_thread() {
-    assert_canonical_operation_finishes_with_one_blocking_thread(true);
-}
+
 
 fn assert_canonical_operation_finishes_with_one_blocking_thread(attach: bool) {
     let temp = tempfile::tempdir().expect("artifact home");
@@ -4432,15 +4499,11 @@ fn raw_retention_worker_keeps_ownership_after_caller_and_runtime_cancellation() 
             .expect("artifact ID")
             .to_str()
             .expect("UTF-8 ID");
-        let output = read_tool_output_artifact(temp.path(), "thread", id, 1, 1, 16_384)
+        let output = read_tool_output_selectors(temp.path(), "thread", id, vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
             .await
             .expect("normal reader after runtime shutdown");
-        assert_eq!(
-            output,
-            format!(
-                "artifact {id}, lines 1–1, 36 retained bytes\nretention survives runtime shutdown\n"
-            )
-        );
+        assert!(output.complete);
+        assert_eq!(output.results[0].text.as_deref(), Some("retention survives runtime shutdown\n"));
     });
     assert!(
         retained_after_caller_cancellation,

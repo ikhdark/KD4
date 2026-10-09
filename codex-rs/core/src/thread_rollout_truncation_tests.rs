@@ -226,40 +226,19 @@ fn truncates_rollout_from_start_before_nth_user_only() {
         .map(RolloutItem::ResponseItem)
         .collect();
 
-    let truncated =
-        truncate_rollout_before_nth_user_message_from_start(&rollout, /*n_from_start*/ 1);
-    let expected = vec![
-        RolloutItem::ResponseItem(items[0].clone()),
-        RolloutItem::ResponseItem(items[1].clone()),
-        RolloutItem::ResponseItem(items[2].clone()),
-    ];
-    assert_eq!(
-        serde_json::to_value(&truncated).unwrap(),
-        serde_json::to_value(&expected).unwrap()
-    );
-
-    let truncated2 =
-        truncate_rollout_before_nth_user_message_from_start(&rollout, /*n_from_start*/ 2);
-    assert_eq!(
-        serde_json::to_value(&truncated2).unwrap(),
-        serde_json::to_value(&rollout).unwrap()
-    );
-}
-
-#[test]
-fn truncation_max_keeps_full_rollout() {
-    let rollout = vec![
-        RolloutItem::ResponseItem(user_msg("u1")),
-        RolloutItem::ResponseItem(assistant_msg("a1")),
-        RolloutItem::ResponseItem(user_msg("u2")),
-    ];
-
-    let truncated = truncate_rollout_before_nth_user_message_from_start(&rollout, usize::MAX);
-
-    assert_eq!(
-        serde_json::to_value(&truncated).unwrap(),
-        serde_json::to_value(&rollout).unwrap()
-    );
+    for (n_from_start, expected_len) in [
+        (0, 0),
+        (1, 3),
+        (2, rollout.len()),
+        (usize::MAX, rollout.len()),
+    ] {
+        let truncated = truncate_rollout_before_nth_user_message_from_start(&rollout, n_from_start);
+        assert_eq!(
+            serde_json::to_value(&truncated).unwrap(),
+            serde_json::to_value(&rollout[..expected_len]).unwrap(),
+            "n_from_start={n_from_start}"
+        );
+    }
 }
 
 #[test]
@@ -475,15 +454,29 @@ fn truncates_rollout_to_last_n_fork_turns_drops_startup_prefix_even_when_under_l
         RolloutItem::ResponseItem(developer_msg("startup developer context")),
         RolloutItem::ResponseItem(user_msg("current task")),
         RolloutItem::ResponseItem(assistant_msg("answer")),
+        RolloutItem::ResponseItem(inter_agent_msg(
+            "triggered task",
+            /*trigger_turn*/ true,
+        )),
+        RolloutItem::ResponseItem(assistant_msg("second answer")),
     ];
 
-    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
-    let expected = rollout[1..].to_vec();
-
-    assert_eq!(
-        serde_json::to_value(&truncated).unwrap(),
-        serde_json::to_value(&expected).unwrap()
-    );
+    for input in [&rollout[..], &rollout[1..]] {
+        for n_from_end in [0, 2, 10, usize::MAX] {
+            let truncated = truncate_rollout_to_last_n_fork_turns(input, n_from_end);
+            let expected = if n_from_end == 0 {
+                &rollout[..0]
+            } else {
+                &rollout[1..]
+            };
+            assert_eq!(
+                serde_json::to_value(&truncated).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "input length={}, n_from_end={n_from_end}",
+                input.len()
+            );
+        }
+    }
 }
 
 #[test]
@@ -581,25 +574,5 @@ fn truncates_rollout_to_last_n_fork_turns_discards_rolled_back_assistant_instruc
     assert_eq!(
         serde_json::to_value(&truncated).unwrap(),
         serde_json::to_value(&expected).unwrap()
-    );
-}
-
-#[test]
-fn truncates_rollout_to_last_n_fork_turns_keeps_full_rollout_when_n_is_large() {
-    let rollout = vec![
-        RolloutItem::ResponseItem(user_msg("u1")),
-        RolloutItem::ResponseItem(assistant_msg("a1")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task",
-            /*trigger_turn*/ true,
-        )),
-        RolloutItem::ResponseItem(assistant_msg("a2")),
-    ];
-
-    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 10);
-
-    assert_eq!(
-        serde_json::to_value(&truncated).unwrap(),
-        serde_json::to_value(&rollout).unwrap()
     );
 }

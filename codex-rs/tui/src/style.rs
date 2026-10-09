@@ -131,25 +131,14 @@ mod tests {
     }
 
     #[test]
-    fn table_separator_blends_toward_dark_background() {
-        let style = table_separator_style_for(
-            Some((255, 255, 255)),
-            Some((0, 0, 0)),
-            StdoutColorLevel::TrueColor,
-        );
-
-        assert_eq!(style.fg, Some(rgb_color((51, 51, 51))));
-    }
-
-    #[test]
-    fn table_separator_blends_toward_light_background() {
-        let style = table_separator_style_for(
-            Some((0, 0, 0)),
-            Some((255, 255, 255)),
-            StdoutColorLevel::TrueColor,
-        );
-
-        assert_eq!(style.fg, Some(rgb_color((204, 204, 204))));
+    fn table_separator_blends_toward_terminal_background() {
+        for (fg, bg, expected) in [
+            ((255, 255, 255), (0, 0, 0), (51, 51, 51)),
+            ((0, 0, 0), (255, 255, 255), (204, 204, 204)),
+        ] {
+            let style = table_separator_style_for(Some(fg), Some(bg), StdoutColorLevel::TrueColor);
+            assert_eq!(style, Style::default().fg(rgb_color(expected)), "{bg:?}");
+        }
     }
 
     #[test]

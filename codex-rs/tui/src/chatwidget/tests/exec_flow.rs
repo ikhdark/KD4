@@ -112,22 +112,7 @@ async fn preamble_keeps_working_status_snapshot() {
     );
 }
 
-#[tokio::test]
-async fn unified_exec_begin_restores_status_indicator_after_preamble() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.on_task_started();
-    assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
-
-    // Simulate a hidden status row during an active turn.
-    chat.bottom_pane.hide_status_indicator();
-    assert_eq!(chat.bottom_pane.status_indicator_visible(), false);
-    assert_eq!(chat.bottom_pane.is_task_running(), true);
-
-    begin_unified_exec_startup(&mut chat, "call-1", "proc-1", "sleep 2");
-
-    assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
-}
 
 #[tokio::test]
 async fn unified_exec_begin_restores_working_status_snapshot() {
@@ -138,8 +123,11 @@ async fn unified_exec_begin_restores_working_status_snapshot() {
     chat.on_commit_tick();
     drain_insert_history(&mut rx);
 
+    assert!(!chat.bottom_pane.status_indicator_visible());
+    assert!(chat.bottom_pane.is_task_running());
     begin_unified_exec_startup(&mut chat, "call-1", "proc-1", "sleep 2");
 
+    assert!(chat.bottom_pane.status_indicator_visible());
     let width: u16 = 80;
     let height = chat.desired_height(width);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
@@ -154,58 +142,43 @@ async fn unified_exec_begin_restores_working_status_snapshot() {
 }
 
 #[tokio::test]
-async fn exec_history_cell_shows_working_then_completed() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+async fn exec_history_cell_transitions_from_running_to_terminal_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    for (command, stdout, stderr, exit_code) in [
+        ("echo done", "done", "", 0),
+        ("false", "", "Bloop", 2),
+    ] {
+        let begin = begin_exec(&mut chat, "call", command);
+        let active = chat.transcript.active_cell.as_ref().unwrap()
+            .as_any().downcast_ref::<ExecCell>().unwrap();
+        assert!(active.is_active());
+        assert!(drain_insert_history(&mut rx).is_empty());
 
-    // Begin command
-    let begin = begin_exec(&mut chat, "call-1", "echo done");
-
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 0, "no exec cell should have been flushed yet");
-
-    // End command successfully
-    end_exec(&mut chat, begin, "done", "", /*exit_code*/ 0);
-
-    let cells = drain_insert_history(&mut rx);
-    // Exec end now finalizes and flushes the exec cell immediately.
-    assert_eq!(cells.len(), 1, "expected finalized exec cell to flush");
-    // Inspect the flushed exec cell rendering.
-    let lines = &cells[0];
-    let blob = lines_to_single_string(lines);
-    // New behavior: no glyph markers; ensure command is shown and no panic.
-    assert!(
-        blob.contains("• Ran"),
-        "expected summary header present: {blob:?}"
-    );
-    assert!(
-        blob.contains("echo done"),
-        "expected command text to be present: {blob:?}"
-    );
+        end_exec(&mut chat, begin, stdout, stderr, exit_code);
+        let mut completed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                completed.push(cell);
+            }
+        }
+        assert_eq!(completed.len(), 1);
+        let cell = completed[0].as_any().downcast_ref::<ExecCell>().unwrap();
+        assert!(!cell.is_active());
+        let calls = cell.iter_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "call");
+        let output = calls[0].output.as_ref().unwrap();
+        assert_eq!(output.exit_code, exit_code);
+        assert_eq!(output.aggregated_output, format!("{stdout}{stderr}"));
+        let rendered = lines_to_single_string(&cell.display_lines(80));
+        assert!(rendered.contains(&format!("• Ran {command}")), "{rendered}");
+        assert!(rendered.contains(&format!("{stdout}{stderr}")), "{rendered}");
+        assert!(chat.transcript.active_cell.is_none());
+        assert!(chat.running_commands.is_empty());
+    }
 }
 
-#[tokio::test]
-async fn exec_history_cell_shows_working_then_failed() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    // Begin command
-    let begin = begin_exec(&mut chat, "call-2", "false");
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 0, "no exec cell should have been flushed yet");
-
-    // End command with failure
-    end_exec(&mut chat, begin, "", "Bloop", /*exit_code*/ 2);
-
-    let cells = drain_insert_history(&mut rx);
-    // Exec end with failure should also flush immediately.
-    assert_eq!(cells.len(), 1, "expected finalized exec cell to flush");
-    let lines = &cells[0];
-    let blob = lines_to_single_string(lines);
-    assert!(
-        blob.contains("• Ran false"),
-        "expected command and header text present: {blob:?}"
-    );
-    assert!(blob.to_lowercase().contains("bloop"), "expected error text");
-}
 
 #[tokio::test]
 async fn exec_end_without_begin_uses_event_command() {
@@ -297,6 +270,10 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
         !active.contains("echo repro-marker"),
         "orphaned end should not replace the active exploring cell: {active:?}"
     );
+    assert_chatwidget_snapshot!(
+        "unified_exec_unknown_end_with_active_exploring_cell",
+        format!("History:\n{orphan_blob}\nActive:\n{active}")
+    );
 }
 
 #[tokio::test]
@@ -368,6 +345,14 @@ async fn overlapping_exploring_exec_end_is_not_misclassified_as_orphan() {
     );
 
     end_exec(&mut chat, begin_cat, "hello\n", "", /*exit_code*/ 0);
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(!chat.transcript.active_cell.as_ref().unwrap()
+        .as_any().downcast_ref::<ExecCell>().unwrap().is_active());
+    let completed = active_blob(&chat);
+    assert!(completed.contains("• Explored"));
+    assert!(completed.contains("List ls -la"));
+    assert!(completed.contains("Read foo.txt"));
+    assert!(chat.running_commands.is_empty());
 }
 
 #[tokio::test]
@@ -420,34 +405,7 @@ async fn exec_history_shows_unified_exec_tool_calls() {
     assert_eq!(blob, "• Explored\n  └ List ls\n");
 }
 
-#[tokio::test]
-async fn unified_exec_unknown_end_with_active_exploring_cell_snapshot() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.on_task_started();
 
-    begin_exec(&mut chat, "call-exploring", "cat /dev/null");
-    let orphan =
-        begin_unified_exec_startup(&mut chat, "call-orphan", "proc-1", "echo repro-marker");
-    end_exec(
-        &mut chat,
-        orphan,
-        "repro-marker\n",
-        "",
-        /*exit_code*/ 0,
-    );
-
-    let cells = drain_insert_history(&mut rx);
-    let history = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<String>();
-    let active = active_blob(&chat);
-    let snapshot = format!("History:\n{history}\nActive:\n{active}");
-    assert_chatwidget_snapshot!(
-        "unified_exec_unknown_end_with_active_exploring_cell",
-        snapshot
-    );
-}
 
 #[tokio::test]
 async fn unified_exec_end_after_task_complete_is_suppressed() {
@@ -574,12 +532,17 @@ async fn unified_exec_wait_status_header_updates_on_late_command_display() {
     chat.unified_exec_processes.push(UnifiedExecProcessSummary {
         key: "proc-1".to_string(),
         call_id: "call-1".to_string(),
-        command_display: "sleep 5".to_string(),
+        command_display: String::new(),
         recent_chunks: Vec::new(),
     });
 
     terminal_interaction(&mut chat, "call-1", "proc-1", "");
 
+    assert!(chat.unified_exec_wait_streak.as_ref().unwrap().command_display.is_none());
+    chat.track_unified_exec_process_begin("call-1", Some("proc-1"), "sleep 5");
+    terminal_interaction(&mut chat, "call-1", "proc-1", "");
+
+    assert_eq!(chat.unified_exec_wait_streak.as_ref().unwrap().command_display.as_deref(), Some("sleep 5"));
     assert!(chat.transcript.active_cell.is_none());
     assert_eq!(
         chat.status_state.current_status.header,
@@ -1153,6 +1116,7 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw patch approval modal");
     let contents = terminal.backend().vt100().screen().contents();
+    assert!(contents.contains("Would you like to make the following edits?"));
     assert!(!contents.contains("$ apply_patch"));
     assert_chatwidget_snapshot!("approval_modal_patch", contents);
 
@@ -1160,14 +1124,19 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn interrupt_preserves_unified_exec_processes() {
+async fn turn_termination_preserves_unified_exec_processes() {
+    for interrupted in [true, false] {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     begin_unified_exec_startup(&mut chat, "call-1", "process-1", "sleep 5");
     begin_unified_exec_startup(&mut chat, "call-2", "process-2", "sleep 6");
     assert_eq!(chat.unified_exec_processes.len(), 2);
 
-    handle_turn_interrupted(&mut chat, "turn-1");
+    if interrupted {
+        handle_turn_interrupted(&mut chat, "turn-1");
+    } else {
+        handle_turn_completed(&mut chat, "turn-1", None);
+    }
 
     assert_eq!(chat.unified_exec_processes.len(), 2);
 
@@ -1188,6 +1157,7 @@ async fn interrupt_preserves_unified_exec_processes() {
     );
 
     let _ = drain_insert_history(&mut rx);
+    }
 }
 
 #[tokio::test]
@@ -1212,42 +1182,13 @@ async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
     assert_chatwidget_snapshot!("interrupt_preserves_unified_exec_wait_streak", snapshot);
 }
 
-#[tokio::test]
-async fn turn_complete_keeps_unified_exec_processes() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    begin_unified_exec_startup(&mut chat, "call-1", "process-1", "sleep 5");
-    begin_unified_exec_startup(&mut chat, "call-2", "process-2", "sleep 6");
-    assert_eq!(chat.unified_exec_processes.len(), 2);
-
-    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
-
-    assert_eq!(chat.unified_exec_processes.len(), 2);
-
-    chat.add_ps_output();
-    let cells = drain_insert_history(&mut rx);
-    let combined = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        combined.contains("Background terminals"),
-        "expected /ps to remain available after turn complete; got {combined:?}"
-    );
-    assert!(
-        combined.contains("sleep 5") && combined.contains("sleep 6"),
-        "expected /ps to list running unified exec processes; got {combined:?}"
-    );
-
-    let _ = drain_insert_history(&mut rx);
-}
 
 #[tokio::test]
 async fn apply_patch_events_emit_history_cells() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    // 1) Approval request -> proposed patch summary cell
+    // 1) Approval request opens a modal without inserting history.
     let mut changes = HashMap::new();
     changes.insert(
         PathBuf::from("foo.txt"),
@@ -1278,14 +1219,14 @@ async fn apply_patch_events_emit_history_cells() {
     );
     handle_patch_apply_begin(&mut chat, "c1", "turn-c1", changes2);
     let cells = drain_insert_history(&mut rx);
-    assert!(!cells.is_empty(), "expected apply block cell to be sent");
+    assert_eq!(cells.len(), 1, "expected one apply block");
     let blob = lines_to_single_string(cells.last().unwrap());
     assert!(
-        blob.contains("Added foo.txt") || blob.contains("Edited foo.txt"),
-        "expected single-file header with filename (Added/Edited): {blob:?}"
+        blob.contains("Added foo.txt (+1 -0)"),
+        "expected exact added-file summary: {blob:?}"
     );
 
-    // 3) End apply success -> success cell
+    // 3) Success must not duplicate the already-rendered patch.
     let mut end_changes = HashMap::new();
     end_changes.insert(
         PathBuf::from("foo.txt"),
@@ -1337,47 +1278,7 @@ async fn file_change_approval_notification_does_not_claim_zero_files() {
     );
 }
 
-#[tokio::test]
-async fn apply_patch_manual_approval_adjusts_header() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let mut proposed_changes = HashMap::new();
-    proposed_changes.insert(
-        PathBuf::from("foo.txt"),
-        FileChange::Add {
-            content: "hello\n".to_string(),
-        },
-    );
-    handle_apply_patch_approval_request(
-        &mut chat,
-        "s1",
-        ApplyPatchApprovalRequestEvent {
-            call_id: "c1".into(),
-            turn_id: "turn-c1".into(),
-            changes: proposed_changes,
-            reason: None,
-            grant_root: None,
-        },
-    );
-    drain_insert_history(&mut rx);
-
-    let mut apply_changes = HashMap::new();
-    apply_changes.insert(
-        PathBuf::from("foo.txt"),
-        FileChange::Add {
-            content: "hello\n".to_string(),
-        },
-    );
-    handle_patch_apply_begin(&mut chat, "c1", "turn-c1", apply_changes);
-
-    let cells = drain_insert_history(&mut rx);
-    assert!(!cells.is_empty(), "expected apply block cell to be sent");
-    let blob = lines_to_single_string(cells.last().unwrap());
-    assert!(
-        blob.contains("Added foo.txt") || blob.contains("Edited foo.txt"),
-        "expected apply summary header for foo.txt: {blob:?}"
-    );
-}
 
 #[tokio::test]
 async fn apply_patch_manual_flow_snapshot() {
@@ -1425,52 +1326,14 @@ async fn apply_patch_manual_flow_snapshot() {
     );
 }
 
-#[tokio::test]
-async fn apply_patch_approval_sends_op_with_call_id() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    // Simulate receiving an approval request with a distinct event id and call id.
-    let mut changes = HashMap::new();
-    changes.insert(
-        PathBuf::from("file.rs"),
-        FileChange::Add {
-            content: "fn main(){}\n".into(),
-        },
-    );
-    let ev = ApplyPatchApprovalRequestEvent {
-        call_id: "call-999".into(),
-        turn_id: "turn-999".into(),
-        changes,
-        reason: None,
-        grant_root: None,
-    };
-    handle_apply_patch_approval_request(&mut chat, "sub-123", ev);
 
-    // Approve via key press 'y'
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-
-    // Expect a thread-scoped PatchApproval op carrying the call id.
-    let mut found = false;
-    while let Ok(app_ev) = rx.try_recv() {
-        if let AppEvent::SubmitThreadOp {
-            op: Op::PatchApproval { id, decision },
-            ..
-        } = app_ev
-        {
-            assert_eq!(id, "call-999");
-            assert_matches!(
-                decision,
-                codex_app_server_protocol::FileChangeApprovalDecision::Accept
-            );
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "expected PatchApproval op to be sent");
-}
 
 #[tokio::test]
-async fn apply_patch_full_flow_integration_like() {
+async fn apply_patch_approval_routes_call_id_and_renders_patch_once() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
 
     // 1) Backend requests approval
     let mut changes = HashMap::new();
@@ -1494,7 +1357,8 @@ async fn apply_patch_full_flow_integration_like() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     let mut maybe_op: Option<Op> = None;
     while let Ok(app_ev) = rx.try_recv() {
-        if let AppEvent::SubmitThreadOp { op, .. } = app_ev {
+        if let AppEvent::SubmitThreadOp { thread_id: actual_thread, op } = app_ev {
+            assert_eq!(actual_thread, thread_id);
             maybe_op = Some(op);
             break;
         }
@@ -1502,7 +1366,7 @@ async fn apply_patch_full_flow_integration_like() {
     let op = maybe_op.expect("expected thread-scoped op after key press");
 
     // 3) App forwards to widget.submit_op, which pushes onto codex_op_tx
-    chat.submit_op(op);
+    assert!(chat.submit_op(op));
     let forwarded = op_rx
         .try_recv()
         .expect("expected op forwarded to codex channel");
@@ -1518,12 +1382,16 @@ async fn apply_patch_full_flow_integration_like() {
     }
 
     // 4) Simulate patch begin/end events from backend; ensure history cells are emitted
+    drain_insert_history(&mut rx);
     let mut changes2 = HashMap::new();
     changes2.insert(
         PathBuf::from("pkg.rs"),
         FileChange::Add { content: "".into() },
     );
     handle_patch_apply_begin(&mut chat, "call-1", "turn-call-1", changes2);
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    assert!(lines_to_single_string(&cells[0]).contains("Added pkg.rs"));
     let mut end_changes = HashMap::new();
     end_changes.insert(
         PathBuf::from("pkg.rs"),
@@ -1536,58 +1404,11 @@ async fn apply_patch_full_flow_integration_like() {
         end_changes,
         AppServerPatchApplyStatus::Completed,
     );
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 }
 
-#[tokio::test]
-async fn apply_patch_untrusted_shows_approval_modal() -> anyhow::Result<()> {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    // Ensure approval policy is untrusted (OnRequest)
-    chat.config
-        .permissions
-        .approval_policy
-        .set(AskForApproval::OnRequest.to_core())?;
 
-    // Simulate a patch approval request from backend
-    let mut changes = HashMap::new();
-    changes.insert(
-        PathBuf::from("a.rs"),
-        FileChange::Add { content: "".into() },
-    );
-    handle_apply_patch_approval_request(
-        &mut chat,
-        "sub-1",
-        ApplyPatchApprovalRequestEvent {
-            call_id: "call-1".into(),
-            turn_id: "turn-call-1".into(),
-            changes,
-            reason: None,
-            grant_root: None,
-        },
-    );
-
-    // Render and ensure the approval modal title is present
-    let area = Rect::new(0, 0, 80, 12);
-    let mut buf = Buffer::empty(area);
-    chat.render(area, &mut buf);
-
-    let mut contains_title = false;
-    for y in 0..area.height {
-        let mut row = String::new();
-        for x in 0..area.width {
-            row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
-        }
-        if row.contains("Would you like to make the following edits?") {
-            contains_title = true;
-            break;
-        }
-    }
-    assert!(
-        contains_title,
-        "expected approval modal to be visible with title 'Would you like to make the following edits?'"
-    );
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn apply_patch_request_omits_diff_summary_from_modal() -> anyhow::Result<()> {

@@ -123,7 +123,9 @@ mod tests {
         for cap in 0..=TRUNCATION_MARKER.len() + 4 {
             let mut budget = ModelContextBudget::new(100);
             let before = budget.remaining_bytes();
-            match budget.take_up_to(text, cap) {
+            let admitted = budget.take_up_to(text, cap);
+            assert_eq!(admitted.is_some(), cap >= TRUNCATION_MARKER.len());
+            match admitted {
                 Some(admitted) => {
                     assert!(admitted.contains(TRUNCATION_MARKER));
                     assert!(admitted.len() <= cap);

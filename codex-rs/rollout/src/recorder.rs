@@ -1317,7 +1317,7 @@ impl RolloutRecorder {
             }
         }
         if !saw_non_empty_line {
-            return Err(IoError::other("empty session file"));
+            return Err(IoError::new(ErrorKind::InvalidData, "empty session file"));
         }
 
         // A damaged metadata payload must not hide an otherwise usable rollout.

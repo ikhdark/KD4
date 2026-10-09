@@ -66,6 +66,7 @@ async fn windows_sandbox_setup_start_emits_completion_notification() -> Result<(
     )?;
 
     assert_eq!(payload.mode, WindowsSandboxSetupMode::Unelevated);
+    assert_eq!(payload.success, payload.error.is_none());
     Ok(())
 }
 

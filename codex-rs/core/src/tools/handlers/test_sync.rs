@@ -329,6 +329,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn barrier_rejects_zero_participants_and_timeout_without_registration() {
+        // These are explicitly forbidden by the tool contract, independently
+        // of the schema snapshot and the barrier's current output.
+        for (participants, timeout_ms, message) in [
+            (0, 1, "barrier participants must be greater than zero"),
+            (1, 0, "barrier timeout must be greater than zero"),
+        ] {
+            let id = unique_barrier_id("invalid-domain");
+            assert_eq!(
+                wait_on_barrier(TEST_SCOPE, barrier_args(&id, participants, timeout_ms)).await,
+                Err(FunctionCallError::RespondToModel(message.to_string())),
+            );
+            assert_eq!(registered_waiters(&id), None);
+        }
+    }
+
+    #[tokio::test]
     async fn handler_scopes_same_id_barriers_to_session_and_turn() {
         let (session, mut first_turn) = make_session_and_context().await;
         let (other_session, mut other_session_turn) = make_session_and_context().await;
@@ -389,31 +406,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_waiter_does_not_satisfy_a_later_rendezvous() {
-        let id = unique_barrier_id("timeout");
-        let error = wait_on_barrier(TEST_SCOPE, barrier_args(&id, 2, 10))
-            .await
-            .expect_err("single waiter must time out");
-        assert!(error.to_string().contains("barrier wait timed out"));
-        assert_eq!(registered_waiters(&id), None);
-
-        assert_fresh_pair_rendezvous(&id).await;
-    }
-
-    #[tokio::test]
-    async fn aborted_waiter_does_not_satisfy_a_later_rendezvous() {
-        let id = unique_barrier_id("abort");
-        let aborted_id = id.clone();
-        let task = tokio::spawn(async move {
-            wait_on_barrier(TEST_SCOPE, barrier_args(&aborted_id, 2, 5_000)).await
-        });
-        wait_until_registered(&id, 1).await;
-
-        task.abort();
-        assert!(task.await.expect_err("task must be aborted").is_cancelled());
-        assert_eq!(registered_waiters(&id), None);
-
-        assert_fresh_pair_rendezvous(&id).await;
+    async fn cancelled_waiters_do_not_satisfy_a_later_rendezvous() {
+        for abort in [false, true] {
+            let id = unique_barrier_id(if abort { "abort" } else { "timeout" });
+            if abort {
+                let aborted_id = id.clone();
+                let task = tokio::spawn(async move {
+                    wait_on_barrier(TEST_SCOPE, barrier_args(&aborted_id, 2, 5_000)).await
+                });
+                wait_until_registered(&id, 1).await;
+                task.abort();
+                assert!(task.await.expect_err("task must be aborted").is_cancelled());
+            } else {
+                let error = wait_on_barrier(TEST_SCOPE, barrier_args(&id, 2, 10))
+                    .await
+                    .expect_err("single waiter must time out");
+                assert!(error.to_string().contains("barrier wait timed out"));
+            }
+            assert_eq!(registered_waiters(&id), None);
+            assert_fresh_pair_rendezvous(&id).await;
+        }
     }
 
     #[tokio::test]
@@ -430,18 +442,22 @@ mod tests {
             register_barrier(TEST_SCOPE, &barrier_args(&id, 2, 5_000)).expect("next first waiter");
         assert!(!Arc::ptr_eq(&first_generation, &next_first.generation));
         assert_eq!(registered_waiters(&id), Some(1));
+
+        // Retire the old generation while the new generation is still registered.
+        // Dropping an old waiter must not remove the new generation's entry.
+        let (first, second) = tokio::join!(first.wait(), second.wait());
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(registered_waiters(&id), Some(1));
+        let next_first = next_first.wait();
+        tokio::pin!(next_first);
+        assert!(futures::poll!(next_first.as_mut()).is_pending());
+
         let next_second =
             register_barrier(TEST_SCOPE, &barrier_args(&id, 2, 5_000)).expect("next second waiter");
         assert_eq!(registered_waiters(&id), None);
 
-        let (first, second, next_first, next_second) = tokio::join!(
-            first.wait(),
-            second.wait(),
-            next_first.wait(),
-            next_second.wait(),
-        );
-        assert!(first.is_ok());
-        assert!(second.is_ok());
+        let (next_first, next_second) = tokio::join!(next_first, next_second.wait());
         assert!(next_first.is_ok());
         assert!(next_second.is_ok());
     }

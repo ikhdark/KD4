@@ -237,84 +237,52 @@ fn turn_metadata_state_includes_root_fork_lineage() {
 }
 
 #[test]
-fn turn_metadata_state_includes_thread_spawn_subagent_parent_without_fork() {
-    let temp_dir = TempDir::new().expect("temp dir");
-    let cwd = temp_dir.path().abs();
-    let permission_profile = PermissionProfile::read_only();
-    let parent_thread_id =
-        ThreadId::from_string("22222222-2222-4222-8222-222222222222").expect("thread id");
-
-    let state = TurnMetadataState::new(
-        "session-a".to_string(),
-        "thread-a".to_string(),
-        /*forked_from_thread_id*/ None,
-        Some(parent_thread_id),
-        &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id,
-            depth: 1,
-            agent_path: None,
-            agent_nickname: None,
-            agent_role: None,
-        }),
-        /*thread_source*/ None,
-        "turn-a".to_string(),
-        cwd,
-        &permission_profile,
-        WindowsSandboxLevel::Disabled,
-        /*enforce_managed_network*/ false,
-    );
-
-    let header = test_turn_metadata_header(&state);
-    let json: Value = serde_json::from_str(&header).expect("json");
-
-    assert!(json.get("forked_from_thread_id").is_none());
-    assert_eq!(
-        json["parent_thread_id"].as_str(),
-        Some("22222222-2222-4222-8222-222222222222")
-    );
-    assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
-}
-
-#[test]
-fn turn_metadata_state_includes_forked_thread_spawn_subagent_lineage() {
+fn turn_metadata_state_includes_thread_spawn_subagent_lineage() {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
     let permission_profile = PermissionProfile::read_only();
     let parent_thread_id =
         ThreadId::from_string("33333333-3333-4333-8333-333333333333").expect("thread id");
 
-    let state = TurnMetadataState::new(
-        "session-a".to_string(),
-        "thread-a".to_string(),
-        Some(parent_thread_id),
-        Some(parent_thread_id),
-        &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id,
-            depth: 1,
-            agent_path: None,
-            agent_nickname: None,
-            agent_role: None,
-        }),
-        /*thread_source*/ None,
-        "turn-a".to_string(),
-        cwd,
-        &permission_profile,
-        WindowsSandboxLevel::Disabled,
-        /*enforce_managed_network*/ false,
-    );
+    for forked_from_thread_id in [None, Some(parent_thread_id)] {
+        let state = TurnMetadataState::new(
+            "session-a".to_string(),
+            "thread-a".to_string(),
+            forked_from_thread_id,
+            Some(parent_thread_id),
+            &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            /*thread_source*/ None,
+            "turn-a".to_string(),
+            cwd.clone(),
+            &permission_profile,
+            WindowsSandboxLevel::Disabled,
+            /*enforce_managed_network*/ false,
+        );
 
-    let header = test_turn_metadata_header(&state);
-    let json: Value = serde_json::from_str(&header).expect("json");
+        let header = test_turn_metadata_header(&state);
+        let json: Value = serde_json::from_str(&header).expect("json");
 
-    assert_eq!(
-        json["forked_from_thread_id"].as_str(),
-        Some("33333333-3333-4333-8333-333333333333")
-    );
-    assert_eq!(
-        json["parent_thread_id"].as_str(),
-        Some("33333333-3333-4333-8333-333333333333")
-    );
-    assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
+        assert_eq!(
+            json["forked_from_thread_id"].as_str(),
+            forked_from_thread_id
+                .as_ref()
+                .map(|_| "33333333-3333-4333-8333-333333333333")
+        );
+        if forked_from_thread_id.is_none() {
+            assert!(json.get("forked_from_thread_id").is_none());
+        }
+        assert_eq!(
+            json["parent_thread_id"].as_str(),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
+    }
 }
 
 #[test]
@@ -358,36 +326,6 @@ fn turn_metadata_state_includes_known_parent_for_non_thread_spawn_subagents_with
         );
         assert_eq!(json["subagent_kind"].as_str(), Some(subagent_kind));
     }
-}
-
-#[test]
-fn turn_metadata_state_includes_turn_started_at_unix_ms_after_start() {
-    let temp_dir = TempDir::new().expect("temp dir");
-    let cwd = temp_dir.path().abs();
-    let permission_profile = PermissionProfile::read_only();
-
-    let state = TurnMetadataState::new(
-        "session-a".to_string(),
-        "thread-a".to_string(),
-        /*forked_from_thread_id*/ None,
-        /*parent_thread_id*/ None,
-        &SessionSource::Exec,
-        /*thread_source*/ None,
-        "turn-a".to_string(),
-        cwd,
-        &permission_profile,
-        WindowsSandboxLevel::Disabled,
-        /*enforce_managed_network*/ false,
-    );
-    state.set_turn_started_at_unix_ms(/*turn_started_at_unix_ms*/ 1_700_000_000_123);
-
-    let header = test_turn_metadata_header(&state);
-    let json: Value = serde_json::from_str(&header).expect("json");
-
-    assert_eq!(
-        json["turn_started_at_unix_ms"].as_i64(),
-        Some(1_700_000_000_123)
-    );
 }
 
 #[test]

@@ -242,6 +242,7 @@ mod tests {
     fn buffers_prefix_until_tag_is_decided() {
         let mut parser = parser();
         let mut segments = parser.parse("<t");
+        assert!(segments.is_empty(), "an undecided tag prefix must stay buffered");
         segments.extend(parser.parse("ag>\nline\n</tag>\n"));
         segments.extend(parser.finish());
 

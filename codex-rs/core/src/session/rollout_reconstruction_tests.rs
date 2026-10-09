@@ -52,11 +52,13 @@ fn assistant_message(text: &str) -> ResponseItem {
 #[test]
 fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
     let record = json!({"session_id": 42, "raw_output_artifact_id": "saved",
-        "nested_commands": [{"tool": "exec_command", "session_id": 43}]});
-    for (text, expected_count) in [
-        (record.to_string(), 2),
-        (serde_json::to_string_pretty(&record).unwrap(), 2),
-        (format!("{}\nstatus text", record), 1),
+        "nested_commands": [{"tool": "exec_command", "session_id": 43, "raw_output_artifact_id": "nested-saved"}]});
+    // Framing a complete receipt with status text must not discard the nested
+    // process identity or its retained recovery reference.
+    for text in [
+        record.to_string(),
+        serde_json::to_string_pretty(&record).unwrap(),
+        format!("{}\nstatus text", record),
     ] {
         let mut history = vec![
             ResponseItem::FunctionCall {
@@ -78,10 +80,9 @@ fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
         ).unwrap();
         assert_eq!(evidence["recorded_process_handles"][0]["session_id"], 42);
         assert_eq!(evidence["recorded_process_handles"][0]["raw_output_artifact_id"], "saved");
-        assert_eq!(evidence["recorded_process_handles"].as_array().unwrap().len(), expected_count);
-        if expected_count == 2 {
-            assert_eq!(evidence["recorded_process_handles"][1]["session_id"], 43);
-        }
+        assert_eq!(evidence["recorded_process_handles"].as_array().unwrap().len(), 2);
+        assert_eq!(evidence["recorded_process_handles"][1]["session_id"], 43);
+        assert_eq!(evidence["recorded_process_handles"][1]["raw_output_artifact_id"], "nested-saved");
     }
 }
 
@@ -1023,6 +1024,9 @@ fn resume_notice_bounds_handle_evidence_and_reports_omissions() {
         .find(|line| line.starts_with('{')).unwrap()).unwrap();
     assert_eq!(evidence["recorded_process_handles"].as_array().unwrap().len(), 32);
     assert_eq!(evidence["omitted_handle_count"], 8);
+    for (id, handle) in evidence["recorded_process_handles"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(handle, &json!({"session_id": id, "raw_output_artifact_id": format!("output-{id}")}));
+    }
 }
 
 #[test]
@@ -2209,103 +2213,57 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
     );
 }
 
-#[tokio::test]
-async fn record_initial_history_resumed_bare_turn_context_does_not_seed_reference_context_item() {
-    let (session, turn_context) = make_session_and_context().await;
-    let previous_context_item = turn_context.to_turn_context_item();
-    let rollout_items = vec![RolloutItem::TurnContext(previous_context_item.clone())];
 
-    session
-        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
-            conversation_id: ThreadId::default(),
-            history: Arc::new(rollout_items),
-            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
-        }))
-        .await;
-
-    assert!(session.reference_context_item().await.is_none());
-}
 
 #[tokio::test]
 async fn unresolved_sampling_boundary_invalidates_older_accepted_context() {
     let (session, turn_context) = make_session_and_context().await;
     let accepted = accepted_context(turn_context.to_turn_context_item());
-    let rollout_items = vec![
-        RolloutItem::TurnContext(accepted),
-        RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+    for (boundary, clears) in [
+        (RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+            sampling_request_id: "request-new".to_string(),
+            physical_attempt_id: "attempt-new".to_string(),
+            turn_id: Some(turn_context.sub_id.clone()),
+            unresolved_context: false,
+            timing_checkpoint: None,
+        }), false),
+        (RolloutItem::SamplingBoundary(SamplingBoundaryItem {
             sampling_request_id: "request-new".to_string(),
             physical_attempt_id: "attempt-new".to_string(),
             turn_id: Some(turn_context.sub_id.clone()),
             unresolved_context: true,
             timing_checkpoint: None,
-        }),
-    ];
-
-    session
-        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
-            conversation_id: ThreadId::default(),
-            history: Arc::new(rollout_items),
-            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
-        }))
-        .await;
-
-    assert!(session.reference_context_item().await.is_none());
-}
-
-#[tokio::test]
-async fn record_initial_history_resumed_does_not_seed_reference_context_item_after_compaction() {
-    let (session, turn_context) = make_session_and_context().await;
-    let previous_context_item = turn_context.to_turn_context_item();
-    let rollout_items = vec![
-        RolloutItem::TurnContext(previous_context_item),
-        RolloutItem::Compacted(CompactedItem {
+        }), true),
+        (RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
-        }),
-    ];
-
-    session
-        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
-            conversation_id: ThreadId::default(),
-            history: Arc::new(rollout_items),
-            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
-        }))
-        .await;
-
-    assert_eq!(session.previous_turn_settings().await, None);
-    assert!(session.reference_context_item().await.is_none());
-}
-
-#[tokio::test]
-async fn reconstruct_history_restores_initial_window_from_session_meta() {
-    let (session, turn_context) = make_session_and_context().await;
-    let thread_id = ThreadId::default();
-    let initial_window_id = Uuid::now_v7();
-    let rollout_items = vec![RolloutItem::SessionMeta(SessionMetaLine {
-        meta: SessionMeta {
-            session_id: thread_id.into(),
-            id: thread_id,
-            context_window: Some(SessionContextWindow {
-                window_id: initial_window_id.to_string(),
+        }), true),
+    ] {
+        let initial = completed_user_turn_rollout(accepted.clone(), Vec::new());
+        let before = session.reconstruct_history_from_rollout(&turn_context, &initial).await;
+        assert_eq!(
+            serde_json::to_value(before.reference_context_item).unwrap(),
+            serde_json::to_value(Some(&accepted)).unwrap(),
+        );
+        let mut items = initial;
+        items.push(boundary);
+        resume_rollout(&session, items).await;
+        assert_eq!(session.reference_context_item().await.is_none(), clears);
+        assert_eq!(
+            session.previous_turn_settings().await,
+            Some(PreviousTurnSettings {
+                model: accepted.model.clone(),
+                comp_hash: accepted.comp_hash.clone(),
             }),
-            ..SessionMeta::default()
-        },
-        git: None,
-    })];
-
-    let reconstructed = session
-        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
-
-    assert_eq!(reconstructed.window_number, 0);
-    assert_eq!(reconstructed.first_window_id, Some(initial_window_id));
-    assert_eq!(reconstructed.previous_window_id, None);
-    assert_eq!(reconstructed.window_id, Some(initial_window_id));
+        );
+    }
 }
+
+
 
 #[tokio::test]
 async fn reconstruct_history_rollback_ignores_discarded_legacy_compaction_for_window_fallback() {
@@ -2396,6 +2354,14 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
             window_id: Some(compacted_window_id.to_string()),
         }),
     ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items[..1])
+        .await;
+    assert_eq!(reconstructed.window_number, 0);
+    assert_eq!(reconstructed.first_window_id, Some(initial_window_id));
+    assert_eq!(reconstructed.previous_window_id, None);
+    assert_eq!(reconstructed.window_id, Some(initial_window_id));
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)

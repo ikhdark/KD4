@@ -35,7 +35,20 @@ mod tests {
 
     #[test]
     fn load_regex() {
-        // The goal of this test is just to compile all the regex to prevent the panic
-        let _ = redact_secrets("secret".to_string());
+        // Exercise every lazy regex through the public sanitizer, including
+        // non-secret text that an overbroad redaction must leave unchanged.
+        for (input, expected) in [
+            ("key sk-abcdefghijklmnopqrst end", "key [REDACTED_SECRET] end"),
+            ("id AKIA0123456789ABCDEF end", "id [REDACTED_SECRET] end"),
+            ("bEaReR abcdefghijklmnop", "Bearer [REDACTED_SECRET]"),
+            ("api_key=abcdefgh", "api_key=[REDACTED_SECRET]"),
+            ("password: \"abcdefgh\"", "password: \"[REDACTED_SECRET]\""),
+            ("token='abcdefgh'", "token='[REDACTED_SECRET]'"),
+            ("secret=abcdefgh", "secret=[REDACTED_SECRET]"),
+            ("secret Bearer short password=short sk-short", "secret Bearer short password=short sk-short"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_secrets(input.to_string()), expected, "{input}");
+        }
     }
 }

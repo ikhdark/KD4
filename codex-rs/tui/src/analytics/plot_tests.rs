@@ -111,25 +111,25 @@ fn stacked_parts_keep_the_remainder_and_full_denominator() {
 }
 
 #[test]
-fn signed_chart_on_light_terminal() {
-    signed_chart(
-        "light",
-        DefaultColors {
-            fg: (0, 0, 0),
-            bg: (255, 255, 255),
-        },
-    );
-}
-
-#[test]
-fn signed_chart_on_dark_terminal() {
-    signed_chart(
-        "dark",
-        DefaultColors {
-            fg: (230, 230, 230),
-            bg: (16, 16, 16),
-        },
-    );
+fn signed_chart_adapts_to_terminal_palette() {
+    for (theme, colors) in [
+        (
+            "light",
+            DefaultColors {
+                fg: (0, 0, 0),
+                bg: (255, 255, 255),
+            },
+        ),
+        (
+            "dark",
+            DefaultColors {
+                fg: (230, 230, 230),
+                bg: (16, 16, 16),
+            },
+        ),
+    ] {
+        signed_chart(theme, colors);
+    }
 }
 
 fn signed_chart(theme: &str, colors: DefaultColors) {

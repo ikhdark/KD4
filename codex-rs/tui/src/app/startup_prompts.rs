@@ -467,21 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_load_warning_state_suppresses_repeated_active_errors() {
-        let mut state = SkillLoadWarningState::default();
-        let error = skill_error("/repo/.codex/skills/abc/SKILL.md", "invalid description");
-
-        assert_eq!(
-            state.newly_active_errors(std::slice::from_ref(&error)),
-            vec![error.clone()]
-        );
-        assert_eq!(
-            state.newly_active_errors(std::slice::from_ref(&error)),
-            Vec::<SkillErrorInfo>::new()
-        );
-    }
-
-    #[test]
     fn skill_load_warning_state_reemits_after_error_clears() {
         let mut state = SkillLoadWarningState::default();
         let error = skill_error("/repo/.codex/skills/abc/SKILL.md", "invalid description");

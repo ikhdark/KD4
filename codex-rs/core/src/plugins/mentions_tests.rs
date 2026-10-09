@@ -42,11 +42,18 @@ fn collect_explicit_app_ids_dedupes_structured_and_linked_mentions() {
             name: "calendar".to_string(),
             path: "app://calendar".to_string(),
         },
+        UserInput::Mention {
+            name: "mail".to_string(),
+            path: "app://mail".to_string(),
+        },
     ];
 
     let app_ids = collect_explicit_app_ids(&input);
 
-    assert_eq!(app_ids, HashSet::from(["calendar".to_string()]));
+    assert_eq!(
+        app_ids,
+        HashSet::from(["calendar".to_string(), "mail".to_string()])
+    );
 }
 
 #[test]

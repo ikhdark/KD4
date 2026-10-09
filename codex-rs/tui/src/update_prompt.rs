@@ -280,30 +280,28 @@ mod tests {
     }
 
     #[test]
-    fn update_prompt_confirm_selects_update() {
-        let mut screen = new_prompt();
-        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(screen.is_done());
-        assert_eq!(screen.selection(), Some(UpdateSelection::UpdateNow));
-    }
-
-    #[test]
-    fn update_prompt_dismiss_option_leaves_prompt_in_normal_state() {
-        let mut screen = new_prompt();
-        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(screen.is_done());
-        assert_eq!(screen.selection(), Some(UpdateSelection::NotNow));
-    }
-
-    #[test]
-    fn update_prompt_dont_remind_selects_dismissal() {
-        let mut screen = new_prompt();
-        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(screen.is_done());
-        assert_eq!(screen.selection(), Some(UpdateSelection::DontRemind));
+    fn update_prompt_confirms_each_highlighted_option() {
+        for (steps, expected) in [
+            (0, UpdateSelection::UpdateNow),
+            (1, UpdateSelection::NotNow),
+            (2, UpdateSelection::DontRemind),
+        ] {
+            let mut screen = new_prompt();
+            for _ in 0..steps {
+                screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                assert!(!screen.is_done());
+            }
+            assert_eq!(screen.highlighted, expected);
+            screen.handle_key(KeyEvent {
+                kind: KeyEventKind::Release,
+                ..KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            });
+            assert!(!screen.is_done());
+            assert_eq!(screen.selection(), None);
+            screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(screen.is_done());
+            assert_eq!(screen.selection(), Some(expected));
+        }
     }
 
     #[test]

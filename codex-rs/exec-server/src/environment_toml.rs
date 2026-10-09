@@ -878,6 +878,24 @@ include_local = false
 
     #[tokio::test]
     async fn environment_provider_from_codex_home_falls_back_when_file_is_missing() {
+        const CHILD_ENV: &str = "CODEX_TEST_ENVIRONMENT_TOML_FALLBACK";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The local fallback requires an absent legacy override. Isolate it
+            // without mutating the environment shared by concurrent tests.
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg("environment_toml::tests::environment_provider_from_codex_home_falls_back_when_file_is_missing")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env_remove(crate::environment::CODEX_EXEC_SERVER_URL_ENV_VAR)
+                .output()
+                .expect("isolated local fallback test");
+            assert!(output.status.success(), "isolated fallback failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "isolated fallback must execute its assertions");
+            return;
+        }
         let codex_home = tempdir().expect("tempdir");
 
         let provider =

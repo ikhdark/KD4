@@ -1158,3 +1158,36 @@ where
     }
     (items, invalid)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn action_required_title_blink_phases_use_elapsed_time() {
+        let (mut chat, _rx, _op_rx) =
+            crate::chatwidget::tests::helpers::make_chatwidget_manual(None).await;
+        let origin = Instant::now();
+        chat.terminal_title_animation_origin = origin;
+        chat.config.animations = true;
+        let selections = chat.status_surface_selections();
+        for (seconds, expected) in [
+            (0, "[ ! ] Action Required | project"),
+            (1, "[ . ] Action Required | project"),
+            (2, "[ ! ] Action Required | project"),
+        ] {
+            assert_eq!(
+                chat.action_required_terminal_title_text(
+                    &selections,
+                    origin + Duration::from_secs(seconds),
+                ),
+                expected
+            );
+        }
+        chat.config.animations = false;
+        assert_eq!(
+            chat.action_required_terminal_title_text(&selections, origin + Duration::from_secs(1)),
+            "[ ! ] Action Required | project"
+        );
+    }
+}

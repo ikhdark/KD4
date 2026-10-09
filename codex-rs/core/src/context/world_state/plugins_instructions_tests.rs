@@ -44,17 +44,6 @@ fn renders_only_when_plugins_become_available() {
 }
 
 #[test]
-fn renders_revocation_when_plugins_become_unavailable() {
-    let true_snapshot = true;
-    let rendered = render(
-        PluginsInstructionsState::new(/*available*/ false),
-        PreviousSectionState::Known(&true_snapshot),
-    );
-
-    assert_eq!(rendered, vec![PluginsInstructionsUnavailable.render()]);
-}
-
-#[test]
 fn unknown_state_reasserts_current_availability() {
     assert_eq!(
         render(

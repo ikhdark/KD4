@@ -406,21 +406,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_traceparent_returns_none() {
-        assert!(
-            context_from_trace_headers(Some("not-a-traceparent"), /*tracestate*/ None).is_none()
-        );
-    }
-
-    #[test]
-    fn missing_traceparent_returns_none() {
-        assert!(
-            context_from_w3c_trace_context(&W3cTraceContext {
-                traceparent: None,
-                tracestate: Some("vendor=value".to_string()),
-            })
-            .is_none()
-        );
+    fn invalid_or_missing_traceparent_returns_none() {
+        for parent in [None, Some("not-a-traceparent")] {
+            for state in [None, Some("vendor=value")] {
+                assert!(context_from_trace_headers(parent, state).is_none());
+                assert!(context_from_w3c_trace_context(&W3cTraceContext {
+                    traceparent: parent.map(str::to_string),
+                    tracestate: state.map(str::to_string),
+                }).is_none());
+            }
+        }
     }
 
     #[test]
@@ -431,13 +426,17 @@ mod tests {
             tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
         let _guard = subscriber.set_default();
 
+        assert_eq!(current_span_trace_id(), None);
         let span = trace_span!("test_span");
+        let expected_trace_id = "00000000000000000000000000000001";
+        assert!(super::set_parent_from_w3c_trace_context(&span, &W3cTraceContext {
+            traceparent: Some(format!("00-{expected_trace_id}-0000000000000002-01")),
+            tracestate: None,
+        }));
         let _entered = span.enter();
         let trace_id = current_span_trace_id().expect("trace id");
 
-        assert_eq!(trace_id.len(), 32);
-        assert!(trace_id.chars().all(|ch| ch.is_ascii_hexdigit()));
-        assert_ne!(trace_id, "00000000000000000000000000000000");
+        assert_eq!(trace_id, expected_trace_id);
     }
 
     #[test]

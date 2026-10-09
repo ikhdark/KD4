@@ -109,44 +109,33 @@ mod tests {
     }
 
     #[test]
-    fn selects_osc9_method() {
-        assert!(matches!(
-            detect_backend(NotificationMethod::Osc9),
-            super::DesktopNotificationBackend::Osc9(_)
-        ));
-    }
-
-    #[test]
-    fn selects_bel_method() {
-        assert!(matches!(
-            detect_backend(NotificationMethod::Bel),
-            super::DesktopNotificationBackend::Bel(_)
-        ));
-    }
-
-    #[test]
-    fn supports_osc9_for_supported_terminals() {
-        for name in [TerminalName::WarpTerminal, TerminalName::WezTerm] {
-            assert!(
-                supports_osc9(&test_terminal(name)),
-                "{name:?} should support OSC 9"
-            );
+    fn selects_explicit_notification_method() {
+        for method in [NotificationMethod::Osc9, NotificationMethod::Bel] {
+            let backend = detect_backend(method);
+            assert!(matches!(
+                (&backend, method),
+                (super::DesktopNotificationBackend::Osc9(_), NotificationMethod::Osc9)
+                    | (super::DesktopNotificationBackend::Bel(_), NotificationMethod::Bel)
+            ));
+            assert_eq!(backend.method(), method);
         }
     }
 
     #[test]
-    fn supports_osc9_for_unsupported_terminals() {
-        for name in [
-            TerminalName::Alacritty,
-            TerminalName::Dumb,
-            TerminalName::Unknown,
-            TerminalName::VsCode,
-            TerminalName::WindowsTerminal,
+    fn supports_osc9_only_for_supported_terminals() {
+        for (name, supported) in [
+            (TerminalName::WarpTerminal, true),
+            (TerminalName::WezTerm, true),
+            (TerminalName::Alacritty, false),
+            (TerminalName::Dumb, false),
+            (TerminalName::Unknown, false),
+            (TerminalName::VsCode, false),
+            (TerminalName::WindowsTerminal, false),
         ] {
             assert_eq!(
                 supports_osc9(&test_terminal(name)),
-                false,
-                "{name:?} should not support OSC 9"
+                supported,
+                "{name:?}"
             );
         }
     }

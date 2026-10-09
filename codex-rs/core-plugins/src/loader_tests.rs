@@ -260,20 +260,14 @@ enabled = true
 }
 
 #[test]
-fn curated_plugin_cache_version_preserves_full_git_sha() {
-    assert_eq!(
-        curated_plugin_cache_version("0123456789abcdef0123456789abcdef01234567"),
-        "0123456789abcdef0123456789abcdef01234567"
-    );
-}
-
-#[test]
-fn curated_plugin_cache_version_preserves_non_git_sha_versions() {
-    assert_eq!(
-        curated_plugin_cache_version("export-backup"),
-        "export-backup"
-    );
-    assert_eq!(curated_plugin_cache_version("0123456"), "0123456");
+fn curated_plugin_cache_version_preserves_full_sha_and_non_sha_versions() {
+    for version in [
+        "0123456789abcdef0123456789abcdef01234567",
+        "export-backup",
+        "0123456",
+    ] {
+        assert_eq!(curated_plugin_cache_version(version), version);
+    }
 }
 
 fn plugin_id() -> PluginId {

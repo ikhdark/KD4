@@ -387,47 +387,59 @@ async fn passive_command_wait_has_no_default_nested_deadline() {
             assert!(events_rx.try_recv().is_err(), "passive wait must not time out");
             delegate.tool_release.notify_one();
         }
-        let RuntimeResponse::Result { error_text, .. } = cell.initial_response().await.unwrap() else {
+        let RuntimeResponse::Result { error_text, content_items, .. } = cell.initial_response().await.unwrap() else {
             panic!("expected a terminal result");
         };
-        assert_eq!(error_text.is_some(), bounded, "{arguments}{options}");
+        if bounded {
+            assert!(error_text.as_deref().is_some_and(|error| error.starts_with("Error: nested tool `write_stdin` exceeded its 10ms timeout")), "{error_text:?}");
+            assert!(content_items.is_empty());
+        } else {
+            assert_eq!(error_text, None);
+            assert_eq!(content_items, vec![FunctionCallOutputContentItem::InputText { text: "completed".into() }]);
+        }
         service.shutdown().await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn bounded_parallel_nested_tool_timeout_rejects_only_the_expired_call() {
-    let (delegate, mut events_rx) = BlockingDelegate::new();
-    let service = InProcessCodeModeSession::with_delegate(delegate);
-    let cell = service
-        .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()].into(),
-            source: r#"
-const outcome = await tools.block({}, { timeout_ms: 10 }).then(
-  () => "unexpected success",
-  (error) => String(error),
-);
-text(outcome);
-"#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
-    assert_eq!(
-        cell.initial_response().await.unwrap(),
-        RuntimeResponse::Result {
-            output_loss: None,
-            cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "Error: nested tool `block` exceeded its 10ms timeout".to_string(),
-            }],
-            error_text: None,
-        }
+async fn explicit_nested_tool_timeout_wins_over_cell_and_tool_defaults() {
+    for generous_defaults in [false, true] {
+        let (delegate, mut events_rx) = BlockingDelegate::new();
+        let service = InProcessCodeModeSession::with_delegate(delegate);
+        let mut tool = blocking_tool();
+        tool.default_timeout_ms = generous_defaults.then_some(300_000);
+        let cell = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![tool].into(),
+                source: r#"
+    const outcome = await tools.block({}, { timeout_ms: 10 }).then(
+      () => "unexpected success",
+      (error) => String(error),
     );
+    text(outcome);
+    "#
+                .to_string(),
+                yield_time_ms: Some(60_000),
+                default_tool_timeout_ms: generous_defaults.then_some(600_000),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+        assert_eq!(
+            cell.initial_response().await.unwrap(),
+            RuntimeResponse::Result {
+                output_loss: None,
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "Error: nested tool `block` exceeded its 10ms timeout".to_string(),
+                }],
+                error_text: None,
+            }
+        );
+        service.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -453,50 +465,15 @@ async fn tool_owned_deadline_survives_service_conversion_and_explicit_options() 
         let RuntimeResponse::Result { error_text, .. } = cell.initial_response().await.unwrap() else {
             panic!("terminal result");
         };
-        assert_eq!(error_text.is_some(), explicit);
+        if explicit {
+            assert!(error_text.as_deref().is_some_and(|error| error.starts_with("Error: nested tool `block` exceeded its 10ms timeout")), "{error_text:?}");
+        } else {
+            assert_eq!(error_text, None);
+        }
         service.shutdown().await.unwrap();
     }
 }
 
-#[tokio::test]
-async fn explicit_nested_tool_timeout_still_wins_over_a_host_supplied_default() {
-    let (delegate, mut events_rx) = BlockingDelegate::new();
-    let service = InProcessCodeModeSession::with_delegate(delegate);
-    let mut tool = blocking_tool();
-    tool.default_timeout_ms = Some(300_000);
-    let cell = service
-        .execute(ExecuteRequest {
-            enabled_tools: vec![tool].into(),
-            source: r#"
-const outcome = await tools.block({}, { timeout_ms: 10 }).then(
-  () => "unexpected success",
-  (error) => String(error),
-);
-text(outcome);
-"#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            // A generous per-cell default must not extend a short explicit
-            // per-call bound.
-            default_tool_timeout_ms: Some(600_000),
-            ..execute_request("")
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
-    assert_eq!(
-        cell.initial_response().await.unwrap(),
-        RuntimeResponse::Result {
-            output_loss: None,
-            cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "Error: nested tool `block` exceeded its 10ms timeout".to_string(),
-            }],
-            error_text: None,
-        }
-    );
-}
 
 #[tokio::test]
 async fn per_tool_default_survives_runtime_conversion_without_extending_other_tools() {

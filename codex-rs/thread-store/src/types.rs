@@ -808,6 +808,7 @@ mod tests {
             agent_nickname: Some(None),
             agent_role: Some(None),
             agent_path: Some(None),
+            project_id: Some(None),
             ..Default::default()
         };
 
@@ -818,6 +819,7 @@ mod tests {
         assert_eq!(value["agent_nickname"], json!(null));
         assert_eq!(value["agent_role"], json!(null));
         assert_eq!(value["agent_path"], json!(null));
+        assert_eq!(value.get("project_id"), Some(&json!(null)));
 
         let decoded: ThreadMetadataPatch =
             serde_json::from_value(value).expect("deserialize patch");
@@ -827,6 +829,7 @@ mod tests {
         assert_eq!(decoded.agent_nickname, Some(None));
         assert_eq!(decoded.agent_role, Some(None));
         assert_eq!(decoded.agent_path, Some(None));
+        assert_eq!(decoded.project_id, Some(None));
     }
 
     #[test]
@@ -871,13 +874,20 @@ mod tests {
 
     #[test]
     fn canonical_history_mode_uses_first_session_meta() {
-        assert_eq!(
-            canonical_history_mode_from_rollout_items(&[
-                session_meta(ThreadHistoryMode::Legacy),
-                session_meta(ThreadHistoryMode::Paginated),
-            ]),
-            ThreadHistoryMode::Legacy
-        );
+        for (first, second) in [
+            (ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated),
+            (ThreadHistoryMode::Paginated, ThreadHistoryMode::Legacy),
+        ] {
+            assert_eq!(
+                canonical_history_mode_from_rollout_items(&[
+                    RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ShutdownComplete),
+                    session_meta(first),
+                    session_meta(second),
+                ]),
+                first
+            );
+        }
+        assert_eq!(canonical_history_mode_from_rollout_items(&[]), ThreadHistoryMode::Legacy);
     }
 
     #[test]

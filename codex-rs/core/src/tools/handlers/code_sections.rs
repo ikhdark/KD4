@@ -508,13 +508,19 @@ mod tests {
         assert_eq!(
             pages
                 .iter()
-                .map(|page| page.value.as_ref().unwrap()["items"]
+                .flat_map(|page| page.value.as_ref().unwrap()["items"]
                     .as_array()
                     .unwrap()
-                    .len())
-                .sum::<usize>(),
-            150
+                    .iter()
+                    .map(|item| item["name"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            (0..150).map(|n| format!("item_{n}")).collect::<Vec<_>>()
         );
+        for (index, page) in pages.iter().enumerate() {
+            let next = pages.get(index + 1).map(|page| page.id.clone());
+            assert_eq!(page.value.as_ref().unwrap()["next"], json!(next));
+            assert_eq!(page.children, next.into_iter().collect::<Vec<_>>());
+        }
         assert!(parse("a.rs", "fn x() {}", "hash", Instant::now()).is_none());
         assert!(parse("a.txt", "", "hash", Instant::now()).is_none());
         assert!(pages.len() > 1);

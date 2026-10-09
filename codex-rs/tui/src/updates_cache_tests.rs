@@ -158,7 +158,7 @@ async fn dismissal_propagates_io_errors_without_replacing_the_cache() {
 }
 
 #[tokio::test]
-async fn dismiss_version_creates_cache_file_when_missing() {
+async fn dismiss_version_recovers_missing_and_malformed_cache() {
     let codex_home = tempdir().expect("temp codex home");
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
@@ -167,19 +167,37 @@ async fn dismiss_version_creates_cache_file_when_missing() {
         .expect("load config");
     let version_file = version_filepath(&config);
 
-    dismiss_version(&config, "999.0.0")
-        .await
-        .expect("dismiss version");
-
-    let info = read_version_info(&version_file).expect("read version info");
-    assert_eq!(info.last_checked_at, DateTime::<Utc>::UNIX_EPOCH);
-    assert_eq!(
-        (
-            info.latest_version.as_str(),
-            info.dismissed_version.as_deref()
-        ),
-        ("999.0.0", Some("999.0.0"))
-    );
+    for initial in [None, Some("{interrupted write")] {
+        if let Some(contents) = initial {
+            tokio::fs::write(&version_file, contents)
+                .await
+                .expect("write malformed cache");
+        } else {
+            assert!(!version_file.exists());
+        }
+        dismiss_version(&config, "999.0.0")
+            .await
+            .expect("dismiss version");
+        let info = read_version_info(&version_file).expect("read version info");
+        assert_eq!(info.last_checked_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(info.latest_version, "999.0.0");
+        assert_eq!(info.dismissed_version.as_deref(), Some("999.0.0"));
+        let persisted: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(&version_file)
+                .await
+                .expect("read persisted dismissal"),
+        )
+        .expect("valid cache JSON");
+        assert_eq!(
+            persisted,
+            serde_json::json!({
+                "latest_version": "999.0.0",
+                "last_checked_at": "1970-01-01T00:00:00Z",
+                "dismissed_version": "999.0.0",
+            }),
+            "initial cache: {initial:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -218,35 +236,3 @@ async fn dismiss_version_preserves_cached_release_metadata() {
     );
 }
 
-#[tokio::test]
-async fn dismiss_version_replaces_malformed_cache() {
-    let codex_home = tempdir().expect("temp codex home");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .build()
-        .await
-        .expect("load config");
-    let version_file = version_filepath(&config);
-    tokio::fs::write(&version_file, "{interrupted write")
-        .await
-        .expect("write malformed cache");
-
-    dismiss_version(&config, "999.0.0")
-        .await
-        .expect("dismiss version");
-
-    let persisted: serde_json::Value = serde_json::from_str(
-        &tokio::fs::read_to_string(&version_file)
-            .await
-            .expect("read persisted dismissal"),
-    )
-    .expect("valid cache JSON");
-    assert_eq!(
-        persisted,
-        serde_json::json!({
-            "latest_version": "999.0.0",
-            "last_checked_at": "1970-01-01T00:00:00Z",
-            "dismissed_version": "999.0.0",
-        })
-    );
-}

@@ -24,116 +24,99 @@ async fn pairing_start_returns_internal_error_when_remote_control_is_unavailable
 }
 
 #[tokio::test]
-async fn pairing_status_returns_internal_error_when_remote_control_is_unavailable() {
-    let err = RemoteControlRequestProcessor::new(/*remote_control_handle*/ None)
-        .pairing_status(RemoteControlPairingStatusParams {
-            pairing_code: Some("pairing-code".to_string()),
-            manual_pairing_code: None,
-        })
-        .await
-        .expect_err("missing remote control should fail pairing status");
-
-    assert_eq!(
-        err,
-        JSONRPCErrorError {
-            code: INTERNAL_ERROR_CODE,
-            data: None,
-            message: "remote control is unavailable for this app-server".to_string(),
-        }
-    );
-}
-
-#[tokio::test]
-async fn pairing_status_rejects_missing_pairing_codes_before_resolving_handle() {
-    assert_eq!(
-        RemoteControlRequestProcessor::new(/*remote_control_handle*/ None)
-            .pairing_status(RemoteControlPairingStatusParams {
-                pairing_code: None,
-                manual_pairing_code: None,
-            })
-            .await,
-        Err(JSONRPCErrorError {
-            code: INVALID_REQUEST_ERROR_CODE,
-            data: None,
-            message: "remoteControl/pairing/status requires pairingCode or manualPairingCode"
-                .to_string(),
-        })
-    );
-}
-
-#[tokio::test]
-async fn pairing_status_rejects_conflicting_pairing_codes_before_resolving_handle() {
-    assert_eq!(
-        RemoteControlRequestProcessor::new(/*remote_control_handle*/ None)
-            .pairing_status(RemoteControlPairingStatusParams {
-                pairing_code: Some("pairing-code".to_string()),
-                manual_pairing_code: Some("ABCD-EFGH".to_string()),
-            })
-            .await,
-        Err(JSONRPCErrorError {
-            code: INVALID_REQUEST_ERROR_CODE,
-            data: None,
-            message:
-                "remoteControl/pairing/status accepts either pairingCode or manualPairingCode, not both"
-                    .to_string(),
-        })
-    );
-}
-
-#[test]
-fn pairing_start_maps_invalid_input_to_invalid_request() {
-    assert_eq!(
-        map_pairing_start_error(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote control pairing is unavailable",
-        )),
-        JSONRPCErrorError {
-            code: INVALID_REQUEST_ERROR_CODE,
-            data: None,
-            message: "remote control pairing is unavailable".to_string(),
-        }
-    );
-}
-
-#[test]
-fn pairing_start_maps_backend_failures_to_internal_error() {
-    assert_eq!(
-        map_pairing_start_error(io::Error::other("remote control pairing failed")),
-        JSONRPCErrorError {
-            code: INTERNAL_ERROR_CODE,
-            data: None,
-            message: "remote control pairing failed".to_string(),
-        }
-    );
-}
-
-#[test]
-fn client_management_maps_user_actionable_errors_to_invalid_request() {
-    for kind in [
-        io::ErrorKind::InvalidInput,
-        io::ErrorKind::NotFound,
-        io::ErrorKind::PermissionDenied,
-        io::ErrorKind::WouldBlock,
+async fn pairing_status_validates_codes_before_resolving_handle() {
+    let processor = RemoteControlRequestProcessor::new(/*remote_control_handle*/ None);
+    for (pairing_code, manual_pairing_code, code, message) in [
+        (
+            Some("pairing-code"),
+            None,
+            INTERNAL_ERROR_CODE,
+            "remote control is unavailable for this app-server",
+        ),
+        (
+            None,
+            Some("ABCD-EFGH"),
+            INTERNAL_ERROR_CODE,
+            "remote control is unavailable for this app-server",
+        ),
+        (
+            None,
+            None,
+            INVALID_REQUEST_ERROR_CODE,
+            "remoteControl/pairing/status requires pairingCode or manualPairingCode",
+        ),
+        (
+            Some("pairing-code"),
+            Some("ABCD-EFGH"),
+            INVALID_REQUEST_ERROR_CODE,
+            "remoteControl/pairing/status accepts either pairingCode or manualPairingCode, not both",
+        ),
     ] {
         assert_eq!(
-            map_client_management_error(io::Error::new(kind, "client management unavailable")),
-            JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
+            processor
+                .pairing_status(RemoteControlPairingStatusParams {
+                    pairing_code: pairing_code.map(str::to_string),
+                    manual_pairing_code: manual_pairing_code.map(str::to_string),
+                })
+                .await,
+            Err(JSONRPCErrorError {
+                code,
                 data: None,
-                message: "client management unavailable".to_string(),
-            }
+                message: message.to_string(),
+            }),
+            "pairing_code={pairing_code:?}, manual_pairing_code={manual_pairing_code:?}"
         );
     }
 }
 
 #[test]
-fn client_management_maps_backend_failures_to_internal_error() {
-    assert_eq!(
-        map_client_management_error(io::Error::other("client management failed")),
-        JSONRPCErrorError {
-            code: INTERNAL_ERROR_CODE,
-            data: None,
-            message: "client management failed".to_string(),
+fn pairing_and_client_management_classify_errors_by_operation() {
+    for (kind, pairing_code, client_code) in [
+        (
+            io::ErrorKind::InvalidInput,
+            INVALID_REQUEST_ERROR_CODE,
+            INVALID_REQUEST_ERROR_CODE,
+        ),
+        (
+            io::ErrorKind::NotFound,
+            INTERNAL_ERROR_CODE,
+            INVALID_REQUEST_ERROR_CODE,
+        ),
+        (
+            io::ErrorKind::PermissionDenied,
+            INTERNAL_ERROR_CODE,
+            INVALID_REQUEST_ERROR_CODE,
+        ),
+        (
+            io::ErrorKind::WouldBlock,
+            INTERNAL_ERROR_CODE,
+            INVALID_REQUEST_ERROR_CODE,
+        ),
+        (
+            io::ErrorKind::Other,
+            INTERNAL_ERROR_CODE,
+            INTERNAL_ERROR_CODE,
+        ),
+    ] {
+        for (actual, code) in [
+            (
+                map_pairing_start_error(io::Error::new(kind, "pairing unavailable")),
+                pairing_code,
+            ),
+            (
+                map_client_management_error(io::Error::new(kind, "pairing unavailable")),
+                client_code,
+            ),
+        ] {
+            assert_eq!(
+                actual,
+                JSONRPCErrorError {
+                    code,
+                    data: None,
+                    message: "pairing unavailable".to_string(),
+                },
+                "{kind:?}"
+            );
         }
-    );
+    }
 }

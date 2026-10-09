@@ -1037,22 +1037,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_skips_prompt() {
-        let items = sample_items();
-        let mut screen = ExternalAgentConfigMigrationScreen::new(
-            FrameRequester::test_dummy(),
-            &items,
-            &items,
-            /*error*/ None,
-        );
-
-        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        assert!(screen.is_done());
-        assert_eq!(screen.outcome(), ExternalAgentConfigMigrationOutcome::Skip);
-    }
-
-    #[test]
     fn numeric_shortcuts_follow_visible_actions_when_proceed_is_disabled() {
         let items = sample_items();
         let mut screen = ExternalAgentConfigMigrationScreen::new(
@@ -1087,9 +1071,13 @@ mod tests {
     }
 
     #[test]
-    fn control_exit_shortcuts_cancel_prompt() {
+    fn exit_shortcuts_cancel_prompt() {
         let items = sample_items();
-        for key_code in [KeyCode::Char('c'), KeyCode::Char('d')] {
+        for (key_code, modifiers) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ] {
             let mut screen = ExternalAgentConfigMigrationScreen::new(
                 FrameRequester::test_dummy(),
                 &items,
@@ -1097,7 +1085,7 @@ mod tests {
                 /*error*/ None,
             );
 
-            screen.handle_key(KeyEvent::new(key_code, KeyModifiers::CONTROL));
+            screen.handle_key(KeyEvent::new(key_code, modifiers));
 
             assert!(screen.is_done());
             assert_eq!(screen.outcome(), ExternalAgentConfigMigrationOutcome::Skip);
@@ -1115,6 +1103,7 @@ mod tests {
             /*error*/ None,
         );
         proceed_screen.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(proceed_screen.is_done());
         assert_eq!(
             proceed_screen.outcome(),
             ExternalAgentConfigMigrationOutcome::Proceed(items.clone())
@@ -1127,6 +1116,7 @@ mod tests {
             /*error*/ None,
         );
         customize_screen.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(!customize_screen.is_done());
         assert_eq!(customize_screen.view, MigrationView::Customize);
         customize_screen.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert_eq!(customize_screen.view, MigrationView::Summary);
@@ -1138,6 +1128,7 @@ mod tests {
             /*error*/ None,
         );
         skip_screen.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert!(skip_screen.is_done());
         assert_eq!(
             skip_screen.outcome(),
             ExternalAgentConfigMigrationOutcome::Skip

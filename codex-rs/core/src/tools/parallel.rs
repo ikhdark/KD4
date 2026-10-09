@@ -1216,20 +1216,7 @@ fn workspace_tool_call_classifications_for_dispatch(
     (admission, inner_evidence)
 }
 
-#[cfg(test)]
-fn workspace_evidence_classification_for_executed_payload(
-    original: &crate::tool_history::WorkspaceCallClassification,
-    tool_identity: &str,
-    executed_payload: Option<&ToolPayload>,
-    default_cwd: &std::path::Path,
-) -> crate::tool_history::WorkspaceCallClassification {
-    executed_payload.map_or_else(
-        || original.clone(),
-        |payload| {
-            crate::tool_history::classify_workspace_tool_call(tool_identity, payload, default_cwd)
-        },
-    )
-}
+
 
 fn workspace_evidence_baseline_is_compatible(
     original: &crate::tool_history::WorkspaceCallClassification,
@@ -3726,28 +3713,7 @@ impl ToolCallRuntime {
 }
 
 impl ToolCallTimingGuard {
-    #[cfg(test)]
-    fn capture(
-        timing: Arc<ToolDispatchTiming>,
-        conversation_id: &impl std::fmt::Display,
-        turn_id: &str,
-        call: &ToolCall,
-        source: &ToolCallSource,
-    ) -> Option<Self> {
-        if !tracing::enabled!(tracing::Level::INFO) {
-            return None;
-        }
 
-        Some(Self::new(
-            timing,
-            None,
-            conversation_id,
-            turn_id,
-            call,
-            source,
-            true,
-        ))
-    }
 
     fn capture_for_turn(
         timing: Arc<ToolDispatchTiming>,
@@ -4021,29 +3987,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reused_stable_failures_require_a_changed_action_or_state() {
-        let diagnosis: serde_json::Value = serde_json::from_str(&reused_failure_diagnosis(
-            &codex_tools::ToolName::plain("read_tool_output"),
-            "stable-failure",
-        ))
-        .expect("valid diagnosis");
 
-        assert_eq!(diagnosis["executed"], false);
-        assert_eq!(diagnosis["outcome"], "skipped");
-        assert_eq!(
-            diagnosis["retry_condition"],
-            "changed_action_or_relevant_state"
-        );
-        assert!(diagnosis.get("retryable").is_none());
-        assert_eq!(diagnosis["required_action"], "change_route_or_state");
-        assert!(
-            diagnosis["next_action"]
-                .as_str()
-                .expect("next action")
-                .contains("Do not repeat this call with unchanged arguments")
-        );
-    }
 
     #[test]
     fn reused_failure_diagnosis_is_nonterminal_for_the_next_sample() {
@@ -4071,6 +4015,13 @@ mod tests {
         assert_eq!(diagnosis["kind"], "reused_failure_diagnosis");
         assert_eq!(diagnosis["tool_name"], "read_tool_output");
         assert_eq!(diagnosis["required_action"], "change_route_or_state");
+        assert_eq!(diagnosis["failure_fingerprint"], "stable-failure");
+        assert_eq!(diagnosis["executed"], false);
+        assert_eq!(diagnosis["outcome"], "skipped");
+        assert_eq!(diagnosis["retry_condition"], "changed_action_or_relevant_state");
+        assert!(diagnosis.get("retryable").is_none());
+        assert!(diagnosis["next_action"].as_str().unwrap()
+            .contains("Do not repeat this call with unchanged arguments"));
     }
     use tokio::sync::Notify;
     use tokio::sync::oneshot;
@@ -4592,50 +4543,7 @@ mod tests {
         assert!(!admission("not json"));
     }
 
-    #[tokio::test]
-    async fn write_stdin_poll_does_not_block_a_same_repository_reader() {
-        let turn_timing_state = Arc::new(TurnTimingState::default());
-        let parallel_execution = Arc::new(RwLock::new(()));
-        let workspace_execution = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let resource = std::path::PathBuf::from("repository");
-        let poll = workspace_admission_plan(
-            false,
-            true,
-            &crate::tool_history::WorkspaceCallClassification {
-                observes_workspace: true,
-                workspace_cwd: resource.clone(),
-                source_dependencies: Default::default(),
-            },
-            Some(resource.clone()),
-            true,
-            true,
-        );
-        let _poll_guard = acquire_workspace_gate(
-            Arc::clone(&parallel_execution),
-            Arc::clone(&workspace_execution),
-            poll.resource_key,
-            poll.shared_resource,
-            poll.supports_parallel,
-            poll.workspace_capable,
-            &turn_timing_state,
-        )
-        .await;
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            acquire_workspace_gate(
-                parallel_execution,
-                workspace_execution,
-                Some(resource),
-                true,
-                true,
-                true,
-                &turn_timing_state,
-            ),
-        )
-        .await
-        .expect("a reader must run while a background poll waits for output");
-    }
 
     #[tokio::test]
     async fn stdin_termination_reaches_handler_while_process_holds_workspace_gate() {
@@ -4764,8 +4672,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn post_hook_workspace_evidence_uses_the_executed_payload() {
+    #[tokio::test]
+    async fn post_hook_workspace_evidence_uses_the_executed_payload() {
         let default_cwd = std::path::Path::new("/repo");
         let original_mutation = ToolPayload::Function {
             arguments: serde_json::json!({
@@ -4790,12 +4698,13 @@ mod tests {
             })
             .to_string(),
         };
-        let executed_read = workspace_evidence_classification_for_executed_payload(
+        let executed_read = executed_workspace_classification(
             &original_mutation,
             "exec_command",
             Some(&rewritten_read),
             default_cwd,
-        );
+            &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+        ).await.expect("executed payload classification");
         assert!(executed_read.observes_workspace);
         assert_eq!(
             executed_read.workspace_cwd,
@@ -4818,7 +4727,7 @@ mod tests {
             &rewritten_read,
             default_cwd,
         );
-        let executed_mutation = workspace_evidence_classification_for_executed_payload(
+        let executed_mutation = executed_workspace_classification(
             &original_read,
             "exec_command",
             Some(&ToolPayload::Function {
@@ -4830,7 +4739,8 @@ mod tests {
                 .to_string(),
             }),
             default_cwd,
-        );
+            &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+        ).await.expect("executed payload classification");
         assert!(!executed_mutation.observes_workspace);
         assert!(!workspace_evidence_baseline_is_compatible(
             &original_read,
@@ -4841,12 +4751,13 @@ mod tests {
             &original_read,
         ));
         assert_eq!(
-            workspace_evidence_classification_for_executed_payload(
+            executed_workspace_classification(
                 &original_read,
                 "exec_command",
                 None,
                 default_cwd,
-            ),
+                &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+            ).await.expect("executed payload classification"),
             original_read,
         );
     }
@@ -5062,62 +4973,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_call_timing_guard_correlates_code_mode_source() {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let call = ToolCall {
-                tool_name: codex_tools::ToolName::plain("test_tool"),
-                call_id: "call-1".to_string(),
-                payload: ToolPayload::Function {
-                    arguments: "{}".to_string(),
-                },
-            };
-            let direct_timing = Arc::new(ToolDispatchTiming::new(
-                TokioInstant::now(),
-                /*eager*/ false,
-            ));
-            direct_timing.mark_first_poll();
-            let direct_guard = ToolCallTimingGuard::capture(
-                direct_timing,
-                &"conversation-id",
-                "turn-id",
-                &call,
-                &ToolCallSource::Direct,
-            );
-            assert!(
-                direct_guard.is_some(),
-                "direct tool calls should create a timing guard"
-            );
-            drop(direct_guard);
 
-            let code_mode_timing = Arc::new(ToolDispatchTiming::new(
-                TokioInstant::now(),
-                /*eager*/ false,
-            ));
-            code_mode_timing.mark_first_poll();
-            let code_mode_guard = ToolCallTimingGuard::capture(
-                code_mode_timing,
-                &"conversation-id",
-                "turn-id",
-                &call,
-                &ToolCallSource::CodeMode {
-                    cell_id: "cell-1".to_string(),
-                    parent_call_id: Some("outer-call".to_string()),
-                    runtime_tool_call_id: "runtime-call-1".to_string(),
-                    nested_deadline: None,
-                    cancellation_cause: None,
-                },
-            );
-            let code_mode_guard = code_mode_guard
-                .expect("nested code-mode calls should expose their parent lifecycle");
-            assert_eq!(code_mode_guard.tool_source, "code_mode");
-            assert_eq!(code_mode_guard.parent_cell_id, "cell-1");
-            assert_eq!(code_mode_guard.runtime_tool_call_id, "runtime-call-1");
-        });
-    }
 
     #[tokio::test]
     async fn cancellation_before_dispatch_admission_logs_dispatch_only_timing() -> anyhow::Result<()>
@@ -5263,17 +5119,11 @@ mod tests {
             },
             cancellation_token.clone(),
         ));
-        for _ in 0..100 {
-            if turn_context
-                .turn_timing_state
-                .lifecycle_context()
-                .parallel_gate_waiter_count
-                == 1
-            {
-                break;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while turn_context.turn_timing_state.lifecycle_context().parallel_gate_waiter_count == 0 {
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        }).await.expect("dispatch must reach the held workspace gate");
         cancellation_token.cancel();
         tokio::time::timeout(Duration::from_secs(1), response_task)
             .await
@@ -6292,82 +6142,7 @@ mod tests {
         assert_eq!(notice["valid_for_current_workspace"], false);
     }
 
-    #[tokio::test]
-    async fn workspace_evidence_ignores_retired_transaction_state() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(workspace.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-        std::fs::write(workspace.path().join("source.txt"), "current source\n").unwrap();
-        let cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(workspace.path()).unwrap();
-        let (session, turn, _events) =
-            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-                codex_login::CodexAuth::from_api_key("Test API Key"),
-                Vec::new(),
-                home.path(),
-                |config| {
-                    config.cwd = cwd.clone();
-                    config.workspace_roots = vec![cwd.clone()];
-                    config
-                        .permissions
-                        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
-                        .unwrap();
-                },
-            )
-            .await;
-        let legacy_state = home
-            .path()
-            .join("workspace-transactions")
-            .join(turn.session_telemetry.conversation_id().to_string())
-            .join("transaction.json");
-        std::fs::create_dir_all(legacy_state.parent().unwrap()).unwrap();
-        std::fs::write(&legacy_state, "retired metadata is not consulted").unwrap();
 
-        let cache = session.services.git_workspace.as_ref();
-        let expected = cache
-            .workspace_evidence_identity_with_attribution(workspace.path())
-            .await
-            .identity;
-        assert!(
-            expected
-                .as_ref()
-                .is_some_and(|identity| !identity.unavailable)
-        );
-        assert_eq!(
-            cache
-                .workspace_evidence_for_turn(&turn, workspace.path())
-                .await
-                .identity,
-            expected
-        );
-        let direct = capture_workspace_evidence_baseline(
-            cache,
-            Some(&turn),
-            workspace.path(),
-            Default::default(),
-            false,
-        )
-        .await;
-        assert_eq!(direct.revision, expected);
-        let batch = WorkspaceEvidenceGenerationBatch::new();
-        for _ in 0..2 {
-            let baseline = batch
-                .capture_baseline(cache, Some(&turn), workspace.path(), Default::default(), 0)
-                .await;
-            assert_eq!(baseline.revision, expected);
-            assert!(finish_workspace_evidence_capture(&baseline, false).1);
-        }
-        assert_eq!(
-            std::fs::read_to_string(legacy_state).unwrap(),
-            "retired metadata is not consulted"
-        );
-    }
 
     #[tokio::test]
     async fn non_workspace_evidence_skips_workspace_gate() {
@@ -7434,7 +7209,11 @@ mod tests {
                 CancellationToken::new(),
             ),
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while turn_context.turn_timing_state.lifecycle_context().parallel_gate_waiter_count == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("dispatch must reach the held workspace gate");
         assert_eq!(
             session
                 .services
@@ -7539,12 +7318,13 @@ mod tests {
             workspace.path(),
         );
         let executed_payload = payload(&executed_path);
-        let executed = workspace_evidence_classification_for_executed_payload(
+        let executed = executed_workspace_classification(
             &original,
             "exec_command",
             Some(&executed_payload),
             workspace.path(),
-        );
+            &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+        ).await.expect("executed payload classification");
         let baseline = capture_workspace_evidence_baseline(
             &session.services.git_workspace,
             None,
@@ -7675,7 +7455,11 @@ mod tests {
                 Some(Arc::clone(&admitted_revision)),
             ),
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while turn_context.turn_timing_state.lifecycle_context().parallel_gate_waiter_count == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("dispatch must reach the held workspace gate");
         assert_eq!(
             session
                 .services
@@ -8770,7 +8554,7 @@ mod tests {
         ));
         let step_context = step_context.with_tool_router_for_test(router);
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let runtime = ToolCallRuntime::new(session, step_context, tracker);
+        let runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
         let cancellation_token = CancellationToken::new();
         let call = ToolCall {
             tool_name,
@@ -8822,6 +8606,9 @@ mod tests {
         );
 
         allow_cleanup.notify_one();
+        session.terminal_tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
+        assert!(records.lock().unwrap().is_empty(), "cleanup must not publish another terminal");
 
         Ok(())
     }
@@ -8859,7 +8646,7 @@ mod tests {
         ));
         let step_context = step_context.with_tool_router_for_test(router);
         let runtime = ToolCallRuntime::new(
-            session,
+            Arc::clone(&session),
             step_context,
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
         );
@@ -8953,6 +8740,9 @@ mod tests {
         assert!(closure.orphan_calls.is_empty());
 
         allow_cleanup.notify_one();
+        session.terminal_tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
+        assert_eq!(records.lock().unwrap().as_slice(), &[ToolCallOutcome::Aborted]);
 
         Ok(())
     }

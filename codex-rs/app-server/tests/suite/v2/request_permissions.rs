@@ -92,6 +92,10 @@ async fn request_permissions_round_trip() -> Result<()> {
         .expect("request should include write permissions");
     assert_eq!(requested_writes.len(), 2);
     assert_eq!(
+        requested_writes[0].as_str(),
+        params.cwd_uri.inferred_native_path_string()
+    );
+    assert_eq!(
         requested_file_system.entries,
         Some(vec![
             codex_app_server_protocol::FileSystemSandboxEntry {
@@ -147,12 +151,55 @@ async fn request_permissions_round_trip() -> Result<()> {
             }
             "turn/completed" => {
                 assert!(saw_resolved, "serverRequest/resolved should arrive first");
+                let completed: codex_app_server_protocol::TurnCompletedNotification =
+                    serde_json::from_value(notification.params.expect("completion params"))?;
+                assert_eq!(completed.thread_id, thread.id);
+                assert_eq!(completed.turn.id, turn.id);
+                assert_eq!(
+                    completed.turn.status,
+                    codex_app_server_protocol::TurnStatus::Completed
+                );
                 break;
             }
             _ => {}
         }
     }
 
+    let mut outputs = Vec::new();
+    for request in server.received_requests().await.expect("recorded requests") {
+        if !request.url.path().ends_with("/responses") {
+            continue;
+        }
+        let body: serde_json::Value = request.body_json()?;
+        for item in body["input"].as_array().into_iter().flatten() {
+            if item["type"] == "function_call_output" && item["call_id"] == "call1" {
+                outputs.push(
+                    item["output"]
+                        .as_str()
+                        .expect("permission output is text")
+                        .to_string(),
+                );
+            }
+        }
+    }
+    assert_eq!(outputs.len(), 1, "model must receive the permission decision");
+    let response: codex_protocol::request_permissions::RequestPermissionsResponse =
+        serde_json::from_str(&outputs[0])?;
+    assert_eq!(
+        response,
+        codex_protocol::request_permissions::RequestPermissionsResponse {
+            permissions: codex_protocol::request_permissions::RequestPermissionProfile {
+                network: None,
+                file_system: Some(
+                    codex_protocol::models::FileSystemPermissions::from_read_write_roots(
+                        None,
+                        Some(vec![params.cwd_uri]),
+                    ),
+                ),
+            },
+            scope: codex_protocol::request_permissions::PermissionGrantScope::Turn,
+        }
+    );
     Ok(())
 }
 

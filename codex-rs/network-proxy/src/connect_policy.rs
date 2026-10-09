@@ -127,37 +127,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn direct_connector_rejects_non_public_target_when_local_binding_disabled() {
+    async fn direct_connector_enforces_local_binding_policy() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind local listener");
         let target = listener.local_addr().expect("local addr");
-        let connector = TargetCheckedTcpConnector::from_allow_local_binding(false);
-
-        let request: rama_tcp::client::Request =
-            rama_tcp::client::Request::new(HostWithPort::from(target));
-        let err = Service::serve(&connector, request)
-            .await
-            .expect_err("local target should be rejected");
-
-        assert!(
-            format!("{err:?}").contains("network target rejected by policy"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn direct_connector_allows_non_public_target_when_local_binding_enabled() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind local listener");
-        let target = listener.local_addr().expect("local addr");
-        let connector = TargetCheckedTcpConnector::from_allow_local_binding(true);
-
-        let request: rama_tcp::client::Request =
-            rama_tcp::client::Request::new(HostWithPort::from(target));
-        let result = Service::serve(&connector, request).await;
-
-        assert!(result.is_ok(), "local target should be allowed: {result:?}");
+        for allow_local_binding in [false, true] {
+            let connector =
+                TargetCheckedTcpConnector::from_allow_local_binding(allow_local_binding);
+            let request = rama_tcp::client::Request::new(HostWithPort::from(target));
+            let result = Service::serve(&connector, request).await;
+            if allow_local_binding {
+                let connected = result.expect("local target should be allowed");
+                let (_, peer) = listener.accept().await.expect("connection reaches listener");
+                assert!(peer.ip().is_loopback());
+                drop(connected);
+            } else {
+                let err = result.expect_err("local target should be rejected");
+                assert!(
+                    format!("{err:?}").contains("network target rejected by policy"),
+                    "unexpected error: {err:?}"
+                );
+            }
+        }
     }
 }

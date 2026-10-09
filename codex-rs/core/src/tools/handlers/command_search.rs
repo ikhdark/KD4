@@ -1016,7 +1016,8 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn explicitly_fresh_search_skips_scope_capture() {
-        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let command = ["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "src"]
+            .map(str::to_string).to_vec();
         let mut search = classify_rg_search_narrowing(
             &command,
             None,
@@ -1025,6 +1026,7 @@ mod deadline_tests {
         )
         .unwrap()
         .unwrap();
+        assert!(search.can_record_miss, "freshness must be the only capture bypass");
         search.scope_state_identity = Some("old evidence".to_string());
         let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_captures = Arc::clone(&captures);
@@ -1222,8 +1224,9 @@ mod missing_path_tests {
         }
         let mut budget = suggestion_budget(CancellationToken::new());
         budget.remaining = 3;
+        budget.deadline = Instant::now() + Duration::from_secs(10);
         let candidates = suggestion_candidates(root.path(), "candidate.rs", "candidate", &mut budget);
-        assert!(candidates.len() <= 2);
+        assert_eq!(candidates.len(), 2);
         assert_eq!(budget.remaining, 0);
         let cancellation = CancellationToken::new();
         cancellation.cancel();

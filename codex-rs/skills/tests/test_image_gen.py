@@ -48,7 +48,7 @@ class OutputPreflightTests(unittest.TestCase):
                 with self.subTest(command=command, derived=derived):
                     output = self.root / f"{command}-{derived}.png"
                     collision = (
-                        image_gen._derive_downscale_path(output, "-web")
+                        output.with_name(f"{output.stem}-web.png")
                         if derived else output
                     )
                     collision.write_bytes(b"preserve")
@@ -70,11 +70,14 @@ class OutputPreflightTests(unittest.TestCase):
         output = self.root / "image.png"
         (self.root / "image-2.png").write_bytes(b"preserve")
         with patch.object(image_gen, "_create_client") as client:
-            with self.assertRaises(SystemExit):
+            with self.assertRaises(SystemExit) as error:
                 self.run_cli(["generate", "--prompt", "test", "--n", "2",
                               "--out", str(output)])
+            self.assertEqual(error.exception.code, 1)
             client.assert_not_called()
         self.assertFalse((self.root / "image-1.png").exists())
+        self.assertFalse(output.exists())
+        self.assertEqual((self.root / "image-2.png").read_bytes(), b"preserve")
 
     def test_batch_checks_later_job_overrides_before_any_request(self):
         jobs = self.root / "jobs.jsonl"

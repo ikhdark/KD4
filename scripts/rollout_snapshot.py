@@ -119,18 +119,20 @@ def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
             directory.mkdir(parents=True, exist_ok=True)
             destination = directory / f"{digest}.json"
             # Publish atomically without replacing any existing immutable blob.
-            with tempfile.NamedTemporaryFile(dir=directory, delete=False) as temporary:
-                temporary_path = Path(temporary.name)
-                temporary.write(data)
-                temporary.flush()
-                os.fsync(temporary.fileno())
+            temporary_path = None
             try:
+                with tempfile.NamedTemporaryFile(dir=directory, delete=False) as temporary:
+                    temporary_path = Path(temporary.name)
+                    temporary.write(data)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
                 try:
                     os.link(temporary_path, destination)
                 except FileExistsError:
                     load_rollout_payload(output, digest, reference["bytes"])
             finally:
-                temporary_path.unlink()
+                if temporary_path is not None:
+                    temporary_path.unlink()
 
 
 @dataclass(frozen=True)
@@ -313,16 +315,20 @@ def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
         captured = tempfile.SpooledTemporaryFile(max_size=4 * _READ_CHUNK_BYTES)
         digest = hashlib.sha256()
         remaining = byte_length
-        while remaining:
-            chunk = handle.read(min(remaining, _READ_CHUNK_BYTES))
-            if not chunk:
-                raise OSError(
-                    f"rollout shrank while reading {resolved}: "
-                    f"expected {byte_length} bytes"
-                )
-            captured.write(chunk)
-            digest.update(chunk)
-            remaining -= len(chunk)
+        try:
+            while remaining:
+                chunk = handle.read(min(remaining, _READ_CHUNK_BYTES))
+                if not chunk:
+                    raise OSError(
+                        f"rollout shrank while reading {resolved}: "
+                        f"expected {byte_length} bytes"
+                    )
+                captured.write(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+        except BaseException:
+            captured.close()
+            raise
 
     return RolloutSnapshot(
         path=resolved,

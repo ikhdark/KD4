@@ -697,6 +697,19 @@ mod tests {
         }]);
         assert_eq!(schema_validated_delivery(&image, 100, None).as_deref(), Ok("![image](<https://example.com/result.png>)"));
         assert_eq!(schema_validated_delivery(&image, 100, Some(&schema)).unwrap_err()["category"], "invalid_json");
+        for image_url in [
+            "javascript:alert(1)",
+            "relative.png",
+            "https://example.com/image.png> injected",
+            "https://example.com/image.png\nextra",
+            "data:text/html,unsafe",
+        ] {
+            let image = response(vec![FunctionCallOutputContentItem::InputImage {
+                image_url: image_url.into(), detail: None,
+            }]);
+            assert_eq!(schema_validated_delivery(&image, 100, None).unwrap_err()["category"],
+                "unsupported_media", "{image_url:?}");
+        }
         assert_eq!(schema_validated_delivery(&json, 0, None).unwrap_err()["category"], "output_budget");
         assert_eq!(schema_validated_delivery(&response(Vec::new()), 100, None).unwrap_err()["category"], "empty_output");
         let bad = response(vec![FunctionCallOutputContentItem::InputText { text:r#"{"count":"bad"}"#.into() }]);

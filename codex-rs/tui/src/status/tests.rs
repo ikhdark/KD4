@@ -437,7 +437,7 @@ async fn status_permissions_non_default_workspace_write_uses_workspace_label() {
 }
 
 #[tokio::test]
-async fn status_permissions_named_read_only_profile_shows_builtin_label() {
+async fn status_permissions_read_only_label_survives_internal_writable_roots() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config
@@ -457,17 +457,6 @@ async fn status_permissions_named_read_only_profile_shows_builtin_label() {
         permissions_text_for(&config).as_deref(),
         Some("Read Only (Ask for approval)")
     );
-}
-
-#[tokio::test]
-async fn status_permissions_read_only_profile_preserves_preset_label_for_internal_writes() {
-    let temp_home = TempDir::new().expect("temp home");
-    let mut config = test_config(&temp_home).await;
-    config
-        .permissions
-        .approval_policy
-        .set(AskForApproval::OnRequest.to_core())
-        .expect("set approval policy");
     let extra_root = test_path_buf("/workspace/extra").abs();
     let file_system_policy = PermissionProfile::read_only()
         .file_system_sandbox_policy()
@@ -490,7 +479,7 @@ async fn status_permissions_read_only_profile_preserves_preset_label_for_interna
 }
 
 #[tokio::test]
-async fn status_permissions_named_workspace_profile_shows_builtin_label() {
+async fn status_permissions_workspace_label_hides_internal_writable_roots() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config
@@ -510,17 +499,6 @@ async fn status_permissions_named_workspace_profile_shows_builtin_label() {
         permissions_text_for(&config).as_deref(),
         Some("Workspace (Ask for approval)")
     );
-}
-
-#[tokio::test]
-async fn status_permissions_named_profile_hides_internal_writable_roots() {
-    let temp_home = TempDir::new().expect("temp home");
-    let mut config = test_config(&temp_home).await;
-    config
-        .permissions
-        .approval_policy
-        .set(AskForApproval::OnRequest.to_core())
-        .expect("set approval policy");
     let extra_root = test_path_buf("/workspace/extra").abs();
     config
         .permissions
@@ -810,7 +788,7 @@ async fn status_model_provider_uses_bedrock_runtime_base_url_and_gates_usage_lin
 }
 
 #[tokio::test]
-async fn status_permissions_full_disk_managed_with_network_is_danger_full_access() {
+async fn status_permissions_full_disk_managed_label_depends_on_network() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config
@@ -818,41 +796,19 @@ async fn status_permissions_full_disk_managed_with_network_is_danger_full_access
         .approval_policy
         .set(AskForApproval::OnRequest.to_core())
         .expect("set approval policy");
-    config
-        .permissions
-        .set_permission_profile(PermissionProfile::Managed {
-            network: NetworkSandboxPolicy::Enabled,
-            file_system: ManagedFileSystemPermissions::Unrestricted,
-        })
-        .expect("set permission profile");
-
-    assert_eq!(
-        permissions_text_for(&config).as_deref(),
-        Some("Custom (danger-full-access, Ask for approval)")
-    );
-}
-
-#[tokio::test]
-async fn status_permissions_full_disk_managed_without_network_is_external_sandbox() {
-    let temp_home = TempDir::new().expect("temp home");
-    let mut config = test_config(&temp_home).await;
-    config
-        .permissions
-        .approval_policy
-        .set(AskForApproval::OnRequest.to_core())
-        .expect("set approval policy");
-    config
-        .permissions
-        .set_permission_profile(PermissionProfile::Managed {
-            network: NetworkSandboxPolicy::Restricted,
-            file_system: ManagedFileSystemPermissions::Unrestricted,
-        })
-        .expect("set permission profile");
-
-    assert_eq!(
-        permissions_text_for(&config).as_deref(),
-        Some("Custom (external-sandbox, Ask for approval)")
-    );
+    for (network, expected) in [
+        (NetworkSandboxPolicy::Enabled, "Custom (danger-full-access, Ask for approval)"),
+        (NetworkSandboxPolicy::Restricted, "Custom (external-sandbox, Ask for approval)"),
+    ] {
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::Managed {
+                network,
+                file_system: ManagedFileSystemPermissions::Unrestricted,
+            })
+            .expect("set permission profile");
+        assert_eq!(permissions_text_for(&config).as_deref(), Some(expected));
+    }
 }
 
 #[tokio::test]

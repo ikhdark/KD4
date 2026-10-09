@@ -9,10 +9,25 @@ async fn recommended_catalog_preserves_status_and_classifies_truncated_bodies() 
     for status in [200, 503] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "client did not connect");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept request: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
                 .unwrap();
             let mut request = [0; 4096];
             let count = stream.read(&mut request).unwrap();
@@ -657,6 +672,10 @@ fn recommended_plugins_are_validated_deduplicated_sorted_and_capped() {
     plugins.push(item("plugin-00", "Duplicate"));
     plugins.push(item("not/a/plugin", "Invalid"));
     plugins.push(RecommendedPluginItem {
+        id: "plugin_valid_id".to_string(),
+        ..item("not/a/plugin", "Invalid name with valid remote identity")
+    });
+    plugins.push(RecommendedPluginItem {
         id: "plugin_disabled".to_string(),
         name: "disabled".to_string(),
         status: Some(PluginAvailability::DisabledByAdmin),
@@ -687,22 +706,15 @@ fn recommended_plugins_are_validated_deduplicated_sorted_and_capped() {
 
     assert_eq!(plugins.len(), MAX_RECOMMENDED_PLUGINS);
     assert_eq!(
-        plugins.first(),
-        Some(&RecommendedPlugin {
-            config_id: "plugin-00@openai-curated-remote".to_string(),
-            remote_plugin_id: "plugin_plugin-00".to_string(),
-            display_name: "Plugin 00".to_string(),
-            app_connector_ids: Vec::new(),
-        })
-    );
-    assert_eq!(
-        plugins.last(),
-        Some(&RecommendedPlugin {
-            config_id: "plugin-49@openai-curated-remote".to_string(),
-            remote_plugin_id: "plugin_plugin-49".to_string(),
-            display_name: "Plugin 49".to_string(),
-            app_connector_ids: Vec::new(),
-        })
+        plugins,
+        (0..50)
+            .map(|index| RecommendedPlugin {
+                config_id: format!("plugin-{index:02}@openai-curated-remote"),
+                remote_plugin_id: format!("plugin_plugin-{index:02}"),
+                display_name: format!("Plugin {index:02}"),
+                app_connector_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>()
     );
 }
 

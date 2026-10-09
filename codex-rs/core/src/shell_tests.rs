@@ -173,9 +173,8 @@ fn rejects_model_provided_non_windows_shells() {
     assert!(err.to_string().contains("unsupported Windows shell"));
 }
 
-#[tokio::test]
-
-async fn detects_powershell_as_default() {
+#[test]
+fn detects_powershell_as_default() {
     let powershell_shell = default_user_shell();
     let shell_path = powershell_shell.shell_path;
 

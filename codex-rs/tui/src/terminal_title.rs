@@ -198,9 +198,11 @@ mod tests {
 
     #[test]
     fn truncates_terminal_title() {
-        let input = "a".repeat(MAX_TERMINAL_TITLE_CHARS + 10);
-        let sanitized = sanitize_terminal_title(&input);
-        assert_eq!(sanitized.len(), MAX_TERMINAL_TITLE_CHARS);
+        for character in ["a", "界", "🦀"] {
+            let input = character.repeat(MAX_TERMINAL_TITLE_CHARS + 10);
+            let sanitized = sanitize_terminal_title(&input);
+            assert_eq!(sanitized, character.repeat(MAX_TERMINAL_TITLE_CHARS));
+        }
     }
 
     #[test]

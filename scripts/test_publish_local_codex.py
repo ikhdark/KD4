@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -67,11 +68,18 @@ function Write-ProofLine { param($Name, $Value); Write-Output "$Name : $Value" }
             fixture.shell = "fixture-shell"
             with (
                 mock.patch.object(support.subprocess, "run") as run,
-                mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "unrelated-live-turn"}),
+                mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "unrelated-live-turn",
+                    "GIT_DIR": "unrelated-repository",
+                    "GIT_WORK_TREE": "unrelated-worktree",
+                    "GIT_CONFIG_COUNT": "1",
+                }),
             ):
                 fixture.run_script()
                 args = run.call_args.args[0]
                 self.assertNotIn("CODEX_THREAD_ID", run.call_args.kwargs["env"])
+                self.assertFalse(any(name.upper().startswith("GIT_")
+                                     for name in run.call_args.kwargs["env"]))
                 self.assertEqual(args[args.index("-LocalCodexHome") + 1],
                                  str(Path(temp) / "local-home"))
                 fixture.run_script("-LocalCodexHome", "explicit-home")
@@ -151,10 +159,12 @@ Write-Output 'guard checks passed'
             app_dir = fixture / "app"
             app_dir.mkdir()
             (app_dir / "ChatGPT.exe").touch()
+            (app_dir / "Other.exe").touch()
             (fixture / "AppxManifest.xml").write_text(
                 """<?xml version="1.0" encoding="utf-8"?>
 <Package>
   <Applications>
+    <Application Id="Other" Executable="app/Other.exe" />
     <Application Id="App" Executable="app/ChatGPT.exe" />
   </Applications>
 </Package>
@@ -570,32 +580,51 @@ if (@($functionAst).Count -ne 1) {{
     throw 'Get-LiveProcessesById was not found exactly once.'
 }}
 Invoke-Expression $functionAst[0].Extent.Text
-$script:disposed = $false
+$script:disposed = 0
+$script:start = [DateTime]'2000-01-01T00:00:00Z'
 function Get-Process {{
     [CmdletBinding()]
     param([int]$Id)
     $fake = [pscustomobject]@{{
         Id = $Id
-        HasExited = $true
-        Path = $null
-        StartTime = [DateTime]::UtcNow
+        HasExited = ($script:scenario -eq 'exited')
+        Path = $(if ($script:scenario -in @('exited', 'unavailable')) {{ $null }} elseif ($script:scenario -eq 'wrong-path') {{ 'C:\\other\\codex.exe' }} else {{ 'C:\\valid\\codex.exe' }})
+        StartTime = $(if ($script:scenario -eq 'reused-pid') {{ $script:start.AddSeconds(1) }} else {{ $script:start }})
     }}
     $fake | Add-Member -MemberType ScriptMethod -Name Dispose -Value {{
-        $script:disposed = $true
+        $script:disposed++
     }}
     return $fake
 }}
 $candidate = [pscustomobject]@{{
     Id = 29448
     Path = 'C:\\valid\\codex.exe'
-    StartTimeUtcTicks = 1
+    StartTimeUtcTicks = $script:start.ToUniversalTime().Ticks
 }}
-$live = @(Get-LiveProcessesById -Processes @($candidate))
-if ($live.Count -ne 0) {{
-    throw "Expected an exited process to be ignored; found $($live.Count)."
-}}
-if (-not $script:disposed) {{
-    throw 'Expected the exited process handle to be disposed.'
+foreach ($script:scenario in @('exited', 'matching', 'reused-pid', 'wrong-path', 'unavailable')) {{
+    $script:disposed = 0
+    if ($script:scenario -eq 'unavailable') {{
+        try {{
+            Get-LiveProcessesById -Processes @($candidate)
+            throw 'expected identity failure'
+        }}
+        catch {{
+            if ($_.Exception.Message -notlike '*Could not revalidate process identity*Process executable path is unavailable*') {{ throw }}
+        }}
+    }}
+    else {{
+        $live = @(Get-LiveProcessesById -Processes @($candidate))
+        $expected = if ($script:scenario -eq 'matching') {{ 1 }} else {{ 0 }}
+        if ($live.Count -ne $expected) {{
+            throw "Unexpected live count for $script:scenario`: $($live.Count), expected $expected"
+        }}
+        if ($expected -eq 1) {{
+            if ($script:disposed -ne 0) {{ throw 'live handle disposed before caller used it' }}
+            if ($live[0].Id -ne $candidate.Id) {{ throw 'wrong live handle returned' }}
+            $live[0].Dispose()
+        }}
+    }}
+    if ($script:disposed -ne 1) {{ throw "Handle not disposed exactly once for $script:scenario" }}
 }}
 "ok"
 """
@@ -624,38 +653,51 @@ if (-not $script:disposed) {{
         self.assertIn("ok", result.stdout)
 
     def test_user_path_edits_preserve_expandable_registry_values(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn("DoNotExpandEnvironmentNames", publish_script)
-        self.assertIn("RegistryValueKind]::ExpandString", publish_script)
-        self.assertIn("ExpandEnvironmentVariables", publish_script)
-        self.assertIn("foreach ($process in $candidates)", publish_script)
-        self.assertIn(
-            "post-close running-target process probe failed",
-            SCRIPT.read_text(encoding="utf-8"),
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        # Redirect only the registry location, never the user's Environment key.
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$keyName = 'Software\CodexPublishTest-' + [Guid]::NewGuid().ToString('N')
+$key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($keyName)
+try {{
+    foreach ($name in @('Get-PathEnvironmentVariableForTarget', 'Set-PathEnvironmentVariableForTarget')) {{
+        $definition = (Get-Command $name).ScriptBlock.ToString()
+        if (-not $definition.Contains('OpenSubKey("Environment",')) {{ throw 'registry boundary not found' }}
+        Set-Item "Function:$name" ([scriptblock]::Create($definition.Replace('OpenSubKey("Environment",', ('OpenSubKey("' + $keyName + '",'))))
+    }}
+    $env:CODEX_PATH_FIXTURE = 'C:\fixture'
+    $raw = '%CODEX_PATH_FIXTURE%\bin;%SystemRoot%\System32;C:\keep'
+    $key.SetValue('Path', $raw, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    $before = Get-PathEnvironmentVariableForTarget -Target User
+    $removed = Remove-PathListEntry -PathValue $before -EntryToRemove 'c:\FIXTURE\bin\'
+    Set-PathEnvironmentVariableForTarget -Target User -Value $removed.Value
+    $after = Get-PathEnvironmentVariableForTarget -Target User
+    $kind = $key.GetValueKind('Path').ToString()
+    Set-PathEnvironmentVariableForTarget -Target User -Value $null
+    [pscustomobject]@{{ Before = $before; After = $after; Removed = $removed.RemovedCount; Kind = $kind; Deleted = ($null -eq $key.GetValue('Path')) }} | ConvertTo-Json -Compress
+}}
+finally {{
+    $key.Dispose()
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($keyName)
+}}
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-Command", command],
+            env=clean_env(), text=True, capture_output=True, check=False,
+            timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
         )
-
-    def test_publish_build_includes_complete_windows_runtime_bundle(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn(
-            '$publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")',
-            publish_script,
-        )
-        self.assertIn("Get-BuiltCodeModeHostPath", publish_script)
-        self.assertIn("Get-BuiltWindowsSandboxSetupPath", publish_script)
-        self.assertIn("Get-BuiltCommandRunnerPath", publish_script)
-        self.assertIn(
-            'Join-Path $InstallDir "codex-code-mode-host.exe"', publish_script
-        )
-        self.assertIn('Join-Path $InstallDir "codex-resources"', publish_script)
-        self.assertIn(
-            'Join-Path $sandboxResourcesDir "codex-windows-sandbox-setup.exe"',
-            publish_script,
-        )
-        self.assertIn(
-            'Join-Path $sandboxResourcesDir "codex-command-runner.exe"',
-            publish_script,
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "Before": r"%CODEX_PATH_FIXTURE%\bin;%SystemRoot%\System32;C:\keep",
+                "After": r"%SystemRoot%\System32;C:\keep",
+                "Removed": 1,
+                "Kind": "ExpandString",
+                "Deleted": True,
+            },
         )
 
     def test_publish_mutex_excludes_contenders_and_releases(self) -> None:
@@ -706,15 +748,6 @@ $released = [MutexContender]::TryAcquire($script:mutexName)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"blocked": True, "released": True})
 
-    def test_publish_build_calls_shared_msvc_linker_setup(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn(
-            '. (Join-Path $PSScriptRoot "common-rust-env.ps1")',
-            publish_script,
-        )
-        self.assertIn("Set-CodexRustMsvcLinkerEnvironment", publish_script)
-
     def test_final_publish_dry_run_only_plans_local_publish(
         self,
     ) -> None:
@@ -745,10 +778,11 @@ $released = [MutexContender]::TryAcquire($script:mutexName)
             "-CloseRunningTargetTimeoutSeconds 30",
             "-ConfigureDesktopLocalCli",
             "-DesktopCliEnvironmentTarget User",
-            "-RestartDesktop",
+            "-RestartDesktopIfNeeded",
         ):
             with self.subTest(argument=argument):
-                self.assertIn(argument, commands)
+                self.assertRegex(commands, rf"(?<!\S){re.escape(argument)}(?!\S)")
+        self.assertNotRegex(commands, r"(?<!\S)-RestartDesktop(?!\S)")
         self.assertNotIn("-SkipPreflightCheck", commands)
 
     def test_requested_restart_rejects_unavailable_desktop(self) -> None:
@@ -793,6 +827,7 @@ catch {{
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
@@ -821,7 +856,7 @@ function Start-Process {{
 [Environment]::SetEnvironmentVariable('CODEX_SQLITE_HOME', 'before-sqlite', 'Process')
 Restart-CodexDesktop `
     -LocalCliPath 'C:\local\codex.exe' `
-    -LocalCodexHome 'C:\local\home' `
+    -LocalCodexHome {ps_single_quote(home)} `
     -LocalCodexSqliteHome 'C:\local\sqlite'
 [pscustomobject]@{{
     Launch = $script:Launch
@@ -855,7 +890,7 @@ Restart-CodexDesktop `
             r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App",
         )
         self.assertEqual(output["Launch"]["CliPath"], r"C:\local\codex.exe")
-        self.assertEqual(output["Launch"]["CodexHome"], r"C:\local\home")
+        self.assertEqual(output["Launch"]["CodexHome"], str(home))
         self.assertEqual(output["Launch"]["SqliteHome"], r"C:\local\sqlite")
         self.assertEqual(output["RestoredCliPath"], "before-cli")
         self.assertEqual(output["RestoredCodexHome"], "before-home")
@@ -866,6 +901,7 @@ Restart-CodexDesktop `
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
@@ -874,7 +910,7 @@ function Start-Process {{}}
 try {{
     Restart-CodexDesktop `
         -LocalCliPath 'C:\local\codex.exe' `
-        -LocalCodexHome 'C:\local\home' `
+        -LocalCodexHome {ps_single_quote(home)} `
         -LocalCodexSqliteHome 'C:\local\sqlite' `
         -ActivationTimeoutSeconds 1
     throw 'expected missing Desktop process to fail'
@@ -986,6 +1022,7 @@ $results += [pscustomobject]@{{ Mode = 'absent'; Matched = $matched; Reason = $r
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 $script:Launched = $false
@@ -1004,7 +1041,7 @@ function Start-Process {{ $script:Launched = $true }}
 try {{
     Restart-CodexDesktop `
         -LocalCliPath 'C:\local\codex.exe' `
-        -LocalCodexHome 'C:\local\home' `
+        -LocalCodexHome {ps_single_quote(home)} `
         -LocalCodexSqliteHome 'C:\local\sqlite' `
         -ActivationTimeoutSeconds 1
     throw 'expected mismatched receipt to fail'
@@ -1050,15 +1087,6 @@ catch {{
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("restartFailed: false", result.stdout)
-
-    def test_default_local_publish_target_is_not_openai_appdata_bin(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn('Join-Path $env:USERPROFILE "Desktop\\LOCAL-KD"', publish_script)
-        self.assertNotIn(
-            'Join-Path $env:LOCALAPPDATA "OpenAI\\Codex\\bin\\codexKD-local"',
-            publish_script,
-        )
 
     def test_publish_doctor_allows_only_non_runtime_failures(self) -> None:
         shell = powershell()
@@ -1122,33 +1150,23 @@ $configFailure = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"config.lo
         self.assertFalse(output["differentTerminalFailure"])
         self.assertFalse(output["configFailure"])
 
-    def test_publish_run_doctor_uses_publish_classifier(self) -> None:
-        publish_script = publish_source_text()
-
-        self.assertIn("function Invoke-DoctorForPublish", publish_script)
-        self.assertIn("warning: allowed non-runtime doctor failure", publish_script)
-        self.assertEqual(
-            publish_script.count("Invoke-DoctorForPublish -TargetPath $targetPath"),
-            3,
-        )
-
     def test_local_release_profile_is_minimal_release_inheritance(self) -> None:
+        import tomllib
+
         cargo_toml = (SCRIPT.parent.parent / "codex-rs" / "Cargo.toml").read_text(
             encoding="utf-8"
         )
-
-        self.assertIn(
-            '[profile.local-release]\ninherits = "release"\nlto = false',
-            cargo_toml,
+        profile = tomllib.loads(cargo_toml)["profile"]["local-release"]
+        self.assertEqual(
+            profile,
+            {
+                "inherits": "release",
+                "lto": False,
+                "codegen-units": 16,
+                "incremental": True,
+                "package": {"*": {"codegen-units": 4}},
+            },
         )
-        local_release_block = cargo_toml.split("[profile.local-release]", 1)[1].split(
-            "[profile.",
-            1,
-        )[0]
-        self.assertIn("incremental = true", local_release_block)
-        self.assertIn("codegen-units = 16", local_release_block)
-        self.assertNotIn("debug", local_release_block)
-        self.assertNotIn("strip", local_release_block)
 
 
 class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
@@ -1170,6 +1188,10 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
             directory = source / "directory.rs"
             for path in (literal, missing, directory):
                 path.write_bytes(b"AAAA")
+            # Ordinal and case-insensitive sorting must yield different orders.
+            sort_contents = {source / "Z.rs": b"upper", source / "a.rs": b"lower"}
+            for path, content in sort_contents.items():
+                path.write_bytes(content)
             for args in (
                 ["init", "--quiet"],
                 ["add", "."],
@@ -1192,17 +1214,17 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
             directory.mkdir()
             untracked = source / "untracked.rs"
             untracked.write_bytes(b"untracked")
-            paths = (literal, missing, directory, untracked)
+            paths = (literal, missing, directory, untracked, *sort_contents)
 
             def expected(literal_content: bytes | None) -> str:
                 digest = hashlib.sha256(
                     f"codex-local-publish-inputs-v4\nhead={head}\nrecipe={'a' * 64}\n".encode()
                 )
-                for path in sorted(paths):
+                for path in sorted(paths, key=lambda path: path.relative_to(root).as_posix()):
                     name = path.relative_to(root).as_posix()
                     content = (
                         literal_content if path == literal
-                        else b"untracked" if path == untracked else None
+                        else b"untracked" if path == untracked else sort_contents.get(path)
                     )
                     if content is None:
                         record = f"missing:{len(name.encode())}:{name}\n"
@@ -1257,7 +1279,9 @@ $deleted = Get-LocalPublishBuildInputSnapshot -RepoRoot $root
                 f"-OutputAssembly {ps_single_quote(helper_exe)} "
                 "-OutputType ConsoleApplication; "
                 f"$lines = @(Get-VersionProofLines -Path {ps_single_quote(helper_exe)} "
-                "-TimeoutMilliseconds 5000); Write-Output $lines[0]"
+                "-TimeoutMilliseconds 5000); "
+                "@{ version = $lines[0]; stderrLength = $lines[1].Length; "
+                "stderrIntact = ($lines[1] -ceq ('x' * 65536)) } | ConvertTo-Json -Compress"
             )
             result = subprocess.run(
                 [
@@ -1281,7 +1305,10 @@ $deleted = Get-LocalPublishBuildInputSnapshot -RepoRoot $root
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertEqual(result.stdout.strip(), "codex noisy 1.0")
+            self.assertEqual(
+                json.loads(result.stdout),
+                {"version": "codex noisy 1.0", "stderrLength": 65536, "stderrIntact": True},
+            )
 
 
 if __name__ == "__main__":

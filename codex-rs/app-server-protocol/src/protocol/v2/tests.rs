@@ -116,21 +116,6 @@ fn thread_sources_round_trip_as_scalar_labels() {
     }
 }
 
-#[test]
-fn turn_defaults_legacy_missing_items_view_to_full() {
-    let turn: Turn = serde_json::from_value(json!({
-        "id": "turn_123",
-        "items": [],
-        "status": "completed",
-        "error": null,
-        "startedAt": null,
-        "completedAt": null,
-        "durationMs": null,
-    }))
-    .expect("legacy turn should deserialize");
-
-    assert_eq!(turn.items_view, TurnItemsView::Full);
-}
 
 #[test]
 fn thread_turns_list_params_accepts_items_view() {
@@ -311,33 +296,16 @@ fn thread_items_list_round_trips() {
 }
 
 #[test]
-fn thread_list_params_accepts_single_cwd() {
-    let params = serde_json::from_value::<ThreadListParams>(json!({
-        "cwd": "/workspace",
-    }))
-    .expect("single cwd should deserialize");
-
-    assert_eq!(
-        params.cwd,
-        Some(ThreadListCwdFilter::One("/workspace".to_string()))
-    );
-    assert_eq!(params.use_state_db_only, None);
-}
-
-#[test]
-fn thread_list_params_accepts_multiple_cwds() {
-    let params = serde_json::from_value::<ThreadListParams>(json!({
-        "cwd": ["/workspace", "/other-workspace"],
-    }))
-    .expect("cwd array should deserialize");
-
-    assert_eq!(
-        params.cwd,
-        Some(ThreadListCwdFilter::Many(vec![
-            "/workspace".to_string(),
-            "/other-workspace".to_string(),
-        ]))
-    );
+fn thread_list_params_accepts_single_or_multiple_cwds() {
+    for (wire, expected) in [
+        (json!("/workspace"), ThreadListCwdFilter::One("/workspace".into())),
+        (json!(["/workspace", "/other-workspace"]), ThreadListCwdFilter::Many(vec!["/workspace".into(), "/other-workspace".into()])),
+    ] {
+        let params: ThreadListParams = serde_json::from_value(json!({"cwd": wire})).unwrap();
+        assert_eq!(params.cwd, Some(expected));
+        assert_eq!(params.use_state_db_only, None);
+        assert_eq!(serde_json::to_value(params).unwrap()["cwd"], wire);
+    }
 }
 
 #[test]
@@ -4041,29 +4009,6 @@ fn codex_error_info_serializes_active_turn_not_steerable_turn_kind_in_camel_case
     );
 }
 
-#[test]
-fn dynamic_tool_response_serializes_content_items() {
-    let value = serde_json::to_value(DynamicToolCallResponse {
-        content_items: vec![DynamicToolCallOutputContentItem::InputText {
-            text: "dynamic-ok".to_string(),
-        }],
-        success: true,
-    })
-    .unwrap();
-
-    assert_eq!(
-        value,
-        json!({
-            "contentItems": [
-                {
-                    "type": "inputText",
-                    "text": "dynamic-ok"
-                }
-            ],
-            "success": true,
-        })
-    );
-}
 
 #[test]
 fn dynamic_tool_response_serializes_text_and_image_content_items() {
@@ -4208,6 +4153,7 @@ fn legacy_turn_defaults_optional_terminal_outcome_fields_to_absent() {
     }))
     .expect("legacy turn");
 
+    assert_eq!(turn.items_view, TurnItemsView::Full);
     assert_eq!(turn.timing, None);
     assert_eq!(turn.surfaced_result, None);
     let serialized = serde_json::to_value(turn).expect("turn serialization");

@@ -600,8 +600,8 @@ url = "ws://127.0.0.1:8765"
         );
     }
 
-    #[tokio::test]
-    async fn default_thread_environment_selections_empty_when_default_disabled() {
+    #[test]
+    fn default_thread_environment_selections_empty_when_default_disabled() {
         let cwd = AbsolutePathBuf::current_dir().expect("cwd");
         let manager = EnvironmentManager::without_environments();
 
@@ -666,7 +666,7 @@ url = "ws://127.0.0.1:8765"
     }
 
     #[tokio::test]
-    async fn resolved_environment_selections_use_first_selection_as_primary() {
+    async fn resolves_selected_local_environment_cwd_and_shell() {
         let cwd = AbsolutePathBuf::current_dir().expect("cwd");
         let selected_cwd = cwd.join("selected");
         let selected_cwd_uri = PathUri::from_abs_path(&selected_cwd);
@@ -676,12 +676,16 @@ url = "ws://127.0.0.1:8765"
             Arc::clone(&manager),
             &[TurnEnvironmentSelection {
                 environment_id: "local".to_string(),
-                cwd: selected_cwd_uri,
+                cwd: selected_cwd_uri.clone(),
             }],
         )
         .await;
 
         let resolved = resolved.snapshot().await;
+        assert_eq!(
+            resolved.primary().expect("primary environment").cwd(),
+            &selected_cwd_uri
+        );
         assert_eq!(
             resolved
                 .primary()
@@ -758,18 +762,14 @@ url = "ws://127.0.0.1:8765"
             /*non_blocking_snapshots*/ false,
         ));
         environments.update_selections(std::slice::from_ref(&selection));
-        let snapshot_task = tokio::spawn({
-            let environments = Arc::clone(&environments);
-            async move { environments.snapshot().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!snapshot_task.is_finished());
+        let snapshot_task = environments.snapshot();
+        tokio::pin!(snapshot_task);
+        assert!(futures::poll!(&mut snapshot_task).is_pending());
 
         let server = tokio::spawn(serve_environment_info(listener));
         let snapshot = timeout(Duration::from_secs(5), snapshot_task)
             .await
-            .expect("snapshot should finish after the environment starts")
-            .expect("snapshot task");
+            .expect("snapshot should finish after the environment starts");
 
         assert!(snapshot.starting.is_empty());
         assert_eq!(snapshot.to_selections(), vec![selection]);
@@ -866,6 +866,10 @@ url = "ws://127.0.0.1:8765"
         let attached = turn_environments.snapshot().await;
 
         assert!(attached.starting.is_empty());
+        assert_eq!(
+            attached.primary().expect("resolved primary").environment_id,
+            remote.environment_id
+        );
         assert_eq!(
             attached
                 .turn_environments

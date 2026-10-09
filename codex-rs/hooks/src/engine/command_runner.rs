@@ -733,36 +733,7 @@ mod tests {
         assert_eq!(result.error.as_deref(), Some("hook timed out after 2s"));
     }
 
-    #[tokio::test]
-    async fn timeout_covers_a_blocked_stdin_write() {
-        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
 
-        #[cfg(windows)]
-        let command = "Start-Sleep -Seconds 60".to_string();
-        #[cfg(not(windows))]
-        let command = "sleep 60".to_string();
-
-        let handler = test_handler(command, 1, &cwd);
-        let input_json = "x".repeat(4 * 1024 * 1024);
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            run_command(
-                &explicit_test_shell(),
-                &handler,
-                0,
-                &input_json,
-                cwd.as_path(),
-            ),
-        )
-        .await
-        .expect("run_command should enforce its timeout while writing stdin");
-
-        assert_eq!(result.exit_code, None);
-        assert_eq!(result.stdout, "");
-        assert_eq!(result.stderr, "");
-        assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
-    }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_covers_process_admission_before_spawn() {

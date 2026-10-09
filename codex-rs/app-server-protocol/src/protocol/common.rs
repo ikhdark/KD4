@@ -2038,17 +2038,20 @@ mod tests {
 
     #[test]
     fn auth_mode_mirror_round_trips_and_delegates_policy() {
-        for core in [
-            CoreAuthMode::ApiKey,
-            CoreAuthMode::Chatgpt,
-            CoreAuthMode::ChatgptAuthTokens,
-            CoreAuthMode::Headers,
-            CoreAuthMode::AgentIdentity,
-            CoreAuthMode::PersonalAccessToken,
-            CoreAuthMode::BedrockApiKey,
+        // Both enums document the same credential kinds. Check each identity
+        // directly: a round trip alone accepts matching wrong permutations.
+        for (core, expected_api) in [
+            (CoreAuthMode::ApiKey, AuthMode::ApiKey),
+            (CoreAuthMode::Chatgpt, AuthMode::Chatgpt),
+            (CoreAuthMode::ChatgptAuthTokens, AuthMode::ChatgptAuthTokens),
+            (CoreAuthMode::Headers, AuthMode::Headers),
+            (CoreAuthMode::AgentIdentity, AuthMode::AgentIdentity),
+            (CoreAuthMode::PersonalAccessToken, AuthMode::PersonalAccessToken),
+            (CoreAuthMode::BedrockApiKey, AuthMode::BedrockApiKey),
         ] {
             let api = AuthMode::from(core);
-            assert_eq!(CoreAuthMode::from(api), core);
+            assert_eq!(api, expected_api);
+            assert_eq!(CoreAuthMode::from(expected_api), core);
             assert_eq!(api.has_chatgpt_account(), core.has_chatgpt_account());
             assert_eq!(api.uses_codex_backend(), core.uses_codex_backend());
         }
@@ -2674,76 +2677,16 @@ mod tests {
             }),
             serde_json::to_value(&request)?,
         );
+        assert_eq!(serde_json::from_value::<ClientRequest>(serde_json::to_value(&request)?)?, request);
         Ok(())
     }
 
     #[test]
-    fn deserialize_initialize_capabilities() -> Result<()> {
-        let request: ClientRequest = serde_json::from_value(json!({
-            "method": "initialize",
-            "id": 42,
-            "params": {
-                "clientInfo": {
-                    "name": "codex_vscode",
-                    "title": "Codex VS Code Extension",
-                    "version": "0.1.0"
-                },
-                "capabilities": {
-                    "experimentalApi": true,
-                    "requestAttestation": true,
-                    "mcpServerOpenaiFormElicitation": true,
-                    "optOutNotificationMethods": [
-                        "thread/started",
-                        "item/agentMessage/delta"
-                    ]
-                }
-            }
-        }))?;
-
-        assert_eq!(
-            request,
-            ClientRequest::Initialize {
-                request_id: RequestId::Integer(42),
-                params: v1::InitializeParams {
-                    client_info: v1::ClientInfo {
-                        name: "codex_vscode".to_string(),
-                        title: Some("Codex VS Code Extension".to_string()),
-                        version: "0.1.0".to_string(),
-                    },
-                    capabilities: Some(v1::InitializeCapabilities {
-                        experimental_api: true,
-                        request_attestation: true,
-                        mcp_server_openai_form_elicitation: true,
-                        opt_out_notification_methods: Some(vec![
-                            "thread/started".to_string(),
-                            "item/agentMessage/delta".to_string(),
-                        ]),
-                    }),
-                },
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn conversation_id_serializes_as_plain_string() -> Result<()> {
+    fn conversation_id_round_trips_as_plain_string() -> Result<()> {
         let id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
-
-        assert_eq!(
-            json!("67e55044-10b1-426f-9247-bb680e5fe0c8"),
-            serde_json::to_value(id)?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn conversation_id_deserializes_from_plain_string() -> Result<()> {
-        let id: ThreadId = serde_json::from_value(json!("67e55044-10b1-426f-9247-bb680e5fe0c8"))?;
-
-        assert_eq!(
-            ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?,
-            id,
-        );
+        let wire = json!("67e55044-10b1-426f-9247-bb680e5fe0c8");
+        assert_eq!(serde_json::to_value(id)?, wire);
+        assert_eq!(serde_json::from_value::<ThreadId>(wire)?, id);
         Ok(())
     }
 
@@ -3284,76 +3227,24 @@ mod tests {
 
     #[test]
     fn serialize_account_login_chatgpt() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(3),
-            params: v2::LoginAccountParams::Chatgpt {
-                app_brand: None,
-                codex_streamlined_login: false,
-                use_hosted_login_success_page: false,
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 3,
-                "params": {
-                    "type": "chatgpt",
-                    "appBrand": null
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn serialize_account_login_chatgpt_streamlined() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(3),
-            params: v2::LoginAccountParams::Chatgpt {
-                app_brand: None,
-                codex_streamlined_login: true,
-                use_hosted_login_success_page: false,
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 3,
-                "params": {
-                    "type": "chatgpt",
-                    "appBrand": null,
-                    "codexStreamlinedLogin": true
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn serialize_account_login_chatgpt_with_hosted_success_page() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(3),
-            params: v2::LoginAccountParams::Chatgpt {
-                app_brand: Some(v2::LoginAppBrand::Chatgpt),
-                codex_streamlined_login: true,
-                use_hosted_login_success_page: true,
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 3,
-                "params": {
-                    "type": "chatgpt",
-                    "appBrand": "chatgpt",
-                    "codexStreamlinedLogin": true,
-                    "useHostedLoginSuccessPage": true
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
+        for (streamlined, hosted, app_brand, expected_params) in [
+            (false, false, None, json!({"type":"chatgpt", "appBrand":null})),
+            (true, false, None, json!({"type":"chatgpt", "appBrand":null, "codexStreamlinedLogin":true})),
+            (true, true, Some(v2::LoginAppBrand::Chatgpt), json!({"type":"chatgpt", "appBrand":"chatgpt", "codexStreamlinedLogin":true, "useHostedLoginSuccessPage":true})),
+            (false, true, None, json!({"type":"chatgpt", "appBrand":null, "useHostedLoginSuccessPage":true})),
+        ] {
+            let request = ClientRequest::LoginAccount {
+                request_id: RequestId::Integer(3),
+                params: v2::LoginAccountParams::Chatgpt {
+                    app_brand,
+                    codex_streamlined_login: streamlined,
+                    use_hosted_login_success_page: hosted,
+                },
+            };
+            let wire = json!({"method":"account/login/start", "id":3, "params":expected_params});
+            assert_eq!(serde_json::to_value(&request)?, wire);
+            assert_eq!(serde_json::from_value::<ClientRequest>(wire)?, request);
+        }
         Ok(())
     }
 

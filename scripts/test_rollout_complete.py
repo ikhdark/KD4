@@ -73,15 +73,21 @@ class CompleteRolloutTest(unittest.TestCase):
         }}]
         report = self.report(rows)
         self.assertNotIn(encrypted, self.output.read_text(encoding="utf-8"))
-        self.assertEqual(report["records"][0]["payload"]["summary"], "visible summary")
+        self.assertEqual(report["records"], [{"payload": {
+            "encrypted_content": None,
+            "summary": "visible summary",
+            "unknown": {"encrypted_content": None},
+        }}])
         self.assertEqual(report["opaqueEncryptedFields"]["/0/payload/encrypted_content"], {
             "utf8Bytes": len(encrypted.encode()),
             "sha256": hashlib.sha256(encrypted.encode()).hexdigest(),
         })
         self.assertEqual(
-            report["opaqueEncryptedFields"]["/0/payload/unknown/encrypted_content"]["utf8Bytes"],
-            2,
+            report["opaqueEncryptedFields"]["/0/payload/unknown/encrypted_content"],
+            {"utf8Bytes": 2, "sha256": hashlib.sha256("λ".encode()).hexdigest()},
         )
+        self.assertEqual(len(report["opaqueEncryptedFields"]), 2)
+        self.assertEqual(report["references"], {})
 
     def test_invalid_or_partial_records_do_not_replace_a_report(self):
         for invalid in [b'{"unfinished":', b'{"invalid":}\n', b'[]\n', b'\xff\n']:

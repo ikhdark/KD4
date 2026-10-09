@@ -2902,9 +2902,11 @@ mod tests {
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("deadline"), "{error:#}");
-        drop(client);
         assert!(started.elapsed() < Duration::from_secs(2));
+        // Keep the client alive: closure must come from the expired operation,
+        // not from client teardown masking a leaked socket/worker.
         peer.join().unwrap();
+        drop(client);
     }
 
     #[test]

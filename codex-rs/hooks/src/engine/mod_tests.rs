@@ -561,7 +561,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
             pre_tool_use: vec![MatcherGroup {
                 matcher: Some("^Bash$".to_string()),
                 hooks: vec![HookHandlerConfig::Command {
-                    command: format!("python3 {}", script_path.display()),
+                    command: format!("python3 \"{}\"", script_path.display()),
                     command_windows: None,
                     timeout_sec: Some(10),
                     r#async: false,
@@ -635,9 +635,11 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
     assert_eq!(preview.len(), 1);
     assert_eq!(preview[0].source_path, managed_dir);
 
+    let session_id = ThreadId::new();
+    let expected_cwd = cwd.display().to_string();
     let outcome = engine
         .run_pre_tool_use(PreToolUseRequest {
-            session_id: ThreadId::new(),
+            session_id,
             turn_id: "turn-1".to_string(),
             subagent: None,
             cwd,
@@ -653,8 +655,22 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
         .await;
 
     assert!(!outcome.should_block);
+    assert_eq!(outcome.hook_events.len(), 1);
+    assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Completed);
     let log_contents = fs::read_to_string(log_path).expect("read managed hook log");
-    assert!(log_contents.contains("\"hook_event_name\": \"PreToolUse\""));
+    let payload: serde_json::Value = serde_json::from_str(&log_contents).expect("one input payload");
+    assert_eq!(payload, serde_json::json!({
+        "session_id": session_id.to_string(),
+        "turn_id": "turn-1",
+        "transcript_path": null,
+        "cwd": expected_cwd,
+        "hook_event_name": "PreToolUse",
+        "model": "gpt-test",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-1",
+        "tool_input": {"command": "echo hello"},
+    }));
 }
 
 #[tokio::test]
@@ -1507,100 +1523,71 @@ fn allow_managed_hooks_only_in_config_toml_does_not_enable_policy() {
 }
 
 #[test]
-fn allow_managed_hooks_only_skips_unmanaged_json_and_toml_hooks() {
+fn managed_only_policy_filters_json_toml_and_plugin_hooks_even_when_trust_is_bypassed() {
     let temp = tempdir().expect("create temp dir");
-    let config_path =
-        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
-    let hooks_json_path =
-        AbsolutePathBuf::try_from(temp.path().join("hooks.json")).expect("absolute hooks path");
+    let root = AbsolutePathBuf::try_from(temp.path()).expect("absolute root");
     fs::write(
-        hooks_json_path.as_path(),
-        r#"{
-              "hooks": {
-                "PreToolUse": [
-                  {
-                    "matcher": "^Bash$",
-                    "hooks": [
-                      {
-                        "type": "command",
-                        "command": "python3 /tmp/json-hook.py"
-                      }
-                    ]
-                  }
-                ]
-              }
-            }"#,
+        root.join("hooks.json"),
+        serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [{
+            "type": "command", "command": "echo json"
+        }]}]}}).to_string(),
     )
     .expect("write hooks.json");
-    let (requirements, requirements_toml) = requirements_with_managed_hooks_only(
-        /*allow_managed_hooks_only*/ true, /*managed_hooks*/ None,
-    );
-    let config_layer_stack = ConfigLayerStack::new(
-        vec![ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: config_path,
-                profile: None,
-            },
-            config_toml_with_pre_tool_use("python3 /tmp/toml-hook.py"),
-        )],
-        requirements,
-        requirements_toml,
-    )
-    .expect("config layer stack");
-
-    let engine = ClaudeHooksEngine::new(
-        /*enabled*/ true,
-        /*bypass_hook_trust*/ false,
-        Some(&config_layer_stack),
-        Vec::new(),
-        Vec::new(),
-        CommandShell {
-            program: String::new(),
-            args: Vec::new(),
-        },
-    );
-
-    assert!(engine.handlers.is_empty());
-    assert!(engine.warnings().is_empty());
-}
-
-#[test]
-fn allow_managed_hooks_only_skips_unmanaged_plugin_hooks() {
-    let temp = tempdir().expect("create temp dir");
-    let plugin_root =
-        AbsolutePathBuf::try_from(temp.path().join("demo-plugin")).expect("plugin root");
-    let plugin_data_root =
-        AbsolutePathBuf::try_from(temp.path().join("plugin-data")).expect("plugin data root");
-    let source_path = plugin_root.join("hooks/hooks.json");
-    let plugin_id = PluginId::parse("demo-plugin@test-marketplace").expect("plugin id");
-    let plugin_hook_sources = vec![PluginHookSource {
-        plugin_id,
-        plugin_root,
-        plugin_data_root,
-        source_path,
-        source_relative_path: "hooks/hooks.json".to_string(),
-        hooks: pre_tool_use_hook_events("python3 /tmp/plugin-hook.py"),
+    let plugin_sources = vec![PluginHookSource {
+        plugin_id: PluginId::parse("demo-plugin@test-marketplace").expect("plugin id"),
+        plugin_root: root.join("plugin"),
+        plugin_data_root: root.join("plugin-data"),
+        source_path: root.join("plugin/hooks.json"),
+        source_relative_path: "hooks.json".to_string(),
+        hooks: pre_tool_use_hook_events("echo plugin"),
     }];
-    let (requirements, requirements_toml) = requirements_with_managed_hooks_only(
-        /*allow_managed_hooks_only*/ true, /*managed_hooks*/ None,
-    );
-    let config_layer_stack = ConfigLayerStack::new(Vec::new(), requirements, requirements_toml)
+
+    for managed_only in [false, true] {
+        let (requirements, requirements_toml) =
+            requirements_with_managed_hooks_only(managed_only, None);
+        let stack = ConfigLayerStack::new(
+            vec![ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: root.join("config.toml"),
+                    profile: None,
+                },
+                config_toml_with_pre_tool_use("echo toml"),
+            )],
+            requirements,
+            requirements_toml,
+        )
         .expect("config layer stack");
-
-    let engine = ClaudeHooksEngine::new(
-        /*enabled*/ true,
-        /*bypass_hook_trust*/ false,
-        Some(&config_layer_stack),
-        plugin_hook_sources,
-        Vec::new(),
-        CommandShell {
-            program: String::new(),
-            args: Vec::new(),
-        },
-    );
-
-    assert!(engine.handlers.is_empty());
-    assert!(engine.warnings().is_empty());
+        let engine = ClaudeHooksEngine::new(
+            true,
+            // Untrusted hooks must otherwise be executable, so trust rejection
+            // cannot mask a broken managed-only policy.
+            true,
+            Some(&stack),
+            plugin_sources.clone(),
+            Vec::new(),
+            CommandShell {
+                program: String::new(),
+                args: Vec::new(),
+            },
+        );
+        let mut commands = engine
+            .handlers
+            .iter()
+            .map(|handler| handler.command.as_str())
+            .collect::<Vec<_>>();
+        commands.sort_unstable();
+        assert_eq!(
+            commands,
+            if managed_only {
+                vec![]
+            } else {
+                vec!["echo json", "echo plugin", "echo toml"]
+            }
+        );
+        if managed_only {
+            assert!(engine.warnings().is_empty());
+        }
+    }
 }
 
 #[test]

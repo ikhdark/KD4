@@ -94,7 +94,14 @@ mod tests {
 
     #[test]
     fn powershell_single_quote_helpers_share_one_escape_rule() {
-        assert_eq!(escape_powershell_single_quoted("it's here"), "it''s here");
-        assert_eq!(quote_powershell_single_quoted("it's here"), "'it''s here'");
+        for (input, escaped) in [
+            ("it's here", "it''s here"),
+            ("‘left’ ‚low‛", "‘‘left’’ ‚‚low‛‛"),
+            ("plain $text", "plain $text"),
+            ("", ""),
+        ] {
+            assert_eq!(escape_powershell_single_quoted(input), escaped);
+            assert_eq!(quote_powershell_single_quoted(input), format!("'{escaped}'"));
+        }
     }
 }

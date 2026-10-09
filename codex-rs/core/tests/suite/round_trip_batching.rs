@@ -306,10 +306,13 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
 
     let baseline_requests = requests_for_sequence(&baseline_responses);
     let requests = requests_for_sequence(&responses);
+    assert_eq!(baseline_completion.error, None);
+    assert_eq!(completion.error, None);
     assert_eq!(
         baseline_completion.last_agent_message.as_deref(),
-        completion.last_agent_message.as_deref()
+        Some("done")
     );
+    assert_eq!(completion.last_agent_message.as_deref(), Some("done"));
     let baseline_timing = baseline_completion.timing.expect("baseline turn timing");
     let timing = completion.timing.expect("turn timing");
     assert_timing_reconciles(&baseline_timing);

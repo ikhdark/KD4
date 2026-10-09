@@ -1,6 +1,4 @@
 use super::*;
-use std::hint::black_box;
-use std::time::Instant;
 
 fn call(index: usize) -> ResponseItem {
     ResponseItem::FunctionCall {
@@ -90,47 +88,6 @@ fn assembly_audit_image_receipts_preserve_order_and_are_idempotent() {
     assert_eq!(items, expected);
 }
 
-/// Local assembly costs only: excludes fixture cloning, transport, and model latency.
-/// Run explicitly with --run-ignored only. Set CODEX_CONTEXT_ASSEMBLY_BENCH_OUTPUT
-/// to retain measurements when the runner suppresses successful test output.
-#[test]
-#[ignore = "narrow context assembly microbenchmark"]
-fn assembly_audit_benchmark() {
-    let mut report = String::new();
-    for count in [128, 2048, 8192] {
-        let missing: Vec<_> = (0..count).map(call).collect();
-        let images: Vec<_> = (0..count).map(image).collect();
-        let mut complete = missing.clone();
-        ensure_call_outputs_present(&mut complete);
-        for (name, fixture, operation) in [
-            ("missing_outputs", &missing, ensure_call_outputs_present as fn(&mut Vec<ResponseItem>)),
-            ("image_omissions", &images, strip_text_only as fn(&mut Vec<ResponseItem>)),
-            ("no_orphan_outputs", &complete, remove_orphan_outputs as fn(&mut Vec<ResponseItem>)),
-        ] {
-            let mut samples = Vec::new();
-            for _ in 0..11 {
-                let mut items = fixture.clone();
-                let started = Instant::now();
-                operation(black_box(&mut items));
-                samples.push(started.elapsed().as_nanos());
-                black_box(items);
-            }
-            samples.sort_unstable();
-            let row = format!("assembly_audit {name} count={count} median_ns={} min_ns={} max_ns={}\n", samples[5], samples[0], samples[10]);
-            eprint!("{row}");
-            report.push_str(&row);
-        }
-    }
-    if let Some(path) = std::env::var_os("CODEX_CONTEXT_ASSEMBLY_BENCH_OUTPUT") {
-        let path = std::path::PathBuf::from(path);
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&path, report)
-            .unwrap_or_else(|error| panic!("benchmark report {}: {error}", path.display()));
-    }
-}
 
-fn strip_text_only(items: &mut Vec<ResponseItem>) {
-    strip_images_when_unsupported(&[InputModality::Text], items);
-}
+
+

@@ -14,8 +14,8 @@ use tempfile::tempdir;
 use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
 
-#[tokio::test]
-async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
+#[test]
+fn file_storage_save_and_load_preserve_auth_dot_json() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let auth_dot_json = AuthDotJson {
@@ -33,33 +33,11 @@ async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
         .context("failed to save auth file")?;
 
     let loaded = storage.load().context("failed to load auth file")?;
-    assert_eq!(Some(auth_dot_json), loaded);
-    Ok(())
-}
-
-#[tokio::test]
-async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some("test-key".to_string()),
-        tokens: None,
-        last_refresh: Some(Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-
-    let file = get_auth_file(codex_home.path());
-    storage
-        .save(&auth_dot_json)
-        .context("failed to save auth file")?;
-
-    let same_auth_dot_json = storage
-        .try_read_auth_json(&file)
-        .context("failed to read auth file after save")?;
-    assert_eq!(auth_dot_json, same_auth_dot_json);
+    assert_eq!(Some(auth_dot_json.clone()), loaded);
+    assert_eq!(
+        storage.try_read_auth_json(&get_auth_file(codex_home.path()))?,
+        auth_dot_json
+    );
     Ok(())
 }
 

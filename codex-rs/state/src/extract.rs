@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_context_sets_cwd_when_session_cwd_missing() {
+    fn turn_context_sets_cwd_model_and_reasoning_effort() {
         let mut metadata = metadata_for_test();
         metadata.cwd = PathBuf::new();
         let fallback_cwd = std::env::current_dir()
@@ -720,42 +720,6 @@ mod tests {
         );
 
         assert_eq!(metadata.cwd, fallback_cwd);
-    }
-
-    #[test]
-    fn turn_context_sets_model_and_reasoning_effort() {
-        let mut metadata = metadata_for_test();
-
-        apply_rollout_item(
-            &mut metadata,
-            &RolloutItem::TurnContext(TurnContextItem {
-                turn_id: Some("turn-1".to_string()),
-                cwd: serde_json::from_value(serde_json::json!(
-                    std::env::current_dir()
-                        .expect("current directory")
-                        .join("fallback/workspace")
-                ))
-                .expect("absolute fallback cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
-                approval_policy: AskForApproval::OnRequest,
-                sandbox_policy: SandboxPolicy::new_read_only_policy(),
-                permission_profile: None,
-                network: None,
-                file_system_sandbox_policy: None,
-                model: "gpt-5".to_string(),
-                comp_hash: None,
-                personality: None,
-                collaboration_mode: None,
-                multi_agent_version: None,
-                multi_agent_mode: None,
-                effort: Some(ReasoningEffort::High),
-                context_provenance: None,
-            }),
-            "test-provider",
-        );
-
         assert_eq!(metadata.model.as_deref(), Some("gpt-5"));
         assert_eq!(metadata.reasoning_effort, Some(ReasoningEffort::High));
     }

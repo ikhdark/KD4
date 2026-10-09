@@ -105,25 +105,11 @@ async fn consume_account_rate_limit_reset_credit_maps_backend_outcomes() -> Resu
                 "code": backend_code,
                 "windows_reset": windows_reset
             })))
+            .expect(1)
             .mount(&server)
             .await;
     }
 
-    let mut mcp = initialized_app_server(codex_home.path()).await?;
-    for (idempotency_key, _, expected_outcome, _) in cases {
-        assert_eq!(
-            consume_reset_credit(&mut mcp, idempotency_key).await?,
-            ConsumeAccountRateLimitResetCreditResponse {
-                outcome: expected_outcome,
-            }
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn consume_account_rate_limit_reset_credit_forwards_selected_credit_id() -> Result<()> {
-    let (codex_home, server) = chatgpt_test_context().await?;
     Mock::given(method("POST"))
         .and(path("/api/codex/rate-limit-reset-credits/consume"))
         .and(header("authorization", "Bearer chatgpt-token"))
@@ -140,30 +126,8 @@ async fn consume_account_rate_limit_reset_credit_forwards_selected_credit_id() -
         .mount(&server)
         .await;
 
+
     let mut mcp = initialized_app_server(codex_home.path()).await?;
-    let request_id = mcp
-        .send_consume_account_rate_limit_reset_credit_request(
-            ConsumeAccountRateLimitResetCreditParams {
-                idempotency_key: "request-selected".to_string(),
-                credit_id: Some("credit-123".to_string()),
-            },
-        )
-        .await?;
-
-    assert_eq!(
-        read_response::<ConsumeAccountRateLimitResetCreditResponse>(&mut mcp, request_id).await?,
-        ConsumeAccountRateLimitResetCreditResponse {
-            outcome: ConsumeAccountRateLimitResetCreditOutcome::Reset,
-        }
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn consume_account_rate_limit_reset_credit_rejects_empty_ids() -> Result<()> {
-    let (codex_home, _server) = chatgpt_test_context().await?;
-    let mut mcp = initialized_app_server(codex_home.path()).await?;
-
     for (params, expected_message) in [
         (
             ConsumeAccountRateLimitResetCreditParams {
@@ -188,8 +152,34 @@ async fn consume_account_rate_limit_reset_credit_rejects_empty_ids() -> Result<(
         assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
         assert_eq!(error.error.message, expected_message);
     }
+
+    for (idempotency_key, _, expected_outcome, _) in cases {
+        assert_eq!(
+            consume_reset_credit(&mut mcp, idempotency_key).await?,
+            ConsumeAccountRateLimitResetCreditResponse {
+                outcome: expected_outcome,
+            }
+        );
+    }
+    let request_id = mcp
+        .send_consume_account_rate_limit_reset_credit_request(
+            ConsumeAccountRateLimitResetCreditParams {
+                idempotency_key: "request-selected".to_string(),
+                credit_id: Some("credit-123".to_string()),
+            },
+        )
+        .await?;
+
+    assert_eq!(
+        read_response::<ConsumeAccountRateLimitResetCreditResponse>(&mut mcp, request_id).await?,
+        ConsumeAccountRateLimitResetCreditResponse {
+            outcome: ConsumeAccountRateLimitResetCreditOutcome::Reset,
+        }
+    );
+
     Ok(())
 }
+
 
 #[tokio::test]
 async fn consume_account_rate_limit_reset_credit_surfaces_backend_failure() -> Result<()> {

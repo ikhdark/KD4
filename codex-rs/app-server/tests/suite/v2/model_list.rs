@@ -92,7 +92,7 @@ fn expected_visible_models() -> Vec<Model> {
 }
 
 #[tokio::test]
-async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
+async fn list_models_preserves_catalog_across_pagination_and_invalid_cursors() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_models_cache(codex_home.path())?;
     let mut mcp = TestAppServer::builder()
@@ -142,7 +142,63 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
     );
     assert_eq!(astra.service_tiers[0].id, "priority");
     assert!(next_cursor.is_none());
-    Ok(())
+    let request_id = mcp
+        .send_list_models_request(ModelListParams {
+            limit: None,
+            cursor: Some("invalid".to_string()),
+            include_hidden: None,
+        })
+        .await?;
+
+    let error: JSONRPCError = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(error.id, RequestId::Integer(request_id));
+    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(error.error.message, "invalid cursor: invalid");
+
+    let expected_models = expected_visible_models();
+    let mut cursor = None;
+    let mut items = Vec::new();
+
+    for _ in 0..expected_models.len() {
+        let request_id = mcp
+            .send_list_models_request(ModelListParams {
+                limit: Some(if cursor.is_none() { 0 } else { 1 }),
+                cursor: cursor.clone(),
+                include_hidden: None,
+            })
+            .await?;
+
+        let response: JSONRPCResponse = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+
+        let ModelListResponse {
+            data: page_items,
+            next_cursor,
+        } = to_response::<ModelListResponse>(response)?;
+
+        assert_eq!(page_items.len(), 1);
+        items.extend(page_items);
+
+        if let Some(next_cursor) = next_cursor {
+            cursor = Some(next_cursor);
+        } else {
+            assert_eq!(items, expected_models);
+            return Ok(());
+        }
+    }
+
+    panic!(
+        "model pagination did not terminate after {} pages",
+        expected_models.len()
+    );
 }
 
 #[tokio::test]
@@ -325,87 +381,6 @@ openai_base_url = "{server_uri}/v1"
     Ok(())
 }
 
-#[tokio::test]
-async fn list_models_pagination_works() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    write_models_cache(codex_home.path())?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
 
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let expected_models = expected_visible_models();
-    let mut cursor = None;
-    let mut items = Vec::new();
 
-    for _ in 0..expected_models.len() {
-        let request_id = mcp
-            .send_list_models_request(ModelListParams {
-                limit: Some(1),
-                cursor: cursor.clone(),
-                include_hidden: None,
-            })
-            .await?;
-
-        let response: JSONRPCResponse = timeout(
-            DEFAULT_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-        )
-        .await??;
-
-        let ModelListResponse {
-            data: page_items,
-            next_cursor,
-        } = to_response::<ModelListResponse>(response)?;
-
-        assert_eq!(page_items.len(), 1);
-        items.extend(page_items);
-
-        if let Some(next_cursor) = next_cursor {
-            cursor = Some(next_cursor);
-        } else {
-            assert_eq!(items, expected_models);
-            return Ok(());
-        }
-    }
-
-    panic!(
-        "model pagination did not terminate after {} pages",
-        expected_models.len()
-    );
-}
-
-#[tokio::test]
-async fn list_models_rejects_invalid_cursor() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    write_models_cache(codex_home.path())?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_list_models_request(ModelListParams {
-            limit: None,
-            cursor: Some("invalid".to_string()),
-            include_hidden: None,
-        })
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(error.error.message, "invalid cursor: invalid");
-    Ok(())
-}

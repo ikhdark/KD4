@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "worker": "/root/finish_session",
+  "status": "complete_source_review_validation_root_owned",
+  "reviewed": [
+    "codex-rs/core/tests/suite/rmcp_client.rs",
+    "codex-rs/core/tests/suite/unified_exec.rs"
+  ],
+  "initial_bytes": 148686,
+  "initial_lines": 4136,
+  "unread_ranges": [],
+  "remaining": [],
+  "production_changes": false,
+  "test_definition_delta": -1,
+  "changes": [
+    "Remove default-false MCP capability fixture: loaded-thread refresh test already asserts the same startup default before enabling support.",
+    "Retained exec lifecycle requires no background terminals after terminal polling and turn completion.",
+    "Inline success child must report one executed successful test, preventing zero-selection success.",
+    "Owner-wait test uses one bounded event deadline and requires successful completion, terminal exit0, and no live process handle.",
+    "Windows smoke requires exact stdout, exit0 and no live process handle."
+  ],
+  "removed_filters": [
+    "suite::rmcp_client::openai_form_capability_is_not_advertised_by_default"
+  ],
+  "focused_filters": [
+    "suite::rmcp_client::openai_form_capability_updates_for_loaded_thread",
+    "suite::unified_exec::exec_command_retained_session_lifecycle_completes_without_stale_processes",
+    "suite::unified_exec::exec_command_fast_success_and_failure_lifecycles_finish_inline",
+    "suite::unified_exec::unified_exec_owner_wait_delivers_terminal_output_before_model_resumes",
+    "suite::unified_exec::unified_exec_runs_on_windows"
+  ],
+  "validation": "Full source review and affected post-edit source inspection; no Cargo/build/Git/format commands. Root owns executable validation. Performance unmeasured.",
+  "coverage_reconciliation": "Original core_session161 = Temp checkpoint reviewed155 + this2 + checkout session-compact-progress.json4. Temp checkpoint write was blocked; unchanged."
+}

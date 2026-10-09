@@ -17,7 +17,13 @@ fn utf8_projection_is_independent_of_poll_boundaries_and_retry() {
             let second = buffer.projected_pending_output(true, &[]);
             let text = format!("{}{}", String::from_utf8_lossy(&first.0), String::from_utf8_lossy(&second.0));
             assert_eq!(text, String::from_utf8_lossy(input));
-            assert_eq!(first.1.unwrap().range.end, second.1.unwrap().range.start);
+            let first_ranges = first.1.unwrap();
+            let second_ranges = second.1.unwrap();
+            assert_eq!(first_ranges.range.start, 0);
+            assert_eq!(first_ranges.range.end, second_ranges.range.start);
+            assert_eq!(second_ranges.range.end, input.len() as u64);
+            assert_eq!(first_ranges.gap, None);
+            assert_eq!(second_ranges.gap, None);
             buffer.acknowledge_pending_output();
             assert!(!buffer.has_unreported_output());
         }
@@ -118,24 +124,19 @@ fn keeps_prefix_and_suffix_when_over_budget() {
 }
 
 #[test]
-fn max_bytes_zero_drops_everything() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 0);
-    buf.push_chunk(b"abc");
+fn zero_head_budget_respects_zero_and_one_byte_capacity() {
+    for (capacity, expected) in [(0, b"".as_slice()), (1, b"c".as_slice())] {
+        let mut buf = HeadTailBuffer::new(capacity);
+        buf.push_chunk(b"abc");
 
-    assert_eq!(buf.retained_bytes(), 0);
-    assert_eq!(buf.omitted_bytes(), 3);
-    assert_eq!(buf.to_bytes(), b"".to_vec());
-    assert_eq!(buf.snapshot_chunks(), Vec::<Vec<u8>>::new());
-}
-
-#[test]
-fn head_budget_zero_keeps_only_last_byte_in_tail() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 1);
-    buf.push_chunk(b"abc");
-
-    assert_eq!(buf.retained_bytes(), 1);
-    assert_eq!(buf.omitted_bytes(), 2);
-    assert_eq!(buf.to_bytes(), b"c".to_vec());
+        assert_eq!(buf.retained_bytes(), capacity);
+        assert_eq!(buf.omitted_bytes(), 3 - capacity);
+        assert_eq!(buf.to_bytes(), expected);
+        let chunks = if capacity == 0 { Vec::new() } else { vec![expected.to_vec()] };
+        assert_eq!(buf.snapshot_chunks(), chunks);
+        assert_eq!(buf.take_unreported_omitted_bytes(), 3 - capacity);
+        assert_eq!(buf.take_unreported_omitted_bytes(), 0);
+    }
 }
 
 #[test]

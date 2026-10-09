@@ -580,8 +580,8 @@ async fn get_status_returns_not_found_without_manager() {
     assert_eq!(got, AgentStatus::NotFound);
 }
 
-#[tokio::test]
-async fn on_event_updates_status_from_task_started() {
+#[test]
+fn on_event_updates_status_from_lifecycle_events() {
     let status = agent_status_from_event(&EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: "turn-1".to_string(),
         trace_id: None,
@@ -590,10 +590,7 @@ async fn on_event_updates_status_from_task_started() {
         collaboration_mode_kind: ModeKind::Default,
     }));
     assert_eq!(status, Some(AgentStatus::Running));
-}
 
-#[tokio::test]
-async fn on_event_updates_status_from_task_complete() {
     let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
         surfaced_result: None,
         turn_id: "turn-1".to_string(),
@@ -606,10 +603,7 @@ async fn on_event_updates_status_from_task_complete() {
     }));
     let expected = AgentStatus::Completed(Some("done".to_string()));
     assert_eq!(status, Some(expected));
-}
 
-#[tokio::test]
-async fn on_event_preserves_typed_surface_in_agent_status() {
     let surfaced_result = codex_protocol::protocol::SurfacedToolResult {
         adapter: "owner".to_string(),
         value: serde_json::json!({"answer": 42}),
@@ -632,10 +626,7 @@ async fn on_event_preserves_typed_surface_in_agent_status() {
             surfaced_result,
         })
     );
-}
 
-#[tokio::test]
-async fn on_event_updates_status_from_error() {
     let status = agent_status_from_event(&EventMsg::Error(ErrorEvent {
         message: "boom".to_string(),
         codex_error_info: None,
@@ -643,10 +634,7 @@ async fn on_event_updates_status_from_error() {
 
     let expected = AgentStatus::Errored("boom".to_string());
     assert_eq!(status, Some(expected));
-}
 
-#[tokio::test]
-async fn on_event_updates_status_from_turn_aborted() {
     let status = agent_status_from_event(&EventMsg::TurnAborted(TurnAbortedEvent {
         turn_id: Some("turn-1".to_string()),
         reason: TurnAbortReason::Interrupted,
@@ -657,10 +645,7 @@ async fn on_event_updates_status_from_turn_aborted() {
 
     let expected = AgentStatus::Interrupted;
     assert_eq!(status, Some(expected));
-}
 
-#[tokio::test]
-async fn on_event_updates_status_from_shutdown_complete() {
     let status = agent_status_from_event(&EventMsg::ShutdownComplete);
     assert_eq!(status, Some(AgentStatus::Shutdown));
 }
@@ -1318,15 +1303,13 @@ async fn concurrent_v2_cold_load_is_singleflight_before_residency_impl() {
 
     let second_control = harness.control.clone();
     let second_config = harness.config.clone();
-    let mut second_load = tokio::spawn(async move {
+    let mut second_load = Box::pin(async move {
         second_control
             .ensure_v2_agent_loaded(second_config, target_thread_id)
             .await
     });
     assert!(
-        timeout(Duration::from_millis(50), &mut second_load)
-            .await
-            .is_err(),
+        futures::poll!(second_load.as_mut()).is_pending(),
         "follower should wait for the in-flight cold load"
     );
     assert_eq!(barrier.visits(), 1);
@@ -1340,7 +1323,6 @@ async fn concurrent_v2_cold_load_is_singleflight_before_residency_impl() {
     timeout(Duration::from_secs(10), second_load)
         .await
         .expect("second cold load should finish")
-        .expect("second cold load task should join")
         .expect("second cold load should succeed");
     assert_eq!(barrier.visits(), 1);
     assert_eq!(
@@ -1425,15 +1407,13 @@ async fn concurrent_v2_cold_load_is_singleflight_before_residency_impl() {
         .await
         .expect("failing cold load should reach the test barrier");
     let second_control = harness.control.clone();
-    let mut second_failure = tokio::spawn(async move {
+    let mut second_failure = Box::pin(async move {
         second_control
             .ensure_v2_agent_loaded(failure_config, target_thread_id)
             .await
     });
     assert!(
-        timeout(Duration::from_millis(50), &mut second_failure)
-            .await
-            .is_err(),
+        futures::poll!(second_failure.as_mut()).is_pending(),
         "follower should wait for the failing in-flight cold load"
     );
     failure_barrier.release_one();
@@ -1447,7 +1427,6 @@ async fn concurrent_v2_cold_load_is_singleflight_before_residency_impl() {
     let second_error = timeout(Duration::from_secs(10), second_failure)
         .await
         .expect("second failing cold load should finish")
-        .expect("second failing cold load task should join")
         .expect_err("follower should receive the shared cold-load failure");
     assert_matches!(second_error, CodexErr::AgentLimitReached { max_threads: 0 });
     assert_eq!(failure_barrier.visits(), 1);
@@ -3364,7 +3343,7 @@ fn spawn_agent_fork_last_n_turns_strips_parent_usage_hints() {
 }
 
 #[tokio::test]
-async fn spawn_agent_respects_max_threads_limit() {
+async fn spawn_agent_respects_shared_limit_and_reuses_capacity_after_shutdown() {
     let max_threads = 1usize;
     let (_home, config) = test_config_with_cli_overrides(vec![(
         "agents.max_threads".to_string(),
@@ -3379,13 +3358,14 @@ async fn spawn_agent_respects_max_threads_limit() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let control = manager.agent_control();
+    let cloned = control.clone();
 
     let _ = manager
         .start_thread(config.clone())
         .await
         .expect("start thread");
 
-    let first_agent_id = control
+    let first_agent_id = cloned
         .spawn_agent(
             config.clone(),
             text_input("hello"),
@@ -3396,7 +3376,7 @@ async fn spawn_agent_respects_max_threads_limit() {
 
     let err = control
         .spawn_agent(
-            config,
+            config.clone(),
             text_input("hello again"),
             /*session_source*/ None,
         )
@@ -3414,37 +3394,6 @@ async fn spawn_agent_respects_max_threads_limit() {
         .shutdown_live_agent(first_agent_id)
         .await
         .expect("shutdown agent");
-}
-
-#[tokio::test]
-async fn spawn_agent_releases_slot_after_shutdown() {
-    let max_threads = 1usize;
-    let (_home, config) = test_config_with_cli_overrides(vec![(
-        "agents.max_threads".to_string(),
-        TomlValue::Integer(max_threads as i64),
-    )])
-    .await;
-    let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-        config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-    );
-    let control = manager.agent_control();
-
-    let first_agent_id = control
-        .spawn_agent(
-            config.clone(),
-            text_input("hello"),
-            /*session_source*/ None,
-        )
-        .await
-        .expect("spawn_agent should succeed");
-    let _ = control
-        .shutdown_live_agent(first_agent_id)
-        .await
-        .expect("shutdown agent");
 
     let second_agent_id = control
         .spawn_agent(
@@ -3456,52 +3405,6 @@ async fn spawn_agent_releases_slot_after_shutdown() {
         .expect("spawn_agent should succeed after shutdown");
     let _ = control
         .shutdown_live_agent(second_agent_id)
-        .await
-        .expect("shutdown agent");
-}
-
-#[tokio::test]
-async fn spawn_agent_limit_shared_across_clones() {
-    let max_threads = 1usize;
-    let (_home, config) = test_config_with_cli_overrides(vec![(
-        "agents.max_threads".to_string(),
-        TomlValue::Integer(max_threads as i64),
-    )])
-    .await;
-    let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-        config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-    );
-    let control = manager.agent_control();
-    let cloned = control.clone();
-
-    let first_agent_id = cloned
-        .spawn_agent(
-            config.clone(),
-            text_input("hello"),
-            /*session_source*/ None,
-        )
-        .await
-        .expect("spawn_agent should succeed");
-
-    let err = control
-        .spawn_agent(
-            config,
-            text_input("hello again"),
-            /*session_source*/ None,
-        )
-        .await
-        .expect_err("spawn_agent should respect shared guard");
-    let CodexErr::AgentLimitReached { max_threads } = err else {
-        panic!("expected CodexErr::AgentLimitReached");
-    };
-    assert_eq!(max_threads, 1);
-
-    let _ = control
-        .shutdown_live_agent(first_agent_id)
         .await
         .expect("shutdown agent");
 }
@@ -4912,6 +4815,13 @@ async fn shutdown_agent_tree_closes_descendants_when_started_at_child_impl() {
         .close_agent(child_thread_id)
         .await
         .expect("child close should succeed");
+
+    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
+    assert_thread_not_loaded(&harness.manager, grandchild_thread_id).await;
+    assert!(
+        harness.manager.get_thread(parent_thread_id).await.is_ok(),
+        "closing the child subtree must leave its parent running"
+    );
 
     let _ = harness
         .control

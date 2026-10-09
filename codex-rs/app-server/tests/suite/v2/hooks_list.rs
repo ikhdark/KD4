@@ -125,68 +125,6 @@ timeout = 5
     Ok(())
 }
 
-#[tokio::test]
-async fn hooks_list_shows_discovered_hook() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    write_user_hook_config(codex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_hooks_list_request(HooksListParams {
-            cwds: vec![cwd.path().to_path_buf()],
-        })
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let HooksListResponse { data } = to_response(response)?;
-    let config_path = AbsolutePathBuf::from_absolute_path(std::fs::canonicalize(
-        codex_home.path().join("config.toml"),
-    )?)?;
-    assert_eq!(
-        data,
-        vec![HooksListEntry {
-            cwd: cwd.path().to_path_buf(),
-            hooks: vec![HookMetadata {
-                key: format!(
-                    "{}:pre_tool_use:v2:sha256:6d5e071f4bc1df089bc6f704aea08fe2e31369e363cac5ec697121bf3b3c4f62:0",
-                    config_path.as_path().display()
-                ),
-                event_name: HookEventName::PreToolUse,
-                handler_type: HookHandlerType::Command,
-                matcher: Some("Bash".to_string()),
-                command: Some("python3 /tmp/listed-hook.py".to_string()),
-                timeout_sec: 5,
-                status_message: Some("running listed hook".to_string()),
-                source_path: config_path,
-                source: HookSource::User,
-                plugin_id: None,
-                display_order: 0,
-                enabled: true,
-                is_managed: false,
-                current_hash: command_hook_hash(
-                    "pre_tool_use",
-                    Some("Bash"),
-                    "python3 /tmp/listed-hook.py",
-                    /*timeout_sec*/ 5,
-                    Some("running listed hook"),
-                ),
-                trust_status: HookTrustStatus::Untrusted,
-            }],
-            warnings: Vec::new(),
-            errors: Vec::new(),
-        }]
-    );
-    Ok(())
-}
 
 #[tokio::test]
 async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
@@ -633,6 +571,43 @@ async fn config_batch_write_toggles_user_hook() -> Result<()> {
     .await??;
     let HooksListResponse { data } = to_response(response)?;
     let hook = &data[0].hooks[0];
+    let config_path = AbsolutePathBuf::from_absolute_path(std::fs::canonicalize(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    assert_eq!(
+        data,
+        vec![HooksListEntry {
+            cwd: cwd.path().to_path_buf(),
+            hooks: vec![HookMetadata {
+                key: format!(
+                    "{}:pre_tool_use:v2:sha256:6d5e071f4bc1df089bc6f704aea08fe2e31369e363cac5ec697121bf3b3c4f62:0",
+                    config_path.as_path().display()
+                ),
+                event_name: HookEventName::PreToolUse,
+                handler_type: HookHandlerType::Command,
+                matcher: Some("Bash".to_string()),
+                command: Some("python3 /tmp/listed-hook.py".to_string()),
+                timeout_sec: 5,
+                status_message: Some("running listed hook".to_string()),
+                source_path: config_path,
+                source: HookSource::User,
+                plugin_id: None,
+                display_order: 0,
+                enabled: true,
+                is_managed: false,
+                current_hash: command_hook_hash(
+                    "pre_tool_use",
+                    Some("Bash"),
+                    "python3 /tmp/listed-hook.py",
+                    /*timeout_sec*/ 5,
+                    Some("running listed hook"),
+                ),
+                trust_status: HookTrustStatus::Untrusted,
+            }],
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        }]
+    );
     assert_eq!(hook.enabled, true);
 
     let write_id = mcp

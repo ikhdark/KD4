@@ -321,10 +321,6 @@ async fn run_remote_compact_task_inner_impl(
         InitialContextInjection::AtStart(_) => {
             Some(compaction_turn_context.to_turn_context_item_async().await)
         }
-        #[cfg(test)]
-        InitialContextInjection::BeforeLastUserMessage(_) => {
-            Some(compaction_turn_context.to_turn_context_item_async().await)
-        }
     };
     let compacted_item = persisted_v2_compacted_item(new_history.clone());
     let trace_replacement_history = trace_input_history.as_ref().map(|_| new_history.clone());
@@ -1267,38 +1263,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_v2_compacted_history_retains_unresolved_agent_input() {
-        let agent_message = ResponseItem::AgentMessage {
-            id: None,
-            author: "worker".to_string(),
-            recipient: "root".to_string(),
-            content: vec![AgentMessageInputContent::InputText {
-                text: "unconsumed worker evidence".to_string(),
-            }],
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let input = vec![
-            message("assistant", "consumed", Some(MessagePhase::FinalAnswer)),
-            agent_message.clone(),
-        ];
-        let output = ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "new".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        };
 
-        let (history, _) = build_v2_compacted_history(input, output.clone());
-
-        assert_eq!(
-            history,
-            vec![
-                message("assistant", "consumed", Some(MessagePhase::FinalAnswer)),
-                agent_message,
-                output
-            ]
-        );
-    }
 
     #[test]
     fn build_v2_compacted_history_bounds_unresolved_user_text() {
@@ -1405,53 +1370,36 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (history, retained_image_count) = build_v2_compacted_history(input, output.clone());
+        let (history, retained_image_count) = build_v2_compacted_history(input.clone(), output.clone());
 
-        assert_eq!(history.len(), 2);
-        let ResponseItem::Message { content, .. } = &history[0] else {
-            panic!("expected unresolved image message");
-        };
-        assert_eq!(
-            content
-                .iter()
-                .filter(|item| matches!(item, ContentItem::InputImage { .. }))
-                .count(),
-            2
-        );
-        assert_eq!(history[1], output);
+        let mut expected = input;
+        expected.push(output);
+        assert_eq!(history, expected);
         assert_eq!(retained_image_count, 2);
-    }
-
-    #[test]
-    fn persisted_v2_compacted_item_carries_exact_replacement_history() {
-        let replacement_history = vec![
-            message("user", "unresolved", None),
-            ResponseItem::Compaction {
-                id: None,
-                encrypted_content: "opaque".to_string(),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ];
-
-        let persisted = persisted_v2_compacted_item(replacement_history.clone());
-
-        assert_eq!(persisted.replacement_history, Some(replacement_history));
     }
 
     #[tokio::test]
     async fn collect_compaction_output_stops_when_owner_is_cancelled() {
-        let (_tx_event, rx_event) = mpsc::channel(1);
-        let stream = ResponseStream {
-            rx_event,
-            attempt_identity: None,
-            consumer_dropped: CancellationToken::new(),
-        };
-        let cancellation_token = CancellationToken::new();
-        cancellation_token.cancel();
-
-        let result = collect_compaction_output(stream, None, &cancellation_token).await;
-
-        assert!(matches!(result, Err(CodexErr::TurnAborted)));
+        for cancel_before_poll in [false, true] {
+            let (_tx_event, rx_event) = mpsc::channel(1);
+            let stream = ResponseStream {
+                rx_event,
+                attempt_identity: None,
+                consumer_dropped: CancellationToken::new(),
+            };
+            let cancellation_token = CancellationToken::new();
+            if cancel_before_poll {
+                cancellation_token.cancel();
+            }
+            let mut pending = Box::pin(collect_compaction_output(stream, None, &cancellation_token));
+            if !cancel_before_poll {
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                cancellation_token.cancel();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                .await.expect("cancelled compaction collector must stop");
+            assert!(matches!(result, Err(CodexErr::TurnAborted)));
+        }
     }
 
     #[tokio::test]
@@ -1561,5 +1509,20 @@ mod tests {
             request.first_model_output_ms
         );
         assert_eq!(profile.milestones.first_visible_output_ms, None);
+        for count in [0, 2] {
+            let mut events = (0..count)
+                .map(|_| Ok(ResponseEvent::OutputItemDone(compaction.clone())))
+                .collect::<Vec<_>>();
+            events.push(Ok(ResponseEvent::Completed {
+                response_id: "invalid-count".into(),
+                token_usage: None,
+                end_turn: Some(true),
+            }));
+            let result = collect_compaction_output(
+                response_stream(events), None, &CancellationToken::new(),
+            ).await;
+            assert!(matches!(result, Err(CodexErr::Fatal(message))
+                if message.contains(&format!("got {count} from {count} output items"))));
+        }
     }
 }

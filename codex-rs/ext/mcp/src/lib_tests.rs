@@ -6,10 +6,10 @@ use codex_extension_api::ExtensionDataInit;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn hosted_plugin_runtime_forwards_thread_originator() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn hosted_plugin_runtime_retains_identity_and_originator_across_enablement()
+-> Result<(), Box<dyn std::error::Error>> {
     let codex_home = tempfile::tempdir()?;
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .cli_overrides(vec![
@@ -20,71 +20,36 @@ async fn hosted_plugin_runtime_forwards_thread_originator() -> Result<(), Box<dy
         .await?;
     let thread_init = ExtensionDataInit::new();
     let thread_store = ExtensionData::new("thread");
-
-    let contributions = HostedPluginRuntimeExtension
-        .contribute(McpServerContributionContext::for_step(
-            &config,
-            &thread_init,
-            &thread_store,
-            "codex_work_desktop",
-            /*available_environment_ids*/ &[],
-        ))
-        .await;
-    let [McpServerContribution::Set { config: server, .. }] = contributions.as_slice() else {
-        panic!("hosted plugin runtime should contribute one server");
-    };
-    let McpServerTransportConfig::StreamableHttp { http_headers, .. } = &server.transport else {
-        panic!("hosted plugin runtime should use streamable HTTP");
-    };
-
-    assert_eq!(
-        http_headers
-            .as_ref()
-            .and_then(|headers| headers.get("originator")),
-        Some(&"codex_work_desktop".to_string())
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn disabled_hosted_plugin_runtime_retains_cache_identity()
--> Result<(), Box<dyn std::error::Error>> {
-    let codex_home = tempfile::tempdir()?;
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .cli_overrides(vec![
-            ("features.apps".to_string(), false.into()),
-            ("chatgpt_base_url".to_string(), "https://chatgpt.com".into()),
-        ])
-        .build()
-        .await?;
-    let thread_init = ExtensionDataInit::new();
-    let thread_store = ExtensionData::new("thread");
-    let contributions = HostedPluginRuntimeExtension
-        .contribute(McpServerContributionContext::for_step(
-            &config,
-            &thread_init,
-            &thread_store,
-            "codex_work_desktop",
-            &[],
-        ))
-        .await;
-    let [
-        McpServerContribution::Set {
-            name,
-            config: server,
-        },
-    ] = contributions.as_slice()
-    else {
-        panic!("disabled hosted plugin runtime should retain its server identity");
-    };
-    assert_eq!(name, CODEX_APPS_MCP_SERVER_NAME);
-    assert!(!server.enabled);
-    let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
-        panic!("hosted plugin runtime should use streamable HTTP");
-    };
-    assert_eq!(url, "https://chatgpt.com/backend-api/ps/mcp");
+    for enabled in [true, false] {
+        if enabled {
+            config.features.enable(codex_features::Feature::Apps)?;
+        } else {
+            config.features.disable(codex_features::Feature::Apps)?;
+        }
+        let contributions = HostedPluginRuntimeExtension
+            .contribute(McpServerContributionContext::for_step(
+                &config,
+                &thread_init,
+                &thread_store,
+                "codex_work_desktop",
+                &[],
+            ))
+            .await;
+        let [McpServerContribution::Set { name, config: server }] = contributions.as_slice()
+        else {
+            panic!("hosted plugin runtime should retain exactly one server");
+        };
+        assert_eq!(name, CODEX_APPS_MCP_SERVER_NAME);
+        assert_eq!(server.enabled, enabled);
+        let McpServerTransportConfig::StreamableHttp { url, http_headers, .. } = &server.transport
+        else {
+            panic!("hosted plugin runtime should use streamable HTTP");
+        };
+        assert_eq!(url, "https://chatgpt.com/backend-api/ps/mcp");
+        assert_eq!(
+            http_headers.as_ref().and_then(|headers| headers.get("originator")),
+            Some(&"codex_work_desktop".to_string())
+        );
+    }
     Ok(())
 }

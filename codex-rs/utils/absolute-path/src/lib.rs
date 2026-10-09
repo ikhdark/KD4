@@ -749,36 +749,20 @@ mod tests {
     }
 
     #[test]
-    fn home_directory_root_is_expanded_in_deserialization() {
+    fn home_directory_forms_are_expanded_in_deserialization() {
         let home = home_dir().expect("home directory");
         let temp_dir = tempdir().expect("base dir");
-        let abs_path_buf = {
-            let _guard = AbsolutePathBufGuard::new(temp_dir.path());
-            serde_json::from_str::<AbsolutePathBuf>("\"~\"").expect("failed to deserialize")
-        };
-        assert_eq!(abs_path_buf.as_path(), home.as_path());
-    }
-
-    #[test]
-    fn home_directory_subpath_is_expanded_in_deserialization() {
-        let home = home_dir().expect("home directory");
-        let temp_dir = tempdir().expect("base dir");
-        let abs_path_buf = {
-            let _guard = AbsolutePathBufGuard::new(temp_dir.path());
-            serde_json::from_str::<AbsolutePathBuf>("\"~/code\"").expect("failed to deserialize")
-        };
-        assert_eq!(abs_path_buf.as_path(), home.join("code").as_path());
-    }
-
-    #[test]
-    fn home_directory_double_slash_is_expanded_in_deserialization() {
-        let home = home_dir().expect("home directory");
-        let temp_dir = tempdir().expect("base dir");
-        let abs_path_buf = {
-            let _guard = AbsolutePathBufGuard::new(temp_dir.path());
-            serde_json::from_str::<AbsolutePathBuf>("\"~//code\"").expect("failed to deserialize")
-        };
-        assert_eq!(abs_path_buf.as_path(), home.join("code").as_path());
+        let _guard = AbsolutePathBufGuard::new(temp_dir.path());
+        for raw in ["~", "~/code", "~//code", r"~\code", r"~\/code", r"~/\code"] {
+            // A backslash after `/` is a literal filename character on Unix.
+            if raw == r"~/\code" && !cfg!(windows) {
+                continue;
+            }
+            let input = serde_json::to_string(raw).expect("serialize path");
+            let path: AbsolutePathBuf = serde_json::from_str(&input).expect("deserialize path");
+            let expected = if raw == "~" { home.clone() } else { home.join("code") };
+            assert_eq!(path.as_path(), expected.as_path(), "{raw:?}");
+        }
     }
 
     #[test]
@@ -790,41 +774,6 @@ mod tests {
             .expect_err("missing path should fail canonicalization");
 
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn home_directory_backslash_subpath_is_expanded_in_deserialization() {
-        let home = home_dir().expect("home directory");
-        let temp_dir = tempdir().expect("base dir");
-        let abs_path_buf = {
-            let _guard = AbsolutePathBufGuard::new(temp_dir.path());
-            let input =
-                serde_json::to_string(r#"~\code"#).expect("string should serialize as JSON");
-            serde_json::from_str::<AbsolutePathBuf>(&input).expect("is valid abs path")
-        };
-        assert_eq!(abs_path_buf.as_path(), home.join("code").as_path());
-    }
-
-    #[test]
-    fn home_directory_mixed_separator_run_stays_under_home() {
-        let home = home_dir().expect("home directory");
-        let temp_dir = tempdir().expect("base dir");
-        let _guard = AbsolutePathBufGuard::new(temp_dir.path());
-        let deserialize = |raw: &str| {
-            let input = serde_json::to_string(raw).expect("string should serialize as JSON");
-            serde_json::from_str::<AbsolutePathBuf>(&input).expect("is valid abs path")
-        };
-        // `/` separates on every platform, so it must not root the remainder.
-        assert_eq!(
-            deserialize(r"~\/code").as_path(),
-            home.join("code").as_path()
-        );
-        if cfg!(windows) {
-            assert_eq!(
-                deserialize(r"~/\code").as_path(),
-                home.join("code").as_path()
-            );
-        }
     }
 
     #[test]

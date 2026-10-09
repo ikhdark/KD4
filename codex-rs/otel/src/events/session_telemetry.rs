@@ -1978,22 +1978,20 @@ mod user_prompt_summary_tests {
     }
 
     #[test]
-    fn redacted_prompt_is_counted_without_being_concatenated() {
-        let summary = summarize_user_prompt(&prompt_items(), false);
-
-        assert_eq!(summary.prompt, None);
-        assert_eq!(summary.prompt_length, 11);
-        assert_eq!(summary.text_input_count, 2);
-        assert_eq!(summary.image_input_count, 1);
-        assert_eq!(summary.local_image_input_count, 1);
-    }
-
-    #[test]
-    fn enabled_prompt_logging_preserves_text_concatenation() {
-        let summary = summarize_user_prompt(&prompt_items(), true);
-
-        assert_eq!(summary.prompt.as_deref(), Some("hello world"));
-        assert_eq!(summary.prompt_length, 11);
+    fn prompt_summary_counts_inputs_and_only_concatenates_when_enabled() {
+        for include_prompt in [false, true] {
+            let summary = summarize_user_prompt(&prompt_items(), include_prompt);
+            assert_eq!(
+                summary,
+                UserPromptSummary {
+                    prompt: include_prompt.then(|| "hello world".to_string()),
+                    prompt_length: 11,
+                    text_input_count: 2,
+                    image_input_count: 1,
+                    local_image_input_count: 1,
+                }
+            );
+        }
     }
 
     #[test]

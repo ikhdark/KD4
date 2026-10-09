@@ -86,30 +86,32 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn desired_height_empty() {
-        let footer = UnifiedExecFooter::new();
+    fn render_session_count_transitions() {
+        let mut footer = UnifiedExecFooter::new();
         assert_eq!(footer.desired_height(/*width*/ 40), 0);
-    }
-
-    #[test]
-    fn render_more_sessions() {
-        let mut footer = UnifiedExecFooter::new();
-        footer.set_process_count(1);
+        assert_eq!(footer.summary_text(), None);
+        assert!(!footer.set_process_count(0));
         let width = 50;
-        let height = footer.desired_height(width);
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
-        footer.render(Rect::new(0, 0, width, height), &mut buf);
-        assert_snapshot!("render_more_sessions", format!("{buf:?}"));
-    }
-
-    #[test]
-    fn render_many_sessions() {
-        let mut footer = UnifiedExecFooter::new();
-        footer.set_process_count(123);
-        let width = 50;
-        let height = footer.desired_height(width);
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
-        footer.render(Rect::new(0, 0, width, height), &mut buf);
-        assert_snapshot!("render_many_sessions", format!("{buf:?}"));
+        for (count, snapshot, summary) in [
+            (1, "render_more_sessions", "1 background terminal running · /ps to view · /stop to close"),
+            (123, "render_many_sessions", "123 background terminals running · /ps to view · /stop to close"),
+        ] {
+            assert!(footer.set_process_count(count));
+            assert!(!footer.set_process_count(count));
+            assert_eq!(footer.summary_text().as_deref(), Some(summary));
+            assert_eq!(footer.desired_height(width), 1);
+            assert_eq!(footer.desired_height(3), 0);
+            let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+            footer.render(Rect::new(0, 0, width, 1), &mut buf);
+            assert_snapshot!(snapshot, format!("{buf:?}"));
+        }
+        assert!(footer.set_process_count(0));
+        assert!(footer.is_empty());
+        assert_eq!(footer.summary_text(), None);
+        assert_eq!(footer.desired_height(width), 0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+        let empty = buf.clone();
+        footer.render(Rect::new(0, 0, width, 1), &mut buf);
+        assert_eq!(buf, empty);
     }
 }

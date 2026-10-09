@@ -630,13 +630,10 @@ trust_level = "untrusted"
         let mut pairs = Vec::new();
         flatten_toml_key_values(&config, None, &mut pairs);
         assert_eq!(
-            pairs
-                .iter()
-                .map(|(key, _)| key.as_str())
-                .collect::<Vec<_>>(),
+            pairs,
             vec![
-                "projects.a.b.trust_level",
-                "projects.\"a.b\\\"c\\nd\".trust_level"
+                ("projects.a.b.trust_level".to_string(), "\"untrusted\"".to_string()),
+                ("projects.\"a.b\\\"c\\nd\".trust_level".to_string(), "\"trusted\"".to_string()),
             ]
         );
     }
@@ -1139,26 +1136,15 @@ approval_policy = "never"
     }
 
     #[test]
-    fn session_all_proxy_url_uses_socks_when_enabled() {
-        assert_eq!(
-            session_all_proxy_url(
-                "127.0.0.1:3128",
-                "127.0.0.1:8081",
-                /*socks_enabled*/ true
-            ),
-            "socks5h://127.0.0.1:8081".to_string()
-        );
-    }
-
-    #[test]
-    fn session_all_proxy_url_uses_http_when_socks_disabled() {
-        assert_eq!(
-            session_all_proxy_url(
-                "127.0.0.1:3128",
-                "127.0.0.1:8081",
-                /*socks_enabled*/ false
-            ),
-            "http://127.0.0.1:3128".to_string()
-        );
+    fn session_all_proxy_url_follows_socks_setting() {
+        for (socks_enabled, expected) in [
+            (true, "socks5h://127.0.0.1:8081"),
+            (false, "http://127.0.0.1:3128"),
+        ] {
+            assert_eq!(
+                session_all_proxy_url("127.0.0.1:3128", "127.0.0.1:8081", socks_enabled),
+                expected
+            );
+        }
     }
 }

@@ -1605,30 +1605,48 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_allow_managed_hooks_only() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_managed_hooks_only = true
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_managed_hooks_only, Some(true));
-        assert!(!requirements.is_empty());
+    fn boolean_requirements_preserve_explicit_false_and_independent_fields() -> Result<()> {
+        assert!(ConfigRequirementsToml::default().is_empty());
+        for key in [
+            "allow_managed_hooks_only",
+            "allow_appshots",
+            "allow_remote_control",
+        ] {
+            for value in [false, true] {
+                let config: ConfigRequirementsToml = from_str(&format!("{key} = {value}"))?;
+                let expected = match key {
+                    "allow_managed_hooks_only" => [Some(value), None, None],
+                    "allow_appshots" => [None, Some(value), None],
+                    _ => [None, None, Some(value)],
+                };
+                assert_eq!(
+                    [
+                        config.allow_managed_hooks_only,
+                        config.allow_appshots,
+                        config.allow_remote_control
+                    ],
+                    expected,
+                    "{key} = {value}"
+                );
+                assert!(!config.is_empty());
+                let sourced = with_unknown_source(config);
+                assert!(!sourced.is_empty());
+                let requirements = ConfigRequirements::try_from(sourced)?;
+                assert_eq!(
+                    [
+                        requirements.allow_managed_hooks_only,
+                        requirements.allow_appshots,
+                        requirements.allow_remote_control
+                    ],
+                    expected
+                        .map(|value| value
+                            .map(|value| Sourced::new(value, RequirementSource::Unknown)))
+                );
+            }
+        }
         Ok(())
     }
 
-    #[test]
-    fn allow_managed_hooks_only_false_is_still_configured() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_managed_hooks_only = false
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_managed_hooks_only, Some(false));
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
 
     #[test]
     fn deserialize_managed_permission_profiles() -> Result<()> {
@@ -1664,29 +1682,17 @@ mod tests {
             .as_ref()
             .expect("managed permission profiles");
         assert!(permissions.profiles.contains_key("managed-standard"));
-        assert!(
+        assert_eq!(
             permissions
                 .profiles
                 .get("managed-build")
-                .and_then(|profile| profile.extends.as_deref())
-                .is_some()
+                .and_then(|profile| profile.extends.as_deref()),
+            Some("managed-standard")
         );
         assert!(!requirements.is_empty());
         Ok(())
     }
 
-    #[test]
-    fn deserialize_allow_appshots() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_appshots = true
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_appshots, Some(true));
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
 
     #[test]
     fn filesystem_requirements_table_cannot_define_a_permission_profile() {
@@ -1706,31 +1712,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allow_appshots_false_is_still_configured() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_appshots = false
-            "#,
-        )?;
 
-        assert_eq!(requirements.allow_appshots, Some(false));
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn allow_remote_control_false_is_still_configured() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_remote_control = false
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_remote_control, Some(false));
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
 
     #[test]
     fn deserialize_computer_use_requirements() -> Result<()> {
@@ -1777,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_unset_fields_copies_every_field_and_sets_sources() {
+    fn merge_unset_fields_copies_configured_fields_and_sets_sources() {
         let mut target = ConfigRequirementsWithSources::default();
         let source = RequirementSource::LegacyManagedConfigTomlFromMdm;
 
@@ -1881,52 +1863,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn merge_unset_fields_fills_missing_values() -> Result<()> {
-        let source: ConfigRequirementsToml = from_str(
-            r#"
-                allowed_approval_policies = ["on-request"]
-            "#,
-        )?;
-
-        let source_location = RequirementSource::MdmManagedPreferences {
-            domain: "com.codex".to_string(),
-            key: "allowed_approval_policies".to_string(),
-        };
-
-        let mut empty_target = ConfigRequirementsWithSources::default();
-        empty_target.merge_unset_fields(source_location.clone(), source);
-        assert_eq!(
-            empty_target,
-            ConfigRequirementsWithSources {
-                allowed_approval_policies: Some(Sourced::new(
-                    vec![AskForApproval::OnRequest],
-                    source_location,
-                )),
-                allowed_sandbox_modes: None,
-                allowed_permission_profiles: None,
-                default_permissions: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                allow_appshots: None,
-                allow_remote_control: None,
-                computer_use: None,
-                windows: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                marketplaces: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-                models: None,
-            }
-        );
-        Ok(())
-    }
 
     #[test]
     fn merge_unset_fields_does_not_overwrite_existing_values() -> Result<()> {
@@ -2024,18 +1960,14 @@ mod tests {
         )?;
         let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
 
+        let filesystem = requirements.filesystem.expect("filesystem constraints");
+        assert_eq!(filesystem.source, RequirementSource::Unknown);
+        assert_eq!(filesystem.value.deny_read.len(), 1);
         assert_eq!(
-            requirements.filesystem,
-            Some(Sourced::new(
-                FilesystemConstraints {
-                    deny_read: vec![
-                        FilesystemDenyReadPattern::from_input("./private/**/*.txt")
-                            .expect("normalize glob pattern"),
-                    ],
-                },
-                RequirementSource::Unknown,
-            ))
+            filesystem.value.deny_read[0].as_str(),
+            format!("{}/**/*.txt", temp_dir.join("private").to_string_lossy())
         );
+        assert!(filesystem.value.deny_read[0].contains_glob());
         Ok(())
     }
 
@@ -2149,56 +2081,38 @@ mod tests {
     }
 
     #[test]
-    fn merge_app_requirements_descending_prefers_false_from_lower_precedence() {
-        let mut merged = apps_requirements(&[("connector_123123", Some(true))]);
-        let lower = apps_requirements(&[("connector_123123", Some(false))]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(false))]),
-        );
+    fn merge_app_requirements_descending_preserves_disablement_and_precedence() {
+        for (higher, lower, expected) in [
+            (Some(false), Some(false), Some(false)),
+            (Some(false), Some(true), Some(false)),
+            (Some(true), Some(false), Some(false)),
+            (Some(true), Some(true), Some(true)),
+            (Some(true), None, Some(true)),
+            (Some(false), None, Some(false)),
+            (None, Some(true), Some(true)),
+            (None, Some(false), Some(false)),
+            (None, None, None),
+        ] {
+            let mut merged = apps_requirements(&[("app", higher)]);
+            merge_app_requirements_descending(&mut merged, apps_requirements(&[("app", lower)]));
+            assert_eq!(
+                merged,
+                apps_requirements(&[("app", expected)]),
+                "{higher:?}, {lower:?}"
+            );
+        }
+        for value in [Some(false), Some(true), None] {
+            let expected = apps_requirements(&[("app", value)]);
+            let mut merged = apps_requirements(&[]);
+            merge_app_requirements_descending(&mut merged, expected.clone());
+            assert_eq!(merged, expected);
+            merge_app_requirements_descending(&mut merged, apps_requirements(&[]));
+            assert_eq!(merged, expected);
+        }
     }
 
-    #[test]
-    fn merge_app_requirements_descending_keeps_higher_true_when_lower_is_unset() {
-        let mut merged = apps_requirements(&[("connector_123123", Some(true))]);
-        let lower = apps_requirements(&[("connector_123123", None)]);
 
-        merge_app_requirements_descending(&mut merged, lower);
 
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(true))]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_uses_lower_value_when_higher_missing() {
-        let mut merged = apps_requirements(&[]);
-        let lower = apps_requirements(&[("connector_123123", Some(true))]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(true))]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_preserves_higher_false_when_lower_missing_app() {
-        let mut merged = apps_requirements(&[("connector_123123", Some(false))]);
-        let lower = apps_requirements(&[]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(false))]),
-        );
-    }
 
     #[test]
     fn merge_app_requirements_descending_preserves_higher_tool_approval_mode() {
@@ -2475,69 +2389,50 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_allowed_windows_sandbox_implementations() -> Result<()> {
-        let toml_str = r#"
-            [windows]
-            allowed_sandbox_implementations = ["elevated"]
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
-
-        assert_eq!(
-            requirements.windows_sandbox_mode.value(),
-            Some(WindowsSandboxModeToml::Elevated)
-        );
-        assert!(
-            requirements
-                .windows_sandbox_mode
-                .can_set(&Some(WindowsSandboxModeToml::Elevated))
-                .is_ok()
-        );
-        assert!(
-            requirements
-                .windows_sandbox_mode
-                .can_set(&Some(WindowsSandboxModeToml::Unelevated))
-                .is_err()
-        );
-        assert!(requirements.windows_sandbox_mode.can_set(&None).is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn empty_allowed_windows_sandbox_implementations_is_rejected() -> Result<()> {
-        let toml_str = r#"
-            [windows]
-            allowed_sandbox_implementations = []
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-
+    fn windows_sandbox_requirements_enforce_allowed_modes_and_prefer_elevated() -> Result<()> {
+        use WindowsSandboxModeToml::{Elevated, Unelevated};
+        for (input, expected, modes) in [
+            ("['elevated']", Elevated, vec![Elevated]),
+            ("['unelevated']", Unelevated, vec![Unelevated]),
+            (
+                "['unelevated', 'elevated']",
+                Elevated,
+                vec![Unelevated, Elevated],
+            ),
+        ] {
+            let config = from_str(&format!(
+                "[windows]\nallowed_sandbox_implementations = {input}"
+            ))?;
+            let requirements = ConfigRequirements::try_from(with_unknown_source(config))?;
+            assert_eq!(requirements.windows_sandbox_mode.value(), Some(expected));
+            for candidate in [None, Some(Elevated), Some(Unelevated)] {
+                let result = requirements.windows_sandbox_mode.can_set(&candidate);
+                if candidate.is_some_and(|mode| modes.contains(&mode)) {
+                    assert_eq!(result, Ok(()));
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(ConstraintError::InvalidValue {
+                            field_name: "windows.sandbox",
+                            candidate: format!("{candidate:?}"),
+                            allowed: format!("{modes:?}"),
+                            requirement_source: RequirementSource::Unknown,
+                        })
+                    );
+                }
+            }
+        }
+        let config = from_str("[windows]\nallowed_sandbox_implementations = []")?;
         assert_eq!(
             ConfigRequirements::try_from(with_unknown_source(config)),
             Err(ConstraintError::EmptyField {
                 field_name: "windows.allowed_sandbox_implementations".to_string(),
             })
         );
-
         Ok(())
     }
 
-    #[test]
-    fn allowed_windows_sandbox_implementations_prefer_elevated_fallback() -> Result<()> {
-        let toml_str = r#"
-            [windows]
-            allowed_sandbox_implementations = ["unelevated", "elevated"]
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
 
-        assert_eq!(
-            requirements.windows_sandbox_mode.value(),
-            Some(WindowsSandboxModeToml::Elevated)
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn deserialize_allowed_sandbox_modes() -> Result<()> {
@@ -2761,126 +2656,56 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_allowed_web_search_modes() -> Result<()> {
-        let toml_str = r#"
-            allowed_web_search_modes = ["cached"]
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
-
-        assert_eq!(requirements.web_search_mode.value(), WebSearchMode::Cached);
-        assert!(
-            requirements
-                .web_search_mode
-                .can_set(&WebSearchMode::Disabled)
-                .is_ok()
-        );
-        assert_eq!(
-            requirements.web_search_mode.can_set(&WebSearchMode::Live),
-            Err(ConstraintError::InvalidValue {
-                field_name: "web_search_mode",
-                candidate: "Live".into(),
-                allowed: "[Disabled, Cached]".into(),
-                requirement_source: RequirementSource::Unknown,
-            })
-        );
-        assert!(
-            requirements
-                .web_search_mode
-                .can_set(&WebSearchMode::Cached)
-                .is_ok()
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn allowed_web_search_modes_supports_indexed() -> Result<()> {
-        let config: ConfigRequirementsToml = from_str(
-            r#"
-                allowed_web_search_modes = ["indexed"]
-            "#,
-        )?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
-
-        assert_eq!(requirements.web_search_mode.value(), WebSearchMode::Indexed);
-        for mode in [WebSearchMode::Disabled, WebSearchMode::Indexed] {
-            assert!(requirements.web_search_mode.can_set(&mode).is_ok());
+    fn web_search_requirements_enforce_modes_and_choose_the_preferred_default() -> Result<()> {
+        use WebSearchMode::{Cached, Disabled, Indexed, Live};
+        for (input, initial, accepted, allowed) in [
+            (
+                "['cached']",
+                Cached,
+                vec![Disabled, Cached],
+                "[Disabled, Cached]",
+            ),
+            (
+                "['indexed']",
+                Indexed,
+                vec![Disabled, Indexed],
+                "[Disabled, Indexed]",
+            ),
+            ("['disabled']", Disabled, vec![Disabled], "[Disabled]"),
+            ("[]", Disabled, vec![Disabled], "[Disabled]"),
+            ("['live']", Live, vec![Disabled, Live], "[Disabled, Live]"),
+            (
+                "['live', 'indexed', 'cached']",
+                Cached,
+                vec![Disabled, Cached, Indexed, Live],
+                "[Disabled, Cached, Indexed, Live]",
+            ),
+        ] {
+            let config = from_str(&format!("allowed_web_search_modes = {input}"))?;
+            let requirements = ConfigRequirements::try_from(with_unknown_source(config))?;
+            assert_eq!(requirements.web_search_mode.value(), initial);
+            for candidate in [Disabled, Cached, Indexed, Live] {
+                let result = requirements.web_search_mode.can_set(&candidate);
+                if accepted.contains(&candidate) {
+                    assert_eq!(result, Ok(()));
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(ConstraintError::InvalidValue {
+                            field_name: "web_search_mode",
+                            candidate: format!("{candidate:?}"),
+                            allowed: allowed.to_string(),
+                            requirement_source: RequirementSource::Unknown,
+                        })
+                    );
+                }
+            }
         }
-        for mode in [WebSearchMode::Cached, WebSearchMode::Live] {
-            assert_eq!(
-                requirements.web_search_mode.can_set(&mode),
-                Err(ConstraintError::InvalidValue {
-                    field_name: "web_search_mode",
-                    candidate: format!("{mode:?}"),
-                    allowed: "[Disabled, Indexed]".into(),
-                    requirement_source: RequirementSource::Unknown,
-                })
-            );
-        }
-
         Ok(())
     }
 
-    #[test]
-    fn allowed_web_search_modes_allows_disabled() -> Result<()> {
-        let toml_str = r#"
-            allowed_web_search_modes = ["disabled"]
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
 
-        assert_eq!(
-            requirements.web_search_mode.value(),
-            WebSearchMode::Disabled
-        );
-        assert!(
-            requirements
-                .web_search_mode
-                .can_set(&WebSearchMode::Disabled)
-                .is_ok()
-        );
-        assert_eq!(
-            requirements.web_search_mode.can_set(&WebSearchMode::Cached),
-            Err(ConstraintError::InvalidValue {
-                field_name: "web_search_mode",
-                candidate: "Cached".into(),
-                allowed: "[Disabled]".into(),
-                requirement_source: RequirementSource::Unknown,
-            })
-        );
-        Ok(())
-    }
 
-    #[test]
-    fn allowed_web_search_modes_empty_restricts_to_disabled() -> Result<()> {
-        let toml_str = r#"
-            allowed_web_search_modes = []
-        "#;
-        let config: ConfigRequirementsToml = from_str(toml_str)?;
-        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
-
-        assert_eq!(
-            requirements.web_search_mode.value(),
-            WebSearchMode::Disabled
-        );
-        assert!(
-            requirements
-                .web_search_mode
-                .can_set(&WebSearchMode::Disabled)
-                .is_ok()
-        );
-        assert_eq!(
-            requirements.web_search_mode.can_set(&WebSearchMode::Cached),
-            Err(ConstraintError::InvalidValue {
-                field_name: "web_search_mode",
-                candidate: "Cached".into(),
-                allowed: "[Disabled]".into(),
-                requirement_source: RequirementSource::Unknown,
-            })
-        );
-        Ok(())
-    }
 
     #[test]
     fn deserialize_feature_requirements() -> Result<()> {
@@ -3006,6 +2831,10 @@ command = "python3 /enterprise/hooks/pre.py"
         let mut managed_hooks = requirements
             .managed_hooks
             .expect("expected managed hooks requirements");
+        let original = (**managed_hooks).clone();
+        managed_hooks
+            .set(original.clone())
+            .expect("unchanged hooks are allowed");
 
         let err = managed_hooks
             .set(ManagedHooksRequirementsToml {
@@ -3023,6 +2852,7 @@ command = "python3 /enterprise/hooks/pre.py"
                 ..
             }
         ));
+        assert_eq!(&**managed_hooks, &original);
         Ok(())
     }
 

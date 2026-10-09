@@ -1430,7 +1430,9 @@ mod tests {
         fn render(&self, area: Rect, buf: &mut Buffer) {
             for y in area.y..area.y.saturating_add(area.height) {
                 for x in area.x..area.x.saturating_add(area.width) {
-                    if x < buf.area().width && y < buf.area().height {
+                    if x >= buf.area().x && x < buf.area().right()
+                        && y >= buf.area().y && y < buf.area().bottom()
+                    {
                         buf[(x, y)].set_symbol(self.marker);
                     }
                 }
@@ -1452,7 +1454,9 @@ mod tests {
         fn render(&self, area: Rect, buf: &mut Buffer) {
             for y in area.y..area.y.saturating_add(area.height) {
                 for x in area.x..area.x.saturating_add(area.width) {
-                    if x < buf.area().width && y < buf.area().height {
+                    if x >= buf.area().x && x < buf.area().right()
+                        && y >= buf.area().y && y < buf.area().bottom()
+                    {
                         buf[(x, y)].set_symbol(self.marker).set_style(self.style);
                     }
                 }
@@ -1620,7 +1624,13 @@ mod tests {
                         items: vec![SelectionItem {
                             name: id.to_string(),
                             display_shortcut: Some(crate::key_hint::plain(KeyCode::Char('x'))),
-                            actions: vec![Box::new(|tx| tx.send(AppEvent::ManageSkillsClosed))],
+                            actions: vec![Box::new(move |tx| {
+                                tx.send(if id == "alpha" {
+                                    AppEvent::OpenApprovalsPopup
+                                } else {
+                                    AppEvent::ManageSkillsClosed
+                                });
+                            })],
                             dismiss_on_select: true,
                             ..Default::default()
                         }],
@@ -1641,6 +1651,7 @@ mod tests {
         );
         view.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
         assert!(matches!(rx.try_recv(), Ok(AppEvent::ManageSkillsClosed)));
+        assert!(rx.try_recv().is_err());
         assert!(
             view.is_complete(),
             "shortcut must activate the visible tab's item"
@@ -1648,18 +1659,16 @@ mod tests {
     }
 
     #[test]
-    fn renders_blank_line_between_title_and_items_without_subtitle() {
-        let view = make_selection_view(/*subtitle*/ None);
-        assert_snapshot!(
-            "list_selection_spacing_without_subtitle",
-            render_lines(&view)
-        );
-    }
-
-    #[test]
-    fn renders_blank_line_between_subtitle_and_items() {
-        let view = make_selection_view(Some("Switch between Codex approval presets"));
-        assert_snapshot!("list_selection_spacing_with_subtitle", render_lines(&view));
+    fn selection_spacing_snapshots_with_and_without_subtitle() {
+        for (name, subtitle) in [
+            ("list_selection_spacing_without_subtitle", None),
+            (
+                "list_selection_spacing_with_subtitle",
+                Some("Switch between Codex approval presets"),
+            ),
+        ] {
+            assert_snapshot!(name, render_lines(&make_selection_view(subtitle)));
+        }
     }
 
     #[test]
@@ -2033,6 +2042,7 @@ mod tests {
             SelectionViewParams {
                 items: vec![SelectionItem {
                     name: "Plugin".to_string(),
+                    search_value: Some("Plugin".to_string()),
                     toggle: Some(SelectionToggle {
                         is_on: false,
                         action: Box::new(|_enabled, tx: &_| {
@@ -2048,6 +2058,7 @@ mod tests {
             crate::keymap::RuntimeKeymap::defaults().list,
         );
         view.set_search_query("plugin".to_string());
+        assert_eq!(view.selected_actual_idx(), Some(0));
 
         view.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
@@ -2555,7 +2566,7 @@ mod tests {
         let mut missing: Vec<u16> = Vec::new();
         for width in 60..=90 {
             let rendered = render_lines_with_width(&view, width);
-            if !rendered.contains("3.") {
+            if !rendered.contains("3. gpt-4.1-codex") {
                 missing.push(width);
             }
         }
@@ -2565,33 +2576,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn narrow_width_keeps_all_rows_visible() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let desc = "x".repeat(10);
-        let items: Vec<SelectionItem> = (1..=3)
-            .map(|idx| SelectionItem {
-                name: format!("Item {idx}"),
-                description: Some(desc.clone()),
-                dismiss_on_select: true,
-                ..Default::default()
-            })
-            .collect();
-        let view = new_view(
-            SelectionViewParams {
-                title: Some("Debug".to_string()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        );
-        let rendered = render_lines_with_width(&view, /*width*/ 24);
-        assert!(
-            rendered.contains("3."),
-            "third option missing for width 24:\n{rendered}"
-        );
-    }
 
     #[test]
     fn snapshot_model_picker_width_80() {
@@ -2661,34 +2645,20 @@ mod tests {
             },
             tx,
         );
-        assert_snapshot!(
-            "list_selection_narrow_width_preserves_rows",
-            render_lines_with_width(&view, /*width*/ 24)
-        );
+        let rendered = render_lines_with_width(&view, /*width*/ 24);
+        assert!(rendered.contains("3."), "third option missing:\n{rendered}");
+        assert_snapshot!("list_selection_narrow_width_preserves_rows", rendered);
     }
 
     #[test]
-    fn snapshot_auto_visible_col_width_mode_scroll_behavior() {
-        assert_snapshot!(
-            "list_selection_col_width_mode_auto_visible_scroll",
-            render_before_after_scroll_snapshot(ColumnWidthMode::AutoVisible, /*width*/ 96)
-        );
-    }
-
-    #[test]
-    fn snapshot_auto_all_rows_col_width_mode_scroll_behavior() {
-        assert_snapshot!(
-            "list_selection_col_width_mode_auto_all_rows_scroll",
-            render_before_after_scroll_snapshot(ColumnWidthMode::AutoAllRows, /*width*/ 96)
-        );
-    }
-
-    #[test]
-    fn snapshot_fixed_col_width_mode_scroll_behavior() {
-        assert_snapshot!(
-            "list_selection_col_width_mode_fixed_scroll",
-            render_before_after_scroll_snapshot(ColumnWidthMode::Fixed, /*width*/ 96)
-        );
+    fn column_width_mode_scroll_snapshots() {
+        for (name, mode) in [
+            ("list_selection_col_width_mode_auto_visible_scroll", ColumnWidthMode::AutoVisible),
+            ("list_selection_col_width_mode_auto_all_rows_scroll", ColumnWidthMode::AutoAllRows),
+            ("list_selection_col_width_mode_fixed_scroll", ColumnWidthMode::Fixed),
+        ] {
+            assert_snapshot!(name, render_before_after_scroll_snapshot(mode, /*width*/ 96));
+        }
     }
 
     #[test]
@@ -2792,7 +2762,7 @@ mod tests {
     fn side_layout_width_half_falls_back_when_list_would_be_too_narrow() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let view = new_view(
+        let mut view = new_view(
             SelectionViewParams {
                 items: vec![SelectionItem {
                     name: "Item 1".to_string(),
@@ -2811,6 +2781,10 @@ mod tests {
         );
 
         assert_eq!(view.side_layout_width(/*content_width*/ 80), None);
+        // Also exercise the list-width guard independently of the side minimum.
+        view.side_content_min_width = 10;
+        assert_eq!(view.side_layout_width(/*content_width*/ 80), None);
+        assert_eq!(view.side_layout_width(/*content_width*/ 82), Some(40));
     }
 
     #[test]
@@ -2949,5 +2923,7 @@ mod tests {
         let cell = &buf[(area.x + width - 1, area.y)];
         assert_eq!(cell.symbol(), " ");
         assert_eq!(cell.style().bg, Some(Color::Reset));
+        assert!(buf.content.iter().any(|cell| cell.symbol() == "W"),
+            "side content must actually render at a non-zero buffer origin");
     }
 }

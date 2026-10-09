@@ -1096,35 +1096,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_process_start_initializes_and_handles_typed_v2_request() {
-        let client = start_test_client(SessionSource::Cli).await;
-        let response = client
-            .sender()
-            .request(ClientRequest::ConfigRequirementsRead {
-                request_id: RequestId::Integer(1),
-                params: None,
-            })
-            .await
-            .expect("request transport should work")
-            .expect("request should succeed");
-        assert!(response.is_object());
-
-        let parsed: ConfigRequirementsReadResponse =
-            serde_json::from_value(response).expect("response should match v2 schema");
-        assert_eq!(parsed.requirements, None);
-        client
-            .shutdown()
-            .await
-            .expect("in-process runtime should shutdown cleanly");
-    }
-
-    #[tokio::test]
-    async fn in_process_start_uses_requested_session_source_for_thread_start() {
+    async fn in_process_start_handles_typed_requests_and_preserves_session_source() {
         for (requested_source, expected_source) in [
             (SessionSource::Cli, ApiSessionSource::Cli),
             (SessionSource::Exec, ApiSessionSource::Exec),
         ] {
             let client = start_test_client(requested_source).await;
+            assert!(client.initialize_response().is_some());
+            let response = client
+                .sender()
+                .request(ClientRequest::ConfigRequirementsRead {
+                    request_id: RequestId::Integer(1),
+                    params: None,
+                })
+                .await
+                .expect("request transport should work")
+                .expect("request should succeed");
+            assert!(response.is_object());
+
+            let parsed: ConfigRequirementsReadResponse =
+                serde_json::from_value(response).expect("response should match v2 schema");
+            assert_eq!(parsed.requirements, None);
+
             let response = client
                 .sender()
                 .request(ClientRequest::ThreadStart {

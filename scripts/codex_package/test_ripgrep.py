@@ -44,7 +44,7 @@ class RipgrepResolverTest(unittest.TestCase):
             "fetch_dotslash_executable",
             return_value=expected,
         ) as fetch:
-            actual = ripgrep.fetch_rg(spec)
+            actual = ripgrep.resolve_rg_bin(spec, None)
 
         self.assertEqual(actual, expected)
         fetch.assert_called_once_with(

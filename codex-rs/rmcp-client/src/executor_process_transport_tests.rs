@@ -206,9 +206,12 @@ async fn stdout_messages_larger_than_a_diagnostic_line_are_delivered() {
     let message = serde_json::to_value(message).unwrap();
     assert_eq!(message["id"], 1);
     assert_eq!(
-        message["result"]["content"][0]["text"]
-            .as_str()
-            .map(str::len),
-        Some(text.len())
+        message["result"]["content"][0]["text"].as_str(),
+        Some(text.as_str())
+    );
+    transport.recover_lagged_events().await.unwrap();
+    assert!(
+        transport.take_stdout_message(false).is_none(),
+        "replayed event sequences must not deliver duplicate messages"
     );
 }

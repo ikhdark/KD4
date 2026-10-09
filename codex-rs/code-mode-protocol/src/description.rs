@@ -40,40 +40,22 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parse_exec_source_without_pragma() {
-        assert_eq!(
-            parse_exec_source("text('hi')").unwrap(),
-            ParsedExecSource {
-                code: "text('hi')",
-                max_output_tokens: None,
-                deliver: false,
-                persist: false,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_exec_source_with_pragma() {
-        assert_eq!(
-            parse_exec_source("// @exec: {\"yield_time_ms\": 10}\ntext('hi')").unwrap(),
-            ParsedExecSource {
-                code: "text('hi')",
-                max_output_tokens: None,
-                deliver: false,
-                persist: false,
-            }
-        );
-    }
-
-    #[test]
     fn parse_exec_source_borrows_the_selected_source_slice() {
-        let input = String::from("// @exec: {\"max_output_tokens\": 20}\ntext('borrowed')");
-        let parsed = parse_exec_source(&input).expect("pragma should parse");
-        let rest_offset = input.find("text('borrowed')").expect("source should exist");
-
-        assert_eq!(parsed.code, "text('borrowed')");
-        assert_eq!(parsed.code.as_ptr(), input[rest_offset..].as_ptr());
-        assert_eq!(parsed.max_output_tokens, Some(20));
+        for (prefix, max_output_tokens) in [
+            ("", None),
+            ("// @exec: {\"yield_time_ms\": 10}\n", None),
+            ("// @exec: {\"max_output_tokens\": 20}\n", Some(20)),
+        ] {
+            let input = format!("{prefix}text('borrowed')");
+            let parsed = parse_exec_source(&input).expect("source should parse");
+            assert_eq!(parsed, ParsedExecSource {
+                code: "text('borrowed')",
+                max_output_tokens,
+                deliver: false,
+                persist: false,
+            });
+            assert_eq!(parsed.code.as_ptr(), input[prefix.len()..].as_ptr());
+        }
     }
 
     #[test]
@@ -720,19 +702,7 @@ mod tests {
         assert!(!description.contains("unresolved $ref"));
     }
 
-    #[test]
-    fn pragma_data_errors_do_not_blame_an_unrelated_field() {
-        let error = parse_exec_source("// @exec: {\"yield_time_ms\": -1}\ntext('hi')").unwrap_err();
-        assert!(error.contains("invalid field value"));
-        assert!(error.contains("-1"));
-        assert!(!error.contains("max_output_tokens"));
-        let error = parse_exec_source(
-            "// @exec: {\"max_output_tokens\": 1, \"max_output_tokens\": 2}\ntext('hi')",
-        )
-        .unwrap_err();
-        assert!(error.contains("duplicate field"));
-        assert!(!error.contains("must be a non-negative safe integer"));
-    }
+
 
     #[test]
     fn declarations_bound_acyclic_reference_expansion_and_large_literals() {

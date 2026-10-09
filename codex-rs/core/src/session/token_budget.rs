@@ -398,6 +398,7 @@ mod tests {
 
     #[test]
     fn experimental_context_requires_eligible_chatgpt_subscription() {
+        assert!(!experimental_context_is_eligible(AuthMode::Chatgpt, None));
         for (auth_mode, plan_type, expected) in [
             (AuthMode::Chatgpt, PlanType::Plus, true),
             (AuthMode::Chatgpt, PlanType::Pro, true),

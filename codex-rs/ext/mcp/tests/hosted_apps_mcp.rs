@@ -174,8 +174,10 @@ async fn disabled_apps_prevent_calls_and_retain_installed_endpoint_identity() ->
                 .get(CODEX_APPS_MCP_SERVER_NAME)
                 .expect("cached endpoint identity");
             assert!(!server.enabled);
-            let serialized = serde_json::to_string(server)?;
-            assert!(!serialized.contains("https://example.com/mcp"));
+            let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
+                panic!("cached endpoint should retain streamable HTTP transport");
+            };
+            assert_eq!(url, "https://chatgpt.com/backend-api/ps/mcp");
         } else {
             assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
         }

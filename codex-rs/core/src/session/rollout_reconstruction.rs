@@ -330,9 +330,8 @@ fn collect_resume_handles(
             })
         })
     }
-    let mut found = false;
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        found |= collect_command_receipt_handle(&value, handles);
+    let collect = |value: &serde_json::Value, handles: &mut std::collections::BTreeMap<u32, Option<String>>| {
+        let mut found = collect_command_receipt_handle(value, handles);
         if nested {
             for pointer in [
             "/nested_commands",
@@ -342,6 +341,11 @@ fn collect_resume_handles(
                 found |= value.pointer(pointer).is_some_and(|states| live(states, handles));
             }
         }
+        found
+    };
+    let mut found = false;
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        found |= collect(&value, handles);
         // A single JSON record was fully handled above. Re-parsing the same
         // potentially large tool receipt as a JSON line adds no new handles.
         if !text.contains('\n') {
@@ -351,7 +355,7 @@ fn collect_resume_handles(
     // Current code-mode packets print each process receipt as its own JSON line.
     for line in text.lines() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            found |= collect_command_receipt_handle(&value, handles);
+            found |= collect(&value, handles);
         }
         let status = line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
             .or_else(|| nested.then(|| line.strip_prefix("Running command session_id: ")).flatten());

@@ -32,7 +32,22 @@ class ToolResultAuditTest(unittest.TestCase):
         add("response_item", {"type": "function_call_output", "output": "pending"})
 
         report = execution_context_audit(records)
+        self.assertEqual([turn["turn_id"] for turn in report["turns"]], ["first", "second"])
+        self.assertEqual(
+            [(output["record"], output["bytes"]) for output in report["tool_outputs"]],
+            [(line, len(row["payload"]["output"].encode())) for line, row, _ in records
+             if row["payload"].get("type") == "function_call_output"],
+        )
         for turn in report["turns"]:
+            self.assertEqual(
+                [(request["sampling_request_id"], request["boundary_record"])
+                 for request in turn["rounds"]],
+                [(f"{turn['turn_id']}-{index}", next(
+                    (line for line, row, _ in records
+                     if row["payload"].get("sampling_request_id") == f"{turn['turn_id']}-{index}"),
+                    None,
+                )) for index in order],
+            )
             previous = 0
             for request in turn["rounds"]:
                 boundary = request["boundary_record"]
@@ -71,6 +86,12 @@ class ToolResultAuditTest(unittest.TestCase):
         with mock.patch("scripts.tool_result_audit.difflib.SequenceMatcher",
                         side_effect=AssertionError("unnecessary quadratic comparison")):
             outputs = execution_context_audit(records)["tool_outputs"]
+        self.assertEqual(len(outputs), len(records))
+        self.assertEqual([o["repeated_block_bytes"] for o in outputs[:-1]], [0] * 101)
+        self.assertEqual(outputs[-1]["matching_blocks"], [{
+            "prior_record": 101, "start_line": 1, "lines": 1600,
+            "bytes": len(source.encode()),
+        }])
         self.assertEqual(outputs[-1]["repeated_block_bytes"], len(source.encode()))
         self.assertTrue(all(o["matching_blocks_coverage"]["complete"] for o in outputs))
 
@@ -385,6 +406,44 @@ class ToolResultAuditTest(unittest.TestCase):
         rows.append((3, {"type": "event_msg", "payload": {"type": "token_count", "info": None}}, 0))
         self.assertEqual(reconciliation()["last_token_count"]["record"], 2)
 
+    def test_partial_usage_does_not_invent_uncached_totals_or_complete_reconciliation(self):
+        complete = {"inputTokens": 100, "cachedInputTokens": 80,
+                    "visibleOutputTokens": 7, "reasoningTokens": 3, "totalTokens": 110}
+        cumulative = {"input_tokens": 100, "cached_input_tokens": 80,
+                      "output_tokens": 10, "reasoning_output_tokens": 3, "total_tokens": 110}
+        # A missing request's contribution is unknown even if observed sums
+        # happen to equal the cumulative event. Missing cache usage is not zero.
+        cases = [
+            ([{"inputTokens": 100}], None, "partial_match"),
+            ([{"cachedInputTokens": 80}], None, "partial_match"),
+            ([{"visibleOutputTokens": 7}], None, "unavailable"),
+            ([complete, {}], None, "unavailable"),
+            ([complete, {"inputTokens": 0}], None, "partial_match"),
+            ([complete], 20, "matched"),
+            ([{"inputTokens": 0, "cachedInputTokens": 0}], 0, "different"),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "partial.jsonl"
+            for usages, uncached, status in cases:
+                with self.subTest(usages=usages):
+                    rows = [
+                        {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t",
+                            "timing": {"modelRequests": [
+                                {"samplingRequestId": str(i), "tokenUsage": tokens}
+                                for i, tokens in enumerate(usages)
+                            ]}}},
+                        {"type": "event_msg", "payload": {"type": "token_count",
+                            "info": {"total_token_usage": cumulative}}},
+                    ]
+                    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                    context = audit(path)["execution_context"]
+                    self.assertEqual(context["provider_uncached_input_tokens"], uncached)
+                    self.assertEqual(context["provider_usage_reconciliation"]["status"], status)
+                    if usages == [complete, {}]:
+                        self.assertEqual(context["provider_usage_totals"], complete)
+                        self.assertEqual(context["coverage"]["requests_without_usage"], 1)
+                        self.assertEqual(context["provider_usage_reconciliation"]["request_minus_cumulative"], {})
+
     def test_exact_bytes_references_and_mentions_are_not_conflated(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -620,6 +679,15 @@ class CompactAuditReportTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp:
             _, report = self.fixture(Path(temp))
+            # Put the largest rows late and out of size order. Equal-size-only
+            # fixtures cannot distinguish ranking from unchanged input order.
+            for session_index, result_index, size in ((0, 5, 6000), (2, 3, 9000), (11, 7, 9000)):
+                session = report["sessions"][session_index]
+                row = session["results"][result_index]
+                row["visible_bytes"] = size
+                row["visible_estimated_tokens"] = (size + 3) // 4
+                for field in ("visible_bytes", "visible_estimated_tokens"):
+                    session["summary"][field] = sum(row[field] for row in session["results"])
             original = encoded(report)
             digest = hashlib.sha256(original).hexdigest()
             summary = compact_report(report, Path(temp) / "ledger.json", digest,
@@ -646,8 +714,11 @@ class CompactAuditReportTest(unittest.TestCase):
                     if "visible_estimated_tokens" in item:
                         self.assertEqual(item["visible_bytes"], value["visible_bytes"])
             # Equal-size ties use report order, including across session boundaries.
-            self.assertEqual(summary["largest_results"]["items"][0]["pointer"],
-                             "/sessions/0/results/0")
+            for field in ("largest_results", "follow_up_candidates"):
+                self.assertEqual(
+                    [item["pointer"] for item in summary[field]["items"]],
+                    ["/sessions/2/results/3", "/sessions/11/results/7"],
+                )
             for limit in (0, 11):
                 with self.assertRaises(ValueError):
                     compact_report(report, Path(temp), digest, len(original), limit)

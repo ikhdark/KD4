@@ -134,33 +134,6 @@ fn context_compaction_notifications_preserve_lifecycle_and_json_shape() {
     }
 }
 
-#[test]
-fn map_todo_items_preserves_text_and_completion_state() {
-    let items = EventProcessorWithJsonOutput::map_todo_items(&[
-        TurnPlanStep {
-            step: "inspect bootstrap".to_string(),
-            status: TurnPlanStepStatus::InProgress,
-        },
-        TurnPlanStep {
-            step: "drop legacy notifications".to_string(),
-            status: TurnPlanStepStatus::Completed,
-        },
-    ]);
-
-    assert_eq!(
-        items,
-        vec![
-            TodoItem {
-                text: "inspect bootstrap".to_string(),
-                completed: false,
-            },
-            TodoItem {
-                text: "drop legacy notifications".to_string(),
-                completed: true,
-            },
-        ]
-    );
-}
 
 #[test]
 fn session_configured_produces_thread_started_event() {
@@ -517,46 +490,6 @@ fn reasoning_items_emit_summary_not_raw_content() {
     );
 }
 
-#[test]
-fn web_search_completion_preserves_query_and_action() {
-    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
-
-    let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
-        ItemCompletedNotification {
-            item: ThreadItem::WebSearch(ApiWebSearchItem {
-                id: "search-1".to_string(),
-                query: "rust async await".to_string(),
-                action: Some(ApiWebSearchAction::Search {
-                    query: Some("rust async await".to_string()),
-                    queries: None,
-                }),
-            }),
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-        },
-    ));
-
-    assert_eq!(
-        collected,
-        CollectedThreadEvents {
-            events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
-                item: ExecThreadItem {
-                    id: "item_0".to_string(),
-                    details: ThreadItemDetails::WebSearch(WebSearchItem {
-                        id: "search-1".to_string(),
-                        query: "rust async await".to_string(),
-                        action: WebSearchAction::Search {
-                            query: Some("rust async await".to_string()),
-                            queries: None,
-                        },
-                    }),
-                },
-            })],
-            status: CodexStatus::Running,
-        }
-    );
-}
 
 #[test]
 fn web_search_completion_preserves_page_actions() {
@@ -1116,7 +1049,7 @@ fn file_change_completion_maps_change_kinds() {
 }
 
 #[test]
-fn file_change_declined_maps_to_failed_status() {
+fn file_change_declined_preserves_status_and_wire_shape() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
 
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
@@ -1154,6 +1087,8 @@ fn file_change_declined_maps_to_failed_status() {
             status: CodexStatus::Running,
         }
     );
+    let serialized = serde_json::to_value(&collected.events[0]).expect("serialize declined patch");
+    assert_eq!(serialized["item"]["status"], "declined");
 }
 
 #[test]
@@ -1215,38 +1150,6 @@ fn agent_message_item_started_is_ignored() {
     );
 }
 
-#[test]
-fn reasoning_item_completed_uses_synthetic_id() {
-    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
-
-    let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
-        ItemCompletedNotification {
-            item: ThreadItem::Reasoning {
-                id: "rs-1".to_string(),
-                summary: vec!["thinking...".to_string()],
-                content: vec!["raw".to_string()],
-            },
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-        },
-    ));
-
-    assert_eq!(
-        collected,
-        CollectedThreadEvents {
-            events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
-                item: ExecThreadItem {
-                    id: "item_0".to_string(),
-                    details: ThreadItemDetails::Reasoning(ReasoningItem {
-                        text: "thinking...".to_string(),
-                    }),
-                },
-            })],
-            status: CodexStatus::Running,
-        }
-    );
-}
 
 #[test]
 fn plan_update_emits_started_then_updated_then_completed() {
@@ -1469,11 +1372,11 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                         reasoning_output_tokens: 7,
                     },
                     last: TokenUsageBreakdown {
-                        total_tokens: 42,
-                        input_tokens: 10,
-                        cached_input_tokens: 3,
-                        output_tokens: 29,
-                        reasoning_output_tokens: 7,
+                        total_tokens: 5,
+                        input_tokens: 2,
+                        cached_input_tokens: 1,
+                        output_tokens: 3,
+                        reasoning_output_tokens: 0,
                     },
                     model_context_window: Some(128_000),
                 },

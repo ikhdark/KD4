@@ -50,18 +50,10 @@ async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
         ThreadId::from_string("019c2d47-4935-7423-a190-05691f566092").expect("forked id");
     chat.emit_forked_thread_event(forked_from_id, /*fork_parent_title*/ None);
 
-    let history_cell = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await {
-                Some(AppEvent::InsertHistoryCell(cell)) => break cell,
-                Some(_) => continue,
-                None => panic!("app event channel closed before forked thread history was emitted"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for forked thread history");
-    let combined = lines_to_single_string(&history_cell.display_lines(/*width*/ 80));
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let combined = lines_to_single_string(&cells[0]);
+    assert_eq!(combined.matches(&forked_from_id.to_string()).count(), 1);
 
     assert_chatwidget_snapshot!("forked_thread_history_line_without_name", combined);
 }
@@ -109,33 +101,31 @@ fn assert_side_rename_rejected(
 }
 
 #[tokio::test]
-async fn slash_rename_is_rejected_for_side_threads() {
+async fn slash_rename_is_rejected_for_side_threads_with_or_without_args() {
+    for with_args in [false, true] {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_thread_rename_block_message(
         "Side conversations are ephemeral and cannot be renamed.".to_string(),
     );
 
-    chat.dispatch_command(SlashCommand::Rename);
+    if with_args {
+        chat.dispatch_command_with_args(SlashCommand::Rename, "investigate".to_string(), Vec::new());
+    } else {
+        chat.dispatch_command(SlashCommand::Rename);
+    }
     assert_side_rename_rejected(&mut rx, &mut op_rx);
+    }
 }
 
-#[tokio::test]
-async fn slash_rename_with_args_is_rejected_for_side_threads() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_thread_rename_block_message(
-        "Side conversations are ephemeral and cannot be renamed.".to_string(),
-    );
 
-    chat.dispatch_command_with_args(SlashCommand::Rename, "investigate".to_string(), Vec::new());
-    assert_side_rename_rejected(&mut rx, &mut op_rx);
-}
 
 #[tokio::test]
-async fn slash_commands_without_side_flag_are_rejected_for_side_threads() {
+async fn disallowed_slash_commands_are_rejected_for_side_threads() {
+    for (command, name) in [(SlashCommand::Review, "review"), (SlashCommand::Side, "side")] {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_side_conversation_active(/*active*/ true);
 
-    chat.dispatch_command(SlashCommand::Review);
+    chat.dispatch_command(command);
 
     let event = rx
         .try_recv()
@@ -144,9 +134,9 @@ async fn slash_commands_without_side_flag_are_rejected_for_side_threads() {
         AppEvent::InsertHistoryCell(cell) => {
             let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
             assert!(
-                rendered.contains(
-                    "'/review' is unavailable in side conversations. Press Ctrl+C to return to the main thread first."
-                ),
+                rendered.contains(&format!(
+                    "'/{name}' is unavailable in side conversations. Press Ctrl+C to return to the main thread first."
+                )),
                 "expected side conversation slash command error, got {rendered:?}"
             );
         }
@@ -154,43 +144,18 @@ async fn slash_commands_without_side_flag_are_rejected_for_side_threads() {
     }
     assert!(rx.try_recv().is_err(), "expected no follow-up events");
     assert!(op_rx.try_recv().is_err(), "expected no review op");
-}
-
-#[tokio::test]
-async fn slash_side_is_rejected_for_side_threads() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_side_conversation_active(/*active*/ true);
-
-    chat.dispatch_command(SlashCommand::Side);
-
-    let event = rx
-        .try_recv()
-        .expect("expected side conversation slash command error");
-    match event {
-        AppEvent::InsertHistoryCell(cell) => {
-            let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
-            assert!(
-                rendered.contains(
-                    "'/side' is unavailable in side conversations. Press Ctrl+C to return to the main thread first."
-                ),
-                "expected side conversation slash command error, got {rendered:?}"
-            );
-        }
-        other => panic!("expected InsertHistoryCell error, got {other:?}"),
     }
-    assert!(rx.try_recv().is_err(), "expected no follow-up events");
-    assert!(
-        op_rx.try_recv().is_err(),
-        "expected no side conversation op"
-    );
 }
 
+
+
 #[tokio::test]
-async fn slash_side_is_rejected_during_review_mode() {
+async fn side_aliases_are_rejected_during_review_mode() {
+    for (command, name) in [(SlashCommand::Side, "side"), (SlashCommand::Btw, "btw")] {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.review.is_review_mode = true;
 
-    chat.dispatch_command(SlashCommand::Side);
+    chat.dispatch_command(command);
 
     let event = rx
         .try_recv()
@@ -199,7 +164,7 @@ async fn slash_side_is_rejected_during_review_mode() {
         AppEvent::InsertHistoryCell(cell) => {
             let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
             assert!(
-                rendered.contains("'/side' is unavailable while code review is running."),
+                rendered.contains(&format!("'/{name}' is unavailable while code review is running.")),
                 "expected review-mode side conversation error, got {rendered:?}"
             );
         }
@@ -210,34 +175,10 @@ async fn slash_side_is_rejected_during_review_mode() {
         op_rx.try_recv().is_err(),
         "expected no side conversation op"
     );
-}
-
-#[tokio::test]
-async fn slash_btw_is_rejected_during_review_mode() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.review.is_review_mode = true;
-
-    chat.dispatch_command(SlashCommand::Btw);
-
-    let event = rx
-        .try_recv()
-        .expect("expected review-mode btw conversation error");
-    match event {
-        AppEvent::InsertHistoryCell(cell) => {
-            let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
-            assert!(
-                rendered.contains("'/btw' is unavailable while code review is running."),
-                "expected review-mode btw conversation error, got {rendered:?}"
-            );
-        }
-        other => panic!("expected InsertHistoryCell error, got {other:?}"),
     }
-    assert!(rx.try_recv().is_err(), "expected no follow-up events");
-    assert!(
-        op_rx.try_recv().is_err(),
-        "expected no side conversation op"
-    );
 }
+
+
 
 #[tokio::test]
 async fn slash_btw_is_rejected_before_the_session_starts() {
@@ -270,9 +211,9 @@ async fn submit_user_message_as_plain_user_turn_does_not_run_shell_commands() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
 
-    chat.submit_user_message_as_plain_user_turn("!echo hello".into());
+    assert!(matches!(chat.submit_user_message_as_plain_user_turn("!echo hello".into()), Some(Op::UserTurn { .. })));
 
-    match next_submit_op(&mut op_rx) {
+    match op_rx.try_recv().expect("expected plain user turn") {
         Op::UserTurn { items, .. } => assert_eq!(
             items,
             vec![UserInput::Text {
@@ -284,16 +225,18 @@ async fn submit_user_message_as_plain_user_turn_does_not_run_shell_commands() {
             panic!("expected Op::UserTurn for side-conversation shell-like input, got {other:?}")
         }
     }
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[tokio::test]
-async fn slash_side_without_args_starts_empty_side_conversation() {
+async fn side_aliases_without_args_start_empty_side_conversation() {
+    for command in ["/side", "/btw"] {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let parent_thread_id = ThreadId::new();
     chat.thread_id = Some(parent_thread_id);
     chat.on_task_started();
     chat.bottom_pane
-        .set_composer_text("/side".to_string(), Vec::new(), Vec::new());
+        .set_composer_text(command.to_string(), Vec::new(), Vec::new());
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -309,32 +252,10 @@ async fn slash_side_without_args_starts_empty_side_conversation() {
         "bare /side should not submit an op on the parent thread"
     );
     assert!(chat.input_queue.queued_user_messages.is_empty());
+    }
 }
 
-#[tokio::test]
-async fn slash_btw_without_args_starts_empty_side_conversation() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let parent_thread_id = ThreadId::new();
-    chat.thread_id = Some(parent_thread_id);
-    chat.on_task_started();
-    chat.bottom_pane
-        .set_composer_text("/btw".to_string(), Vec::new(), Vec::new());
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert_matches!(
-        rx.try_recv(),
-        Ok(AppEvent::StartSide {
-            parent_thread_id: emitted_parent_thread_id,
-            user_message: None,
-        }) if emitted_parent_thread_id == parent_thread_id
-    );
-    assert!(
-        op_rx.try_recv().is_err(),
-        "bare /btw should not submit an op on the parent thread"
-    );
-    assert!(chat.input_queue.queued_user_messages.is_empty());
-}
 
 #[tokio::test]
 async fn slash_side_requests_forked_side_question_while_task_running() {

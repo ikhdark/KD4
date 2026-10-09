@@ -1132,6 +1132,7 @@ mod tests {
         assert_eq!(reverted.lineage.requirements[&outstanding[0]].text, "Inspect A and B");
         store.restore_with_lineage(Some(reverted.current.clone()), Some(reverted.lineage.clone())).await;
         assert_eq!(store.snapshot_with_lineage().await.unwrap(), (reverted.current, reverted.lineage));
+        assert_eq!(store.execution_snapshot().await.unwrap().obligations.unresolved, outstanding);
     }
 
     #[tokio::test]
@@ -1193,6 +1194,7 @@ mod tests {
         assert!(!update.lineage.active_for_plan(&update.current).requirements.contains_key(&id));
         store.restore_with_lineage(Some(update.current.clone()), Some(update.lineage.clone())).await;
         assert_eq!(store.snapshot_with_lineage().await.unwrap(), (update.current, update.lineage));
+        assert_eq!(store.execution_snapshot().await.unwrap().obligations.superseded, 1);
     }
 
     #[tokio::test]
@@ -1689,51 +1691,20 @@ mod tests {
     #[tokio::test]
     async fn classifies_straight_line_checklist_updates() {
         let store = PlanStore::default();
-
-        assert_eq!(
-            store
-                .update(plan("inspect", StepStatus::InProgress))
-                .await
-                .effect,
-            PlanUpdateEffect::Initial
-        );
-        assert_eq!(
-            store
-                .update(plan("inspect", StepStatus::Completed))
-                .await
-                .effect,
-            PlanUpdateEffect::StatusOnly
-        );
-        assert_eq!(
-            store
-                .update(plan("inspect", StepStatus::Completed))
-                .await
-                .effect,
-            PlanUpdateEffect::NoOp
-        );
-        assert_eq!(
-            store
-                .update(plan("implement", StepStatus::InProgress))
-                .await
-                .effect,
-            PlanUpdateEffect::StructuralRevision
-        );
-    }
-
-    #[tokio::test]
-    async fn explanation_only_update_is_status_only() {
-        let store = PlanStore::default();
-        let mut initial = plan("inspect", StepStatus::InProgress);
-        initial.explanation = Some("first explanation".to_string());
-        assert_eq!(
-            store.update(initial.clone()).await.effect,
-            PlanUpdateEffect::Initial
-        );
-
-        initial.explanation = Some("reworded explanation".to_string());
-        let effect = store.update(initial).await.effect;
-
-        assert_eq!(effect, PlanUpdateEffect::StatusOnly);
+        for (step, status, explanation, effect) in [
+            ("inspect", StepStatus::InProgress, "first explanation", PlanUpdateEffect::Initial),
+            ("inspect", StepStatus::InProgress, "reworded explanation", PlanUpdateEffect::StatusOnly),
+            ("inspect", StepStatus::Completed, "reworded explanation", PlanUpdateEffect::StatusOnly),
+            ("inspect", StepStatus::Completed, "reworded explanation", PlanUpdateEffect::NoOp),
+            ("implement", StepStatus::InProgress, "new work", PlanUpdateEffect::StructuralRevision),
+        ] {
+            let mut expected = plan(step, status);
+            expected.explanation = Some(explanation.to_string());
+            let updated = json_update(&store, serde_json::to_value(&expected).unwrap()).await;
+            assert_eq!(updated.effect, effect);
+            assert_eq!(updated.current, expected);
+            assert_eq!(store.snapshot().await, Some(expected));
+        }
     }
 
     #[tokio::test]
@@ -1760,7 +1731,11 @@ mod tests {
         let store = PlanStore::default();
 
         assert!(store.restore_from_history(&history).await);
-        assert_eq!(store.update(expected).await.effect, PlanUpdateEffect::NoOp);
+        assert_eq!(
+            json_update(&store, serde_json::to_value(&expected).unwrap()).await.effect,
+            PlanUpdateEffect::NoOp
+        );
+        assert_eq!(store.snapshot().await, Some(expected));
     }
 
     #[tokio::test]

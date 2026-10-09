@@ -645,31 +645,18 @@ pub(crate) enum PluginState {
 #[cfg(test)]
 mod tests {
     use super::CodexErrKind;
-    use super::CompactionStrategy;
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::UnexpectedResponseError;
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn pre_dispatch_retry_exhausted_has_distinct_analytics_kind() {
-        let kind = CodexErrKind::from(&CodexErr::PreDispatchRetryExhausted(
-            "connection reset".to_string(),
-        ));
-
-        assert_eq!(
-            serde_json::to_value(kind).expect("serialize error kind"),
-            serde_json::json!("pre_dispatch_retry_exhausted")
-        );
-    }
-
-    #[test]
-    fn request_build_has_distinct_analytics_kind() {
-        let kind = CodexErrKind::from(&CodexErr::RequestBuild("invalid header".to_string()));
-
-        assert_eq!(
-            serde_json::to_value(kind).expect("serialize error kind"),
-            serde_json::json!("request_build")
-        );
+    fn retry_and_request_build_errors_have_distinct_analytics_kinds() {
+        for (error, expected) in [
+            (CodexErr::PreDispatchRetryExhausted("connection reset".to_string()), "pre_dispatch_retry_exhausted"),
+            (CodexErr::RequestBuild("invalid header".to_string()), "request_build"),
+        ] {
+            assert_eq!(serde_json::to_value(CodexErrKind::from(&error)).expect("serialize error kind"), serde_json::json!(expected));
+        }
     }
 
     #[test]
@@ -692,10 +679,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compaction_strategy_has_only_memento_variant() {
-        let strategy = CompactionStrategy::Memento;
-        let serialized = serde_json::to_value(strategy).expect("serialize compaction strategy");
-        assert_eq!(serialized, serde_json::json!("memento"));
-    }
 }

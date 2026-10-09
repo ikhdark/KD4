@@ -163,15 +163,17 @@ mod tests {
 
     #[tokio::test]
     async fn nonterminal_result_reenters_when_pending_input_exists() {
-        let polled = Arc::new(AtomicBool::new(false));
-        let future_polled = Arc::clone(&polled);
-        let reenter = should_reenter_regular_task(&TurnTaskResult::default(), async move {
-            future_polled.store(true, Ordering::Release);
-            true
-        })
-        .await;
+        for pending in [false, true] {
+            let polled = Arc::new(AtomicBool::new(false));
+            let future_polled = Arc::clone(&polled);
+            let reenter = should_reenter_regular_task(&TurnTaskResult::default(), async move {
+                future_polled.store(true, Ordering::Release);
+                pending
+            })
+            .await;
 
-        assert!(reenter);
-        assert!(polled.load(Ordering::Acquire));
+            assert_eq!(reenter, pending);
+            assert!(polled.load(Ordering::Acquire));
+        }
     }
 }

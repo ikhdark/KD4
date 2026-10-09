@@ -43,7 +43,10 @@ def _percentile_from_ordered(ordered: Sequence[float], fraction: float) -> float
 def _number(value: Any, *, nonnegative: bool = True) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError:
+        return None
     if not math.isfinite(result) or (nonnegative and result < 0):
         return None
     return result
@@ -101,7 +104,7 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
     seen_attempts: dict[tuple[str, str, int], dict[str, Any]] = {}
     conflicted_requests: set[str] = set()
     components: list[dict[str, Any]] = []
-    seen_components: set[tuple[Any, ...]] = set()
+    seen_components: dict[tuple[Any, ...], dict[str, Any]] = {}
     for path in paths:
         with path.open(encoding="utf-8") as source:
             for line in source:
@@ -118,7 +121,32 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
                     exclusions[reason] = exclusions.get(reason, 0) + 1
                 else:
                     event_kind, fields = recognized
+                    # JSON containers are not identities/cohort labels. Reject
+                    # them before set/dict joins, without rejecting absent
+                    # legacy fields that still carry partial measurements.
+                    if any(isinstance(fields.get(key), (dict, list)) for key in (
+                        "sampling_request_id", "attempt_id", "retry_index",
+                        "component_kind", "contract_version", "semantic_id", "content_hash",
+                        "model", "provider", "service_tier", "transport", "connection_reused",
+                        "request_kind", "generation_purpose", "generation_disposition", "outcome",
+                    )):
+                        reason = "invalid_identity_fields"
+                        exclusions[reason] = exclusions.get(reason, 0) + 1
+                        continue
                     if event_kind == "component":
+                        # Components require an established physical identity:
+                        # absent IDs cannot join or quarantine legacy attempts.
+                        if not (
+                            isinstance(fields.get("sampling_request_id"), str)
+                            and fields["sampling_request_id"]
+                            and isinstance(fields.get("attempt_id"), str)
+                            and fields["attempt_id"]
+                            and type(fields.get("retry_index")) is int
+                            and fields["retry_index"] >= 0
+                        ):
+                            reason = "invalid_context_component_identity"
+                            exclusions[reason] = exclusions.get(reason, 0) + 1
+                            continue
                         identity = (
                             fields.get("sampling_request_id"),
                             fields.get("attempt_id"),
@@ -127,15 +155,20 @@ def load_jsonl(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], dict[str, i
                             fields.get("semantic_id"),
                             fields.get("content_hash"),
                         )
-                        if identity in seen_components:
+                        previous = seen_components.get(identity)
+                        if previous == fields:
                             exclusions["duplicate_context_component_collapsed"] = (
                                 exclusions.get(
                                     "duplicate_context_component_collapsed", 0
                                 )
                                 + 1
                             )
+                        elif previous is not None:
+                            reason = "conflicting_context_component_duplicate"
+                            exclusions[reason] = exclusions.get(reason, 0) + 1
+                            conflicted_requests.add(fields.get("sampling_request_id"))
                         else:
-                            seen_components.add(identity)
+                            seen_components[identity] = fields
                             components.append(fields)
                         continue
                     identity_values = (

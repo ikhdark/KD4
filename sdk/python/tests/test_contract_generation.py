@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -88,9 +89,22 @@ def test_typed_jsonrpc_error_payloads_are_generated() -> None:
 
 
 def test_public_notification_payload_matches_generated_registry() -> None:
+    # Compare dispatch against its independent wire contract, not just two
+    # generated surfaces that could omit the same notification together.
+    schema_path = (
+        ROOT.parents[1] / "codex-rs/app-server-protocol/schema/json/ServerNotification.json"
+    )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    expected_models = {
+        variant["properties"]["method"]["enum"][0]: getattr(
+            generated_v2, variant["properties"]["params"]["$ref"].rsplit("/", 1)[1]
+        )
+        for variant in schema["oneOf"]
+    }
+    assert NOTIFICATION_MODELS == expected_models
     payload_types = set(get_args(NotificationPayload))
 
-    assert payload_types == set(NOTIFICATION_MODELS.values()) | {UnknownNotification}
+    assert payload_types == set(expected_models.values()) | {UnknownNotification}
     assert ServerInfo not in payload_types
 
 

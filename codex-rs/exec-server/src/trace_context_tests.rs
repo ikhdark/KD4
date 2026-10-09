@@ -28,6 +28,17 @@ fn creates_traceparent_header_from_current_span() {
         let expected = codex_otel::span_w3c_trace_context(&span).expect("span context");
         let headers = span.in_scope(current_trace_context_headers);
         let traceparent = headers.get("traceparent").expect("traceparent header");
+        // These fields come from the supplied parent, not the helper used by
+        // the implementation to serialize its current span.
+        let fields: Vec<_> = traceparent.to_str().expect("valid header").split('-').collect();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], "00");
+        assert_eq!(fields[1], "0123456789abcdef0123456789abcdef");
+        assert_eq!(fields[3], "01");
+        assert_eq!(fields[2].len(), 16);
+        assert!(fields[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(fields[2], "0000000000000000");
+        assert_ne!(fields[2], "0123456789abcdef");
         assert_eq!(
             traceparent.to_str().expect("valid header"),
             expected

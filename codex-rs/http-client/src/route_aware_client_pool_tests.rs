@@ -215,7 +215,10 @@ async fn shared_pool_isolates_concurrent_request_headers_and_cancellation() {
         "https://pending.test/responses",
         |_| std::future::pending::<io::Result<OutboundProxyRoute>>(),
     ));
-    assert!(futures::poll!(&mut cancelled).is_pending());
+    assert!(std::future::Future::poll(
+        cancelled.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ).is_pending());
 
     let request = |address, session: &'static str| {
         let mut request = reqwest::Request::new(

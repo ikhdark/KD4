@@ -594,28 +594,6 @@ async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -
     }
 }
 
-#[tokio::test]
-async fn discovery_reuses_shared_config_storage() {
-    let root = tempfile::tempdir().expect("workspace");
-    let config = Arc::new(
-        make_config(&root, /*limit*/ 4096, /*instructions*/ None)
-            .await
-            .config,
-    );
-    let environments = resolved_local_environments([("local", config.cwd.clone())]);
-    let expected_identity = Arc::as_ptr(&config) as usize;
-    let project_root_markers = effective_project_root_markers(config.as_ref());
-
-    let discovery = discover_project_instructions_with_markers(
-        Arc::clone(&config),
-        &environments,
-        &project_root_markers,
-    )
-    .await;
-
-    assert_eq!(discovery.config_identity(), expected_identity);
-}
-
 async fn make_config_with_fallback(
     root: &TempDir,
     limit: usize,
@@ -678,7 +656,6 @@ async fn no_doc_file_returns_none() {
         res.is_none(),
         "Expected None when AGENTS.md is absent and no system instructions provided"
     );
-    assert!(res.is_none(), "Expected None when AGENTS.md is absent");
 }
 
 #[test]
@@ -1868,7 +1845,8 @@ async fn aggregate_budget_keeps_a_truncated_secondary_doc_utf8_valid() {
         secondary_doc.len() as u64,
         secondary_retained_bytes,
     );
-    let limit = primary_doc.len() + secondary_retained_bytes;
+    // The remaining budget must split a code point, not land on its boundary.
+    let limit = primary_doc.len() + secondary_retained_bytes + 1;
     let config = make_config(&primary, limit, /*instructions*/ None).await;
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
@@ -2487,9 +2465,39 @@ async fn applicable_instruction_loading_has_no_inventory_wait() {
             filesystem: Arc::clone(&LOCAL_FS),
             result: Ok(vec![ProjectDocCandidate { path: PathUri::from_abs_path(&AbsolutePathBuf::try_from(path).unwrap()), size: 42 }]),
         }],
-        config_identity: 0,
     };
     let loaded = tokio::time::timeout(std::time::Duration::from_millis(100),
         load_project_instructions_from_discovery(&config, None, discovery, None)).await.unwrap();
     assert!(loaded.loaded.unwrap().text().contains("Readable primary policy: never modify X"));
+}
+#[tokio::test]
+async fn failed_discovery_preserves_truncated_source_without_charging_generated_notices() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("AGENTS.md");
+    fs::write(&path, "abcdefgh").unwrap();
+    let config = make_config(&root, 4, None).await;
+    let environments = resolved_local_environments([("local", config.cwd.clone())]);
+    let previous = load_project_instructions(&config.config, None, &environments).await;
+    let expected = format!(
+        "## AGENTS.md instructions from {path}\n\nabcd\n\n[Project documentation truncation notice: source path: {path}; original byte count: 8; retained byte count: 4; omitted byte count: 4.]",
+        path = path.display(),
+    );
+    assert_eq!(previous.loaded.as_ref().unwrap().text(), expected);
+    let discovery = ProjectInstructionsDiscovery {
+        environments: vec![EnvironmentProjectInstructionsDiscovery {
+            environment_id: "local".to_string(),
+            cwd: PathUri::from_abs_path(&config.cwd),
+            filesystem: Arc::clone(&LOCAL_FS),
+            result: Err(io::Error::new(io::ErrorKind::PermissionDenied, "discovery failed")),
+        }],
+    };
+    let retained = load_project_instructions_with_fallback(
+        &config.config, None, discovery, None,
+        Some((previous.loaded.as_ref().unwrap(), &previous.retained_sources)),
+    ).await;
+    assert!(!retained.complete);
+    assert_eq!(retained.loaded.unwrap().text(), expected);
+    assert_eq!(retained.retained_sources.len(), 1);
+    assert_eq!(retained.retained_sources[0].read.retained_data, b"abcd");
+    assert_eq!(retained.retained_sources[0].read.original_bytes, 8);
 }

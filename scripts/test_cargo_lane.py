@@ -182,7 +182,9 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{ $glob
         self.assertEqual(config.read_bytes(), source.read_bytes())
         self.assertTrue(marker.exists())
         previous = source.stat()
-        updated = b"[net]\noffline = false\n"
+        # Same length and mtime, different bytes: metadata is not content identity.
+        updated = b"[net]\noffline= false\n"
+        self.assertEqual(len(updated), previous.st_size)
         source.write_bytes(updated)
         os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns))
         invoke()
@@ -519,7 +521,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
     [IO.File]::WriteAllText({ps_single_quote(self.temp_root / f"ready-{index}")}, 'ready')
     while (-not (Test-Path {ps_single_quote(self.temp_root / "release-snapshot")})) {{ Start-Sleep -Milliseconds 20 }}
 }} | Out-Null
-& {ps_single_quote(SCRIPT)} -Lane auto -LanesRoot {ps_single_quote(self.lanes_root)} {ps_single_quote(cargo)} check -p core
+& {ps_single_quote(SCRIPT)} -Lane auto -WarmWaitSeconds 5 -LanesRoot {ps_single_quote(self.lanes_root)} {ps_single_quote(cargo)} check -p core
 """
                 processes.append(
                     subprocess.Popen(
@@ -552,9 +554,12 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         finally:
             (self.temp_root / "release-snapshot").touch()
             (self.temp_root / "release-child").touch()
+            results = []
             for process in processes:
                 out, err = process.communicate(timeout=15)
-                self.assertEqual(process.returncode, 0, out + err)
+                results.append((process.returncode, out + err))
+            for returncode, output in results:
+                self.assertEqual(returncode, 0, output)
 
     def test_reservation_rechecks_cargo_lock_after_active_snapshot(self):
         lane = self.make_lane("late-cargo")
@@ -1016,7 +1021,7 @@ Write-Output 'reservation released'
                     before,
                 )
 
-    def test_lane_names_resolve_to_the_same_directory_as_python(self) -> None:
+    def test_lane_names_obey_independent_safety_and_affinity_cases(self) -> None:
         # PowerShell once validated before trimming "-" and never validated
         # affinity names: "..-" reserved the lanes root's parent, and derived
         # names could enter the cleanup namespace or keep non-ASCII letters.
@@ -1025,27 +1030,35 @@ Write-Output 'reservation released'
             "import os;print('TARGET='+os.environ['CODEX_CARGO_LANE_TARGET_DIR'])"
         )
         cases = [
-            ("..-", []),
-            ("keep-", []),
-            (f"core{kelvin}", []),
-            ("auto", ["-p", "../"]),
-            ("auto", ["-p", "x.trash-20260102030405000"]),
-            ("auto", ["-p", f"a{kelvin}b"]),
+            # Explicit valid names stay literal; non-ASCII explicit names are
+            # rejected. Derived names replace non-ASCII/path separators, but
+            # must still reject parent paths and the cleanup namespace.
+            ("..-", [], "..-"),
+            ("keep-", [], "keep-"),
+            (f"core{kelvin}", [], None),
+            ("auto", ["-p", "../"], None),
+            ("auto", ["-p", "x.trash-20260102030405000"], None),
+            ("auto", ["-p", f"a{kelvin}b"], "a-b"),
         ]
-        for lane, selection in cases:
+        for lane, selection, expected in cases:
             command = [sys.executable, "-c", show_target, *selection]
             # ascii(): unittest reports subtests through the console encoding.
             with self.subTest(lane=ascii(lane), selection=ascii(selection)):
-                try:
-                    with rust_build_status.reserve_cargo_lane(
+                def reserve():
+                    return rust_build_status.reserve_cargo_lane(
                         repo_root=self.temp_root,
                         requested_lane=lane,
                         command=command,
                         lane_root=self.temp_root / "python-lanes",
-                    ) as (expected, _):
-                        pass
-                except ValueError:
-                    expected = None
+                    )
+
+                if expected is None:
+                    with self.assertRaises(ValueError), reserve():
+                        self.fail("unsafe lane name was reserved")
+                else:
+                    with reserve() as (actual, target):
+                        self.assertEqual(actual, expected)
+                        self.assertEqual(target, self.temp_root / "python-lanes" / expected)
                 lanes_before = sorted(p for p in self.lanes_root.iterdir() if p.is_dir())
                 result = self.run_script(
                     "-Lane",
@@ -1882,6 +1895,46 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 )
                 self.assertIn(f"--target-dir {self.lane_path(package)}", result.stdout)
 
+    def test_core_package_selections_share_named_core_lane_in_powershell(self) -> None:
+        # Named core gates and package runs must reuse the shared core-tests
+        # cache, including the isolated-home recipe's PowerShell entrypoint.
+        for selection in (
+            ["-p", "codex-core"],
+            ["-pcodex-core"],
+            ["--package=codex-core"],
+            ["-p", "codex-tui", "-p", "codex-core"],
+        ):
+            for flags, expected in (([], "core-tests"), (["--release"], "core-tests-release")):
+                with self.subTest(selection=selection, flags=flags):
+                    result = self.run_fake_cargo(
+                        "-Lane", "auto", "cargo", "check", *flags, *selection
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [line for line in result.stdout.splitlines() if line.startswith("cargo-args:")],
+                        [f"cargo-args:check --target-dir {self.lane_path(expected)} " + " ".join([*flags, *selection])],
+                    )
+        result = self.run_fake_cargo(
+            "-Lane", "auto", "cargo", "check", "-p", "codex-tui", "--", "-p", "codex-core"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [line for line in result.stdout.splitlines() if line.startswith("cargo-args:")],
+            [f"cargo-args:check --target-dir {self.lane_path('codex-tui')} -p codex-tui -- -p codex-core"],
+        )
+
+        # Sharing the route must also share ownership: an active named gate
+        # cannot be bypassed with a second cold core build or an implicit wait.
+        with rust_build_status.reserve_cargo_lane(
+            repo_root=self.temp_root, lane_root=self.lanes_root,
+            requested_lane="core-tests", command=["cargo", "check"],
+        ):
+            busy = self.run_fake_cargo("-Lane", "auto", "cargo", "check", "-p", "codex-core")
+        self.assertEqual(busy.returncode, 75, busy.stderr)
+        self.assertNotIn("cargo-args:", busy.stdout)
+        self.assertNotIn("waiting up to", busy.stderr)
+        self.assertFalse((self.lanes_root / "core-tests-2").exists())
+
     def test_mismatched_cargo_target_dir_is_rejected(self) -> None:
         package = f"unit-explicit-target-{os.getpid()}"
         explicit_target = self.temp_root / "explicit-target"
@@ -2136,44 +2189,24 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         self.assertIn("check --target-dir", result.stdout)
         self.assertIn(str(self.lanes_root), result.stdout)
 
-    def test_cargo_watch_exec_gets_lane_target_dir(self) -> None:
+    def test_cargo_watch_exec_forms_share_package_lane_target_dir(self) -> None:
         package = f"unit-watch-exec-{os.getpid()}"
-
         result = self.run_fake_cargo(
-            "-Lane",
-            "auto",
-            "cargo",
-            "watch",
-            "-x",
-            f"check -p {package}",
-        )
-
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertIn(f"check -p {package} --target-dir", result.stdout)
-        self.assertIn(self.lane_path(package), result.stdout)
-
-    def test_cargo_watch_exec_equals_gets_lane_target_dir(self) -> None:
-        package = f"unit-watch-equals-{os.getpid()}"
-
-        result = self.run_fake_cargo(
-            "-Lane",
-            "auto",
-            "cargo",
-            "watch",
+            "-Lane", "auto", "cargo", "watch",
+            "-x", f"check -p {package}",
             f"--exec=check -p {package}",
         )
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = self.lane_path(package)
+        # Both exec forms must be rewritten; proving just one target substring
+        # would miss a second command escaping the reserved lane.
+        self.assertIn(
+            f'cargo-args:watch -x "check -p {package} --target-dir {target}" '
+            f'"--exec=check -p {package} --target-dir {target}"',
+            result.stdout,
         )
-        self.assertIn(f"--exec=check -p {package} --target-dir", result.stdout)
-        self.assertIn(self.lane_path(package), result.stdout)
+        self.assertEqual(result.stdout.count("--target-dir"), 2)
 
     def test_cargo_watch_exec_rejects_mismatched_target_dir(self) -> None:
         lane = f"unit-watch-mismatch-{os.getpid()}"
@@ -2648,6 +2681,8 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         self.assertTrue(active_path.exists())
 
     def test_gc_invalid_env_knobs_fall_back_to_defaults(self) -> None:
+        fake_bin = self.fake_python('echo %* >> "%CODEX_TEST_GC_ARGS_LOG%"\r\n')
+        args_log = self.temp_root / "gc-default-args.txt"
         result = self.run_script(
             "-Lane",
             f"unit-env-{os.getpid()}",
@@ -2656,6 +2691,8 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
             "/c",
             "echo ok",
             extra_env={
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "CODEX_TEST_GC_ARGS_LOG": str(args_log),
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "not-a-number",
                 "CODEX_CARGO_LANE_MAX_AGE_DAYS": "not-a-number",
                 "CODEX_CARGO_LANE_MAX_LANE_BYTES": "not-a-number",
@@ -2670,3 +2707,20 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
+        calls = args_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].rstrip().endswith(
+            "prune --skip-disk-report --keep-warm-per-base 1 --max-age-days 7"
+        ), calls[0])
+        # Invalid interval falls back to one hour, not zero (always due).
+        again = self.run_script(
+            "-Lane", "second-default-check",
+            extra_env={
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "CODEX_TEST_GC_ARGS_LOG": str(args_log),
+                "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "not-a-number",
+            },
+            maintenance=True,
+        )
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(args_log.read_text(encoding="utf-8").splitlines(), calls)

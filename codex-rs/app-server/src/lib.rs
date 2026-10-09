@@ -1593,16 +1593,31 @@ mod tests {
     async fn shutdown_force_retires_runtime_owners_with_open_channels() {
         let force = tokio_util::sync::CancellationToken::new();
         force.cancel();
-        let result = super::finish_runtime_task_groups(
-            tokio::spawn(std::future::pending()),
-            tokio::spawn(std::future::pending()),
-            tokio_util::sync::CancellationToken::new(),
-            vec![tokio::spawn(std::future::pending())],
-            force,
-            std::future::pending(),
+        let processor = tokio::spawn(std::future::pending());
+        let outbound = tokio::spawn(std::future::pending());
+        let transport = tokio::spawn(std::future::pending());
+        let owners = [
+            processor.abort_handle(),
+            outbound.abort_handle(),
+            transport.abort_handle(),
+        ];
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::finish_runtime_task_groups(
+                processor,
+                outbound,
+                shutdown.clone(),
+                vec![transport],
+                force,
+                std::future::pending(),
+            ),
         )
-        .await;
-        assert!(result.is_ok());
+        .await
+        .expect("forced shutdown must not wait for blocked owners")
+        .expect("forced cancellation is not a runtime failure");
+        assert!(shutdown.is_cancelled());
+        assert!(owners.iter().all(tokio::task::AbortHandle::is_finished));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1810,21 +1825,13 @@ mod tests {
     }
 
     #[test]
-    fn log_format_from_env_value_matches_json_values_case_insensitively() {
-        assert_eq!(LogFormat::from_env_value(Some("json")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("JSON")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("  Json  ")), LogFormat::Json);
-    }
-
-    #[test]
-    fn log_format_from_env_value_defaults_for_non_json_values() {
-        assert_eq!(
-            LogFormat::from_env_value(/*value*/ None),
-            LogFormat::Default
-        );
-        assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    fn log_format_from_env_value_accepts_only_json_case_insensitively() {
+        for value in ["json", "JSON", "  Json  "] {
+            assert_eq!(LogFormat::from_env_value(Some(value)), LogFormat::Json);
+        }
+        for value in [None, Some(""), Some("text"), Some("jsonl")] {
+            assert_eq!(LogFormat::from_env_value(value), LogFormat::Default);
+        }
     }
 
     #[cfg(debug_assertions)]

@@ -149,14 +149,14 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(process.argv[1], 'utf8');
 const results = [];
-for (const timeout of [false, true]) {
+for (const outcome of ['success', 'timeout', 'unsupported']) {
   const calls = [], errors = [];
   let exitCode;
   try {
     vm.runInNewContext(source, {
       require: () => ({spawnSync: (command, args, options) => {
         calls.push({command, args, options});
-        return timeout ? {error: {code: 'ETIMEDOUT'}} : {status: 0};
+        return outcome === 'timeout' ? {error: {code: 'ETIMEDOUT'}} : {status: outcome === 'unsupported' ? 1 : 0};
       }}),
       process: {argv: ['node', 'run-python.js', 'maintenance.py'], env: {PYTHON: 'chosen-python'}, exit: code => {exitCode = code; throw new Error('exit');}},
       console: {error: message => errors.push(message)},
@@ -173,15 +173,20 @@ console.log(JSON.stringify(results));
             check=True,
             timeout=15,
         )
-        success, timeout = json.loads(result.stdout)
+        success, timeout, unsupported = json.loads(result.stdout)
         self.assertEqual(success["exitCode"], 0)
         self.assertEqual(len(success["calls"]), 2)
         self.assertEqual(success["calls"][0]["options"]["timeout"], 10000)
+        self.assertEqual(success["calls"][0]["command"], "chosen-python")
+        self.assertIn("sys.version_info >= (3, 11)", success["calls"][0]["args"][1])
         self.assertNotIn("timeout", success["calls"][1]["options"])
         self.assertEqual(success["calls"][1]["args"], ["maintenance.py"])
         self.assertEqual(timeout["exitCode"], 1)
         self.assertEqual(len(timeout["calls"]), 1)
         self.assertIn("probe timed out", timeout["errors"][0])
+        self.assertEqual(unsupported["exitCode"], 127)
+        self.assertEqual(len(unsupported["calls"]), 1)
+        self.assertIn("Python 3 was not found", unsupported["errors"][0])
 
     def test_explicit_package_bound_allows_nested_codex_rs_package(self):
         from scripts.rust_packages import nearest_package_root
@@ -769,14 +774,20 @@ function Get-Command($Name) {
             self.skipTest("PowerShell is required for the Windows installer test")
         installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
         with tempfile.TemporaryDirectory() as temp_dir:
+            metadata = Path(temp_dir) / "codex-install.env"
+            metadata.write_text("version=previous\n", encoding="utf-8")
             command = (
-                "$tokens=$null; $errors=$null; "
+                "$ErrorActionPreference='Stop'; $tokens=$null; $errors=$null; "
                 f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
                 "$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Write-InstallMetadata'},$true)[0]; "
                 "Invoke-Expression $fn.Extent.Text; $InstallMetadataFile='codex-install.env'; "
-                "function Move-Item { throw 'injected move failure' }; "
-                f"try {{ Write-InstallMetadata -ReleaseDir {ps_single_quote(Path(temp_dir))} -ResolvedVersion '1' -Target 't' -Layout 'Package' }} catch {{ }}; "
-                f"if (@(Get-ChildItem -LiteralPath {ps_single_quote(Path(temp_dir))} -Filter 'codex-install.env.*').Count -ne 0) {{ exit 9 }}"
+                "$script:moveCalls=0; $script:written=@(); $caught=$false; "
+                "function Move-Item { param($LiteralPath,$Destination,[switch]$Force) "
+                "$script:moveCalls++; $script:written=@(Get-Content -LiteralPath $LiteralPath); throw 'injected move failure' }; "
+                f"try {{ Write-InstallMetadata -ReleaseDir {ps_single_quote(Path(temp_dir))} -ResolvedVersion '1' -Target 't' -Layout 'Package' }} "
+                "catch { if ($_.Exception.Message -cne 'injected move failure') { throw }; $caught=$true }; "
+                "if (-not $caught -or $script:moveCalls -ne 1 -or "
+                "($script:written -join '|') -cne 'version=1|target=t|layout=Package') { exit 8 }"
             )
             completed = run_test_command(
                 [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
@@ -784,6 +795,8 @@ function Get-Command($Name) {
                 capture_output=True,
                 check=False,
             )
+            self.assertEqual(metadata.read_text(encoding="utf-8"), "version=previous\n")
+            self.assertEqual(list(Path(temp_dir).iterdir()), [metadata])
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_windows_installer_detects_unknown_external_codex_conflict(self) -> None:
@@ -1111,13 +1124,42 @@ function Get-Command($Name) {
             )
 
     def test_windows_installer_parses_the_first_nonempty_version_line(self) -> None:
-        powershell_installer = (
-            REPO_ROOT / "scripts" / "install" / "install.ps1"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("$versionLine = @($versionOutput)", powershell_installer)
-        self.assertIn("[regex]::Match($versionLine", powershell_installer)
-        self.assertNotIn("$versionOutput -match", powershell_installer)
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+        installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "version fixture.ps1"
+            command = (
+                "$ErrorActionPreference='Stop'; $tokens=$null; $errors=$null; "
+                f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
+                "$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-VersionFromBinary'},$true)[0]; "
+                "Invoke-Expression $fn.Extent.Text; "
+                f"$actual=Get-VersionFromBinary -CodexPath {ps_single_quote(binary)}; "
+                "@{version=$actual; preference=[string]$ErrorActionPreference} | ConvertTo-Json -Compress"
+            )
+            for lines, exit_code, expected in (
+                (["", "   ", "codex 1.2.3", "codex 9.9.9"], 0, "1.2.3"),
+                (["codex 1.2.3-rc.1+build"], 0, "1.2.3-rc.1+build"),
+                (["warning without a version", "codex 1.2.3"], 0, None),
+                (["", "  "], 0, None),
+                (["codex 1.2.3"], 7, None),
+            ):
+                with self.subTest(lines=lines, exit_code=exit_code):
+                    binary.write_text(
+                        "if ($args.Count -ne 1 -or $args[0] -cne '--version') { throw 'wrong argv' }\n"
+                        + "\n".join(ps_single_quote(line) for line in lines)
+                        + f"\n$global:LASTEXITCODE={exit_code}\n",
+                        encoding="utf-8",
+                    )
+                    completed = run_test_command(
+                        [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(json.loads(completed.stdout), {
+                        "version": expected, "preference": "Stop",
+                    })
 
     def test_windows_installer_uninstall_removes_only_its_path_entry(self) -> None:
         ps = powershell()
@@ -1149,14 +1191,18 @@ function Get-Command($Name) {
             releases = Path(temp_dir) / "releases"
             active = releases / "active"
             incomplete = releases / "incomplete"
-            completed_releases = [releases / f"previous-{index}" for index in range(3)]
+            # Names must disagree with modification time.
+            completed_releases = [releases / name for name in ("z-oldest", "a-middle", "m-newest")]
             for release in (active, incomplete, *completed_releases):
                 release.mkdir(parents=True)
+            # An active completed release must survive even when it is oldest.
+            (active / "codex-install.env").write_text("version=active\n", encoding="utf-8")
+            os.utime(active, (1, 1))
             for index, release in enumerate(completed_releases):
                 (release / "codex-install.env").write_text(
                     "version=1\n", encoding="utf-8"
                 )
-                os.utime(release, (index + 1, index + 1))
+                os.utime(release, (index + 2, index + 2))
 
             command = (
                 "$tokens=$null; $errors=$null; "
@@ -1586,35 +1632,6 @@ function Get-Command($Name) {
             self.assertIn("Unsupported platform", result.stderr)
             self.assertNotIn("\n    at ", result.stderr)
 
-    def test_run_python_enforces_the_supported_interpreter_version(self) -> None:
-        node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is not available")
-        launcher = REPO_ROOT / "scripts" / "run-python.js"
-        self.assertIn(
-            "sys.version_info >= (3, 11)", launcher.read_text(encoding="utf-8")
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            marker = Path(temp_dir) / "selected.txt"
-            script = Path(temp_dir) / "selected.py"
-            script.write_text(
-                "from pathlib import Path\n"
-                f"Path({str(marker)!r}).write_text('ok', encoding='utf-8')\n",
-                encoding="utf-8",
-            )
-            result = run_test_command(
-                [node, str(launcher), str(script)],
-                cwd=REPO_ROOT,
-                env={**os.environ, "PYTHON": sys.executable},
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(marker.read_text(encoding="utf-8"), "ok")
-
     def test_run_python_honors_active_venv_and_explicit_override(self) -> None:
         node = shutil.which("node")
         if node is None:
@@ -1702,7 +1719,7 @@ function Get-Command($Name) {
         self.assertEqual(
             (result.stdout + result.stderr).strip(),
             "just cargo-lane core-tests cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib "
-            "-E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'",
+            "-E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'; exit $LASTEXITCODE",
         )
 
     @unittest.skipUnless(sys.platform == "win32", "Windows protobuf wrapper")
@@ -1866,21 +1883,36 @@ function Get-Command($Name) {
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
             codex_rs_root = repo_root / "codex-rs"
-            source = codex_rs_root / "workspace-file.rs"
-            codex_rs_root.mkdir()
-            (codex_rs_root / "Cargo.toml").write_text(
-                '[workspace]\nmembers = ["crate"]\n',
-                encoding="utf-8",
-            )
-            source.write_text("", encoding="utf-8")
+            # A virtual workspace has no package to select. The nested case
+            # must inspect the manifest, not pass via the codex-rs boundary.
+            for workspace in (codex_rs_root, codex_rs_root / "nested-workspace"):
+                with self.subTest(workspace=workspace):
+                    workspace.mkdir(parents=True, exist_ok=True)
+                    (workspace / "Cargo.toml").write_text(
+                        '[workspace]\nmembers = ["crate"]\n', encoding="utf-8"
+                    )
+                    source = workspace / "workspace-file.rs"
+                    source.touch()
+                    self.assertIsNone(
+                        rust_packages.nearest_package_root(
+                            source, repo_root=repo_root, assume_file=True
+                        )
+                    )
 
-            self.assertIsNone(
-                rust_packages.nearest_package_root(
-                    source,
-                    repo_root=repo_root,
-                    assume_file=True,
-                )
-            )
+                    # A member remains a package even below a virtual manifest.
+                    member = workspace / "crate"
+                    member.mkdir()
+                    (member / "Cargo.toml").write_text(
+                        '[package]\nname = "member"\n', encoding="utf-8"
+                    )
+                    self.assertEqual(
+                        rust_packages.nearest_package_root(
+                            member / "src" / "lib.rs",
+                            repo_root=repo_root,
+                            assume_file=True,
+                        ),
+                        member,
+                    )
 
     def test_formatter_group_decodes_command_output_as_utf8(self) -> None:
         format_script = load_format_module()
@@ -2596,8 +2628,8 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         # own profile or target name as one, so pin it per recipe signature.
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         signature = re.compile(
-            r"^(core-test|core-test-fast|core-test-lane"
-            r"|core-gate|_core-test-reserved|_core-gate-reserved)"
+            r"^(core-test|core-test-fast|core-test-lane|core-test-small"
+            r"|core-gate|_core-test-reserved|_core-test-small-reserved|_core-gate-reserved)"
             r"((?: [^:\n]*)?):[ \t]*$"
         )
         skip = re.compile(r"\$args \| Select-Object -Skip (\d+)")
@@ -2626,9 +2658,11 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
                 "core-test": 2,
                 "core-test-fast": 2,
                 "core-test-lane": 2,
+                "core-test-small": 2,
                 # A `+`/`*` variadic occupies no slot of its own.
                 "core-gate": 1,
                 "_core-test-reserved": 3,
+                "_core-test-small-reserved": 2,
                 "_core-gate-reserved": 1,
             },
         )

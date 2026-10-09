@@ -18,7 +18,9 @@ async fn shared_future_runs_once() {
         Ok(Some(CloudConfigBundle::default()))
     });
 
-    let (first, second) = tokio::join!(loader.get(), loader.get());
+    let cloned = loader.clone();
+    let (first, second) = tokio::join!(loader.get(), cloned.get());
+    assert_eq!(first, Ok(Some(CloudConfigBundle::default())));
     assert_eq!(first, second);
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
@@ -59,7 +61,7 @@ async fn retryable_loader_shares_attempts_and_keeps_the_successful_snapshot() {
 }
 
 #[tokio::test]
-async fn retryable_loader_never_retries_permanent_errors_or_drops_requirements() {
+async fn retryable_loader_caches_permanent_errors() {
     for (code, status) in [
         (CloudConfigBundleLoadErrorCode::Auth, None),
         (CloudConfigBundleLoadErrorCode::InvalidBundle, None),

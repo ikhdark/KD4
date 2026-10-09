@@ -263,6 +263,10 @@ index 1111111..2222222
 ";
 
         let summary = accepted_line_fingerprints_from_unified_diff(diff);
+        assert_eq!(accepted_line_counts_from_unified_diff(diff), AcceptedLineCounts {
+            accepted_added_lines: 3,
+            accepted_deleted_lines: 1,
+        });
 
         assert_eq!(
             summary,
@@ -283,27 +287,6 @@ index 1111111..2222222
         );
     }
 
-    #[test]
-    fn counts_only_parser_ignores_headers_and_counts_hunk_changes() {
-        let diff = "\
-diff --git a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -1,2 +1,3 @@
--old
-+new
-+another
- context
-";
-
-        assert_eq!(
-            accepted_line_counts_from_unified_diff(diff),
-            AcceptedLineCounts {
-                accepted_added_lines: 2,
-                accepted_deleted_lines: 1,
-            }
-        );
-    }
 
     #[test]
     fn skips_added_file_metadata_headers() {

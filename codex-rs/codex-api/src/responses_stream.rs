@@ -983,10 +983,20 @@ mod tests {
                     code == "server_error",
                     "{code}: {mapped:?}"
                 );
-                if code == "future_failure" {
-                    assert!(
-                        matches!(mapped, codex_protocol::error::CodexErr::ProviderFailure { code: Some(ref actual), .. } if actual == code)
-                    );
+                use codex_protocol::error::CodexErr;
+                match (code, mapped) {
+                    ("invalid_image" | "invalid_base64_image", CodexErr::InvalidRequest(message))
+                    | ("cyber_policy", CodexErr::CyberPolicy { message })
+                    | ("server_error", CodexErr::Stream(message, None)) => {
+                        assert_eq!(message, "same message");
+                    }
+                    ("insufficient_quota", CodexErr::QuotaExceeded)
+                    | ("context_length_exceeded", CodexErr::ContextWindowExceeded) => {}
+                    ("future_failure", CodexErr::ProviderFailure { code, message }) => {
+                        assert_eq!(code.as_deref(), Some("future_failure"));
+                        assert_eq!(message, "same message");
+                    }
+                    (code, other) => panic!("wrong error identity for {code}: {other:?}"),
                 }
             }
         }
@@ -1056,6 +1066,7 @@ mod tests {
         for payload in [
             r#"{"type":"response.output_text.delta","delta":"hello"}"#,
             r#"{"delta":"hello","type":"response.output_text.\u0064elta"}"#,
+            r#"{"type":"response.output_text.delta","delta":"hello","obfuscation":"ignored","sequence_number":7}"#,
         ] {
             let events = interpreter
                 .process_payload_with_error_mapper(payload, || {
@@ -1095,6 +1106,7 @@ mod tests {
         assert_eq!(turn_state.get().map(String::as_str), Some("turn-1"));
 
         let events = metadata.initial_events();
+        assert_eq!(events.len(), 4);
         assert!(matches!(&events[0], ResponseEvent::ServerModel(model) if model == "server-model"));
         assert!(matches!(&events[1], ResponseEvent::RateLimits(_)));
         assert!(matches!(&events[2], ResponseEvent::ModelsEtag(etag) if etag == "etag-1"));
@@ -1252,24 +1264,6 @@ mod tests {
         assert_eq!(
             snapshot.primary.map(|window| window.used_percent),
             Some(25.0)
-        );
-    }
-
-    #[test]
-    fn ordinary_stream_event_ignores_unmatched_fields_without_rate_limit_flattening() {
-        let mut interpreter = ResponsesEventInterpreter::new(
-            &ResponsesStreamMetadata::default(),
-            /*turn_state*/ None,
-        );
-
-        let events = interpreter
-            .process_payload(
-                r#"{"type":"response.output_text.delta","delta":"hello","obfuscation":"ignored","sequence_number":7}"#,
-            )
-            .expect("ordinary delta should ignore unmatched transport fields");
-
-        assert!(
-            matches!(events.as_slice(), [ResponseEvent::OutputTextDelta(delta)] if delta == "hello")
         );
     }
 

@@ -74,7 +74,7 @@ fn normalized_summary_path(mut summary: ConversationSummary) -> Result<Conversat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_conversation_summary_by_thread_id_reads_rollout() -> Result<()> {
+async fn get_conversation_summary_resolves_thread_id_and_rollout_paths() -> Result<()> {
     let codex_home = TempDir::new()?;
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -101,19 +101,31 @@ async fn get_conversation_summary_by_thread_id_reads_rollout() -> Result<()> {
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_get_conversation_summary_request(GetConversationSummaryParams::ThreadId {
+    let absolute_path = rollout_path(codex_home.path(), FILENAME_TS, &conversation_id);
+    let relative_path = absolute_path.strip_prefix(codex_home.path())?.to_path_buf();
+    for params in [
+        GetConversationSummaryParams::ThreadId {
             conversation_id: thread_id,
-        })
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: GetConversationSummaryResponse = to_response(response)?;
+        },
+        GetConversationSummaryParams::RolloutPath {
+            rollout_path: relative_path,
+        },
+        GetConversationSummaryParams::RolloutPath {
+            rollout_path: absolute_path,
+        },
+    ] {
+        let request_id = mcp
+            .send_get_conversation_summary_request(params)
+            .await?;
+        let response: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        let received: GetConversationSummaryResponse = to_response(response)?;
 
-    assert_eq!(normalized_summary_path(received.summary)?, expected);
+        assert_eq!(normalized_summary_path(received.summary)?, expected);
+    }
     Ok(())
 }
 
@@ -235,45 +247,6 @@ async fn get_conversation_summary_reads_configured_in_memory_store() -> Result<(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_conversation_summary_by_relative_rollout_path_resolves_from_codex_home() -> Result<()>
-{
-    let codex_home = TempDir::new()?;
-    let conversation_id = create_fake_rollout(
-        codex_home.path(),
-        FILENAME_TS,
-        META_RFC3339,
-        PREVIEW,
-        Some(MODEL_PROVIDER),
-        /*git_info*/ None,
-    )?;
-    let thread_id = ThreadId::from_string(&conversation_id)?;
-    let rollout_path = rollout_path(codex_home.path(), FILENAME_TS, &conversation_id);
-    let relative_path = rollout_path.strip_prefix(codex_home.path())?.to_path_buf();
-    let expected = expected_summary(thread_id, normalized_absolute_path(rollout_path)?);
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_get_conversation_summary_request(GetConversationSummaryParams::RolloutPath {
-            rollout_path: relative_path,
-        })
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: GetConversationSummaryResponse = to_response(response)?;
-
-    assert_eq!(normalized_summary_path(received.summary)?, expected);
-    Ok(())
-}
 
 struct InMemoryThreadStoreId {
     store_id: String,

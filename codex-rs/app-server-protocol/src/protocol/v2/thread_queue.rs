@@ -127,7 +127,7 @@ mod tests {
     fn thread_queue_desktop_requests_round_trip() {
         let input = json!([{"type":"text", "text":"next task", "text_elements":[]}]);
         for (method, params) in [
-            ("list", json!({"threadId":"thread", "cursor":null})),
+            ("list", json!({"threadId":"thread", "cursor":"page", "limit":7})),
             (
                 "add",
                 json!({"threadId":"thread", "input":input, "clientUserMessageId":"client"}),
@@ -142,7 +142,7 @@ mod tests {
             ),
             (
                 "reorder",
-                json!({"threadId":"thread", "queuedSubmissionIds":["item"]}),
+                json!({"threadId":"thread", "queuedSubmissionIds":["second", "first"]}),
             ),
             (
                 "start",
@@ -150,13 +150,14 @@ mod tests {
             ),
         ] {
             let method = format!("thread/queue/{method}");
-            let request: ClientRequest = serde_json::from_value(json!({
+            let wire = json!({
                 "id":1, "method":method, "params":params,
-            }))
-            .expect("Desktop queue request");
+            });
+            let request: ClientRequest = serde_json::from_value(wire.clone())
+                .expect("Desktop queue request");
             let encoded = serde_json::to_value(&request).expect("encode queue request");
-            assert_eq!(encoded["method"], method);
-            assert_eq!(encoded["params"]["threadId"], "thread");
+            assert_eq!(encoded, wire, "{method}");
+            assert_eq!(serde_json::from_value::<ClientRequest>(encoded).unwrap(), request);
             assert!(matches!(request.serialization_scope(),
                 Some(crate::ClientRequestSerializationScope::Thread { thread_id }) if thread_id == "thread"));
         }

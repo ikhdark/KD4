@@ -1489,12 +1489,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_workspace_snapshots_do_not_prove_read_only_execution() {
-        assert_eq!(observed_workspace_identity_changed(Some(&None), None), None);
-        assert_eq!(observed_workspace_identity_changed(None, None), None);
-    }
-
-    #[test]
     fn command_end_does_not_recapture_an_unavailable_workspace_observation() {
         assert!(workspace_identity_capture_required(true, false));
         assert!(!workspace_identity_capture_required(true, true));
@@ -1502,6 +1496,7 @@ mod tests {
         assert!(!workspace_identity_capture_required(false, true));
         // Avoiding a second scan must not upgrade unavailable evidence.
         assert_eq!(observed_workspace_identity_changed(Some(&None), None), None);
+        assert_eq!(observed_workspace_identity_changed(None, None), None);
     }
 
     #[tokio::test]
@@ -1731,7 +1726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_apply_patch_tracks_committed_delta() {
+    async fn declined_and_sandbox_denied_patches_track_committed_delta() {
         let output = ExecToolCallOutput {
             exit_code: 1,
             ..Default::default()
@@ -1744,10 +1739,6 @@ mod tests {
             PatchApplyStatus::Failed,
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn user_declined_apply_patch_tracks_committed_delta() {
         assert_failed_apply_patch_tracks_committed_delta(
             Err(ToolError::Denied("rejected by user".to_string())),
             PatchApplyStatus::Declined,
@@ -1949,12 +1940,8 @@ mod tests {
 
 
     #[tokio::test]
-    async fn patch_after_capture_overlaps_relay_and_flush_joins_it() {
+    async fn patch_after_capture_reuses_only_the_matching_mutation_revision() {
         check_patch_after_capture(false).await;
-    }
-
-    #[tokio::test]
-    async fn patch_after_capture_is_rejected_after_a_later_mutation() {
         check_patch_after_capture(true).await;
     }
 
@@ -2659,12 +2646,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_history_failure_returns_fatal_after_shell_mutation_completion() {
+    async fn tool_history_failure_preserves_shell_and_patch_completion() {
         assert_tool_history_failure_preserves_mutation_completion(false).await;
-    }
-
-    #[tokio::test]
-    async fn tool_history_failure_returns_fatal_after_committed_patch_diff() {
         assert_tool_history_failure_preserves_mutation_completion(true).await;
     }
 }

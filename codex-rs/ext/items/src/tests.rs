@@ -69,22 +69,18 @@ fn web_search_item_preserves_stable_wire_shape() {
 }
 
 #[test]
-fn unknown_extension_kind_is_rejected() {
-    let value = json!({
-        "kind": "image_gen.unknown",
-        "id": "image-1",
-    });
-
-    assert!(serde_json::from_value::<ExtensionItem>(value).is_err());
-}
-
-#[test]
-fn malformed_known_extension_payload_is_rejected() {
-    let value = json!({
-        "kind": "image_gen.generation",
-        "id": "image-1",
-        "status": "completed",
-    });
-
-    assert!(serde_json::from_value::<ExtensionItem>(value).is_err());
+fn invalid_extension_payloads_are_rejected_for_the_expected_reason() {
+    for (value, expected) in [
+        (
+            json!({"kind": "image_gen.unknown", "id": "image-1"}),
+            "unknown variant `image_gen.unknown`",
+        ),
+        (
+            json!({"kind": "image_gen.generation", "id": "image-1", "status": "completed"}),
+            "missing field `result`",
+        ),
+    ] {
+        let error = serde_json::from_value::<ExtensionItem>(value).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }

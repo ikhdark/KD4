@@ -508,35 +508,15 @@ mod tests {
             CharDecision::RetainFirstChar
         ));
 
+        assert!(matches!(
+            burst.flush_if_due(t0 + PASTE_BURST_CHAR_INTERVAL),
+            FlushResult::None
+        ));
         let t1 = t0 + PasteBurst::recommended_flush_delay() + Duration::from_millis(1);
         assert!(matches!(burst.flush_if_due(t1), FlushResult::Typed('a')));
         assert!(!burst.is_active());
     }
 
-    /// Behavior: if two ASCII chars arrive quickly, we should start buffering without ever
-    /// rendering the first one, then flush the whole buffered payload as a paste.
-    #[test]
-    fn ascii_two_fast_chars_start_buffer_from_pending_and_flush_as_paste() {
-        let mut burst = PasteBurst::default();
-        let t0 = Instant::now();
-        assert!(matches!(
-            burst.on_plain_char('a', t0),
-            CharDecision::RetainFirstChar
-        ));
-
-        let t1 = t0 + Duration::from_millis(1);
-        assert!(matches!(
-            burst.on_plain_char('b', t1),
-            CharDecision::BeginBufferFromPending
-        ));
-        burst.append_char_to_buffer('b', t1);
-
-        let t2 = t1 + PasteBurst::recommended_active_flush_delay() + Duration::from_millis(1);
-        assert!(matches!(
-            burst.flush_if_due(t2),
-            FlushResult::Paste(ref s) if s == "ab"
-        ));
-    }
 
     /// Behavior: when non-char input is about to be applied, we flush any transient burst state
     /// immediately (including a single pending ASCII char) so state doesn't leak across inputs.
@@ -593,6 +573,10 @@ mod tests {
         ));
         burst.append_char_to_buffer('b', t1);
 
+        assert!(matches!(
+            burst.flush_if_due(t1 + PASTE_BURST_ACTIVE_IDLE_TIMEOUT),
+            FlushResult::None
+        ));
         let t2 = t1 + PasteBurst::recommended_active_flush_delay() + Duration::from_millis(1);
         assert!(matches!(burst.flush_if_due(t2), FlushResult::Paste(ref s) if s == "ab"));
         assert!(!burst.is_active());

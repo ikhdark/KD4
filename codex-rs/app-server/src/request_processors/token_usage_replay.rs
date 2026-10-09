@@ -132,29 +132,36 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn replay_attribution_uses_already_loaded_history() {
-        let rollout_items = token_usage_history();
-        let (turns, replay) = build_turns_with_token_usage_replay(&rollout_items);
-
-        let snapshot = replay.into_snapshot(&turns).expect("usage snapshot");
-        assert_eq!(snapshot.turn_id, turns[0].id);
-        assert_eq!(snapshot.info.total_token_usage.total_tokens, 150);
-        assert_eq!(snapshot.info.last_token_usage.total_tokens, 90);
-    }
-
-    #[test]
-    fn replay_attribution_falls_back_to_rebuilt_turn_position() {
-        let rollout_items = token_usage_history();
-        let (mut turns, replay) = build_turns_with_token_usage_replay(&rollout_items);
-        turns[0].id = "rebuilt-turn-id".to_string();
-
-        assert_eq!(
-            replay
-                .into_snapshot(&turns)
-                .expect("usage snapshot")
-                .turn_id,
-            "rebuilt-turn-id"
-        );
+    fn replay_attribution_preserves_usage_across_rebuilt_turns() {
+        for rebuilt in [false, true] {
+            let rollout_items = token_usage_history();
+            let (mut turns, replay) = build_turns_with_token_usage_replay(&rollout_items);
+            if rebuilt {
+                turns[0].id = "rebuilt-turn-id".to_string();
+            }
+            let snapshot = replay.into_snapshot(&turns).expect("usage snapshot");
+            assert_eq!(snapshot.turn_id, turns[0].id);
+            assert_eq!(
+                snapshot.info,
+                TokenUsageInfo {
+                    total_token_usage: TokenUsage {
+                        input_tokens: 120,
+                        cached_input_tokens: 20,
+                        output_tokens: 30,
+                        reasoning_output_tokens: 10,
+                        total_tokens: 150,
+                    },
+                    last_token_usage: TokenUsage {
+                        input_tokens: 70,
+                        cached_input_tokens: 10,
+                        output_tokens: 20,
+                        reasoning_output_tokens: 5,
+                        total_tokens: 90,
+                    },
+                    model_context_window: Some(200_000),
+                }
+            );
+        }
     }
 
     #[test]
@@ -190,14 +197,20 @@ mod tests {
             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                 info: Some(TokenUsageInfo {
                     total_token_usage: TokenUsage {
+                        input_tokens: 120,
+                        cached_input_tokens: 20,
+                        output_tokens: 30,
+                        reasoning_output_tokens: 10,
                         total_tokens: 150,
-                        ..Default::default()
                     },
                     last_token_usage: TokenUsage {
+                        input_tokens: 70,
+                        cached_input_tokens: 10,
+                        output_tokens: 20,
+                        reasoning_output_tokens: 5,
                         total_tokens: 90,
-                        ..Default::default()
                     },
-                    model_context_window: None,
+                    model_context_window: Some(200_000),
                 }),
                 rate_limits: None,
             })),

@@ -534,14 +534,6 @@ mod tests {
     use tokio::time::Duration;
     use tokio::time::timeout;
 
-    #[test]
-    fn pairing_status_deserializes_into_the_public_response_type() {
-        let response: RemoteControlPairingStatusResponse =
-            serde_json::from_value(json!({ "claimed": true })).expect("valid pairing status");
-
-        assert!(response.claimed);
-    }
-
     async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
         StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
             .await

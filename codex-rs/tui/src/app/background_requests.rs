@@ -1426,7 +1426,7 @@ mod tests {
             assert_eq!(initialized["method"], "initialized");
             // Every request must arrive before any response; serial fetching times out here.
             let mut requests = Vec::new();
-            for _ in 0..3 {
+            for kind in ["vertical", "workspace-directory", "shared-with-me"] {
                 let request = tokio::time::timeout(Duration::from_secs(5), socket.next())
                     .await
                     .expect("concurrent request deadline")
@@ -1435,6 +1435,7 @@ mod tests {
                 let request: serde_json::Value =
                     serde_json::from_str(request.to_text().expect("text")).expect("JSON");
                 assert_eq!(request["method"], "plugin/list");
+                assert_eq!(request["params"]["marketplaceKinds"], serde_json::json!([kind]));
                 requests.push(request);
             }
             for (index, request) in requests.iter().enumerate().rev() {

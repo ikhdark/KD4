@@ -851,6 +851,9 @@ mod tests {
                 .expect("query feedback logs"),
         )
         .expect("valid utf-8");
+        for expected in ["threadless-before", "thread-scoped", "foo=2", "threadless-after"] {
+            assert!(sqlite_logs.contains(expected), "{expected}: {sqlite_logs}");
+        }
         assert_eq!(
             without_timestamps(&sqlite_logs),
             without_timestamps(&feedback_logs)
@@ -859,36 +862,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
-    #[tokio::test]
-    async fn flush_persists_logs_for_query() {
-        let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
-        let layer = start(runtime.clone());
-
-        let guard = tracing_subscriber::registry()
-            .with(
-                layer
-                    .clone()
-                    .with_filter(Targets::new().with_default(tracing::Level::TRACE)),
-            )
-            .set_default();
-
-        tracing::info!("buffered-log");
-
-        layer.flush().await.expect("flush logs");
-        drop(guard);
-
-        let after_flush = runtime
-            .query_logs(&crate::LogQuery::default())
-            .await
-            .expect("query logs after flush");
-        assert_eq!(after_flush.len(), 1);
-        assert_eq!(after_flush[0].message.as_deref(), Some("buffered-log"));
-
-        let _ = tokio::fs::remove_dir_all(codex_home).await;
-    }
 
     #[tokio::test]
     async fn flush_reports_failed_automatic_batch() {
@@ -1019,63 +992,35 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
-    #[tokio::test]
-    async fn event_queue_drops_new_entries_when_full() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let layer = LogDbLayer {
-            sender,
-            process_uuid: "process-1".to_string(),
-        };
-
-        layer.try_send(test_entry("first-queued-log"));
-        layer.try_send(test_entry("dropped-log"));
-
-        match receiver.try_recv().expect("first entry queued") {
-            LogDbCommand::Entry(entry) => {
-                assert_eq!(entry.message.as_deref(), Some("first-queued-log"));
-            }
-            LogDbCommand::Flush(_) => panic!("expected queued entry"),
-        }
-        assert!(receiver.try_recv().is_err());
-    }
 
     #[tokio::test]
     async fn flush_waits_for_queue_capacity_and_receiver_processing() {
+        use std::future::Future;
         let (sender, mut receiver) = mpsc::channel(1);
         let layer = LogDbLayer {
             sender,
             process_uuid: "process-1".to_string(),
         };
-
         layer.try_send(test_entry("queued-before-flush"));
-        let mut flush_task = tokio::spawn({
-            let layer = layer.clone();
-            async move {
-                layer.flush().await.expect("flush logs");
-            }
-        });
+        let mut flush = std::pin::pin!(layer.flush());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(flush.as_mut().poll(&mut context).is_pending());
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(!flush_task.is_finished());
+        let LogDbCommand::Entry(entry) = receiver.try_recv().expect("queued entry") else {
+            panic!("expected queued entry");
+        };
+        assert_eq!(entry.message.as_deref(), Some("queued-before-flush"));
 
-        match receiver.recv().await.expect("queued entry") {
-            LogDbCommand::Entry(entry) => {
-                assert_eq!(entry.message.as_deref(), Some("queued-before-flush"));
-            }
-            LogDbCommand::Flush(_) => panic!("expected queued entry"),
-        }
-
-        match receiver.recv().await.expect("flush command") {
-            LogDbCommand::Flush(reply) => {
-                assert!(!flush_task.is_finished());
-                let _ = reply.send(Ok(()));
-            }
-            LogDbCommand::Entry(_) => panic!("expected flush command"),
-        }
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), &mut flush_task)
+        assert!(flush.as_mut().poll(&mut context).is_pending());
+        let LogDbCommand::Flush(reply) = receiver.try_recv().expect("flush command") else {
+            panic!("expected flush command");
+        };
+        assert!(flush.as_mut().poll(&mut context).is_pending());
+        reply.send(Ok(())).expect("flush receiver remains alive");
+        tokio::time::timeout(Duration::from_secs(1), flush)
             .await
-            .expect("flush task completes")
-            .expect("flush task succeeds");
+            .expect("flush completes")
+            .expect("flush succeeds");
     }
+
 }

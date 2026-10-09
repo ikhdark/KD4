@@ -133,6 +133,46 @@ async fn plugin_share_save_uploads_local_plugin() -> Result<()> {
         }
     );
 
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recorded upload requests");
+    let upload = requests
+        .iter()
+        .find(|request| request.method == "PUT" && request.url.path() == "/upload/file_123")
+        .expect("plugin archive upload");
+    assert!(!upload.headers.contains_key("authorization"));
+    assert!(!upload.headers.contains_key("chatgpt-account-id"));
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(upload.body.as_slice()));
+    let mut files = std::collections::BTreeMap::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        assert!(entry.header().entry_type().is_file());
+        let path = entry.path()?.into_owned();
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut contents)?;
+        assert!(
+            files.insert(path, contents).is_none(),
+            "duplicate archive entry"
+        );
+    }
+    assert_eq!(
+        files,
+        std::collections::BTreeMap::from([
+            (
+                PathBuf::from(".codex-plugin/plugin.json"),
+                r#"{"name":"demo-plugin"}"#.to_string(),
+            ),
+            (
+                PathBuf::from("skills/example/SKILL.md"),
+                "# Example\n\nA test skill.\n".to_string(),
+            ),
+        ])
+    );
+
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/workspace/created"))
         .and(query_param("limit", "200"))
@@ -176,7 +216,7 @@ async fn plugin_share_save_uploads_local_plugin() -> Result<()> {
                     id: "demo-plugin@workspace-shared-with-me".to_string(),
                     remote_plugin_id: Some("plugins_123".to_string()),
                     version: Some("0.1.0".to_string()),
-                    local_version: Some("0.1.0".to_string()),
+                    local_version: None,
                     name: "demo-plugin".to_string(),
                     share_context: Some(expected_share_context("plugins_123")),
                     source: PluginSource::Remote,
@@ -388,6 +428,14 @@ async fn plugin_share_rejects_invalid_share_settings() -> Result<()> {
         assert_eq!(error.error.code, -32600, "{method}");
         assert_eq!(error.error.message, expected_message, "{method}");
     }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "invalid share settings must be rejected before upload or mutation"
+    );
     Ok(())
 }
 
@@ -529,7 +577,7 @@ async fn plugin_share_list_returns_created_workspace_plugins() -> Result<()> {
                     id: "demo-plugin@workspace-shared-with-me".to_string(),
                     remote_plugin_id: Some("plugins_123".to_string()),
                     version: Some("0.1.0".to_string()),
-                    local_version: Some("0.1.0".to_string()),
+                    local_version: None,
                     name: "demo-plugin".to_string(),
                     share_context: Some(expected_share_context("plugins_123")),
                     source: PluginSource::Remote,
@@ -1041,7 +1089,7 @@ async fn plugin_share_update_targets_updates_share_targets() -> Result<()> {
 }
 
 #[tokio::test]
-async fn plugin_share_delete_removes_created_workspace_plugin() -> Result<()> {
+async fn plugin_share_delete_clears_mapping_without_deleting_local_files() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_remote_plugin_config(codex_home.path(), &format!("{}/backend-api", server.uri()))?;
@@ -1055,6 +1103,8 @@ async fn plugin_share_delete_removes_created_workspace_plugin() -> Result<()> {
     )?;
     let local_plugin_path = AbsolutePathBuf::try_from(codex_home.path().join("local-plugin"))?;
     write_plugin_share_local_path_mapping(codex_home.path(), "plugins_123", &local_plugin_path)?;
+    let local_file = local_plugin_path.as_path().join("local-edit.txt");
+    write_file(&local_file, "preserve local edits")?;
 
     Mock::given(method("DELETE"))
         .and(path("/backend-api/public/plugins/workspace/plugins_123"))
@@ -1088,6 +1138,7 @@ async fn plugin_share_delete_removes_created_workspace_plugin() -> Result<()> {
     let response: PluginShareDeleteResponse = to_response(response)?;
 
     assert_eq!(response, PluginShareDeleteResponse {});
+    assert_eq!(std::fs::read_to_string(local_file)?, "preserve local edits");
 
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/workspace/created"))
@@ -1132,7 +1183,7 @@ async fn plugin_share_delete_removes_created_workspace_plugin() -> Result<()> {
                     id: "demo-plugin@workspace-shared-with-me".to_string(),
                     remote_plugin_id: Some("plugins_123".to_string()),
                     version: Some("0.1.0".to_string()),
-                    local_version: Some("0.1.0".to_string()),
+                    local_version: None,
                     name: "demo-plugin".to_string(),
                     share_context: Some(expected_share_context("plugins_123")),
                     source: PluginSource::Remote,

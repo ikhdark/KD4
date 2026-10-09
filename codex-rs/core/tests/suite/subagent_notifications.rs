@@ -853,7 +853,11 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
     })
     .await;
     wait_for_event_match(internal_thread.thread.as_ref(), |event| match event {
-        EventMsg::TurnComplete(event) if event.turn_id == turn_id => Some(()),
+        EventMsg::TurnComplete(event) if event.turn_id == turn_id => {
+            assert_eq!(event.error, None);
+            assert_eq!(event.last_agent_message.as_deref(), Some("internal subagent done"));
+            Some(())
+        }
         _ => None,
     })
     .await;
@@ -1684,10 +1688,22 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
     assert!(!parent_request.body_contains_text("<skills_instructions>"));
     assert!(!parent_request.body_contains_text("demo-skill"));
 
-    let child_requests = wait_for_requests(&child_request_log).await?;
-    let child_request = child_requests
-        .last()
-        .expect("child request log should capture at least one request");
+    // ResponseMock records candidates before its matcher runs. Do not mistake
+    // the parent's follow-up for the child's independently rendered context.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let child_request = loop {
+        if let Some(request) = child_request_log.requests().into_iter().find(|request| {
+            request.body_contains_text(CHILD_PROMPT)
+                && !request.body_contains_text(SPAWN_CALL_ID)
+        }) {
+            break request;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for child skill context request");
+        }
+        sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    };
     assert!(!child_request.body_contains_text("<skills_instructions>"));
     assert!(!child_request.body_contains_text("demo-skill"));
 
@@ -1704,7 +1720,7 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
         json!({
             "message": CHILD_PROMPT,
             "agent_type": "custom",
-            "model": REQUESTED_MODEL,
+            "model": INHERITED_MODEL,
             "reasoning_effort": REQUESTED_REASONING_EFFORT,
         }),
         |builder| {

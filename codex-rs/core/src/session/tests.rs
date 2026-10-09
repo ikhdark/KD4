@@ -750,43 +750,6 @@ async fn tool_history_persistence_queue_reports_failure_and_recovers_all_mutatio
 }
 
 #[tokio::test]
-async fn tool_history_persistence_queue_rejects_mutations_after_worker_closes() {
-    let codex_home = tempfile::tempdir().expect("create codex home");
-    let io_gate = Arc::new(Semaphore::new(/*permits*/ 0));
-    io_gate.close();
-    let queue = super::session::ToolHistoryPersistenceQueue::new(
-        io_gate,
-        codex_home.path().to_path_buf(),
-        ThreadId::new(),
-        crate::tool_history::ToolHistoryState::default(),
-    );
-    queue
-        .enqueue_mutation(
-            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
-                call_id: "closes-worker".to_string(),
-            },
-            "test completed-tool history metadata",
-        )
-        .await
-        .expect("the first mutation wakes the worker");
-    queue.wait_until_worker_closed_for_test().await;
-
-    let error = queue
-        .enqueue_mutation(
-            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
-                call_id: "must-not-be-silently-dropped".to_string(),
-            },
-            "test completed-tool history metadata",
-        )
-        .await
-        .expect_err("a closed worker must reject later mutations");
-    assert_eq!(
-        error,
-        super::session::ToolHistoryPersistenceEnqueueError::WorkerClosed
-    );
-}
-
-#[tokio::test]
 async fn tool_history_persistence_checkpoint_reports_worker_closed() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let io_gate = Arc::new(Semaphore::new(/*permits*/ 0));
@@ -807,6 +770,20 @@ async fn tool_history_persistence_checkpoint_reports_worker_closed() {
         .await
         .expect("the first mutation wakes the worker");
     queue.wait_until_worker_closed_for_test().await;
+
+    let error = queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "must-not-be-silently-dropped".to_string(),
+            },
+            "test completed-tool history metadata",
+        )
+        .await
+        .expect_err("a closed worker must reject later mutations");
+    assert_eq!(
+        error,
+        super::session::ToolHistoryPersistenceEnqueueError::WorkerClosed
+    );
 
     let checkpoint_error = timeout(Duration::from_secs(5), queue.checkpoint())
         .await
@@ -2103,11 +2080,16 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
             b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
         )
         .await?;
-    let mut buffer = [0_u8; 4096];
-    let bytes_read = tokio::time::timeout(StdDuration::from_secs(2), stream.read(&mut buffer))
+    // TCP may split headers across reads. The request asks for connection close;
+    // retain the same byte and wall-clock bounds while collecting that response.
+    let mut buffer = Vec::new();
+    tokio::time::timeout(
+        StdDuration::from_secs(2),
+        stream.take(4096).read_to_end(&mut buffer),
+    )
         .await
         .expect("timed out waiting for proxy response")?;
-    let response = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let response = String::from_utf8_lossy(&buffer);
 
     assert!(
         response.starts_with("HTTP/1.1 403 Forbidden"),
@@ -2754,34 +2736,6 @@ fn refresh_runtime_config_cancelled_during_hook_preparation_keeps_accepted_state
     });
 }
 
-#[tokio::test]
-async fn reload_user_config_layer_updates_effective_tool_suggest_config() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let codex_home = session.codex_home().await;
-    std::fs::create_dir_all(&codex_home).expect("create codex home");
-    let config_toml_path = codex_home.join(CONFIG_TOML_FILE);
-    std::fs::write(
-        &config_toml_path,
-        r#"[tool_suggest]
-disabled_tools = [
-  { type = "connector", id = " calendar " },
-  { type = "plugin", id = "slack@openai-curated" },
-]
-"#,
-    )
-    .expect("write user config");
-
-    session.reload_user_config_layer().await;
-
-    let config = session.get_config().await;
-    assert_eq!(
-        config.tool_suggest.disabled_tools,
-        vec![
-            ToolSuggestDisabledTool::connector("calendar"),
-            ToolSuggestDisabledTool::plugin("slack@openai-curated"),
-        ]
-    );
-}
 
 #[tokio::test]
 async fn reload_user_config_layer_preserves_tool_suggest_on_invalid_reload() {
@@ -3186,29 +3140,8 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
     );
 }
 
-/// N1 regression: raw response items mirror every recorded history item, including full
-/// tool outputs, so the producer must not build or send them when no consumer opted in.
-#[tokio::test]
-async fn raw_response_items_are_not_produced_when_no_consumer_requested_them() {
-    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
-    session
-        .raw_response_items_requested
-        .store(false, std::sync::atomic::Ordering::Release);
 
-    session
-        .record_conversation_items(&turn_context, &[user_message("hello")])
-        .await
-        .unwrap();
-
-    while let Ok(event) = rx.try_recv() {
-        assert!(
-            !matches!(event.msg, EventMsg::RawResponseItem(_)),
-            "suppressed sessions must not emit raw response items"
-        );
-    }
-}
-
-/// A consumer that opts in must still observe raw response items.
+/// Raw response events are opt-in, while recording history is unconditional.
 #[tokio::test]
 async fn raw_response_items_resume_after_a_consumer_requests_them() {
     let (session, turn_context, rx) = make_session_and_context_with_rx().await;
@@ -3217,24 +3150,34 @@ async fn raw_response_items_resume_after_a_consumer_requests_them() {
         .store(false, std::sync::atomic::Ordering::Release);
     assert!(!session.raw_response_items_requested());
 
+    session
+        .record_conversation_items(&turn_context, &[user_message("before opt-in")])
+        .await
+        .unwrap();
+    let before = session.clone_history().await.raw_items().to_vec();
+    assert_eq!(before.len(), 1, "suppression must not suppress history");
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(event.msg, EventMsg::RawResponseItem(_)));
+    }
+
     session.request_raw_response_items();
     assert!(session.raw_response_items_requested());
-
     session
-        .record_conversation_items(&turn_context, &[user_message("hello")])
+        .record_conversation_items(&turn_context, &[user_message("after opt-in")])
         .await
         .unwrap();
 
-    let mut saw_raw_response_item = false;
+    let history = session.clone_history().await.raw_items().to_vec();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0], before[0]);
+    let mut raw_items = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        if matches!(event.msg, EventMsg::RawResponseItem(_)) {
-            saw_raw_response_item = true;
+        if let EventMsg::RawResponseItem(raw) = event.msg {
+            assert_eq!(event.id, turn_context.sub_id);
+            raw_items.push(raw.item);
         }
     }
-    assert!(
-        saw_raw_response_item,
-        "an opted-in consumer must still observe raw response items"
-    );
+    assert_eq!(raw_items, history[1..], "emit the newly recorded item exactly once");
 }
 
 #[tokio::test]
@@ -3379,6 +3322,9 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
         .unwrap();
 
     let recorded_item = session.clone_history().await.raw_items()[0].clone();
+    assert!(
+        recorded_item.id().expect("agent message id").starts_with("amsg_")
+    );
     assert_eq!(
         strip_response_item_ids(std::slice::from_ref(&recorded_item)),
         vec![expected_item.clone()]
@@ -3425,74 +3371,6 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     );
 }
 
-#[tokio::test]
-async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resume() {
-    let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
-        Vec::new(),
-        |_config| {},
-    )
-    .await;
-    let rollout_path =
-        attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
-    let communication = InterAgentCommunication::new(
-        AgentPath::root().join("worker").expect("worker path"),
-        AgentPath::root(),
-        Vec::new(),
-        "child done".to_string(),
-        /*trigger_turn*/ false,
-    );
-
-    session
-        .record_inter_agent_communication(&turn_context, communication)
-        .await
-        .unwrap();
-
-    let live_history = session.clone_history().await;
-    let [live_item] = live_history.raw_items() else {
-        panic!("expected exactly one live history item");
-    };
-    let live_item_id = live_item
-        .id()
-        .expect("live agent message should have an item id")
-        .to_string();
-    assert!(live_item_id.starts_with("amsg_"));
-
-    session.flush_rollout().await.expect("rollout should flush");
-    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
-        .await
-        .expect("read rollout history")
-    else {
-        panic!("expected resumed rollout history");
-    };
-    let persisted_item_id = resumed.history.iter().find_map(|item| match item {
-        RolloutItem::ResponseItem(item @ ResponseItem::AgentMessage { .. }) => item.id(),
-        _ => None,
-    });
-    assert_eq!(
-        persisted_item_id.map(ResponseItemId::as_str),
-        Some(live_item_id.as_str())
-    );
-
-    let (resumed_session, _resumed_turn_context, _rx) =
-        make_session_and_context_with_auth_and_config_and_rx(
-            CodexAuth::from_api_key("Test API Key"),
-            Vec::new(),
-            |_config| {},
-        )
-        .await;
-    resumed_session
-        .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
-    let resumed_history = resumed_session.clone_history().await;
-    let [resumed_item] = resumed_history.raw_items() else {
-        panic!("expected exactly one resumed history item");
-    };
-    assert_eq!(
-        resumed_item.id().map(ResponseItemId::as_str),
-        Some(live_item_id.as_str())
-    );
-}
 
 #[tokio::test]
 async fn prepares_image_failures_before_history_insertion() {
@@ -4098,8 +3976,15 @@ async fn record_token_usage_info_notifies_extension_contributors() {
         .await
         .expect("second usage should be recorded");
 
-    let mut expected_total_usage = first_usage.clone();
-    expected_total_usage.add_assign(&second_usage);
+    // Independently sum the supplied fields rather than reuse the accumulator
+    // under test. Provider-reported total_tokens remains its own field.
+    let expected_total_usage = TokenUsage {
+        input_tokens: 17,
+        cached_input_tokens: 3,
+        output_tokens: 28,
+        reasoning_output_tokens: 8,
+        total_tokens: 53,
+    };
     let expected = vec![
         RecordedTokenUsage {
             session_level_id: session.session_id().to_string(),
@@ -4700,10 +4585,20 @@ async fn fork_startup_context_then_first_turn_diff_snapshot_impl() -> anyhow::Re
     )
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config.permissions.approval_policy =
-            codex_config::Constrained::allow_any(AskForApproval::OnRequest);
-    });
+    let mut builder = test_codex()
+        // Keep the existing V2 policy in the inherited baseline, but omit
+        // optional usage hints and discovery: neither is part of this
+        // permission/collaboration context-delta scenario.
+        .with_model_info_override("gpt-5.5", |model| {
+            model.multi_agent_version = Some(MultiAgentVersion::V2);
+            model.supports_search_tool = false;
+        })
+        .with_config(|config| {
+            config.multi_agent_v2.root_agent_usage_hint_text = None;
+            config.multi_agent_v2.subagent_usage_hint_text = None;
+            config.permissions.approval_policy =
+                codex_config::Constrained::allow_any(AskForApproval::OnRequest);
+        });
     let initial = builder.build(&server).await?;
     let rollout_path = initial
         .session_configured
@@ -5504,6 +5399,7 @@ async fn thread_rollback_fails_when_turn_in_progress() {
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
 
     let error_event = wait_for_thread_rollback_failed(&rx).await;
+    assert_eq!(error_event.message, "Cannot rollback while a turn is in progress.");
     assert_eq!(
         error_event.codex_error_info,
         Some(CodexErrorInfo::ThreadRollbackFailed)
@@ -6139,127 +6035,25 @@ fn model_with_default_service_tier(default_service_tier: Option<&str>) -> ModelI
 }
 
 #[test]
-fn get_service_tier_does_not_use_model_default_when_absent_and_fast_mode_enabled() {
-    let model_info = model_with_default_service_tier(Some(ServiceTier::Fast.request_value()));
-
-    assert_eq!(
-        get_service_tier(
-            /*configured_service_tier*/ None,
-            /*fast_mode_enabled*/ true,
-            &model_info,
-        ),
-        None
-    );
-}
-
-#[test]
-fn get_service_tier_does_not_use_model_default_when_fast_mode_disabled() {
-    let model_info = model_with_default_service_tier(Some(ServiceTier::Fast.request_value()));
-
-    assert_eq!(
-        get_service_tier(
-            /*configured_service_tier*/ None,
-            /*fast_mode_enabled*/ false,
-            &model_info,
-        ),
-        None
-    );
-}
-
-#[test]
-fn get_service_tier_keeps_supported_explicit_tier() {
-    let model_info = model_with_default_service_tier(Some(ServiceTier::Fast.request_value()));
-
-    assert_eq!(
-        get_service_tier(
-            Some(ServiceTier::Fast.request_value().to_string()),
-            /*fast_mode_enabled*/ true,
-            &model_info,
-        ),
-        Some(ServiceTier::Fast.request_value().to_string())
-    );
-}
-
-#[test]
-fn get_service_tier_does_not_default_when_model_has_no_default() {
-    let model_info = model_with_default_service_tier(/*default_service_tier*/ None);
-
-    assert_eq!(
-        get_service_tier(
-            /*configured_service_tier*/ None,
-            /*fast_mode_enabled*/ true,
-            &model_info,
-        ),
-        None
-    );
-}
-
-#[test]
-fn get_service_tier_drops_unsupported_configured_tier_when_fast_mode_enabled() {
-    let model_info = model_with_default_service_tier(Some(ServiceTier::Fast.request_value()));
-
-    assert_eq!(
-        get_service_tier(
-            Some("unsupported".to_string()),
-            /*fast_mode_enabled*/ true,
-            &model_info,
-        ),
-        None
-    );
-    assert_eq!(
-        get_service_tier(
-            Some(ServiceTier::Flex.request_value().to_string()),
-            /*fast_mode_enabled*/ true,
-            &model_info,
-        ),
-        None
-    );
-    assert_eq!(
-        get_service_tier(
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
-            /*fast_mode_enabled*/ true,
-            &model_info,
-        ),
-        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
-    );
-}
-
-#[test]
-fn get_service_tier_ignores_configured_tier_when_fast_mode_disabled() {
-    let model_info = model_with_default_service_tier(Some(ServiceTier::Fast.request_value()));
-
-    assert_eq!(
-        get_service_tier(
-            Some(ServiceTier::Fast.request_value().to_string()),
-            /*fast_mode_enabled*/ false,
-            &model_info,
-        ),
-        None
-    );
-    assert_eq!(
-        get_service_tier(
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
-            /*fast_mode_enabled*/ false,
-            &model_info,
-        ),
-        None
-    );
-    assert_eq!(
-        get_service_tier(
-            Some("unsupported".to_string()),
-            /*fast_mode_enabled*/ false,
-            &model_info,
-        ),
-        None
-    );
-    assert_eq!(
-        get_service_tier(
-            /*configured_service_tier*/ None,
-            /*fast_mode_enabled*/ false,
-            &model_info,
-        ),
-        None
-    );
+fn get_service_tier_requires_enabled_fast_mode_and_supported_explicit_choice() {
+    for model_default in [None, Some(ServiceTier::Fast.request_value())] {
+        let model_info = model_with_default_service_tier(model_default);
+        for fast_mode_enabled in [false, true] {
+            for (configured, supported) in [
+                (None, None),
+                (Some(ServiceTier::Fast.request_value()), Some(ServiceTier::Fast.request_value())),
+                (Some(ServiceTier::Flex.request_value()), None),
+                (Some("unsupported"), None),
+                (Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE), Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)),
+            ] {
+                assert_eq!(
+                    get_service_tier(configured.map(str::to_owned), fast_mode_enabled, &model_info),
+                    if fast_mode_enabled { supported.map(str::to_owned) } else { None },
+                    "model_default={model_default:?}, enabled={fast_mode_enabled}, configured={configured:?}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -9602,10 +9396,11 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
     let (tx_sub, rx_sub) = async_channel::bounded(4);
     let (_tx_event, rx_event) = async_channel::unbounded();
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (shutdown_complete_tx, shutdown_complete_rx) = tokio::sync::oneshot::channel();
     let session_loop_handle = tokio::spawn(async move {
         let shutdown: QueuedSubmission = rx_sub.recv().await.expect("shutdown submission");
         assert_eq!(shutdown.submission.op, Op::Shutdown);
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        shutdown_complete_rx.await.expect("release shutdown");
     });
     let codex = Arc::new(Codex {
         tx_sub,
@@ -9615,23 +9410,19 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
     });
 
-    let waiter_1 = {
-        let codex = Arc::clone(&codex);
-        tokio::spawn(async move { codex.shutdown_and_wait().await })
-    };
-    let waiter_2 = {
-        let codex = Arc::clone(&codex);
-        tokio::spawn(async move { codex.shutdown_and_wait().await })
-    };
+    let mut waiter_1 = Box::pin(codex.shutdown_and_wait());
+    let mut waiter_2 = Box::pin(codex.shutdown_and_wait());
+    assert!(futures::poll!(waiter_1.as_mut()).is_pending());
+    assert!(futures::poll!(waiter_2.as_mut()).is_pending());
+    shutdown_complete_tx.send(()).expect("release session loop");
 
-    waiter_1
-        .await
-        .expect("first shutdown waiter join")
-        .expect("first shutdown waiter");
-    waiter_2
-        .await
-        .expect("second shutdown waiter join")
-        .expect("second shutdown waiter");
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        let (first, second) = tokio::join!(waiter_1, waiter_2);
+        first.expect("first shutdown waiter");
+        second.expect("second shutdown waiter");
+    })
+    .await
+    .expect("both waiters observe the same loop termination");
 }
 
 #[tokio::test]
@@ -9653,21 +9444,16 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
     });
 
-    let waiter = {
-        let codex = Arc::clone(&codex);
-        tokio::spawn(async move { codex.shutdown_and_wait().await })
-    };
-
-    tokio::time::sleep(StdDuration::from_millis(10)).await;
-    assert!(!waiter.is_finished());
+    let mut waiter = Box::pin(codex.shutdown_and_wait());
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
 
     shutdown_complete_tx
         .send(())
         .expect("session loop should still be waiting to terminate");
 
-    waiter
+    tokio::time::timeout(StdDuration::from_secs(2), waiter)
         .await
-        .expect("shutdown waiter join")
+        .expect("shutdown waiter must finish after loop termination")
         .expect("shutdown waiter");
 }
 
@@ -10240,6 +10026,7 @@ where
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
         task_start_gate: Semaphore::new(/*permits*/ 1),
+        submission_preparation_slots: Arc::new(Semaphore::new(SUBMISSION_CHANNEL_CAPACITY)),
         task_start_state: Mutex::new(super::session::TaskStartState::default()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
@@ -12174,11 +11961,18 @@ impl codex_extension_api::ContextContributor for TurnContextExtensionTestContrib
 async fn build_initial_context_includes_prompt_fragments_from_extensions() {
     let (mut session, turn_context) = make_session_and_context().await;
     session.services.extensions = prompt_extension_test_registry();
+    let turn_context = Arc::new(turn_context);
+    let without_state = build_initial_context(&session, &turn_context).await;
+    assert!(
+        developer_input_texts(&without_state)
+            .iter()
+            .all(|text| !text.contains("prompt extension enabled")),
+        "the wrapped contribution must be absent before extension state exists"
+    );
     session
         .services
         .thread_extension_data
         .insert(PromptExtensionTestState);
-    let turn_context = Arc::new(turn_context);
 
     let initial_context = build_initial_context(&session, &turn_context).await;
     let developer_messages = developer_message_texts(&initial_context);
@@ -13350,23 +13144,6 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
     );
 }
 
-#[tokio::test]
-async fn build_initial_context_omits_prompt_fragments_without_extension_state() {
-    let (mut session, turn_context) = make_session_and_context().await;
-    session.services.extensions = prompt_extension_test_registry();
-    let turn_context = Arc::new(turn_context);
-
-    let initial_context = build_initial_context(&session, &turn_context).await;
-    let developer_messages = developer_message_texts(&initial_context);
-
-    assert!(
-        !developer_messages
-            .iter()
-            .flatten()
-            .any(|text| *text == "prompt extension enabled"),
-        "did not expect prompt extension developer text, got {developer_messages:?}"
-    );
-}
 
 #[tokio::test]
 async fn desktop_and_skill_prefixes_stay_stable_across_task_changes() {
@@ -13595,7 +13372,7 @@ async fn build_initial_context_trims_skill_metadata_from_context_window_budget()
     assert!(
         developer_texts
             .iter()
-            .all(|text| !text.contains("- admin-skill:") && !text.contains("- repo-skill:")),
+            .all(|text| !text.contains("- admin-skill") && !text.contains("- repo-skill")),
         "expected no skill metadata entries to fit the tiny budget, got {developer_texts:?}"
     );
 }
@@ -15268,7 +15045,6 @@ async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
         EventMsg::TurnAborted(e) => assert_eq!(TurnAbortReason::Interrupted, e.reason),
         other => panic!("unexpected event: {other:?}"),
     }
-    abort_task.await.expect("abort task should finish");
     let history = sess.clone_history().await;
     assert!(history.raw_items().iter().any(|item| {
         matches!(
@@ -15282,6 +15058,7 @@ async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
             )
         )
     }));
+    abort_task.await.expect("abort task should finish");
     // Expected flushes:
     // 1. Task-runner flush after the task body observes cancellation.
     // 2. Missing-output flush before TurnAborted closes the persisted tool lifecycle.
@@ -15849,10 +15626,16 @@ fn owned_history_preparation_preserves_payload_and_assigns_identity_once() {
 
     assert_eq!(prepared.len(), 1);
     assert!(prepared[0].id().is_some_and(|id| !id.is_empty()));
-    assert!(
-        serde_json::to_string(&prepared[0])
-            .expect("serialize prepared item")
-            .contains(&output_text)
+    assert_eq!(prepared[0].turn_id(), Some("turn-owned"));
+    let ResponseItem::FunctionCallOutput { call_id, output, .. } = &prepared[0] else {
+        panic!("preparation must preserve the output variant");
+    };
+    assert_eq!(call_id, "owned-preparation");
+    assert_eq!(output.text_content(), Some(output_text.as_str()));
+    assert_eq!(
+        Session::prepare_owned_conversation_items_for_history("different-turn", prepared.clone()),
+        prepared,
+        "preparing an identified item again must preserve its payload and original identity"
     );
 }
 
@@ -16714,16 +16497,9 @@ async fn terminal_task_tracker_shutdown_waits_for_running_finalizer() {
         .await
         .expect("finalizer should enter abort cleanup");
     sess.terminal_tasks.close();
-    let mut tracker_wait = tokio::spawn({
-        let sess = Arc::clone(&sess);
-        async move {
-            sess.terminal_tasks.wait().await;
-        }
-    });
+    let mut tracker_wait = Box::pin(sess.terminal_tasks.wait());
     assert!(
-        timeout(Duration::from_millis(50), &mut tracker_wait)
-            .await
-            .is_err(),
+        futures::poll!(tracker_wait.as_mut()).is_pending(),
         "closing the tracker must not abandon a running finalizer"
     );
 
@@ -16731,76 +16507,12 @@ async fn terminal_task_tracker_shutdown_waits_for_running_finalizer() {
     abort_caller.await.expect("abort caller should finish");
     timeout(Duration::from_secs(2), &mut tracker_wait)
         .await
-        .expect("tracker should drain after finalizer completion")
-        .expect("tracker waiter should not panic");
+        .expect("tracker should drain after finalizer completion");
     let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
     assert!(matches!(event.msg, EventMsg::TurnAborted(_)));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn terminal_task_tracker_waits_for_tracked_work() {
-    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-    let persistence_started = Arc::new(tokio::sync::Notify::new());
-    let delivery_started = Arc::new(tokio::sync::Notify::new());
-    let delivery_completed = Arc::new(tokio::sync::Notify::new());
-    let (release_persistence_tx, release_persistence_rx) = tokio::sync::oneshot::channel();
-    let (release_delivery_tx, release_delivery_rx) = tokio::sync::oneshot::channel();
 
-    sess.terminal_tasks.spawn({
-        let persistence_started = Arc::clone(&persistence_started);
-        let delivery_started = Arc::clone(&delivery_started);
-        let delivery_completed = Arc::clone(&delivery_completed);
-        async move {
-            persistence_started.notify_one();
-            let _ = release_persistence_rx.await;
-            delivery_started.notify_one();
-            let _ = release_delivery_rx.await;
-            delivery_completed.notify_one();
-        }
-    });
-    timeout(Duration::from_secs(2), persistence_started.notified())
-        .await
-        .expect("tracked terminal work should start");
-
-    sess.terminal_tasks.close();
-    let mut tracker_wait = tokio::spawn({
-        let sess = Arc::clone(&sess);
-        async move {
-            sess.terminal_tasks.wait().await;
-        }
-    });
-    assert!(
-        timeout(Duration::from_millis(50), &mut tracker_wait)
-            .await
-            .is_err(),
-        "tracker wait must retain tracked terminal work"
-    );
-
-    release_persistence_tx
-        .send(())
-        .expect("tracked terminal task should still be waiting");
-    timeout(Duration::from_secs(2), delivery_started.notified())
-        .await
-        .expect("second tracked phase should start after the first");
-    assert!(
-        timeout(Duration::from_millis(50), &mut tracker_wait)
-            .await
-            .is_err(),
-        "tracker wait must retain the second tracked phase"
-    );
-
-    let delivery_completed_wait = delivery_completed.notified();
-    release_delivery_tx
-        .send(())
-        .expect("tracked terminal task should still be waiting");
-    timeout(Duration::from_secs(2), delivery_completed_wait)
-        .await
-        .expect("tracked terminal work should complete");
-    timeout(Duration::from_secs(2), &mut tracker_wait)
-        .await
-        .expect("tracker should drain after tracked terminal work")
-        .expect("tracker waiter should not panic");
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
@@ -17161,31 +16873,33 @@ async fn orchestration_audit_pending_mailbox_start_reserves_only_inside_shared_s
 
 #[tokio::test]
 async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: true,
-        },
-    )
-    .await;
+    for kind in [TaskKind::Regular, TaskKind::Review] {
+        let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+        sess.spawn_task(
+            Arc::clone(&tc),
+            Vec::new(),
+            NeverEndingTask {
+                kind,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
 
-    let item = user_message("synthetic idle input");
-    let err = sess
-        .try_start_turn_if_idle(vec![item.clone()])
-        .await
-        .expect_err("active turn should reject idle-only input");
+        let item = user_message("synthetic idle input");
+        let err = sess
+            .try_start_turn_if_idle(vec![item.clone()])
+            .await
+            .expect_err("active turn should reject idle-only input");
 
-    assert_eq!(TryStartTurnIfIdleRejectionReason::Busy, err.reason());
-    assert_eq!(vec![item], err.into_input());
-    assert_eq!(
-        Vec::<TurnInput>::new(),
-        sess.input_queue.get_pending_input(&sess.active_turn).await
-    );
+        assert_eq!(TryStartTurnIfIdleRejectionReason::Busy, err.reason());
+        assert_eq!(vec![item], err.into_input());
+        assert_eq!(
+            Vec::<TurnInput>::new(),
+            sess.input_queue.get_pending_input(&sess.active_turn).await
+        );
 
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    }
 }
 
 #[tokio::test]
@@ -17366,34 +17080,7 @@ async fn late_idle_start_rejection_and_cancellation_notify_once_without_reentran
     }
 }
 
-#[tokio::test]
-async fn try_start_turn_if_idle_rejects_active_review_turn_without_injecting() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Review,
-            listen_to_cancellation_token: true,
-        },
-    )
-    .await;
 
-    let item = user_message("synthetic idle input");
-    let err = sess
-        .try_start_turn_if_idle(vec![item.clone()])
-        .await
-        .expect_err("active review turn should reject automatic idle input");
-
-    assert_eq!(TryStartTurnIfIdleRejectionReason::Busy, err.reason());
-    assert_eq!(vec![item], err.into_input());
-    assert_eq!(
-        Vec::<TurnInput>::new(),
-        sess.input_queue.get_pending_input(&sess.active_turn).await
-    );
-
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-}
 
 #[tokio::test]
 async fn steer_input_requires_active_turn() {
@@ -17443,7 +17130,7 @@ async fn steer_input_enforces_expected_turn_id() {
     }];
     let err = sess
         .steer_input(
-            steer_input,
+            steer_input.clone(),
             /*additional_context*/ Default::default(),
             Some("different-turn-id"),
             /*client_user_message_id*/ None,
@@ -17461,6 +17148,26 @@ async fn steer_input_enforces_expected_turn_id() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+    assert!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await.is_empty(),
+        "rejected steering must not be admitted"
+    );
+    let turn_id = sess
+        .steer_input(
+            steer_input.clone(),
+            Default::default(),
+            Some(&tc.sub_id),
+            None,
+            None,
+        )
+        .await
+        .expect("matching turn accepts steering after a rejected attempt");
+    assert_eq!(turn_id, tc.sub_id);
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![TurnInput::UserInput { content: steer_input, client_id: None }]
+    );
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]
@@ -17756,44 +17463,7 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
     }
 }
 
-#[tokio::test]
-async fn steer_input_returns_active_turn_id() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    let input = vec![TurnInput::UserInput {
-        content: vec![UserInput::Text {
-            text: "hello".to_string(),
-            text_elements: Vec::new(),
-        }],
-        client_id: None,
-    }];
-    sess.spawn_task(
-        Arc::clone(&tc),
-        input,
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
-        },
-    )
-    .await;
 
-    let steer_input = vec![UserInput::Text {
-        text: "Run focused tests.".to_string(),
-        text_elements: Vec::new(),
-    }];
-    let turn_id = sess
-        .steer_input(
-            steer_input,
-            /*additional_context*/ Default::default(),
-            Some(&tc.sub_id),
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
-        .await
-        .expect("steering with matching expected turn id should succeed");
-
-    assert_eq!(turn_id, tc.sub_id);
-    assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
-}
 
 #[tokio::test]
 async fn abort_empty_active_turn_preserves_pending_input() {

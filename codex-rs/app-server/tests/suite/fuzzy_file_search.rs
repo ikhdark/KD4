@@ -455,7 +455,7 @@ async fn test_fuzzy_file_search_accepts_cancellation_token() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_session_streams_updates() -> Result<()> {
+async fn fuzzy_file_search_session_streams_case_insensitive_queries_and_clears() -> Result<()> {
     let codex_home = TempDir::new()?;
     let root = TempDir::new()?;
     std::fs::write(root.path().join("alpha.txt"), "contents")?;
@@ -466,43 +466,26 @@ async fn test_fuzzy_file_search_session_streams_updates() -> Result<()> {
 
     mcp.start_fuzzy_file_search_session(session_id, vec![root_path.clone()])
         .await?;
-    mcp.update_fuzzy_file_search_session(session_id, "alp")
-        .await?;
+    for query in ["alp", "ALP"] {
+        mcp.update_fuzzy_file_search_session(session_id, query).await?;
+        let payload =
+            wait_for_session_updated(&mut mcp, session_id, query, FileExpectation::NonEmpty)
+                .await?;
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].root, root_path);
+        assert_eq!(payload.files[0].path, "alpha.txt");
+        let completed = wait_for_session_completed(&mut mcp, session_id, query).await?;
+        assert_eq!(completed.session_id, session_id);
+        assert_eq!(completed.query, query);
+    }
 
-    let payload =
-        wait_for_session_updated(&mut mcp, session_id, "alp", FileExpectation::NonEmpty).await?;
-    assert_eq!(payload.files.len(), 1);
-    assert_eq!(payload.files[0].root, root_path);
-    assert_eq!(payload.files[0].path, "alpha.txt");
-    let completed = wait_for_session_completed(&mut mcp, session_id, "alp").await?;
-    assert_eq!(completed.session_id, session_id);
-    assert_eq!(completed.query, "alp");
+    mcp.update_fuzzy_file_search_session(session_id, "").await?;
+    let blank =
+        wait_for_session_updated(&mut mcp, session_id, "", FileExpectation::Empty).await?;
+    assert!(blank.files.is_empty());
+    assert_eq!(blank.total_match_count, 0);
 
     mcp.stop_fuzzy_file_search_session(session_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_session_update_is_case_insensitive() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let root = TempDir::new()?;
-    std::fs::write(root.path().join("alpha.txt"), "contents")?;
-    let mut mcp = initialized_mcp(&codex_home).await?;
-
-    let root_path = root.path().to_string_lossy().to_string();
-    let session_id = "session-case-insensitive";
-
-    mcp.start_fuzzy_file_search_session(session_id, vec![root_path.clone()])
-        .await?;
-    mcp.update_fuzzy_file_search_session(session_id, "ALP")
-        .await?;
-
-    let payload =
-        wait_for_session_updated(&mut mcp, session_id, "ALP", FileExpectation::NonEmpty).await?;
-    assert_eq!(payload.files.len(), 1);
-    assert_eq!(payload.files[0].root, root_path);
-    assert_eq!(payload.files[0].path, "alpha.txt");
 
     Ok(())
 }
@@ -534,14 +517,6 @@ async fn test_fuzzy_file_search_session_no_updates_after_complete_until_query_ed
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_session_update_before_start_errors() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = initialized_mcp(&codex_home).await?;
-    assert_update_request_fails_for_missing_session(&mut mcp, "missing", "alp").await?;
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_fuzzy_file_search_session_update_works_without_waiting_for_start_response()
@@ -618,13 +593,14 @@ async fn test_fuzzy_file_search_session_completions_identify_query() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_session_update_after_stop_fails() -> Result<()> {
+async fn fuzzy_file_search_session_rejects_updates_before_start_and_after_stop() -> Result<()> {
     let codex_home = TempDir::new()?;
     let root = TempDir::new()?;
     std::fs::write(root.path().join("alpha.txt"), "contents")?;
     let mut mcp = initialized_mcp(&codex_home).await?;
 
     let session_id = "session-stop-fail";
+    assert_update_request_fails_for_missing_session(&mut mcp, session_id, "alp").await?;
     let root_path = root.path().to_string_lossy().to_string();
     mcp.start_fuzzy_file_search_session(session_id, vec![root_path])
         .await?;
@@ -700,26 +676,4 @@ async fn test_fuzzy_file_search_two_sessions_are_independent() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_query_cleared_sends_blank_snapshot() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let root = TempDir::new()?;
-    std::fs::write(root.path().join("alpha.txt"), "contents")?;
-    let mut mcp = initialized_mcp(&codex_home).await?;
 
-    let root_path = root.path().to_string_lossy().to_string();
-    let session_id = "session-clear-query";
-    mcp.start_fuzzy_file_search_session(session_id, vec![root_path])
-        .await?;
-
-    mcp.update_fuzzy_file_search_session(session_id, "alp")
-        .await?;
-    wait_for_session_updated(&mut mcp, session_id, "alp", FileExpectation::NonEmpty).await?;
-
-    mcp.update_fuzzy_file_search_session(session_id, "").await?;
-    let payload =
-        wait_for_session_updated(&mut mcp, session_id, "", FileExpectation::Empty).await?;
-    assert_eq!(payload.files.is_empty(), true);
-
-    Ok(())
-}

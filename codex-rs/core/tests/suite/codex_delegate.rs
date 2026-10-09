@@ -211,7 +211,7 @@ async fn codex_delegate_review_rejects_patch_without_parent_approval() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_delegate_ignores_legacy_deltas() {
+async fn codex_delegate_forwards_reasoning_summary_delta() {
     require_network!();
 
     // Single response with reasoning summary deltas.
@@ -241,16 +241,16 @@ async fn codex_delegate_ignores_legacy_deltas() {
         .await
         .expect("submit review");
 
-    let mut reasoning_delta_count = 0;
+    let mut reasoning_deltas = Vec::new();
 
     loop {
         let ev = wait_for_event_with_timeout(&test.codex, |_| true, Duration::from_secs(30)).await;
         match ev {
-            EventMsg::ReasoningContentDelta(_) => reasoning_delta_count += 1,
+            EventMsg::ReasoningContentDelta(event) => reasoning_deltas.push(event.delta),
             EventMsg::TurnComplete(_) => break,
             _ => {}
         }
     }
 
-    assert_eq!(reasoning_delta_count, 1, "expected one new reasoning delta");
+    assert_eq!(reasoning_deltas, vec!["think-1"]);
 }

@@ -217,129 +217,74 @@ async fn http_disconnect_denies_follower_and_requires_fresh_approval() -> anyhow
 }
 
 #[tokio::test]
-async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
+async fn pending_approvals_are_deduped_only_for_identical_host_keys() {
     let service = NetworkApprovalService::default();
     let key = HostApprovalKey {
         environment_id: "local".to_string(),
         approval_scope_id: "local-scope".to_string(),
         host: "example.com".to_string(),
-        protocol: "http",
+        protocol: "https",
         port: 443,
     };
-
     let (first, first_is_owner) = service.get_or_create_pending_approval(key.clone()).await;
-    let (second, second_is_owner) = service.get_or_create_pending_approval(key).await;
-
     assert!(first_is_owner);
-    assert!(!second_is_owner);
-    assert!(Arc::ptr_eq(&first, &second));
+    for (candidate, same) in [
+        (key.clone(), true),
+        (HostApprovalKey { port: 8443, ..key.clone() }, false),
+        (HostApprovalKey { environment_id: "remote".into(), ..key.clone() }, false),
+        (HostApprovalKey { approval_scope_id: "replacement".into(), ..key.clone() }, false),
+        (HostApprovalKey { host: "other.example.com".into(), ..key.clone() }, false),
+        (HostApprovalKey { protocol: "http", ..key.clone() }, false),
+    ] {
+        let (pending, is_owner) = service.get_or_create_pending_approval(candidate.clone()).await;
+        assert_eq!(is_owner, !same, "{candidate:?}");
+        assert_eq!(Arc::ptr_eq(&first, &pending), same, "{candidate:?}");
+    }
 }
 
 #[tokio::test]
-async fn pending_approvals_do_not_dedupe_across_ports() {
-    let service = NetworkApprovalService::default();
-    let first_key = HostApprovalKey {
-        environment_id: "local".to_string(),
-        approval_scope_id: "local-scope".to_string(),
-        host: "example.com".to_string(),
+async fn session_approved_hosts_are_scoped_by_environment_and_incarnation() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let service = &session.services.network_approval;
+    service.session_approved_hosts.lock().await.insert(HostApprovalKey {
+        environment_id: "remote".into(),
+        approval_scope_id: "remote-scope-1".into(),
+        host: "example.com".into(),
         protocol: "https",
         port: 443,
-    };
-    let second_key = HostApprovalKey {
-        environment_id: "local".to_string(),
-        approval_scope_id: "local-scope".to_string(),
-        host: "example.com".to_string(),
-        protocol: "https",
-        port: 8443,
-    };
+    });
 
-    let (first, first_is_owner) = service.get_or_create_pending_approval(first_key).await;
-    let (second, second_is_owner) = service.get_or_create_pending_approval(second_key).await;
-
-    assert!(first_is_owner);
-    assert!(second_is_owner);
-    assert!(!Arc::ptr_eq(&first, &second));
-}
-
-#[tokio::test]
-async fn pending_approvals_do_not_dedupe_across_environments() {
-    let service = NetworkApprovalService::default();
-    let first_key = HostApprovalKey {
-        environment_id: "local".to_string(),
-        approval_scope_id: "local-scope".to_string(),
-        host: "example.com".to_string(),
-        protocol: "https",
-        port: 443,
-    };
-    let second_key = HostApprovalKey {
-        environment_id: "remote".to_string(),
-        ..first_key.clone()
-    };
-
-    let (first, first_is_owner) = service.get_or_create_pending_approval(first_key).await;
-    let (second, second_is_owner) = service.get_or_create_pending_approval(second_key).await;
-
-    assert!(first_is_owner);
-    assert!(second_is_owner);
-    assert!(!Arc::ptr_eq(&first, &second));
-}
-
-#[tokio::test]
-async fn session_approved_hosts_are_scoped_by_environment() {
-    let service = NetworkApprovalService::default();
-    let local_key = HostApprovalKey {
-        environment_id: "local".to_string(),
-        approval_scope_id: "local-scope".to_string(),
-        host: "example.com".to_string(),
-        protocol: "https",
-        port: 443,
-    };
-    let remote_key = HostApprovalKey {
-        environment_id: "remote".to_string(),
-        ..local_key.clone()
-    };
-    service
-        .session_approved_hosts
-        .lock()
-        .await
-        .insert(local_key);
-
-    assert!(
-        !service
-            .session_approved_hosts
-            .lock()
-            .await
-            .contains(&remote_key)
-    );
-}
-
-#[tokio::test]
-async fn session_approved_hosts_are_scoped_by_environment_incarnation() {
-    let service = NetworkApprovalService::default();
-    let first_key = HostApprovalKey {
-        environment_id: "remote".to_string(),
-        approval_scope_id: "remote-scope-1".to_string(),
-        host: "example.com".to_string(),
-        protocol: "https",
-        port: 443,
-    };
-    let replacement_key = HostApprovalKey {
-        approval_scope_id: "remote-scope-2".to_string(),
-        ..first_key.clone()
-    };
-    service
-        .session_approved_hosts
-        .lock()
-        .await
-        .insert(first_key);
-
-    assert!(
-        !service
-            .session_approved_hosts
-            .lock()
-            .await
-            .contains(&replacement_key)
-    );
+    for (environment, scope, expected) in [
+        ("remote", "remote-scope-1", NetworkDecision::Allow),
+        ("other", "remote-scope-1", NetworkDecision::deny("not_allowed")),
+        ("remote", "remote-scope-2", NetworkDecision::deny("not_allowed")),
+    ] {
+        service.register_call(
+            "registration".into(),
+            test_path_buf("/tmp").abs().into(),
+            "curl https://example.com".into(),
+            environment.into(),
+            scope.into(),
+            CancellationToken::new(),
+        ).await;
+        let decision = service.handle_inline_policy_request(
+            Arc::clone(&session),
+            NetworkPolicyRequest {
+                protocol: NetworkProtocol::HttpsConnect,
+                host: "EXAMPLE.COM".into(),
+                port: 443,
+                environment_id: Some(environment.into()),
+                client_addr: None,
+                method: None,
+                command: None,
+                exec_policy_hint: None,
+                execution_id: Some("registration".into()),
+            },
+        ).await;
+        assert_eq!(decision, expected, "environment={environment}, scope={scope}");
+        service.unregister_call("registration").await;
+    }
 }
 
 #[tokio::test]
@@ -350,12 +295,17 @@ async fn pending_waiters_receive_owner_decision() {
         let pending = Arc::clone(&pending);
         tokio::spawn(async move { pending.wait_for_decision().await })
     };
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
 
     pending
         .set_decision(PendingApprovalDecision::AllowOnce)
         .await;
 
-    let decision = waiter.await.expect("waiter should complete");
+    let decision = timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("owner decision should wake the pending waiter")
+        .expect("waiter should complete");
     assert_eq!(decision, PendingApprovalDecision::AllowOnce);
 }
 

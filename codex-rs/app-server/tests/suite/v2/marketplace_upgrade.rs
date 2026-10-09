@@ -195,8 +195,9 @@ async fn marketplace_upgrade_all_configured_git_marketplaces() -> Result<()> {
         "tools new"
     );
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    assert!(config.contains(&debug_new_revision));
-    assert!(config.contains(&tools_new_revision));
+    let config: toml::Table = config.parse()?;
+    assert_eq!(config["marketplaces"]["debug"]["last_revision"].as_str(), Some(debug_new_revision.as_str()));
+    assert_eq!(config["marketplaces"]["tools"]["last_revision"].as_str(), Some(tools_new_revision.as_str()));
     Ok(())
 }
 
@@ -252,45 +253,17 @@ async fn marketplace_upgrade_named_marketplace_only() -> Result<()> {
             .join("debug")
             .exists()
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn marketplace_upgrade_returns_empty_roots_when_already_up_to_date() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let source = TempDir::new()?;
-    let old_revision = init_marketplace_repo(source.path(), "debug", "debug old")?;
-    commit_marketplace_marker(source.path(), "debug new")?;
-    record_git_marketplace(
-        codex_home.path(),
-        "debug",
-        source.path(),
-        &old_revision,
-        /*ref_name*/ None,
-    )?;
-    disable_plugin_startup_tasks(codex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let first_response = send_marketplace_upgrade(&mut mcp, Some("debug")).await?;
-    assert!(first_response.errors.is_empty());
-
-    let response = send_marketplace_upgrade(&mut mcp, Some("debug")).await?;
-
     assert_eq!(
-        response,
+        send_marketplace_upgrade(&mut mcp, Some("tools")).await?,
         MarketplaceUpgradeResponse {
-            selected_marketplaces: vec!["debug".to_string()],
+            selected_marketplaces: vec!["tools".to_string()],
             upgraded_roots: Vec::new(),
             errors: Vec::new(),
         }
     );
     Ok(())
 }
+
 
 #[tokio::test]
 async fn marketplace_upgrade_rejects_unknown_or_non_git_marketplace() -> Result<()> {

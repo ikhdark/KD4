@@ -29,25 +29,20 @@ async fn transport_timing_scopes_are_isolated_and_cancel_safe() {
 }
 
 #[tokio::test]
-async fn enabled_request_logging_emits_body_size_not_contents() {
-    let logs = capture_transport_logs(HttpClient::new(test_reqwest_client())).await;
+async fn request_logging_obeys_policy_without_exposing_body() {
+    for enabled in [true, false] {
+        let client = if enabled {
+            HttpClient::new(test_reqwest_client())
+        } else {
+            HttpClient::new_without_request_logging(test_reqwest_client())
+        };
+        let logs = capture_transport_logs(client).await;
 
-    assert!(logs.contains("log capture sentinel"));
-    assert!(logs.contains("url-secret"));
-    assert!(logs.contains("<JSON body: 23 bytes>"));
-    assert!(!logs.contains("body-secret"));
-}
-
-#[tokio::test]
-async fn disabled_request_logging_suppresses_transport_url_and_body() {
-    let logs = capture_transport_logs(HttpClient::new_without_request_logging(
-        test_reqwest_client(),
-    ))
-    .await;
-
-    assert!(logs.contains("log capture sentinel"));
-    assert!(!logs.contains("url-secret"));
-    assert!(!logs.contains("body-secret"));
+        assert!(logs.contains("log capture sentinel"));
+        assert_eq!(logs.contains("url-secret"), enabled);
+        assert_eq!(logs.contains("<JSON body: 23 bytes>"), enabled);
+        assert!(!logs.contains("body-secret"));
+    }
 }
 
 #[test]
@@ -111,8 +106,21 @@ async fn permanent_certificate_failure_is_not_connection_recovery() {
             rustls_pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into())).unwrap();
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
     let server = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "TLS request must arrive");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept TLS request: {error}"),
+            }
+        };
+        // Accepted Windows sockets can inherit the listener's nonblocking mode.
+        socket.set_nonblocking(false).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut tls = rustls::ServerConnection::new(Arc::new(config)).unwrap();

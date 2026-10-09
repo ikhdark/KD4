@@ -418,7 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_uses_client_id_and_tracks_the_owner_scoped_entry() {
+    async fn watch_and_unwatch_preserve_connection_ownership() {
         let temp_dir = TempDir::new().expect("temp dir");
         let head_path = temp_dir.path().join("HEAD");
         std::fs::write(&head_path, "ref: refs/heads/main\n").expect("write HEAD");
@@ -439,37 +439,21 @@ mod tests {
 
         assert_eq!(response.path, path);
 
-        let state = manager.state.lock().await;
-        assert_eq!(
-            state.entries.keys().cloned().collect::<HashSet<_>>(),
-            HashSet::from([WatchKey {
-                connection_id: ConnectionId(1),
-                watch_id,
-            }])
-        );
-    }
-
-    #[tokio::test]
-    async fn unwatch_is_scoped_to_the_connection_that_created_the_watch() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let head_path = temp_dir.path().join("HEAD");
-        std::fs::write(&head_path, "ref: refs/heads/main\n").expect("write HEAD");
-
-        let manager = manager_with_noop_watcher();
-        manager
-            .watch(
-                ConnectionId(1),
-                FsWatchParams {
-                    watch_id: "watch-head".to_string(),
-                    path: absolute_path(head_path),
-                },
-            )
-            .await
-            .expect("watch should succeed");
         let watch_key = WatchKey {
             connection_id: ConnectionId(1),
-            watch_id: "watch-head".to_string(),
+            watch_id: watch_id.clone(),
         };
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .entries
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from([watch_key.clone()])
+        );
 
         manager
             .unwatch(
@@ -480,7 +464,10 @@ mod tests {
             )
             .await
             .expect("foreign unwatch should be a no-op");
-        assert!(manager.state.lock().await.entries.contains_key(&watch_key));
+        assert!(matches!(
+            manager.state.lock().await.entries.get(&watch_key),
+            Some(WatchEntry::Active(_))
+        ));
 
         manager
             .unwatch(

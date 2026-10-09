@@ -244,7 +244,7 @@ def read_cached_tool_run(
         if not -0.001 <= age <= ttl_seconds:
             return None
         value = path.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     if value == "ok":
         return True

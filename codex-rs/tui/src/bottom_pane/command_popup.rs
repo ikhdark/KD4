@@ -363,19 +363,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn model_is_first_suggestion_for_mo() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
-        popup.on_composer_text_change("/mo".to_string());
-        let matches = popup.filtered_items();
-        match matches.first() {
-            Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "model"),
-            Some(CommandItem::ServiceTier(command)) => {
-                panic!("expected model command, got service tier {command:?}")
-            }
-            None => panic!("expected at least one match for '/mo'"),
-        }
-    }
 
     #[test]
     fn service_tier_command_uses_catalog_name_and_description() {
@@ -589,27 +576,14 @@ mod tests {
     }
 
     #[test]
-    fn quit_hidden_in_empty_filter_but_shown_for_prefix() {
+    fn aliases_are_hidden_in_empty_filter_but_shown_for_prefix() {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
-        popup.on_composer_text_change("/".to_string());
-        let items = popup.filtered_items();
-        assert!(!items.contains(&CommandItem::Builtin(SlashCommand::Quit)));
-
-        popup.on_composer_text_change("/qu".to_string());
-        let items = popup.filtered_items();
-        assert!(items.contains(&CommandItem::Builtin(SlashCommand::Quit)));
-    }
-
-    #[test]
-    fn btw_hidden_in_empty_filter_but_shown_for_prefix() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
-        popup.on_composer_text_change("/".to_string());
-        let items = popup.filtered_items();
-        assert!(!items.contains(&CommandItem::Builtin(SlashCommand::Btw)));
-
-        popup.on_composer_text_change("/bt".to_string());
-        let items = popup.filtered_items();
-        assert!(items.contains(&CommandItem::Builtin(SlashCommand::Btw)));
+        for (alias, prefix) in [(SlashCommand::Quit, "/qu"), (SlashCommand::Btw, "/bt")] {
+            popup.on_composer_text_change("/".to_string());
+            assert!(!popup.filtered_items().contains(&CommandItem::Builtin(alias)));
+            popup.on_composer_text_change(prefix.to_string());
+            assert!(popup.filtered_items().contains(&CommandItem::Builtin(alias)));
+        }
     }
 
     #[test]

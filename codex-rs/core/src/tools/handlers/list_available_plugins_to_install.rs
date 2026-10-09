@@ -226,7 +226,13 @@ mod tests {
             assert_eq!(raw["tools"][index]["description"], candidate.description.as_ref().unwrap().as_str());
         }
         let preview: serde_json::Value = serde_json::from_str(&output.projection_metadata().unwrap().spillable_text[0]).unwrap();
-        assert_eq!(preview["tools"][0]["description"], preview["tools"][1]["description"]);
+        assert_eq!(preview["tools"].as_array().unwrap().len(), candidates.len());
+        for index in 0..candidates.len() {
+            assert_eq!(
+                preview["tools"][index]["description"],
+                format!("{prefix} [... recover full description with read_tool_output]")
+            );
+        }
         assert_eq!(output.canonical_result(&payload), JsonToolOutput::new(raw).canonical_result(&payload));
         assert!(!ListAvailablePluginsToInstallHandler::new(Vec::new()).output().unwrap().requires_canonical_artifact());
     }

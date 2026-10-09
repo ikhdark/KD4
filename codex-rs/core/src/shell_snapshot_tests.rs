@@ -62,6 +62,7 @@ impl ExecBackend for DelayedSnapshotBackend {
 
 struct DelayedSnapshotProcess {
     process_id: ProcessId,
+    output: Vec<Vec<u8>>,
     read_delay: Duration,
     terminate_calls: AtomicUsize,
     wake_tx: watch::Sender<u64>,
@@ -82,15 +83,21 @@ impl ExecProcess for DelayedSnapshotProcess {
 
     fn read(
         &self,
-        _after_seq: Option<u64>,
+        after_seq: Option<u64>,
         _max_bytes: Option<usize>,
         _wait_ms: Option<u64>,
     ) -> ExecProcessFuture<'_, ReadResponse> {
         Box::pin(async move {
             tokio::time::sleep(self.read_delay).await;
+            let index = after_seq.unwrap_or(0) as usize;
+            let chunks = self.output.get(index).map(|bytes| codex_exec_server::ProcessOutputChunk {
+                seq: index as u64 + 1,
+                stream: ExecOutputStream::Stdout,
+                chunk: bytes.clone().into(),
+            }).into_iter().collect();
             Ok(ReadResponse {
-                chunks: Vec::new(),
-                next_seq: 1,
+                chunks,
+                next_seq: index as u64 + 2,
                 output_gap: None,
                 exited: true,
                 exit_code: Some(0),
@@ -130,6 +137,7 @@ async fn remote_snapshot_start_and_collection_share_one_deadline() {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let process = Arc::new(DelayedSnapshotProcess {
         process_id: "snapshot-process".into(),
+        output: Vec::new(),
         read_delay: Duration::from_secs(6),
         terminate_calls: AtomicUsize::new(0),
         wake_tx,
@@ -169,6 +177,43 @@ async fn remote_snapshot_start_and_collection_share_one_deadline() {
     assert_eq!(process.terminate_calls.load(Ordering::Acquire), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn remote_snapshot_drains_closed_pages_and_preserves_total_deadline() {
+    for read_delay in [Duration::ZERO, Duration::from_secs(6)] {
+        let (wake_tx, _) = watch::channel(0);
+        let process = Arc::new(DelayedSnapshotProcess {
+            process_id: "paged-snapshot".into(),
+            output: vec![b"first".to_vec(), b"second".to_vec()],
+            read_delay,
+            terminate_calls: AtomicUsize::new(0),
+            wake_tx,
+        });
+        let backend: Arc<dyn ExecBackend> = Arc::new(DelayedSnapshotBackend {
+            process: process.clone(),
+            start_delay: Duration::ZERO,
+        });
+        let result = run_remote_snapshot_process_before(
+            backend,
+            ExecParams {
+                process_id: process.process_id.clone(),
+                argv: vec!["snapshot".to_string()],
+                cwd: PathUri::from_host_native_path(std::env::temp_dir()).unwrap(),
+                env_policy: None, env: HashMap::new(), tty: false, pipe_stdin: false,
+                arg0: None, sandbox: None, enforce_managed_network: false, managed_network: None,
+            },
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            "test-shell",
+        ).await;
+        if read_delay.is_zero() {
+            assert_eq!(result.unwrap(), "firstsecond");
+            assert_eq!(process.terminate_calls.load(Ordering::Acquire), 0);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("timed out"));
+            assert_eq!(process.terminate_calls.load(Ordering::Acquire), 1);
+        }
+    }
+}
+
 #[tokio::test]
 async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> Result<()> {
     use futures::SinkExt;
@@ -177,7 +222,7 @@ async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> R
 
     // The peer replaces the external executor only. Capture, environment
     // selection, remote process ownership, and snapshot admission remain real.
-    for failure_kind in ["read_error", "process_failure", "output_overflow"] {
+    for failure_kind in ["read_error", "process_failure", "output_overflow", "output_gap"] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let peer = tokio::spawn(async move {
@@ -228,7 +273,10 @@ async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> R
                                 Vec::new()
                             },
                             next_seq: 1,
-                            output_gap: None,
+                            output_gap: (failure_kind == "output_gap").then_some(codex_exec_server::ProcessOutputGap {
+                                through_seq: 3,
+                                exit_seq: None,
+                            }),
                             exited: false,
                             exit_code: None,
                             closed: false,
@@ -323,14 +371,10 @@ fn assert_snapshot_section(snapshot: &str, section: &str) {
 }
 
 #[test]
-fn strip_snapshot_preamble_removes_leading_output() {
+fn strip_snapshot_preamble_requires_and_preserves_snapshot_marker() {
     let snapshot = "noise\n# Snapshot file\nexport PATH=/bin\n";
     let cleaned = strip_snapshot_preamble(snapshot).expect("snapshot marker exists");
     assert_eq!(cleaned, "# Snapshot file\nexport PATH=/bin\n");
-}
-
-#[test]
-fn strip_snapshot_preamble_requires_marker() {
     let result = strip_snapshot_preamble("missing header");
     assert!(result.is_err());
 }
@@ -401,6 +445,13 @@ fn cmd_snapshot_formats_environment_as_replayable_batch() -> Result<()> {
     );
     assert!(!snapshot.contains("PWD="));
     assert!(!snapshot.contains("__CODEX_PRIVATE="));
+    assert_eq!(
+        parse_cmd_snapshot_environment(&snapshot),
+        Some(vec![
+            ("CODEX_TEST".to_string(), "100%^value".to_string()),
+            ("CODEX_META".to_string(), "quoted\" & piped| angles<> parens()".to_string()),
+        ])
+    );
     Ok(())
 }
 
@@ -487,6 +538,8 @@ async fn windows_cmd_snapshot_captures_validates_and_replays_environment() -> Re
         launch_environment.get(marker_name).map(String::as_str),
         Some(override_value)
     );
+    drop(snapshot_file);
+    assert!(!snapshot_path.exists(), "the final local owner removes its file");
     Ok(())
 }
 
@@ -622,17 +675,29 @@ async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> 
     let live_snapshot = snapshot_dir.join(format!("{live_session}.123.cmd"));
     let orphan_snapshot = snapshot_dir.join(format!("{orphan_session}.456.cmd"));
     let invalid_snapshot = snapshot_dir.join("not-a-snapshot.txt");
+    let active_session = ThreadId::new();
+    let active_snapshot = snapshot_dir.join(format!("{active_session}.cmd"));
+    let stale_session = ThreadId::new();
+    let stale_snapshot = snapshot_dir.join(format!("{stale_session}.cmd"));
+    let stale_rollout = write_rollout_stub(&codex_home, stale_session).await?;
+    std::fs::File::options().write(true).open(stale_rollout)?.set_modified(
+        SystemTime::now() - SNAPSHOT_RETENTION - Duration::from_secs(1),
+    )?;
+    fs::write(&active_snapshot, "active without rollout").await?;
+    fs::write(&stale_snapshot, "stale").await?;
 
     write_rollout_stub(&codex_home, live_session).await?;
     fs::write(&live_snapshot, "live").await?;
     fs::write(&orphan_snapshot, "orphan").await?;
     fs::write(&invalid_snapshot, "invalid").await?;
 
-    cleanup_stale_snapshots(&codex_home, ThreadId::new(), /*state_db*/ None).await?;
+    cleanup_stale_snapshots(&codex_home, active_session, /*state_db*/ None).await?;
 
     assert_eq!(live_snapshot.exists(), true);
     assert_eq!(orphan_snapshot.exists(), false);
     assert_eq!(invalid_snapshot.exists(), false);
+    assert!(!stale_snapshot.exists(), "expired rollouts do not retain snapshots");
+    assert!(active_snapshot.exists(), "the active session is exempt even without a rollout");
     Ok(())
 }
 
@@ -702,9 +767,14 @@ async fn assert_cancelled_remote_snapshot_cleanup(
                         let raw = b"# Snapshot file\n# Codex Cmd snapshot format: 1\n# exports\nSNAPSHOT_MARKER=retained\n";
                         let chunk =
                             serde_json::to_value(codex_exec_server::ByteChunk::from(raw.to_vec()))?;
+                        let chunks = if request["params"]["afterSeq"].is_null() {
+                            vec![json!({"seq": 1, "stream": "stdout", "chunk": chunk})]
+                        } else {
+                            Vec::new()
+                        };
                         websocket.send(tokio_tungstenite::tungstenite::Message::Text(
                             json!({"jsonrpc":"2.0", "id": request["id"], "result": {
-                                "chunks": [{"seq": 1, "stream": "stdout", "chunk": chunk}],
+                                "chunks": chunks,
                                 "nextSeq": 2, "exited": true, "exitCode": 0, "closed": true, "failure": null
                             }}).to_string().into()
                         )).await?;
@@ -833,13 +903,14 @@ async fn assert_cancelled_remote_snapshot_cleanup(
         );
     } else if cancel_validation {
         assert_eq!(
-            &methods[..8],
+            &methods[..9],
             &[
                 "initialize",
                 "initialized",
                 "environment/info",
                 "fs/createDirectory",
                 "process/start",
+                "process/read",
                 "process/read",
                 "fs/writeFile",
                 "process/start",
@@ -850,7 +921,7 @@ async fn assert_cancelled_remote_snapshot_cleanup(
                 .iter()
                 .filter(|method| *method == "process/read")
                 .count(),
-            2
+            3
         );
         assert_eq!(
             methods
@@ -1236,7 +1307,7 @@ async fn assert_remote_snapshot_shutdown(inherit: bool, expire_wait: bool) -> Re
                     json!({"processId":request["params"]["processId"]})
                 }
                 "process/read" => {
-                    let chunks = if process_count == 1 {
+                    let chunks = if process_count == 1 && request["params"]["afterSeq"].is_null() {
                         let raw = b"# Snapshot file\n# Codex Cmd snapshot format: 1\n# exports\nSNAPSHOT_MARKER=retained\n";
                         vec![json!({"seq":1,"stream":"stdout","chunk":
                             codex_exec_server::ByteChunk::from(raw.to_vec())})]
@@ -1435,6 +1506,7 @@ async fn snapshot_overflow_returns_before_eof_with_bounded_retention() {
     )
     .await;
     producer.abort();
+    assert!(producer.await.unwrap_err().is_cancelled());
     assert!(
         result
             .expect("overflow must not wait for EOF")

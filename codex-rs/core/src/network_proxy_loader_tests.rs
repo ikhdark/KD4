@@ -236,6 +236,7 @@ default_permissions = "dev"
 [permissions.dev.network.domains]
 "lower.example.com" = "allow"
 "blocked.example.com" = "deny"
+"shared.example.com" = "deny"
 "#,
     )
     .expect("lower layer should parse");
@@ -247,81 +248,34 @@ default_permissions = "dev"
 
 [permissions.dev.network.domains]
 "higher.example.com" = "allow"
+"shared.example.com" = "allow"
 "#,
     )
     .expect("higher layer should parse");
 
-    let mut config = NetworkProxyConfig::default();
-    apply_network_tables(
-        &mut config,
-        network_tables_from_toml(&lower_network).expect("lower layer should deserialize"),
+    let layers = ConfigLayerStack::new(
+        vec![
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, lower_network),
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, higher_network),
+        ],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
     )
-    .expect("lower layer should apply");
-    apply_network_tables(
-        &mut config,
-        network_tables_from_toml(&higher_network).expect("higher layer should deserialize"),
-    )
-    .expect("higher layer should apply");
+    .expect("layer stack should be valid");
+    let config = config_from_layers(&layers, &Policy::empty()).expect("merged config should build");
 
     assert_eq!(
         config.allowed_domains(),
         Some(vec![
+            "higher.example.com".to_string(),
             "lower.example.com".to_string(),
-            "higher.example.com".to_string()
+            "shared.example.com".to_string()
         ])
     );
     assert_eq!(
         config.denied_domains(),
         Some(vec!["blocked.example.com".to_string()])
     );
-}
-
-#[test]
-fn higher_precedence_profile_network_overrides_matching_domain_entries() {
-    let lower_network: toml::Value = toml::from_str(
-        r#"
-default_permissions = "dev"
-
-[permissions.dev.network]
-
-[permissions.dev.network.domains]
-"shared.example.com" = "deny"
-"other.example.com" = "allow"
-"#,
-    )
-    .expect("lower layer should parse");
-    let higher_network: toml::Value = toml::from_str(
-        r#"
-default_permissions = "dev"
-
-[permissions.dev.network]
-
-[permissions.dev.network.domains]
-"shared.example.com" = "allow"
-"#,
-    )
-    .expect("higher layer should parse");
-
-    let mut config = NetworkProxyConfig::default();
-    apply_network_tables(
-        &mut config,
-        network_tables_from_toml(&lower_network).expect("lower layer should deserialize"),
-    )
-    .expect("lower layer should apply");
-    apply_network_tables(
-        &mut config,
-        network_tables_from_toml(&higher_network).expect("higher layer should deserialize"),
-    )
-    .expect("higher layer should apply");
-
-    assert_eq!(
-        config.allowed_domains(),
-        Some(vec![
-            "other.example.com".to_string(),
-            "shared.example.com".to_string()
-        ])
-    );
-    assert_eq!(config.denied_domains(), None);
 }
 
 #[test]
@@ -363,26 +317,24 @@ strip_request_headers = ["x-api-key"]
     )
     .expect("higher layer should parse");
 
-    let mut accumulator = NetworkConfigAccumulator::default();
-    accumulator
-        .apply_network_tables(
-            network_tables_from_toml(&lower_network).expect("lower layer should deserialize"),
-        )
-        .expect("lower layer should apply");
-    accumulator
-        .apply_network_tables(
-            network_tables_from_toml(&higher_network).expect("higher layer should deserialize"),
-        )
-        .expect("higher layer should apply");
-    let config = accumulator.finish().expect("merged config should build");
+    let layers = ConfigLayerStack::new(
+        vec![
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, lower_network),
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, higher_network),
+        ],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("layer stack should be valid");
+    let config = config_from_layers(&layers, &Policy::empty()).expect("merged config should build");
 
     assert_eq!(config.mode, codex_network_proxy::NetworkMode::Full);
     assert!(config.mitm);
     assert_eq!(
         config.allowed_domains(),
         Some(vec![
-            "lower.example.com".to_string(),
-            "higher.example.com".to_string()
+            "higher.example.com".to_string(),
+            "lower.example.com".to_string()
         ])
     );
     assert_eq!(config.mitm_hooks.len(), 1);

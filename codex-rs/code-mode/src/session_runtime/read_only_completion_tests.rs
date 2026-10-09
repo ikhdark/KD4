@@ -83,7 +83,14 @@ async fn read_only_completion_does_not_wait_on_unrelated_transaction() {
     let before = Some(vec![OutputItem::Text {
         text: "before\r\n".into(),
     }]);
-    let expected = crate::cell_actor::prepend_initial_yield(event(), before.clone());
+    let expected = CellEvent::Completed {
+        content_items: vec![
+            OutputItem::Text { text: "before\r\n".into() },
+            OutputItem::Text { text: "after λ".into() },
+        ],
+        error_text: None,
+        output_loss: None,
+    };
     let committed = tokio::time::timeout(
         std::time::Duration::from_millis(250),
         host.commit_completion(HashMap::new(), event(), before, Arc::clone(&state)),

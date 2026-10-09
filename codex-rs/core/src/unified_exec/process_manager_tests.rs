@@ -65,6 +65,10 @@ async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_iden
     let process = crate::unified_exec::process_tests::remote_process(
         codex_exec_server::WriteStatus::Accepted, None,
     ).await;
+    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn, 1000, Arc::clone(&process)).await;
+    let execution_id = manager.process_store.lock().await.processes[&1000].command_execution_id;
+    let policy = codex_utils_output_truncation::TruncationPolicy::Bytes(1000);
+    assert!(manager.reuse_running_validation(1000, execution_id, policy, None).await.is_none());
     process.set_validation(Some(crate::validation::CommandValidation {
         execution_context: None,
         declared: None, receipt_runner: None,
@@ -73,17 +77,21 @@ async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_iden
                 program: "cargo".into(), args: vec!["test".into(), "-p".into(), "app".into()],
             }),
     }));
-    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn, 1000, Arc::clone(&process)).await;
-    let execution_id = manager.process_store.lock().await.processes[&1000].command_execution_id;
-    let policy = codex_utils_output_truncation::TruncationPolicy::Bytes(1000);
+    process.publish_output_for_test(b"unconsumed validation evidence\n".to_vec()).await;
     let reused = manager.reuse_running_validation(1000, execution_id, policy, None).await.unwrap();
     assert_eq!(reused.process_id, Some(1000));
     assert!(reused.raw_output.is_empty());
     assert!(reused.session_capabilities.is_some());
     assert_eq!(reused.event_call_id, "exec-call-1000");
     assert!(manager.process_store.lock().await.processes.contains_key(&1000));
+    assert_eq!(process.snapshot_output().await, b"unconsumed validation evidence\n");
+    let active = Arc::clone(&manager.process_store.lock().await.processes[&1000].initial_exec_command_active);
+    active.store(true, Ordering::Release);
+    assert!(manager.reuse_running_validation(1000, execution_id, policy, None).await.is_none());
+    active.store(false, Ordering::Release);
     let other_id = session.services.command_execution.allocate_execution_id();
     assert!(manager.reuse_running_validation(1000, other_id, policy, None).await.is_none());
+    assert_eq!(process.snapshot_output().await, b"unconsumed validation evidence\n");
     process.signal_exit_for_test(Some(0));
     assert!(manager.reuse_running_validation(1000, execution_id, policy, None).await.is_none());
     manager.process_store.lock().await.remove(1000);
@@ -174,7 +182,6 @@ async fn nested_deadline_clips_recorded_yield_budget() {
         1000, Arc::clone(&process)).await;
     let start = Instant::now();
     let nested = (start + NESTED_POLL_MARGIN + Duration::from_secs(1)).into_std();
-    let effective = nested_poll_bound(Some(nested)).unwrap().duration_since(start).as_millis() as u64;
     let timing = Arc::new(ToolDispatchTiming::new(start, false));
     scope_tool_dispatch_timing(Arc::clone(&timing), manager.write_stdin(WriteStdinRequest {
         process_id: 1000, input: "", yield_time_ms: 30_000, max_output_tokens: None,
@@ -184,7 +191,8 @@ async fn nested_deadline_clips_recorded_yield_budget() {
     let snapshot = timing.snapshot(Instant::now());
     let wait = snapshot.timer_waits.iter().find(|w| w.wait_kind == "write_stdin_yield").unwrap();
     assert_eq!(wait.requested_timeout_ms, Some(30_000));
-    assert_eq!(wait.effective_timeout_ms, Some(effective));
+    // The fixture leaves exactly one second after reserving the nested-call margin.
+    assert_eq!(wait.effective_timeout_ms, Some(1_000));
     assert!(snapshot.timer_waits.iter().any(|w| w.wait_kind == "owner_output_wait"));
     assert!(!snapshot.timer_waits.iter().any(|w| w.wait_kind == "post_exit_output_drain"));
     manager.process_store.lock().await.remove(1000);

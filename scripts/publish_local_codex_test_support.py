@@ -91,7 +91,10 @@ def clean_env() -> dict[str, str]:
     # so the inherited environment can carry them; the script prefers
     # CODEX_LOCAL_PUBLISH_DIR over the test's temp USERPROFILE, which makes
     # assertions machine-state-dependent unless they are stripped.
-    env = os.environ.copy()
+    # Git's repository/index/config overrides can redirect even `git -C` out
+    # of a temporary checkout. No ambient Git controls belong in fixtures.
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith("GIT_")}
     # Publish builds refuse these, so an ambient value must not decide a test.
     for name in (*PUBLISH_ENV_VARS, "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CODEX_THREAD_ID"):
         env.pop(name, None)

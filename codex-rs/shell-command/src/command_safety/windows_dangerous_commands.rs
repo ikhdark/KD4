@@ -535,278 +535,176 @@ mod tests {
         ])));
     }
 
-    // Force delete tests for PowerShell
-
     #[test]
-    fn powershell_remove_item_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Remove-Item test -Force"
-        ])));
-    }
-
-    #[test]
-    fn powershell_remove_item_recurse_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Remove-Item test -Recurse -Force"
-        ])));
-    }
-
-    #[test]
-    fn powershell_ri_alias_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "pwsh",
-            "-Command",
-            "ri test -Force"
-        ])));
-    }
-
-    #[test]
-    fn powershell_remove_item_without_force_is_not_flagged() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Remove-Item test"
-        ])));
-    }
-
-    // Force delete tests for CMD
-    #[test]
-    fn cmd_del_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "del", "/f", "test.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_erase_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "erase", "/f", "test.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_del_without_force_is_not_flagged() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "del", "test.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_rd_recursive_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "rd", "/s", "/q", "test"
-        ])));
-    }
-
-    #[test]
-    fn cmd_rd_without_quiet_is_not_flagged() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "rd", "/s", "test"
-        ])));
-    }
-
-    #[test]
-    fn cmd_rmdir_recursive_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "rmdir", "/s", "/q", "test"
-        ])));
-    }
-
-    // Test exact scenario from issue #8567
-    #[test]
-    fn powershell_remove_item_path_recurse_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Remove-Item -Path 'test' -Recurse -Force"
-        ])));
-    }
-
-    #[test]
-    fn powershell_remove_item_force_with_semicolon_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Remove-Item test -Force; Write-Host done"
-        ])));
-    }
-
-    #[test]
-    fn powershell_remove_item_force_inside_block_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "if ($true) { Remove-Item test -Force}"
-        ])));
-    }
-
-    #[test]
-    fn powershell_remove_item_force_inside_brackets_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "[void]( Remove-Item test -Force)]"
-        ])));
-    }
-
-    #[test]
-    fn cmd_del_path_containing_f_is_not_flagged() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "del",
-            "C:/foo/bar.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_rd_path_containing_s_is_not_flagged() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "rd",
-            "C:/source"
-        ])));
-    }
-
-    #[test]
-    fn cmd_bypass_chained_del_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "echo", "hello", "&", "del", "/f", "file.txt"
-        ])));
-    }
-
-    #[test]
-    fn powershell_chained_no_space_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Write-Host hi;Remove-Item -Force C:\\tmp"
-        ])));
-    }
-
-    #[test]
-    fn powershell_comma_separated_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "del,-Force,C:\\foo"
-        ])));
-    }
-
-    #[test]
-    fn cmd_echo_del_is_not_dangerous() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "echo", "del", "/f"
-        ])));
-    }
-
-    #[test]
-    fn cmd_del_single_string_argument_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "del /f file.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_del_chained_single_string_argument_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "echo hello & del /f file.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_chained_no_space_del_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "echo hi&del /f file.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_chained_andand_no_space_del_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "echo hi&&del /f file.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_chained_oror_no_space_del_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "echo hi||del /f file.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_start_url_single_string_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "start https://example.com"
-        ])));
-    }
-
-    #[test]
-    fn cmd_chained_no_space_rmdir_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "echo hi&rmdir /s /q testdir"
-        ])));
-    }
-
-    #[test]
-    fn cmd_del_force_uppercase_flag_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd", "/c", "DEL", "/F", "file.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmdexe_r_del_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd.exe", "/r", "del", "/f", "file.txt"
-        ])));
-    }
-
-    #[test]
-    fn cmd_start_quoted_url_single_string_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            r#"start "https://example.com""#
-        ])));
-    }
-
-    #[test]
-    fn cmd_start_title_then_url_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            r#"start "" https://example.com"#
-        ])));
-    }
-
-    #[test]
-    fn powershell_rm_alias_force_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "rm test -Force"
-        ])));
+    fn force_delete_command_variants_preserve_hazard_classification() {
+        for (case, command, expected) in [
+            (
+                "powershell_remove_item_force_is_dangerous",
+                vec_str(&["powershell", "-Command", "Remove-Item test -Force"]),
+                true,
+            ),
+            (
+                "powershell_remove_item_recurse_force_is_dangerous",
+                vec_str(&["powershell", "-Command", "Remove-Item test -Recurse -Force"]),
+                true,
+            ),
+            (
+                "powershell_ri_alias_force_is_dangerous",
+                vec_str(&["pwsh", "-Command", "ri test -Force"]),
+                true,
+            ),
+            (
+                "powershell_remove_item_without_force_is_not_flagged",
+                vec_str(&["powershell", "-Command", "Remove-Item test"]),
+                false,
+            ),
+            (
+                "cmd_del_force_is_dangerous",
+                vec_str(&["cmd", "/c", "del", "/f", "test.txt"]),
+                true,
+            ),
+            (
+                "cmd_erase_force_is_dangerous",
+                vec_str(&["cmd", "/c", "erase", "/f", "test.txt"]),
+                true,
+            ),
+            (
+                "cmd_del_without_force_is_not_flagged",
+                vec_str(&["cmd", "/c", "del", "test.txt"]),
+                false,
+            ),
+            (
+                "cmd_rd_recursive_is_dangerous",
+                vec_str(&["cmd", "/c", "rd", "/s", "/q", "test"]),
+                true,
+            ),
+            (
+                "cmd_rd_without_quiet_is_not_flagged",
+                vec_str(&["cmd", "/c", "rd", "/s", "test"]),
+                false,
+            ),
+            (
+                "cmd_rmdir_recursive_is_dangerous",
+                vec_str(&["cmd", "/c", "rmdir", "/s", "/q", "test"]),
+                true,
+            ),
+            (
+                "powershell_remove_item_path_recurse_force_is_dangerous",
+                vec_str(&["powershell", "-Command", "Remove-Item -Path 'test' -Recurse -Force"]),
+                true,
+            ),
+            (
+                "powershell_remove_item_force_with_semicolon_is_dangerous",
+                vec_str(&["powershell", "-Command", "Remove-Item test -Force; Write-Host done"]),
+                true,
+            ),
+            (
+                "powershell_remove_item_force_inside_block_is_dangerous",
+                vec_str(&["powershell", "-Command", "if ($true) { Remove-Item test -Force}"]),
+                true,
+            ),
+            (
+                "powershell_remove_item_force_inside_brackets_is_dangerous",
+                vec_str(&["powershell", "-Command", "[void]( Remove-Item test -Force)]"]),
+                true,
+            ),
+            (
+                "cmd_del_path_containing_f_is_not_flagged",
+                vec_str(&["cmd", "/c", "del", "C:/foo/bar.txt"]),
+                false,
+            ),
+            (
+                "cmd_rd_path_containing_s_is_not_flagged",
+                vec_str(&["cmd", "/c", "rd", "C:/source"]),
+                false,
+            ),
+            (
+                "cmd_bypass_chained_del_is_dangerous",
+                vec_str(&["cmd", "/c", "echo", "hello", "&", "del", "/f", "file.txt"]),
+                true,
+            ),
+            (
+                "powershell_chained_no_space_is_dangerous",
+                vec_str(&["powershell", "-Command", "Write-Host hi;Remove-Item -Force C:\\tmp"]),
+                true,
+            ),
+            (
+                "powershell_comma_separated_is_dangerous",
+                vec_str(&["powershell", "-Command", "del,-Force,C:\\foo"]),
+                true,
+            ),
+            (
+                "cmd_echo_del_is_not_dangerous",
+                vec_str(&["cmd", "/c", "echo", "del", "/f"]),
+                false,
+            ),
+            (
+                "cmd_del_single_string_argument_is_dangerous",
+                vec_str(&["cmd", "/c", "del /f file.txt"]),
+                true,
+            ),
+            (
+                "cmd_del_chained_single_string_argument_is_dangerous",
+                vec_str(&["cmd", "/c", "echo hello & del /f file.txt"]),
+                true,
+            ),
+            (
+                "cmd_chained_no_space_del_is_dangerous",
+                vec_str(&["cmd", "/c", "echo hi&del /f file.txt"]),
+                true,
+            ),
+            (
+                "cmd_chained_andand_no_space_del_is_dangerous",
+                vec_str(&["cmd", "/c", "echo hi&&del /f file.txt"]),
+                true,
+            ),
+            (
+                "cmd_chained_oror_no_space_del_is_dangerous",
+                vec_str(&["cmd", "/c", "echo hi||del /f file.txt"]),
+                true,
+            ),
+            (
+                "cmd_start_url_single_string_is_dangerous",
+                vec_str(&["cmd", "/c", "start https://example.com"]),
+                true,
+            ),
+            (
+                "cmd_chained_no_space_rmdir_is_dangerous",
+                vec_str(&["cmd", "/c", "echo hi&rmdir /s /q testdir"]),
+                true,
+            ),
+            (
+                "cmd_del_force_uppercase_flag_is_dangerous",
+                vec_str(&["cmd", "/c", "DEL", "/F", "file.txt"]),
+                true,
+            ),
+            (
+                "cmdexe_r_del_force_is_dangerous",
+                vec_str(&["cmd.exe", "/r", "del", "/f", "file.txt"]),
+                true,
+            ),
+            (
+                "cmd_start_quoted_url_single_string_is_dangerous",
+                vec_str(&["cmd", "/c", r#"start "https://example.com""#]),
+                true,
+            ),
+            (
+                "cmd_start_title_then_url_is_dangerous",
+                vec_str(&["cmd", "/c", r#"start "" https://example.com"#]),
+                true,
+            ),
+            (
+                "powershell_rm_alias_force_is_dangerous",
+                vec_str(&["powershell", "-Command", "rm test -Force"]),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                is_dangerous_command_windows(&command),
+                expected,
+                "{case}: {command:?}"
+            );
+        }
     }
 
     #[test]

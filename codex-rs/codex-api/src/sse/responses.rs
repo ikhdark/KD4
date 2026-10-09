@@ -677,6 +677,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(2);
         let producer = tokio::spawn(process_sse(Box::pin(chunks), tx, idle_timeout(), None));
         tokio::task::yield_now().await;
+        assert!(consumed.load(Ordering::SeqCst) > 0, "producer must have started");
         assert!(consumed.load(Ordering::SeqCst) < 4096);
         drop(rx);
         producer.await.unwrap();
@@ -695,6 +696,7 @@ mod tests {
             Box::pin(stream::iter(chunks)), tx, Duration::from_millis(30), None,
         ));
         tokio::task::yield_now().await;
+        assert_eq!(rx.len(), 1, "producer must reach backpressure before time advances");
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
         assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
@@ -1891,87 +1893,56 @@ mod tests {
     }
 
     #[test]
-    fn responses_stream_event_response_model_reads_top_level_headers() {
-        let value = json!({
-            "type": "response.metadata",
-            "headers": {
-                "openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS,
-            }
-        });
-        let ev = <ResponsesStreamEvent as serde::Deserialize>::deserialize(&value)
-            .expect("expected event to deserialize");
-
-        assert_eq!(ev.response_model(), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS));
-    }
-
-    #[test]
     fn responses_stream_event_response_model_prefers_response_headers() {
-        let value = json!({
-            "type": "response.created",
-            "headers": {
-                "openai-model": "top-level-model"
-            },
-            "response": {
-                "id": "resp-1",
-                "headers": {
-                    "openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS
-                }
-            }
-        });
-        let ev = <ResponsesStreamEvent as serde::Deserialize>::deserialize(&value)
-            .expect("expected event to deserialize");
-
-        assert_eq!(ev.response_model(), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS));
+        for (value, expected) in [
+            (json!({
+                "type": "response.metadata",
+                "headers": {"openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS}
+            }), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)),
+            (json!({
+                "type": "response.created",
+                "headers": {"openai-model": "top-level-model"},
+                "response": {"id": "resp-1", "headers": {"openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS}}
+            }), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)),
+            (json!({
+                "type": "response.created",
+                "headers": {"OpenAI-Model": ["fallback"]},
+                "response": {"headers": {"openai-model": 42}}
+            }), Some("fallback")),
+            (json!({"type": "response.metadata", "headers": {}}), None),
+        ] {
+            let event = <ResponsesStreamEvent as serde::Deserialize>::deserialize(&value)
+                .expect("expected event to deserialize");
+            assert_eq!(event.response_model(), expected);
+        }
     }
 
     #[test]
-    fn responses_stream_event_model_verification_reads_metadata_field() {
-        let event = json!({
-            "type": "response.metadata",
-            "sequence_number": 1,
-            "response_id": "resp-1",
-            "metadata": {
-                "openai_verification_recommendation": [TRUSTED_ACCESS_FOR_CYBER_VERIFICATION]
+    fn responses_stream_event_model_verification_filters_metadata_values() {
+        for (recommendations, recognized) in [
+            (json!([TRUSTED_ACCESS_FOR_CYBER_VERIFICATION]), true),
+            (json!([TRUSTED_ACCESS_FOR_CYBER_VERIFICATION, "unknown", 42, TRUSTED_ACCESS_FOR_CYBER_VERIFICATION]), true),
+            (json!(["unknown"]), false),
+            (json!(TRUSTED_ACCESS_FOR_CYBER_VERIFICATION), false),
+            (json!([]), false),
+            (Value::Null, false),
+        ] {
+            for kind in ["response.metadata", "response.created"] {
+                let value = json!({
+                    "type": kind,
+                    "sequence_number": 1,
+                    "response_id": "resp-1",
+                    "metadata": {"openai_verification_recommendation": recommendations}
+                });
+                let event = <ResponsesStreamEvent as serde::Deserialize>::deserialize(&value)
+                    .expect("expected event to deserialize");
+                assert_eq!(
+                    event.model_verifications(),
+                    (recognized && kind == "response.metadata")
+                        .then(|| vec![ModelVerification::TrustedAccessForCyber])
+                );
             }
-        });
-        let event: ResponsesStreamEvent =
-            <ResponsesStreamEvent as serde::Deserialize>::deserialize(&event)
-                .expect("expected event to deserialize");
-
-        assert_eq!(
-            event.model_verifications(),
-            Some(vec![ModelVerification::TrustedAccessForCyber])
-        );
-    }
-
-    #[test]
-    fn responses_stream_event_model_verification_ignores_unknown_field() {
-        let event = json!({
-            "type": "response.metadata",
-            "metadata": {
-                "openai_verification_recommendation": ["unknown"]
-            }
-        });
-        let event: ResponsesStreamEvent =
-            <ResponsesStreamEvent as serde::Deserialize>::deserialize(&event)
-                .expect("expected event to deserialize");
-
-        assert_eq!(event.model_verifications(), None);
-    }
-
-    #[test]
-    fn responses_stream_event_model_verification_ignores_non_array_field() {
-        let event = json!({
-            "type": "response.metadata",
-            "metadata": {
-                "openai_verification_recommendation": TRUSTED_ACCESS_FOR_CYBER_VERIFICATION
-            }
-        });
-        let event: ResponsesStreamEvent =
-            <ResponsesStreamEvent as serde::Deserialize>::deserialize(&event)
-                .expect("expected event to deserialize");
-
-        assert_eq!(event.model_verifications(), None);
+        }
     }
 
     const CYBER_RESTRICTED_MODEL_FOR_TESTS: &str = "gpt-5.3-codex";

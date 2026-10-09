@@ -223,17 +223,18 @@ mod tests {
     }
 
     #[test]
-    fn strips_proposed_plan_blocks_from_text() {
-        let text = "before\n<proposed_plan>\n- step\n</proposed_plan>\nafter";
-        assert_eq!(strip_proposed_plan_blocks(text), "before\nafter");
-    }
-
-    #[test]
-    fn extracts_proposed_plan_text() {
-        let text = "before\n<proposed_plan>\n- step\n</proposed_plan>\nafter";
-        assert_eq!(
-            extract_proposed_plan_text(text),
-            Some("- step\n".to_string())
-        );
+    fn strips_plan_blocks_and_extracts_only_the_last_plan() {
+        for (text, visible, plan) in [
+            ("before\n<proposed_plan>\n- step\n</proposed_plan>\nafter", "before\nafter", Some("- step\n")),
+            ("plain text", "plain text", None),
+            ("<proposed_plan> extra\n", "<proposed_plan> extra\n", None),
+            ("<proposed_plan>\n", "", Some("")),
+            ("before\n<proposed_plan>\nunfinished", "before\n", Some("unfinished")),
+            ("<proposed_plan>\nfirst\n</proposed_plan>\nbetween\n<proposed_plan>\nlast\n</proposed_plan>", "between\n", Some("last\n")),
+            ("<proposed_plan>\nfirst\n</proposed_plan>\n<proposed_plan>\n</proposed_plan>", "", Some("")),
+        ] {
+            assert_eq!(strip_proposed_plan_blocks(text), visible, "{text:?}");
+            assert_eq!(extract_proposed_plan_text(text).as_deref(), plan, "{text:?}");
+        }
     }
 }

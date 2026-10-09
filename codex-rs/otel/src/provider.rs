@@ -461,50 +461,24 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn resource_attributes_include_host_name_when_present() {
-        let attrs = resource_attributes(
-            &test_otel_settings(),
-            Some("opentelemetry-test"),
-            ResourceKind::Logs,
-        );
-
-        let host_name = attrs
-            .iter()
-            .find(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
-            .map(|kv| kv.value.as_str().to_string());
-
-        assert_eq!(host_name, Some("opentelemetry-test".to_string()));
-    }
-
-    #[test]
-    fn resource_attributes_omit_host_name_when_missing_or_empty() {
-        let missing = resource_attributes(
-            &test_otel_settings(),
-            /*host_name*/ None,
-            ResourceKind::Logs,
-        );
-        let empty = resource_attributes(&test_otel_settings(), Some("   "), ResourceKind::Logs);
-        let trace_attrs = resource_attributes(
-            &test_otel_settings(),
-            Some("opentelemetry-test"),
-            ResourceKind::Traces,
-        );
-
-        assert!(
-            !missing
-                .iter()
-                .any(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
-        );
-        assert!(
-            !empty
-                .iter()
-                .any(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
-        );
-        assert!(
-            !trace_attrs
-                .iter()
-                .any(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
-        );
+    fn resource_attributes_only_include_nonempty_host_names_for_logs() {
+        for (kind, host, expected_host) in [
+            (ResourceKind::Logs, Some("opentelemetry-test"), Some("opentelemetry-test")),
+            (ResourceKind::Logs, Some("  opentelemetry-test  "), Some("opentelemetry-test")),
+            (ResourceKind::Logs, None, None),
+            (ResourceKind::Logs, Some("   "), None),
+            (ResourceKind::Traces, Some("opentelemetry-test"), None),
+        ] {
+            let attrs = resource_attributes(&test_otel_settings(), host, kind);
+            let mut expected = vec![
+                KeyValue::new(semconv::attribute::SERVICE_VERSION, "0.0.0"),
+                KeyValue::new(ENV_ATTRIBUTE, "test"),
+            ];
+            if let Some(host) = expected_host {
+                expected.push(KeyValue::new(HOST_NAME_ATTRIBUTE, host));
+            }
+            assert_eq!(attrs, expected, "{kind:?} {host:?}");
+        }
     }
 
     #[test]
@@ -551,10 +525,10 @@ mod tests {
     fn provider_rejects_invalid_headers_for_every_signal_and_transport() {
         for http in [false, true] {
             for signal in ["logs", "traces", "metrics"] {
-                for entries in [
-                    vec![("bad name", "secret")],
-                    vec![("authorization", "secret\nvalue")],
-                    vec![("X-Token", "secret"), ("x-token", "different-secret")],
+                for (entries, expected) in [
+                    (vec![("bad name", "secret")], "invalid OTLP header name"),
+                    (vec![("authorization", "secret\nvalue")], "invalid OTLP header value"),
+                    (vec![("X-Token", "secret"), ("x-token", "different-secret")], "duplicate OTLP header name"),
                 ] {
                     let headers = entries
                         .into_iter()
@@ -584,7 +558,7 @@ mod tests {
                         .err()
                         .expect("invalid headers rejected");
                     let message = error.to_string();
-                    assert!(message.contains("header"), "{signal}: {message}");
+                    assert!(message.contains(expected), "{signal}: {message}");
                     assert!(
                         !message.contains("secret"),
                         "header value leaked: {message}"

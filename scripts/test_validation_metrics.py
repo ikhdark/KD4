@@ -119,6 +119,19 @@ class SummaryTest(unittest.TestCase):
         report = metrics.summarize([value])
         self.assertEqual(report["launches_producing_current_proof"], 0)
         self.assertEqual(report["proof_freshness"], {"unknown": 1})
+        value.update(input_coverage="complete", input_digest="a" * 64)
+        value["proof"].update(coverage="verified", freshness_basis={"revision": "r1"})
+        self.assertEqual(metrics.summarize([value])["launches_producing_current_proof"], 1)
+        for section, field in (
+            (None, "input_coverage"), (None, "input_digest"),
+            ("proof", "coverage"), ("proof", "freshness_basis"), ("proof", "obligations"),
+        ):
+            with self.subTest(section=section, field=field):
+                incomplete = copy.deepcopy(value)
+                (incomplete[section] if section else incomplete)[field] = None
+                report = metrics.summarize([incomplete])
+                self.assertEqual(report["launches_producing_current_proof"], 0)
+                self.assertEqual(report["proof_freshness"], {"unknown": 1})
 
     def test_reason_and_proof_are_independent_and_timestamps_are_normalized(self):
         value = record(reason="inputs_changed", reason_basis={"changed_inputs": ["src/a"]})
@@ -158,10 +171,22 @@ class PersistenceTest(unittest.TestCase):
             self.assertEqual(unresolved, [])
             self.assertEqual(metrics.summarize(records)["duplicate_records"], 1)
             self.assertEqual(metrics.summarize(records)["launches"], 1)
-            ledger.path.write_text("{}")
-            _, _, unresolved = metrics.read_inputs([rollout])
+            # A same-size valid ledger must not bypass content-hash validation.
+            altered = raw.replace(b'"passed"', b'"failed"')
+            self.assertNotEqual(altered, raw)
+            self.assertEqual(len(altered), len(raw))
+            ledger.path.write_bytes(altered)
+            records, _, unresolved = metrics.read_inputs([rollout])
+            self.assertEqual(records, [])
             self.assertEqual(len(unresolved), 1)
             self.assertIn("hash/size", unresolved[0]["error"])
+            ledger.path.write_text("{}")
+            records, _, unresolved = metrics.read_inputs([rollout])
+            self.assertEqual(records, [])
+            self.assertEqual(len(unresolved), 1)
+            self.assertIn("hash/size", unresolved[0]["error"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(metrics.main([str(rollout), "--json"]), 1)
 
     def test_retention_failure_preserves_inline_ledger(self):
         ledger = metrics.ValidationMetrics(["test"])
@@ -186,8 +211,12 @@ class PersistenceTest(unittest.TestCase):
             report = json.loads(output.getvalue())
             self.assertEqual(report["launches"], 1)
             self.assertEqual(report["coverage"][0]["bytes"], path.stat().st_size)
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()) as description:
                 self.assertEqual(metrics.main(["--describe"]), 0)
+            contract = json.loads(description.getvalue())
+            self.assertEqual(contract["kind"], metrics.KIND)
+            self.assertIn("freshness", contract["proof"])
+            self.assertEqual(contract["reasons"], list(metrics.REASONS))
 
     def test_non_string_metadata_kinds_do_not_abort_rollout_extraction(self):
         kinds = [[], ["bin"], {"target": "bin"}, None, 1, True]
@@ -215,6 +244,45 @@ class PersistenceTest(unittest.TestCase):
                 {row["run_id"] for row in report["records"]},
                 {f"run-{index}" for index in range(len(kinds))},
             )
+
+    def test_malformed_rollout_carriers_preserve_later_ledger_and_coverage(self):
+        # A JSONL audit must report bad records and still account for valid
+        # siblings, rather than turn malformed carrier data into a traceback.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            invalid_ledger = root / "not-a-ledger.json"
+            invalid_ledger.write_bytes(b"[]")
+            bad_reference = {
+                "kind": metrics.REF_KIND, "path": str(invalid_ledger),
+                "bytes": 2, "sha256": hashlib.sha256(b"[]").hexdigest(),
+                "run_id": "invalid",
+            }
+            malformed = [
+                {"type": "response_item", "payload": value}
+                for value in (None, [], "text", 1)
+            ]
+            malformed.extend({"type": "response_item", "payload": {
+                "type": "function_call_output", "output": packet,
+            }} for packet in (bad_reference, {**bad_reference, "path": []}))
+            malformed.append({"type": "rollout_payload_artifact", "payload": None})
+            good = record("surviving-run")
+            rows = [*malformed, {"type": "response_item", "payload": {"type": []}}, good]
+            raw = "".join(json.dumps(row) + "\n" for row in rows).encode()
+            path = root / "rollout.jsonl"
+            path.write_bytes(raw)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(metrics.main([str(path), "--json"]), 1)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["records"], [good])
+            self.assertEqual(report["launches"], 1)
+            self.assertEqual([row["line"] for row in report["unresolved"]],
+                             list(range(1, len(malformed) + 1)))
+            self.assertTrue(all(row["error"] for row in report["unresolved"]))
+            self.assertEqual(report["coverage"], [{
+                "path": str(path), "records": len(rows), "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }])
 
     def test_source_strings_are_not_metrics(self):
         value = record()

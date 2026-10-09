@@ -683,16 +683,14 @@ async fn append_after_compression_final_check_survives_in_one_representation() -
         )
         .await
     });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut append_task)
-            .await
-            .is_err(),
-        "append should wait for compression's exclusive rollout lock"
-    );
+    let waited = tokio::time::timeout(Duration::from_millis(100), &mut append_task)
+        .await
+        .is_err();
 
     resume_tx.send(())?;
     compression_task.await??;
     append_task.await??;
+    assert!(waited, "append should wait for compression's exclusive rollout lock");
 
     let compressed_path = compressed_rollout_path(&rollout_path);
     assert!(rollout_path.exists());
@@ -731,6 +729,8 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
     write_rollout(&rollout_path, thread_id, "hello before resume")?;
     compress_now(&rollout_path)?;
     let compressed_path = compressed_rollout_path(&rollout_path);
+    set_old_mtime(&compressed_path)?;
+    let compressed_modified = fs::metadata(&compressed_path)?.modified()?;
 
     let InitialHistory::Resumed(history) =
         RolloutRecorder::get_rollout_history(compressed_path.as_path()).await?
@@ -746,6 +746,7 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
     .await?;
 
     assert_eq!(recorder.rollout_path(), rollout_path.as_path());
+    assert_eq!(fs::metadata(&rollout_path)?.modified()?, compressed_modified);
     assert!(rollout_path.exists());
     assert!(!compressed_path.exists());
     recorder
@@ -764,40 +765,15 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
     assert_eq!(loaded_thread_id, Some(thread_id));
     assert_eq!(parse_errors, 0);
     assert_eq!(items.len(), 3);
+    let messages = items.iter().filter_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::UserMessage(event)) => Some(event.message.as_str()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(messages, ["hello before resume", "hello after resume"]);
     Ok(())
 }
 
-#[tokio::test]
-async fn resume_materialization_preserves_rollout_modified_time() -> anyhow::Result<()> {
-    let home = TempDir::new()?;
-    let config = RolloutConfig {
-        codex_home: home.path().to_path_buf(),
-        sqlite_home: home.path().to_path_buf(),
-        cwd: home.path().to_path_buf(),
-        model_provider_id: "test-provider".to_string(),
-    };
-    let uuid = Uuid::from_u128(4);
-    let thread_id = ThreadId::from_string(&uuid.to_string())?;
-    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
-    write_rollout(&rollout_path, thread_id, "hello before resume")?;
-    compress_now(&rollout_path)?;
-    let compressed_path = compressed_rollout_path(&rollout_path);
-    set_old_mtime(&compressed_path)?;
-    let compressed_modified = fs::metadata(&compressed_path)?.modified()?;
 
-    let recorder = RolloutRecorder::new(
-        &config,
-        RolloutRecorderParams::resume(compressed_path.clone()),
-    )
-    .await?;
-
-    assert_eq!(
-        fs::metadata(&rollout_path)?.modified()?,
-        compressed_modified
-    );
-    recorder.shutdown().await?;
-    Ok(())
-}
 
 #[test]
 fn persist_temp_file_noclobber_installs_completed_temp() -> anyhow::Result<()> {

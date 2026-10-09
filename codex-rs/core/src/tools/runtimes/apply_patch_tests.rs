@@ -414,7 +414,7 @@ async fn sandbox_cwd_uses_patch_action_cwd() {
     let path = std::env::temp_dir()
         .join("apply-patch-runtime-sandbox-cwd.txt")
         .abs();
-    let req = ApplyPatchRequest {
+    let mut req = ApplyPatchRequest {
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         action: ApplyPatchAction::new_add_for_test(
@@ -431,6 +431,8 @@ async fn sandbox_cwd_uses_patch_action_cwd() {
         permissions_preapproved: false,
     };
 
+    req.action.cwd = req.turn_environment.cwd().join("patch-subdirectory").unwrap();
+    assert_ne!(&req.action.cwd, req.turn_environment.cwd());
     assert_eq!(runtime.sandbox_cwd(&req), Some(&req.action.cwd));
 }
 

@@ -225,18 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_notification_thread_ids_are_not_global() {
-        let notification = ServerNotification::Warning(WarningNotification {
-            thread_id: Some("malformed".to_string()),
-            message: "warning".to_string(),
-        });
-        assert_eq!(
-            server_notification_thread_target(&notification),
-            ServerNotificationThreadTarget::InvalidThreadId("malformed".to_string())
-        );
-    }
-
-    #[test]
     fn duplicate_question_ids_are_rejected_before_routing() {
         let question = codex_app_server_protocol::ToolRequestUserInputQuestion {
             id: "choice".to_string(),
@@ -273,61 +261,51 @@ mod tests {
     }
 
     #[test]
-    fn warning_notifications_without_threads_are_global() {
-        let notification = ServerNotification::Warning(WarningNotification {
-            thread_id: None,
-            message: "warning".to_string(),
-        });
-
-        let target = server_notification_thread_target(&notification);
-
-        assert_eq!(target, ServerNotificationThreadTarget::Global);
-    }
-
-    #[test]
-    fn warning_notifications_route_to_threads_when_thread_id_is_present() {
+    fn warning_notifications_route_by_thread_id() {
         let thread_id = ThreadId::new();
-        let notification = ServerNotification::Warning(WarningNotification {
-            thread_id: Some(thread_id.to_string()),
-            message: "warning".to_string(),
-        });
-
-        let target = server_notification_thread_target(&notification);
-
-        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+        for (id, expected) in [
+            (None, ServerNotificationThreadTarget::Global),
+            (
+                Some(thread_id.to_string()),
+                ServerNotificationThreadTarget::Thread(thread_id),
+            ),
+            (
+                Some("malformed".to_string()),
+                ServerNotificationThreadTarget::InvalidThreadId("malformed".to_string()),
+            ),
+        ] {
+            let notification = ServerNotification::Warning(WarningNotification {
+                thread_id: id,
+                message: "warning".to_string(),
+            });
+            assert_eq!(server_notification_thread_target(&notification), expected);
+        }
     }
 
     #[test]
-    fn mcp_startup_notifications_route_to_threads() {
+    fn mcp_startup_notifications_route_by_thread_id() {
         let thread_id = ThreadId::new();
-        let notification =
-            ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
-                thread_id: Some(thread_id.to_string()),
-                name: "sentry".to_string(),
-                status: McpServerStartupState::Failed,
-                error: Some("sentry is not logged in".to_string()),
-                failure_reason: None,
-            });
-
-        let target = server_notification_thread_target(&notification);
-
-        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
-    }
-
-    #[test]
-    fn mcp_startup_notifications_without_threads_are_app_scoped() {
-        let notification =
-            ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
-                thread_id: None,
-                name: "sentry".to_string(),
-                status: McpServerStartupState::Failed,
-                error: Some("sentry is not logged in".to_string()),
-                failure_reason: None,
-            });
-
-        let target = server_notification_thread_target(&notification);
-
-        assert_eq!(target, ServerNotificationThreadTarget::AppScoped);
+        for (id, expected) in [
+            (None, ServerNotificationThreadTarget::AppScoped),
+            (
+                Some(thread_id.to_string()),
+                ServerNotificationThreadTarget::Thread(thread_id),
+            ),
+            (
+                Some("malformed".to_string()),
+                ServerNotificationThreadTarget::InvalidThreadId("malformed".to_string()),
+            ),
+        ] {
+            let notification =
+                ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
+                    thread_id: id,
+                    name: "sentry".to_string(),
+                    status: McpServerStartupState::Failed,
+                    error: Some("sentry is not logged in".to_string()),
+                    failure_reason: None,
+                });
+            assert_eq!(server_notification_thread_target(&notification), expected);
+        }
     }
 
     #[test]

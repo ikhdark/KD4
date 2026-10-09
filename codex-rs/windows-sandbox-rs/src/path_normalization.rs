@@ -27,5 +27,9 @@ mod tests {
             canonical_path_key(windows_style),
             canonical_path_key(slash_style)
         );
+        assert_ne!(
+            canonical_path_key(windows_style),
+            canonical_path_key(Path::new(r"C:\Users\Dev\DifferentRepo"))
+        );
     }
 }

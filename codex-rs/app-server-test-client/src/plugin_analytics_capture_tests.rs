@@ -11,9 +11,13 @@ use std::time::SystemTime;
 const REMOTE_PLUGIN_ID: &str = "plugins~Plugin_test";
 
 #[test]
-fn rejects_wrong_metadata_types() {
+fn rejects_missing_and_wrong_metadata_types() {
     for (field, value) in [
         ("has_skills", json!("true")),
+        ("has_skills", Value::Null),
+        ("mcp_server_count", Value::Null),
+        ("connector_ids", Value::Null),
+        ("product_client_id", Value::Null),
         ("mcp_server_count", json!(-1)),
         ("mcp_server_count", json!(0.5)),
         ("connector_ids", json!([1])),
@@ -21,7 +25,9 @@ fn rejects_wrong_metadata_types() {
     ] {
         let mut installed = mutation_event("codex_plugin_installed");
         installed["event_params"][field] = value;
-        let error = validate_mutation_events(vec![installed], expected_identity()).unwrap_err();
+        let uninstalled = mutation_event("codex_plugin_uninstalled");
+        let error = validate_mutation_events(vec![installed, uninstalled], expected_identity())
+            .unwrap_err();
         assert!(error.to_string().contains(field), "{error}");
     }
 }
@@ -86,16 +92,6 @@ fn rejects_duplicate_mutation_events() {
         .expect_err("duplicate install events should fail validation");
 
     assert!(error.to_string().contains("found 2"));
-}
-
-#[test]
-fn rejects_missing_capability_metadata() {
-    let mut installed = mutation_event("codex_plugin_installed");
-    installed["event_params"]["has_skills"] = Value::Null;
-    let error = validate_mutation_events(vec![installed], expected_identity())
-        .expect_err("missing capability metadata should fail validation");
-
-    assert!(error.to_string().contains("has_skills"));
 }
 
 fn mutation_event(event_type: &str) -> Value {

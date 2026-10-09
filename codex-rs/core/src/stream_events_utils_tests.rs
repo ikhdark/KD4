@@ -40,7 +40,7 @@ use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 
 #[test]
-fn logging_contract_tool_call_metadata_omits_payload() {
+fn tool_call_arguments_length_counts_utf8_payload_bytes() {
     let call = ToolCall {
         tool_name: ToolName::plain("shell"),
         call_id: "call-secret".to_string(),
@@ -50,6 +50,11 @@ fn logging_contract_tool_call_metadata_omits_payload() {
     };
 
     assert_eq!(tool_call_arguments_length(&call), 15);
+    for (arguments, bytes) in [("", 0), ("é🦀", 6)] {
+        let mut call = call.clone();
+        call.payload = ToolPayload::Function { arguments: arguments.to_string() };
+        assert_eq!(tool_call_arguments_length(&call), bytes);
+    }
 }
 
 struct PersistenceProbeHandler {
@@ -227,51 +232,7 @@ async fn handle_non_tool_response_item_runs_turn_item_contributors_only_when_req
     assert_eq!(text, "hello world");
 }
 
-#[tokio::test]
-async fn handle_output_item_done_returns_contributed_last_agent_message() {
-    let (mut session, turn_context) = make_session_and_context().await;
-    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
-    builder.turn_item_contributor(Arc::new(RewriteAgentMessageContributor));
-    session.services.extensions = Arc::new(builder.build());
-    let session = Arc::new(session);
-    let turn_context = Arc::new(turn_context);
-    let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let router = Arc::new(ToolRouter::from_context(
-        step_context.as_ref(),
-        crate::tools::router::ToolRouterParams {
-            tool_suggest_candidates: None,
-            mcp_tools: None,
-            deferred_mcp_tools: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: turn_context.dynamic_tools.as_slice(),
-            exposure_identity: Default::default(),
-        },
-        &Default::default(),
-    ));
-    let step_context = step_context.with_tool_router_for_test(router);
-    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let tool_runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
-    let item = assistant_output_text("original assistant text");
-    let mut ctx = HandleOutputCtx {
-        sess: session,
-        turn_context: Arc::clone(&turn_context),
-        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
-        tool_runtime,
-        cancellation_token: CancellationToken::new(),
-        response_item_recorder: OrderedResponseItemRecorder::default(),
-    };
 
-    let output = handle_output_item_done(
-        &mut ctx, item, /*previously_active_item*/ None, &mut true,
-    )
-    .await
-    .expect("assistant message should complete");
-
-    assert_eq!(
-        output.last_agent_message.as_deref(),
-        Some("contributed assistant text")
-    );
-}
 
 #[tokio::test]
 async fn malformed_client_tool_search_records_correlated_tool_search_output() {
@@ -323,12 +284,14 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
         response_item_recorder: OrderedResponseItemRecorder::default(),
     };
 
+    let mut eager_prefix_open = true;
     let output = handle_output_item_done(
-        &mut ctx, item.clone(), /*previously_active_item*/ None, &mut true,
+        &mut ctx, item.clone(), /*previously_active_item*/ None, &mut eager_prefix_open,
     )
     .await
     .expect("malformed tool_search call should be recorded for model recovery");
 
+    assert!(!eager_prefix_open);
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());
     assert!(control.observe_budget_progress(&baselines, &collector, &settled));
@@ -421,7 +384,7 @@ async fn unstreamed_contributed_assistant_item_replays_finalized_text_between_li
         response_item_recorder: OrderedResponseItemRecorder::default(),
     };
 
-    handle_output_item_done(
+    let output = handle_output_item_done(
         &mut ctx,
         assistant_output_text("original assistant text"),
         /*previously_active_item*/ None,
@@ -430,6 +393,8 @@ async fn unstreamed_contributed_assistant_item_replays_finalized_text_between_li
     .await
     .expect("assistant message should complete");
 
+    assert_eq!(output.last_agent_message.as_deref(), Some("contributed assistant text"));
+    ctx.response_item_recorder.flush().await.unwrap();
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         if let Some(event) = match event.msg {
@@ -599,34 +564,35 @@ async fn completed_tool_call_auxiliary_persistence_does_not_block_dispatch() {
     };
     let mut eager_prefix_open = true;
 
-    let output = handle_output_item_done(
+    let output = tokio::time::timeout(std::time::Duration::from_secs(1), handle_output_item_done(
         &mut ctx,
         item,
         /*previously_active_item*/ None,
         &mut eager_prefix_open,
-    )
+    ))
     .await
+    .expect("acceptance must not wait for auxiliary persistence")
     .expect("read-safe tool call should be accepted");
-    output
+    tokio::time::timeout(std::time::Duration::from_secs(1), output
         .tool_future
         .expect("accepted tool call should retain its lazy future")
-        .into_future()
+        .into_future())
         .await
+        .expect("dispatch must not wait for auxiliary persistence")
         .result
         .expect("auxiliary persistence must not delay tool dispatch");
 
     assert!(started.load(Ordering::SeqCst));
     let mut flush = Box::pin(recorder_for_flush.flush());
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), flush.as_mut())
-            .await
-            .is_err(),
+        futures::poll!(flush.as_mut()).is_pending(),
         "the test must keep auxiliary persistence blocked after dispatch"
     );
     release_auxiliary
         .send(())
         .expect("auxiliary persistence blocker should still be active");
-    flush.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), flush)
+        .await.expect("released persistence must finish").unwrap();
     let history = session.clone_history().await;
     let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
         panic!("completed tool call must be model-visible before relaying results")
@@ -795,87 +761,45 @@ async fn finalized_turn_item_defers_mailbox_for_contributed_visible_text() {
     builder.turn_item_contributor(Arc::new(RewriteAgentMessageContributor));
     session.services.extensions = Arc::new(builder.build());
     let turn_store = ExtensionData::new(turn_context.sub_id.clone());
-    let item = assistant_output_text("<proposed_plan>\n- hidden only\n</proposed_plan>");
-
-    let finalized = finalize_non_tool_response_item(
-        &session,
-        TurnItemContributorPolicy::Run(&turn_store),
-        &item,
-        /*plan_mode*/ true,
-    )
-    .await
-    .expect("assistant message should parse");
-
-    assert_eq!(
-        finalized.facts.last_agent_message.as_deref(),
-        Some("contributed assistant text")
-    );
-    assert!(finalized.facts.defers_mailbox_delivery_to_next_turn);
-}
-
-#[tokio::test]
-async fn finalized_turn_item_keeps_mailbox_open_for_commentary_text() {
-    let (mut session, turn_context) = make_session_and_context().await;
-    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
-    builder.turn_item_contributor(Arc::new(RewriteAgentMessageContributor));
-    session.services.extensions = Arc::new(builder.build());
-    let turn_store = ExtensionData::new(turn_context.sub_id.clone());
-    let item = assistant_output_text_with_phase("still working", Some(MessagePhase::Commentary));
-
-    let finalized = finalize_non_tool_response_item(
-        &session,
-        TurnItemContributorPolicy::Run(&turn_store),
-        &item,
-        /*plan_mode*/ false,
-    )
-    .await
-    .expect("assistant message should parse");
-
-    assert_eq!(
-        finalized.facts.last_agent_message.as_deref(),
-        Some("contributed assistant text")
-    );
-    assert!(!finalized.facts.defers_mailbox_delivery_to_next_turn);
+    for (text, phase, plan_mode, defers) in [
+        ("<proposed_plan>\n- hidden only\n</proposed_plan>", None, true, true),
+        ("still working", Some(MessagePhase::Commentary), false, false),
+        ("finished", Some(MessagePhase::FinalAnswer), false, true),
+    ] {
+        let item = assistant_output_text_with_phase(text, phase);
+        let finalized = finalize_non_tool_response_item(
+            &session, TurnItemContributorPolicy::Run(&turn_store), &item, plan_mode,
+        ).await.expect("assistant message should parse");
+        assert_eq!(finalized.facts.last_agent_message.as_deref(), Some("contributed assistant text"));
+        assert_eq!(finalized.facts.defers_mailbox_delivery_to_next_turn, defers);
+    }
 }
 
 #[test]
 fn last_assistant_message_from_item_strips_only_plan_blocks() {
-    let item = assistant_output_text(
-        "before<oai-mem-citation>doc1</oai-mem-citation>\n<proposed_plan>\n- x\n</proposed_plan>\nafter",
-    );
-
-    let message = last_assistant_message_from_item(&item, /*plan_mode*/ true)
-        .expect("assistant text should remain after stripping");
-
-    assert_eq!(message, "before<oai-mem-citation>doc1</oai-mem-citation>\nafter");
+    let mixed = "before<oai-mem-citation>doc1</oai-mem-citation>\n<proposed_plan>\n- x\n</proposed_plan>\nafter";
+    let hidden = "<proposed_plan>\n- x\n</proposed_plan>";
+    for (text, plan_mode, expected) in [
+        (mixed, true, Some("before<oai-mem-citation>doc1</oai-mem-citation>\nafter")),
+        (mixed, false, Some(mixed)),
+        (hidden, true, None),
+        (hidden, false, Some(hidden)),
+        ("", false, None),
+        ("  \n", false, None),
+    ] {
+        assert_eq!(last_assistant_message_from_item(&assistant_output_text(text), plan_mode).as_deref(), expected);
+    }
 }
 
 #[test]
-fn last_assistant_message_from_item_returns_none_for_plan_only_hidden_message() {
-    let item = assistant_output_text("<proposed_plan>\n- x\n</proposed_plan>");
-
-    assert_eq!(
-        last_assistant_message_from_item(&item, /*plan_mode*/ true),
-        None
-    );
-}
-
-#[test]
-fn completed_item_defers_mailbox_delivery_for_unknown_phase_messages() {
-    let item = assistant_output_text("final answer");
-
-    assert!(completed_item_defers_mailbox_delivery_to_next_turn(
-        &item, /*plan_mode*/ false,
-    ));
-}
-
-#[test]
-fn completed_item_keeps_mailbox_delivery_open_for_commentary_messages() {
-    let item = assistant_output_text_with_phase("still working", Some(MessagePhase::Commentary));
-
-    assert!(!completed_item_defers_mailbox_delivery_to_next_turn(
-        &item, /*plan_mode*/ false,
-    ));
+fn completed_item_defers_mailbox_only_for_visible_final_text() {
+    for phase in [None, Some(MessagePhase::Commentary), Some(MessagePhase::FinalAnswer)] {
+        let item = assistant_output_text_with_phase("final answer", phase.clone());
+        assert_eq!(completed_item_defers_mailbox_delivery_to_next_turn(&item, false),
+            phase != Some(MessagePhase::Commentary));
+        let hidden = assistant_output_text_with_phase("<proposed_plan>\n- x\n</proposed_plan>", phase);
+        assert!(!completed_item_defers_mailbox_delivery_to_next_turn(&hidden, true));
+    }
 }
 
 #[tokio::test]
@@ -920,4 +844,5 @@ async fn audit_reports_17_19_terminal_generation_rejects_tools_before_acceptance
     let result = handle_output_item_done(&mut ctx, item, None, &mut true).await;
     assert!(matches!(result, Err(CodexErr::Fatal(message)) if message.contains("terminal-only")));
     assert!(ctx.sess.clone_history().await.raw_items().is_empty());
+    assert_eq!(turn_context.turn_timing_state.tool_closure_snapshot().accepted_count, 0);
 }

@@ -99,7 +99,7 @@ class RolloutReportsTest(unittest.TestCase):
                 record(
                     "event_msg",
                     {"type": "task_complete", "timing": native_timing()},
-                    20,
+                    29,  # Event wall time must not substitute for native timing.
                 ),
             ]
         )
@@ -399,6 +399,9 @@ class RolloutReportsTest(unittest.TestCase):
 
     def test_summary_and_diagnostics_cli_keep_multiple_inputs_and_verbose_mode(self):
         self.path.write_bytes(encode([record("session_meta", {"id": "test"})]))
+        second = self.root / "second.jsonl"
+        second.write_bytes(encode([record("sampling_boundary", {})]))
+        original = {path: path.read_bytes() for path in (self.path, second)}
         for command, options, marker in (
             ("summary", [], "samplings:"),
             ("summary", ["-v"], "--- timeline ---"),
@@ -407,15 +410,23 @@ class RolloutReportsTest(unittest.TestCase):
             with self.subTest(command=command, options=options):
                 result = subprocess.run(
                     [sys.executable, "-B", reports.__file__, command, *options,
-                     str(self.path), str(self.path)],
+                     str(self.path), str(second)],
                     cwd=self.root, capture_output=True, encoding="utf-8", timeout=30, check=False,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.count(marker), 2)
+                self.assertEqual(result.stdout.count(self.path.name), 1)
+                self.assertEqual(result.stdout.count(second.name), 1)
+                if command == "summary":
+                    self.assertIn("samplings: 0", result.stdout)
+                    self.assertIn("samplings: 1", result.stdout)
+                else:
+                    self.assertIn("('session_meta', None)", result.stdout)
+                    self.assertIn("('sampling_boundary', None)", result.stdout)
                 if command == "summary" and not options:
                     self.assertNotIn("--- timeline ---", result.stdout)
-                self.assertEqual(set(self.root.iterdir()), {self.path})
+                self.assertEqual({path: path.read_bytes() for path in self.root.iterdir()}, original)
 
     def test_command_help_and_missing_arguments_do_not_write(self):
         for command in ([], ["summary"], ["diagnostics"], ["dump"], ["narrative"]):
@@ -444,7 +455,38 @@ class RolloutReportsTest(unittest.TestCase):
             reports.dump(self.path, self.output)
         self.assertIn(text, self.output.read_text(encoding="utf-8"))
 
+    def test_narrative_small_limits_bound_retained_text_and_count_actual_omissions(self):
+        text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        self.path.write_bytes(encode([
+            record("response_item", {"type": "function_call_output", "output": text})
+        ]))
+        for limit in range(8):
+            with self.subTest(limit=limit), mock.patch.dict(
+                os.environ, {"NARR_OUT_LIMIT": str(limit)}
+            ):
+                reports.dump_narrative(self.path, self.output)
+            rendered = self.output.read_text(encoding="utf-8").split("<<< ", 1)[1].removesuffix("\n")
+            marker = f"\n...[{len(text) - limit} chars omitted]...\n"
+            head, tail = rendered.split(marker)
+            # The configured budget counts source characters, not the notice.
+            self.assertEqual(len(head) + len(tail), limit)
+            self.assertTrue(text.startswith(head))
+            self.assertTrue(text.endswith(tail))
+            self.assertNotIn("MNOP", rendered)
+
+    def test_negative_narrative_limit_fails_before_replacing_output(self):
+        self.path.write_bytes(encode([record("session_meta", {})]))
+        self.output.write_text("previous report", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"NARR_OUT_LIMIT": "-1"}):
+            with self.assertRaisesRegex(ValueError, "nonnegative"):
+                reports.dump_narrative(self.path, self.output)
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "previous report")
+
     def test_shared_timestamps_preserve_strict_diagnostics_and_tolerant_views(self):
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                parsed = reports.ts({"timestamp": "2026-09-26T12:34:56.123Z"}, strict=strict)
+                self.assertEqual(parsed.isoformat(), "2026-09-26T12:34:56.123000+00:00")
         self.assertIsNone(reports.ts({"timestamp": "invalid"}))
         with self.assertRaises(ValueError):
             reports.ts({"timestamp": "invalid"}, strict=True)

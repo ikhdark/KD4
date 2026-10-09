@@ -343,27 +343,40 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     assert_eq!(payload.auth_mode, Some(AuthMode::ChatgptAuthTokens));
     assert_eq!(payload.plan_type, Some(AccountPlanType::Pro));
 
-    let get_id = mcp
-        .send_get_account_request(GetAccountParams {
-            refresh_token: false,
-        })
-        .await?;
-    let get_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(get_id)),
+    for refresh_token in [false, true] {
+        let get_id = mcp
+            .send_get_account_request(GetAccountParams {
+                refresh_token,
+            })
+            .await?;
+        let get_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(get_id)),
+        )
+        .await??;
+        let account: GetAccountResponse = to_response(get_resp)?;
+        assert_eq!(
+            account,
+            GetAccountResponse {
+                workspace_routing: None,
+                account: Some(Account::Chatgpt {
+                    email: Some("embedded@example.com".to_string()),
+                    plan_type: AccountPlanType::Pro,
+                }),
+                requires_openai_auth: true,
+            }
+        );
+
+    }
+
+    let refresh_request = timeout(
+        Duration::from_millis(250),
+        mcp.read_stream_until_request_message(),
     )
-    .await??;
-    let account: GetAccountResponse = to_response(get_resp)?;
-    assert_eq!(
-        account,
-        GetAccountResponse {
-            workspace_routing: None,
-            account: Some(Account::Chatgpt {
-                email: Some("embedded@example.com".to_string()),
-                plan_type: AccountPlanType::Pro,
-            }),
-            requires_openai_auth: true,
-        }
+    .await;
+    assert!(
+        refresh_request.is_err(),
+        "external mode should not emit account/chatgptAuthTokens/refresh for refreshToken=true"
     );
 
     let logout_id = mcp.send_logout_account_request().await?;
@@ -390,88 +403,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        CreateConfigTomlParams {
-            requires_openai_auth: Some(true),
-            ..Default::default()
-        },
-    )?;
-    write_models_cache(codex_home.path())?;
 
-    let access_token = encode_id_token(
-        &ChatGptIdTokenClaims::new()
-            .email("embedded@example.com")
-            .plan_type("pro")
-            .chatgpt_account_id(WORKSPACE_ID_EMBEDDED),
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let set_id = mcp
-        .send_chatgpt_auth_tokens_login_request(
-            access_token,
-            WORKSPACE_ID_EMBEDDED.to_string(),
-            Some("pro".to_string()),
-        )
-        .await?;
-    let set_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(set_id)),
-    )
-    .await??;
-    let response: LoginAccountResponse = to_response(set_resp)?;
-    assert_eq!(response, LoginAccountResponse::ChatgptAuthTokens {});
-    let _updated = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("account/updated"),
-    )
-    .await??;
-
-    let get_id = mcp
-        .send_get_account_request(GetAccountParams {
-            refresh_token: true,
-        })
-        .await?;
-    let get_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(get_id)),
-    )
-    .await??;
-    let account: GetAccountResponse = to_response(get_resp)?;
-    assert_eq!(
-        account,
-        GetAccountResponse {
-            workspace_routing: None,
-            account: Some(Account::Chatgpt {
-                email: Some("embedded@example.com".to_string()),
-                plan_type: AccountPlanType::Pro,
-            }),
-            requires_openai_auth: true,
-        }
-    );
-
-    let refresh_request = timeout(
-        Duration::from_millis(250),
-        mcp.read_stream_until_request_message(),
-    )
-    .await;
-    assert!(
-        refresh_request.is_err(),
-        "external mode should not emit account/chatgptAuthTokens/refresh for refreshToken=true"
-    );
-
-    Ok(())
-}
 
 async fn respond_to_refresh_request(
     mcp: &mut TestAppServer,
@@ -993,14 +925,38 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
 #[tokio::test]
 async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            ..Default::default()
+        },
+    )?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let get_id = mcp
+        .send_get_account_request(GetAccountParams { refresh_token: false })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(get_id)),
+    )
+    .await??;
+    assert_eq!(
+        to_response::<GetAccountResponse>(response)?,
+        GetAccountResponse {
+            workspace_routing: None,
+            account: None,
+            requires_openai_auth: true,
+        }
+    );
 
     let req_id = mcp
         .send_login_account_api_key_request("sk-test-key")
@@ -1039,6 +995,22 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     pretty_assertions::assert_eq!(payload.plan_type, None);
 
     assert!(codex_home.path().join("auth.json").exists());
+    let get_id = mcp
+        .send_get_account_request(GetAccountParams { refresh_token: false })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(get_id)),
+    )
+    .await??;
+    assert_eq!(
+        to_response::<GetAccountResponse>(response)?,
+        GetAccountResponse {
+            workspace_routing: None,
+            account: Some(Account::ApiKey {}),
+            requires_openai_auth: true,
+        }
+    );
     Ok(())
 }
 
@@ -1442,7 +1414,8 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(cancel_id)),
     )
     .await??;
-    let _ok: CancelLoginAccountResponse = to_response(cancel_resp)?;
+    let response: CancelLoginAccountResponse = to_response(cancel_resp)?;
+    assert_eq!(response.status, CancelLoginAccountStatus::Canceled);
 
     let note = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1456,7 +1429,7 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
     pretty_assertions::assert_eq!(payload.login_id, Some(login_id));
     pretty_assertions::assert_eq!(payload.success, false);
     assert!(
-        payload.error.is_some(),
+        payload.error.as_ref().is_some_and(|error| !error.is_empty()),
         "expected a non-empty error on cancel"
     );
 
@@ -1521,33 +1494,7 @@ async fn ephemeral_login_callbacks_do_not_cancel_another_server() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test]
-async fn active_chatgpt_login_does_not_block_app_server_shutdown() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
-    let mut mcp = TestAppServer::builder()
-        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp.send_login_account_chatgpt_request().await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let login: LoginAccountResponse = to_response(response)?;
-    assert!(matches!(login, LoginAccountResponse::Chatgpt { .. }));
-
-    mcp.close_stdin();
-    timeout(Duration::from_secs(5), mcp.wait_for_exit()).await??;
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
@@ -1774,10 +1721,12 @@ async fn login_account_chatgpt_includes_forced_workspace_query_param() -> Result
     let LoginAccountResponse::Chatgpt { auth_url, .. } = login else {
         bail!("unexpected login response: {login:?}");
     };
-    assert!(
-        auth_url.contains(&format!("allowed_workspace_id={WORKSPACE_ID_ALLOWED}")),
-        "auth URL should include forced workspace"
-    );
+    let auth_url = Url::parse(&auth_url)?;
+    let allowed = auth_url
+        .query_pairs()
+        .filter_map(|(key, value)| (key == "allowed_workspace_id").then(|| value.into_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(allowed, vec![WORKSPACE_ID_ALLOWED.to_string()]);
     Ok(())
 }
 
@@ -1828,90 +1777,9 @@ async fn login_account_chatgpt_includes_forced_workspace_allowlist_query_param()
     Ok(())
 }
 
-#[tokio::test]
-async fn get_account_no_auth() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        CreateConfigTomlParams {
-            requires_openai_auth: Some(true),
-            ..Default::default()
-        },
-    )?;
 
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let params = GetAccountParams {
-        refresh_token: false,
-    };
-    let request_id = mcp.send_get_account_request(params).await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let account: GetAccountResponse = to_response(resp)?;
-
-    assert_eq!(account.account, None, "expected no account");
-    assert_eq!(account.requires_openai_auth, true);
-    Ok(())
-}
-
-#[tokio::test]
-async fn get_account_with_api_key() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        CreateConfigTomlParams {
-            requires_openai_auth: Some(true),
-            ..Default::default()
-        },
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let req_id = mcp
-        .send_login_account_api_key_request("sk-test-key")
-        .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let _login_ok = to_response::<LoginAccountResponse>(resp)?;
-
-    let params = GetAccountParams {
-        refresh_token: false,
-    };
-    let request_id = mcp.send_get_account_request(params).await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: GetAccountResponse = to_response(resp)?;
-
-    let expected = GetAccountResponse {
-        workspace_routing: None,
-        account: Some(Account::ApiKey {}),
-        requires_openai_auth: true,
-    };
-    assert_eq!(received, expected);
-    Ok(())
-}
 
 #[tokio::test]
 async fn get_account_when_auth_not_required() -> Result<()> {

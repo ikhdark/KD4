@@ -88,73 +88,34 @@ async fn unsupported_scheme_with_explicit_port_never_opens_a_socket() {
 }
 
 #[tokio::test]
-async fn public_connector_uses_factory_and_exposes_stream_and_sink() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-        let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
-            .into_client_request()
-            .expect("websocket request should build");
-        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-        let connector = WebSocketConnector::new(&factory).expect("connector should build");
+async fn public_connector_uses_factory_stream_sink_and_requested_nodelay() {
+    for (nodelay, message) in [(false, "hello"), (true, "latency-sensitive")] {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
+            let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
+                .into_client_request()
+                .expect("websocket request should build");
+            let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+            let connector = WebSocketConnector::new(&factory).expect("connector should build");
+            let connector = if nodelay { connector.with_tcp_nodelay() } else { connector };
 
-        let (mut websocket, _) = connector
-            .connect(request, WebSocketConfig::default())
-            .await
-            .expect("websocket handshake should succeed");
-        assert!(!websocket_tcp_nodelay(&websocket));
-        let expected = Message::Text("hello".into());
-        websocket
-            .send(expected.clone())
-            .await
-            .expect("websocket should send");
-        let actual = websocket
-            .next()
-            .await
-            .expect("websocket should receive a message")
-            .expect("websocket message should be valid");
-        assert_eq!(actual, expected);
-
-        target_task.await.expect("target task should finish");
-    })
-    .await
-    .expect("WebSocket scenario timed out");
-}
-
-#[tokio::test]
-async fn public_connector_enables_tcp_nodelay_when_requested() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-        let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
-            .into_client_request()
-            .expect("websocket request should build");
-        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-        let connector = WebSocketConnector::new(&factory)
-            .expect("connector should build")
-            .with_tcp_nodelay();
-
-        let (mut websocket, _) = connector
-            .connect(request, WebSocketConfig::default())
-            .await
-            .expect("websocket handshake should succeed");
-        assert!(websocket_tcp_nodelay(&websocket));
-        let expected = Message::Text("latency-sensitive".into());
-        websocket
-            .send(expected.clone())
-            .await
-            .expect("websocket should send");
-        assert_eq!(
-            websocket
-                .next()
+            let (mut websocket, _) = connector
+                .connect(request, WebSocketConfig::default())
                 .await
-                .expect("websocket should receive a message")
-                .expect("websocket message should be valid"),
-            expected
-        );
-
-        target_task.await.expect("target task should finish");
-    })
-    .await
-    .expect("WebSocket scenario timed out");
+                .expect("websocket handshake should succeed");
+            assert_eq!(websocket_tcp_nodelay(&websocket), nodelay);
+            let expected = Message::Text(message.into());
+            websocket.send(expected.clone()).await.expect("websocket should send");
+            assert_eq!(
+                websocket.next().await.expect("websocket should receive a message")
+                    .expect("websocket message should be valid"),
+                expected,
+            );
+            target_task.await.expect("target task should finish");
+        })
+        .await
+        .expect("WebSocket scenario timed out");
+    }
 }
 
 #[tokio::test]
@@ -184,31 +145,15 @@ async fn direct_route_connects_secure_websocket() {
 }
 
 #[tokio::test]
-async fn http_proxy_tunnels_secure_websocket_before_handshake() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ false, "localhost").await;
-    })
-    .await
-    .expect("WebSocket scenario timed out");
-}
-
-#[tokio::test]
-async fn https_proxy_tunnels_secure_websocket_before_handshake() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true, "localhost").await;
-    })
-    .await
-    .expect("WebSocket scenario timed out");
-}
-
-#[tokio::test]
-async fn https_proxy_addressed_by_ipv6_literal_tunnels_secure_websocket() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        // The proxy URL keeps its IPv6 brackets through parsing; TLS must verify the address.
-        assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true, "[::1]").await;
-    })
-    .await
-    .expect("WebSocket scenario timed out");
+async fn proxy_routes_tunnel_secure_websocket_before_handshake() {
+    for (proxy_tls, proxy_host) in [(false, "localhost"), (true, "localhost"), (true, "[::1]")] {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            // IPv6 brackets must survive URL parsing but be removed for TLS name verification.
+            assert_proxy_tunnels_secure_websocket(proxy_tls, proxy_host).await;
+        })
+        .await
+        .expect("WebSocket scenario timed out");
+    }
 }
 
 #[tokio::test]
@@ -279,10 +224,20 @@ async fn transport_proxy_config_error_subprocess_probe() {
         .await
         {
             Ok(_) => panic!("{route:?} accepted an unparsable proxy"),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
+        // The expected formatter is production code too: comparing only with
+        // invalid_proxy_config() would accept a shared credential leak.
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            for secret in ["codex-user", "codex secret", "codex%20secret"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "proxy credentials must not appear in error display or debug output"
+                );
+            }
+        }
         assert_eq!(
-            error,
+            error.to_string(),
             invalid_proxy_config().to_string(),
             "{route:?} must not echo proxy configuration"
         );

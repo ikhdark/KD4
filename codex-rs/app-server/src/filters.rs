@@ -90,18 +90,11 @@ mod tests {
 
     #[test]
     fn compute_source_filters_defaults_to_interactive_sources() {
-        let (allowed_sources, filter) = compute_source_filters(/*source_kinds*/ None);
-
-        assert_eq!(allowed_sources, INTERACTIVE_SESSION_SOURCES.to_vec());
-        assert_eq!(filter, None);
-    }
-
-    #[test]
-    fn compute_source_filters_empty_means_interactive_sources() {
-        let (allowed_sources, filter) = compute_source_filters(Some(Vec::new()));
-
-        assert_eq!(allowed_sources, INTERACTIVE_SESSION_SOURCES.to_vec());
-        assert_eq!(filter, None);
+        for source_kinds in [None, Some(Vec::new())] {
+            let (allowed_sources, filter) = compute_source_filters(source_kinds);
+            assert_eq!(allowed_sources, INTERACTIVE_SESSION_SOURCES.to_vec());
+            assert_eq!(filter, None);
+        }
     }
 
     #[test]
@@ -128,18 +121,26 @@ mod tests {
 
     #[test]
     fn compute_source_filters_subagent_variant_requires_post_filtering() {
-        let source_kinds = vec![ThreadSourceKind::SubAgentReview];
-        let (allowed_sources, filter) = compute_source_filters(Some(source_kinds.clone()));
-
-        assert_eq!(allowed_sources, Vec::new());
-        assert_eq!(filter, Some(source_kinds));
+        for kind in [
+            ThreadSourceKind::SubAgent,
+            ThreadSourceKind::SubAgentReview,
+            ThreadSourceKind::SubAgentCompact,
+            ThreadSourceKind::SubAgentThreadSpawn,
+            ThreadSourceKind::SubAgentOther,
+            ThreadSourceKind::Unknown,
+        ] {
+            for source_kinds in [vec![kind], vec![ThreadSourceKind::Cli, kind]] {
+                let (allowed_sources, filter) = compute_source_filters(Some(source_kinds.clone()));
+                assert_eq!(allowed_sources, Vec::new(), "{source_kinds:?}");
+                assert_eq!(filter, Some(source_kinds));
+            }
+        }
     }
 
     #[test]
     fn source_kind_matches_distinguishes_subagent_variants() {
         let parent_thread_id =
             ThreadId::from_string(&Uuid::new_v4().to_string()).expect("valid thread id");
-        let review = CoreSessionSource::SubAgent(CoreSubAgentSource::Review);
         let spawn = CoreSessionSource::SubAgent(CoreSubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth: 1,
@@ -148,21 +149,47 @@ mod tests {
             agent_role: None,
         });
 
-        assert!(source_kind_matches(
-            &review,
-            &[ThreadSourceKind::SubAgentReview]
-        ));
-        assert!(!source_kind_matches(
-            &review,
-            &[ThreadSourceKind::SubAgentThreadSpawn]
-        ));
-        assert!(source_kind_matches(
-            &spawn,
-            &[ThreadSourceKind::SubAgentThreadSpawn]
-        ));
-        assert!(!source_kind_matches(
-            &spawn,
-            &[ThreadSourceKind::SubAgentReview]
-        ));
+        let cases = [
+            (CoreSessionSource::Cli, ThreadSourceKind::Cli, false),
+            (CoreSessionSource::VSCode, ThreadSourceKind::VsCode, false),
+            (CoreSessionSource::Exec, ThreadSourceKind::Exec, false),
+            (CoreSessionSource::Mcp, ThreadSourceKind::AppServer, false),
+            (
+                CoreSessionSource::SubAgent(CoreSubAgentSource::Review),
+                ThreadSourceKind::SubAgentReview,
+                true,
+            ),
+            (
+                CoreSessionSource::SubAgent(CoreSubAgentSource::Compact),
+                ThreadSourceKind::SubAgentCompact,
+                true,
+            ),
+            (spawn, ThreadSourceKind::SubAgentThreadSpawn, true),
+            (
+                CoreSessionSource::SubAgent(CoreSubAgentSource::Other("custom".into())),
+                ThreadSourceKind::SubAgentOther,
+                true,
+            ),
+            (CoreSessionSource::Unknown, ThreadSourceKind::Unknown, false),
+        ];
+        for (source, expected_kind, is_subagent) in &cases {
+            assert!(!source_kind_matches(source, &[]));
+            assert_eq!(
+                source_kind_matches(source, &[ThreadSourceKind::SubAgent]),
+                *is_subagent
+            );
+            for (_, filter_kind, _) in &cases {
+                assert_eq!(
+                    source_kind_matches(source, &[*filter_kind]),
+                    expected_kind == filter_kind,
+                    "source {source:?}, filter {filter_kind:?}"
+                );
+                assert_eq!(
+                    source_kind_matches(source, &[ThreadSourceKind::SubAgent, *filter_kind]),
+                    *is_subagent || expected_kind == filter_kind,
+                    "union filter for source {source:?}, filter {filter_kind:?}"
+                );
+            }
+        }
     }
 }

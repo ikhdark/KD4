@@ -17,7 +17,7 @@ use tokio::time::timeout;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
-async fn thread_loaded_list_returns_loaded_thread_ids() -> Result<()> {
+async fn thread_loaded_list_returns_loaded_thread_ids_and_paginates() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
@@ -43,25 +43,10 @@ async fn thread_loaded_list_returns_loaded_thread_ids() -> Result<()> {
         next_cursor,
     } = to_response::<ThreadLoadedListResponse>(resp)?;
     data.sort();
-    assert_eq!(data, vec![thread_id]);
+    assert_eq!(data, vec![thread_id.clone()]);
     assert_eq!(next_cursor, None);
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_loaded_list_paginates() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-    let codex_home = TempDir::new()?;
-    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let first = start_thread(&mut mcp).await?;
+    let first = thread_id;
     let second = start_thread(&mut mcp).await?;
 
     let mut expected = [first, second];
@@ -126,6 +111,7 @@ async fn thread_loaded_list_rejects_invalid_cursor_when_empty() -> Result<()> {
         mcp.read_stream_until_error_message(RequestId::Integer(list_id)),
     )
     .await??;
+    assert_eq!(error.error.code, -32600);
     assert_eq!(error.error.message, "invalid cursor: not-a-cursor");
 
     Ok(())

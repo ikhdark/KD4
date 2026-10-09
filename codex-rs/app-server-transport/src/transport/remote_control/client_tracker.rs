@@ -687,9 +687,21 @@ mod tests {
             .await
             .expect("writer should accept queued message");
 
+        timeout(Duration::from_secs(1), async {
+            while writer.capacity() != CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder must consume the message before shutdown");
+        assert!(!writer.is_closed());
+        assert_eq!(server_event_tx.capacity(), 0);
         timeout(Duration::from_secs(1), client_tracker.shutdown())
             .await
             .expect("shutdown should not hang on blocked server forwarding");
+        assert!(writer.is_closed());
+        assert!(client_tracker.clients.is_empty());
+        assert!(client_tracker.join_set.is_empty());
     }
 
     #[tokio::test]
@@ -787,30 +799,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn non_close_transport_event_send_times_out_when_queue_stays_full() {
-        let (server_event_tx, _server_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let (transport_event_tx, _transport_event_rx) = mpsc::channel(1);
-        let shutdown_token = CancellationToken::new();
-        let client_tracker =
-            ClientTracker::new(server_event_tx, transport_event_tx.clone(), &shutdown_token);
 
-        transport_event_tx
-            .send(TransportEvent::ConnectionClosed {
-                connection_id: next_connection_id(),
-            })
-            .await
-            .expect("transport event queue should accept prefill");
-
-        let send_result = client_tracker
-            .send_transport_event(TransportEvent::IncomingMessage {
-                connection_id: next_connection_id(),
-                message: initialized_notification(),
-            })
-            .await;
-
-        assert!(send_result.is_err());
-    }
 
     #[tokio::test]
     async fn incoming_message_timeout_does_not_advance_seq_id() {
@@ -868,8 +857,11 @@ mod tests {
         match transport_event_rx.recv().await.expect("retried event") {
             TransportEvent::IncomingMessage {
                 connection_id: queued_connection_id,
-                ..
-            } => assert_eq!(queued_connection_id, connection_id),
+                message,
+            } => {
+                assert_eq!(queued_connection_id, connection_id);
+                assert_eq!(message, initialized_notification());
+            }
             other => panic!("expected incoming message, got {other:?}"),
         }
     }

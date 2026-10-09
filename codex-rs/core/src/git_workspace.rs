@@ -377,18 +377,17 @@ async fn capture_workspace_evidence_identity_with_attribution(
 async fn capture_workspace_evidence_identity_for_repo_root_with_attribution(
     repo_root: PathBuf,
 ) -> WorkspaceEvidenceCapture {
-    capture_workspace_evidence_with_cancellation(repo_root, CancellationToken::new(), Arc::default()).await
+    capture_workspace_evidence_with_cancellation(repo_root, CancellationToken::new()).await
 }
 
 async fn capture_workspace_evidence_with_cancellation(
     repo_root: PathBuf,
     cancellation: CancellationToken,
-    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
 ) -> WorkspaceEvidenceCapture {
     let unavailable = WorkspaceEvidenceIdentity::unavailable(Some(&repo_root));
     match within_workspace_generation_deadline(
         WORKSPACE_GENERATION_DEADLINE,
-        capture_workspace_generation_marker(repo_root, cancellation, content_cache),
+        capture_workspace_generation_marker(repo_root, cancellation),
     )
     .await
     {
@@ -765,9 +764,7 @@ fn workspace_generation_status_args() -> &'static [&'static str] {
 async fn capture_workspace_generation_marker(
     repo_root: PathBuf,
     cancellation: CancellationToken,
-    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
 ) -> Option<WorkspaceEvidenceIdentity> {
-    let capture_started = SystemTime::now();
     let _cancel_on_drop = cancellation.clone().drop_guard();
     let control = WorkspaceCaptureControl {
         deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE,
@@ -775,7 +772,7 @@ async fn capture_workspace_generation_marker(
     };
     let (status, paths) = workspace_generation_status(&repo_root).await?;
     let head_identity = workspace_head_identity(&status)?;
-    let metadata = capture_workspace_metadata_cached(repo_root.clone(), paths, control, content_cache, capture_started).await?;
+    let metadata = capture_workspace_metadata(repo_root.clone(), paths, control).await?;
 
     let mut index_hasher = Sha256::new();
     index_hasher.update(b"KD4_WORKSPACE_INDEX_GENERATION_V1\n");
@@ -1047,36 +1044,10 @@ fn hash_workspace_content(
     Some((format!("{:x}", hasher.finalize()), bytes_read))
 }
 
-#[derive(Default)]
-struct WorkspaceContentCache {
-    files: HashMap<PathBuf, CachedWorkspaceContent>,
-    #[cfg(test)]
-    hits: AtomicUsize,
-}
-
-struct CachedWorkspaceContent {
-    size: u64,
-    modified: SystemTime,
-    file_id: StableFileIdentity,
-    capture_started: SystemTime,
-    hash: String,
-}
-
-#[cfg(test)]
 async fn capture_workspace_metadata(
     repo_root: PathBuf,
     paths: Vec<WorkspaceGenerationPath>,
     control: WorkspaceCaptureControl,
-) -> Option<WorkspaceGenerationMetadata> {
-    capture_workspace_metadata_cached(repo_root, paths, control, Arc::default(), SystemTime::now()).await
-}
-
-async fn capture_workspace_metadata_cached(
-    repo_root: PathBuf,
-    paths: Vec<WorkspaceGenerationPath>,
-    control: WorkspaceCaptureControl,
-    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
-    capture_started: SystemTime,
 ) -> Option<WorkspaceGenerationMetadata> {
     let total_paths = paths.len();
     let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
@@ -1087,7 +1058,6 @@ async fn capture_workspace_metadata_cached(
     let results = futures::stream::iter(paths.into_iter().map(|observation| {
         let repo_root = repo_root.clone();
         let control = control.clone();
-        let content_cache = Arc::clone(&content_cache);
         let observed_bytes = Arc::clone(&observed_bytes);
         async move { tokio::task::spawn_blocking(move || {
             let mut manifest = Vec::new();
@@ -1127,36 +1097,16 @@ async fn capture_workspace_metadata_cached(
                 manifest.extend_from_slice(format!("{:x}", Sha256::digest(target.to_string_lossy().as_bytes())).as_bytes());
             } else if metadata.is_file() {
                 let mut file = File::open(&absolute).ok()?;
-                let modified = metadata.modified().ok()?;
-                let file_id = stable_file_identity(&file);
-                let cached_hash = {
-                    let cache = content_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let hash = cache.files.get(&absolute).filter(|entry| {
-                        entry.size == declared_bytes && entry.modified == modified
-                            && Some(&entry.file_id) == file_id.as_ref()
-                            && modified < entry.capture_started
-                    }).map(|entry| entry.hash.clone());
-                    #[cfg(test)]
-                    if hash.is_some() { cache.hits.fetch_add(1, Ordering::Relaxed); }
-                    hash
-                };
-                let (hash, actual_bytes) = match cached_hash {
-                    Some(hash) => (hash, declared_bytes),
-                    None => hash_workspace_content(&mut file, declared_bytes, &mut [0_u8; 64 * 1024], &control)?,
-                };
+                // Size, file identity and mtime can all survive an in-place
+                // rewrite. Authoritative freshness must hash the current bytes.
+                let (hash, actual_bytes) = hash_workspace_content(
+                    &mut file, declared_bytes, &mut [0_u8; 64 * 1024], &control,
+                )?;
                 let after = file.metadata().ok()?;
                 if actual_bytes != declared_bytes || after.len() != declared_bytes || after.modified().ok()? != metadata.modified().ok()? {
                     return None;
                 }
                 manifest.extend_from_slice(hash.as_bytes());
-                if let Some(file_id) = file_id {
-                    let mut cache = content_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // Bound cross-repository retention; eviction only costs a rehash.
-                    if cache.files.len() >= 4096 && !cache.files.contains_key(&absolute) { cache.files.clear(); }
-                    if cache.files.get(&absolute).is_none_or(|entry| entry.capture_started <= capture_started) {
-                        cache.files.insert(absolute, CachedWorkspaceContent { size: declared_bytes, modified, file_id, capture_started, hash });
-                    }
-                }
             }
             manifest.push(b'\n');
             Some((manifest, None))
@@ -1695,7 +1645,6 @@ impl WorkspaceEvidenceCapturePause {
 pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
     pub(crate) roots: Arc<WorkspaceRootCache>,
-    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
     watcher_epoch: u64,
     watcher_generation: AtomicU64,
     host_mutation_generation: AtomicU64,
@@ -2032,7 +1981,6 @@ impl GitWorkspaceCache {
         let cache = Arc::new(Self {
             state: Mutex::new(GitWorkspaceCacheState::default()),
             roots: Arc::default(),
-            content_cache: Arc::default(),
             watcher_epoch,
             watcher_generation: AtomicU64::new(0),
             host_mutation_generation: AtomicU64::new(0),
@@ -2257,7 +2205,6 @@ impl GitWorkspaceCache {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
                     let capture_repo_root = repo_root.clone();
-                    let content_cache = Arc::clone(&self.content_cache);
                     let cancellation = CancellationToken::new();
                     let interest = Arc::new(WorkspaceCaptureInterest {
                         waiters: AtomicUsize::new(1),
@@ -2272,7 +2219,6 @@ impl GitWorkspaceCache {
                         capture_workspace_evidence_with_cancellation(
                             capture_repo_root,
                             cancellation,
-                            content_cache,
                         )
                         .await
                     }
@@ -3131,7 +3077,7 @@ fn path_is_same_or_descendant_with_case_sensitivity(
     path == ancestor
         || path
             .strip_prefix(&ancestor)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+            .is_some_and(|suffix| ancestor.ends_with('/') || suffix.starts_with('/'))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

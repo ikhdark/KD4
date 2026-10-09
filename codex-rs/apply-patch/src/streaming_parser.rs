@@ -460,7 +460,22 @@ mod tests {
             .unwrap();
         let hunks_ptr = parser.hunks().as_ptr();
         let environment_ptr = parser.environment_id().unwrap().as_ptr();
-        let expected = parser.clone().finish().unwrap();
+        let expected = vec![
+            Hunk::AddFile {
+                path: PathBuf::from("a.txt"),
+                contents: "hello\n".to_string(),
+            },
+            Hunk::UpdateFile {
+                path: PathBuf::from("b.txt"),
+                move_path: None,
+                chunks: vec![UpdateFileChunk {
+                    change_context: None,
+                    old_lines: vec!["old".to_string()],
+                    new_lines: vec!["new".to_string()],
+                    is_end_of_file: false,
+                }],
+            },
+        ];
 
         let (hunks, environment_id) = parser.into_parts().unwrap();
         assert_eq!(hunks, expected);

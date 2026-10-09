@@ -14,16 +14,12 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 #[tokio::test]
-async fn chatgpt_turn_costs_use_workspace_auth_and_chatgpt_path() {
+async fn chatgpt_turn_costs_use_workspace_auth_and_both_path_styles() {
     check_query(
         "/backend-api",
         "/backend-api/wham/usage/thread-estimates/query",
     )
     .await;
-}
-
-#[tokio::test]
-async fn chatgpt_turn_costs_use_workspace_auth_and_codex_path() {
     check_query("", "/api/codex/usage/thread-estimates/query").await;
 }
 

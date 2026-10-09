@@ -1418,38 +1418,42 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_failures_block_before_compatibility_name_index_updates() {
-        assert!(sqlite_write_failure_should_block(&ThreadMetadataPatch {
-            name: Some(Some("User chosen name".to_string())),
-            ..Default::default()
-        }));
-    }
-
-    #[test]
-    fn sqlite_failures_are_best_effort_for_observed_metadata_updates() {
-        assert!(!sqlite_write_failure_should_block(&ThreadMetadataPatch {
-            updated_at: Some(Utc::now()),
-            ..Default::default()
-        }));
-        assert!(!sqlite_write_failure_should_block(&ThreadMetadataPatch {
-            preview: Some("Observed preview".to_string()),
-            git_info: Some(GitInfoPatch {
-                branch: Some(Some("main".to_string())),
+    fn sqlite_failure_policy_distinguishes_explicit_and_observed_updates() {
+        for (patch, blocks) in [
+            (ThreadMetadataPatch {
+                name: Some(Some("User chosen name".to_string())),
                 ..Default::default()
-            }),
-            ..Default::default()
-        }));
-    }
-
-    #[test]
-    fn sqlite_failures_still_block_for_explicit_git_only_updates() {
-        assert!(sqlite_write_failure_should_block(&ThreadMetadataPatch {
-            git_info: Some(GitInfoPatch {
-                branch: Some(Some("main".to_string())),
+            }, true),
+            (ThreadMetadataPatch {
+                name: Some(None),
                 ..Default::default()
-            }),
-            ..Default::default()
-        }));
+            }, true),
+            (ThreadMetadataPatch {
+                project_id: Some(None),
+                ..Default::default()
+            }, true),
+            (ThreadMetadataPatch {
+                updated_at: Some(Utc::now()),
+                ..Default::default()
+            }, false),
+            (ThreadMetadataPatch {
+                preview: Some("Observed preview".to_string()),
+                git_info: Some(GitInfoPatch {
+                    branch: Some(Some("main".to_string())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }, false),
+            (ThreadMetadataPatch {
+                git_info: Some(GitInfoPatch {
+                    branch: Some(Some("main".to_string())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }, true),
+        ] {
+            assert_eq!(sqlite_write_failure_should_block(&patch), blocks, "{patch:?}");
+        }
     }
 
     #[tokio::test]

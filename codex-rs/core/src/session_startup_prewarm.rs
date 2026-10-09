@@ -454,6 +454,11 @@ mod tests {
             )
             .await;
         assert!(!session.services.model_client.startup_websocket_enabled());
+        let auth_task = tokio::spawn(std::future::pending::<CodexResult<ModelClientSession>>());
+        let auth_abort = auth_task.abort_handle();
+        session
+            .set_session_startup_transport(SessionStartupTransportHandle::new(auth_task))
+            .await;
         session
             .schedule_startup_prewarm("startup instructions".to_string())
             .await;
@@ -467,6 +472,7 @@ mod tests {
             .expect("prewarm task must finish")
             .expect("no network request is needed");
         assert!(prepared_session.is_none(), "disabled prewarm must not claim an empty session");
+        assert!(!auth_abort.is_finished(), "router publication must retain auth work");
         let resolution = SessionStartupPrewarmHandle::resolution_from_join_result(
             Ok(Ok(prepared_session)),
             Instant::now(),
@@ -491,55 +497,15 @@ mod tests {
                 .await
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn http_router_completion_preserves_pending_auth_owner() {
-        let home = tempfile::tempdir().unwrap();
-        let (session, _, _) =
-            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-                codex_login::CodexAuth::from_api_key("test"),
-                Vec::new(),
-                home.path(),
-                |config| config.model_provider.supports_websockets = false,
-            )
-            .await;
-        let task = tokio::spawn(std::future::pending::<CodexResult<ModelClientSession>>());
-        let abort = task.abort_handle();
-        session
-            .set_session_startup_transport(SessionStartupTransportHandle::new(task))
-            .await;
-        session
-            .schedule_startup_prewarm("instructions".into())
-            .await;
-        let prewarm = session.take_session_startup_prewarm().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), prewarm.task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(
-            !abort.is_finished(),
-            "router publication must not discard auth work"
-        );
-        assert!(
-            session
-                .startup_prepared_router
-                .take_for_first_turn()
-                .await
-                .is_some()
-        );
         session
             .take_session_startup_transport()
             .await
             .expect("session retains auth ownership")
             .abort()
             .await;
-        assert!(
-            abort.is_finished(),
-            "shutdown can still drain the auth owner"
-        );
+        assert!(auth_abort.is_finished(), "shutdown must drain the auth owner");
     }
+
 
     #[tokio::test]
     async fn prewarm_publishes_router_while_transport_is_pending() {
@@ -596,11 +562,16 @@ mod tests {
     async fn aborting_startup_transport_drops_retained_work() {
         let dropped = Arc::new(AtomicBool::new(false));
         let task_dropped = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _drop_signal = DropSignal(task_dropped);
+            started_tx.send(()).expect("start receiver");
             std::future::pending::<CodexResult<ModelClientSession>>().await
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("transport task starts")
+            .expect("start signal");
 
         SessionStartupTransportHandle::new(task).abort().await;
 

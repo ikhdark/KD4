@@ -491,7 +491,23 @@ mod tests {
             "taking the pending update should not drop retry state"
         );
 
+        assert!(
+            sync.take_pending_update_for_existing_history().is_none(),
+            "resume-only metadata must wait for a new append"
+        );
+        let appended = sync
+            .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+                user_message("new append"),
+            ))])
+            .expect("first append flushes pending resume metadata");
+        assert_eq!(appended.patch.preview.as_deref(), Some("hello metadata"));
+        assert!(appended.patch.updated_at.is_some());
         sync.mark_pending_update_applied(&update);
+        assert!(
+            sync.take_pending_update_for_existing_history().is_some(),
+            "acknowledging the older generation must not erase the append"
+        );
+        sync.mark_pending_update_applied(&appended);
         assert!(sync.take_pending_update().is_none());
     }
 
@@ -691,30 +707,6 @@ mod tests {
         assert_eq!(
             update.patch.advance_recency_at,
             DateTime::<Utc>::from_timestamp(started_at, 0)
-        );
-    }
-
-    #[test]
-    fn resume_history_waits_for_append_before_flushing_metadata() {
-        let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
-            thread_id,
-            vec![
-                RolloutItem::SessionMeta(session_meta(thread_id)),
-                RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
-            ],
-        ));
-
-        assert!(
-            sync.take_pending_update_for_existing_history().is_none(),
-            "resume-only metadata should not flush without a new append"
-        );
-        assert!(
-            sync.observe_appended_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
-                user_message("new append"),
-            ))])
-            .is_some(),
-            "the first append should flush resume metadata together with append metadata"
         );
     }
 

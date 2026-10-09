@@ -144,19 +144,37 @@ mod tests {
     }
     #[test]
     fn mixed_dynamic_output_preserves_text_and_reports_incomplete_delivery() {
-        let (response, diagnostic) = decode_response(serde_json::json!({
-            "success": true,
-            "contentItems": [
-                {"type":"inputText", "text":"operation receipt 123"},
-                {"type":"inputImage", "imageUrl":"https://example.com/image.png"}
-            ]
-        }));
-        assert!(response.success);
-        assert_eq!(response.content_items.len(), 2);
-        assert!(
-            matches!(&response.content_items[0], DynamicToolCallOutputContentItem::InputText { text } if text == "operation receipt 123")
-        );
-        assert!(diagnostic.unwrap().contains("Partial dynamic tool output"));
+        for success in [true, false] {
+            let (response, diagnostic) = decode_response(serde_json::json!({
+                "success": success,
+                "contentItems": [
+                    {"type":"inputText", "text":"operation receipt 123"},
+                    {"type":"inputImage", "imageUrl":"https://example.com/image.png"},
+                    {"type":"inputImage", "imageUrl":"data:image/png;base64,aGVsbG8="},
+                    {"type":"inputImage", "imageUrl":"HtTp://example.com/image.png"},
+                    {"type":"inputText", "text":"final receipt"}
+                ]
+            }));
+            assert_eq!(response.success, success);
+            let diagnostic = diagnostic.unwrap();
+            assert!(diagnostic.contains("Partial dynamic tool output"));
+            assert!(diagnostic.contains("omitted 2 unsupported image item(s)"));
+            assert_eq!(
+                response.content_items,
+                vec![
+                    DynamicToolCallOutputContentItem::InputText {
+                        text: "operation receipt 123".to_string(),
+                    },
+                    DynamicToolCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,aGVsbG8=".to_string(),
+                    },
+                    DynamicToolCallOutputContentItem::InputText {
+                        text: "final receipt".to_string(),
+                    },
+                    DynamicToolCallOutputContentItem::InputText { text: diagnostic },
+                ]
+            );
+        }
     }
 
     #[test]
@@ -167,5 +185,9 @@ mod tests {
         let diagnostic = diagnostic.unwrap();
         assert!(diagnostic.contains("schema invalid"));
         assert!(!diagnostic.contains("private-token"));
+        assert_eq!(
+            response.content_items,
+            vec![DynamicToolCallOutputContentItem::InputText { text: diagnostic }]
+        );
     }
 }

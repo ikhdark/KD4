@@ -116,6 +116,11 @@ impl<R> ResponseBodyDump<R> {
 
 impl<R: Read> Read for ResponseBodyDump<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // An empty destination can return zero without reaching EOF. Do not
+        // finalize the dump until a nonempty read observes EOF (or Drop).
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let bytes_read = self.response_body.read(buf)?;
         if bytes_read == 0 {
             self.write_dump_if_needed();
@@ -316,15 +321,16 @@ mod tests {
         );
 
         let mut response_body = String::new();
-        exchange_dump
-            .tee_response_body(
-                /*status*/ 200,
-                &headers,
-                Cursor::new(b"data: hello\n\n".to_vec()),
-            )
+        let mut reader = exchange_dump.tee_response_body(
+            /*status*/ 200,
+            &headers,
+            Cursor::new(b"data: hello\n\n".to_vec()),
+        );
+        reader
             .read_to_string(&mut response_body)
             .expect("read response body");
 
+        // EOF must persist the dump while the reader is still alive, not only on Drop.
         let response_dump = fs::read_to_string(dump_file_with_suffix(&dump_dir, "-response.json"))
             .expect("read response dump");
 
@@ -351,6 +357,37 @@ mod tests {
             })
         );
 
+        drop(reader);
+        fs::remove_dir_all(dump_dir).expect("remove test dump dir");
+    }
+
+    #[test]
+    fn empty_reads_do_not_finalize_response_dump() {
+        let dump_dir = test_dump_dir();
+        let dumper = ExchangeDumper::new(dump_dir.clone()).expect("create dumper");
+        let exchange_dump = dumper
+            .dump_request(&Method::Post, "/v1/responses", &[], b"{}")
+            .expect("dump request");
+        let response_path = exchange_dump.response_path.clone();
+        let mut reader = exchange_dump.tee_response_body(
+            /*status*/ 200,
+            &HeaderMap::new(),
+            Cursor::new(b"complete response"),
+        );
+
+        // Read's zero-length-buffer case is not EOF. A tee must still retain
+        // all bytes subsequently delivered to its consumer.
+        assert_eq!(reader.read(&mut []).expect("empty read"), 0);
+        assert!(!response_path.exists(), "empty read must not publish a dump");
+        let mut body = String::new();
+        reader.read_to_string(&mut body).expect("read response");
+        assert_eq!(body, "complete response");
+        let dump: serde_json::Value =
+            serde_json::from_slice(&fs::read(&response_path).expect("read dump"))
+                .expect("parse dump");
+        assert_eq!(dump["body"], json!("complete response"));
+
+        drop(reader);
         fs::remove_dir_all(dump_dir).expect("remove test dump dir");
     }
 

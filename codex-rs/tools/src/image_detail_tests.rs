@@ -42,46 +42,30 @@ fn model_info() -> ModelInfo {
 }
 
 #[test]
-fn explicit_original_is_allowed_when_model_supports_it() {
-    let model_info = model_info();
-
-    assert!(can_request_original_image_detail(&model_info));
-    assert_eq!(
-        normalize_output_image_detail(&model_info, Some(ImageDetail::Original)),
-        Some(ImageDetail::Original)
-    );
-    assert_eq!(
-        normalize_output_image_detail(&model_info, /*detail*/ None),
-        None
-    );
-}
-
-#[test]
-fn explicit_original_is_dropped_without_model_support() {
-    let mut model_info = model_info();
-    model_info.supports_image_detail_original = false;
-    assert_eq!(
-        normalize_output_image_detail(&model_info, Some(ImageDetail::Original)),
-        None
-    );
-}
-
-#[test]
-fn explicit_non_original_detail_is_preserved() {
-    let model_info = model_info();
-
-    assert_eq!(
-        normalize_output_image_detail(&model_info, Some(ImageDetail::Auto)),
-        Some(ImageDetail::Auto)
-    );
-    assert_eq!(
-        normalize_output_image_detail(&model_info, Some(ImageDetail::Low)),
-        Some(ImageDetail::Low)
-    );
-    assert_eq!(
-        normalize_output_image_detail(&model_info, Some(ImageDetail::High)),
-        Some(ImageDetail::High)
-    );
+fn output_detail_respects_model_capability_without_changing_other_details() {
+    for supports_original in [false, true] {
+        let mut model = model_info();
+        model.supports_image_detail_original = supports_original;
+        assert_eq!(can_request_original_image_detail(&model), supports_original);
+        for detail in [
+            None,
+            Some(ImageDetail::Original),
+            Some(ImageDetail::Auto),
+            Some(ImageDetail::Low),
+            Some(ImageDetail::High),
+        ] {
+            let expected = if !supports_original && detail == Some(ImageDetail::Original) {
+                None
+            } else {
+                detail
+            };
+            assert_eq!(
+                normalize_output_image_detail(&model, detail),
+                expected,
+                "supports_original={supports_original}, detail={detail:?}"
+            );
+        }
+    }
 }
 
 #[test]

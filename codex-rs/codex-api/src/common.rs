@@ -278,13 +278,15 @@ mod responses_input_tests {
             assert!(input.get_item(input.len()).is_none());
             assert!(input.get_item(usize::MAX).is_none());
             for _ in 0..2 {
-                assert_eq!(serde_json::to_vec(&input.clone()).unwrap(), serde_json::to_vec(&expected).unwrap());
+                assert_eq!(serde_json::to_vec(&input).unwrap(), serde_json::to_vec(&expected).unwrap());
                 assert!(input.contiguous.get().is_none());
                 assert!(Arc::ptr_eq(&input.shared, &history));
             }
             let mut modified = input.clone();
             Arc::make_mut(&mut modified)[0] = item("rewritten");
-            assert_ne!(serde_json::to_vec(&modified).unwrap(), serde_json::to_vec(&input).unwrap());
+            let mut expected_modified = expected.clone();
+            expected_modified[0] = item("rewritten");
+            assert_eq!(serde_json::to_vec(&modified).unwrap(), serde_json::to_vec(&expected_modified).unwrap());
             assert_eq!(serde_json::to_vec(&input).unwrap(), serde_json::to_vec(&expected).unwrap());
         }
     }

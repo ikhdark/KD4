@@ -33,15 +33,6 @@ use http::HeaderValue;
 use http::StatusCode;
 use pretty_assertions::assert_eq;
 
-fn assert_path_ends_with(requests: &[Request], suffix: &str) {
-    assert_eq!(requests.len(), 1);
-    let url = &requests[0].url;
-    assert!(
-        url.ends_with(suffix),
-        "expected url to end with {suffix}, got {url}"
-    );
-}
-
 fn request_body_bytes(request: &Request) -> &[u8] {
     let Some(RequestBody::EncodedJson(body)) = request.body.as_ref() else {
         panic!("expected a prepared request body");
@@ -398,27 +389,6 @@ async fn responses_client_preserves_configured_query_parameters() -> Result<()> 
 }
 
 #[tokio::test]
-async fn responses_client_uses_responses_path() -> Result<()> {
-    let state = RecordingState::default();
-    let transport = RecordingTransport::new(state.clone());
-    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
-
-    let body = serde_json::json!({ "echo": true });
-    let _stream = client
-        .stream(
-            body,
-            HeaderMap::new(),
-            Compression::None,
-            /*turn_state*/ None,
-        )
-        .await?;
-
-    let requests = state.take_stream_requests();
-    assert_path_ends_with(&requests, "/responses");
-    Ok(())
-}
-
-#[tokio::test]
 async fn non_streaming_retries_reuse_one_prepared_body() -> Result<()> {
     let transport = FailsOnceExecuteTransport::default();
     let client = SearchClient::new(transport.clone(), provider("openai"), Arc::new(NoAuth));
@@ -532,6 +502,8 @@ async fn streaming_client_adds_auth_headers() -> Result<()> {
     assert_eq!(requests.len(), 1);
     let req = &requests[0];
 
+    assert_eq!(req.method, http::Method::POST);
+    assert_eq!(req.url, "https://example.com/v1/responses");
     let auth_header = req.headers.get(http::header::AUTHORIZATION);
     assert!(auth_header.is_some(), "missing auth header");
     assert_eq!(
@@ -744,6 +716,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
     );
 
     let body: serde_json::Value = serde_json::from_slice(request_body_bytes(req))?;
+    assert_eq!(body["store"], true);
     let input_id = body
         .get("input")
         .and_then(|input| input.get(0))

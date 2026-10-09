@@ -297,7 +297,9 @@ fn over_truncation_remote_compaction_keeps_exact_artifact_recovery_sidecar() {
     })
     .to_string();
 
-    let retained = append_remote_compaction_artifact_pins(vec![compaction], Some(payload));
+    let retained = append_remote_compaction_artifact_pins(vec![compaction.clone()], Some(payload.clone()));
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[0], compaction);
     assert!(crate::stable_context::is_trusted_stable_context_item(&retained[1]));
     assert!(!crate::compact::task_compaction_items(&retained).iter().any(|item|
         matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part|
@@ -309,9 +311,7 @@ fn over_truncation_remote_compaction_keeps_exact_artifact_recovery_sidecar() {
         panic!("expected text sidecar");
     };
 
-    assert!(text.contains("tool_history_artifact_pins"));
-    assert!(text.contains("019fd974-843a-7601-8624-dc36cd5cc3cd"));
-    assert!(text.contains("read_tool_output"));
+    assert_eq!(text, &payload);
 }
 
 #[test]
@@ -329,10 +329,10 @@ fn remote_compaction_drops_orphan_tool_receipts() {
     let items = vec![function_call_output(
         "orphan",
         "call-orphan",
-        "artifact 123",
+        &tool_history_receipt("call-orphan"),
     )];
 
-    assert!(bounded_remote_compacted_history(items, |_| false).is_empty());
+    assert!(bounded_remote_compacted_history(items, response_item_has_valid_tool_history_receipt).is_empty());
 }
 
 #[test]
@@ -535,34 +535,38 @@ async fn prepared_prompt_size_does_not_rewrite_an_output_already_absent_from_pro
             text: "prepared prefix".to_string(),
         },
     );
-    let output = function_call_output("output-id", "call-id", &"x".repeat(20_000));
+    let mut search = tool_search_group("absent-search");
+    let ResponseItem::ToolSearchOutput { tools, .. } = &mut search[1] else {
+        unreachable!()
+    };
+    tools[0]["description"] = serde_json::json!("large schema ".repeat(2_000));
+    let mut items = vec![prefix.clone()];
+    items.extend(search);
     let mut history = ContextManager::new();
-    history.replace(vec![prefix.clone(), output.clone()]);
+    history.replace(items.clone());
     let prepared_tokens = estimate_item_token_count(&prefix);
     turn_context.model_info.context_window =
         Some(prepared_tokens.saturating_add(REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS));
     turn_context.model_info.effective_context_window_percent = 100;
 
-    let (rewritten, _) = trim_function_call_history_to_fit_context_window_for_prompt(
+    // Ensure the omitted output is actually rewriteable and the projected
+    // request remains over budget, so neither early return can mask a bug.
+    let mut included = history.clone();
+    assert_eq!(
+        trim_function_call_history_to_fit_context_window_for_prompt(
+            &mut included, &turn_context, &base_instructions, Some(&items), 1_000,
+        ).0,
+        1
+    );
+    let (rewritten, savings) = trim_function_call_history_to_fit_context_window_for_prompt(
         &mut history,
         &turn_context,
         &base_instructions,
         Some(&[prefix]),
-        0,
+        1_000,
     );
 
     assert_eq!(rewritten, 0);
-    assert_eq!(
-        history.raw_items(),
-        &[
-            message(
-                "prefix-id",
-                "user",
-                ContentItem::InputText {
-                    text: "prepared prefix".to_string(),
-                },
-            ),
-            output
-        ]
-    );
+    assert_eq!(savings, 0);
+    assert_eq!(history.raw_items(), items);
 }

@@ -630,25 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn set_allowed_domains_preserves_existing_deny_for_same_pattern() {
-        let mut settings = NetworkProxyConfig::default();
-        settings.set_denied_domains(vec!["example.com".to_string()]);
-
-        settings.set_allowed_domains(vec!["example.com".to_string()]);
-
-        assert_eq!(settings.allowed_domains(), None);
-        assert_eq!(
-            settings.denied_domains(),
-            Some(vec!["example.com".to_string()])
-        );
-    }
-
-    #[test]
     fn network_domain_permissions_serialize_to_effective_map_shape() {
         let mut settings = NetworkProxyConfig::default();
         settings.set_denied_domains(vec!["example.com".to_string()]);
         settings.set_allowed_domains(vec!["example.com".to_string()]);
         let config = settings;
+
+        assert_eq!(config.allowed_domains(), None);
+        assert_eq!(config.denied_domains(), Some(vec!["example.com".to_string()]));
 
         let value = serde_json::to_value(&config).unwrap();
 
@@ -678,13 +667,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_host_port_defaults_for_empty_string() {
-        assert!(parse_host_port("", /*default_port*/ 1234).is_err());
-    }
-
-    #[test]
-    fn parse_host_port_defaults_for_whitespace() {
-        assert!(parse_host_port("   ", /*default_port*/ 5555).is_err());
+    fn parse_host_port_rejects_missing_host() {
+        for (input, port) in [("", 1234), ("   ", 5555)] {
+            let error = parse_host_port(input, port).unwrap_err();
+            assert!(error.to_string().contains("missing host"), "{error}");
+        }
     }
 
     #[test]

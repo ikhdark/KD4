@@ -257,6 +257,11 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
     ];
     let body0 = req1.single_request().body_json();
     let expected_instructions = base_instructions;
+    assert!(
+        !normalize_newlines(&expected_instructions)
+            .contains(&normalize_newlines(APPLY_PATCH_TOOL_INSTRUCTIONS)),
+        "patch-tool instructions belong to the tool, not the base prompt"
+    );
 
     assert_eq!(
         body0["instructions"],
@@ -284,90 +289,6 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gpt_5_patch_tool_keeps_base_instructions_consistent() -> anyhow::Result<()> {
-    require_network!();
-    use pretty_assertions::assert_eq;
-
-    let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
-
-    let TestCodex { codex, .. } = test_codex()
-        .with_pre_build_hook(write_global_instructions)
-        .with_config(|config| {
-            config.model = Some("gpt-5.2".to_string());
-        })
-        .build(&server)
-        .await?;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let body0 = req1.single_request().body_json();
-    let instructions0 = body0["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
-    assert!(
-        !normalize_newlines(instructions0)
-            .contains(&normalize_newlines(APPLY_PATCH_TOOL_INSTRUCTIONS)),
-        "base instructions should remain unchanged when apply_patch is exposed as a tool"
-    );
-    assert!(
-        body0["tools"]
-            .as_array()
-            .expect("tools should be an array")
-            .iter()
-            .any(|tool| tool.get("name").and_then(serde_json::Value::as_str)
-                == Some("apply_patch")),
-        "gpt-5.2 fixture should register the apply_patch tool"
-    );
-
-    let body1 = req2.single_request().body_json();
-    let instructions1 = body1["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
-    assert_eq!(
-        normalize_newlines(instructions1),
-        normalize_newlines(instructions0)
-    );
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefixes_context_and_instructions_once_and_consistently_across_requests()
@@ -534,6 +455,10 @@ async fn overrides_turn_context_preserve_history_and_update_cache_routing() -> a
     let body2 = request2.body_json();
     // Permission changes alter schemas without changing thread cache routing.
     assert_ne!(body1["tools"], body2["tools"]);
+    assert_eq!(
+        body1["prompt_cache_key"],
+        codex.session_configured().thread_id.to_string()
+    );
     assert_eq!(
         body1["prompt_cache_key"], body2["prompt_cache_key"],
         "cache routing stays bound to the thread"
@@ -823,6 +748,10 @@ async fn per_turn_overrides_preserve_history_and_update_cache_routing() -> anyho
     // Model changes retain the thread's cache routing identity.
     assert_ne!(body1["model"], body2["model"]);
     assert_eq!(
+        body1["prompt_cache_key"],
+        codex.session_configured().thread_id.to_string()
+    );
+    assert_eq!(
         body1["prompt_cache_key"], body2["prompt_cache_key"],
         "cache routing stays bound to the thread"
     );
@@ -1106,7 +1035,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_rollout()
+async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
 -> anyhow::Result<()> {
     require_network!();
 

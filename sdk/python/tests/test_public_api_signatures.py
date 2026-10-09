@@ -252,9 +252,6 @@ def test_package_root_exports_only_public_api() -> None:
         "TurnStatus": False,
     }
 
-
-def test_package_star_import_matches_public_api() -> None:
-    """Star imports should follow the same explicit public API list."""
     namespace: dict[str, object] = {}
     exec("from openai_codex import *", namespace)
 
@@ -269,9 +266,6 @@ def test_types_module_exports_curated_public_types() -> None:
         EXPECTED_TYPES_EXPORTS, True
     )
 
-
-def test_types_star_import_matches_public_types() -> None:
-    """Star imports from the type module should match its explicit export list."""
     namespace: dict[str, object] = {}
     exec("from openai_codex.types import *", namespace)
 

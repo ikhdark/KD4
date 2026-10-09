@@ -938,31 +938,19 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
 
 #[test]
 fn push_chunk_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
-    buffer.push_chunk(&vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
-    buffer.push_chunk(b"b");
-    buffer.push_chunk(b"c");
-
-    assert_eq!(buffer.retained_bytes(), UNIFIED_EXEC_OUTPUT_MAX_BYTES);
-    let snapshot = buffer.snapshot_chunks();
-
-    let mut expected = vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES - 2];
-    expected.extend_from_slice(b"bc");
-    assert_eq!(snapshot.concat(), expected);
-    assert_eq!(buffer.omitted_bytes(), 2);
-}
-
-#[test]
-fn head_tail_buffer_default_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
-    buffer.push_chunk(&vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
-    buffer.push_chunk(b"bc");
-
-    let rendered = buffer.to_bytes();
-    let mut expected = vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES - 2];
-    expected.extend_from_slice(b"bc");
-    assert_eq!(rendered, expected);
-    assert_eq!(buffer.omitted_bytes(), 2);
+    for chunks in [vec![b"b".as_slice(), b"c".as_slice()], vec![b"bc".as_slice()]] {
+        let mut buffer = HeadTailBuffer::default();
+        buffer.push_chunk(&vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
+        for chunk in chunks {
+            buffer.push_chunk(chunk);
+        }
+        let mut expected = vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES - 2];
+        expected.extend_from_slice(b"bc");
+        assert_eq!(buffer.retained_bytes(), UNIFIED_EXEC_OUTPUT_MAX_BYTES);
+        assert_eq!(buffer.snapshot_chunks().concat(), expected);
+        assert_eq!(buffer.to_bytes(), expected);
+        assert_eq!(buffer.omitted_bytes(), 2);
+    }
 }
 
 #[cfg(windows)]

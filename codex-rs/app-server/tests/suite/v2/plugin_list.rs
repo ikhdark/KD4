@@ -509,6 +509,11 @@ async fn plugin_list_returns_empty_when_workspace_codex_plugins_disabled() -> Re
     let server = MockServer::start().await;
     std::fs::create_dir_all(repo_root.path().join(".git"))?;
     std::fs::create_dir_all(repo_root.path().join(".agents/plugins"))?;
+    std::fs::create_dir_all(repo_root.path().join("demo-plugin/.codex-plugin"))?;
+    std::fs::write(
+        repo_root.path().join("demo-plugin/.codex-plugin/plugin.json"),
+        r#"{"name":"demo-plugin"}"#,
+    )?;
     write_plugins_enabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
@@ -874,7 +879,25 @@ async fn plugin_list_accepts_omitted_cwds() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let _: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse = to_response(response)?;
+    assert_eq!(response.marketplaces.len(), 1);
+    let marketplace = &response.marketplaces[0];
+    assert_eq!(marketplace.name, "codex-curated");
+    assert_eq!(
+        marketplace.path,
+        Some(AbsolutePathBuf::try_from(
+            codex_home.path().join(".agents/plugins/marketplace.json"),
+        )?)
+    );
+    assert_eq!(
+        marketplace
+            .plugins
+            .iter()
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["home-plugin@codex-curated"]
+    );
+    assert!(response.marketplace_load_errors.is_empty());
     Ok(())
 }
 
@@ -1737,7 +1760,8 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
             .chatgpt_account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
-    write_installed_plugin_with_version(&codex_home, "openai-curated-remote", "linear", "1.2.3")?;
+    // The local package can lag behind the account's advertised/installed release.
+    write_installed_plugin_with_version(&codex_home, "openai-curated-remote", "linear", "0.9.0")?;
 
     let global_directory_body = r#"{
   "plugins": [
@@ -1910,7 +1934,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
     );
     assert_eq!(
         remote_marketplace.plugins[0].local_version.as_deref(),
-        Some("1.2.3")
+        Some("0.9.0")
     );
     assert_eq!(remote_marketplace.plugins[0].installed, true);
     assert_eq!(remote_marketplace.plugins[0].enabled, true);
@@ -1986,6 +2010,36 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
                 .query_pairs()
                 .any(|(name, value)| name == "collection" && value == "vertical"))
     );
+    // Removing only this fixture-owned cache must clear the local version even
+    // while the backend still reports the account installation at 1.2.3.
+    std::fs::remove_dir_all(
+        codex_home
+            .path()
+            .join("plugins/cache/openai-curated-remote/linear"),
+    )?;
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response: PluginListResponse = to_response(response)?;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("remote marketplace remains after local cache removal");
+    assert_eq!(
+        remote_marketplace.plugins[0].version.as_deref(),
+        Some("1.2.3")
+    );
+    assert_eq!(remote_marketplace.plugins[0].local_version, None);
+    assert!(remote_marketplace.plugins[0].installed);
     Ok(())
 }
 
@@ -2088,6 +2142,32 @@ async fn plugin_list_uses_cached_global_remote_catalog_and_refreshes_it() -> Res
     wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[refreshed_remote_plugin_id])
         .await?;
 
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("expected refreshed remote marketplace");
+    assert_eq!(
+        remote_marketplace
+            .plugins
+            .iter()
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notion@openai-curated-remote"]
+    );
     Ok(())
 }
 
@@ -3865,6 +3945,11 @@ fn cached_remote_catalog_plugin_ids(codex_home: &std::path::Path) -> Result<Vec<
     let mut plugin_ids = Vec::new();
     for entry in std::fs::read_dir(cache_dir)? {
         let path = entry?.path();
+        // Atomic publication stages an incomplete temporary file beside the
+        // canonical .json cache. Only published snapshots are observations.
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
         let cached_catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
         let Some(plugins) = cached_catalog["plugins"].as_array() else {
             continue;
@@ -3878,6 +3963,25 @@ fn cached_remote_catalog_plugin_ids(codex_home: &std::path::Path) -> Result<Vec<
     }
     plugin_ids.sort();
     Ok(plugin_ids)
+}
+
+#[test]
+fn cached_remote_catalog_ignores_unpublished_temporary_files() -> Result<()> {
+    let home = TempDir::new()?;
+    let cache_dir = home.path().join("cache/remote_plugin_catalog");
+    std::fs::create_dir_all(&cache_dir)?;
+    let published = cache_dir.join("0123456789abcdef.json");
+    std::fs::write(&published, r#"{"plugins":[{"id":"retained"}]}"#)?;
+    let mut staged = tempfile::NamedTempFile::new_in(&cache_dir)?;
+    std::io::Write::write_all(staged.as_file_mut(), b"{")?;
+
+    assert_eq!(cached_remote_catalog_plugin_ids(home.path())?, vec!["retained"]);
+    drop(staged);
+    assert_eq!(cached_remote_catalog_plugin_ids(home.path())?, vec!["retained"]);
+    std::fs::write(published, "{")?;
+    assert!(cached_remote_catalog_plugin_ids(home.path()).is_err(),
+        "invalid published snapshots must not be hidden as pending refreshes");
+    Ok(())
 }
 
 async fn wait_for_path_exists(path: &std::path::Path) -> Result<()> {

@@ -3164,18 +3164,6 @@ impl ThreadRequestProcessor {
                 }
                 let instruction_sources = codex_thread.legacy_instruction_sources().await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
-                let Some(rollout_path) = rollout_path else {
-                    let error =
-                        internal_error(format!("rollout path missing for thread {thread_id}"));
-                    self.rollback_failed_resumed_thread(
-                        thread_id,
-                        &codex_thread,
-                        was_already_running,
-                    )
-                    .await;
-                    self.outgoing.send_error(request_id, error).await;
-                    return Ok(());
-                };
                 match self
                     .ensure_conversation_listener(thread_id, request_id.connection_id, false)
                     .await
@@ -3199,7 +3187,7 @@ impl ThreadRequestProcessor {
                         thread_id,
                         codex_thread.as_ref(),
                         &mut response_history,
-                        rollout_path.as_path(),
+                        rollout_path.as_deref(),
                         resume_source_thread,
                         include_turns,
                     )
@@ -3717,7 +3705,7 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         thread: &CodexThread,
         response_history: &mut ResumeResponseHistory,
-        rollout_path: &Path,
+        rollout_path: Option<&Path>,
         resume_source_thread: Option<StoredThread>,
         include_turns: bool,
     ) -> std::result::Result<(Thread, Option<TokenUsageReplaySnapshot>), String> {
@@ -3793,7 +3781,7 @@ impl ThreadRequestProcessor {
                     thread_id,
                     session_id.clone(),
                     &config_snapshot,
-                    Some(rollout_path.into()),
+                    rollout_path.map(Into::into),
                 );
                 thread.preview = preview.clone();
                 Ok(thread)
@@ -3807,7 +3795,7 @@ impl ThreadRequestProcessor {
         let mut thread = thread?;
         thread.id = thread_id.to_string();
         thread.session_id = session_id;
-        thread.path = Some(rollout_path.to_path_buf());
+        thread.path = rollout_path.map(Path::to_path_buf);
         let token_usage_snapshot = match (include_turns, &mut *response_history) {
             (true, ResumeResponseHistory::Resumed(history)) => {
                 super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
@@ -4032,8 +4020,7 @@ impl ThreadRequestProcessor {
             let instruction_sources = forked_thread.legacy_instruction_sources().await;
 
             // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
-            // pathless, so they rebuild their visible history from the copied source history
-            // instead.
+            // pathless, so reconstruct the same interrupted snapshot for their visible history.
             let (thread, token_usage_snapshot, config_snapshot) = if session_configured
                 .rollout_path
                 .is_some()
@@ -4060,9 +4047,16 @@ impl ThreadRequestProcessor {
                 thread.forked_from_id = Some(source_thread_id.to_string());
                 thread.project_id = source_thread.project_id.clone();
                 let token_usage_snapshot = if include_turns {
+                    let display_history = codex_core::interrupted_fork_history_for_display(
+                        InitialHistory::Resumed(ResumedHistory {
+                            conversation_id: source_thread_id,
+                            history: Arc::clone(&history_items),
+                            rollout_path: source_thread.rollout_path.clone(),
+                        }),
+                    );
                     super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
                         &mut thread,
-                        &history_items,
+                        display_history.get_rollout_items(),
                         /*active_turn*/ None,
                     )
                 } else {

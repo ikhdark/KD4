@@ -241,15 +241,14 @@ pub async fn wait_for_mcp_server(codex: &CodexThread, server_name: &str) -> anyh
 
     // Wait for the startup summary regardless of outcome, then interpret the
     // requested server's ready, failed, or cancelled entry below.
-    let summary = loop {
-        let event = codex
-            .next_event()
-            .await
-            .expect("stream ended unexpectedly while waiting for MCP startup");
-        if let EventMsg::McpStartupComplete(summary) = event.msg {
-            break summary;
+    let summary = wait_for_event_match(codex, |event| {
+        if let EventMsg::McpStartupComplete(summary) = event {
+            Some(summary.clone())
+        } else {
+            None
         }
-    };
+    })
+    .await;
     if let Some(failure) = summary
         .failed
         .iter()

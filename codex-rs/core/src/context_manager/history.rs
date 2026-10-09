@@ -77,10 +77,6 @@ enum PreparedPromptItemsSource {
         prefix: PreparedPromptItems,
         suffix: Arc<[ResponseItem]>,
     },
-    #[cfg(test)]
-    Prefix {
-        source: PreparedPromptItems,
-    },
 }
 
 #[derive(Debug)]
@@ -126,38 +122,7 @@ impl PreparedPromptItems {
         }))
     }
 
-    #[cfg(test)]
-    fn truncated(&self, len: usize) -> Self {
-        let len = len.min(self.0.len);
-        if len == self.0.len {
-            return self.clone();
-        }
-        // Keep cheap views for small cuts, but do not pin a large discarded
-        // tail for the lifetime of a much smaller prompt. Copy only survivors.
-        if self.0.len.saturating_sub(len) >= 256 && len <= self.0.len / 4 {
-            let mut chunks = Vec::new();
-            self.collect_prefix_chunks(len, &mut chunks);
-            let mut retained = Vec::with_capacity(len);
-            for (chunk, count) in chunks {
-                retained.extend_from_slice(&chunk[..count]);
-            }
-            return Self::from_shared(retained.into());
-        }
-        let prefix = Self(Arc::new(PreparedPromptItemsInner {
-            len,
-            source: PreparedPromptItemsSource::Prefix {
-                source: self.clone(),
-            },
-            flattened: OnceLock::new(),
-        }));
-        // Small tail adjustments should stay lazy. A substantially smaller
-        // retained prefix should release the obsolete suffix and its ancestors.
-        if len == 0 || (len <= self.0.len / 4 && self.0.len - len >= 64) {
-            Self::from_shared(prefix.shared())
-        } else {
-            prefix
-        }
-    }
+
 
     fn shared(&self) -> Arc<[ResponseItem]> {
         Arc::clone(self.flattened())
@@ -196,40 +161,12 @@ impl PreparedPromptItems {
                     remaining = remaining.min(prefix.0.len);
                     current = prefix.clone();
                 }
-                #[cfg(test)]
-                PreparedPromptItemsSource::Prefix { source } => {
-                    remaining = remaining.min(source.0.len);
-                    current = source.clone();
-                }
             }
         }
         chunks.extend(reversed.into_iter().rev());
     }
 
-    #[cfg(test)]
-    fn get(&self, index: usize) -> Option<&ResponseItem> {
-        if index >= self.0.len {
-            return None;
-        }
-        let mut current = self;
-        loop {
-            if let Some(flattened) = current.0.flattened.get() {
-                return flattened.get(index);
-            }
-            match &current.0.source {
-                PreparedPromptItemsSource::Shared(items) => return items.get(index),
-                PreparedPromptItemsSource::Appended { prefix, suffix } => {
-                    if index < prefix.0.len {
-                        current = prefix;
-                    } else {
-                        return suffix.get(index - prefix.0.len);
-                    }
-                }
-                #[cfg(test)]
-                PreparedPromptItemsSource::Prefix { source } => current = source,
-            }
-        }
-    }
+
 
     fn as_slice(&self) -> &[ResponseItem] {
         self.flattened().as_ref()

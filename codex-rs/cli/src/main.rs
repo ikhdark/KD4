@@ -2288,54 +2288,41 @@ mod tests {
     }
 
     #[test]
-    fn exec_server_remote_api_key_auth_accepts_https_openai_domains() {
+    fn exec_server_remote_api_key_auth_restricts_destinations() {
         for base_url in [
             "https://openai.com/api",
             "https://service.openai.com/api",
             "https://openai.org/api",
             "https://service.openai.org/api",
-        ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
-        }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_accepts_http_loopback() {
-        for base_url in [
             "http://localhost:8098/api",
             "http://127.0.0.1:8098/api",
             "http://[::1]:8098/api",
+            "https://127.0.0.1:8098/api",
         ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
+            assert!(validate_api_key_remote_host(base_url).is_ok(), "{base_url}");
         }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_rejects_http_openai_domain() {
         for base_url in [
             "http://service.openai.com/api",
             "http://service.openai.org/api",
+            "https://service.openai.org.evil.example/api",
+            "https://evilopenai.org/api",
+            "ftp://localhost/api",
         ] {
             let error = validate_api_key_remote_host(base_url)
-                .expect_err("reject plaintext OpenAI destination");
-
+                .expect_err("reject an untrusted destination");
             assert_eq!(
                 error.to_string(),
-                "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
+                "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts",
+                "{base_url}"
             );
         }
     }
 
-    #[test]
-    fn exec_server_remote_api_key_auth_rejects_suffix_spoof() {
-        let error = validate_api_key_remote_host("https://service.openai.org.evil.example/api")
-            .expect_err("reject suffix spoof");
 
-        assert_eq!(
-            error.to_string(),
-            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
-        );
-    }
+
+
+
+
 
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
@@ -2814,62 +2801,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plugin_marketplace_add_parses_under_plugin() {
-        let cli =
-            MultitoolCli::try_parse_from(["codex", "plugin", "marketplace", "add", "owner/repo"])
-                .expect("parse");
 
-        assert!(matches!(cli.subcommand, Some(Subcommand::Plugin(_))));
-    }
 
-    #[test]
-    fn plugin_marketplace_upgrade_parses_under_plugin() {
-        let cli =
-            MultitoolCli::try_parse_from(["codex", "plugin", "marketplace", "upgrade", "debug"])
-                .expect("parse");
 
-        assert!(matches!(cli.subcommand, Some(Subcommand::Plugin(_))));
-    }
 
-    #[test]
-    fn plugin_add_parses_under_plugin() {
-        let cli = MultitoolCli::try_parse_from([
-            "codex",
-            "plugin",
-            "add",
-            "sample",
-            "--marketplace",
-            "debug",
-        ])
-        .expect("parse");
 
-        assert!(matches!(cli.subcommand, Some(Subcommand::Plugin(_))));
-    }
 
-    #[test]
-    fn plugin_list_parses_under_plugin() {
-        let cli =
-            MultitoolCli::try_parse_from(["codex", "plugin", "list", "--marketplace", "debug"])
-                .expect("parse");
 
-        assert!(matches!(cli.subcommand, Some(Subcommand::Plugin(_))));
-    }
 
-    #[test]
-    fn plugin_remove_parses_under_plugin() {
-        let cli = MultitoolCli::try_parse_from([
-            "codex",
-            "plugin",
-            "remove",
-            "sample",
-            "--marketplace",
-            "debug",
-        ])
-        .expect("parse");
 
-        assert!(matches!(cli.subcommand, Some(Subcommand::Plugin(_))));
-    }
 
     #[test]
     fn update_parses_as_update_subcommand() {
@@ -2913,9 +2853,18 @@ mod tests {
     }
 
     #[test]
-    fn delete_force_requires_uuid() {
-        assert!(delete_action("123e4567-e89b-12d3-a456-426614174000", true).is_ok());
-
+    fn delete_force_requires_uuid_and_only_force_skips_confirmation() {
+        for target in ["123e4567-e89b-12d3-a456-426614174000", "my-thread"] {
+            assert_matches!(
+                delete_action(target, false).expect("interactive deletion"),
+                codex_tui::SessionArchiveAction::Delete(codex_tui::DeleteConfirmation::Prompt)
+            );
+        }
+        assert_matches!(
+            delete_action("123e4567-e89b-12d3-a456-426614174000", true)
+                .expect("forced UUID deletion"),
+            codex_tui::SessionArchiveAction::Delete(codex_tui::DeleteConfirmation::Skip)
+        );
         let err = delete_action("my-thread", true).expect_err("name should require prompt");
         assert_eq!(
             err.to_string(),
@@ -2924,44 +2873,21 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_parses_permission_profile() {
-        let cli = MultitoolCli::try_parse_from([
-            "codex",
-            "sandbox",
-            "--permission-profile",
-            ":workspace",
-            "--",
-            "echo",
-        ])
-        .expect("parse");
-
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
-            panic!("expected sandbox command");
-        };
-
-        assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
-        assert_eq!(command.command, vec!["echo"]);
+    fn sandbox_parses_permission_profile_aliases() {
+        for flag in ["--permission-profile", "--permissions-profile", "-P"] {
+            let cli = MultitoolCli::try_parse_from([
+                "codex", "sandbox", flag, ":workspace", "--", "echo",
+            ])
+            .expect("parse");
+            let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+                panic!("expected sandbox command");
+            };
+            assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"), "{flag}");
+            assert_eq!(command.command, vec!["echo"], "{flag}");
+        }
     }
 
-    #[test]
-    fn sandbox_parses_legacy_permissions_profile_alias() {
-        let cli = MultitoolCli::try_parse_from([
-            "codex",
-            "sandbox",
-            "--permissions-profile",
-            ":workspace",
-            "--",
-            "echo",
-        ])
-        .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
-            panic!("expected sandbox command");
-        };
-
-        assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
-        assert_eq!(command.command, vec!["echo"]);
-    }
 
     #[test]
     fn sandbox_help_only_shows_singular_permission_profile() {
@@ -2970,19 +2896,7 @@ mod tests {
         assert!(!help.contains("--permissions-profile"), "{help}");
     }
 
-    #[test]
-    fn sandbox_parses_permissions_profile_short_alias() {
-        let cli =
-            MultitoolCli::try_parse_from(["codex", "sandbox", "-P", ":workspace", "--", "echo"])
-                .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
-            panic!("expected sandbox command");
-        };
-
-        assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
-        assert_eq!(command.command, vec!["echo"]);
-    }
 
     #[test]
     fn sandbox_parses_config_profile() {
@@ -3006,14 +2920,7 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
-    #[test]
-    fn plugin_marketplace_remove_parses_under_plugin() {
-        let cli =
-            MultitoolCli::try_parse_from(["codex", "plugin", "marketplace", "remove", "debug"])
-                .expect("parse");
 
-        assert!(matches!(cli.subcommand, Some(Subcommand::Plugin(_))));
-    }
 
     #[test]
     fn marketplace_no_longer_parses_at_top_level() {
@@ -3043,25 +2950,20 @@ mod tests {
     }
 
     #[test]
-    fn full_auto_no_longer_parses_at_top_level() {
-        let result = MultitoolCli::try_parse_from(["codex", "--full-auto"]);
-
-        assert!(result.is_err());
+    fn removed_full_auto_flag_is_rejected_at_each_command_level() {
+        for args in [
+            vec!["codex", "--full-auto"],
+            vec!["codex", "exec", "--full-auto", "summarize"],
+            vec!["codex", "sandbox", "--full-auto", "--"],
+        ] {
+            let error = MultitoolCli::try_parse_from(&args).expect_err("removed flag");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument, "{args:?}");
+        }
     }
 
-    #[test]
-    fn exec_full_auto_no_longer_parses() {
-        let result = MultitoolCli::try_parse_from(["codex", "exec", "--full-auto", "summarize"]);
 
-        assert!(result.is_err());
-    }
 
-    #[test]
-    fn sandbox_full_auto_no_longer_parses() {
-        let result = MultitoolCli::try_parse_from(["codex", "sandbox", "--full-auto", "--"]);
 
-        assert!(result.is_err());
-    }
 
     fn sample_exit_info(conversation_id: Option<&str>, thread_name: Option<&str>) -> AppExitInfo {
         let token_usage = TokenUsage {
@@ -3640,32 +3542,23 @@ mod tests {
     }
 
     #[test]
-    fn read_remote_auth_token_from_env_var_reports_missing_values() {
-        let err = read_remote_auth_token_from_env_var_with("CODEX_REMOTE_AUTH_TOKEN", |_| {
-            Err(std::env::VarError::NotPresent)
-        })
-        .expect_err("missing env vars should be rejected");
-        assert!(err.to_string().contains("is not set"));
+    fn read_remote_auth_token_from_env_var_validates_and_trims_values() {
+        for (value, expected) in [
+            (Err(std::env::VarError::NotPresent), Err("environment variable `CODEX_REMOTE_AUTH_TOKEN` is not set")),
+            (Ok(" \n\t ".to_string()), Err("environment variable `CODEX_REMOTE_AUTH_TOKEN` is empty")),
+            (Ok("  bearer-token  ".to_string()), Ok("bearer-token")),
+        ] {
+            let result = read_remote_auth_token_from_env_var_with("CODEX_REMOTE_AUTH_TOKEN", |name| {
+                assert_eq!(name, "CODEX_REMOTE_AUTH_TOKEN");
+                value
+            });
+            assert_eq!(result.as_deref().map_err(ToString::to_string), expected.map_err(str::to_string));
+        }
     }
 
-    #[test]
-    fn read_remote_auth_token_from_env_var_trims_values() {
-        let auth_token =
-            read_remote_auth_token_from_env_var_with("CODEX_REMOTE_AUTH_TOKEN", |_| {
-                Ok("  bearer-token  ".to_string())
-            })
-            .expect("env var should parse");
-        assert_eq!(auth_token, "bearer-token");
-    }
 
-    #[test]
-    fn read_remote_auth_token_from_env_var_rejects_empty_values() {
-        let err = read_remote_auth_token_from_env_var_with("CODEX_REMOTE_AUTH_TOKEN", |_| {
-            Ok(" \n\t ".to_string())
-        })
-        .expect_err("empty env vars should be rejected");
-        assert!(err.to_string().contains("is empty"));
-    }
+
+
 
     #[test]
     fn app_server_listen_websocket_url_parses() {
@@ -3900,49 +3793,27 @@ mod tests {
     }
 
     #[test]
-    fn feature_toggles_reject_removed_linux_sandbox_flag() {
-        let toggles = FeatureToggles {
-            enable: vec!["use_linux_sandbox_bwrap".to_string()],
-            disable: Vec::new(),
-        };
-        let error = toggles
-            .to_overrides()
-            .expect_err("removed feature should be rejected");
-        assert_eq!(
-            error.to_string(),
-            "Unknown feature flag: use_linux_sandbox_bwrap"
-        );
+    fn feature_toggles_reject_unknown_removed_and_legacy_keys() {
+        for key in [
+            "use_linux_sandbox_bwrap",
+            "image_detail_original",
+            "experimental_use_unified_exec_tool",
+            "does_not_exist",
+        ] {
+            for flag in ["--enable", "--disable"] {
+                let cli = MultitoolCli::try_parse_from(["codex", flag, key]).expect("parse toggle");
+                assert_eq!(
+                    cli.feature_toggles.to_overrides().expect_err("invalid feature").to_string(),
+                    format!("Unknown feature flag: {key}"),
+                    "{flag}"
+                );
+            }
+        }
     }
 
-    #[test]
-    fn feature_toggles_reject_removed_image_detail_original_flag() {
-        let toggles = FeatureToggles {
-            enable: vec!["image_detail_original".to_string()],
-            disable: Vec::new(),
-        };
-        let error = toggles
-            .to_overrides()
-            .expect_err("removed feature should be rejected");
-        assert_eq!(
-            error.to_string(),
-            "Unknown feature flag: image_detail_original"
-        );
-    }
 
-    #[test]
-    fn feature_toggles_reject_legacy_aliases() {
-        let toggles = FeatureToggles {
-            enable: vec!["experimental_use_unified_exec_tool".to_string()],
-            disable: Vec::new(),
-        };
-        let error = toggles
-            .to_overrides()
-            .expect_err("legacy alias should be rejected");
-        assert_eq!(
-            error.to_string(),
-            "Unknown feature flag: experimental_use_unified_exec_tool"
-        );
-    }
+
+
 
     #[test]
     fn removed_memory_feature_cannot_be_enabled_or_cleared() {
@@ -3957,40 +3828,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn feature_toggles_unknown_feature_errors() {
-        let toggles = FeatureToggles {
-            enable: vec!["does_not_exist".to_string()],
-            disable: Vec::new(),
-        };
-        let err = toggles
-            .to_overrides()
-            .expect_err("feature should be rejected");
-        assert_eq!(err.to_string(), "Unknown feature flag: does_not_exist");
-    }
+
 
     #[test]
-    fn strict_config_with_unknown_enable_errors() {
-        let err = strict_config_feature_toggle_error(["--enable", "does_not_exist"].as_ref());
-        assert_eq!(err.to_string(), "Unknown feature flag: does_not_exist");
+    fn strict_config_rejects_unknown_and_compound_feature_toggles() {
+        for flag in ["--enable", "--disable"] {
+            for key in ["does_not_exist", "multi_agent_v2.subagent_usage_hint_text"] {
+                let err = strict_config_feature_toggle_error(&[flag, key]);
+                assert_eq!(err.to_string(), format!("Unknown feature flag: {key}"));
+            }
+        }
     }
 
-    #[test]
-    fn strict_config_with_unknown_disable_errors() {
-        let err = strict_config_feature_toggle_error(["--disable", "does_not_exist"].as_ref());
-        assert_eq!(err.to_string(), "Unknown feature flag: does_not_exist");
-    }
 
-    #[test]
-    fn strict_config_with_compound_enable_errors() {
-        let err = strict_config_feature_toggle_error(
-            ["--enable", "multi_agent_v2.subagent_usage_hint_text"].as_ref(),
-        );
-        assert_eq!(
-            err.to_string(),
-            "Unknown feature flag: multi_agent_v2.subagent_usage_hint_text"
-        );
-    }
+
+
 
     fn strict_config_feature_toggle_error(args: &[&str]) -> anyhow::Error {
         let cli_args = std::iter::once("codex")

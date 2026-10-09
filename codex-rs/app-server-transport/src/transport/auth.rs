@@ -603,13 +603,17 @@ mod tests {
 
     #[test]
     fn capability_token_hash_policy_authorizes_matching_bearer_token() {
-        let settings = AppServerWebsocketAuthSettings {
-            config: Some(AppServerWebsocketAuthConfig::CapabilityToken {
-                source: AppServerWebsocketCapabilityTokenSource::TokenSha256 {
-                    token_sha256: sha256_digest(b"super-secret-token"),
-                },
-            }),
-        };
+        // SHA-256 of b"super-secret-token", independently computed with Python
+        // hashlib. Do not let the production digest helper define its own oracle.
+        let settings = AppServerWebsocketAuthArgs {
+            ws_auth: Some(WebsocketAuthCliMode::CapabilityToken),
+            ws_token_sha256: Some(
+                "599a7f359d1e11124054f8afeae201f2d265b8988d91cb5b7d4dc4c9e2225c30".into(),
+            ),
+            ..Default::default()
+        }
+        .try_into_settings()
+        .expect("known SHA-256 digest should parse");
         let policy = policy_from_settings(&settings).expect("hash policy should build");
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -642,9 +646,11 @@ mod tests {
 
     #[test]
     fn signed_bearer_args_default_clock_skew_and_trim_optional_claims() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let secret_path = dir.path().join("secret");
         let settings = AppServerWebsocketAuthArgs {
             ws_auth: Some(WebsocketAuthCliMode::SignedBearerToken),
-            ws_shared_secret_file: Some(PathBuf::from("/tmp/secret")),
+            ws_shared_secret_file: Some(secret_path.clone()),
             ws_issuer: Some(" issuer ".to_string()),
             ws_audience: Some(" audience ".to_string()),
             ..Default::default()
@@ -656,7 +662,7 @@ mod tests {
             settings,
             AppServerWebsocketAuthSettings {
                 config: Some(AppServerWebsocketAuthConfig::SignedBearerToken {
-                    shared_secret_file: AbsolutePathBuf::from_absolute_path("/tmp/secret")
+                    shared_secret_file: AbsolutePathBuf::from_absolute_path(secret_path)
                         .expect("absolute path"),
                     issuer: Some("issuer".to_string()),
                     audience: Some("audience".to_string()),
@@ -694,13 +700,14 @@ mod tests {
 
     #[test]
     fn signed_bearer_args_reject_blank_claim_restrictions() {
+        let dir = tempfile::tempdir().expect("temp dir");
         for (issuer, audience, flag) in [
             (Some(" ".to_string()), None, "--ws-issuer"),
             (None, Some("\t".to_string()), "--ws-audience"),
         ] {
             let err = AppServerWebsocketAuthArgs {
                 ws_auth: Some(WebsocketAuthCliMode::SignedBearerToken),
-                ws_shared_secret_file: Some(PathBuf::from("/tmp/secret")),
+                ws_shared_secret_file: Some(dir.path().join("secret")),
                 ws_issuer: issuer,
                 ws_audience: audience,
                 ..Default::default()

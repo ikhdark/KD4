@@ -85,7 +85,7 @@ model = "gpt-5"
 }
 
 #[tokio::test]
-async fn add_with_env_preserves_key_order_and_values() -> Result<()> {
+async fn add_with_env_preserves_values() -> Result<()> {
     let codex_home = TempDir::new()?;
 
     let mut add_cmd = codex_command(codex_home.path())?;
@@ -95,7 +95,7 @@ async fn add_with_env_preserves_key_order_and_values() -> Result<()> {
             "add",
             "envy",
             "--env",
-            "FOO=bar",
+            "FOO=bar=baz",
             "--env",
             "ALPHA=beta",
             "--",
@@ -113,121 +113,64 @@ async fn add_with_env_preserves_key_order_and_values() -> Result<()> {
     };
 
     assert_eq!(env.len(), 2);
-    assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
+    assert_eq!(env.get("FOO"), Some(&"bar=baz".to_string()));
     assert_eq!(env.get("ALPHA"), Some(&"beta".to_string()));
     assert!(envy.enabled);
 
     Ok(())
 }
 
-#[tokio::test]
-async fn add_streamable_http_without_manual_token() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut add_cmd = codex_command(codex_home.path())?;
-    add_cmd
-        .args(["mcp", "add", "github", "--url", "https://example.com/mcp"])
-        .assert()
-        .success();
-
-    let servers = load_global_mcp_servers(codex_home.path()).await?;
-    let github = servers.get("github").expect("github server should exist");
-    match &github.transport {
-        McpServerTransportConfig::StreamableHttp {
-            url,
-            bearer_token_env_var,
-            http_headers,
-            env_http_headers,
-        } => {
-            assert_eq!(url, "https://example.com/mcp");
-            assert!(bearer_token_env_var.is_none());
-            assert!(http_headers.is_none());
-            assert!(env_http_headers.is_none());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_streamable_http_persists_transport_and_oauth_options() -> Result<()> {
+    // The CLI probes OAuth support. A local 404 keeps this configuration test
+    // independent of public networking; another worker serves the blocking CLI.
+    let server = wiremock::MockServer::start().await;
+    let url = format!("{}/mcp", server.uri());
+    for (extra, token, client_id, resource) in [
+        (vec![], None, None, None),
+        (vec!["--bearer-token-env-var", "GITHUB_TOKEN"], Some("GITHUB_TOKEN"), None, None),
+        (
+            vec!["--oauth-client-id", "eci-prd-pub-codex-123", "--oauth-resource", "https://resource.example.com"],
+            None,
+            Some("eci-prd-pub-codex-123"),
+            Some("https://resource.example.com"),
+        ),
+    ] {
+        let codex_home = TempDir::new()?;
+        codex_command(codex_home.path())?
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env_remove("GITHUB_TOKEN")
+            .args(["mcp", "add", "server", "--url", &url])
+            .args(extra)
+            .timeout(std::time::Duration::from_secs(15))
+            .assert()
+            .success();
+        let servers = load_global_mcp_servers(codex_home.path()).await?;
+        assert_eq!(servers.len(), 1);
+        let configured = servers.get("server").expect("server should exist");
+        match &configured.transport {
+            McpServerTransportConfig::StreamableHttp {
+                url: actual_url,
+                bearer_token_env_var,
+                http_headers,
+                env_http_headers,
+            } => {
+                assert_eq!(actual_url, &url);
+                assert_eq!(bearer_token_env_var.as_deref(), token);
+                assert!(http_headers.is_none());
+                assert!(env_http_headers.is_none());
+            }
+            other => panic!("unexpected transport: {other:?}"),
         }
-        other => panic!("unexpected transport: {other:?}"),
+        assert!(configured.enabled);
+        assert_eq!(configured.oauth_client_id(), client_id);
+        assert_eq!(configured.oauth_resource.as_deref(), resource);
+        assert!(!codex_home.path().join(".credentials.json").exists());
+        assert!(!codex_home.path().join(".env").exists());
     }
-    assert!(github.enabled);
-
-    assert!(!codex_home.path().join(".credentials.json").exists());
-    assert!(!codex_home.path().join(".env").exists());
-
     Ok(())
 }
-
-#[tokio::test]
-async fn add_streamable_http_with_custom_env_var() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut add_cmd = codex_command(codex_home.path())?;
-    add_cmd
-        .args([
-            "mcp",
-            "add",
-            "issues",
-            "--url",
-            "https://example.com/issues",
-            "--bearer-token-env-var",
-            "GITHUB_TOKEN",
-        ])
-        .assert()
-        .success();
-
-    let servers = load_global_mcp_servers(codex_home.path()).await?;
-    let issues = servers.get("issues").expect("issues server should exist");
-    match &issues.transport {
-        McpServerTransportConfig::StreamableHttp {
-            url,
-            bearer_token_env_var,
-            http_headers,
-            env_http_headers,
-        } => {
-            assert_eq!(url, "https://example.com/issues");
-            assert_eq!(bearer_token_env_var.as_deref(), Some("GITHUB_TOKEN"));
-            assert!(http_headers.is_none());
-            assert!(env_http_headers.is_none());
-        }
-        other => panic!("unexpected transport: {other:?}"),
-    }
-    assert!(issues.enabled);
-    Ok(())
-}
-
-#[tokio::test]
-async fn add_streamable_http_with_oauth_options() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut add_cmd = codex_command(codex_home.path())?;
-    add_cmd
-        .args([
-            "mcp",
-            "add",
-            "oauth-server",
-            "--url",
-            "https://example.com/mcp",
-            "--oauth-client-id",
-            "eci-prd-pub-codex-123",
-            "--oauth-resource",
-            "https://resource.example.com",
-        ])
-        .assert()
-        .success();
-
-    let servers = load_global_mcp_servers(codex_home.path()).await?;
-    let oauth_server = servers
-        .get("oauth-server")
-        .expect("oauth server should exist");
-    assert_eq!(
-        oauth_server.oauth_client_id(),
-        Some("eci-prd-pub-codex-123")
-    );
-    assert_eq!(
-        oauth_server.oauth_resource.as_deref(),
-        Some("https://resource.example.com")
-    );
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn add_streamable_http_rejects_removed_flag() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -264,14 +207,14 @@ async fn add_cant_add_command_and_url() -> Result<()> {
             "github",
             "--url",
             "https://example.com/mcp",
-            "--command",
             "--",
             "echo",
             "hello",
         ])
         .assert()
         .failure()
-        .stderr(contains("unexpected argument '--command' found"));
+        .stderr(contains("cannot be used with"))
+        .stderr(contains("--url"));
 
     let servers = load_global_mcp_servers(codex_home.path()).await?;
     assert!(servers.is_empty());

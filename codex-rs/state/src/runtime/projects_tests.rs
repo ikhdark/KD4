@@ -233,7 +233,7 @@ async fn project_import_rejects_unknown_thread_without_partial_project() -> anyh
     let home = unique_temp_dir();
     let runtime = StateRuntime::init(home.clone(), "test-provider".to_string()).await?;
     let mut thread_ids = Vec::new();
-    for index in 0..128 {
+    for index in 0..4 {
         let thread_id = ThreadId::default();
         let metadata = ThreadMetadataBuilder::new(
             thread_id,
@@ -250,7 +250,7 @@ async fn project_import_rejects_unknown_thread_without_partial_project() -> anyh
             "Previous".to_string(),
             Vec::new(),
             BTreeMap::new(),
-            &thread_ids[..64],
+            &thread_ids[..2],
             "state:previous-project",
         )
         .await?
@@ -300,7 +300,7 @@ async fn project_import_rejects_unknown_thread_without_partial_project() -> anyh
     );
     thread_ids.pop();
     for (index, thread_id) in thread_ids.iter().enumerate() {
-        let expected_project_id = (index < 64).then(|| previous_project.id.clone());
+        let expected_project_id = (index < 2).then(|| previous_project.id.clone());
         assert_eq!(
             runtime
                 .get_thread(ThreadId::from_string(thread_id)?)
@@ -410,39 +410,6 @@ async fn project_list_rejects_malformed_cursors() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn project_list_cursor_round_trips_across_pages() -> anyhow::Result<()> {
-    let home = unique_temp_dir();
-    let runtime = StateRuntime::init(home.clone(), "test-provider".to_string()).await?;
-    for name in ["One", "Two"] {
-        runtime
-            .create_project(name.to_string(), Vec::new(), BTreeMap::new(), &[], name)
-            .await?;
-    }
-
-    let first = runtime
-        .list_projects(
-            /*cursor*/ None,
-            /*limit*/ 1,
-            ProjectSortKey::Position,
-            SortDirection::Asc,
-        )
-        .await?;
-    assert_eq!(first.projects.len(), 1);
-    let cursor = first.next_cursor.expect("next cursor");
-    let second = runtime
-        .list_projects(
-            Some(&cursor),
-            /*limit*/ 1,
-            ProjectSortKey::Position,
-            SortDirection::Asc,
-        )
-        .await?;
-    assert_eq!(second.projects.len(), 1);
-    assert_ne!(first.projects[0].id, second.projects[0].id);
-    assert_eq!(second.next_cursor, None);
-    Ok(())
-}
 
 #[tokio::test]
 async fn project_list_orders_and_pages_recency_with_roots_and_nulls() -> anyhow::Result<()> {

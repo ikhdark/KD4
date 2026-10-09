@@ -1,5 +1,6 @@
 """Process/output lifetime regressions using real child processes."""
 
+import contextlib
 import os
 import shutil
 import socket
@@ -29,18 +30,44 @@ class ProcessOwnerTest(unittest.TestCase):
                 )
 
     def test_timeout_preserves_flushed_short_diagnostic(self):
-        result = process_owner.run_finite(
-            [
-                sys.executable,
-                "-c",
-                "import time; print('diagnostic', flush=True); time.sleep(60)",
-            ],
-            timeout=0.5,
-        )
-        self.assertEqual((result.status, result.returncode), ("timed_out", 124))
-        self.assertEqual(result.stdout, "diagnostic\n")
-        self.assertFalse(result.output_truncated)
-        self.assertLess(result.elapsed, 3)
+        real_owned_process = process_owner.owned_process
+        for startup_delay in (0, 0.7):
+            with self.subTest(startup_delay=startup_delay), tempfile.TemporaryDirectory() as directory:
+                flushed = Path(directory) / "flushed"
+                ready_at = None
+
+                @contextlib.contextmanager
+                def after_flush(*args, **kwargs):
+                    nonlocal ready_at
+                    with real_owned_process(*args, **kwargs) as child:
+                        deadline = time.monotonic() + 10
+                        while not flushed.exists():
+                            self.assertIsNone(child.poll(), "child exited before flushing")
+                            self.assertLess(time.monotonic(), deadline, "child did not flush")
+                            time.sleep(0.01)
+                        ready_at = time.monotonic()
+                        yield child
+
+                # Output preservation requires bytes actually written before
+                # timeout, not an assumption about interpreter startup speed.
+                # Keep the real pipe, reader, deadline and process-tree cleanup.
+                with mock.patch.object(process_owner, "owned_process", after_flush):
+                    result = process_owner.run_finite(
+                        [
+                            sys.executable,
+                            "-c",
+                            "import time; from pathlib import Path; "
+                            f"time.sleep({startup_delay}); "
+                            "print('diagnostic', flush=True); "
+                            f"Path({str(flushed)!r}).touch(); time.sleep(60)",
+                        ],
+                        timeout=0.5,
+                    )
+                self.assertEqual((result.status, result.returncode), ("timed_out", 124))
+                self.assertEqual(result.stdout, "diagnostic\n")
+                self.assertFalse(result.output_truncated)
+                # Bound timeout/cleanup, separately from fixture startup.
+                self.assertLess(time.monotonic() - ready_at, 3)
 
     def test_cancellation_preserves_observed_output(self):
         observed = []
@@ -65,12 +92,14 @@ class ProcessOwnerTest(unittest.TestCase):
         self.assertEqual("".join(observed).replace("\r\n", "\n"), result.stdout)
 
     def test_observer_failure_is_not_repeated_during_cleanup(self):
+        observer = mock.Mock(side_effect=ValueError("observer failed"))
         with self.assertRaisesRegex(ValueError, "observer failed"):
             process_owner.run_finite(
                 [sys.executable, "-c", "import sys; sys.stdout.write('x'*2097152)"],
                 timeout=5,
-                observe=mock.Mock(side_effect=ValueError("observer failed")),
+                observe=observer,
             )
+        observer.assert_called_once()
 
     def test_version_probe_uses_owned_timeout_and_reaps_shim_child(self):
         if os.name != "nt":

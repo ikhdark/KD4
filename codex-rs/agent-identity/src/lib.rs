@@ -786,7 +786,8 @@ mod tests {
         )
         .expect("JWT should encode");
 
-        verify_agent_identity_jwt(&jwt, &jwks).expect_err("JWT should not verify");
+        let error = verify_agent_identity_jwt(&jwt, &jwks).expect_err("JWT should not verify");
+        assert_eq!(error.to_string(), "agent identity JWT kid test-key is not trusted");
     }
 
     #[test]
@@ -832,15 +833,73 @@ mod tests {
         assert!(!format!("{key:?}").contains("secret-key-material"));
     }
 
+    #[test]
+    fn verify_agent_identity_jwt_rejects_expired_and_tampered_tokens() {
+        let jwks = test_jwks("test-key");
+        for (expires_at, tamper_signature) in [(1usize, false), (4_000_000_000, true)] {
+            let mut jwt = jsonwebtoken::encode(
+                &test_jwt_header("test-key"),
+                &serde_json::json!({
+                    "iss": AGENT_IDENTITY_JWT_ISSUER,
+                    "aud": AGENT_IDENTITY_JWT_AUDIENCE,
+                    "iat": 0, "exp": expires_at,
+                    "agent_runtime_id": "agent-runtime-id",
+                    "agent_private_key": "private-key", "account_id": "account-id",
+                    "chatgpt_user_id": "user-id", "email": "user@example.com",
+                    "plan_type": "pro", "chatgpt_account_is_fedramp": false,
+                }),
+                &test_rsa_encoding_key(),
+            )
+            .expect("JWT should encode");
+            if tamper_signature {
+                let (signed_payload, signature) = jwt.rsplit_once('.').expect("JWT signature");
+                let mut signature = URL_SAFE_NO_PAD.decode(signature).expect("base64 signature");
+                signature[0] ^= 1;
+                jwt = format!("{signed_payload}.{}", URL_SAFE_NO_PAD.encode(signature));
+            }
+
+            // The verifier's public contract requires both authenticity and expiry
+            // checks. Valid claim shapes alone must not authorize either token.
+            assert!(parse_unverified_agent_identity_jwt(&jwt).is_ok());
+            let error = verify_agent_identity_jwt(&jwt, &jwks)
+                .expect_err("expired or unauthentic claims must not verify");
+            let error = error
+                .downcast_ref::<jsonwebtoken::errors::Error>()
+                .expect("JWT validation error");
+            let expected = if tamper_signature {
+                jsonwebtoken::errors::ErrorKind::InvalidSignature
+            } else {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature
+            };
+            assert_eq!(error.kind(), &expected);
+        }
+    }
+
     #[tokio::test]
     async fn register_agent_task_does_not_wait_for_error_body() {
         use std::io::Read;
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener binds");
+        listener.set_nonblocking(true).expect("nonblocking listener");
         let address = listener.local_addr().expect("listener address");
         let (release, receiver) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("client connects");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // A client failure before connect must not strand the join below.
+                        if receiver.try_recv().is_ok() {
+                            return;
+                        }
+                        assert!(std::time::Instant::now() < deadline, "client connects");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("client connects: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking connection");
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .expect("read timeout");
@@ -1132,54 +1191,45 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
     }
 
     #[test]
-    fn retryable_registration_error_accepts_429_and_5xx() {
-        let too_many_requests = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
-            "agent registration",
-            StatusCode::TOO_MANY_REQUESTS,
-        ));
-        let unavailable = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
-            "agent registration",
-            StatusCode::SERVICE_UNAVAILABLE,
-        ));
-
-        assert!(is_retryable_registration_error(&too_many_requests));
-        assert!(is_retryable_registration_error(&unavailable));
-    }
-
-    #[test]
-    fn retryable_registration_error_rejects_hard_failures() {
-        let forbidden = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
-            "agent registration",
-            StatusCode::FORBIDDEN,
-        ));
+    fn retryable_registration_error_classifies_status_through_context() {
+        for (status, retryable) in [
+            (StatusCode::TOO_MANY_REQUESTS, true),
+            (StatusCode::SERVICE_UNAVAILABLE, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, true),
+            (StatusCode::FORBIDDEN, false),
+            (StatusCode::BAD_REQUEST, false),
+        ] {
+            let error = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
+                "agent registration",
+                status,
+            ));
+            assert_eq!(is_retryable_registration_error(&error), retryable, "{status}");
+            assert_eq!(
+                is_retryable_registration_error(&error.context("outer registration context")),
+                retryable,
+                "wrapped {status}"
+            );
+        }
         let malformed = anyhow::anyhow!("failed to sign registration request");
-
-        assert!(!is_retryable_registration_error(&forbidden));
         assert!(!is_retryable_registration_error(&malformed));
     }
 
     #[test]
-    fn agent_identity_jwks_url_uses_agent_identity_jwt_route() {
-        assert_eq!(
-            agent_identity_jwks_url("https://chatgpt.com/backend-api"),
-            "https://chatgpt.com/backend-api/wham/agent-identities/jwks"
-        );
-        assert_eq!(
-            agent_identity_jwks_url("https://chatgpt.com/backend-api/"),
-            "https://chatgpt.com/backend-api/wham/agent-identities/jwks"
-        );
-    }
-
-    #[test]
-    fn agent_identity_jwks_url_uses_jwt_issuer_base_url() {
-        assert_eq!(
-            agent_identity_jwks_url("http://localhost:8080/api/codex"),
-            "http://localhost:8080/api/codex/agent-identities/jwks"
-        );
-        assert_eq!(
-            agent_identity_jwks_url("http://localhost:8080/api/codex/"),
-            "http://localhost:8080/api/codex/agent-identities/jwks"
-        );
+    fn agent_identity_jwks_url_selects_route_and_trims_trailing_slashes() {
+        for (base, expected) in [
+            (
+                "https://chatgpt.com/backend-api",
+                "https://chatgpt.com/backend-api/wham/agent-identities/jwks",
+            ),
+            (
+                "http://localhost:8080/api/codex",
+                "http://localhost:8080/api/codex/agent-identities/jwks",
+            ),
+        ] {
+            for suffix in ["", "/"] {
+                assert_eq!(agent_identity_jwks_url(&format!("{base}{suffix}")), expected);
+            }
+        }
     }
 
     fn jwt_with_payload(payload: serde_json::Value) -> String {

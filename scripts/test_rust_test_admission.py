@@ -36,7 +36,10 @@ root, target, name = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.a
 original = lanes._try_acquire_binary_file_lock
 def acquire(path):
     (root / (name + '.attempt')).touch()
-    return original(path)
+    handle = original(path)
+    if handle is None:
+        (root / (name + '.blocked')).touch()
+    return handle
 lanes._try_acquire_binary_file_lock = acquire
 def observe_busy(probe):
     def wrapped(path):
@@ -84,7 +87,7 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
         first = self.child("first", self.target)
         self.barrier("first.ready", first)
         second = self.child("second", self.target / ".." / "target")
-        self.barrier("second.attempt", second)
+        self.barrier("second.blocked", second)
         independent = self.child("independent", self.root / "other")
         self.barrier("independent.ready", independent)
         self.assertFalse((self.root / "second.ready").exists())
@@ -262,6 +265,13 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                 self.assertEqual(result[result.index("--target-dir") + 1], str(self.target))
                 parsed = runner.build_parser().parse_args(result[2:])
                 self.assertEqual(parsed.profile, "fast")
+                if command[1] == "_core-gate-reserved":
+                    self.assertEqual(parsed.command, "run-gate")
+                    self.assertEqual(parsed.names, ["example"])
+                else:
+                    self.assertEqual(parsed.command, "run-target")
+                    self.assertEqual(parsed.name, "core_lib")
+                    self.assertEqual(parsed.filter_args, ["-E", "test(example)"])
                 self.assertEqual(
                     parsed.cargo_profile,
                     "dev-small" if command[1] == "_core-test-small-reserved" else None,
@@ -389,21 +399,28 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
 $tokens=$null; $errors=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if($errors.Count){throw $errors[0]}
-foreach($name in @('Test-ExclusiveLaneFileBusy','Test-CargoLockBusy')) {
+foreach($name in @('Test-IsCargoLaneLockContention','Test-ExclusiveLaneFileBusy','Test-CargoLockBusy')) {
     $fn=$ast.Find({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
+    if($null -eq $fn){throw "missing production function $name"}
     . ([scriptblock]::Create($fn.Extent.Text))
 }
-if(-not (Test-CargoLockBusy -TargetDir $args[1])){throw 'live runner lease not recognized'}
+if((Test-CargoLockBusy -TargetDir $args[1]) -ne ($args[2] -eq 'busy')){throw 'incorrect runner lease state'}
 '''
         probe = self.root / "probe.ps1"
         probe.write_text(command)
-        with lanes.reserve_rust_test_target(self.target):
+        def assert_probe(state):
             result = subprocess.run(
-                ["pwsh", "-NoProfile", "-File", str(probe), str(script), str(self.target)],
+                ["pwsh", "-NoProfile", "-File", str(probe), str(script), str(self.target), state],
                 capture_output=True, text=True, timeout=15,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+        self.target.mkdir()
+        assert_probe("idle")
+        with lanes.reserve_rust_test_target(self.target):
+            assert_probe("busy")
+        assert_probe("idle")
 
 
 class AdmissionDispatchTest(RunnerTestCase):
@@ -416,6 +433,14 @@ class AdmissionDispatchTest(RunnerTestCase):
         output = io.StringIO()
         ledger = {"fixture": ["b", "a"]}
         observations = []
+        original_retain = instance._retain_text
+        def retain(text, *, prefix):
+            path = original_retain(text, prefix=prefix)
+            if path is not None:
+                self.assertTrue(lanes.cargo_lock_is_busy(self.target_dir))
+                self.assertEqual(path.read_text(encoding="utf-8"), text)
+                observations.append("retain")
+            return path
         def evidence(*_args):
             self.assertTrue(lanes.cargo_lock_is_busy(self.target_dir))
             observations.append("evidence")
@@ -427,12 +452,22 @@ class AdmissionDispatchTest(RunnerTestCase):
         with (
             mock.patch.object(runner.Manifest, "load", return_value=current_manifest or instance.manifest),
             mock.patch.object(runner, "execution_dependency_manifest", side_effect=evidence),
-            mock.patch.object(instance, "run_gates", side_effect=execute),
-            mock.patch.object(instance, "run_target", side_effect=execute),
-            mock.patch.object(instance, "check_gates", side_effect=execute),
+            mock.patch.object(instance, "_retain_text", side_effect=retain),
+            mock.patch.object(instance, "run_gates", side_effect=execute) as run_gates,
+            mock.patch.object(instance, "run_target", side_effect=execute) as run_target,
+            mock.patch.object(instance, "check_gates", side_effect=execute) as check_gates,
             contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()),
         ):
             runner._dispatch_with_admission(args, instance, instance.metadata, fingerprint, [], False)
+            expected_calls = {
+                "run-gate": [mock.call(["demo-gate"])],
+                "run-target": [mock.call("core_lib", [], allow_all=False)],
+                "check-gates": [mock.call(["demo-gate"])],
+            }
+            for name, method in (("run-gate", run_gates), ("run-target", run_target),
+                                 ("check-gates", check_gates)):
+                self.assertEqual(method.call_args_list,
+                                 expected_calls[name] if name == command else [], name)
         return output.getvalue(), observations, ledger
 
     def test_admission_covers_fresh_evidence_execution_and_receipt_in_order(self):
@@ -504,7 +539,7 @@ class AdmissionDispatchTest(RunnerTestCase):
                 self.assertEqual(summary["coverage"], "declared_not_exhaustive")
                 self.assertEqual(receipt["completed_tests"], ledger)
                 self.assertEqual(receipt["executed_tests"], 2)
-                self.assertEqual(order, ["evidence", "execute"])
+                self.assertEqual(order, ["evidence", "retain", "execute"])
         with mock.patch.object(runner.RustTestRunner, "_retain_text", return_value=None):
             text, _, _ = self.dispatch(dependencies=manifest)
             self.assertEqual(json.loads(text)["dependency_manifest"], manifest)

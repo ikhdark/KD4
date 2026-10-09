@@ -238,6 +238,7 @@ mod tests {
     fn remove_resolved_prompt_keeps_lifecycle_events() {
         let mut manager = InterruptManager::new();
         manager.push_item_started(command_execution("call"));
+        manager.push_item_completed(command_execution("call"));
 
         assert!(
             !manager.remove_resolved_prompt(&ResolvedAppServerRequest::ExecApproval {
@@ -245,10 +246,14 @@ mod tests {
             })
         );
 
-        assert_eq!(manager.queue.len(), 1);
+        assert_eq!(manager.queue.len(), 2);
         assert!(matches!(
             manager.queue.front(),
-            Some(QueuedInterrupt::ItemStarted(_))
+            Some(QueuedInterrupt::ItemStarted(ThreadItem::CommandExecution { id, .. })) if id == "call"
+        ));
+        assert!(matches!(
+            manager.queue.back(),
+            Some(QueuedInterrupt::ItemCompleted(ThreadItem::CommandExecution { id, .. })) if id == "call"
         ));
     }
 }

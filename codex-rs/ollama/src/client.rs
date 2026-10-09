@@ -458,6 +458,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compat_setup_preserves_repeated_version_segments_in_deployment_path() {
+        let server = wiremock::MockServer::start().await;
+        // ModelProviderInfo::base_url names the OpenAI-compatible API root.
+        // Health must append `/models` to that root, while native listing
+        // replaces only its final `/v1` suffix with `/api/tags`.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gateway/v1/v1/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gateway/v1/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"models": [{"name": "installed:latest"}]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_oss_provider_with_base_url(
+            &format!("{}/gateway/v1/v1/", server.uri()),
+            WireApi::Responses,
+        );
+        let (_, models) = OllamaClient::try_from_provider_with_models(&provider)
+            .await
+            .expect("probe the configured API root");
+        assert_eq!(models.expect("native model listing"), vec!["installed:latest"]);
+    }
+
+    #[tokio::test]
     async fn provider_without_base_url_is_a_configuration_error() {
         let mut provider =
             create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses);
@@ -499,8 +529,7 @@ mod tests {
 
         let client = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
         let models = client.fetch_models().await.expect("fetch models");
-        assert!(models.contains(&"llama3.2:3b".to_string()));
-        assert!(models.contains(&"mistral".to_string()));
+        assert_eq!(models, vec!["llama3.2:3b", "mistral"]);
     }
 
     #[tokio::test]
@@ -745,6 +774,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/tags"))
             .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
             .mount(&server)
             .await;
         let native = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
@@ -754,6 +784,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v1/models"))
             .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(2)
             .mount(&server)
             .await;
         let ollama_client =
@@ -764,30 +795,6 @@ mod tests {
             .probe_server()
             .await
             .expect("probe OpenAI compat");
-    }
-
-    #[tokio::test]
-    async fn test_try_from_oss_provider_ok_when_server_running() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} set; skipping test_try_from_oss_provider_ok_when_server_running",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
-
-        let server = wiremock::MockServer::start().await;
-
-        // OpenAI‑compat models endpoint responds OK.
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v1/models"))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        OllamaClient::try_from_provider_with_base_url(&format!("{}/v1", server.uri()))
-            .await
-            .expect("client should be created when probe succeeds");
     }
 
     #[tokio::test]

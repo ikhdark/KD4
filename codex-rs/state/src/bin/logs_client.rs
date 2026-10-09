@@ -385,37 +385,25 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn log_level_threshold_includes_more_severe_levels() {
-        assert_eq!(
-            LogLevelThreshold::Warn.levels_upper(),
-            vec!["WARN".to_string(), "ERROR".to_string()]
-        );
-        assert_eq!(
-            LogLevelThreshold::Trace.levels_upper(),
-            vec![
-                "TRACE".to_string(),
-                "DEBUG".to_string(),
-                "INFO".to_string(),
-                "WARN".to_string(),
-                "ERROR".to_string(),
-            ]
-        );
+    fn log_level_values_validate_and_expand_through_the_cli() {
+        for (value, expected) in [
+            ("TRACE", vec!["TRACE", "DEBUG", "INFO", "WARN", "ERROR"]),
+            ("debug", vec!["DEBUG", "INFO", "WARN", "ERROR"]),
+            ("Info", vec!["INFO", "WARN", "ERROR"]),
+            ("WARN", vec!["WARN", "ERROR"]),
+            ("error", vec!["ERROR"]),
+        ] {
+            let args = Args::try_parse_from(["codex-state-logs", "--level", value])
+                .expect("canonical level");
+            assert_eq!(build_filter(&args).expect("filter").levels_upper, expected, "{value}");
+        }
+        for value in ["warning", "err", "warn,error"] {
+            let error = Args::try_parse_from(["codex-state-logs", "--level", value])
+                .expect_err("aliases and lists are not thresholds");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "{value}");
+        }
     }
 
-    #[test]
-    fn log_level_rejects_aliases_and_unknown_values() {
-        assert!(Args::try_parse_from(["codex-state-logs", "--level", "warning"]).is_err());
-        assert!(Args::try_parse_from(["codex-state-logs", "--level", "err"]).is_err());
-        assert!(Args::try_parse_from(["codex-state-logs", "--level", "warn,error"]).is_err());
-    }
-
-    #[test]
-    fn log_level_accepts_canonical_values_case_insensitively() {
-        let args = Args::try_parse_from(["codex-state-logs", "--level", "WARN"])
-            .expect("parse uppercase log level");
-
-        assert_eq!(args.level, Some(LogLevelThreshold::Warn));
-    }
 
     #[test]
     fn poll_interval_must_be_positive() {

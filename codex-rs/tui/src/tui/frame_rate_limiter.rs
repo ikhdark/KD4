@@ -42,13 +42,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn default_does_not_clamp() {
-        let t0 = Instant::now();
-        let limiter = FrameRateLimiter::default();
-        assert_eq!(limiter.clamp_deadline(t0), t0);
-    }
-
-    #[test]
     fn clamps_to_min_interval_since_last_emit() {
         let t0 = Instant::now();
         let mut limiter = FrameRateLimiter::default();
@@ -58,5 +51,7 @@ mod tests {
 
         let too_soon = t0 + Duration::from_millis(1);
         assert_eq!(limiter.clamp_deadline(too_soon), t0 + MIN_FRAME_INTERVAL);
+        let later = t0 + Duration::from_secs(1);
+        assert_eq!(limiter.clamp_deadline(later), later);
     }
 }

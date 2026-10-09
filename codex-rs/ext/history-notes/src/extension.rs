@@ -249,11 +249,11 @@ mod tests {
             server.verify().await;
         }
 
-        for result in [
-            json!({}),
-            json!({"text": 3}),
-            json!({"text": " \n\t"}),
-            json!({"text": "é".repeat(MAX_THREAD_HINT_BYTES / 2 + 1)}),
+        for (result, unavailable) in [
+            (json!({}), true),
+            (json!({"text": 3}), true),
+            (json!({"text": " \n\t"}), false),
+            (json!({"text": "é".repeat(MAX_THREAD_HINT_BYTES / 2 + 1)}), true),
         ] {
             server.reset().await;
             Mock::given(method("POST"))
@@ -262,7 +262,14 @@ mod tests {
                 .mount(&server)
                 .await;
             let fragments = contributor.contribute_thread_context(&session, &thread).await;
-            assert!(fragments.is_empty() || fragments.iter().all(PromptFragment::is_unavailable));
+            assert_eq!(
+                fragments,
+                if unavailable {
+                    vec![PromptFragment::unavailable()]
+                } else {
+                    Vec::new()
+                }
+            );
             server.verify().await;
         }
         server.reset().await;

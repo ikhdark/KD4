@@ -107,7 +107,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
             .session
             .lock_pending_mcp_server_refresh_config()
             .await,
-        Some(first_refresh)
+        Some(first_refresh.clone())
     );
     assert_eq!(
         *second
@@ -116,6 +116,70 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
             .session
             .lock_pending_mcp_server_refresh_config()
             .await,
-        Some(second_refresh)
+        Some(second_refresh.clone())
     );
+
+    let duplicate = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.queue_mcp_server_refreshes_atomically(vec![
+            (
+                first.thread_id,
+                Arc::clone(&first.thread),
+                refresh_config("duplicate-a"),
+            ),
+            (
+                first.thread_id,
+                Arc::clone(&first.thread),
+                refresh_config("duplicate-b"),
+            ),
+        ]),
+    )
+    .await
+    .expect("duplicate targets must fail rather than lock the same mutex twice");
+    assert!(matches!(duplicate, Err(CodexErr::InvalidRequest(_))));
+
+    let mut targets = [(&first, &first_refresh), (&second, &second_refresh)];
+    targets.sort_by_key(|(thread, _)| thread.thread_id.to_string());
+    let held = targets[1]
+        .0
+        .thread
+        .codex
+        .session
+        .lock_pending_mcp_server_refresh_config()
+        .await;
+    // Block the second lock so cancellation happens after acquiring the first.
+    let mut pending = Box::pin(manager.queue_mcp_server_refreshes_atomically(
+        targets
+            .iter()
+            .map(|(thread, _)| {
+                (
+                    thread.thread_id,
+                    Arc::clone(&thread.thread),
+                    refresh_config("cancelled"),
+                )
+            })
+            .collect(),
+    ));
+    assert!(futures::poll!(&mut pending).is_pending());
+    drop(pending);
+    assert_eq!(*held, Some(targets[1].1.clone()));
+    drop(held);
+    for (thread, expected) in targets {
+        let pending_config = tokio::time::timeout(
+            Duration::from_secs(1),
+            thread
+                .thread
+                .codex
+                .session
+                .lock_pending_mcp_server_refresh_config(),
+        )
+        .await
+        .expect("cancelling the batch must release all acquired locks");
+        assert_eq!(*pending_config, Some(expected.clone()));
+    }
+    first
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown first thread");
 }

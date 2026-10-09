@@ -241,11 +241,9 @@ mod tests {
             cell.raw_lines().last().unwrap().to_string(),
             "answer: ******"
         );
-        assert!(
-            !cell
-                .display_lines(80)
-                .iter()
-                .any(|line| line.to_string().contains("sensitive-value"))
+        assert_eq!(
+            cell.display_lines(80).iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["• Questions 1/1 answered", "  • Enter a value", "    answer: ••••••"]
         );
         assert!(!format!("{cell:?}").contains("sensitive-value"));
     }

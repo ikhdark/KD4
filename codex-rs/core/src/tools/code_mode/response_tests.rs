@@ -955,6 +955,7 @@ async fn partial_selection_data_survives_nested_dispatch() {
          if (r.complete || r.selector_errors.length !== 1) throw new Error('lost failure'); \
          text(r.results[0].text);",
     ).await;
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
     assert!(packet_output_text(output.as_ref()).contains("EXACT_SIBLING"));
     runtime.finish().await;
 }
@@ -1240,6 +1241,42 @@ fn yielded_runtime_response_is_resumable_not_timed_out() {
 
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Yielded);
     assert_eq!(output.success, None);
+}
+
+#[tokio::test]
+async fn truncated_cell_recovery_covers_the_entire_omitted_gap() {
+    let source = (0..600).map(|line| format!("line {line} λ😀\r\n")).collect::<String>();
+    let output = format_runtime_response(
+        RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: CellId::new("full-gap".into()),
+            content_items: vec![RuntimeContentItem::InputText { text: source }],
+            error_text: None,
+        },
+        Some(300), usize::MAX, true, Instant::now(), Vec::new(), Vec::new(), None,
+    );
+    let visible = super::code_mode_text_content(&output.body);
+    let gap = visible.split("[omitted lines ").nth(1).expect("omission marker");
+    let coordinates = gap.split(" of ").next().unwrap();
+    let (start, end) = coordinates.split_once('-').unwrap();
+    let start = start.parse::<usize>().unwrap();
+    let end = end.parse::<usize>().unwrap();
+    assert!(end - start > 200, "fixture must exercise more than the old prefix");
+    let selector = output.essential_inline["cell_output_recovery_selector"].clone();
+    assert_eq!(selector, serde_json::json!({"kind":"lines", "start":start, "end":end}));
+    let canonical = output.canonical_result(&ToolPayload::Custom { input: "fixture".into() }).unwrap();
+    let expected = std::str::from_utf8(&canonical.bytes).unwrap()
+        .split_inclusive('\n').skip(start - 1).take(end - start + 1).collect::<String>();
+    let home = tempfile::tempdir().unwrap();
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        home.path(), "full-gap", &canonical,
+    ).await;
+    let (recovered, _) = crate::tools::handlers::execute_recovery_transaction(
+        home.path(), "full-gap", &artifact.artifact_id().unwrap(),
+        vec![serde_json::from_value(selector).unwrap()], true,
+    ).await.unwrap();
+    assert!(recovered.complete);
+    assert_eq!(recovered.results[0].text.as_deref(), Some(expected.as_str()));
 }
 
 #[test]
@@ -1613,20 +1650,6 @@ fn printed_compact_results_are_not_repeated_on_failure() {
         assert_eq!(output.matches("COMPACT_RESULT_SENTINEL").count(), 1, "{output}");
         assert!(output.contains("later failure"));
     }
-}
-
-#[test]
-fn successful_script_output_suppresses_duplicate_retained_result_projection() {
-    let response = RuntimeResponse::Result {
-        output_loss: None,
-        cell_id: CellId::new("cell-1".to_string()),
-        content_items: vec![RuntimeContentItem::InputText {
-            text: "already projected".to_string(),
-        }],
-        error_text: None,
-    };
-
-    assert!(!response_needs_retained_nested_results(&response));
 }
 
 #[tokio::test]
@@ -2165,6 +2188,8 @@ async fn recovery_audit_failure_keeps_bounded_diagnostic_without_changing_succes
             "process_exited": error.is_none(), "exit_code": if error.is_none() { Some(0) } else { None },
             "execution_state": if error.is_none() { "exited" } else { "unknown" }, "error": error,
         }), "", None).await;
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+        assert_eq!(output.success, Some(true));
         let visible = super::code_mode_text_content(&output.body);
         assert_eq!(visible.contains("launch denied"), error.is_some());
         assert_eq!(visible.contains("nested_command_failure"), error.is_some());

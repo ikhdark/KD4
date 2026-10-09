@@ -1551,7 +1551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_key_flow_disabled_when_chatgpt_forced() {
+    async fn api_key_entry_and_save_are_disabled_when_chatgpt_forced() {
         let (mut widget, _tmp) = widget_forced_chatgpt().await;
 
         widget.start_api_key_entry();
@@ -1564,12 +1564,7 @@ mod tests {
             &*widget.sign_in_state.read().unwrap(),
             SignInState::PickMode
         ));
-    }
-
-    #[tokio::test]
-    async fn saving_api_key_is_blocked_when_chatgpt_forced() {
-        let (mut widget, _tmp) = widget_forced_chatgpt().await;
-
+        *widget.error.write().unwrap() = None;
         widget.save_api_key("sk-test".to_string());
 
         assert_eq!(
@@ -1600,7 +1595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_active_attempt_resets_browser_login_state() {
+    async fn cancel_active_attempt_resets_browser_and_device_code_login_states() {
         let (widget, _tmp) = widget_forced_chatgpt().await;
         *widget.error.write().unwrap() = Some("still logging in".to_string());
         *widget.sign_in_state.write().unwrap() =
@@ -1616,11 +1611,6 @@ mod tests {
             &*widget.sign_in_state.read().unwrap(),
             SignInState::PickMode
         ));
-    }
-
-    #[tokio::test]
-    async fn cancel_active_attempt_resets_device_code_login_state() {
-        let (widget, _tmp) = widget_forced_chatgpt().await;
         *widget.error.write().unwrap() = Some("still logging in".to_string());
         *widget.sign_in_state.write().unwrap() =
             SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::ready(
@@ -1736,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_widget_suppresses_animations_when_device_code_is_visible() {
+    fn auth_widget_suppresses_animations_for_pending_and_visible_device_codes() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
         *widget.sign_in_state.write().unwrap() =
@@ -1748,17 +1738,13 @@ mod tests {
             ));
 
         assert_eq!(widget.should_suppress_animations(), true);
-    }
-
-    #[test]
-    fn auth_widget_suppresses_animations_while_requesting_device_code() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
         *widget.sign_in_state.write().unwrap() = SignInState::ChatGptDeviceCode(
             ContinueWithDeviceCodeState::pending("request-1".to_string()),
         );
 
         assert_eq!(widget.should_suppress_animations(), true);
+        *widget.sign_in_state.write().unwrap() = SignInState::PickMode;
+        assert_eq!(widget.should_suppress_animations(), false);
     }
 
     #[tokio::test]
@@ -1828,10 +1814,7 @@ mod tests {
         let sym = buf[(0, 0)].symbol().to_string();
         // The sanitized URL retains `]` (printable) but strips ESC and BEL.
         let sanitized = "https://evil.com/]8;;injected";
-        assert!(
-            sym.contains(sanitized),
-            "symbol should contain sanitized URL, got: {sym:?}"
-        );
+        assert_eq!(sym, format!("\x1B]8;;{sanitized}\x07a\x1B]8;;\x07"));
         // The injected close-sequence must not survive: \x1B and \x07 are gone.
         assert!(
             !sym.contains("\x1B]8;;\x07injected"),

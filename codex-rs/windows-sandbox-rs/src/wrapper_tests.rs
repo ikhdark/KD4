@@ -95,6 +95,7 @@ fn windows_wrapper_args_round_trip() {
         vec!["codex.exe", "--codex-run-as-fs-helper"]
     );
     assert_eq!(parsed.command_cwd, command_cwd);
+    assert_eq!(parsed.codex_home, PathBuf::from(r"C:\Users\me\.codex"));
     assert_eq!(parsed.workspace_roots, workspace_roots);
     assert_eq!(parsed.env_map, env);
     assert_eq!(parsed.permission_profile, permission_profile);

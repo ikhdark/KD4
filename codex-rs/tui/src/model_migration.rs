@@ -621,9 +621,6 @@ mod tests {
         terminal.flush().expect("flush");
 
         let rendered = terminal.backend().to_string();
-        assert!(
-            rendered.contains("tail42"),
-            "expected wrapped markdown URL tail to remain visible, got:\n{rendered}"
-        );
+        assert_eq!(rendered.lines().map(str::trim).collect::<String>(), long_url);
     }
 }

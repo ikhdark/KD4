@@ -80,10 +80,19 @@ mod tests {
 
         state.remember_retry_status_header();
 
+        state.current_status.header = "Reconnecting".to_string();
+        state.remember_retry_status_header();
+
         assert_eq!(
             state.take_retry_status_header(),
             Some("Thinking".to_string())
         );
         assert_eq!(state.take_retry_status_header(), None);
+
+        state.remember_retry_status_header();
+        assert_eq!(
+            state.take_retry_status_header(),
+            Some("Reconnecting".to_string())
+        );
     }
 }

@@ -102,7 +102,10 @@ struct CancellationDelegate {
     slow_cleanup_release: Semaphore,
 }
 
-struct OversizedResultDelegate;
+#[derive(Default)]
+struct OversizedResultDelegate {
+    invoked: AtomicBool,
+}
 
 /// Holds every notification until its cancellation token fires.
 struct StalledNotificationDelegate {
@@ -142,6 +145,7 @@ impl CodeModeSessionDelegate for OversizedResultDelegate {
         _invocation: CodeModeNestedToolCall,
         _cancellation_token: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
+        self.invoked.store(true, Ordering::SeqCst);
         Box::pin(async { Ok(json!("x".repeat(MAX_FRAME_BYTES))) })
     }
 
@@ -705,14 +709,21 @@ async fn nested_poll_deadlines_survive_stdio_with_and_without_explicit_options()
             description: "".into(), kind: CodeModeToolKind::Function,
             input_schema: None, default_timeout_ms: Some(315_000), output_schema: None,
         }].into();
+        let before_execute = std::time::Instant::now();
         assert!(matches!(execute_to_terminal(&session, request).await,
             RuntimeResponse::Result { error_text: None, .. }));
         let calls = delegate.invocations.lock().unwrap();
         let deadline = calls.last().unwrap().nested_deadline;
         match expected_ms {
             Some(ms) => {
-                let remaining = deadline.expect("deadline survives transport")
-                    .saturating_duration_since(std::time::Instant::now());
+                let deadline = deadline.expect("deadline survives transport");
+                // Dispatch starts after before_execute. Permit clock conversion
+                // drift, not shortening the requested budget to the 60s default.
+                assert!(
+                    deadline >= before_execute + Duration::from_millis(ms - 50),
+                    "transport shortened the requested {ms}ms deadline"
+                );
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 assert!(remaining > Duration::ZERO && remaining <= Duration::from_millis(ms));
             }
             None => assert!(deadline.is_none()),
@@ -996,8 +1007,9 @@ async fn oversized_delegate_payloads_fail_only_the_tool_call() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
+    let delegate = Arc::new(OversizedResultDelegate::default());
     let session = provider
-        .create_session(Arc::new(OversizedResultDelegate))
+        .create_session(delegate.clone())
         .await
         .expect("create remote session");
     let tool = |name: &str| ToolDefinition {
@@ -1014,7 +1026,8 @@ async fn oversized_delegate_payloads_fail_only_the_tool_call() {
         r#"
 try {{
     await tools.big_argument({{ value: "x".repeat({MAX_FRAME_BYTES}) }});
-}} catch (_) {{
+}} catch (error) {{
+    if (!(error instanceof TypeError) || !error.message.startsWith("payload exceeds its limit of ")) throw error;
     text("argument rejected");
 }}
 "#
@@ -1033,11 +1046,13 @@ try {{
         }
     );
 
+    assert!(!delegate.invoked.load(Ordering::SeqCst));
     let mut oversized_result = execute_request(
         r#"
 try {
     await tools.big_result({});
-} catch (_) {
+} catch (error) {
+    if (!String(error).includes("delegate response exceeds the IPC frame limit")) throw error;
     text("result rejected");
 }
 "#,
@@ -1056,6 +1071,7 @@ try {
         }
     );
 
+    assert!(delegate.invoked.load(Ordering::SeqCst));
     assert_eq!(
         execute(&session, execute_request(r#"text("still alive");"#)).await,
         RuntimeResponse::Result {

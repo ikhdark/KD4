@@ -2069,32 +2069,31 @@ mod tests {
         assert_eq!(legacy.disposition, None);
     }
 
-    #[test]
-    fn request_user_input_client_error_is_interrupted() {
-        assert_interrupted_user_input_response(request_user_input_response_from_client_result(Ok(
-            Err(JSONRPCErrorError {
+    #[tokio::test]
+    async fn request_user_input_transport_failures_are_interrupted() {
+        let (sender, receiver) = oneshot::channel::<ClientRequestResult>();
+        drop(sender);
+        for response in [
+            Ok(Err(JSONRPCErrorError {
                 code: -1,
                 message: "client could not collect an answer".to_string(),
                 data: None,
-            }),
-        )));
-    }
-
-    #[tokio::test]
-    async fn request_user_input_closed_response_channel_is_interrupted() {
-        let (sender, receiver) = oneshot::channel::<ClientRequestResult>();
-        drop(sender);
-
-        assert_interrupted_user_input_response(request_user_input_response_from_client_result(
+            })),
             receiver.await,
-        ));
-    }
-
-    #[test]
-    fn request_user_input_malformed_response_is_interrupted() {
-        assert_interrupted_user_input_response(request_user_input_response_from_client_result(Ok(
-            Ok(json!({ "answers": "not-an-answer-map" })),
-        )));
+            Ok(Ok(json!({ "answers": "not-an-answer-map" }))),
+        ] {
+            assert_interrupted_user_input_response(
+                request_user_input_response_from_client_result(response),
+            );
+        }
+        assert_eq!(
+            request_user_input_response_from_client_result(Ok(Err(JSONRPCErrorError {
+                code: -1,
+                message: "turn changed".to_string(),
+                data: Some(json!({ "reason": "turnTransition" })),
+            }))),
+            None
+        );
     }
 
     #[test]
@@ -2361,10 +2360,18 @@ mod tests {
     }
 
     #[test]
-    fn file_change_accept_for_session_maps_to_approved_for_session() {
-        let decision =
-            map_file_change_approval_decision(FileChangeApprovalDecision::AcceptForSession);
-        assert_eq!(decision, ReviewDecision::ApprovedForSession);
+    fn file_change_approval_decisions_preserve_scope_and_rejection_kind() {
+        for (decision, expected) in [
+            (FileChangeApprovalDecision::Accept, ReviewDecision::Approved),
+            (
+                FileChangeApprovalDecision::AcceptForSession,
+                ReviewDecision::ApprovedForSession,
+            ),
+            (FileChangeApprovalDecision::Decline, ReviewDecision::Denied),
+            (FileChangeApprovalDecision::Cancel, ReviewDecision::Abort),
+        ] {
+            assert_eq!(map_file_change_approval_decision(decision), expected);
+        }
     }
 
     #[test]
@@ -2430,9 +2437,10 @@ mod tests {
 
     #[test]
     fn request_permissions_response_accepts_partial_network_and_file_system_grants() {
-        let input_path = r"C:\tmp\input";
-        let output_path = r"C:\tmp\output";
-        let ignored_path = r"C:\tmp\ignored";
+        let root = TempDir::new().expect("permission fixture");
+        let input_path = root.path().join("input").to_string_lossy().into_owned();
+        let output_path = root.path().join("output").to_string_lossy().into_owned();
+        let ignored_path = root.path().join("ignored").to_string_lossy().into_owned();
         let absolute_path = |path: &str| {
             native_path_uri(
                 AbsolutePathBuf::try_from(std::path::PathBuf::from(path))
@@ -2445,8 +2453,8 @@ mod tests {
                 enabled: Some(true),
             }),
             file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                Some(vec![absolute_path(input_path)]),
-                Some(vec![absolute_path(output_path)]),
+                Some(vec![absolute_path(&input_path)]),
+                Some(vec![absolute_path(&output_path)]),
             )),
         };
         let cases = vec![
@@ -2476,7 +2484,7 @@ mod tests {
                 CoreRequestPermissionProfile {
                     file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
                         /*read*/ None,
-                        Some(vec![absolute_path(output_path)]),
+                        Some(vec![absolute_path(&output_path)]),
                     )),
                     ..CoreRequestPermissionProfile::default()
                 },
@@ -2493,8 +2501,8 @@ mod tests {
                 }),
                 CoreRequestPermissionProfile {
                     file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                        Some(vec![absolute_path(input_path)]),
-                        Some(vec![absolute_path(output_path)]),
+                        Some(vec![absolute_path(&input_path)]),
+                        Some(vec![absolute_path(&output_path)]),
                     )),
                     ..CoreRequestPermissionProfile::default()
                 },
@@ -3685,11 +3693,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_turn_complete_emits_error_multiple_turns() -> Result<()> {
+    async fn turn_completion_consumes_errors_without_leaking_across_threads_or_turns() -> Result<()> {
         // Conversation A will have two turns; Conversation B will have one turn.
         let conversation_a = ThreadId::new();
         let conversation_b = ThreadId::new();
-        let thread_state = new_thread_state();
+        let thread_state_a = new_thread_state();
+        let thread_state_b = new_thread_state();
 
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(
@@ -3711,23 +3720,9 @@ mod tests {
                 codex_error_info: Some(V2CodexErrorInfo::BadRequest),
                 additional_details: None,
             },
-            &thread_state,
+            &thread_state_a,
         )
         .await;
-        let ((), first_message) = tokio::join!(
-            async {
-                handle_turn_complete(
-                    conversation_a,
-                    a_turn1.clone(),
-                    turn_complete_event(&a_turn1),
-                    &outgoing,
-                    &thread_state,
-                )
-                .await;
-            },
-            recv_broadcast_message(&mut rx),
-        );
-
         // Turn 1 on conversation B
         let b_turn1 = "b_turn1".to_string();
         handle_error(
@@ -3737,9 +3732,24 @@ mod tests {
                 codex_error_info: None,
                 additional_details: None,
             },
-            &thread_state,
+            &thread_state_b,
         )
         .await;
+
+        let ((), first_message) = tokio::join!(
+            async {
+                handle_turn_complete(
+                    conversation_a,
+                    a_turn1.clone(),
+                    turn_complete_event(&a_turn1),
+                    &outgoing,
+                    &thread_state_a,
+                )
+                .await;
+            },
+            recv_broadcast_message(&mut rx),
+        );
+
         let ((), second_message) = tokio::join!(
             async {
                 handle_turn_complete(
@@ -3747,7 +3757,7 @@ mod tests {
                     b_turn1.clone(),
                     turn_complete_event(&b_turn1),
                     &outgoing,
-                    &thread_state,
+                    &thread_state_b,
                 )
                 .await;
             },
@@ -3763,7 +3773,7 @@ mod tests {
                     a_turn2.clone(),
                     turn_complete_event(&a_turn2),
                     &outgoing,
-                    &thread_state,
+                    &thread_state_a,
                 )
                 .await;
             },
@@ -3774,6 +3784,7 @@ mod tests {
         let msg = first_message?;
         match msg {
             OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
+                assert_eq!(n.thread_id, conversation_a.to_string());
                 assert_eq!(n.turn.id, a_turn1);
                 assert_eq!(n.turn.status, TurnStatus::Failed);
                 assert_eq!(
@@ -3792,6 +3803,7 @@ mod tests {
         let msg = second_message?;
         match msg {
             OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
+                assert_eq!(n.thread_id, conversation_b.to_string());
                 assert_eq!(n.turn.id, b_turn1);
                 assert_eq!(n.turn.status, TurnStatus::Failed);
                 assert_eq!(
@@ -3810,6 +3822,7 @@ mod tests {
         let msg = third_message?;
         match msg {
             OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
+                assert_eq!(n.thread_id, conversation_a.to_string());
                 assert_eq!(n.turn.id, a_turn2);
                 assert_eq!(n.turn.status, TurnStatus::Completed);
                 assert_eq!(n.turn.error, None);

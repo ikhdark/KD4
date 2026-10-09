@@ -1,6 +1,5 @@
 use anyhow::Result;
 use codex_features::Feature;
-use codex_protocol::protocol::Op;
 use core_test_support::responses;
 use core_test_support::test_codex::test_codex;
 
@@ -44,13 +43,17 @@ async fn request_lifecycle_wall_clock_benchmark() -> Result<()> {
             assert_eq!(requests.requests().len(), 2);
             let output = requests.requests()[1].function_call_output_text("latency-plan")
                 .expect("the real tool result must reach the continuation");
-            assert!(!output.contains("error"), "{output}");
+            let output: serde_json::Value = serde_json::from_str(&output)?;
+            assert_eq!(output["message"], "Plan updated");
+            assert_eq!(output["current_plan"]["plan"], serde_json::json!([
+                {"step": "Measure the request lifecycle", "status": "completed"}
+            ]));
             samples.push(serde_json::json!({
                 "prompt_bytes": prompt_bytes, "sample": sample, "warmup": sample == 0,
                 "wall_ms": wall_ms, "requests": 2, "tool_calls": 1,
                 "exact_answer": true, "timing": completed.timing,
             }));
-            test.codex.submit(Op::Shutdown).await?;
+            test.codex.shutdown_and_wait().await?;
         }
     }
     if let Some(path) = std::env::var_os("KD4_REQUEST_LIFECYCLE_BENCHMARK_OUTPUT") {

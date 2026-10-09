@@ -48,11 +48,12 @@ class SourceInventoryTests(unittest.TestCase):
             self.git("add", "--", path)
         return dest
 
-    def scan_stdin(self, query, *args, root=None):
+    def scan_stdin(self, query, *args, root=None, bom=False):
         # An ASCII text wrapper proves that stdin bytes are decoded as UTF-8
         # independently of the caller's locale.
         stream = io.TextIOWrapper(
-            io.BytesIO(json.dumps(query, ensure_ascii=False).encode("utf-8")),
+            io.BytesIO((b"\xef\xbb\xbf" if bom else b"")
+                       + json.dumps(query, ensure_ascii=False).encode("utf-8")),
             encoding="ascii",
         )
         with (stream, mock.patch.object(sys, "stdin", stream),
@@ -103,14 +104,17 @@ class SourceInventoryTests(unittest.TestCase):
                             "--state", str(Path(self.temp.name) / "file-state.json"),
                             "--paths"])
         file_result = json.loads(stdout.getvalue())
-        stdin_result = self.scan_stdin(
-            query, "--state", str(Path(self.temp.name) / "stdin-state.json"), "--paths",
-        )
-        for key in ("count", "paths", "category_counts", "query_id", "ready_to_render"):
-            self.assertEqual(stdin_result[key], file_result[key])
-        self.assertEqual(stdin_result["paths"], ["src/café.md"])
-        self.assertEqual(stdin_result["category_counts"], {"日本語": 1})
-        self.assertNotIn("report", stdin_result)
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                stdin_result = self.scan_stdin(
+                    query, "--state", str(Path(self.temp.name) / f"stdin-{bom}.json"),
+                    "--paths", bom=bom,
+                )
+                for key in ("count", "paths", "category_counts", "query_id", "ready_to_render"):
+                    self.assertEqual(stdin_result[key], file_result[key])
+                self.assertEqual(stdin_result["paths"], ["src/café.md"])
+                self.assertEqual(stdin_result["category_counts"], {"日本語": 1})
+                self.assertNotIn("report", stdin_result)
         self.assertNotIn("report", file_result)
 
     def test_large_path_query_batches_without_losing_deleted_or_untracked_sources(self):
@@ -118,7 +122,13 @@ class SourceInventoryTests(unittest.TestCase):
         for i, path in enumerate(paths):
             self.file(path, tracked=i != 7)
         (self.root / paths[0]).unlink()
-        expected = inventory.repository_source_records(self.root, paths=paths)
+        expected = {
+            path: "deleted" if i == 0 else "untracked" if i == 7 else "tracked"
+            for i, path in enumerate(paths)
+        }
+        self.assertEqual(
+            inventory.repository_source_records(self.root, paths=paths), expected,
+        )
         real_run = subprocess.run
         with (
             mock.patch.object(inventory, "GIT_COMMAND_UNITS", 180),
@@ -382,15 +392,6 @@ class SourceInventoryTests(unittest.TestCase):
                       self.assertRaises(ValueError)):
                     inventory.main(["--query", "-"])
                 create.assert_not_called()
-
-    def test_stdin_accepts_utf8_bom(self):
-        query = {"categories": [{"name": "docs", "paths": ["*.md"],
-                                 "verification": "path"}]}
-        stream = io.TextIOWrapper(io.BytesIO(b"\xef\xbb\xbf" + json.dumps(query).encode()))
-        with (stream, mock.patch.object(sys, "stdin", stream),
-              mock.patch.object(tempfile, "tempdir", self.temp.name),
-              contextlib.redirect_stdout(io.StringIO())):
-            self.assertEqual(inventory.main(["--root", str(self.root), "--query", "-"]), 0)
 
     def test_stdin_controls_still_protect_sources_and_state(self):
         self.file("a.md")
@@ -822,9 +823,9 @@ class SourceInventoryTests(unittest.TestCase):
 
     def decision(self, path, consumer, disposition="include"):
         return {"path": path, "category": "runtime", "disposition": disposition,
-                "source_sha256": inventory.digest((self.root / path).read_bytes()),
+                "source_sha256": hashlib.sha256((self.root / path).read_bytes()).hexdigest(),
                 "reason": "reviewed runtime consumer" if disposition == "include" else "maintainer reference only",
-                "evidence": [{"path": consumer, "sha256": inventory.digest((self.root / consumer).read_bytes()),
+                "evidence": [{"path": consumer, "sha256": hashlib.sha256((self.root / consumer).read_bytes()).hexdigest(),
                               "line": 1, "text": (self.root / consumer).read_text().splitlines()[0]}]}
 
     def test_lineage_distinguishes_decisions_but_not_report_presentation(self):
@@ -889,7 +890,7 @@ class SourceInventoryTests(unittest.TestCase):
         output, stale = inventory.inventory(self.root, query, state)
         self.assertEqual(output["count"], 0)
         self.assertEqual(output["unresolved"][0]["unresolved"], "consumer evidence is unavailable or stale")
-        query["decisions"][0]["evidence"][0]["sha256"] = inventory.digest(consumer.read_bytes())
+        query["decisions"][0]["evidence"][0]["sha256"] = hashlib.sha256(consumer.read_bytes()).hexdigest()
         output, _ = inventory.inventory(self.root, query, stale)
         self.assertEqual(output["unresolved"][0]["unresolved"], "consumer evidence does not match the exact source line")
         source.write_text("changed prompt", encoding="utf-8")
@@ -931,11 +932,6 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(delivered["paths"], paths)
         self.assertEqual(delivered["count"], len(delivered["paths"]))
         self.assertEqual(delivered["query_id"], summary["query_id"])
-        # These sets have the right count, but must never pass exact delivery.
-        for wrong in [[paths[0], paths[1].replace(".xml", ".md")],
-                      [paths[0].replace("compact/", "compaction/"), paths[1]]]:
-            self.assertEqual(len(wrong), delivered["count"])
-            self.assertNotEqual(delivered["paths"], wrong)
         self.assertEqual(summary["next_action"], "deliver_report")
         saved = state_path.read_bytes()
         before = report.read_text(encoding="utf-8")
@@ -1079,7 +1075,7 @@ class SourceInventoryTests(unittest.TestCase):
         output, state = inventory.inventory(self.root, query)
         evidence = output["unresolved"][0]["evidence"]["structure"]
         fields = evidence["fields"]["models"]["items"]["0"]["fields"]
-        self.assertEqual(fields["base_instructions"], {"type": "string", "length": len(body), "sha256": inventory.digest(body.encode())})
+        self.assertEqual(fields["base_instructions"], {"type": "string", "length": len(body), "sha256": hashlib.sha256(body.encode()).hexdigest()})
         self.assertNotIn("SECRET", json.dumps(state))
         state_path = Path(self.temp.name) / "state.json"
         state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -1131,9 +1127,9 @@ class SourceInventoryTests(unittest.TestCase):
         evidence = summary["json_summaries"][0]
         self.assertEqual((evidence["path"], evidence["category"], evidence["status"]),
                          ("src/models.json", "catalog", "matched"))
-        self.assertEqual(evidence["sha256"], inventory.digest(catalog.read_bytes()))
+        self.assertEqual(evidence["sha256"], hashlib.sha256(catalog.read_bytes()).hexdigest())
         self.assertEqual(evidence["structure"]["fields"]["models"]["items"]["0"]["fields"]["prompt"],
-                         {"type": "string", "length": len(body), "sha256": inventory.digest(body.encode())})
+                         {"type": "string", "length": len(body), "sha256": hashlib.sha256(body.encode()).hexdigest()})
         delivered = json.loads(Path(summary["canonical_paths"]).read_text(encoding="utf-8"))
         self.assertEqual(delivered["json_summaries"], summary["json_summaries"])
         self.assertEqual(delivered["paths"], summary["paths"])
@@ -1276,7 +1272,7 @@ class SourceInventoryTests(unittest.TestCase):
             inventory.main(["--state", str(state_path), "--render-only", "--report", str(report)])
         delivery = json.loads(Path(json.loads(stdout.getvalue())["canonical_paths"]).read_text(encoding="utf-8"))
         self.assertEqual(delivery["json_summaries"][0]["structure"]["fields"]["prompt"],
-                         {"type": "string", "length": len("private body"), "sha256": inventory.digest(b"private body")})
+                         {"type": "string", "length": len("private body"), "sha256": hashlib.sha256(b"private body").hexdigest()})
 
     def test_path_pages_keep_counts_readiness_and_report_links(self):
         for index in range(52):
@@ -1383,12 +1379,15 @@ class SourceInventoryTests(unittest.TestCase):
                 self.assertIsNone(inventory.consumer_evidence(self.root, [reference], cache))
             self.assertEqual(hashed.call_count, 1)
         self.assertEqual(cache["src/loader.rs"][0], len(data))
-        self.assertIsNotNone(inventory.consumer_evidence(
-            self.root, [dict(reference, sha256="stale")], cache))
-        self.assertIsNotNone(inventory.consumer_evidence(
-            self.root, [dict(reference, text="invented")], cache))
+        self.assertEqual(inventory.consumer_evidence(
+            self.root, [dict(reference, sha256="stale")], cache),
+            "consumer evidence is unavailable or stale")
+        self.assertEqual(inventory.consumer_evidence(
+            self.root, [dict(reference, text="invented")], cache),
+            "consumer evidence does not match the exact source line")
         self.file("src/loader.rs", "changed\n")
-        self.assertIsNotNone(inventory.consumer_evidence(self.root, [reference], {}))
+        self.assertEqual(inventory.consumer_evidence(self.root, [reference], {}),
+                         "consumer evidence is unavailable or stale")
 
 
 if __name__ == "__main__":

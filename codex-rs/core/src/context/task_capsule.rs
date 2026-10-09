@@ -40,10 +40,15 @@ mod tests {
     #[test]
     fn renders_one_contextual_user_fragment_with_canonical_payload_unchanged() {
         let payload = r#"{"schema_version":1,"objective":"inspect"}"#.to_string();
-
+        let fragment = TaskCapsuleFragment::new(payload.clone());
+        assert_eq!(fragment.role(), "user");
+        let rendered = fragment.render();
         assert_eq!(
-            TaskCapsuleFragment::new(payload.clone()).render(),
+            rendered,
             format!("{TASK_CAPSULE_OPEN_TAG}{payload}{TASK_CAPSULE_CLOSE_TAG}")
         );
+        assert!(crate::context::is_contextual_user_fragment(
+            &codex_protocol::models::ContentItem::InputText { text: rendered }
+        ));
     }
 }

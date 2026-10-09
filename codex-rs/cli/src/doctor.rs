@@ -3518,7 +3518,10 @@ mod tests {
 
         let redacted: DoctorIssue = redacted_json_issue(&issue);
         assert_eq!(redacted.severity, CheckStatus::Warning);
-        assert_ne!(redacted.cause, issue.cause);
+        assert_eq!(redacted.cause, "https://example.com/mcp is unreachable");
+        assert_eq!(redacted.measured.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(redacted.expected.as_deref(), Some("reachable"));
+        assert_eq!(redacted.remedy.as_deref(), Some("Open https://example.com/help."));
         assert_eq!(redacted.fields, vec!["endpoint"]);
     }
 
@@ -3985,17 +3988,22 @@ mod tests {
 
     #[test]
     fn provider_reachability_skips_route_probe_for_bedrock() {
-        let plan = provider_reachability_plan_from_parts(
-            ProviderAuthReachabilityMode::NotRequired,
-            "amazon-bedrock",
-            "Amazon Bedrock",
-            Some("https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"),
-            /*provider_query_params*/ None,
-            /*is_amazon_bedrock*/ true,
-            "https://chatgpt.com/backend-api/",
-        );
+        for (bedrock, expected) in [
+            (true, None),
+            (false, Some("https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/models")),
+        ] {
+            let plan = provider_reachability_plan_from_parts(
+                ProviderAuthReachabilityMode::NotRequired,
+                "openai",
+                "Amazon Bedrock",
+                Some("https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"),
+                /*provider_query_params*/ None,
+                bedrock,
+                "https://chatgpt.com/backend-api/",
+            );
 
-        assert_eq!(plan.endpoints[0].route_probe_url, None);
+            assert_eq!(plan.endpoints[0].route_probe_url.as_deref(), expected);
+        }
     }
 
     #[test]
@@ -4295,11 +4303,16 @@ mod tests {
             // Leave HEAD unanswered and open until the GET fallback arrives, so HEAD can only
             // end by timing out however slowly this thread is scheduled.
             let mut head_stream = accept_probe(&listener);
-            let mut request = [0; 1024];
-            let _ = head_stream.read(&mut request);
+            let mut request = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut head_stream), &mut request)
+                .expect("read HEAD request line");
+            assert_eq!(request, "HEAD /mcp HTTP/1.1\r\n");
 
             let mut get_stream = accept_probe(&listener);
-            let _ = get_stream.read(&mut request);
+            request.clear();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut get_stream), &mut request)
+                .expect("read GET request line");
+            assert_eq!(request, "GET /mcp HTTP/1.1\r\n");
             get_stream
                 .write_all(
                     b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -4405,6 +4418,7 @@ mod tests {
 
     #[test]
     fn should_enable_color_respects_terminal_inputs() {
+        assert!(!should_enable_color(false, false, Some("xterm-256color"), true, false));
         assert!(should_enable_color(
             /*no_color_flag*/ false,
             /*no_color_env*/ false,

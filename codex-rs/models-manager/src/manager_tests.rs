@@ -101,9 +101,10 @@ fn remote_model_with_visibility(
 
 fn assert_models_contain(actual: &[ModelInfo], expected: &[ModelInfo]) {
     for model in expected {
-        assert!(
-            actual.iter().any(|candidate| candidate.slug == model.slug),
-            "expected model {} in cached list",
+        assert_eq!(
+            actual.iter().find(|candidate| candidate.slug == model.slug),
+            Some(model),
+            "cached metadata for {} must be preserved",
             model.slug
         );
     }
@@ -915,6 +916,13 @@ async fn matching_etag_renews_ttl_without_fetching() {
             crate::client_version_to_whole(),
         )
         .await;
+    // Establish the validator and its representation through the real cache load,
+    // rather than assigning an ETag to the unrelated bundled catalog.
+    let loaded = manager
+        .raw_model_catalog(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("load cached catalog");
+    assert_eq!(loaded.models, cached);
     manager
         .cache_manager
         .manipulate_cache_for_test(|fetched_at| {
@@ -922,7 +930,7 @@ async fn matching_etag_renews_ttl_without_fetching() {
         })
         .await
         .expect("age cache");
-    manager.state.write().await.etag = Some("same-etag".to_string());
+    manager.state.write().await.fresh_until = Some(Instant::now());
 
     Arc::clone(&manager)
         .notify_etag("same-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY)
@@ -933,14 +941,15 @@ async fn matching_etag_renews_ttl_without_fetching() {
         manager.memory_is_fresh().await,
         "a matching ETag confirms the in-memory catalog"
     );
-    assert!(
-        manager
-            .cache_manager
-            .load_fresh(&crate::client_version_to_whole())
-            .await
-            .expect("read cache")
-            .is_some()
-    );
+    assert_eq!(manager.get_remote_models().await, cached);
+    let renewed = manager
+        .cache_manager
+        .load_fresh(&crate::client_version_to_whole())
+        .await
+        .expect("read cache")
+        .expect("matching ETag renews the cached representation");
+    assert_eq!(renewed.models, cached);
+    assert_eq!(renewed.etag.as_deref(), Some("same-etag"));
 }
 
 #[tokio::test]
@@ -1168,98 +1177,31 @@ c2ln",
 }
 
 #[tokio::test]
-async fn static_manager_preserves_supported_requested_model_when_fallback_is_allowed() {
+async fn static_manager_fallback_requires_exact_catalog_membership() {
     let manager = static_manager_for_tests(ModelsResponse {
         models: vec![
             remote_model("provider-default", "Default", /*priority*/ 0),
             remote_model("provider-supported", "Supported", /*priority*/ 1),
         ],
     });
-    let requested_model = Some("provider-supported".to_string());
-
-    let model = manager
-        .get_default_model(
-            &requested_model,
-            /*allow_provider_model_fallback*/ true,
-            RefreshStrategy::Offline,
-            DEFAULT_HTTP_CLIENT_FACTORY,
-        )
-        .await
-        .expect("default model");
-
-    assert_eq!(model, "provider-supported");
-}
-
-#[tokio::test]
-async fn static_manager_falls_back_from_unsupported_requested_model_when_allowed() {
-    let manager = static_manager_for_tests(ModelsResponse {
-        models: vec![
-            remote_model("provider-default", "Default", /*priority*/ 0),
-            remote_model("provider-supported", "Supported", /*priority*/ 1),
-        ],
-    });
-    let requested_model = Some("unsupported".to_string());
-
-    let model = manager
-        .get_default_model(
-            &requested_model,
-            /*allow_provider_model_fallback*/ true,
-            RefreshStrategy::Offline,
-            DEFAULT_HTTP_CLIENT_FACTORY,
-        )
-        .await
-        .expect("default model");
-
-    assert_eq!(model, "provider-default");
-}
-
-#[tokio::test]
-async fn static_manager_falls_back_for_unlisted_sol() {
-    let manager = static_manager_for_tests(ModelsResponse {
-        models: vec![remote_model(
-            "provider-default",
-            "Default",
-            /*priority*/ 0,
-        )],
-    });
-
-    for requested_model in ["gpt-5.6-sol", "openai.gpt-5.6-sol"] {
+    for (requested, expected) in [
+        ("provider-supported", "provider-supported"),
+        ("unsupported", "provider-default"),
+        ("gpt-5.6-sol", "provider-default"),
+        ("openai.gpt-5.6-sol", "provider-default"),
+        ("notgpt-5.6-sol", "provider-default"),
+        (".gpt-5.6-sol", "provider-default"),
+    ] {
         let model = manager
             .get_default_model(
-                &Some(requested_model.to_string()),
+                &Some(requested.to_string()),
                 /*allow_provider_model_fallback*/ true,
                 RefreshStrategy::Offline,
                 DEFAULT_HTTP_CLIENT_FACTORY,
             )
             .await
             .expect("default model");
-
-        assert_eq!(model, "provider-default");
-    }
-}
-
-#[tokio::test]
-async fn static_manager_falls_back_from_unqualified_sol_suffixes() {
-    let manager = static_manager_for_tests(ModelsResponse {
-        models: vec![remote_model(
-            "provider-default",
-            "Default",
-            /*priority*/ 0,
-        )],
-    });
-
-    for requested_model in ["notgpt-5.6-sol", ".gpt-5.6-sol"] {
-        let model = manager
-            .get_default_model(
-                &Some(requested_model.to_string()),
-                /*allow_provider_model_fallback*/ true,
-                RefreshStrategy::Offline,
-                DEFAULT_HTTP_CLIENT_FACTORY,
-            )
-            .await
-            .expect("default model");
-
-        assert_eq!(model, "provider-default");
+        assert_eq!(model, expected, "requested model: {requested}");
     }
 }
 
@@ -1572,66 +1514,37 @@ async fn picker_snapshot_is_reused_until_the_catalog_changes() {
 }
 
 #[tokio::test]
-async fn refresh_available_models_uses_remote_only_catalog_for_chatgpt_auth() {
-    let remote_models = vec![remote_model(
-        "chatgpt-visible-source-of-truth",
-        "ChatGPT Visible",
-        /*priority*/ 0,
-    )];
-    let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
-    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
-
-    manager
-        .refresh_available_models(
-            RefreshStrategy::OnlineIfUncached,
-            &DEFAULT_HTTP_CLIENT_FACTORY,
-        )
-        .await
-        .expect("refresh succeeds");
-
-    assert_eq!(manager.get_remote_models().await, remote_models);
-    assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
-}
-
-#[tokio::test]
-async fn refresh_available_models_uses_cached_remote_only_catalog_for_chatgpt_auth() {
-    let remote_models = vec![remote_model(
-        "chatgpt-cached-source-of-truth",
-        "ChatGPT Cached",
-        /*priority*/ 0,
-    )];
+async fn refresh_available_models_reuses_authoritative_catalog_in_memory_and_on_disk() {
+    let remote_models = vec![remote_model("cached", "Cached", /*priority*/ 5)];
     let codex_home = tempdir().expect("temp dir");
     let fetch_endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
     let fetch_manager =
         openai_manager_for_tests(codex_home.path().to_path_buf(), fetch_endpoint.clone());
 
-    fetch_manager
-        .refresh_available_models(
-            RefreshStrategy::OnlineIfUncached,
-            &DEFAULT_HTTP_CLIENT_FACTORY,
-        )
-        .await
-        .expect("initial refresh succeeds");
+    for _ in 0..2 {
+        fetch_manager
+            .refresh_available_models(
+                RefreshStrategy::OnlineIfUncached,
+                &DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .expect("initial fetch or fresh memory snapshot");
+        assert_eq!(fetch_manager.get_remote_models().await, remote_models);
+        assert_eq!(fetch_endpoint.fetch_count(), 1);
+    }
 
     let cache_endpoint = TestModelsEndpoint::new(Vec::new());
     let cache_manager =
         openai_manager_for_tests(codex_home.path().to_path_buf(), cache_endpoint.clone());
-
     cache_manager
         .refresh_available_models(
             RefreshStrategy::OnlineIfUncached,
             &DEFAULT_HTTP_CLIENT_FACTORY,
         )
         .await
-        .expect("cached refresh succeeds");
-
+        .expect("fresh disk cache");
     assert_eq!(cache_manager.get_remote_models().await, remote_models);
-    assert_eq!(
-        cache_endpoint.fetch_count(),
-        0,
-        "fresh cache should avoid a model fetch"
-    );
+    assert_eq!(cache_endpoint.fetch_count(), 0);
 }
 
 #[tokio::test]
@@ -1900,37 +1813,7 @@ async fn refresh_available_models_replaces_obsolete_cache_before_decoding_models
     }
 }
 
-#[tokio::test]
-async fn refresh_available_models_uses_cache_when_fresh() {
-    let remote_models = vec![remote_model("cached", "Cached", /*priority*/ 5)];
-    let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
-    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
 
-    manager
-        .refresh_available_models(
-            RefreshStrategy::OnlineIfUncached,
-            &DEFAULT_HTTP_CLIENT_FACTORY,
-        )
-        .await
-        .expect("first refresh succeeds");
-    assert_models_contain(&manager.get_remote_models().await, &remote_models);
-
-    // Second call should read from cache and avoid the network.
-    manager
-        .refresh_available_models(
-            RefreshStrategy::OnlineIfUncached,
-            &DEFAULT_HTTP_CLIENT_FACTORY,
-        )
-        .await
-        .expect("cached refresh succeeds");
-    assert_models_contain(&manager.get_remote_models().await, &remote_models);
-    assert_eq!(
-        endpoint.fetch_count(),
-        1,
-        "cache hit should avoid a second model fetch"
-    );
-}
 
 #[tokio::test]
 async fn runtime_identity_change_does_not_reuse_disk_or_in_memory_catalog() {

@@ -1067,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_draw_applies_requested_cursor_style() {
+    fn terminal_draw_applies_requested_cursor_style_and_reset_restores_default() {
         let mut output = Vec::new();
         let mut terminal =
             Terminal::with_options(CaptureBackend::new(/*width*/ 2, /*height*/ 1))
@@ -1089,24 +1089,14 @@ mod tests {
             actual.contains(&expected),
             "expected terminal output to contain cursor style {expected:?}, got {actual:?}"
         );
-    }
-
-    #[test]
-    fn reset_cursor_style_emits_default_user_shape() {
-        let mut output = Vec::new();
-        let mut terminal =
-            Terminal::with_options(CaptureBackend::new(/*width*/ 2, /*height*/ 1))
-                .expect("terminal");
-
+        output = Vec::new();
+        terminal.backend_mut().output.clear();
         terminal.reset_cursor_style().expect("reset cursor style");
         ratatui::backend::Backend::flush(terminal.backend_mut()).expect("flush backend");
 
         queue!(output, SetCursorStyle::DefaultUserShape).expect("queue style");
         let expected = String::from_utf8(output).expect("utf8");
         let actual = terminal.backend().output();
-        assert!(
-            actual.contains(&expected),
-            "expected terminal output to contain cursor style reset {expected:?}, got {actual:?}"
-        );
+        assert_eq!(actual, expected);
     }
 }

@@ -147,8 +147,6 @@ use crate::context::PromptProvenanceSidecar;
 use crate::feedback::emit_feedback_auth_recovery_tags;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
-#[cfg(test)]
-use crate::responses_metadata::subagent_header_value;
 use crate::turn_timing::ModelAttemptGenerationMetadata;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingGuard;
@@ -2815,18 +2813,6 @@ impl ModelClient {
         }
 
         activated
-    }
-
-    #[cfg(test)]
-    fn build_subagent_headers(&self) -> ApiHeaderMap {
-        let mut extra_headers = ApiHeaderMap::new();
-        add_originator_header(&mut extra_headers, self.state.originator.as_str());
-        if let Some(subagent) = subagent_header_value(&self.state.session_source)
-            && let Ok(val) = HeaderValue::from_str(&subagent)
-        {
-            extra_headers.insert(X_OPENAI_SUBAGENT_HEADER, val);
-        }
-        extra_headers
     }
 
     fn build_responses_compatibility_headers(

@@ -235,13 +235,7 @@ fn selected_network_from_tables(parsed: NetworkTablesToml) -> Result<Option<Netw
     Ok(profile.network)
 }
 
-#[cfg(test)]
-fn apply_network_tables(config: &mut NetworkProxyConfig, parsed: NetworkTablesToml) -> Result<()> {
-    if let Some(network) = selected_network_from_tables(parsed)? {
-        network.apply_to_network_proxy_config(config);
-    }
-    Ok(())
-}
+
 
 #[derive(Default)]
 struct NetworkConfigAccumulator {

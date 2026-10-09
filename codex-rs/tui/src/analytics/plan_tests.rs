@@ -326,7 +326,13 @@ fn moving_period_selection_collapses_its_previous_details() {
 
 #[test]
 fn invalid_history_returns_safe_errors() {
-    for invalid in 0..5 {
+    for (invalid, expected) in [
+        (0, "Invalid plan history timestamp."),
+        (1, "Invalid plan history period."),
+        (2, "Invalid plan history period."),
+        (3, "Unsupported plan history window."),
+        (4, "Invalid plan history period."),
+    ] {
         let mut history = response();
         match invalid {
             0 => history.periods[0].starts_at = "private wire value".into(),
@@ -336,7 +342,7 @@ fn invalid_history_returns_safe_errors() {
             _ => history.periods[0].used_basis_points = Some(f64::INFINITY),
         }
         let error = Report::parse(history).err().unwrap();
-        assert!(!error.contains("private wire value"));
+        assert_eq!(error, expected, "invalid case: {invalid}");
     }
 }
 

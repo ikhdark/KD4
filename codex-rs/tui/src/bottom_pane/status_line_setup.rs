@@ -409,103 +409,23 @@ mod tests {
     use crate::app_event::AppEvent;
 
     #[test]
-    fn context_used_accepts_context_usage_legacy_id() {
-        assert_eq!(StatusLineItem::ContextUsed.to_string(), "context-used");
-        assert_eq!(
-            "context-used".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ContextUsed)
-        );
-        assert_eq!(
-            "context-usage".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ContextUsed)
-        );
-    }
-
-    #[test]
-    fn context_remaining_is_selectable_id() {
-        assert_eq!(
-            "context-remaining".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ContextRemaining)
-        );
-        assert_eq!(
-            StatusLineItem::ContextRemaining.to_string(),
-            "context-remaining"
-        );
-    }
-    #[test]
-    fn project_name_is_canonical_and_accepts_legacy_ids() {
-        assert_eq!(StatusLineItem::ProjectRoot.to_string(), "project-name");
-        assert_eq!(
-            "project-name".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ProjectRoot)
-        );
-        assert_eq!(
-            "project".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ProjectRoot)
-        );
-        assert_eq!(
-            "project-root".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ProjectRoot)
-        );
-    }
-
-    #[test]
-    fn model_is_canonical_and_accepts_model_name_legacy_id() {
-        assert_eq!(StatusLineItem::ModelName.to_string(), "model");
-        assert_eq!(
-            "model".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ModelName)
-        );
-        assert_eq!(
-            "model-name".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::ModelName)
-        );
-    }
-
-    #[test]
-    fn reasoning_is_selectable_id() {
-        assert_eq!(StatusLineItem::Reasoning.to_string(), "reasoning");
-        assert_eq!(
-            "reasoning".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::Reasoning)
-        );
-    }
-
-    #[test]
-    fn run_state_is_canonical_and_accepts_status_legacy_id() {
-        assert_eq!(StatusLineItem::Status.to_string(), "run-state");
-        assert_eq!(
-            "run-state".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::Status)
-        );
-        assert_eq!(
-            "status".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::Status)
-        );
-    }
-
-    #[test]
-    fn git_summary_items_are_selectable_ids() {
-        assert_eq!(
-            "pull-request-number".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::PullRequestNumber)
-        );
-        assert_eq!(
-            "branch-changes".parse::<StatusLineItem>(),
-            Ok(StatusLineItem::BranchChanges)
-        );
-    }
-
-    #[test]
-    fn parse_status_line_items_accepts_title_only_variants() {
-        let items = ["run-state", "task-progress"]
-            .into_iter()
-            .map(str::parse::<StatusLineItem>)
-            .collect::<Result<Vec<_>, _>>();
-        assert_eq!(
-            items,
-            Ok(vec![StatusLineItem::Status, StatusLineItem::TaskProgress,])
-        );
+    fn status_line_ids_preserve_canonical_names_and_legacy_aliases() {
+        for (item, canonical, aliases) in [
+            (StatusLineItem::ContextUsed, "context-used", &["context-usage"][..]),
+            (StatusLineItem::ContextRemaining, "context-remaining", &[][..]),
+            (StatusLineItem::ProjectRoot, "project-name", &["project", "project-root"][..]),
+            (StatusLineItem::ModelName, "model", &["model-name"][..]),
+            (StatusLineItem::Reasoning, "reasoning", &[][..]),
+            (StatusLineItem::Status, "run-state", &["status"][..]),
+            (StatusLineItem::PullRequestNumber, "pull-request-number", &[][..]),
+            (StatusLineItem::BranchChanges, "branch-changes", &[][..]),
+            (StatusLineItem::TaskProgress, "task-progress", &[][..]),
+        ] {
+            assert_eq!(item.to_string(), canonical);
+            for id in std::iter::once(canonical).chain(aliases.iter().copied()) {
+                assert_eq!(id.parse::<StatusLineItem>(), Ok(item), "{id}");
+            }
+        }
     }
 
     #[test]

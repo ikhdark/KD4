@@ -1005,111 +1005,54 @@ mod tests {
     }
 
     #[test]
-    fn desktop_runtime_receipt_requires_a_live_matching_pid() {
+    fn desktop_runtime_receipt_rejects_mismatched_live_identity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("codex.exe");
         let home = temp.path().join("LOCAL-KD");
         let receipt = matching_receipt(target.clone(), home.clone(), 42);
-
-        let err = validate_desktop_runtime_receipt(
-            &receipt,
-            &[],
-            &target,
-            Ok(&target_hash(&target)),
-            10,
-            &home,
-        )
-        .expect_err("an absent receipt PID must not prove a Desktop restart");
-
-        assert!(err.contains("not live"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn desktop_runtime_receipt_rejects_non_desktop_client() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let target = temp.path().join("codex.exe");
-        let home = temp.path().join("LOCAL-KD");
-        let processes = vec![DesktopProcessEvidence {
+        let process = DesktopProcessEvidence {
             pid: 42,
             path: Some(target.clone()),
             is_app_server: true,
-        }];
-        let mut receipt = matching_receipt(target.clone(), home.clone(), 42);
-        receipt.client_name = "codex_vscode".to_string();
-
-        let err = validate_desktop_runtime_receipt(
-            &receipt,
-            &processes,
-            &target,
-            Ok(&target_hash(&target)),
-            10,
-            &home,
-        )
-        .expect_err("a non-Desktop receipt must not prove a Desktop restart");
-
-        assert!(err.contains("not Codex Desktop"), "unexpected error: {err}");
+        };
+        let hash = target_hash(&target);
+        for (case, expected) in [
+            ("missing pid", "receipt PID 42 is not live"),
+            ("client", "receipt client codex_vscode is not Codex Desktop"),
+            ("binary", "receipt executable does not match the selected binary"),
+            ("home", "receipt CODEX_HOME does not match the intended fork home"),
+            ("schema", "unsupported schema version 2"),
+            ("current pid", "receipt identifies the doctor process"),
+            ("process kind", "receipt PID 42 is not an app-server"),
+            ("process path", "live receipt process is not running the selected binary"),
+        ] {
+            let mut receipt = receipt.clone();
+            let mut processes = vec![process.clone()];
+            let mut current_pid = 10;
+            match case {
+                "missing pid" => processes.clear(),
+                "client" => receipt.client_name = "codex_vscode".to_string(),
+                "binary" => receipt.executable_path = temp.path().join("official-codex.exe"),
+                "home" => receipt.codex_home = temp.path().join("official-home"),
+                "schema" => receipt.schema_version = 2,
+                "current pid" => current_pid = 42,
+                "process kind" => processes[0].is_app_server = false,
+                "process path" => processes[0].path = None,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_desktop_runtime_receipt(&receipt, &processes, &target, Ok(&hash), current_pid, &home),
+                Err(expected.to_string()),
+                "{case}"
+            );
+        }
     }
 
-    #[test]
-    fn desktop_runtime_receipt_rejects_wrong_binary_or_home() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let target = temp.path().join("codex.exe");
-        let wrong_binary = temp.path().join("official-codex.exe");
-        let home = temp.path().join("LOCAL-KD");
-        let wrong_home = temp.path().join("official-home");
-        let processes = vec![DesktopProcessEvidence {
-            pid: 42,
-            path: Some(target.clone()),
-            is_app_server: true,
-        }];
 
-        let wrong_binary_receipt = matching_receipt(wrong_binary, home.clone(), 42);
-        let binary_err = validate_desktop_runtime_receipt(
-            &wrong_binary_receipt,
-            &processes,
-            &target,
-            Ok(&wrong_binary_receipt.executable_sha256),
-            10,
-            &home,
-        )
-        .expect_err("a wrong receipt executable must fail");
-        assert!(binary_err.contains("executable"));
 
-        let wrong_home_receipt = matching_receipt(target.clone(), wrong_home, 42);
-        let home_err = validate_desktop_runtime_receipt(
-            &wrong_home_receipt,
-            &processes,
-            &target,
-            Ok(&target_hash(&target)),
-            10,
-            &home,
-        )
-        .expect_err("a wrong receipt CODEX_HOME must fail");
-        assert!(home_err.contains("CODEX_HOME"));
-    }
 
-    #[test]
-    fn desktop_runtime_receipt_accepts_matching_live_fork_identity() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let target = temp.path().join("codex.exe");
-        let home = temp.path().join("LOCAL-KD");
-        let processes = vec![DesktopProcessEvidence {
-            pid: 42,
-            path: Some(target.clone()),
-            is_app_server: true,
-        }];
-        let receipt = matching_receipt(target.clone(), home.clone(), 42);
 
-        validate_desktop_runtime_receipt(
-            &receipt,
-            &processes,
-            &target,
-            Ok(&target_hash(&target)),
-            10,
-            &home,
-        )
-        .expect("matching live receipt should prove the selected fork runtime");
-    }
+
 
     #[test]
     fn desktop_runtime_receipt_binds_identity_to_the_selected_file_hash() {

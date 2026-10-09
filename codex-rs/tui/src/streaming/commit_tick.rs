@@ -222,6 +222,8 @@ mod tests {
 
     #[test]
     fn suppressed_tick_reports_controller_and_queue_without_draining() {
+        // Keep queue age at zero even if the test process is descheduled after enqueue.
+        let now = Instant::now();
         let mut controller = StreamController::new(
             Some(80),
             &std::env::temp_dir(),
@@ -238,7 +240,7 @@ mod tests {
             Some(&mut controller),
             None,
             CommitTickScope::CatchUpOnly,
-            Instant::now(),
+            now,
         );
         assert!(output.has_controller);
         assert!(!output.all_idle);
@@ -250,7 +252,7 @@ mod tests {
             Some(&mut controller),
             None,
             CommitTickScope::AnyMode,
-            Instant::now(),
+            now,
         );
         assert_eq!(output.cells.len(), 1);
         let text: String = output.cells[0]
@@ -258,6 +260,9 @@ mod tests {
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect();
-        assert!(text.contains("first"), "expected first queued line: {text}");
+        assert_eq!(text, "• first");
+        assert_eq!(controller.queued_lines(), queued - 1);
+        assert!(output.has_controller);
+        assert!(!output.all_idle);
     }
 }

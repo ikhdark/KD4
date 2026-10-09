@@ -613,48 +613,29 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn misplaced_action_at_keymap_root_is_rejected() {
-        // Actions placed directly under [tui.keymap] instead of a context
-        // sub-table (e.g. [tui.keymap.global]) must produce a parse error,
-        // not be silently ignored.
-        let toml_input = r#"
-            open_transcript = "ctrl-s"
-        "#;
-        let result = toml::from_str::<TuiKeymap>(toml_input);
-        assert!(
-            result.is_err(),
-            "expected error for action at keymap root, got: {result:?}"
-        );
+    fn keymap_rejects_unknown_context_actions() {
+        for (context, action, key) in [
+            ("", "open_transcript", "ctrl-s"),
+            ("global", "open_transcrip", "ctrl-x"),
+            ("vim_text_object", "double_quotes", "shift-a"),
+            ("vim_normal", "move_lefft", "h"),
+            ("vim_operator", "move_lefft", "h"),
+        ] {
+            let header = if context.is_empty() {
+                String::new()
+            } else {
+                format!("[{context}]\n")
+            };
+            let input = format!("{header}{action} = '{key}'");
+            let error = toml::from_str::<TuiKeymap>(&input).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{action}`")),
+                "{error}"
+            );
+        }
     }
-
-    #[test]
-    fn misspelled_action_under_context_is_rejected() {
-        let toml_input = r#"
-            [global]
-            open_transcrip = "ctrl-x"
-        "#;
-        let err = toml::from_str::<TuiKeymap>(toml_input)
-            .expect_err("expected unknown action under context");
-        assert!(
-            err.to_string().contains("open_transcrip"),
-            "expected error to mention misspelled field, got: {err}"
-        );
-    }
-
-    #[test]
-    fn misspelled_vim_text_object_action_is_rejected() {
-        let toml_input = r#"
-            [vim_text_object]
-            double_quotes = "shift-quote"
-        "#;
-        let err = toml::from_str::<TuiKeymap>(toml_input)
-            .expect_err("expected unknown vim text object action");
-        assert!(
-            err.to_string().contains("double_quotes"),
-            "expected error to mention misspelled field, got: {err}"
-        );
-    }
-
     #[test]
     fn removed_backtrack_actions_are_rejected() {
         for (context, action) in [
@@ -681,22 +662,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn action_under_global_context_is_accepted() {
-        let toml_input = r#"
-            [global]
-            open_transcript = "ctrl-s"
-        "#;
-        let keymap: TuiKeymap = toml::from_str(toml_input).expect("valid config");
-        assert_eq!(
-            keymap.global.open_transcript,
-            Some(KeybindingsSpec::One(KeybindingSpec("ctrl-s".to_string())))
-        );
-    }
 
     #[test]
-    fn minus_bindings_under_global_context_are_accepted() {
+    fn global_bindings_preserve_canonical_key_names() {
         for (spec, expected) in [
+            (
+                "ctrl-s",
+                KeybindingsSpec::One(KeybindingSpec("ctrl-s".to_string())),
+            ),
             (
                 "minus",
                 KeybindingsSpec::One(KeybindingSpec("minus".to_string())),
@@ -720,23 +693,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn function_keys_through_f24_are_accepted() {
-        assert_eq!(normalize_keybinding_spec("F13"), Ok("f13".to_string()));
-        assert_eq!(normalize_keybinding_spec("f24"), Ok("f24".to_string()));
-        assert!(normalize_keybinding_spec("f25").is_err());
-    }
-    #[test]
-    fn vim_contexts_reject_misspelled_actions() {
-        for context in ["vim_normal", "vim_operator"] {
-            let err = toml::from_str::<TuiKeymap>(&format!("[{context}]\nmove_lefft = 'h'"))
-                .expect_err("unknown action");
-            assert!(err.to_string().contains("move_lefft"), "{err}");
-        }
-    }
 
     #[test]
     fn binding_values_preserve_normalization_order_and_diagnostics() {
+        for number in 1..=24 {
+            let input = format!("[global]\nopen_transcript = 'F{number}'");
+            let keymap: TuiKeymap = toml::from_str(&input).unwrap();
+            assert_eq!(
+                keymap.global.open_transcript,
+                Some(KeybindingsSpec::One(KeybindingSpec(format!("f{number}"))))
+            );
+        }
+        let error = toml::from_str::<TuiKeymap>("[global]\nopen_transcript = 'f25'").unwrap_err();
+        assert!(error.to_string().contains("unknown key `f25`"), "{error}");
         for (value, expected) in [
             (
                 "'f01'",

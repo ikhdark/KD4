@@ -1134,34 +1134,36 @@ mod tests {
         ));
     }
 
-    #[test_case::test_case("", "wss://rendezvous.test/ws"; "missing_registration")]
-    #[test_case::test_case("   ", "wss://rendezvous.test/ws"; "blank_registration")]
-    #[test_case::test_case("registration-1", ""; "missing_url")]
-    #[test_case::test_case("registration-1", "https://rendezvous.test/ws"; "wrong_scheme")]
-    #[test_case::test_case("registration-1", "ws://"; "missing_host")]
     #[tokio::test]
-    async fn register_rejects_unusable_connection_data(registration: &str, url: &str) {
+    async fn register_rejects_unusable_connection_data() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/cloud/environment/environment-requested/register"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "environment_id": "environment-requested",
-                "url": url,
-                "security_profile": NOISE_RELAY_SECURITY_PROFILE,
-                "executor_registration_id": registration,
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
         let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
             .expect("client");
-        let public_key = NoiseChannelIdentity::generate()
-            .expect("identity")
-            .public_key();
-        let result = client
-            .register_environment("environment-requested", &public_key)
-            .await;
-        assert!(matches!(result, Err(ExecServerError::Protocol(_))));
+        let public_key = NoiseChannelIdentity::generate().expect("identity").public_key();
+        for (registration, url, expected) in [
+            ("", "wss://rendezvous.test/ws", "environment registry returned an empty executor registration id"),
+            ("   ", "wss://rendezvous.test/ws", "environment registry returned an empty executor registration id"),
+            ("registration-1", "", "environment registry returned an invalid rendezvous URL"),
+            ("registration-1", "https://rendezvous.test/ws", "environment registry returned an invalid rendezvous URL"),
+            ("registration-1", "ws://", "environment registry returned an invalid rendezvous URL"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/cloud/environment/environment-requested/register"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "environment_id": "environment-requested",
+                    "url": url,
+                    "security_profile": NOISE_RELAY_SECURITY_PROFILE,
+                    "executor_registration_id": registration,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = client.register_environment("environment-requested", &public_key).await;
+            assert!(matches!(result, Err(ExecServerError::Protocol(message)) if message == expected),
+                "registration={registration:?}, url={url:?}");
+            server.verify().await;
+            server.reset().await;
+        }
     }
 
     #[tokio::test]

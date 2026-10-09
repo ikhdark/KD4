@@ -426,7 +426,7 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
     assert_eq!(
         result,
         json!({
-            "goalRef": result["goalRef"],
+            "goalRef": goal_ref(runtime.as_ref(), thread_id).await?,
             "accountingPending": false,
             "goal": {
                 "threadId": thread_id,
@@ -455,34 +455,17 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn goal_tools_hidden_for_ephemeral_threads() -> anyhow::Result<()> {
+async fn goal_tools_require_persistence_and_non_review_session() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
-    let tools = installed_tools_with_start(
-        runtime,
-        thread_id,
-        SessionSource::Cli,
-        /*persistent_thread_state_available*/ false,
-    )
-    .await;
-
-    assert_eq!(Vec::<String>::new(), tool_names(&tools));
-    Ok(())
-}
-
-#[tokio::test]
-async fn goal_tools_hidden_for_review_subagents() -> anyhow::Result<()> {
-    let runtime = test_runtime().await?;
-    let thread_id = test_thread_id()?;
-    let tools = installed_tools_with_start(
-        runtime,
-        thread_id,
-        SessionSource::SubAgent(SubAgentSource::Review),
-        /*persistent_thread_state_available*/ true,
-    )
-    .await;
-
-    assert_eq!(Vec::<String>::new(), tool_names(&tools));
+    for (source, persistent, expected) in [
+        (SessionSource::Cli, true, vec!["create_goal"]),
+        (SessionSource::Cli, false, Vec::new()),
+        (SessionSource::SubAgent(SubAgentSource::Review), true, Vec::new()),
+    ] {
+        let tools = installed_tools_with_start(runtime.clone(), thread_id, source, persistent).await;
+        assert_eq!(tool_names(&tools), expected);
+    }
     Ok(())
 }
 
@@ -784,136 +767,52 @@ async fn parallel_tool_finish_accounts_active_goal_progress_once() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn budget_limited_goal_keeps_accruing_until_turn_stop() -> anyhow::Result<()> {
-    let runtime = test_runtime().await?;
-    let thread_id = test_thread_id()?;
-    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
-    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
-    harness.start_turn("turn-1", &TokenUsage::default()).await;
-
-    let tools = harness.tools();
-    let create_tool = tool_by_name(&tools, "create_goal");
-    create_tool
-        .handle(tool_call(
-            "create_goal",
-            "call-create-goal",
-            json!({
-                "objective": "ship goal extension backend",
-                "token_budget": 25,
-            }),
-        ))
-        .await?;
-    harness.sink.clear();
-
-    harness
-        .record_token_usage(
-            "turn-1",
-            &token_usage(
-                /*input_tokens*/ 20, /*cached_input_tokens*/ 5,
-                /*output_tokens*/ 10, /*reasoning_output_tokens*/ 0,
-                /*total_tokens*/ 30,
-            ),
-        )
-        .await;
-    harness
-        .notify_tool_finish("turn-1", "call-shell", "shell")
-        .await;
-    harness
-        .record_token_usage(
-            "turn-1",
-            &token_usage(
-                /*input_tokens*/ 24, /*cached_input_tokens*/ 5,
-                /*output_tokens*/ 16, /*reasoning_output_tokens*/ 0,
-                /*total_tokens*/ 40,
-            ),
-        )
-        .await;
-    harness.stop_turn("turn-1").await;
-
-    let goal = runtime
-        .thread_goals()
-        .get_thread_goal(thread_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
-    assert_eq!(35, goal.tokens_used);
-    assert_eq!(codex_state::ThreadGoalStatus::BudgetLimited, goal.status);
-
-    assert_eq!(
-        vec![
-            CapturedGoalEvent {
-                event_id: "call-shell".to_string(),
-                turn_id: Some("turn-1".to_string()),
-                status: ThreadGoalStatus::BudgetLimited,
-                tokens_used: 25,
-            },
-            CapturedGoalEvent {
-                event_id: "turn-1:turn-stop".to_string(),
-                turn_id: Some("turn-1".to_string()),
-                status: ThreadGoalStatus::BudgetLimited,
-                tokens_used: 35,
-            },
-        ],
-        harness.sink.goal_events()
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn budget_limited_goal_keeps_accounting_after_later_tool_finish() -> anyhow::Result<()> {
-    let runtime = test_runtime().await?;
-    let thread_id = test_thread_id()?;
-    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
-    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
-    harness.start_turn("turn-1", &TokenUsage::default()).await;
-
-    let tools = harness.tools();
-    let create_tool = tool_by_name(&tools, "create_goal");
-    create_tool
-        .handle(tool_call(
-            "create_goal",
-            "call-create-goal",
-            json!({
-                "objective": "ship goal extension backend",
-                "token_budget": 25,
-            }),
-        ))
-        .await?;
-
-    harness
-        .record_token_usage(
-            "turn-1",
-            &token_usage(
-                /*input_tokens*/ 20, /*cached_input_tokens*/ 5,
-                /*output_tokens*/ 10, /*reasoning_output_tokens*/ 0,
-                /*total_tokens*/ 30,
-            ),
-        )
-        .await;
-    harness
-        .notify_tool_finish("turn-1", "call-shell-1", "shell")
-        .await;
-    harness
-        .record_token_usage(
-            "turn-1",
-            &token_usage(
-                /*input_tokens*/ 24, /*cached_input_tokens*/ 5,
-                /*output_tokens*/ 16, /*reasoning_output_tokens*/ 0,
-                /*total_tokens*/ 40,
-            ),
-        )
-        .await;
-    harness
-        .notify_tool_finish("turn-1", "call-shell-2", "shell")
-        .await;
-
-    let goal = runtime
-        .thread_goals()
-        .get_thread_goal(thread_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
-    assert_eq!(35, goal.tokens_used);
-    assert_eq!(codex_state::ThreadGoalStatus::BudgetLimited, goal.status);
+async fn budget_limited_goal_keeps_accruing_through_tool_and_turn_completion() -> anyhow::Result<()> {
+    for stop_turn in [false, true] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+        harness.start_turn("turn-1", &TokenUsage::default()).await;
+        tool_by_name(&harness.tools(), "create_goal")
+            .handle(tool_call(
+                "create_goal",
+                "call-create-goal",
+                json!({"objective": "ship goal extension backend", "token_budget": 25}),
+            ))
+            .await?;
+        harness.sink.clear();
+        harness.record_token_usage("turn-1", &token_usage(20, 5, 10, 0, 30)).await;
+        harness.notify_tool_finish("turn-1", "call-shell-1", "shell").await;
+        harness.record_token_usage("turn-1", &token_usage(24, 5, 16, 0, 40)).await;
+        let event_id = if stop_turn {
+            harness.stop_turn("turn-1").await;
+            "turn-1:turn-stop"
+        } else {
+            harness.notify_tool_finish("turn-1", "call-shell-2", "shell").await;
+            "call-shell-2"
+        };
+        let goal = runtime.thread_goals().get_thread_goal(thread_id).await?.expect("goal");
+        assert_eq!(goal.tokens_used, 35);
+        assert_eq!(goal.status, codex_state::ThreadGoalStatus::BudgetLimited);
+        assert_eq!(
+            harness.sink.goal_events(),
+            vec![
+                CapturedGoalEvent {
+                    event_id: "call-shell-1".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    status: ThreadGoalStatus::BudgetLimited,
+                    tokens_used: 25,
+                },
+                CapturedGoalEvent {
+                    event_id: event_id.to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    status: ThreadGoalStatus::BudgetLimited,
+                    tokens_used: 35,
+                },
+            ]
+        );
+    }
     Ok(())
 }
 
@@ -1192,6 +1091,7 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
 
     let tools = harness.tools();
     let create_tool = tool_by_name(&tools, "create_goal");
+    let started_at = std::time::Instant::now();
     create_tool
         .handle(tool_call(
             "create_goal",
@@ -1228,18 +1128,26 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
     );
     let output = update_tool.handle(invocation.clone()).await?;
     let result = output.code_mode_result(&invocation.payload);
+    // Accounting measures real elapsed time, including scheduling and storage waits.
+    // It starts after this clock and stops before the tool returns, so zero is
+    // not the only valid result on a slow machine.
+    let elapsed_seconds = i64::try_from(started_at.elapsed().as_secs())?;
+    let accounted_seconds = result["goal"]["timeUsedSeconds"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("goal should report integral elapsed seconds"))?;
+    assert!((0..=elapsed_seconds).contains(&accounted_seconds));
 
     assert_eq!(
         result,
         json!({
-            "goalRef": result["goalRef"],
+            "goalRef": goal_ref(runtime.as_ref(), thread_id).await?,
             "accountingPending": false,
             "goal": {
                 "threadId": thread_id,
                 "objective": "ship goal extension backend",
                 "status": "blocked",
                 "tokensUsed": 23,
-                "timeUsedSeconds": 0,
+                "timeUsedSeconds": accounted_seconds,
                 "createdAt": result["goal"]["createdAt"],
                 "updatedAt": result["goal"]["updatedAt"],
             },
@@ -1254,6 +1162,7 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
         .await?
         .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
     assert_eq!(23, goal.tokens_used);
+    assert_eq!(accounted_seconds, goal.time_used_seconds);
     assert_eq!(codex_state::ThreadGoalStatus::Blocked, goal.status);
 
     assert_eq!(

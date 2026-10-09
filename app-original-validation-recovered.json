@@ -1,0 +1,501 @@
+{
+  "schema_version": 1,
+  "source": "C:/Users/kuh/Desktop/LOCAL-KD/sessions/2026/10/09/rollout-2026-10-09T00-25-27-01a11f1f-9916-7a03-abdb-0ff3b7924eac.jsonl",
+  "source_sha256": "bd8cbb4d3984e8cb7915c1fb71897c86bd0c912e240517bac925141486622462",
+  "source_bytes": 7503525,
+  "records_scanned": 2020,
+  "parent_messages_scanned": 160,
+  "original_worker_messages": 28,
+  "scope": "Original app_server worker only; no successor/plugin-worker edits included",
+  "modified_src_files": 32,
+  "modified_integration_files": 33,
+  "modified_files_without_direct_test_selectors": [
+    "codex-rs/app-server/src/request_processors.rs",
+    "codex-rs/app-server/src/request_processors/thread_summary.rs"
+  ],
+  "granularity": "Changed-module selectors except two exact lib.rs tests. Messages/checkpoints generally recorded modules, not exact changed-function lists. These selectors include unchanged tests within changed owners, but exclude all unmodified owners; do not describe as an exact changed-test-only list.",
+  "evidence": "Union of explicit app-progress modified/modified_tests ledger pushes and successful patch_apply_end events; runner target names and test module registrations checked against current source. Source changes are historical recovered evidence, not executable validation.",
+  "files": [
+    {
+      "path": "codex-rs/app-server/src/bespoke_event_handling.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "bespoke_event_handling::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/command_exec.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "command_exec::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/connection_rpc_gate.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "connection_rpc_gate::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/dynamic_tools.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "dynamic_tools::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/external_agent_config_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "external_agent_config::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/fs_watch.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "fs_watch::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/in_process.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "in_process::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/lib.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "tests::shutdown_force_retires_runtime_owners_with_open_channels",
+        "tests::log_format_from_env_value_accepts_only_json_case_insensitively"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/mcp_refresh.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "mcp_refresh::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/message_processor_tracing_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "message_processor::message_processor_tracing_tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/outgoing_message.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "outgoing_message::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/account_processor.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::account_processor::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/apps_processor.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::apps_processor::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/config_processor.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::config_processor::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/external_agent_config_processor_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::external_agent_config_processor::external_agent_config_processor_tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/feedback_doctor_report.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::feedback_doctor_report::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/feedback_processor.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::feedback_processor::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/process_exec_processor.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::process_exec_processor::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/remote_control_processor/remote_control_processor_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::remote_control_processor::remote_control_processor_tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/thread_lifecycle.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::thread_lifecycle::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/thread_processor_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::thread_processor::thread_processor_tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/thread_queue.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::thread_queue::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/thread_summary_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::thread_summary::thread_summary_tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/token_usage_replay.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::token_usage_replay::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/turn_processor_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::turn_processor::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "request_processors::windows_sandbox_processor::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/runtime_provenance.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "runtime_provenance::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/thread_state.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "thread_state::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/thread_status.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "thread_status::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/src/transport_tests.rs",
+      "target": "app_server_lib",
+      "selectors": [
+        "transport::tests::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/auth.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::auth::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/conversation_summary.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::conversation_summary::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/fuzzy_file_search.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::fuzzy_file_search::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/account.rs",
+      "target": "app_server_accounts",
+      "selectors": [
+        "suite::v2::account::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/analytics.rs",
+      "target": "app_server_sessions",
+      "selectors": [
+        "suite::v2::analytics::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/client_metadata.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::client_metadata::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/command_exec.rs",
+      "target": "app_server_transport",
+      "selectors": [
+        "suite::v2::command_exec::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/compaction.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::compaction::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/config_rpc.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::config_rpc::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs",
+      "target": "app_server_transport",
+      "selectors": [
+        "suite::v2::connection_handling_websocket::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/dynamic_tools.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::dynamic_tools::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/experimental_feature_list.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::experimental_feature_list::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/external_agent_config.rs",
+      "target": "app_server_sessions",
+      "selectors": [
+        "suite::v2::external_agent_config::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/fs.rs",
+      "target": "app_server_environments",
+      "selectors": [
+        "suite::v2::fs::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/hooks_list.rs",
+      "target": "app_server_plugins",
+      "selectors": [
+        "suite::v2::hooks_list::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/imagegen_extension.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::imagegen_extension::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/initialize.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::initialize::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/marketplace_remove.rs",
+      "target": "app_server_plugins",
+      "selectors": [
+        "suite::v2::marketplace_remove::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/marketplace_upgrade.rs",
+      "target": "app_server_plugins",
+      "selectors": [
+        "suite::v2::marketplace_upgrade::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/mcp_resource.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::mcp_resource::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/mcp_server_status.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::mcp_server_status::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/mcp_tool.rs",
+      "target": "app_server_environments",
+      "selectors": [
+        "suite::v2::mcp_tool::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/model_list.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::model_list::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/output_schema.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::output_schema::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/plan_item.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::plan_item::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/projects.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::projects::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/rate_limit_reset_credits.rs",
+      "target": "app_server_accounts",
+      "selectors": [
+        "suite::v2::rate_limit_reset_credits::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/rate_limits.rs",
+      "target": "app_server_accounts",
+      "selectors": [
+        "suite::v2::rate_limits::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/remote_thread_store.rs",
+      "target": "app_server_threads",
+      "selectors": [
+        "suite::v2::remote_thread_store::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/request_permissions.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::request_permissions::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/request_user_input.rs",
+      "target": "app_server_initialize",
+      "selectors": [
+        "suite::v2::request_user_input::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/selected_environment.rs",
+      "target": "app_server_environments",
+      "selectors": [
+        "suite::v2::selected_environment::"
+      ]
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/skills_list.rs",
+      "target": "app_server_plugins",
+      "selectors": [
+        "suite::v2::skills_list::"
+      ]
+    }
+  ],
+  "targets": [
+    {
+      "target": "app_server_lib",
+      "filter": "test(bespoke_event_handling::tests::) | test(command_exec::tests::) | test(connection_rpc_gate::tests::) | test(dynamic_tools::tests::) | test(external_agent_config::tests::) | test(fs_watch::tests::) | test(in_process::tests::) | test(tests::shutdown_force_retires_runtime_owners_with_open_channels) | test(tests::log_format_from_env_value_accepts_only_json_case_insensitively) | test(mcp_refresh::tests::) | test(message_processor::message_processor_tracing_tests::) | test(outgoing_message::tests::) | test(request_processors::account_processor::tests::) | test(request_processors::apps_processor::tests::) | test(request_processors::config_processor::tests::) | test(request_processors::external_agent_config_processor::external_agent_config_processor_tests::) | test(request_processors::feedback_doctor_report::tests::) | test(request_processors::feedback_processor::tests::) | test(request_processors::process_exec_processor::tests::) | test(request_processors::remote_control_processor::remote_control_processor_tests::) | test(request_processors::thread_lifecycle::tests::) | test(request_processors::thread_processor::thread_processor_tests::) | test(request_processors::thread_queue::tests::) | test(request_processors::thread_summary::thread_summary_tests::) | test(request_processors::token_usage_replay::tests::) | test(request_processors::turn_processor::tests::) | test(request_processors::windows_sandbox_processor::tests::) | test(runtime_provenance::tests::) | test(thread_state::tests::) | test(thread_status::tests::) | test(transport::tests::)"
+    },
+    {
+      "target": "app_server_initialize",
+      "filter": "test(suite::auth::) | test(suite::conversation_summary::) | test(suite::fuzzy_file_search::) | test(suite::v2::client_metadata::) | test(suite::v2::compaction::) | test(suite::v2::config_rpc::) | test(suite::v2::dynamic_tools::) | test(suite::v2::experimental_feature_list::) | test(suite::v2::imagegen_extension::) | test(suite::v2::initialize::) | test(suite::v2::mcp_resource::) | test(suite::v2::mcp_server_status::) | test(suite::v2::model_list::) | test(suite::v2::output_schema::) | test(suite::v2::plan_item::) | test(suite::v2::projects::) | test(suite::v2::request_permissions::) | test(suite::v2::request_user_input::)"
+    },
+    {
+      "target": "app_server_accounts",
+      "filter": "test(suite::v2::account::) | test(suite::v2::rate_limit_reset_credits::) | test(suite::v2::rate_limits::)"
+    },
+    {
+      "target": "app_server_sessions",
+      "filter": "test(suite::v2::analytics::) | test(suite::v2::external_agent_config::)"
+    },
+    {
+      "target": "app_server_transport",
+      "filter": "test(suite::v2::command_exec::) | test(suite::v2::connection_handling_websocket::)"
+    },
+    {
+      "target": "app_server_environments",
+      "filter": "test(suite::v2::fs::) | test(suite::v2::mcp_tool::) | test(suite::v2::selected_environment::)"
+    },
+    {
+      "target": "app_server_plugins",
+      "filter": "test(suite::v2::hooks_list::) | test(suite::v2::marketplace_remove::) | test(suite::v2::marketplace_upgrade::) | test(suite::v2::skills_list::)"
+    },
+    {
+      "target": "app_server_threads",
+      "filter": "test(suite::v2::remote_thread_store::)"
+    }
+  ],
+  "validation": "No builds, Cargo, Git, source edits, or test execution performed; root owns validation.",
+  "limitations": [
+    "Module-level expansion required because retained original filter receipts were module-granular; no inferred per-test exclusions.",
+    "Remote-thread-store integration is cfg(debug_assertions); existing fast target profile must retain debug assertions."
+  ]
+}

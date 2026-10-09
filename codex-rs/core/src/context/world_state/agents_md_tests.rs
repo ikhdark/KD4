@@ -305,6 +305,16 @@ fn instruction_retention_requires_user_role_and_complete_body() {
     let replay = state.render_history_diff(Some(&accepted), &retained);
     assert_eq!(replay.len(), 1);
     assert!(replay[0].render().contains("whole body"));
+    if let ResponseItem::Message { role, content, .. } = &mut retained[0] {
+        *role = "user".to_string();
+        let [ContentItem::InputText { text }] = content.as_mut_slice() else {
+            panic!("expected instruction text");
+        };
+        *text = text.replace("whole body", "whole");
+    }
+    let replay = state.render_history_diff(Some(&accepted), &retained);
+    assert_eq!(replay.len(), 1);
+    assert!(replay[0].render().contains("whole body"));
 }
 
 #[test]

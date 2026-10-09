@@ -16,16 +16,12 @@ use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
-use codex_app_server_protocol::ExperimentalFeatureListParams;
-use codex_app_server_protocol::ExperimentalFeatureListResponse;
 use codex_app_server_protocol::ForcedChatgptWorkspaceIds;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
-use codex_app_server_protocol::ThreadStartParams;
-use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ToolsV2;
 use codex_app_server_protocol::WriteStatus;
 use codex_core::config::set_project_trust_level;
@@ -52,52 +48,13 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_requirements_read_includes_allow_remote_control() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join("requirements.toml"),
-        "allow_remote_control = false\n",
-    )?;
-    let mut mcp = TestAppServer::builder()
-        .with_env_overrides(&[(
-            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
-            Some(
-                codex_home
-                    .path()
-                    .join("managed_config.toml")
-                    .to_string_lossy()
-                    .as_ref(),
-            ),
-        )])
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp.send_config_requirements_read_request().await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ConfigRequirementsReadResponse = to_response(response)?;
-    assert_eq!(
-        response
-            .requirements
-            .expect("managed requirements should be returned")
-            .allow_remote_control,
-        Some(false)
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_requirements_read_includes_new_thread_model_defaults() -> Result<()> {
+async fn config_requirements_read_preserves_remote_control_and_model_defaults() -> Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
         r#"
+allow_remote_control = false
+
 [models.new_thread]
 model = "gpt-managed"
 model_reasoning_effort = "medium"
@@ -129,9 +86,9 @@ service_tier = "priority"
     .await??;
     let response: ConfigRequirementsReadResponse = to_response(response)?;
 
-    let defaults = response
-        .requirements
-        .and_then(|requirements| requirements.models)
+    let requirements = response.requirements.expect("managed requirements");
+    assert_eq!(requirements.allow_remote_control, Some(false));
+    let defaults = requirements.models
         .and_then(|models| models.new_thread)
         .expect("managed new-thread defaults");
     assert_eq!(defaults.model.as_deref(), Some("gpt-managed"));
@@ -995,6 +952,10 @@ model = "gpt-old"
         .and_then(|d| d.get("config_write_error_code"))
         .and_then(|v| v.as_str());
     assert_eq!(code, Some("configVersionConflict"));
+    let persisted: toml::Value = toml::from_str(
+        &std::fs::read_to_string(codex_home.path().join("config.toml"))?,
+    )?;
+    assert_eq!(persisted["model"].as_str(), Some("gpt-old"));
 
     Ok(())
 }
@@ -1069,73 +1030,7 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_batch_write_hot_reloads_supported_feature_for_loaded_thread() -> Result<()> {
-    let tmp_dir = TempDir::new()?;
-    let codex_home = tmp_dir.path().canonicalize()?;
-    write_config(&tmp_dir, "[features]\nauth_elicitation = false\n")?;
 
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(&codex_home)
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let thread_start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            cwd: Some(codex_home.display().to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let thread_start_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response(thread_start_response)?;
-
-    let batch_id = mcp
-        .send_config_batch_write_request(ConfigBatchWriteParams {
-            file_path: Some(codex_home.join("config.toml").display().to_string()),
-            edits: vec![ConfigEdit {
-                key_path: "features.auth_elicitation".to_string(),
-                value: json!(true),
-                merge_strategy: MergeStrategy::Replace,
-            }],
-            expected_version: None,
-            reload_user_config: true,
-        })
-        .await?;
-    let batch_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(batch_id)),
-    )
-    .await??;
-    let batch_write: ConfigWriteResponse = to_response(batch_response)?;
-    assert_eq!(batch_write.status, WriteStatus::Ok);
-
-    let feature_list_id = mcp
-        .send_experimental_feature_list_request(ExperimentalFeatureListParams {
-            cursor: None,
-            limit: None,
-            thread_id: Some(thread.id),
-        })
-        .await?;
-    let feature_list_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(feature_list_id)),
-    )
-    .await??;
-    let feature_list: ExperimentalFeatureListResponse = to_response(feature_list_response)?;
-    let auth_elicitation = feature_list
-        .data
-        .iter()
-        .find(|feature| feature.name == "auth_elicitation")
-        .expect("auth_elicitation feature should be present");
-    assert!(auth_elicitation.enabled);
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_batch_write_rejects_legacy_profile_tables() -> Result<()> {

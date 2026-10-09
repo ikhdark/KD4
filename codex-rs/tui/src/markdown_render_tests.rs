@@ -115,33 +115,22 @@ fn merged_text_events_preserve_entity_decoding() {
 }
 
 #[test]
-fn empty() {
-    assert_eq!(render_markdown_text(""), Text::default());
+fn paragraphs_preserve_empty_single_multiline_and_separated_content() {
+    for (markdown, expected) in [
+        ("", Text::default()),
+        ("Hello, world!", Text::from("Hello, world!")),
+        ("Hello\nWorld", Text::from_iter(["Hello", "World"])),
+        ("Paragraph 1\n\nParagraph 2", Text::from_iter(["Paragraph 1", "", "Paragraph 2"])),
+    ] {
+        assert_eq!(render_markdown_text(markdown), expected, "{markdown:?}");
+    }
 }
 
-#[test]
-fn paragraph_single() {
-    assert_eq!(
-        render_markdown_text("Hello, world!"),
-        Text::from("Hello, world!")
-    );
-}
 
-#[test]
-fn paragraph_soft_break() {
-    assert_eq!(
-        render_markdown_text("Hello\nWorld"),
-        Text::from_iter(["Hello", "World"])
-    );
-}
 
-#[test]
-fn paragraph_multiple() {
-    assert_eq!(
-        render_markdown_text("Paragraph 1\n\nParagraph 2"),
-        Text::from_iter(["Paragraph 1", "", "Paragraph 2"])
-    );
-}
+
+
+
 
 #[test]
 fn headings() {
@@ -274,14 +263,10 @@ fn blockquote_list_then_nested_blockquote() {
 }
 
 #[test]
-fn list_item_with_inline_blockquote_on_same_line() {
-    let md = "1. > quoted\n";
-    let text = render_markdown_text(md);
-    let mut lines = text.lines.iter();
-    let first = lines.next().expect("one line");
-    // Expect content to include the ordered marker, a space, "> ", and the text
-    let s: String = first.spans.iter().map(|sp| sp.content.clone()).collect();
-    assert_eq!(s, "1. > quoted");
+fn blockquotes_begin_inline_or_on_the_next_list_line() {
+    for (markdown, expected) in [("1. > quoted\n", "1. > quoted"), ("1.\n   > quoted\n", "1. > quoted"), ("-\n  > quoted\n", "- > quoted")] {
+        assert_eq!(plain_lines(&render_markdown_text(markdown)), vec![expected]);
+    }
 }
 
 #[test]
@@ -310,43 +295,9 @@ fn blockquote_surrounded_by_blank_lines() {
     );
 }
 
-#[test]
-fn blockquote_in_ordered_list_on_next_line() {
-    // Blockquote begins on a new line within an ordered list item; it should
-    // render inline on the same marker line.
-    let md = "1.\n   > quoted\n";
-    let text = render_markdown_text(md);
-    let lines: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    assert_eq!(lines, vec!["1. > quoted".to_string()]);
-}
 
-#[test]
-fn blockquote_in_unordered_list_on_next_line() {
-    // Blockquote begins on a new line within an unordered list item; it should
-    // render inline on the same marker line.
-    let md = "-\n  > quoted\n";
-    let text = render_markdown_text(md);
-    let lines: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    assert_eq!(lines, vec!["- > quoted".to_string()]);
-}
+
+
 
 #[test]
 fn blockquote_two_paragraphs_inside_ordered_list_has_blank_line() {
@@ -442,30 +393,7 @@ fn list_item_text_blockquote_text() {
     assert_eq!(lines, vec!["1. before", "   > quoted", "   > after"]);
 }
 
-#[test]
-fn blockquote_with_heading_and_paragraph() {
-    let md = "> # Heading\n> paragraph text\n";
-    let text = render_markdown_text(md);
-    // Validate on content shape; styling is handled elsewhere
-    let lines: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    assert_eq!(
-        lines,
-        vec![
-            "> # Heading".to_string(),
-            "> ".to_string(),
-            "> paragraph text".to_string(),
-        ]
-    );
-}
+
 
 #[test]
 fn blockquote_heading_inherits_heading_style() {
@@ -486,38 +414,16 @@ fn blockquote_heading_inherits_heading_style() {
 }
 
 #[test]
-fn blockquote_with_code_block() {
-    let md = "> ```\n> code\n> ```\n";
-    let text = render_markdown_text(md);
-    let lines: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    assert_eq!(lines, vec!["> code".to_string()]);
+fn blockquoted_code_preserves_all_lines() {
+    for (markdown, expected) in [
+        ("> ```\n> code\n> ```\n", vec!["> code"]),
+        ("> ```\n> first\n> second\n> ```\n", vec!["> first", "> second"]),
+    ] {
+        assert_eq!(plain_lines(&render_markdown_text(markdown)), expected);
+    }
 }
 
-#[test]
-fn blockquote_with_multiline_code_block() {
-    let md = "> ```\n> first\n> second\n> ```\n";
-    let text = render_markdown_text(md);
-    let lines: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    assert_eq!(lines, vec!["> first", "> second"]);
-}
+
 
 #[test]
 fn nested_blockquote_with_inline_and_fenced_code() {
@@ -563,21 +469,16 @@ fn nested_blockquote_with_inline_and_fenced_code() {
 }
 
 #[test]
-fn list_unordered_single() {
-    let text = render_markdown_text("- List item 1\n");
-    let expected = Text::from_iter([Line::from_iter(["- ", "List item 1"])]);
-    assert_eq!(text, expected);
+fn unordered_lists_preserve_single_and_multiple_items() {
+    for (markdown, expected) in [
+        ("- List item 1\n", Text::from_iter([Line::from_iter(["- ", "List item 1"])])),
+        ("- List item 1\n- List item 2\n", Text::from_iter([Line::from_iter(["- ", "List item 1"]), Line::from_iter(["- ", "List item 2"])])),
+    ] {
+        assert_eq!(render_markdown_text(markdown), expected);
+    }
 }
 
-#[test]
-fn list_unordered_multiple() {
-    let text = render_markdown_text("- List item 1\n- List item 2\n");
-    let expected = Text::from_iter([
-        Line::from_iter(["- ", "List item 1"]),
-        Line::from_iter(["- ", "List item 2"]),
-    ]);
-    assert_eq!(text, expected);
-}
+
 
 #[test]
 fn list_ordered() {
@@ -717,28 +618,19 @@ fn inline_code() {
 }
 
 #[test]
-fn strong() {
-    assert_eq!(
-        render_markdown_text("**Strong**"),
-        Text::from(Line::from("Strong".bold()))
-    );
+fn inline_emphasis_styles() {
+    for (markdown, expected) in [
+        ("**Strong**", Text::from(Line::from("Strong".bold()))),
+        ("*Emphasis*", Text::from(Line::from("Emphasis".italic()))),
+        ("~~Strikethrough~~", Text::from(Line::from("Strikethrough".crossed_out()))),
+    ] {
+        assert_eq!(render_markdown_text(markdown), expected);
+    }
 }
 
-#[test]
-fn emphasis() {
-    assert_eq!(
-        render_markdown_text("*Emphasis*"),
-        Text::from(Line::from("Emphasis".italic()))
-    );
-}
 
-#[test]
-fn strikethrough() {
-    assert_eq!(
-        render_markdown_text("~~Strikethrough~~"),
-        Text::from(Line::from("Strikethrough".crossed_out()))
-    );
-}
+
+
 
 #[test]
 fn strong_emphasis() {
@@ -785,15 +677,18 @@ fn file_link_decodes_percent_encoded_bare_path_destination() {
 }
 
 #[test]
-fn file_link_appends_line_number_when_label_lacks_it() {
-    let text = render_markdown_text_for_cwd(
-        "[markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74)",
-        Path::new("/Users/example/code/codex"),
-    );
-    let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74".cyan()
-    ]));
-    assert_eq!(text, expected);
+fn file_link_locations_come_from_target_not_label() {
+    for (markdown, expected) in [
+        ("[markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74)", "codex-rs/tui/src/markdown_render.rs:74"),
+        ("[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)", "codex-rs/tui/src/markdown_render.rs:74:3"),
+        ("[markdown_render.rs#L74C3](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)", "codex-rs/tui/src/markdown_render.rs:74:3"),
+        ("[markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)", "codex-rs/tui/src/markdown_render.rs:74:3-76:9"),
+        ("[markdown_render.rs:74:3-76:9](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)", "codex-rs/tui/src/markdown_render.rs:74:3-76:9"),
+        ("[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)", "codex-rs/tui/src/markdown_render.rs:74:3-76:9"),
+        ("[markdown_render.rs#L74C3-L76C9](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)", "codex-rs/tui/src/markdown_render.rs:74:3-76:9"),
+    ] {
+        assert_eq!(render_markdown_text_for_cwd(markdown, Path::new("/Users/example/code/codex")), Text::from(Line::from_iter([expected.to_string().cyan()])), "{markdown}");
+    }
 }
 
 #[test]
@@ -808,65 +703,15 @@ fn file_link_keeps_absolute_paths_outside_cwd() {
     assert_eq!(text, expected);
 }
 
-#[test]
-fn file_link_appends_hash_anchor_when_label_lacks_it() {
-    let text = render_markdown_text_for_cwd(
-        "[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",
-        Path::new("/Users/example/code/codex"),
-    );
-    let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
-    ]));
-    assert_eq!(text, expected);
-}
 
-#[test]
-fn file_link_uses_target_path_for_hash_anchor() {
-    let text = render_markdown_text_for_cwd(
-        "[markdown_render.rs#L74C3](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",
-        Path::new("/Users/example/code/codex"),
-    );
-    let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
-    ]));
-    assert_eq!(text, expected);
-}
 
-#[test]
-fn file_link_appends_range_when_label_lacks_it() {
-    let text = render_markdown_text_for_cwd(
-        "[markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)",
-        Path::new("/Users/example/code/codex"),
-    );
-    let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-    ]));
-    assert_eq!(text, expected);
-}
 
-#[test]
-fn file_link_uses_target_path_for_range() {
-    let text = render_markdown_text_for_cwd(
-        "[markdown_render.rs:74:3-76:9](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)",
-        Path::new("/Users/example/code/codex"),
-    );
-    let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-    ]));
-    assert_eq!(text, expected);
-}
 
-#[test]
-fn file_link_appends_hash_range_when_label_lacks_it() {
-    let text = render_markdown_text_for_cwd(
-        "[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)",
-        Path::new("/Users/example/code/codex"),
-    );
-    let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-    ]));
-    assert_eq!(text, expected);
-}
+
+
+
+
+
 
 #[test]
 fn multiline_file_link_label_after_styled_prefix_does_not_panic() {
@@ -882,17 +727,7 @@ fn multiline_file_link_label_after_styled_prefix_does_not_panic() {
     assert_eq!(text, expected);
 }
 
-#[test]
-fn file_link_uses_target_path_for_hash_range() {
-    let text = render_markdown_text_for_cwd(
-        "[markdown_render.rs#L74C3-L76C9](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)",
-        Path::new("/Users/example/code/codex"),
-    );
-    let expected = Text::from(Line::from_iter([
-        "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
-    ]));
-    assert_eq!(text, expected);
-}
+
 
 #[test]
 fn url_link_shows_destination() {
@@ -1004,90 +839,21 @@ fn consecutive_unordered_list_local_file_links_do_not_detach_paths() {
 }
 
 #[test]
-fn code_block_known_lang_has_syntax_colors() {
-    let text = render_markdown_text("```rust\nfn main() {}\n```\n");
-    let content: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    // Content should be preserved; ignore trailing empty line from highlighting.
-    let content: Vec<&str> = content
-        .iter()
-        .map(std::string::String::as_str)
-        .filter(|s| !s.is_empty())
-        .collect();
-    assert_eq!(content, vec!["fn main() {}"]);
-
-    // At least one span should have non-default style (syntax highlighting).
-    let has_colored_span = text
-        .lines
-        .iter()
-        .flat_map(|l| l.spans.iter())
-        .any(|sp| sp.style.fg.is_some());
-    assert!(
-        has_colored_span,
-        "expected syntax-highlighted spans with color"
-    );
+fn fenced_code_preserves_content_and_colors_only_known_languages() {
+    for (markdown, expected, colored) in [
+        ("```rust\nfn main() {}\n```\n", "fn main() {}", true),
+        ("```xyzlang\nhello world\n```\n", "hello world", false),
+        ("```\nno lang specified\n```\n", "no lang specified", false),
+    ] {
+        let text = render_markdown_text(markdown);
+        assert_eq!(plain_lines(&text), vec![expected]);
+        assert_eq!(text.lines.iter().flat_map(|line| &line.spans).any(|span| span.style.fg.is_some()), colored);
+    }
 }
 
-#[test]
-fn code_block_unknown_lang_plain() {
-    let text = render_markdown_text("```xyzlang\nhello world\n```\n");
-    let content: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    let content: Vec<&str> = content
-        .iter()
-        .map(std::string::String::as_str)
-        .filter(|s| !s.is_empty())
-        .collect();
-    assert_eq!(content, vec!["hello world"]);
 
-    // No syntax coloring for unknown language — all spans have default style.
-    let has_colored_span = text
-        .lines
-        .iter()
-        .flat_map(|l| l.spans.iter())
-        .any(|sp| sp.style.fg.is_some());
-    assert!(
-        !has_colored_span,
-        "expected no syntax coloring for unknown lang"
-    );
-}
 
-#[test]
-fn code_block_no_lang_plain() {
-    let text = render_markdown_text("```\nno lang specified\n```\n");
-    let content: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    let content: Vec<&str> = content
-        .iter()
-        .map(std::string::String::as_str)
-        .filter(|s| !s.is_empty())
-        .collect();
-    assert_eq!(content, vec!["no lang specified"]);
-}
+
 
 #[test]
 fn code_block_multiple_lines_root() {
@@ -1176,38 +942,16 @@ Here is a code block that shows another fenced block:
 }
 
 #[test]
-fn code_block_inside_unordered_list_item_is_indented() {
-    let md = "- Item\n\n  ```\n  code line\n  ```\n";
-    let text = render_markdown_text(md);
-    let lines: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    assert_eq!(lines, vec!["- Item", "", "  code line"]);
+fn code_blocks_inside_unordered_lists_preserve_indented_lines() {
+    for (markdown, expected) in [
+        ("- Item\n\n  ```\n  code line\n  ```\n", vec!["- Item", "", "  code line"]),
+        ("- Item\n\n  ```\n  first\n  second\n  ```\n", vec!["- Item", "", "  first", "  second"]),
+    ] {
+        assert_eq!(plain_lines(&render_markdown_text(markdown)), expected);
+    }
 }
 
-#[test]
-fn code_block_multiple_lines_inside_unordered_list() {
-    let md = "- Item\n\n  ```\n  first\n  second\n  ```\n";
-    let text = render_markdown_text(md);
-    let lines: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    assert_eq!(lines, vec!["- Item", "", "  first", "  second"]);
-}
+
 
 #[test]
 fn list_item_after_code_block_keeps_blank_separator() {
@@ -1243,12 +987,7 @@ fn outer_list_item_after_nested_code_block_keeps_blank_separator() {
     );
 }
 
-#[test]
-fn list_item_after_simple_item_stays_compact() {
-    let md = "1. First\n\n2. Second\n";
-    let text = render_markdown_text(md);
-    assert_eq!(plain_lines(&text), vec!["1. First", "2. Second"]);
-}
+
 
 #[test]
 fn multiline_finding_items_are_separated_snapshot() {
@@ -1504,36 +1243,8 @@ fn nested_item_continuation_paragraph_is_indented() {
 
 #[test]
 fn code_block_preserves_trailing_blank_lines() {
-    // A fenced code block with an intentional trailing blank line must keep it.
-    let md = "```rust\nfn main() {}\n\n```\n";
-    let text = render_markdown_text(md);
-    let content: Vec<String> = text
-        .lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        })
-        .collect();
-    // Should have: "fn main() {}" then "" (the blank line).
-    // Filter only to content lines (skip leading/trailing empty from rendering).
-    assert!(
-        content.iter().any(|c| c == "fn main() {}"),
-        "expected code line, got {content:?}"
-    );
-    // The trailing blank line inside the fence should be preserved.
-    let code_start = content.iter().position(|c| c == "fn main() {}").unwrap();
-    assert!(
-        content.len() > code_start + 1,
-        "expected a line after 'fn main() {{}}' but content ends: {content:?}"
-    );
-    assert_eq!(
-        content[code_start + 1],
-        "",
-        "trailing blank line inside code fence was lost: {content:?}"
-    );
+    let markdown = "```rust\nfn main() {}\n\n```\n";
+    assert_eq!(plain_lines(&render_markdown_text(markdown)), vec!["fn main() {}", ""]);
 }
 
 #[test]
@@ -1728,7 +1439,8 @@ fn table_falls_back_to_key_value_records_if_grid_cannot_fit() {
         .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
         .collect();
 
-    assert!(lines.first().is_some_and(|line| line.contains("c1")));
+    let expected = (1..=10).map(|index| format!(" {:<3}  {index}", format!("c{index}"))).collect::<Vec<_>>();
+    assert_eq!(lines, expected);
     assert!(
         lines
             .iter()

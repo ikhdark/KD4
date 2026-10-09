@@ -610,7 +610,7 @@ mod tests {
             response(
                 &["git", "diff", "--numstat", "base-sha..head-sha"],
                 /*exit_code*/ 0,
-                "1\t0\tfile\n",
+                "1\t0\tfile\n3\t2\tother\n-\t-\tbinary\n",
             ),
         ]);
 
@@ -621,8 +621,8 @@ mod tests {
         assert_eq!(
             stats,
             GitBranchDiffStats {
-                additions: 1,
-                deletions: 0,
+                additions: 4,
+                deletions: 2,
             }
         );
         assert!(runner.saw(&["git", "merge-base", "head-sha", "refs/remotes/origin/main"]));

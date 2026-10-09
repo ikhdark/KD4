@@ -1184,6 +1184,45 @@ mod tests {
             extract_failure(&err).map(|failure| failure.code),
             Some(SetupErrorCode::OrchestratorHelperIncomplete)
         );
+        let marker = super::SetupMarker {
+            version: super::SETUP_VERSION,
+            offline_username: "offline".to_string(),
+            online_username: "online".to_string(),
+            created_at: None,
+            proxy_ports: vec![],
+            allow_local_binding: false,
+        };
+        let mut users = super::SandboxUsersFile {
+            version: super::SETUP_VERSION,
+            offline: super::SandboxUserRecord {
+                username: "offline".to_string(),
+                password: "opaque encrypted password".to_string(),
+            },
+            online: super::SandboxUserRecord {
+                username: "online".to_string(),
+                password: "opaque encrypted password".to_string(),
+            },
+        };
+        fs::create_dir_all(super::sandbox_dir(codex_home.path())).expect("sandbox dir");
+        fs::create_dir_all(super::sandbox_secrets_dir(codex_home.path())).expect("secrets dir");
+        let marker_path = super::setup_marker_path(codex_home.path());
+        let users_path = super::sandbox_users_path(codex_home.path());
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).expect("write marker");
+        assert!(verify_setup_completed(codex_home.path()).is_err(), "users still missing");
+        fs::write(&users_path, serde_json::to_vec(&users).unwrap()).expect("write users");
+        verify_setup_completed(codex_home.path()).expect("matching artifacts are ready");
+
+        users.version -= 1;
+        fs::write(&users_path, serde_json::to_vec(&users).unwrap()).expect("write old users");
+        assert!(verify_setup_completed(codex_home.path()).is_err(), "old users rejected");
+        users.version = super::SETUP_VERSION;
+        fs::write(&users_path, serde_json::to_vec(&users).unwrap()).expect("restore users");
+        let mut old_marker = marker;
+        old_marker.version -= 1;
+        fs::write(&marker_path, serde_json::to_vec(&old_marker).unwrap()).expect("write old marker");
+        assert!(verify_setup_completed(codex_home.path()).is_err(), "old marker rejected");
+        fs::write(&marker_path, b"{").expect("write malformed marker");
+        assert!(verify_setup_completed(codex_home.path()).is_err(), "malformed marker rejected");
     }
 
     fn permissions_for(
@@ -1451,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_marker_request_mismatch_reason_ignores_proxy_drift_for_online_identity() {
+    fn setup_marker_request_mismatch_reason_tracks_offline_firewall_fields() {
         let marker = super::SetupMarker {
             version: super::SETUP_VERSION,
             offline_username: "offline".to_string(),
@@ -1460,39 +1499,33 @@ mod tests {
             proxy_ports: vec![3128],
             allow_local_binding: false,
         };
-        let desired = super::OfflineProxySettings {
-            proxy_ports: vec![1081, 8080],
-            allow_local_binding: true,
-        };
-
-        assert_eq!(
-            marker.request_mismatch_reason(super::SandboxNetworkIdentity::Online, &desired),
-            None
-        );
-    }
-
-    #[test]
-    fn setup_marker_request_mismatch_reason_reports_offline_firewall_drift() {
-        let marker = super::SetupMarker {
-            version: super::SETUP_VERSION,
-            offline_username: "offline".to_string(),
-            online_username: "online".to_string(),
-            created_at: None,
-            proxy_ports: vec![3128],
-            allow_local_binding: false,
-        };
-        let desired = super::OfflineProxySettings {
-            proxy_ports: vec![1081, 8080],
-            allow_local_binding: true,
-        };
-
-        assert_eq!(
-            marker.request_mismatch_reason(super::SandboxNetworkIdentity::Offline, &desired),
-            Some(
-                "offline firewall settings changed (stored_ports=[3128], desired_ports=[1081, 8080], stored_allow_local_binding=false, desired_allow_local_binding=true)"
-                    .to_string()
-            )
-        );
+        for (ports, allow_local_binding) in [
+            (vec![3128], false),
+            (vec![1081, 8080], false),
+            (vec![3128], true),
+            (vec![1081, 8080], true),
+        ] {
+            let desired = super::OfflineProxySettings {
+                proxy_ports: ports,
+                allow_local_binding,
+            };
+            assert_eq!(
+                marker.request_mismatch_reason(super::SandboxNetworkIdentity::Online, &desired),
+                None
+            );
+            let expected = if desired == marker.offline_proxy_settings() {
+                None
+            } else {
+                Some(format!(
+                    "offline firewall settings changed (stored_ports=[3128], desired_ports={:?}, stored_allow_local_binding=false, desired_allow_local_binding={allow_local_binding})",
+                    desired.proxy_ports,
+                ))
+            };
+            assert_eq!(
+                marker.request_mismatch_reason(super::SandboxNetworkIdentity::Offline, &desired),
+                expected
+            );
+        }
     }
 
     #[test]

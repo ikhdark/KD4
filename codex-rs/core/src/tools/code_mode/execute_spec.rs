@@ -129,7 +129,10 @@ SOURCE: /[\s\S]+/
                 .count(),
             1
         );
-        assert!(exec.description.contains("write_stdin(args:"));
-        assert!(exec.description.contains("exec_command(args:"));
+        assert!(exec.description.ends_with(concat!(
+            "Eager nested tool contracts:\n\n",
+            "declare const tools: { exec_command(args: unknown): Promise<unknown>; };\n\n",
+            "declare const tools: { write_stdin(args: unknown): Promise<unknown>; };",
+        )));
     }
 }

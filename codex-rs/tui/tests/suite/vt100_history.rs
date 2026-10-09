@@ -3,22 +3,6 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 
-// Small helper macro to assert a collection contains an item with a clearer
-// failure message.
-macro_rules! assert_contains {
-    ($collection:expr, $item:expr $(,)?) => {
-        assert!(
-            $collection.contains(&$item),
-            "Expected {:?} to contain {:?}",
-            $collection,
-            $item
-        );
-    };
-    ($collection:expr, $item:expr, $($arg:tt)+) => {
-        assert!($collection.contains(&$item), $($arg)+);
-    };
-}
-
 struct TestScenario {
     term: codex_tui::Terminal<VT100Backend>,
 }
@@ -49,8 +33,10 @@ fn basic_insertion_no_wrap() {
     let lines = vec!["first".into(), "second".into()];
     scenario.run_insert(lines);
     let rows = scenario.term.backend().vt100().screen().contents();
-    assert_contains!(rows, String::from("first"));
-    assert_contains!(rows, String::from("second"));
+    assert_eq!(
+        rows.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
 }
 
 #[test]
@@ -115,8 +101,14 @@ fn mixed_ansi_spans() {
 
     let line = vec!["red".red(), "+plain".into()].into();
     scenario.run_insert(vec![line]);
-    let rows = scenario.term.backend().vt100().screen().contents();
-    assert_contains!(rows, String::from("red+plain"));
+    let screen = scenario.term.backend().vt100().screen();
+    let row = (0..6).find(|row| screen.cell(*row, 0).unwrap().contents() == "r")
+        .expect("styled line must render");
+    assert_eq!(screen.contents().trim(), "red+plain");
+    for col in 0..9 {
+        let expected = if col < 3 { vt100::Color::Idx(1) } else { vt100::Color::Default };
+        assert_eq!(screen.cell(row, col).unwrap().fgcolor(), expected, "column {col}");
+    }
 }
 
 #[test]

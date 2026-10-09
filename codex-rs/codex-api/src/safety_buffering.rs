@@ -26,42 +26,29 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn reads_treatment_from_http_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER,
-            HeaderValue::from_static("true"),
-        );
-        headers.insert(
-            X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER,
-            HeaderValue::from_static("faster-model"),
-        );
-
-        assert_eq!(
-            treatment_from_headers(&headers),
-            Some(SafetyBufferingTreatment {
-                faster_model: Some("faster-model".to_string()),
-            })
-        );
-    }
-
-    #[test]
-    fn buffering_enabled_header_does_not_gate_the_faster_model_fallback() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER,
-            HeaderValue::from_static("false"),
-        );
-        headers.insert(
-            X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER,
-            HeaderValue::from_static("faster-model"),
-        );
-
-        assert_eq!(
-            treatment_from_headers(&headers),
-            Some(SafetyBufferingTreatment {
-                faster_model: Some("faster-model".to_string()),
-            })
-        );
+    fn treatment_depends_on_header_presence_not_enabled_value() {
+        for enabled in [None, Some("true"), Some("false")] {
+            for faster_model in [None, Some("faster-model")] {
+                let mut headers = HeaderMap::new();
+                if let Some(enabled) = enabled {
+                    headers.insert(
+                        X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER,
+                        HeaderValue::from_static(enabled),
+                    );
+                }
+                if let Some(faster_model) = faster_model {
+                    headers.insert(
+                        X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER,
+                        HeaderValue::from_static(faster_model),
+                    );
+                }
+                assert_eq!(
+                    treatment_from_headers(&headers),
+                    (enabled.is_some() || faster_model.is_some()).then(|| SafetyBufferingTreatment {
+                        faster_model: faster_model.map(str::to_owned),
+                    }),
+                );
+            }
+        }
     }
 }

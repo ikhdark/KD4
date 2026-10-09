@@ -388,6 +388,21 @@ mod tests {
             json!({"$ref":"#/$defs/missing"}),
             json!({"type":"object", "not":{"required":["unsafe"]}}),
             json!({"type":"object", "patternProperties":{"^x":{"type":"string"}}}),
+            // JSON Schema validation constraints must remain recoverable even
+            // when TypeScript can describe only the surrounding structure.
+            json!({"type":"array", "uniqueItems":true}),
+            json!({"type":"array", "contains":{"const":42}}),
+            json!({"type":"array", "contains":{"type":"number"}, "minContains":2}),
+            json!({"type":"array", "contains":{"type":"number"}, "maxContains":3}),
+            json!({"type":"array", "prefixItems":[{"type":"string"}], "unevaluatedItems":false}),
+            json!({"type":"object", "minProperties":1}),
+            json!({"type":"object", "maxProperties":2}),
+            json!({"type":"object", "propertyNames":{"pattern":"^[a-z]+$"}}),
+            json!({"type":"object", "unevaluatedProperties":false}),
+            json!({"type":"object", "dependentRequired":{"credit_card":["billing_address"]}}),
+            json!({"type":"object", "dependentSchemas":{"credit_card":{"required":["billing_address"]}}}),
+            json!({"type":"object", "dependencies":{"credit_card":["billing_address"]}}),
+            json!({"type":"object", "properties":{"ids":{"type":"array", "uniqueItems":true}}}),
         ] {
             for output in [false, true] {
                 let definition = ToolDefinition {
@@ -476,9 +491,15 @@ mod tests {
         assert_eq!(rendered.matches("type CodeModeSelector2 = ").count(), 1);
         assert_eq!(rendered.matches("kind: \"file\";").count(), 1);
         assert_eq!(rendered.matches("kind: \"different\";").count(), 1);
-        for name in ["read_file", "read_output", "another_selector"] {
+        for (name, alias) in [
+            ("read_file", "CodeModeSelector"),
+            ("read_output", "CodeModeSelector"),
+            ("another_selector", "CodeModeSelector2"),
+        ] {
             assert!(
-                rendered.contains(&format!("{name}(args: CodeModeSelector")),
+                rendered.contains(&format!(
+                    "{name}(args: {alias}, options?: ToolCallOptions): Promise<{alias}>;"
+                )),
                 "{rendered}"
             );
         }

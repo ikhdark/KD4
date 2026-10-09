@@ -106,15 +106,13 @@ mod tests {
     }
 
     #[test]
-    fn desired_height_empty() {
-        let widget = PendingThreadApprovals::new();
-        assert_eq!(widget.desired_height(/*width*/ 40), 0);
-    }
-
-    #[test]
     fn render_single_thread_snapshot() {
         let mut widget = PendingThreadApprovals::new();
-        widget.set_threads(vec!["Robie [explorer]".to_string()]);
+        assert!(widget.is_empty());
+        assert_eq!(widget.desired_height(/*width*/ 40), 0);
+        assert!(widget.set_threads(vec!["Robie [explorer]".to_string()]));
+        assert!(!widget.is_empty());
+        assert!(!widget.set_threads(vec!["Robie [explorer]".to_string()]));
 
         assert_snapshot!(
             snapshot_rows(&widget, /*width*/ 40).replace(' ', "."),
@@ -135,8 +133,14 @@ mod tests {
             "Extra agent".to_string(),
         ]);
 
+        let rendered = snapshot_rows(&widget, /*width*/ 44);
+        // The preview omits a pending thread, so it must tell the user the list
+        // is incomplete. The whitespace visualization below turns spaces and
+        // literal dots into the same character and cannot enforce that signal.
+        assert!(rendered.lines().any(|line| line.trim() == "..."));
+        assert!(!rendered.contains("Extra agent"));
         assert_snapshot!(
-            snapshot_rows(&widget, /*width*/ 44).replace(' ', "."),
+            rendered.replace(' ', "."),
             @r"
         ..!.Approval.needed.in.Main.[default].......
         ..!.Approval.needed.in.Robie.[explorer].....

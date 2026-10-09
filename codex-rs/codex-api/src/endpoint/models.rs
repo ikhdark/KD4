@@ -212,25 +212,27 @@ mod tests {
 
     #[tokio::test]
     async fn appends_client_version_query() {
+        for (version, expected_etag) in [("0.99.0", None), ("0.1.0", Some("\"abc\""))] {
         let response = ModelsResponse { models: Vec::new() };
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(serde_json::to_vec(&response).unwrap()),
-            etag: None,
+            etag: expected_etag.map(str::to_owned),
             status: StatusCode::OK,
         };
 
         let provider = provider("https://example.com/api/codex");
-        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, version);
         let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
 
-        let (models, _) = client
+        let (models, etag) = client
             .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 
         assert_eq!(models.len(), 0);
+        assert_eq!(etag.as_deref(), expected_etag);
 
         let url = transport
             .last_request
@@ -242,8 +244,9 @@ mod tests {
             .clone();
         assert_eq!(
             url,
-            "https://example.com/api/codex/models?client_version=0.99.0"
+            format!("https://example.com/api/codex/models?client_version={version}")
         );
+        }
     }
 
     #[tokio::test]
@@ -293,34 +296,7 @@ mod tests {
             .await
             .expect("request should succeed");
 
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].slug, "gpt-test");
-        assert_eq!(models[0].supported_in_api, true);
-        assert_eq!(models[0].priority, 1);
-    }
-
-    #[tokio::test]
-    async fn list_models_includes_etag() {
-        let response = ModelsResponse { models: Vec::new() };
-
-        let transport = CapturingTransport {
-            last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(serde_json::to_vec(&response).unwrap()),
-            etag: Some("\"abc\"".to_string()),
-            status: StatusCode::OK,
-        };
-
-        let provider = provider("https://example.com/api/codex");
-        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
-        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
-
-        let (models, etag) = client
-            .list_models(request_url, HeaderMap::new())
-            .await
-            .expect("request should succeed");
-
-        assert_eq!(models.len(), 0);
-        assert_eq!(etag, Some("\"abc\"".to_string()));
+        assert_eq!(models, response.models);
     }
 
     #[tokio::test]
@@ -405,10 +381,13 @@ mod tests {
         let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
         let result = client
-            .list_models_conditional(request_url, HeaderMap::new())
+            .list_models_conditional(request_url.clone(), HeaderMap::new())
             .await
             .expect("304 should be a successful conditional response");
 
         assert!(matches!(result, ModelsListResult::NotModified));
+        let error = client.list_models(request_url, HeaderMap::new()).await.unwrap_err();
+        assert!(matches!(error, ApiError::Stream(message)
+            if message == "models endpoint returned 304 without a conditional request"));
     }
 }

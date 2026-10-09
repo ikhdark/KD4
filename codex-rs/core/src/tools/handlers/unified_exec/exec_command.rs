@@ -589,18 +589,11 @@ impl ExecCommandHandler {
             ..
         } = args;
 
-        // Direct caller caps remain authoritative; nested commands get enough
-        // display space to avoid a second recovery call for small explicit caps.
-        // Historical artifact retrieval does not establish producer truncation.
+        // Preserve explicit caps for retention as well as display. Code mode
+        // reapplies the original argument when projecting the result; inflating
+        // it here could hide a reduction from prepare_recovery_artifact.
         let max_output_tokens = max_output_tokens.or_else(|| {
             crate::tools::shell_output_summary::source_read_output_budget(&hook_command)
-        });
-        let max_output_tokens = max_output_tokens.map(|limit| {
-            if nested && limit != 0 {
-                limit.max(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS)
-            } else {
-                limit
-            }
         });
 
         let exec_permission_approvals_enabled =

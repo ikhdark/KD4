@@ -148,6 +148,7 @@ fn collect_code_mode_tool_definitions_disambiguates_flattened_name_collisions() 
 
     let definitions = collect_code_mode_tool_definitions(&specs);
 
+    assert_ne!(definitions[0].name, definitions[1].name);
     assert_eq!(
         definitions
             .iter()
@@ -284,6 +285,7 @@ fn code_mode_aliases_disambiguate_identifier_normalization_collisions() {
         })
     });
     let definitions = collect_code_mode_tool_definitions(&specs);
+    assert_ne!(definitions[0].name, definitions[1].name);
     assert_eq!(
         definitions
             .iter()

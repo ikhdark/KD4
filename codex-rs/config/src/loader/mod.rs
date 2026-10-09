@@ -1785,44 +1785,19 @@ foo = "xyzzy"
     }
 
     #[test]
-    fn windows_system_requirements_toml_file_uses_expected_suffix() {
-        let expected = windows_program_data_dir_from_known_folder()
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS))
-            .join("OpenAI")
-            .join("Codex")
-            .join("requirements.toml");
-        assert_eq!(
-            windows_system_requirements_toml_file()
-                .expect("requirements.toml path")
-                .as_path(),
-            expected.as_path()
-        );
-        assert!(
-            windows_system_requirements_toml_file()
-                .expect("requirements.toml path")
-                .as_path()
-                .ends_with(Path::new("OpenAI").join("Codex").join("requirements.toml"))
-        );
+    fn windows_system_files_use_the_program_data_codex_directory() {
+        let program_data = windows_program_data_dir_from_known_folder()
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS));
+        for (path, filename) in [
+            (windows_system_requirements_toml_file(), "requirements.toml"),
+            (windows_system_config_toml_file(), "config.toml"),
+        ] {
+            let path = path.expect("system config path");
+            let suffix = Path::new("OpenAI").join("Codex").join(filename);
+            assert_eq!(path.as_path(), program_data.join(&suffix));
+            assert!(path.as_path().ends_with(suffix));
+        }
     }
 
-    #[test]
-    fn windows_system_config_toml_file_uses_expected_suffix() {
-        let expected = windows_program_data_dir_from_known_folder()
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS))
-            .join("OpenAI")
-            .join("Codex")
-            .join("config.toml");
-        assert_eq!(
-            windows_system_config_toml_file()
-                .expect("config.toml path")
-                .as_path(),
-            expected.as_path()
-        );
-        assert!(
-            windows_system_config_toml_file()
-                .expect("config.toml path")
-                .as_path()
-                .ends_with(Path::new("OpenAI").join("Codex").join("config.toml"))
-        );
-    }
+
 }

@@ -413,28 +413,19 @@ async fn test_get_has_changes_non_git_directory_returns_none() {
 }
 
 #[tokio::test]
-async fn test_get_has_changes_clean_repo_returns_false() {
+async fn test_get_has_changes_tracks_clean_tracked_and_untracked_states() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let repo_path = create_test_git_repo(&temp_dir).await;
     assert_eq!(get_has_changes(&repo_path).await, Some(false));
-}
-
-#[tokio::test]
-async fn test_get_has_changes_with_tracked_change_returns_true() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let repo_path = create_test_git_repo(&temp_dir).await;
-
     fs::write(repo_path.join("test.txt"), "updated tracked file").expect("write tracked file");
     assert_eq!(get_has_changes(&repo_path).await, Some(true));
-}
-
-#[tokio::test]
-async fn test_get_has_changes_with_untracked_change_returns_true() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let repo_path = create_test_git_repo(&temp_dir).await;
+    fs::write(repo_path.join("test.txt"), "test content").expect("restore tracked file");
+    assert_eq!(get_has_changes(&repo_path).await, Some(false));
 
     fs::write(repo_path.join("new_file.txt"), "untracked").expect("write untracked file");
     assert_eq!(get_has_changes(&repo_path).await, Some(true));
+    fs::remove_file(repo_path.join("new_file.txt")).expect("remove untracked file");
+    assert_eq!(get_has_changes(&repo_path).await, Some(false));
 }
 
 #[tokio::test]
@@ -499,6 +490,16 @@ async fn test_get_git_working_tree_state_branch_fallback() {
         .output()
         .await
         .expect("Failed to create feature branch");
+    // Distinguish the feature remote from the default remote. Equal SHAs would
+    // let an implementation that never examines fallback branches pass.
+    fs::write(repo_path.join("test.txt"), "feature change").unwrap();
+    let commit = Command::new("git")
+        .args(["commit", "-am", "feature change"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("commit feature change");
+    assert!(commit.status.success(), "feature commit failed: {commit:?}");
     Command::new("git")
         .args(["push", "-u", "origin", "feature"])
         .current_dir(&repo_path)
@@ -760,36 +761,34 @@ async fn test_get_git_working_tree_state_unpushed_commit() {
 
 #[test]
 fn test_git_info_serialization() {
-    let git_info = GitInfo {
-        commit_hash: Some(GitSha::new("abc123def456")),
-        branch: Some("main".to_string()),
-        repository_url: Some("https://github.com/example/repo.git".to_string()),
-    };
-
-    let json = serde_json::to_string(&git_info).expect("Should serialize GitInfo");
-    let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse JSON");
-
-    assert_eq!(parsed["commit_hash"], "abc123def456");
-    assert_eq!(parsed["branch"], "main");
-    assert_eq!(
-        parsed["repository_url"],
-        "https://github.com/example/repo.git"
-    );
-}
-
-#[test]
-fn test_git_info_serialization_with_nones() {
-    let git_info = GitInfo {
-        commit_hash: None,
-        branch: None,
-        repository_url: None,
-    };
-
-    let json = serde_json::to_string(&git_info).expect("Should serialize GitInfo");
-    let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse JSON");
-
-    // Fields with None values should be omitted due to skip_serializing_if
-    assert!(!parsed.as_object().unwrap().contains_key("commit_hash"));
-    assert!(!parsed.as_object().unwrap().contains_key("branch"));
-    assert!(!parsed.as_object().unwrap().contains_key("repository_url"));
+    for (git_info, expected) in [
+        (
+            GitInfo {
+                commit_hash: Some(GitSha::new("abc123def456")),
+                branch: Some("main".to_string()),
+                repository_url: Some("https://github.com/example/repo.git".to_string()),
+            },
+            serde_json::json!({
+                "commit_hash": "abc123def456",
+                "branch": "main",
+                "repository_url": "https://github.com/example/repo.git",
+            }),
+        ),
+        (
+            GitInfo {
+                commit_hash: None,
+                branch: None,
+                repository_url: None,
+            },
+            serde_json::json!({}),
+        ),
+    ] {
+        let json = serde_json::to_string(&git_info).expect("Should serialize GitInfo");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse JSON");
+        assert_eq!(parsed, expected);
+        let restored: GitInfo = serde_json::from_str(&json).expect("Should deserialize GitInfo");
+        assert_eq!(restored.commit_hash, git_info.commit_hash);
+        assert_eq!(restored.branch, git_info.branch);
+        assert_eq!(restored.repository_url, git_info.repository_url);
+    }
 }

@@ -95,6 +95,12 @@ async fn usage_command_opens_menu_when_reset_is_available_snapshot() {
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenTokenActivity));
+    assert!(rx.try_recv().is_err());
+    chat.dispatch_command(SlashCommand::Usage);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenRateLimitResetCredits));
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -247,23 +253,7 @@ async fn usage_command_can_check_reset_availability_for_workspace_accounts() {
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenRateLimitResetCredits));
 }
 
-#[tokio::test]
-async fn usage_menu_rate_limit_reset_entry_opens_reset_flow() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-    let request_id = chat.start_rate_limit_reset_startup_check();
-    assert!(chat.finish_rate_limit_reset_hint_refresh(
-        request_id,
-        Vec::new(),
-        Ok(reset_credits(/*available_count*/ 2)),
-    ));
-    chat.dispatch_command(SlashCommand::Usage);
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenRateLimitResetCredits));
-}
 
 #[tokio::test]
 async fn rate_limit_reset_popup_states_snapshot() {
@@ -613,11 +603,14 @@ async fn no_credit_outcome_disables_reset_entry_in_usage_menu() {
 
 #[tokio::test]
 async fn rate_limit_reset_redemption_cannot_be_dismissed_while_in_flight() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     set_chatgpt_auth(&mut chat);
 
     let request_id = chat.show_rate_limit_reset_consuming_popup();
     dismiss_popup(&mut chat);
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Using a reset..."));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
     assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Using a reset..."));
 
     assert!(finish_reset_consume_outcome(
@@ -638,16 +631,7 @@ async fn rate_limit_reset_redemption_cannot_be_dismissed_while_in_flight() {
     assert!(chat.bottom_pane.no_modal_or_popup_active());
 }
 
-#[tokio::test]
-async fn rate_limit_reset_redemption_allows_ctrl_c_to_quit_while_in_flight() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.show_rate_limit_reset_consuming_popup();
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Using a reset..."));
-}
 
 #[tokio::test]
 async fn already_redeemed_is_an_idempotent_success() {
@@ -814,23 +798,27 @@ async fn account_change_dismisses_reset_popup_beneath_overlay() {
 }
 
 #[tokio::test]
-async fn startup_check_shows_available_reset_hint_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+async fn startup_check_shows_reset_hint_only_when_available_for_personal_and_workspace_accounts() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     set_chatgpt_auth(&mut chat);
-    let hint_request_id = chat.start_rate_limit_reset_startup_check();
-
-    assert!(chat.finish_rate_limit_reset_hint_refresh(
-        hint_request_id,
-        Vec::new(),
-        Ok(reset_credits(/*available_count*/ 2)),
-    ));
-    let rendered = lines_to_single_string(
-        &chat
-            .pending_rate_limit_reset_hint()
-            .expect("pending reset hint")
-            .display_lines(/*width*/ 80),
-    );
-    assert_chatwidget_snapshot!("rate_limit_reset_available_hint", rendered);
+    for plan_type in [chat.plan_type, Some(PlanType::Business)] {
+        chat.plan_type = plan_type;
+        for available_count in [2, 0] {
+            let request_id = chat.start_rate_limit_reset_startup_check();
+            assert!(chat.finish_rate_limit_reset_hint_refresh(
+                request_id, Vec::new(), Ok(reset_credits(available_count)),
+            ));
+            assert_eq!(chat.available_rate_limit_reset_credits, Some(available_count));
+            if available_count == 0 {
+                assert!(chat.pending_rate_limit_reset_hint().is_none());
+            } else {
+                let rendered = lines_to_single_string(
+                    &chat.pending_rate_limit_reset_hint().expect("pending reset hint").display_lines(80),
+                );
+                assert_chatwidget_snapshot!("rate_limit_reset_available_hint", rendered);
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -898,35 +886,9 @@ async fn starting_rate_limit_reset_redemption_clears_deferred_startup_hint() {
     assert!(chat.pending_rate_limit_reset_hint().is_none());
 }
 
-#[tokio::test]
-async fn startup_check_omits_reset_hint_when_none_are_available() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-    let hint_request_id = chat.start_rate_limit_reset_startup_check();
 
-    assert!(chat.finish_rate_limit_reset_hint_refresh(
-        hint_request_id,
-        Vec::new(),
-        Ok(reset_credits(/*available_count*/ 0)),
-    ));
-    assert!(chat.pending_rate_limit_reset_hint().is_none());
-}
 
-#[tokio::test]
-async fn startup_check_shows_reset_hint_for_workspace_account_with_credit() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-    chat.plan_type = Some(PlanType::Business);
-    let hint_request_id = chat.start_rate_limit_reset_startup_check();
 
-    assert!(chat.finish_rate_limit_reset_hint_refresh(
-        hint_request_id,
-        Vec::new(),
-        Ok(reset_credits(/*available_count*/ 2)),
-    ));
-    assert!(chat.pending_rate_limit_reset_hint().is_some());
-    assert_eq!(chat.available_rate_limit_reset_credits, Some(2));
-}
 
 fn consume_response(
     outcome: ConsumeAccountRateLimitResetCreditOutcome,

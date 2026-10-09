@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -31,35 +32,6 @@ class RootMaintenanceTest(unittest.TestCase):
                 mock.patch.object(maintenance, "SCRIPT_AUDIT_ROOTS", (scripts,)),
             ):
                 yield scripts
-
-    def test_mixed_changed_scripts_report_uncovered_path(self):
-        maintenance = load_root_maintenance_module()
-        with (
-            self.temporary_script_tree(maintenance),
-            mock.patch.object(maintenance, "run") as run,
-        ):
-            self.assertEqual(
-                maintenance.main(
-                    [
-                        "test-python",
-                        "--changed",
-                        "scripts/readme_toc.py",
-                        "--changed",
-                        "scripts/unmapped_helper.py",
-                    ]
-                ),
-                2,
-            )
-            run.assert_not_called()
-        with mock.patch.object(
-            maintenance,
-            "script_inventory",
-            side_effect=AssertionError("broad discovery"),
-        ):
-            self.assertIn(
-                "scripts.test_readme_toc",
-                maintenance.test_modules_for_changed_path("scripts/readme_toc.py"),
-            )
 
     def test_root_maintenance_covers_current_script_tooling_tests(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -181,6 +153,64 @@ class RootMaintenanceTest(unittest.TestCase):
             ["scripts.test_kd4_model_inference", "scripts.test_kd4_perf_snapshot"],
         )
 
+    def test_script_test_entrypoints_have_explicit_validation_declarations(self):
+        maintenance = load_root_maintenance_module()
+        config = json.loads((REPO_ROOT / ".codex/test-runners.json").read_text())
+        declarations = [row for row in config["runners"]
+                        if any("scripts/root_maintenance.py" in prefix
+                               for prefix in row["prefixes"])]
+        # Classify only the public test subcommand, not audit-scripts (whose
+        # --quick mode omits tests) or arbitrary scripts through run-python.js.
+        self.assertEqual(declarations, [
+            {
+                "programs": ["python", "python3", "py"],
+                "prefixes": [["scripts/root_maintenance.py", "test-python"]],
+                "options": {"-B": 0, "-u": 0},
+                "allow_extra_args": True, "operations": ["test"],
+            },
+            {
+                "programs": ["node"],
+                "prefixes": [["scripts/run-python.js", "scripts/root_maintenance.py", "test-python"]],
+                "allow_extra_args": True, "operations": ["test"],
+            },
+        ])
+        for option, code in (("--help", 0), ("--dry-run", 2), ("--list", 2),
+                             ("--no-run", 2), ("--quick", 2)):
+            with (self.subTest(option=option),
+                  mock.patch.object(maintenance, "run") as run,
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(io.StringIO()),
+                  self.assertRaises(SystemExit) as exit_status):
+                maintenance.main(["test-python", option])
+            self.assertEqual(exit_status.exception.code, code)
+            run.assert_not_called()
+        self.assertIn(
+            "scripts.test_root_maintenance.RootMaintenanceTest.test_script_test_entrypoints_have_explicit_validation_declarations",
+            maintenance.python_test_targets([], [".codex/test-runners.json"]),
+        )
+
+    def test_runner_changes_select_split_regressions_once_through_cli(self):
+        maintenance = load_root_maintenance_module()
+        # These modules exercise runner dispatch, admission, log diagnostics,
+        # metrics and scheduling; adjacency alone cannot discover split tests.
+        expected = {
+            "scripts.test_rust_test_runner",
+            "scripts.test_rust_test_admission",
+            "scripts.test_rust_test_runner_failure_diagnostics",
+            "scripts.test_validation_metrics",
+            "scripts.test_validation_scheduling",
+        }
+        with mock.patch.object(maintenance, "run", return_value=0) as run:
+            self.assertEqual(maintenance.main([
+                "test-python", "--changed", "scripts/rust_test_runner.py",
+                "--changed", "scripts/rust_build_status.py",
+                "--changed", "scripts/test_validation_scheduling.py",
+            ]), 0)
+        command = run.call_args.args[0]
+        for module in expected:
+            self.assertEqual(command.count(module), 1, module)
+        self.assertIn("scripts.test_build_tooling_storage", command)
+
     def test_changed_script_validation_runs_focused_tests_and_skips_retired_scripts(
         self,
     ) -> None:
@@ -268,6 +298,13 @@ class RootMaintenanceTest(unittest.TestCase):
             any(label.startswith("JavaScript syntax:") for label in labels),
             bool(javascript_targets),
         )
+        self.assertTrue(javascript_targets, "fixture must exercise Node syntax checks")
+        self.assertEqual(
+            [(label, command) for label, command in commands
+             if label.startswith("JavaScript syntax:")],
+            [(f"JavaScript syntax: {target}", ("node", "--check", target))
+             for target in javascript_targets],
+        )
         self.assertIn("script unit tests", labels)
         unit_command = dict(commands)["script unit tests"]
         self.assertIn("scripts.test_asciicheck", unit_command)
@@ -284,6 +321,7 @@ class RootMaintenanceTest(unittest.TestCase):
             (
                 "scripts.test_build_tooling_storage",
                 "scripts.test_report_script_regressions.ScriptReportRegressions.test_recent_overflow_survives_expired_base",
+                "scripts.test_rust_test_admission",
             ),
         )
         commands_without_tests, _missing = root_maintenance.script_audit_commands(
@@ -455,7 +493,7 @@ class RootMaintenanceTest(unittest.TestCase):
         untracked = subprocess.CompletedProcess(
             ["git"],
             0,
-            stdout="scripts/ trailing .py\0",
+            stdout="scripts/ trailing .py\0scripts/line\nbreak.py\0",
             stderr="",
         )
 
@@ -472,6 +510,7 @@ class RootMaintenanceTest(unittest.TestCase):
         self.assertIn("-z", run.call_args_list[0].args[0])
         self.assertIn("--diff-filter=ACDMRTUXB", run.call_args_list[0].args[0])
         self.assertIn("--others", run.call_args_list[1].args[0])
+        self.assertIn("-z", run.call_args_list[1].args[0])
 
     def test_changed_production_script_without_tests_is_unverified(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -479,17 +518,30 @@ class RootMaintenanceTest(unittest.TestCase):
         with (
             self.temporary_script_tree(root_maintenance) as scripts,
             mock.patch.object(root_maintenance, "run") as run,
+            mock.patch.object(
+                root_maintenance, "script_inventory",
+                side_effect=AssertionError("broad discovery"),
+            ),
         ):
             self.assertEqual(
-                root_maintenance.main(
-                    [
-                        "test-python",
-                        "--changed",
-                        "scripts/unmapped_helper.py",
-                    ]
-                ),
-                2,
+                root_maintenance.test_modules_for_changed_path("scripts/readme_toc.py"),
+                ("scripts.test_readme_toc",),
             )
+            for extra in ([], ["--changed", "scripts/readme_toc.py"]):
+                with (self.subTest(extra=extra),
+                      contextlib.redirect_stderr(io.StringIO()) as stderr):
+                    self.assertEqual(
+                        root_maintenance.main([
+                            "test-python", "--changed", "scripts/unmapped_helper.py", *extra,
+                        ]),
+                        2,
+                    )
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "Changed production script validation is unverified: no focused test route for "
+                    "scripts/unmapped_helper.py\n",
+                )
+                run.assert_not_called()
             (scripts / "unmapped_helper.py").unlink()
             self.assertEqual(
                 root_maintenance.main(

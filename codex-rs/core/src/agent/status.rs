@@ -199,6 +199,12 @@ mod tests {
                     "The turn was aborted because of an internal error.".to_string(),
                 ),
             ),
+            (
+                TurnAbortReason::ProcessLost,
+                AgentStatus::Errored(
+                    "The process was lost before the turn completed.".to_string(),
+                ),
+            ),
         ] {
             assert_eq!(
                 agent_status_from_event(&EventMsg::TurnAborted(TurnAbortedEvent {
@@ -388,21 +394,19 @@ mod tests {
             message
                 .contains("Agent-reported summary (not verification evidence): Everything passed")
         );
-        for status in [AgentStatusClaim::NeedsMain, AgentStatusClaim::Blocked] {
-            assert!(matches!(
-                agent_status_from_task(&typed_task_with_receipt(status, false), None),
-                Some(AgentStatus::Errored(message)) if message.contains("durable typed receipt status")
-            ));
-        }
-        for status in [
-            AgentStatusClaim::Failed,
-            AgentStatusClaim::Violated,
-            AgentStatusClaim::Abandoned,
+        for (status, label) in [
+            (AgentStatusClaim::NeedsMain, "needs_main"),
+            (AgentStatusClaim::Blocked, "blocked"),
+            (AgentStatusClaim::Failed, "failed"),
+            (AgentStatusClaim::Violated, "violated"),
+            (AgentStatusClaim::Abandoned, "abandoned"),
         ] {
-            assert!(matches!(
+            assert_eq!(
                 agent_status_from_task(&typed_task_with_receipt(status, false), None),
-                Some(AgentStatus::Errored(message)) if message.contains("durable typed receipt status")
-            ));
+                Some(AgentStatus::Errored(format!(
+                    "durable typed receipt status: {label}: durable summary"
+                )))
+            );
         }
     }
 

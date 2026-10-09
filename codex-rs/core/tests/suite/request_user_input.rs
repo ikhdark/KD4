@@ -275,6 +275,9 @@ async fn request_user_input_round_trip_for_mode(
     .await;
     assert_eq!(request.call_id, call_id);
     assert_eq!(request.questions.len(), 1);
+    assert_eq!(request.questions[0].id, "confirm_path");
+    assert_eq!(request.questions[0].header, "Confirm");
+    assert_eq!(request.questions[0].question, "Proceed with the plan?");
     assert_eq!(request.auto_resolution_ms, auto_resolution_ms);
     assert_eq!(request.questions[0].is_other, true);
     assert_eq!(

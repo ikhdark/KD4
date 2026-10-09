@@ -28,6 +28,103 @@ pub(crate) fn recovery_completion() -> ServerNotification {
 }
 
 #[tokio::test]
+async fn progress_notifications_reach_jsonl_only_for_the_primary_turn() {
+    use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
+    use codex_app_server_protocol::ItemStartedNotification;
+    use codex_app_server_protocol::McpToolCallProgressNotification;
+
+    let mut processor = EventProcessorWithJsonOutput::new(None);
+    let items = [
+        AppServerThreadItem::CommandExecution {
+            id: "command".into(),
+            command: "running command".into(),
+            cwd: test_path_buf("/tmp/project").abs().into(),
+            process_id: None,
+            parent_call_id: None,
+            parent_cell_id: None,
+            runtime_tool_call_id: None,
+            execution_id: None,
+            source: codex_app_server_protocol::CommandExecutionSource::UserShell,
+            status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
+            command_actions: Vec::new(),
+            aggregated_output: None,
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
+            exit_code: None,
+            duration_ms: None,
+        },
+        AppServerThreadItem::McpToolCall {
+            id: "mcp".into(),
+            server: "server".into(),
+            tool: "tool".into(),
+            status: codex_app_server_protocol::McpToolCallStatus::InProgress,
+            arguments: serde_json::json!({}),
+            app_context: None,
+            mcp_app_resource_uri: None,
+            plugin_id: None,
+            result: None,
+            error: None,
+            duration_ms: None,
+        },
+    ];
+    for item in items {
+        let mut notification = ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            started_at_ms: 0,
+            item,
+        });
+        assert!(prepare_server_notification(
+            false, "thread-1", "turn-1", false, &mut notification,
+            async |_| panic!("progress must not read history"),
+        ).await.unwrap());
+        assert_eq!(processor.collect_thread_events(notification).events.len(), 1);
+    }
+
+    // The runtime filter must preserve own-turn progress, while preventing
+    // another thread or turn from publishing under the same raw item identity.
+    for (thread_id, turn_id, admitted) in [
+        ("other-thread", "turn-1", false),
+        ("thread-1", "other-turn", false),
+        ("thread-1", "turn-1", true),
+    ] {
+        for (mut notification, expected) in [
+            (
+                ServerNotification::CommandExecutionOutputDelta(CommandExecutionOutputDeltaNotification {
+                    thread_id: thread_id.into(), turn_id: turn_id.into(), item_id: "command".into(),
+                    delta: "output λ".into(),
+                    stream: Some(codex_protocol::protocol::ExecOutputStream::Stderr),
+                    decoding_lossy: Some(false),
+                }),
+                serde_json::json!({"type":"item.progress", "item_id":"item_0", "call_id":"command",
+                    "kind":"command_output", "delta":"output λ", "stream":"stderr",
+                    "decoding_lossy":false, "truncated":false}),
+            ),
+            (
+                ServerNotification::McpToolCallProgress(McpToolCallProgressNotification {
+                    thread_id: thread_id.into(), turn_id: turn_id.into(), item_id: "mcp".into(),
+                    message: "working".into(), progress: Some(2.0), total: Some(3.0),
+                }),
+                serde_json::json!({"type":"item.progress", "item_id":"item_1", "call_id":"mcp",
+                    "kind":"mcp", "message":"working", "progress":2.0, "total":3.0, "truncated":false}),
+            ),
+        ] {
+            let accepted = prepare_server_notification(
+                false, "thread-1", "turn-1", false, &mut notification,
+                async |_| panic!("progress must not read history"),
+            ).await.unwrap();
+            assert_eq!(accepted, admitted);
+            if accepted {
+                let events = processor.collect_thread_events(notification);
+                assert_eq!(events.status, CodexStatus::Running);
+                assert_eq!(serde_json::to_value(events.events).unwrap(), serde_json::json!([expected]));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn notification_preparation_filters_before_reading_history() {
     let mut notification = recovery_completion();
     let result = prepare_server_notification(
@@ -390,78 +487,32 @@ async fn review_rejects_before_configuration_is_loaded() {
 }
 
 #[test]
-fn decode_prompt_bytes_strips_utf8_bom() {
-    let input = [0xEF, 0xBB, 0xBF, b'h', b'i', b'\n'];
-
-    let out = decode_prompt_bytes(&input).expect("decode utf-8 with BOM");
-
-    assert_eq!(out, "hi\n");
+fn decode_prompt_bytes_decodes_supported_encodings() {
+    for input in [
+        b"hi\n".as_slice(),
+        &[0xEF, 0xBB, 0xBF, b'h', b'i', b'\n'],
+        &[0xFF, 0xFE, b'h', 0, b'i', 0, b'\n', 0],
+        &[0xFE, 0xFF, 0, b'h', 0, b'i', 0, b'\n'],
+    ] {
+        assert_eq!(decode_prompt_bytes(input), Ok("hi\n".to_string()), "{input:?}");
+    }
+    assert_eq!(decode_prompt_bytes(&[]), Ok(String::new()));
 }
 
 #[test]
-fn decode_prompt_bytes_decodes_utf16le_bom() {
-    // UTF-16LE BOM + "hi\n"
-    let input = [0xFF, 0xFE, b'h', 0x00, b'i', 0x00, b'\n', 0x00];
-
-    let out = decode_prompt_bytes(&input).expect("decode utf-16le with BOM");
-
-    assert_eq!(out, "hi\n");
-}
-
-#[test]
-fn decode_prompt_bytes_decodes_utf16be_bom() {
-    // UTF-16BE BOM + "hi\n"
-    let input = [0xFE, 0xFF, 0x00, b'h', 0x00, b'i', 0x00, b'\n'];
-
-    let out = decode_prompt_bytes(&input).expect("decode utf-16be with BOM");
-
-    assert_eq!(out, "hi\n");
-}
-
-#[test]
-fn decode_prompt_bytes_rejects_utf32le_bom() {
-    // UTF-32LE BOM + "hi\n"
-    let input = [
-        0xFF, 0xFE, 0x00, 0x00, b'h', 0x00, 0x00, 0x00, b'i', 0x00, 0x00, 0x00, b'\n', 0x00, 0x00,
-        0x00,
-    ];
-
-    let err = decode_prompt_bytes(&input).expect_err("utf-32le should be rejected");
-
-    assert_eq!(
-        err,
-        PromptDecodeError::UnsupportedBom {
-            encoding: "UTF-32LE"
-        }
-    );
-}
-
-#[test]
-fn decode_prompt_bytes_rejects_utf32be_bom() {
-    // UTF-32BE BOM + "hi\n"
-    let input = [
-        0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, b'h', 0x00, 0x00, 0x00, b'i', 0x00, 0x00, 0x00,
-        b'\n',
-    ];
-
-    let err = decode_prompt_bytes(&input).expect_err("utf-32be should be rejected");
-
-    assert_eq!(
-        err,
-        PromptDecodeError::UnsupportedBom {
-            encoding: "UTF-32BE"
-        }
-    );
-}
-
-#[test]
-fn decode_prompt_bytes_rejects_invalid_utf8() {
-    // Invalid UTF-8 sequence: 0xC3 0x28
-    let input = [0xC3, 0x28];
-
-    let err = decode_prompt_bytes(&input).expect_err("invalid utf-8 should fail");
-
-    assert_eq!(err, PromptDecodeError::InvalidUtf8 { valid_up_to: 0 });
+fn decode_prompt_bytes_rejects_unsupported_and_invalid_encodings() {
+    for (input, expected) in [
+        (b"\xff\xfe\0\0h\0\0\0i\0\0\0\n\0\0\0".as_slice(), PromptDecodeError::UnsupportedBom { encoding: "UTF-32LE" }),
+        (b"\0\0\xfe\xff\0\0\0h\0\0\0i\0\0\0\n".as_slice(), PromptDecodeError::UnsupportedBom { encoding: "UTF-32BE" }),
+        (b"\xc3(".as_slice(), PromptDecodeError::InvalidUtf8 { valid_up_to: 0 }),
+        (b"ok\xc3(".as_slice(), PromptDecodeError::InvalidUtf8 { valid_up_to: 2 }),
+        (b"\xff\xfeh".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16LE" }),
+        (b"\xfe\xffh".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16BE" }),
+        (b"\xff\xfe\0\xd8".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16LE" }),
+        (b"\xfe\xff\xd8\0".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16BE" }),
+    ] {
+        assert_eq!(decode_prompt_bytes(input), Err(expected), "{input:?}");
+    }
 }
 
 #[test]
@@ -693,6 +744,7 @@ async fn thread_start_params_preserve_configured_permissions() {
     let params = thread_start_params_from_config(&config);
 
     assert_eq!(params.sandbox, None);
+    assert_eq!(params.thread_source, Some(codex_app_server_protocol::ThreadSource::User));
     assert_eq!(
         params.permissions,
         permissions_selection_from_config(&config)
@@ -720,24 +772,6 @@ async fn headless_approval_policy_applies() {
     );
 }
 
-#[tokio::test]
-async fn thread_start_params_include_user_thread_source() {
-    let codex_home = tempdir().expect("create temp codex home");
-    let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(cwd.path().to_path_buf()))
-        .build()
-        .await
-        .expect("build config");
-
-    let params = thread_start_params_from_config(&config);
-
-    assert_eq!(
-        params.thread_source,
-        Some(codex_app_server_protocol::ThreadSource::User)
-    );
-}
 
 #[tokio::test]
 async fn thread_lifecycle_params_preserve_hook_trust_bypass() {

@@ -450,7 +450,7 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn capture_thread_input_state(&self) -> Option<ThreadInputState> {
+    pub(crate) fn capture_thread_input_state(&mut self) -> Option<ThreadInputState> {
         let draft = self.bottom_pane.composer_draft_snapshot();
         let composer = draft;
         Some(ThreadInputState {

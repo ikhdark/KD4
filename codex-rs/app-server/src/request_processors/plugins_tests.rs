@@ -8,6 +8,105 @@ use futures::FutureExt;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
+#[tokio::test]
+async fn remote_local_version_requires_matching_materialized_package() {
+    async fn assert_version(home: &Path, plugin: &mut PluginSummary, version: Option<&str>) {
+        // Seed a stale value to prove rejection clears it, not merely leaves None untouched.
+        plugin.local_version = Some("stale-local-version".to_string());
+        let mut expected = plugin.clone();
+        expected.local_version = version.map(str::to_string);
+        hydrate_remote_plugin_local_versions(home, vec![&mut *plugin])
+            .await
+            .expect("read real local package evidence");
+        assert_eq!(
+            *plugin, expected,
+            "only the evidenced local version may change"
+        );
+    }
+
+    let home = TempDir::new().unwrap();
+    let store = codex_core_plugins::store::PluginStore::new(home.path().to_path_buf());
+    let id = PluginId::parse("sample@openai-curated-remote").unwrap();
+    let root = store.plugin_root(&id, "0.9.0");
+    std::fs::create_dir_all(root.join(".codex-plugin").as_path()).unwrap();
+    let manifest_path = root.join(".codex-plugin/plugin.json");
+    std::fs::write(
+        manifest_path.as_path(),
+        r#"{"name":"sample","version":"0.8.0"}"#,
+    )
+    .unwrap();
+    store
+        .write_remote_plugin_id(&id, "plugins~Plugin_expected")
+        .unwrap();
+    let mut plugin = PluginSummary {
+        id: id.as_key(),
+        remote_plugin_id: Some("plugins~Plugin_expected".to_string()),
+        version: Some("9.9.9".to_string()),
+        local_version: None,
+        name: "sample".to_string(),
+        share_context: None,
+        source: PluginSource::Remote,
+        installed: true,
+        enabled: true,
+        install_policy: PluginInstallPolicy::Available,
+        install_policy_source: None,
+        auth_policy: codex_app_server_protocol::PluginAuthPolicy::OnUse,
+        availability: PluginAvailability::Available,
+        interface: None,
+        keywords: Vec::new(),
+    };
+
+    // PluginSummary documents the materialized package version, so its manifest
+    // wins over both the cache directory's label and the backend's advertised version.
+    assert_version(home.path(), &mut plugin, Some("0.8.0")).await;
+
+    // The same cache key cannot attest the version of a different backend plugin.
+    store
+        .write_remote_plugin_id(&id, "plugins~Plugin_other")
+        .unwrap();
+    assert_version(home.path(), &mut plugin, None).await;
+    let metadata_path = store
+        .plugin_base_root(&id)
+        .join(".codex-remote-plugin-install.json");
+    std::fs::write(metadata_path.as_path(), "{").unwrap();
+    assert_version(home.path(), &mut plugin, None).await;
+
+    store
+        .write_remote_plugin_id(&id, "plugins~Plugin_expected")
+        .unwrap();
+    std::fs::write(
+        manifest_path.as_path(),
+        r#"{"name":"another-plugin","version":"0.8.0"}"#,
+    )
+    .unwrap();
+    assert_version(home.path(), &mut plugin, None).await;
+
+    // A legacy manifest without a version can use its installer's concrete cache
+    // version, but the Store's "local" placeholder is not a package version.
+    std::fs::write(manifest_path.as_path(), r#"{"name":"sample"}"#).unwrap();
+    assert_version(home.path(), &mut plugin, Some("0.9.0")).await;
+    let unversioned_root = store.plugin_root(&id, "local");
+    std::fs::rename(root.as_path(), unversioned_root.as_path()).unwrap();
+    assert_version(home.path(), &mut plugin, None).await;
+    std::fs::write(
+        unversioned_root.join(".codex-plugin/plugin.json").as_path(),
+        r#"{"name":"sample","version":"0.7.0"}"#,
+    )
+    .unwrap();
+    assert_version(home.path(), &mut plugin, Some("0.7.0")).await;
+
+    // This adapter must not reinterpret versions already supplied by the local source owner.
+    plugin.source = PluginSource::Local {
+        path: AbsolutePathBuf::try_from(home.path()).unwrap(),
+    };
+    plugin.local_version = Some("local-source-version".to_string());
+    let expected = plugin.clone();
+    hydrate_remote_plugin_local_versions(home.path(), vec![&mut plugin])
+        .await
+        .expect("local summaries bypass remote hydration");
+    assert_eq!(plugin, expected);
+}
+
 #[test]
 fn remote_catalog_jsonrpc_error_preserves_typed_recovery_data() {
     let error = remote_plugin_catalog_error_to_jsonrpc(

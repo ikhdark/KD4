@@ -806,21 +806,13 @@ mod tests {
     }
 
     #[test]
-    fn terminal_unacknowledged_continuations_are_cleaned_up_explicitly() {
+    fn worker_cleanup_removes_terminal_cells_and_preserves_live_cells() {
         let broker = CodeModeDispatchBroker::new();
         let cell_id = CellId::new("cell-d".to_string());
         broker.mark_cell_ready_for_dispatch(&cell_id);
         broker.record_continuation(&cell_id, continuation(0));
         broker.close_cell(&cell_id);
-
         assert_eq!(broker.continuation_snapshot(&cell_id).len(), 1);
-        cleanup_terminal_cells(&broker.cells);
-        assert!(broker.continuation_snapshot(&cell_id).is_empty());
-    }
-
-    #[test]
-    fn worker_cleanup_preserves_live_dispatch_cells() {
-        let broker = CodeModeDispatchBroker::new();
         let first = CellId::new("cell-live".to_string());
         let second = CellId::new("cell-pending".to_string());
         broker.mark_cell_ready_for_dispatch(&first);
@@ -830,6 +822,12 @@ mod tests {
 
         cleanup_terminal_cells(&broker.cells);
 
+        assert!(broker.continuation_snapshot(&cell_id).is_empty());
+        let cells = broker.cells.lock().unwrap();
+        assert!(!cells.contains_key(&cell_id));
+        assert!(cells.contains_key(&first));
+        assert!(cells.contains_key(&second));
+        drop(cells);
         assert!(broker.has_waitable_cells());
         assert!(broker.continuation_snapshot(&first).is_empty());
         assert_eq!(broker.continuation_snapshot(&second).len(), 1);

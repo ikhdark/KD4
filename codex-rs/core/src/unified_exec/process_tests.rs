@@ -1774,13 +1774,9 @@ async fn terminate_all_processes_confirms_remote_termination_for_failed_process(
     .expect("detached remote termination should start");
     assert!(!process.has_exited());
 
-    let manager_for_shutdown = Arc::clone(&manager);
-    let shutdown_task = tokio::spawn(async move {
-        manager_for_shutdown.terminate_all_processes().await;
-    });
-
-    tokio::task::yield_now().await;
-    assert!(!shutdown_task.is_finished());
+    let shutdown = manager.terminate_all_processes();
+    tokio::pin!(shutdown);
+    assert!(futures::poll!(&mut shutdown).is_pending());
     assert!(!termination_control.completed.load(Ordering::Acquire));
 
     termination_control.allowed.send_replace(true);
@@ -1788,14 +1784,14 @@ async fn terminate_all_processes_confirms_remote_termination_for_failed_process(
         .await
         .expect("failure task joins")
         .expect("failure termination succeeds");
-    tokio::time::timeout(Duration::from_secs(2), shutdown_task)
+    tokio::time::timeout(Duration::from_secs(2), shutdown)
         .await
-        .expect("shutdown should finish after remote termination")
-        .expect("shutdown task should succeed");
+        .expect("shutdown should finish after remote termination");
 
     assert!(termination_control.completed.load(Ordering::Acquire));
     assert!(process.has_exited());
     assert!(manager.process_store.lock().await.processes.is_empty());
+    assert_eq!(termination_control.calls.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

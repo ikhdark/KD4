@@ -74,7 +74,13 @@ class Report26ValidationRegressions(unittest.TestCase):
             self.assertIn("timed_out", diagnostic.getvalue())
         formatter = load_format_module()
         command = formatter.Command((sys.executable, "-c", "import sys; sys.stdout.write('x'*2097152+'END')"))
-        result = formatter.run_formatter_group(formatter.FormatterGroup("noisy", (command,)))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            formatter.tempfile, "gettempdir", return_value=directory
+        ):
+            result = formatter.run_formatter_group(formatter.FormatterGroup("noisy", (command,)))
+            [retained] = list(Path(directory).glob("codex-formatter-*.log"))
+            self.assertIn(f"Full formatter log: {retained}", result.output)
+            self.assertEqual(retained.read_bytes(), b"x" * 2097152 + b"END")
         self.assertEqual(result.returncode, 0)
         self.assertIn("output truncated", result.output)
         self.assertLess(len(result.output), 66000)
@@ -453,25 +459,52 @@ class ScriptReportRegressions(unittest.TestCase):
             parent.wait(timeout=10)
 
     def test_pool_failure_cancels_owned_sibling_and_preserves_primary_error(self):
-        started = __import__("threading").Event()
-
-        def run():
-            started.set()
-            return process_owner.run_owned(
-                [sys.executable, "-c", "import time; time.sleep(60)"]
+        with tempfile.TemporaryDirectory() as directory:
+            ready = Path(directory) / "ready"
+            child = (
+                "import time; from pathlib import Path; "
+                f"Path({str(ready)!r}).touch()\n"
+                "while True: time.sleep(60)"
             )
+            processes = []
+            owned_process = process_owner.owned_process
 
-        def fail():
-            started.wait(5)
-            raise ValueError("dependency failed")
+            def reap(process):
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
 
-        before = time.monotonic()
-        with self.assertRaisesRegex(ValueError, "dependency failed"):
-            with process_owner.OwnedThreadPoolExecutor(max_workers=2) as executor:
-                sibling = executor.submit(run)
-                executor.submit(fail)
-                sibling.result()
-        self.assertLess(time.monotonic() - before, 10)
+            @contextlib.contextmanager
+            def observe_process(*args, **kwargs):
+                with owned_process(*args, **kwargs) as process:
+                    processes.append(process)
+                    self.addCleanup(reap, process)
+                    yield process
+
+            def run():
+                return process_owner.run_owned([sys.executable, "-c", child], timeout=5)
+
+            def fail():
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "sibling command never started")
+                raise ValueError("dependency failed")
+
+            before = time.monotonic()
+            with (
+                mock.patch.object(process_owner, "owned_process", observe_process),
+                self.assertRaisesRegex(ValueError, "dependency failed"),
+            ):
+                with process_owner.OwnedThreadPoolExecutor(max_workers=2) as executor:
+                    sibling = executor.submit(run)
+                    executor.submit(fail)
+                    sibling.result()
+            self.assertLess(time.monotonic() - before, 10)
+            self.assertTrue(ready.exists())
+            self.assertEqual(len(processes), 1)
+            self.assertIsNotNone(processes[0].poll(), "cancelled sibling kept running")
+            self.assertNotEqual(processes[0].returncode, 0)
 
     def test_terminal_conflicts_are_order_independent_and_malformed_is_local(self):
         first = timing_profile()
@@ -503,32 +536,6 @@ class ScriptReportRegressions(unittest.TestCase):
                 self.assertEqual(report["coverage"]["conflictingTerminalProfiles"], 1)
                 self.assertFalse(report["auditDecision"]["readyToFinalize"])
 
-    def test_publication_rolls_back_package_archive_and_sidecar(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            package, archive, sidecar = (
-                root / "package",
-                root / "archive.zip",
-                root / "checksums",
-            )
-            package.mkdir()
-            (package / "old").write_bytes(b"old package")
-            archive.write_bytes(b"old archive")
-            with self.assertRaisesRegex(OSError, "sidecar"):
-                with cli.publication_transaction([package, archive, sidecar]):
-                    with cli.staged_package_destination(
-                        package, reuse_existing=True
-                    ) as staged:
-                        staged.mkdir()
-                        (staged / "new").write_bytes(b"new")
-                    cli.write_text_atomically(archive, "new archive")
-                    cli.write_text_atomically(sidecar, "partial")
-                    raise OSError("sidecar failed")
-            self.assertEqual((package / "old").read_bytes(), b"old package")
-            self.assertFalse((package / "new").exists())
-            self.assertEqual(archive.read_bytes(), b"old archive")
-            self.assertFalse(sidecar.exists())
-
     def test_npm_cancellation_restores_all_outputs_and_clears_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -537,8 +544,8 @@ class ScriptReportRegressions(unittest.TestCase):
             staged.mkdir()
             results = []
             for name in ("one.tgz", "two.tgz"):
-                (output / name).write_bytes(b"old")
-                (staged / name).write_bytes(b"new")
+                (output / name).write_bytes(f"old {name}".encode())
+                (staged / name).write_bytes(f"new {name}".encode())
                 results.append(
                     stage_npm_packages.StagePackageResult(name, staged / name, "")
                 )
@@ -556,7 +563,7 @@ class ScriptReportRegressions(unittest.TestCase):
                     stage_npm_packages.commit_staged_packages(results, output)
             self.assertEqual(
                 [(output / name).read_bytes() for name in ("one.tgz", "two.tgz")],
-                [b"old", b"old"],
+                [b"old one.tgz", b"old two.tgz"],
             )
             self.assertFalse((output / ".npm-activation.json").exists())
 
@@ -574,24 +581,27 @@ class ScriptReportRegressions(unittest.TestCase):
     def test_activation_rollback_retains_old_outputs_without_copying(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package, checksum = root / "package", root / "checksum"
+            package, archive, checksum = root / "package", root / "archive.zip", root / "checksum"
             package.mkdir()
             (package / "old").write_bytes(b"old")
-            checksum.write_text("old checksum")
+            archive.write_bytes(b"old archive")
             with mock.patch.object(
                 cli.shutil, "copytree", side_effect=AssertionError("extra copy")
             ):
                 with self.assertRaisesRegex(OSError, "final output"):
-                    with cli.publication_transaction([package, checksum]):
+                    with cli.publication_transaction([package, archive, checksum]):
                         with cli.staged_package_destination(
                             package, reuse_existing=True
                         ) as staging:
                             staging.mkdir()
                             (staging / "new").write_bytes(b"new")
-                        cli.write_text_atomically(checksum, "new checksum")
+                        cli.write_text_atomically(archive, "new archive")
+                        cli.write_text_atomically(checksum, "partial checksum")
                         raise OSError("final output failed")
             self.assertEqual([p.name for p in package.iterdir()], ["old"])
-            self.assertEqual(checksum.read_text(), "old checksum")
+            self.assertEqual((package / "old").read_bytes(), b"old")
+            self.assertEqual(archive.read_bytes(), b"old archive")
+            self.assertFalse(checksum.exists())
             self.assertEqual(list(root.glob("*.backup-*")), [])
 
     def test_npm_recovery_rejects_unowned_backup_before_mutation(self):

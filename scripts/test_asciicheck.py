@@ -68,7 +68,8 @@ class AsciiCheckTest(unittest.TestCase):
     def test_invalid_character_reports_location_and_fix_rewrites_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "invalid.md"
-            path.write_text("alpha\nem—dash\n", encoding="utf-8")
+            original = "alpha\r\nem—dash\r\n".encode("utf-8")
+            path.write_bytes(original)
             output = io.StringIO()
 
             with contextlib.redirect_stdout(output):
@@ -76,11 +77,12 @@ class AsciiCheckTest(unittest.TestCase):
 
             self.assertIn("line 2, column 3", output.getvalue())
             self.assertIn("U+2014", output.getvalue())
+            self.assertEqual(path.read_bytes(), original)
 
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertTrue(asciicheck.lint_utf8_ascii(path, fix=True))
 
-            self.assertEqual(path.read_text(encoding="utf-8"), "alpha\nem-dash\n")
+            self.assertEqual(path.read_bytes(), b"alpha\r\nem-dash\r\n")
 
     def test_invalid_utf8_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -119,6 +121,30 @@ class AsciiCheckTest(unittest.TestCase):
 
             self.assertIn("byte offset: 2", output.getvalue())
             self.assertIn("location: line 1, column 3", output.getvalue())
+
+    def test_decode_locations_count_characters_after_multibyte_text(self) -> None:
+        # A sparkle occupies three UTF-8 bytes but one diagnostic column.
+        cases = (
+            ("a✨".encode() + b"\xff", 4, "line 1, column 3"),
+            ("a✨\r\nx✨".encode() + b"\xe2(\xa1", 10, "line 2, column 3"),
+            ("a✨\r\nx✨".encode() + b"\xe2\x82", 10, "line 2, column 3"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid.bin"
+            for payload, byte_offset, location in cases:
+                for fix in (False, True):
+                    for chunk_size in range(1, len(payload) + 1):
+                        with self.subTest(payload=payload, fix=fix, chunk_size=chunk_size):
+                            path.write_bytes(payload)
+                            output = io.StringIO()
+                            with (
+                                mock.patch.object(asciicheck, "_READ_CHUNK_SIZE", chunk_size),
+                                contextlib.redirect_stdout(output),
+                            ):
+                                self.assertTrue(asciicheck.lint_utf8_ascii(path, fix=fix))
+                            self.assertIn(f"byte offset: {byte_offset}\n", output.getvalue())
+                            self.assertIn(f"location: {location}\n", output.getvalue())
+                            self.assertEqual(path.read_bytes(), payload)
 
     def test_fix_does_not_rewrite_unfixable_only_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

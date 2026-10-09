@@ -1018,18 +1018,28 @@ mod tests {
             .await
             .expect("append initial user message");
         live_thread.flush().await.expect("flush thread");
-        let before_turn_start = runtime
+        let mut before_turn_start = runtime
             .get_thread(thread_id)
             .await
             .expect("sqlite metadata read")
             .expect("sqlite metadata");
+
+        // SQLite stores milliseconds; consecutive operations need not cross a clock tick.
+        let baseline = chrono::DateTime::<chrono::Utc>::from_timestamp(1_704_067_200, 0)
+            .expect("baseline timestamp");
+        before_turn_start.updated_at = baseline;
+        runtime
+            .upsert_thread_preserving_timestamps(&before_turn_start)
+            .await
+            .expect("seed timestamp baseline");
+        let started_at = before_turn_start.recency_at.timestamp() + 2;
 
         live_thread
             .append_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
                     turn_id: "turn-1".to_string(),
                     trace_id: None,
-                    started_at: None,
+                    started_at: Some(started_at),
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
                 },
@@ -1037,12 +1047,22 @@ mod tests {
             .await
             .expect("append turn start");
         live_thread.flush().await.expect("flush thread");
-        let after_turn_start = runtime
+        let mut after_turn_start = runtime
             .get_thread(thread_id)
             .await
             .expect("sqlite metadata read")
             .expect("sqlite metadata");
         assert!(after_turn_start.recency_at > before_turn_start.recency_at);
+        assert_eq!(
+            after_turn_start.recency_at,
+            chrono::DateTime::<chrono::Utc>::from_timestamp(started_at, 0)
+                .expect("turn timestamp")
+        );
+        after_turn_start.updated_at = baseline;
+        runtime
+            .upsert_thread_preserving_timestamps(&after_turn_start)
+            .await
+            .expect("seed output timestamp baseline");
 
         live_thread
             .append_items(&[
@@ -1418,7 +1438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_thread_rejects_duplicate_live_writer() {
+    async fn lifecycle_rejects_duplicate_live_writer() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let thread_id = ThreadId::default();
@@ -1435,18 +1455,6 @@ mod tests {
 
         assert!(matches!(err, ThreadStoreError::InvalidRequest { .. }));
         assert!(err.to_string().contains("already has a live local writer"));
-    }
-
-    #[tokio::test]
-    async fn resume_thread_rejects_duplicate_live_writer() {
-        let home = TempDir::new().expect("temp dir");
-        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
-        let thread_id = ThreadId::default();
-
-        store
-            .create_thread(create_thread_params(thread_id))
-            .await
-            .expect("create live thread");
         let rollout_path = store
             .live_rollout_path(thread_id)
             .await
@@ -1454,7 +1462,7 @@ mod tests {
         let err = store
             .resume_thread(ResumeThreadParams {
                 thread_id,
-                rollout_path: Some(rollout_path),
+                rollout_path: Some(rollout_path.clone()),
                 history: None,
                 include_archived: true,
                 metadata: thread_metadata(),
@@ -1463,6 +1471,22 @@ mod tests {
             .expect_err("duplicate live resume should fail");
         assert!(matches!(err, ThreadStoreError::InvalidRequest { .. }));
         assert!(err.to_string().contains("already has a live local writer"));
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![user_message_item("original writer survives")],
+            })
+            .await
+            .expect("original writer remains usable");
+        store
+            .persist_thread(thread_id)
+            .await
+            .expect("persist original writer");
+        assert_rollout_contains_message(&rollout_path, "original writer survives").await;
+        store
+            .shutdown_thread(thread_id)
+            .await
+            .expect("shutdown original writer");
     }
 
     #[tokio::test]
@@ -1735,9 +1759,12 @@ mod tests {
                 .expect("history")
                 .items
                 .iter()
-                .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_))))
-                .count(),
-            1
+                .filter_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) => Some(event.message.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["path read"]
         );
     }
 

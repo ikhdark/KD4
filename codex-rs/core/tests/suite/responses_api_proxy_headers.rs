@@ -247,8 +247,31 @@ where
 
 fn event_summary(event: &EventMsg) -> String {
     let mut summary = format!("{event:?}");
-    summary.truncate(240);
+    let mut end = summary.len().min(240);
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    summary.truncate(end);
     summary
+}
+
+#[test]
+fn event_summary_preserves_utf8_within_the_diagnostic_byte_limit() {
+    for message in ["short".to_string(), "x".repeat(300), "🦀".repeat(100)] {
+        let event = EventMsg::Warning(codex_protocol::protocol::WarningEvent { message });
+        let full = format!("{event:?}");
+        let summary = event_summary(&event);
+        assert!(summary.len() <= 240);
+        assert!(full.starts_with(&summary));
+        if full.len() <= 240 {
+            assert_eq!(summary, full);
+        } else {
+            // Preserve the longest valid prefix within the byte budget, not
+            // an empty placeholder or a lossy replacement character.
+            let next = full[summary.len()..].chars().next().unwrap();
+            assert!(summary.len() + next.len_utf8() > 240);
+        }
+    }
 }
 
 fn request_body_contains(req: &wiremock::Request, text: &str) -> bool {

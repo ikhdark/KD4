@@ -117,6 +117,11 @@ async fn registered_listing_tracks_directory_evidence_and_bounds_traversal() {
 #[tokio::test]
 async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
     let root = tempfile::tempdir().unwrap();
+    let call = invocation(root.path(), json!({"path": "."})).await;
+    let payload = call.payload.clone();
+    let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+    assert_eq!(output["complete"], true);
+    assert_eq!(output["entries"], json!([]));
     let ToolSpec::Function(spec) = ListFilesHandler.spec() else {
         panic!("function spec")
     };
@@ -135,9 +140,9 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
                 .is_err()
         );
     }
-    for arguments in [
-        json!({"path": ".", "max_entries": 50_001}),
-        json!({"path": ".", "max_depth": 65}),
+    for (arguments, expected_depth, expected_entries) in [
+        (json!({"path": ".", "max_entries": 50_001}), 8, MAX_ENTRIES),
+        (json!({"path": ".", "max_depth": 65}), MAX_DEPTH, 2000),
     ] {
         assert!(validator.is_valid(&arguments));
         let call = invocation(root.path(), arguments).await;
@@ -145,8 +150,8 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
         let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
         assert_eq!(output["complete"], true);
         assert_eq!(output["limits_clamped"], true);
-        assert!(output["effective_walk_options"]["max_depth"].as_u64().unwrap() <= MAX_DEPTH as u64);
-        assert!(output["effective_walk_options"]["max_entries"].as_u64().unwrap() <= MAX_ENTRIES as u64);
+        assert_eq!(output["effective_walk_options"]["max_depth"], expected_depth);
+        assert_eq!(output["effective_walk_options"]["max_entries"], expected_entries);
     }
     assert!(
         ListFilesHandler
@@ -239,19 +244,6 @@ async fn verified_evidence_directory_scope_includes_effective_walk_policy() {
     }
     assert_ne!(evidence[0], evidence[1]);
     assert_ne!(evidence[0], evidence[2]);
-}
-
-#[tokio::test]
-async fn listing_distinguishes_empty_directory_and_regular_file() {
-    let root = tempfile::tempdir().unwrap();
-    let call = invocation(root.path(), json!({"path":"."})).await;
-    let payload = call.payload.clone();
-    let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
-    assert_eq!(output["complete"], true);
-    assert_eq!(output["entries"], json!([]));
-    std::fs::write(root.path().join("file.txt"), "text").unwrap();
-    let call = invocation(root.path(), json!({"path":"file.txt"})).await;
-    assert!(ListFilesHandler.handle(call).await.err().unwrap().to_string().contains("not a directory"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -365,110 +365,63 @@ fn powershell_script_mode_preserves_exact_nonblank_body() {
 }
 
 #[test]
-fn powershell_script_mode_builds_encoded_args_without_host_powershell() {
-    let script_body = "$value = 'quoted value'; Write-Output $value";
-    let invocation = parse(
-        None,
-        Some("powershell_script"),
-        None,
-        None,
-        Some(script_body),
-    )
-    .expect("script_body should be accepted");
-    let shell = Shell {
-        shell_type: ShellType::PowerShell,
-        shell_path: PathBuf::from("pwsh"),
-    };
-
-    let command = invocation
-        .to_exec_args(&shell, /*use_login_shell*/ false)
-        .expect("PowerShell args");
-
-    assert_eq!(command.first().map(String::as_str), Some("pwsh"));
-    assert!(command.iter().any(|arg| arg == "-NoLogo"));
-    assert!(command.iter().any(|arg| arg == "-NoProfile"));
-    assert!(command.iter().any(|arg| arg == "-EncodedCommand"));
-    assert!(
-        !command.iter().any(|arg| arg == script_body),
-        "script body should be encoded, not nested as raw shell text"
-    );
-}
-
-#[test]
-fn powershell_script_mode_builds_plain_safety_args_without_host_powershell() {
-    let script_body = "Get-ChildItem -Force";
-    let invocation = parse(
-        None,
-        Some("powershell_script"),
-        None,
-        None,
-        Some(script_body),
-    )
-    .expect("script_body should be accepted");
-    let shell = Shell {
-        shell_type: ShellType::PowerShell,
-        shell_path: PathBuf::from("pwsh"),
-    };
-
-    let command = invocation
-        .to_safety_args(&shell, /*use_login_shell*/ false)
-        .expect("PowerShell safety args");
-
-    assert_eq!(
-        command,
-        vec![
-            "pwsh".to_string(),
-            "-NoLogo".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            script_body.to_string(),
-        ]
-    );
-}
-
-#[test]
 fn powershell_exec_and_safety_projections_encode_the_same_script() {
-    let script_body = "$value = 'quoted value'; Write-Output $value";
-    let invocation = CommandInvocation::PowerShellScript(script_body.to_string());
     let shell = Shell {
         shell_type: ShellType::PowerShell,
         shell_path: PathBuf::from("pwsh"),
     };
-    let exec = invocation
-        .to_exec_args(&shell, /*use_login_shell*/ false)
-        .expect("PowerShell execution args");
-    let safety = invocation
-        .to_safety_args(&shell, /*use_login_shell*/ false)
-        .expect("PowerShell safety args");
-    let exec_mode = exec
-        .iter()
-        .position(|arg| arg == "-EncodedCommand")
-        .expect("encoded execution mode");
-    let safety_mode = safety
-        .iter()
-        .position(|arg| arg == "-Command")
-        .expect("plain safety mode");
-
-    assert_eq!(&exec[..exec_mode], &safety[..safety_mode]);
-    assert_eq!(
-        safety.get(safety_mode + 1).map(String::as_str),
-        Some(script_body)
-    );
-
-    let encoded = exec.get(exec_mode + 1).expect("encoded script payload");
-    let bytes = BASE64_STANDARD.decode(encoded).expect("base64 payload");
-    let utf16 = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        String::from_utf16(&utf16).expect("UTF-16LE payload"),
-        format!(
-            "{}{}",
-            codex_shell_command::powershell::UTF8_OUTPUT_PREFIX,
-            script_body
+    for script_body in [
+        "$value = 'quoted value'; Write-Output $value",
+        "Get-ChildItem -Force",
+        "Write-Output 'Grüße 世界 😀'",
+    ] {
+        let invocation = parse(
+            None,
+            Some("powershell_script"),
+            None,
+            None,
+            Some(script_body),
         )
-    );
+        .expect("script_body should be accepted");
+        for use_login_shell in [false, true] {
+            let exec = invocation
+                .to_exec_args(&shell, use_login_shell)
+                .expect("PowerShell execution args");
+            let safety = invocation
+                .to_safety_args(&shell, use_login_shell)
+                .expect("PowerShell safety args");
+            let mut expected_base = vec!["pwsh", "-NoLogo"];
+            if !use_login_shell {
+                expected_base.push("-NoProfile");
+            }
+            let mut expected_safety = expected_base.clone();
+            expected_safety.extend(["-Command", script_body]);
+            assert_eq!(safety, expected_safety);
+            assert_eq!(exec.len(), expected_base.len() + 2);
+            assert_eq!(&exec[..expected_base.len()], expected_base);
+            assert_eq!(exec[expected_base.len()], "-EncodedCommand");
+            assert!(
+                !exec.iter().any(|arg| arg == script_body),
+                "script body should be encoded, not nested as raw shell text"
+            );
+
+            let encoded = exec.last().expect("encoded script payload");
+            let bytes = BASE64_STANDARD.decode(encoded).expect("base64 payload");
+            assert_eq!(bytes.len() % 2, 0, "UTF-16LE must not have trailing bytes");
+            let utf16 = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                String::from_utf16(&utf16).expect("UTF-16LE payload"),
+                format!(
+                    "{}{}",
+                    codex_shell_command::powershell::UTF8_OUTPUT_PREFIX,
+                    script_body
+                )
+            );
+        }
+    }
 }
 
 #[test]

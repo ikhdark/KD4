@@ -1037,18 +1037,20 @@ async fn plugin_add_reinstalls_from_configured_marketplace_snapshot() -> Result<
         .assert()
         .success();
 
+    let installed_manifest = codex_home
+        .path()
+        .join("plugins/cache/debug/sample/1.2.3/.codex-plugin/plugin.json");
+    let original_manifest = std::fs::read(&installed_manifest)?;
+    assert!(!original_manifest.is_empty());
+    std::fs::write(&installed_manifest, b"damaged cached manifest")?;
+
     codex_command(codex_home.path())?
         .args(["plugin", "add", "sample@debug"])
         .assert()
         .success()
         .stdout(contains("Added plugin `sample` from marketplace `debug`."));
 
-    assert!(
-        codex_home
-            .path()
-            .join("plugins/cache/debug/sample/1.2.3/.codex-plugin/plugin.json")
-            .is_file()
-    );
+    assert_eq!(std::fs::read(&installed_manifest)?, original_manifest);
 
     Ok(())
 }

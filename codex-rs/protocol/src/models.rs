@@ -2917,31 +2917,33 @@ mod tests {
 
     #[test]
     fn image_detail_roundtrips_all_wire_values() -> Result<()> {
-        assert_eq!(
-            serde_json::from_str::<ImageDetail>("\"auto\"")?,
-            ImageDetail::Auto
-        );
-        assert_eq!(
-            serde_json::from_str::<ImageDetail>("\"low\"")?,
-            ImageDetail::Low
-        );
-        assert_eq!(serde_json::to_string(&ImageDetail::Auto)?, "\"auto\"");
-        assert_eq!(serde_json::to_string(&ImageDetail::Low)?, "\"low\"");
+        for (detail, wire_value) in [
+            (ImageDetail::Auto, "auto"),
+            (ImageDetail::Low, "low"),
+            (ImageDetail::High, "high"),
+            (ImageDetail::Original, "original"),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ImageDetail>(serde_json::json!(wire_value))?,
+                detail
+            );
+            assert_eq!(serde_json::to_value(detail)?, serde_json::json!(wire_value));
 
-        let content_item: ContentItem = serde_json::from_value(serde_json::json!({
-            "type": "input_image",
-            "image_url": "data:image/png;base64,abc",
-            "detail": "auto",
-        }))?;
-
-        assert_eq!(
-            content_item,
-            ContentItem::InputImage {
-                image_url: "data:image/png;base64,abc".to_string(),
-                detail: Some(ImageDetail::Auto),
-            }
-        );
-
+            let wire_item = serde_json::json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,abc",
+                "detail": wire_value,
+            });
+            let content_item: ContentItem = serde_json::from_value(wire_item.clone())?;
+            assert_eq!(
+                content_item,
+                ContentItem::InputImage {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                    detail: Some(detail),
+                }
+            );
+            assert_eq!(serde_json::to_value(content_item)?, wire_item);
+        }
         Ok(())
     }
 
@@ -3597,8 +3599,18 @@ mod tests {
         let json = serde_json::to_string(&item)?;
         let v: serde_json::Value = serde_json::from_str(&json)?;
 
-        let output = v.get("output").expect("output field");
-        assert!(output.is_array(), "expected array output");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call1",
+                "output": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,BASE64",
+                    "detail": "high",
+                }],
+            })
+        );
 
         Ok(())
     }

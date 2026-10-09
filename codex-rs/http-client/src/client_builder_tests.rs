@@ -24,19 +24,43 @@ fn transport_default_client_propagates_custom_ca_failure() {
 
 #[test]
 fn exclusive_tls_roots_select_explicit_root_policy() {
+    for pem in [
+        b"".as_slice(),
+        b"not a certificate".as_slice(),
+        b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n".as_slice(),
+    ] {
+        let error = HttpClientBuilder::new()
+            .tls_certs_only_pem(pem)
+            .err()
+            .expect("empty or malformed explicit roots must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    let invalid_der = b"-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n";
+    assert!(
+        HttpClientBuilder::new()
+            .tls_certs_only_pem(invalid_der)
+            .expect("well-formed PEM is parsed before DER validation")
+            .build_direct()
+            .is_err(),
+        "invalid DER must fail client construction"
+    );
+
     let ca_pem = include_bytes!("../tests/fixtures/test-ca.pem");
-
-    let client = HttpClientBuilder::new()
-        .tls_certs_only_pem(ca_pem)
-        .expect("valid CA certificate")
-        .build_with_transport_default_proxy_using(|builder, custom_ca_policy| {
-            assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
-            builder
-                .build()
-                .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
-        });
-
-    assert!(client.is_ok());
+    for count in [1, 2] {
+        let builder = HttpClientBuilder::new()
+            .tls_certs_only_pem(&ca_pem.repeat(count))
+            .expect("valid CA certificate bundle");
+        assert_eq!(builder.tls_certs_only.as_ref().unwrap().len(), count);
+        let client = builder
+            .build_with_transport_default_proxy_using(|builder, custom_ca_policy| {
+                assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
+                builder
+                    .build()
+                    .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
+            });
+        assert!(client.is_ok());
+    }
 }
 
 #[tokio::test]

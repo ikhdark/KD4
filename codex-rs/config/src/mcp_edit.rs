@@ -242,9 +242,8 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
     {
         entry["disabled_tools"] = array_from_strings(disabled_tools);
     }
-    if let Some(scopes) = &config.scopes
-        && !scopes.is_empty()
-    {
+    // An explicit empty list suppresses OAuth scope discovery; it is not unset.
+    if let Some(scopes) = &config.scopes {
         entry["scopes"] = array_from_strings(scopes);
     }
     if let Some(oauth) = &config.oauth

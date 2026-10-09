@@ -234,7 +234,7 @@ class ReadmeTocTest(unittest.TestCase):
             with self.subTest(lines=lines), self.assertRaises(ValueError):
                 readme_toc.parse_markdown_toc(lines)
 
-    def test_fix_updates_only_toc_block(self) -> None:
+    def test_check_then_fix_updates_only_toc_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "README.md"
             path.write_text(
@@ -242,6 +242,17 @@ class ReadmeTocTest(unittest.TestCase):
                 f"{readme_toc.END_TOC}\n\n## New Section\n",
                 encoding="utf-8",
             )
+            original = path.read_bytes()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(readme_toc.check_or_fix(path, fix=False), 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("out of date", stderr.getvalue())
+            self.assertEqual(path.read_bytes(), original)
 
             result = readme_toc.check_or_fix(path, fix=True)
 
@@ -252,6 +263,10 @@ class ReadmeTocTest(unittest.TestCase):
                 f"- [New Section](#new-section)\n\n{readme_toc.END_TOC}\n\n"
                 "## New Section\n",
             )
+            updated = path.read_bytes()
+            self.assertEqual(readme_toc.check_or_fix(path, fix=False), 0)
+            self.assertEqual(readme_toc.check_or_fix(path, fix=True), 0)
+            self.assertEqual(path.read_bytes(), updated)
 
     def test_fix_preserves_crlf_and_nonstandard_separators_outside_toc(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,29 +290,6 @@ class ReadmeTocTest(unittest.TestCase):
             self.assertNotIn("\n", updated.replace("\r\n", ""))
             self.assertIn("- [New Section](#new-section)\r\n", updated)
 
-    def test_out_of_date_error_is_written_to_stderr(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "README.md"
-            path.write_text(
-                f"{readme_toc.BEGIN_TOC}\n"
-                "- [Old](#old)\n"
-                f"{readme_toc.END_TOC}\n"
-                "## New\n",
-                encoding="utf-8",
-            )
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                contextlib.redirect_stderr(stderr),
-            ):
-                result = readme_toc.check_or_fix(path, fix=False)
-
-            self.assertEqual(result, 1)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("out of date", stderr.getvalue())
-
     def test_capped_diff_reports_truncation(self) -> None:
         current = [f"- [Old {index}](#old-{index})" for index in range(12)]
         expected = [f"- [New {index}](#new-{index})" for index in range(12)]
@@ -305,9 +297,18 @@ class ReadmeTocTest(unittest.TestCase):
 
         readme_toc.print_toc_diff(current, expected, max_lines=6, stream=output)
 
-        text = output.getvalue()
-        self.assertIn("Diff truncated", text)
-        self.assertLess(text.count("\n"), 12)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "--- existing ToC",
+                "+++ generated ToC",
+                "@@ -1,12 +1,12 @@",
+                "-- [Old 0](#old-0)",
+                "-- [Old 1](#old-1)",
+                "-- [Old 2](#old-2)",
+                "... Diff truncated after 6 lines; rerun with --diff-max-lines 0.",
+            ],
+        )
 
 
 if __name__ == "__main__":

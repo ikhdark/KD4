@@ -413,56 +413,30 @@ mod tests {
     }
 
     #[test]
-    fn appends_rule_without_duplicate_newline() {
+    fn append_preserves_exactly_one_newline_between_rules() {
         let tmp = tempdir().expect("create temp dir");
         let policy_path = tmp.path().join("rules").join("default.rules");
         std::fs::create_dir_all(policy_path.parent().unwrap()).expect("create policy dir");
-        std::fs::write(
-            &policy_path,
-            r#"prefix_rule(pattern=["ls"], decision="allow")
-"#,
-        )
-        .expect("write seed rule");
+        for trailing_newline in ["", "\n"] {
+            std::fs::write(
+                &policy_path,
+                format!("prefix_rule(pattern=[\"ls\"], decision=\"allow\"){trailing_newline}"),
+            )
+            .expect("write seed rule");
 
-        blocking_append_allow_prefix_rule(
-            &policy_path,
-            &[String::from("echo"), String::from("Hello, world!")],
-        )
-        .expect("append rule");
+            blocking_append_allow_prefix_rule(
+                &policy_path,
+                &[String::from("echo"), String::from("Hello, world!")],
+            )
+            .expect("append rule");
 
-        let contents = std::fs::read_to_string(&policy_path).expect("read policy");
-        assert_eq!(
-            contents,
-            r#"prefix_rule(pattern=["ls"], decision="allow")
-prefix_rule(pattern=["echo", "Hello, world!"], decision="allow")
-"#
-        );
-    }
-
-    #[test]
-    fn inserts_newline_when_missing_before_append() {
-        let tmp = tempdir().expect("create temp dir");
-        let policy_path = tmp.path().join("rules").join("default.rules");
-        std::fs::create_dir_all(policy_path.parent().unwrap()).expect("create policy dir");
-        std::fs::write(
-            &policy_path,
-            r#"prefix_rule(pattern=["ls"], decision="allow")"#,
-        )
-        .expect("write seed rule without newline");
-
-        blocking_append_allow_prefix_rule(
-            &policy_path,
-            &[String::from("echo"), String::from("Hello, world!")],
-        )
-        .expect("append rule");
-
-        let contents = std::fs::read_to_string(&policy_path).expect("read policy");
-        assert_eq!(
-            contents,
-            r#"prefix_rule(pattern=["ls"], decision="allow")
-prefix_rule(pattern=["echo", "Hello, world!"], decision="allow")
-"#
-        );
+            let contents = std::fs::read_to_string(&policy_path).expect("read policy");
+            assert_eq!(
+                contents,
+                "prefix_rule(pattern=[\"ls\"], decision=\"allow\")\nprefix_rule(pattern=[\"echo\", \"Hello, world!\"], decision=\"allow\")\n",
+                "seed trailing newline: {trailing_newline:?}"
+            );
+        }
     }
 
     #[test]

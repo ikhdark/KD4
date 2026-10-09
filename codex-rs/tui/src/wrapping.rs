@@ -202,57 +202,6 @@ fn map_owned_wrapped_line_to_range(
     start..end
 }
 
-/// Returns `true` if any whitespace-delimited token in `line` looks like a URL.
-///
-/// Concatenates all span contents and delegates to [`text_contains_url_like`].
-#[cfg(test)]
-pub(crate) fn line_contains_url_like(line: &Line<'_>) -> bool {
-    let text: String = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    text_contains_url_like(&text)
-}
-
-/// Returns `true` if `line` contains both a URL-like token and at least one
-/// substantive non-URL token.
-///
-/// Decorative marker tokens (for example list prefixes like `-`, `1.`, `|`,
-/// `│`) are ignored for the non-URL side of this check.
-#[cfg(test)]
-pub(crate) fn line_has_mixed_url_and_non_url_tokens(line: &Line<'_>) -> bool {
-    let text: String = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    text_has_mixed_url_and_non_url_tokens(&text)
-}
-
-/// Returns `true` if any whitespace-delimited token in `text` looks like a URL.
-///
-/// Recognized patterns:
-/// - Absolute URLs with a scheme (`https://…`, `ftp://…`, custom `myapp://…`).
-/// - Bare domain URLs (`example.com/path`, `www.example.com`, `localhost:3000/api`).
-/// - IPv4 hosts with a path (`192.168.1.1:8080/health`).
-///
-/// Surrounding punctuation (`()[]{}< >,.;:!'"`) is stripped before
-/// checking. Tokens that look like file paths (`src/main.rs`, `foo/bar`)
-/// are intentionally rejected — the host portion must be a valid domain
-/// name (with a recognized TLD), an IPv4 address, or `localhost`.
-#[cfg(test)]
-pub(crate) fn text_contains_url_like(text: &str) -> bool {
-    text.split_ascii_whitespace().any(is_url_like_token)
-}
-
-/// Returns `true` if `text` contains at least one URL-like token and at least
-/// one substantive non-URL token.
-#[cfg(test)]
-fn text_has_mixed_url_and_non_url_tokens(text: &str) -> bool {
-    let (saw_url, saw_non_url) = classify_url_tokens(text);
-    saw_url && saw_non_url
-}
 
 fn classify_url_tokens(text: &str) -> (bool, bool) {
     let mut saw_url = false;
@@ -1197,14 +1146,7 @@ mod tests {
             .subsequent_indent(Line::from("  "));
         let line = Line::from("hello world foo");
         let out = word_wrap_line(&line, opts);
-        // Expect three lines with proper prefixes
-        assert!(concat_line(&out[0]).starts_with("- "));
-        assert!(concat_line(&out[1]).starts_with("  "));
-        assert!(concat_line(&out[2]).starts_with("  "));
-        // And content roughly segmented
-        assert_eq!(concat_line(&out[0]), "- hello");
-        assert_eq!(concat_line(&out[1]), "  world");
-        assert_eq!(concat_line(&out[2]), "  foo");
+        assert_eq!(out.iter().map(concat_line).collect_vec(), ["- hello", "  world", "  foo"]);
     }
 
     #[test]
@@ -1215,6 +1157,9 @@ mod tests {
         let line = Line::from("hello world foobar");
         let out = word_wrap_line(&line, opts);
         assert!(concat_line(&out[0]).starts_with("hello"));
+        assert!(out.len() > 1);
+        assert_eq!(out.iter().map(concat_line).collect::<String>().replace(' ', ""), "helloworldfoobar");
+        assert!(out.iter().all(|row| row.width() <= 8));
         for l in &out[1..] {
             assert!(concat_line(l).starts_with("    "));
         }
@@ -1279,10 +1224,14 @@ mod tests {
     #[test]
     fn wide_unicode_wraps_by_display_width() {
         let line = Line::from("😀😀😀");
-        let out = word_wrap_line(&line, /*width_or_options*/ 4);
-        assert_eq!(out.len(), 2);
-        assert_eq!(concat_line(&out[0]), "😀😀");
-        assert_eq!(concat_line(&out[1]), "😀");
+        for (width, expected) in [
+            (2, vec!["😀", "😀", "😀"]),
+            (4, vec!["😀😀", "😀"]),
+            (6, vec!["😀😀😀"]),
+        ] {
+            let out = word_wrap_line(&line, width);
+            assert_eq!(out.iter().map(concat_line).collect_vec(), expected);
+        }
     }
 
     #[test]
@@ -1311,10 +1260,7 @@ mod tests {
         // Expect: first line prefixed with "- ", subsequent wrapped pieces with "  "
         // and for the second input line, there should be no "- " prefix on its first piece
         let rendered: Vec<String> = out.iter().map(concat_line).collect();
-        assert!(rendered[0].starts_with("- "));
-        for r in rendered.iter().skip(1) {
-            assert!(r.starts_with("  "));
-        }
+        assert_eq!(rendered, ["- hello", "  world", "  foo", "  bar", "  baz"]);
     }
 
     #[test]
@@ -1339,14 +1285,6 @@ mod tests {
         let out = word_wrap_lines(lines, /*width_or_options*/ 12);
         let rendered: Vec<String> = out.iter().map(concat_line).collect();
         assert_eq!(rendered, vec!["hello world", "goodnight", "moon"]);
-    }
-
-    #[test]
-    fn line_height_counts_double_width_emoji() {
-        let line = "😀😀😀".into(); // each emoji ~ width 2
-        assert_eq!(word_wrap_line(&line, /*width_or_options*/ 4).len(), 2);
-        assert_eq!(word_wrap_line(&line, /*width_or_options*/ 2).len(), 3);
-        assert_eq!(word_wrap_line(&line, /*width_or_options*/ 6).len(), 1);
     }
 
     #[test]
@@ -1388,8 +1326,8 @@ them."#
     }
 
     #[test]
-    fn text_contains_url_like_matches_expected_tokens() {
-        let positives = [
+    fn url_token_classification_accepts_urls_and_rejects_paths_and_invalid_ports() {
+        for text in [
             "https://example.com/a/b",
             "ftp://host/path",
             "www.example.com/path?x=1",
@@ -1397,72 +1335,48 @@ them."#
             "localhost:3000/api",
             "127.0.0.1:8080/health",
             "(https://example.com/wrapped-in-parens)",
-        ];
-
-        for text in positives {
-            assert!(
-                text_contains_url_like(text),
-                "expected URL-like match for {text:?}"
-            );
+            "myapp://open/some/path",
+        ] {
+            assert_eq!(classify_url_tokens(text), (true, false), "{text:?}");
         }
-    }
-
-    #[test]
-    fn text_contains_url_like_rejects_non_urls() {
-        let negatives = [
+        for text in [
             "src/main.rs",
             "foo/bar",
             "key:value",
             "just-some-text-with-dashes",
-            "hello.world", // no path/query/fragment and no www
-        ];
-
-        for text in negatives {
-            assert!(
-                !text_contains_url_like(text),
-                "did not expect URL-like match for {text:?}"
-            );
+            "hello.world",
+            "localhost:99999/path",
+            "example.com:abc/path",
+        ] {
+            assert_eq!(classify_url_tokens(text), (false, true), "{text:?}");
         }
     }
 
     #[test]
-    fn line_contains_url_like_checks_across_spans() {
+    fn adaptive_wrap_detects_url_split_across_styled_spans() {
         let line = Line::from(vec![
             "see ".into(),
-            "https://example.com/a/very/long/path".cyan(),
+            "https://example.".cyan(),
+            "com/a/very/long/path".cyan(),
             " for details".into(),
         ]);
-
-        assert!(line_contains_url_like(&line));
+        let out = adaptive_wrap_line(&line, RtOptions::new(10));
+        assert_eq!(
+            out.iter().map(concat_line).collect_vec(),
+            ["see", "https://example.com/a/very/long/path", "for", "details"]
+        );
+        assert!(out[1].spans.iter().all(|span| span.style.fg == Some(Color::Cyan)));
     }
 
     #[test]
-    fn line_has_mixed_url_and_non_url_tokens_detects_prose_plus_url() {
-        let line = Line::from("see https://example.com/path for details");
-        assert!(line_has_mixed_url_and_non_url_tokens(&line));
-    }
-
-    #[test]
-    fn line_has_mixed_url_and_non_url_tokens_ignores_pipe_prefix() {
-        let line = Line::from(vec!["  │ ".into(), "https://example.com/path".into()]);
-        assert!(!line_has_mixed_url_and_non_url_tokens(&line));
-    }
-
-    #[test]
-    fn line_has_mixed_url_and_non_url_tokens_ignores_ordered_list_marker() {
-        let line = Line::from("1. https://example.com/path");
-        assert!(!line_has_mixed_url_and_non_url_tokens(&line));
-    }
-
-    #[test]
-    fn text_contains_url_like_accepts_custom_scheme_with_separator() {
-        assert!(text_contains_url_like("myapp://open/some/path"));
-    }
-
-    #[test]
-    fn text_contains_url_like_rejects_invalid_ports() {
-        assert!(!text_contains_url_like("localhost:99999/path"));
-        assert!(!text_contains_url_like("example.com:abc/path"));
+    fn mixed_url_classification_ignores_decorative_prefixes_not_prose() {
+        for (text, expected) in [
+            ("see https://example.com/path for details", (true, true)),
+            ("  │ https://example.com/path", (true, false)),
+            ("1. https://example.com/path", (true, false)),
+        ] {
+            assert_eq!(classify_url_tokens(text), expected, "{text:?}");
+        }
     }
 
     #[test]

@@ -158,33 +158,24 @@ async fn pasted_mixed_line_endings_reach_composer_without_extra_lines() -> Resul
 }
 
 #[test]
-fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
-    assert_eq!(
-        App::should_wait_for_initial_session(&SessionSelection::StartFresh),
-        true
-    );
-    assert_eq!(
-        App::should_wait_for_initial_session(&SessionSelection::Exit),
-        true
-    );
-    assert_eq!(
-        App::should_wait_for_initial_session(&SessionSelection::Resume(
-            crate::resume_picker::SessionTarget {
-                path: Some(PathBuf::from("/tmp/restore")),
-                thread_id: ThreadId::new(),
-            }
-        )),
-        false
-    );
-    assert_eq!(
-        App::should_wait_for_initial_session(&SessionSelection::Fork(
-            crate::resume_picker::SessionTarget {
-                path: Some(PathBuf::from("/tmp/fork")),
-                thread_id: ThreadId::new(),
-            }
-        )),
-        false
-    );
+fn startup_waiting_gate_depends_on_selection_and_receiver() {
+    for (selection, waits) in [
+        (SessionSelection::StartFresh, true),
+        (SessionSelection::Exit, true),
+        (SessionSelection::Resume(crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("/tmp/restore")),
+            thread_id: ThreadId::new(),
+        }), false),
+        (SessionSelection::Fork(crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("/tmp/fork")),
+            thread_id: ThreadId::new(),
+        }), false),
+    ] {
+        let wait_for_initial_session = App::should_wait_for_initial_session(&selection);
+        assert_eq!(wait_for_initial_session, waits);
+        assert_eq!(App::should_handle_active_thread_events(wait_for_initial_session, true), !waits);
+        assert!(!App::should_handle_active_thread_events(wait_for_initial_session, false));
+    }
 }
 
 #[test]
@@ -258,35 +249,7 @@ fn startup_waiting_gate_holds_active_thread_events_until_primary_thread_configur
     );
 }
 
-#[test]
-fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
-    let wait_for_resume = App::should_wait_for_initial_session(&SessionSelection::Resume(
-        crate::resume_picker::SessionTarget {
-            path: Some(PathBuf::from("/tmp/restore")),
-            thread_id: ThreadId::new(),
-        },
-    ));
-    assert_eq!(
-        App::should_handle_active_thread_events(
-            wait_for_resume,
-            /*has_active_thread_receiver*/ true
-        ),
-        true
-    );
-    let wait_for_fork = App::should_wait_for_initial_session(&SessionSelection::Fork(
-        crate::resume_picker::SessionTarget {
-            path: Some(PathBuf::from("/tmp/fork")),
-            thread_id: ThreadId::new(),
-        },
-    ));
-    assert_eq!(
-        App::should_handle_active_thread_events(
-            wait_for_fork,
-            /*has_active_thread_receiver*/ true
-        ),
-        true
-    );
-}
+
 
 #[tokio::test]
 async fn startup_thread_started_submits_queued_startup_input() {

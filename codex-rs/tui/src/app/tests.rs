@@ -245,7 +245,7 @@ async fn handle_mcp_inventory_result_renders_tools_by_server() {
 }
 
 #[test]
-fn bypass_hook_trust_startup_warning_snapshot() {
+fn hook_trust_warning_text_wraps_snapshot() {
     let rendered = lines_to_single_string(
         &history_cell::new_warning_event(
             "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."
@@ -296,18 +296,18 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
     app.chat_widget
         .handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
 
-    while let Ok(app_event) = app_event_rx.try_recv() {
-        if let AppEvent::SubmitThreadOp {
-            thread_id: op_thread_id,
-            ..
-        } = app_event
-        {
-            assert_eq!(op_thread_id, thread_id);
-            return Ok(());
-        }
-    }
-
-    panic!("expected approval action to submit a thread-scoped op");
+    let decisions = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::SubmitThreadOp { thread_id, op } => Some((thread_id, op)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, vec![(thread_id, Op::ExecApproval {
+        id: "call-1".to_string(),
+        turn_id: None,
+        decision: codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
+    })]);
+    Ok(())
 }
 
 #[tokio::test]
@@ -580,7 +580,7 @@ async fn enqueue_thread_event_uses_one_bounded_overflow_relay() -> Result<()> {
 }
 
 #[tokio::test]
-async fn replay_thread_snapshot_restores_draft_and_queued_input() {
+async fn replay_thread_snapshot_restores_draft_without_resubmitting_pending_turn() {
     let (mut app, _events, _ops) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
     let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
@@ -611,6 +611,7 @@ async fn replay_thread_snapshot_restores_draft_and_queued_input() {
         .chat_widget
         .capture_thread_input_state()
         .expect("expected thread input state");
+    assert!(app.chat_widget.queued_user_message_texts().is_empty());
 
     app.store_active_thread_receiver().await;
 
@@ -626,11 +627,15 @@ async fn replay_thread_snapshot_restores_draft_and_queued_input() {
 
     let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
         make_chatwidget_manual_with_sender().await;
+    assert!(!chat_widget.is_task_running_for_test());
     app.chat_widget = chat_widget;
 
     app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ true);
 
     assert_eq!(app.chat_widget.composer_text_with_pending(), "draft prompt");
+    // No turn-start event was replayed, so this running projection must come
+    // from the restored pending-start state rather than an active agent turn.
+    assert!(app.chat_widget.is_task_running_for_test());
     assert!(app.chat_widget.queued_user_message_texts().is_empty());
     while let Ok(op) = new_op_rx.try_recv() {
         assert!(
@@ -1800,6 +1805,11 @@ default_permissions = "locked-down"
 #[tokio::test]
 async fn open_agent_picker_allows_existing_agent_threads_when_feature_is_disabled() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+    app.config
+        .features
+        .disable(Feature::Collab)
+        .expect("disable collaboration in the test fixture");
+    assert!(!app.config.features.enabled(Feature::Collab));
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
         app.chat_widget.config_ref(),
     ))
@@ -3458,82 +3468,34 @@ async fn discard_closed_side_thread_removes_local_state_without_server_rpc() {
 }
 
 #[tokio::test]
-async fn active_non_primary_shutdown_target_returns_none_for_non_shutdown_event() -> Result<()> {
+async fn active_non_primary_shutdown_target_respects_thread_and_exit_state() {
     let mut app = make_test_app().await;
-    app.active_thread_id = Some(ThreadId::new());
-    app.primary_thread_id = Some(ThreadId::new());
-
-    assert_eq!(
-        app.active_non_primary_shutdown_target(&ServerNotification::SkillsChanged(
-            codex_app_server_protocol::SkillsChangedNotification {},
-        )),
-        None
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn active_non_primary_shutdown_target_returns_none_for_primary_thread_shutdown() -> Result<()>
-{
-    let mut app = make_test_app().await;
-    let thread_id = ThreadId::new();
-    app.active_thread_id = Some(thread_id);
-    app.primary_thread_id = Some(thread_id);
-
-    assert_eq!(
-        app.active_non_primary_shutdown_target(&thread_closed_notification(thread_id)),
-        None
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn active_non_primary_shutdown_target_returns_ids_for_non_primary_shutdown() -> Result<()> {
-    let mut app = make_test_app().await;
-    let active_thread_id = ThreadId::new();
-    let primary_thread_id = ThreadId::new();
-    app.active_thread_id = Some(active_thread_id);
-    app.primary_thread_id = Some(primary_thread_id);
-
-    assert_eq!(
-        app.active_non_primary_shutdown_target(&thread_closed_notification(active_thread_id)),
-        Some((active_thread_id, primary_thread_id))
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn active_non_primary_shutdown_target_returns_none_when_shutdown_exit_is_pending()
--> Result<()> {
-    let mut app = make_test_app().await;
-    let active_thread_id = ThreadId::new();
-    let primary_thread_id = ThreadId::new();
-    app.active_thread_id = Some(active_thread_id);
-    app.primary_thread_id = Some(primary_thread_id);
-    app.pending_shutdown_exit_thread_id = Some(active_thread_id);
-
-    assert_eq!(
-        app.active_non_primary_shutdown_target(&thread_closed_notification(active_thread_id)),
-        None
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn active_non_primary_shutdown_target_still_switches_for_other_pending_exit_thread()
--> Result<()> {
-    let mut app = make_test_app().await;
-    let active_thread_id = ThreadId::new();
-    let primary_thread_id = ThreadId::new();
-    app.active_thread_id = Some(active_thread_id);
-    app.primary_thread_id = Some(primary_thread_id);
-    app.pending_shutdown_exit_thread_id = Some(ThreadId::new());
-
-    assert_eq!(
-        app.active_non_primary_shutdown_target(&thread_closed_notification(active_thread_id)),
-        Some((active_thread_id, primary_thread_id))
-    );
-    Ok(())
+    let active = ThreadId::new();
+    let primary = ThreadId::new();
+    let other = ThreadId::new();
+    for (active_id, primary_id, pending_exit, expected) in [
+        (Some(active), Some(primary), None, Some((active, primary))),
+        (Some(primary), Some(primary), None, None),
+        (Some(active), Some(primary), Some(active), None),
+        (Some(active), Some(primary), Some(other), Some((active, primary))),
+        (None, Some(primary), None, None),
+        (Some(active), None, None, None),
+    ] {
+        app.active_thread_id = active_id;
+        app.primary_thread_id = primary_id;
+        app.pending_shutdown_exit_thread_id = pending_exit;
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&thread_closed_notification(active)),
+            expected,
+            "active={active_id:?}, primary={primary_id:?}, pending_exit={pending_exit:?}"
+        );
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&ServerNotification::SkillsChanged(
+                codex_app_server_protocol::SkillsChangedNotification {},
+            )),
+            None
+        );
+    }
 }
 
 async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
@@ -3871,6 +3833,111 @@ async fn make_test_app_with_channels() -> (
 }
 
 #[tokio::test]
+async fn goal_rejection_reports_original_error_when_cleanup_stalls() -> Result<()> {
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (mut app, mut events, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+    let thread_id = ThreadId::new();
+    app.active_thread_id = Some(thread_id);
+    app.primary_thread_id = Some(thread_id);
+    while events.try_recv().is_ok() {}
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept goal client");
+        let mut socket = tokio_tungstenite::accept_async(stream).await.expect("handshake");
+        for cleanup_stalls in [false, true] {
+            let mut created_path = serde_json::Value::Null;
+            let methods = if cleanup_stalls {
+                vec!["fs/createDirectory", "fs/writeFile", "thread/goal/set", "fs/remove"]
+            } else {
+                vec!["initialize", "initialized", "fs/createDirectory", "fs/writeFile", "thread/goal/set", "fs/remove"]
+            };
+            for method in methods {
+                let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await.expect("goal request deadline").expect("connection").expect("frame");
+                let request: serde_json::Value = serde_json::from_str(frame.to_text().expect("text"))
+                    .expect("request JSON");
+                assert_eq!(request["method"], method);
+                let response = match method {
+                    "initialize" => serde_json::json!({"result": {"codexHome": "/remote/codex"}}),
+                    "initialized" => continue,
+                    "fs/createDirectory" => {
+                        created_path = request["params"]["path"].clone();
+                        let path = created_path.as_str().expect("attachment directory");
+                        let id = path.strip_prefix("/remote/codex/attachments/").expect("attachment root");
+                        uuid::Uuid::parse_str(id).expect("fresh draft directory");
+                        serde_json::json!({"result": {}})
+                    }
+                    "fs/writeFile" => serde_json::json!({"result": {}}),
+                    "thread/goal/set" => {
+                        assert_eq!(request["params"]["threadId"], thread_id.to_string());
+                        assert_eq!(request["params"]["replace"], true);
+                        serde_json::json!({"error": {"code": -32602, "message": "goal rejected"}})
+                    }
+                    "fs/remove" => {
+                        assert_eq!(request["params"]["path"], created_path);
+                        if cleanup_stalls {
+                            // Keep the transport open without completing this request.
+                            continue;
+                        }
+                        serde_json::json!({"error": {"code": -32000, "message": "cleanup denied"}})
+                    }
+                    _ => unreachable!(),
+                };
+                let mut response = response;
+                response["id"] = request["id"].clone();
+                socket.send(Message::Text(response.to_string().into())).await.expect("response");
+            }
+        }
+        finished.await.expect("original failure reported before closing transport");
+    });
+    let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        endpoint: RemoteAppServerEndpoint::WebSocket { websocket_url: endpoint, auth_token: None },
+        client_name: "goal-cleanup-test".to_string(),
+        client_version: "0.0.0-test".to_string(),
+        experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 8,
+    }).await?;
+    let mut session = AppServerSession::new(
+        AppServerClient::Remote(client), crate::app_server_session::ThreadParamsMode::Remote,
+    );
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(5), Box::pin(app.set_thread_goal_draft(
+            &mut session, thread_id,
+            goal_files::GoalDraft {
+                objective: "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1),
+                ..Default::default()
+            },
+            crate::app_event::ThreadGoalSetMode::ReplaceExisting,
+        ))).await.expect("cleanup must not indefinitely delay the goal rejection");
+        let mut errors = String::new();
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                errors.push_str(&lines_to_single_string(&cell.transcript_lines(400)));
+            }
+        }
+        assert!(errors.contains("Failed to replace thread goal:"), "{errors}");
+        assert!(errors.contains("thread/goal/set failed in TUI"), "{errors}");
+        assert!(!errors.contains("cleanup denied"), "{errors}");
+    }
+    done.send(()).expect("release peer");
+    peer.await?;
+    session.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_paste() -> Result<()>
 {
     let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
@@ -4025,6 +4092,51 @@ async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_p
             .await?
             .goal
             .expect("small goal should remain set")
+            .objective,
+        "small goal"
+    );
+
+    // A missing later image must not leave the already-written paste behind or
+    // replace the existing goal. Keep this on the real embedded filesystem path.
+    let missing_image_dir = tempfile::tempdir()?;
+    while events.try_recv().is_ok() {}
+    app.set_thread_goal_draft(
+        &mut app_server,
+        thread_id,
+        crate::goal_files::GoalDraft {
+            objective: format!("Use {placeholder}"),
+            text_elements: vec![TextElement::new(
+                (4..4 + placeholder.len()).into(),
+                Some(placeholder.to_string()),
+            )],
+            pending_pastes: vec![(placeholder.to_string(), "hello".to_string())],
+            local_images: vec![crate::bottom_pane::LocalImageAttachment {
+                placeholder: String::new(),
+                path: missing_image_dir.path().join("missing.png"),
+            }],
+            ..Default::default()
+        },
+        crate::app_event::ThreadGoalSetMode::ReplaceExisting,
+    )
+    .await;
+    let mut materialization_errors = String::new();
+    while let Ok(event) = events.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            materialization_errors.push_str(&lines_to_single_string(&cell.transcript_lines(400)));
+        }
+    }
+    assert!(materialization_errors.contains("Could not read goal image"));
+    assert_eq!(
+        std::fs::read_dir(&attachments_dir)?.count(),
+        attachment_count
+    );
+    assert_eq!(std::fs::read_to_string(paste_path)?, "hello");
+    assert_eq!(
+        app_server
+            .thread_goal_get(thread_id)
+            .await?
+            .goal
+            .expect("existing goal retained")
             .objective,
         "small goal"
     );
@@ -4246,9 +4358,10 @@ async fn uncapped_resize_reflow_renders_all_cells_when_row_cap_absent() {
 
     let rendered = app.render_transcript_lines_for_reflow(/*width*/ 80);
 
-    assert_eq!(rendered.lines.len(), 39);
-    assert_eq!(rendered_line_text(&rendered.lines[0]), "cell 0");
-    assert_eq!(rendered_line_text(&rendered.lines[38]), "cell 19");
+    assert_eq!(
+        rendered.lines.iter().map(rendered_line_text).collect::<Vec<_>>().join("\n"),
+        (0..20).map(|i| format!("cell {i}")).collect::<Vec<_>>().join("\n\n")
+    );
 }
 
 #[tokio::test]
@@ -5408,6 +5521,14 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
         user_messages,
         vec!["first prompt".to_string(), "third prompt".to_string()]
     );
+    let transcript = app.transcript_cells.iter()
+        .map(|cell| lines_to_single_string(&cell.display_lines(120)))
+        .collect::<Vec<_>>().join("\n");
+    let first = transcript.find("first prompt").expect("first user message");
+    let third = transcript.find("third prompt").expect("second user message");
+    let answer = transcript.find("done").expect("assistant answer");
+    assert!(first < third && third < answer, "{transcript}");
+    assert_eq!(transcript.matches("done").count(), 1);
 }
 
 #[tokio::test]

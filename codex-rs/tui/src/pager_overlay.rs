@@ -1103,41 +1103,24 @@ mod tests {
     }
 
     #[test]
-    fn edit_prev_hint_is_visible() {
+    fn edit_hints_follow_highlight_state() {
         let mut overlay = transcript_overlay(vec![Arc::new(TestCell {
             lines: vec![Line::from("hello")],
         })]);
-
-        // Render into a wide buffer so the footer hints aren't truncated.
         let area = Rect::new(0, 0, 120, 10);
-        let mut buf = Buffer::empty(area);
-        overlay.render(area, &mut buf);
-
-        let s = buffer_to_text(&buf, area);
-        assert!(
-            s.contains("edit prev"),
-            "expected 'edit prev' hint in overlay footer, got: {s:?}"
-        );
+        for highlight in [None, Some(0), None] {
+            overlay.set_highlight_cell(highlight);
+            // Each terminal frame starts with a cleared drawing buffer.
+            let mut buf = Buffer::empty(area);
+            overlay.render(area, &mut buf);
+            let rendered = buffer_to_text(&buf, area);
+            assert!(rendered.contains("edit prev"));
+            assert_eq!(rendered.contains("edit next"), highlight.is_some());
+            assert_eq!(rendered.contains("edit message"), highlight.is_some());
+        }
     }
 
-    #[test]
-    fn edit_next_hint_is_visible_when_highlighted() {
-        let mut overlay = transcript_overlay(vec![Arc::new(TestCell {
-            lines: vec![Line::from("hello")],
-        })]);
-        overlay.set_highlight_cell(Some(0));
 
-        // Render into a wide buffer so the footer hints aren't truncated.
-        let area = Rect::new(0, 0, 120, 10);
-        let mut buf = Buffer::empty(area);
-        overlay.render(area, &mut buf);
-
-        let s = buffer_to_text(&buf, area);
-        assert!(
-            s.contains("edit next"),
-            "expected 'edit next' hint in overlay footer, got: {s:?}"
-        );
-    }
 
     #[test]
     fn transcript_overlay_snapshot_basic() {
@@ -1337,7 +1320,8 @@ mod tests {
     }
 
     #[test]
-    fn transcript_overlay_keeps_scroll_pinned_at_bottom() {
+    fn transcript_overlay_insertion_respects_follow_bottom() {
+        for follow_bottom in [false, true] {
         let mut overlay = transcript_overlay(
             (0..20)
                 .map(|i| {
@@ -1356,90 +1340,38 @@ mod tests {
             "expected initial render to leave view at bottom"
         );
 
+        if !follow_bottom { overlay.view.scroll_offset = 0; }
         overlay.insert_cell(Arc::new(TestCell {
             lines: vec!["tail".into()],
         }));
 
-        assert_eq!(overlay.view.scroll_offset, usize::MAX);
+        assert_eq!(overlay.view.scroll_offset, if follow_bottom { usize::MAX } else { 0 });
+        term.draw(|f| overlay.render(f.area(), f.buffer_mut())).expect("draw inserted cell");
+        assert_eq!(overlay.view.is_scrolled_to_bottom(), follow_bottom);
+        }
     }
 
-    #[test]
-    fn transcript_overlay_preserves_manual_scroll_position() {
-        let mut overlay = transcript_overlay(
-            (0..20)
-                .map(|i| {
-                    Arc::new(TestCell {
-                        lines: vec![Line::from(format!("line{i}"))],
-                    }) as Arc<dyn HistoryCell>
-                })
-                .collect(),
-        );
-        let mut term = Terminal::new(TestBackend::new(40, 12)).expect("term");
-        term.draw(|f| overlay.render(f.area(), f.buffer_mut()))
-            .expect("draw");
 
-        overlay.view.scroll_offset = 0;
-
-        overlay.insert_cell(Arc::new(TestCell {
-            lines: vec!["tail".into()],
-        }));
-
-        assert_eq!(overlay.view.scroll_offset, 0);
-    }
 
     #[test]
-    fn transcript_overlay_consolidation_remaps_highlight_inside_range() {
-        let mut overlay = transcript_overlay(
-            (0..6)
-                .map(|i| {
-                    Arc::new(TestCell {
-                        lines: vec![Line::from(format!("line{i}"))],
-                    }) as Arc<dyn HistoryCell>
-                })
-                .collect(),
-        );
-        overlay.set_highlight_cell(Some(3));
-
-        overlay.consolidate_cells(
-            2..5,
-            Arc::new(TestCell {
+    fn transcript_overlay_consolidation_remaps_highlights() {
+        for (highlight, expected) in [(None, None), (Some(1), Some(1)), (Some(2), Some(2)), (Some(3), Some(2)), (Some(4), Some(2)), (Some(6), Some(4))] {
+            let mut overlay = transcript_overlay(
+                (0..7).map(|i| Arc::new(TestCell {
+                    lines: vec![Line::from(format!("line{i}"))],
+                }) as Arc<dyn HistoryCell>).collect(),
+            );
+            overlay.set_highlight_cell(highlight);
+            overlay.consolidate_cells(2..5, Arc::new(TestCell {
                 lines: vec![Line::from("consolidated")],
-            }),
-        );
-
-        assert_eq!(
-            overlay.highlight_cell,
-            Some(2),
-            "highlight inside consolidated range should point to replacement cell",
-        );
+            }));
+            assert_eq!(overlay.highlight_cell, expected, "{highlight:?}");
+            assert_eq!(overlay.cells.len(), 5);
+            assert_eq!(overlay.cells[2].raw_lines(), vec![Line::from("consolidated")]);
+        }
     }
 
-    #[test]
-    fn transcript_overlay_consolidation_remaps_highlight_after_range() {
-        let mut overlay = transcript_overlay(
-            (0..7)
-                .map(|i| {
-                    Arc::new(TestCell {
-                        lines: vec![Line::from(format!("line{i}"))],
-                    }) as Arc<dyn HistoryCell>
-                })
-                .collect(),
-        );
-        overlay.set_highlight_cell(Some(6));
 
-        overlay.consolidate_cells(
-            2..5,
-            Arc::new(TestCell {
-                lines: vec![Line::from("consolidated")],
-            }),
-        );
-
-        assert_eq!(
-            overlay.highlight_cell,
-            Some(4),
-            "highlight after consolidated range should shift left by removed cells",
-        );
-    }
 
     #[test]
     fn static_overlay_snapshot_basic() {
@@ -1480,8 +1412,8 @@ mod tests {
         nums
     }
 
-    #[test]
-    fn transcript_overlay_paging_is_continuous_and_round_trips() {
+    #[tokio::test]
+    async fn transcript_overlay_paging_is_continuous_and_round_trips() {
         let mut overlay = transcript_overlay(
             (0..50)
                 .map(|i| {
@@ -1492,6 +1424,7 @@ mod tests {
                 .collect(),
         );
         let area = Rect::new(0, 0, 40, 15);
+        let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
 
         // Prime layout so last_content_height is populated and paging uses the real content height.
         let mut buf = Buffer::empty(area);
@@ -1503,13 +1436,14 @@ mod tests {
         overlay.view.scroll_offset = 0;
         let page1 = transcript_line_numbers(&mut overlay, area);
         let page1_len = page1.len();
+        assert_eq!(page1_len, 5, "full content rows, not an empty-page round trip");
         let expected_page1: Vec<usize> = (0..page1_len).collect();
         assert_eq!(
             page1, expected_page1,
             "first page should start at line-00 and show a full page of content"
         );
 
-        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_add(page_height);
+        overlay.handle_event(&mut tui, TuiEvent::Key(KeyEvent::from(KeyCode::PageDown))).expect("page down");
         let page2 = transcript_line_numbers(&mut overlay, area);
         assert_eq!(
             page2.len(),
@@ -1526,9 +1460,9 @@ mod tests {
         let interior_offset = 3usize;
         overlay.view.scroll_offset = interior_offset;
         let before = transcript_line_numbers(&mut overlay, area);
-        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_add(page_height);
+        overlay.handle_event(&mut tui, TuiEvent::Key(KeyEvent::from(KeyCode::PageDown))).expect("page down");
         let _ = transcript_line_numbers(&mut overlay, area);
-        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_sub(page_height);
+        overlay.handle_event(&mut tui, TuiEvent::Key(KeyEvent::from(KeyCode::PageUp))).expect("page up");
         let after = transcript_line_numbers(&mut overlay, area);
         assert_eq!(
             before, after,
@@ -1538,9 +1472,9 @@ mod tests {
         // Scenario 3: from the top of the second page, PageUp then PageDown should round-trip.
         overlay.view.scroll_offset = page_height;
         let before2 = transcript_line_numbers(&mut overlay, area);
-        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_sub(page_height);
+        overlay.handle_event(&mut tui, TuiEvent::Key(KeyEvent::from(KeyCode::PageUp))).expect("page up");
         let _ = transcript_line_numbers(&mut overlay, area);
-        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_add(page_height);
+        overlay.handle_event(&mut tui, TuiEvent::Key(KeyEvent::from(KeyCode::PageDown))).expect("page down");
         let after2 = transcript_line_numbers(&mut overlay, area);
         assert_eq!(
             before2, after2,

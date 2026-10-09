@@ -989,134 +989,52 @@ mod tests {
     }
 
     #[test]
-    fn custom_pet_rejects_zero_frame_dimensions() {
-        let dir = write_pet_manifest(
-            r#"{
-                "displayName": "Zero",
-                "spritesheetPath": "spritesheet.webp",
-                "frame": { "width": 0, "height": 208, "columns": 8, "rows": 9 }
-            }"#,
-        );
-
-        let err = load_pet_error_from_dir(&dir);
-
-        assert!(
-            err.to_string()
-                .contains("pet frame dimensions and grid counts must be non-zero")
-        );
-    }
-
-    #[test]
-    fn custom_pet_rejects_frame_grid_that_does_not_cover_spritesheet() {
-        let dir = write_pet_manifest(
-            r#"{
-                "displayName": "Short",
-                "spritesheetPath": "spritesheet.webp",
-                "frame": { "width": 192, "height": 208, "columns": 7, "rows": 9 }
-            }"#,
-        );
-
-        let err = load_pet_error_from_dir(&dir);
-
-        assert!(
-            err.to_string()
-                .contains("pet frame grid must cover spritesheet exactly")
-        );
-    }
-
-    #[test]
-    fn custom_pet_rejects_excessive_frame_count() {
-        let dir = write_pet_manifest(
-            r#"{
-                "displayName": "Dense",
-                "spritesheetPath": "spritesheet.webp",
-                "frame": { "width": 8, "height": 8, "columns": 192, "rows": 234 }
-            }"#,
-        );
-
-        let err = load_pet_error_from_dir(&dir);
-
-        assert!(err.to_string().contains("exceeds maximum"));
-    }
-
-    #[test]
-    fn custom_pet_rejects_empty_animation_frames() {
-        let dir = write_pet_manifest(
-            r#"{
-                "displayName": "Empty",
-                "spritesheetPath": "spritesheet.webp",
-                "animations": {
-                    "idle": { "frames": [] }
-                }
-            }"#,
-        );
-
-        let err = load_pet_error_from_dir(&dir);
-
-        assert!(
-            err.to_string()
-                .contains("animation idle must include at least one frame")
-        );
-    }
-
-    #[test]
-    fn custom_pet_rejects_animation_frame_outside_grid() {
-        let dir = write_pet_manifest(
-            r#"{
-                "displayName": "Outside",
-                "spritesheetPath": "spritesheet.webp",
-                "animations": {
-                    "idle": { "frames": [72] }
-                }
-            }"#,
-        );
-
-        let err = load_pet_error_from_dir(&dir);
-
-        assert!(
-            err.to_string()
-                .contains("animation idle references sprite index 72")
-        );
-    }
-
-    #[test]
-    fn custom_pet_rejects_invalid_animation_fps() {
-        let dir = write_pet_manifest(
-            r#"{
-                "displayName": "Fast",
-                "spritesheetPath": "spritesheet.webp",
-                "animations": {
-                    "idle": { "frames": [0], "fps": 120.0 }
-                }
-            }"#,
-        );
-
-        let err = load_pet_error_from_dir(&dir);
-
-        assert!(
-            err.to_string()
-                .contains("animation idle fps must be finite and between")
-        );
-    }
-
-    #[test]
-    fn custom_pet_rejects_animation_fallback_to_missing_animation() {
-        let dir = write_pet_manifest(
-            r#"{
-                "displayName": "Fallback",
-                "spritesheetPath": "spritesheet.webp",
-                "animations": {
-                    "wave": { "frames": [1], "loop": false, "fallback": "missing" }
-                }
-            }"#,
-        );
-
-        let err = load_pet_error_from_dir(&dir);
-
-        assert!(
-            err.to_string()
-                .contains("animation wave fallback missing does not exist")
-        );
+    fn custom_pet_rejects_invalid_frame_and_animation_specs() {
+        // All cases use the same valid spritesheet; only the manifest varies.
+        let dir = write_minimal_pet();
+        for (field, spec, expected) in [
+            (
+                "frame",
+                serde_json::json!({"width": 0, "height": 208, "columns": 8, "rows": 9}),
+                "pet frame dimensions and grid counts must be non-zero",
+            ),
+            (
+                "frame",
+                serde_json::json!({"width": 192, "height": 208, "columns": 7, "rows": 9}),
+                "pet frame grid must cover spritesheet exactly",
+            ),
+            (
+                "frame",
+                serde_json::json!({"width": 8, "height": 8, "columns": 192, "rows": 234}),
+                "pet frame count 44928 exceeds maximum 256",
+            ),
+            (
+                "animations",
+                serde_json::json!({"idle": {"frames": []}}),
+                "animation idle must include at least one frame",
+            ),
+            (
+                "animations",
+                serde_json::json!({"idle": {"frames": [72]}}),
+                "animation idle references sprite index 72",
+            ),
+            (
+                "animations",
+                serde_json::json!({"idle": {"frames": [0], "fps": 120.0}}),
+                "animation idle fps must be finite and between",
+            ),
+            (
+                "animations",
+                serde_json::json!({"wave": {"frames": [1], "loop": false, "fallback": "missing"}}),
+                "animation wave fallback missing does not exist",
+            ),
+        ] {
+            let mut manifest = serde_json::json!({"spritesheetPath": "spritesheet.webp"});
+            manifest[field] = spec;
+            fs::write(dir.path().join("pet.json"), manifest.to_string()).unwrap();
+            let err = load_pet_error_from_dir(&dir);
+            assert!(err.to_string().contains(expected), "{manifest}: {err:#}");
+        }
     }
 
     fn sprite_indices(animation: &Animation) -> Vec<usize> {

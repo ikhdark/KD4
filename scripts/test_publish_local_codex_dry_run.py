@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,27 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
+    def test_source_bundle_identity_accepts_python_json_filename_escaping(self) -> None:
+        # Package inventories hash Python's compact, sorted-key, ASCII JSON.
+        # Windows-valid Unicode and apostrophes must not change that identity
+        # when the consumer runs under a different PowerShell JSON serializer.
+        for name in ("caf\u00e9.exe", "codex'quoted.exe", "codex-\U0001f527.exe"):
+            with self.subTest(name=name):
+                binary = Path(self.repo_temp.name) / name
+                binary.write_bytes(self.source_exe_bytes)
+                manifest = self.write_source_bundle_manifest(binary)
+                expected_id = json.loads(manifest.read_text())["bundleId"]
+                install = self.repo_root / "install"
+                result = self.run_script(
+                    "-DryRun", "-SkipBuild", "-SourceBundleManifest", str(manifest),
+                    "-InstallDir", str(install),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_proof_value(result.stdout, "sourceBundleId", expected_id)
+                self.assert_proof_value(result.stdout, "sourceSha256",
+                                        hashlib.sha256(self.source_exe_bytes).hexdigest())
+                self.assertFalse(install.exists())
+
     def test_skip_build_rejects_tampered_source_bundle_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             manifest = self.write_source_bundle_manifest(
@@ -97,8 +119,10 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertIn("DRY-RUN", result.stdout)
-            self.assertIn("sourceSha256:", result.stdout)
-            self.assertIn("targetPath:", result.stdout)
+            self.assert_proof_value(
+                result.stdout, "sourceSha256", hashlib.sha256(self.source_exe_bytes).hexdigest()
+            )
+            self.assert_proof_value(result.stdout, "targetPath", str(install_dir / "codex.exe"))
             self.assertIn(
                 f"sourceCodeModeHostPath: {self.source_code_mode_host}", result.stdout
             )
@@ -106,10 +130,24 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                 f"codeModeHostTargetPath: {install_dir / 'codex-code-mode-host.exe'}",
                 result.stdout,
             )
-            self.assertIn("sourceCodeModeHostSha256:", result.stdout)
+            self.assert_proof_value(
+                result.stdout, "sourceCodeModeHostSha256",
+                hashlib.sha256(self.source_code_mode_host_bytes).hexdigest(),
+            )
             self.assertIn("codeModeHostTargetBeforeSha256: <missing>", result.stdout)
-            self.assertFalse((install_dir / "codex.exe").exists())
-            self.assertFalse((install_dir / "codex-code-mode-host.exe").exists())
+            self.assertIn(
+                "targetKind: local CLI/TUI payload used by Codex Desktop; "
+                "launching it directly opens a terminal.",
+                result.stdout,
+            )
+            self.assertIn("desktopAppExecutable:", result.stdout)
+            self.assert_proof_value(
+                result.stdout, "desktopAppLaunchCommand",
+                "explorer.exe shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App",
+            )
+            self.assertFalse(install_dir.exists())
+            self.assertFalse((install_dir.parent / "publisher-backups").exists())
+            self.assert_no_publish_temps(install_dir)
 
     def test_dry_run_allows_missing_default_source_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -287,7 +325,8 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             checksum = self.write_rusty_v8_checksum(archive, binary_marker=True)
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
-            self.write_fake_cargo(fake_bin, "echo fake cargo %*")
+            calls = temp_path / "cargo-calls.txt"
+            self.write_fake_cargo(fake_bin, "echo fake cargo %*", f'echo invoked>>"{calls}"')
             env = self.publish_env_without_v8_archive(user_profile)
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
 
@@ -310,36 +349,23 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assertIn("v8ArchiveCacheAction: seeded from", result.stdout)
             self.assertIn("v8ArchiveStatus: cached", result.stdout)
             self.assertEqual(cache_path.read_bytes(), archive.read_bytes())
+            self.assertEqual(calls.read_text().splitlines(), ["invoked"])
 
-    def test_dry_run_disambiguates_cli_payload_from_desktop_app(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            install_dir = Path(temp_dir) / "install"
-
-            result = self.run_script(
-                "-DryRun",
-                "-SkipBuild",
-                "-SourceExe",
-                str(self.source_exe),
-                "-InstallDir",
-                str(install_dir),
+            # A successful checksum report alone cannot prove bad inputs are
+            # rejected. Keep the original checksum and corrupt only the archive.
+            cached_bytes = cache_path.read_bytes()
+            installed_bytes = (install_dir / "codex.exe").read_bytes()
+            archive.write_bytes(b"tampered rusty v8 archive")
+            rejected = self.run_script(
+                "-RustyV8Archive", str(archive), "-InstallDir", str(install_dir), env=env,
             )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertIn(
-                "targetKind: local CLI/TUI payload used by Codex Desktop; "
-                "launching it directly opens a terminal.",
-                result.stdout,
-            )
-            self.assertIn("desktopAppExecutable:", result.stdout)
-            self.assertIn(
-                "desktopAppLaunchCommand: explorer.exe "
-                "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App",
-                result.stdout,
-            )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn("Rusty V8 archive checksum mismatch", rejected.stderr)
+            self.assert_proof_value(rejected.stdout, "v8ArchiveChecksumStatus", "mismatch")
+            self.assertEqual(calls.read_text().splitlines(), ["invoked"])
+            self.assertEqual(cache_path.read_bytes(), cached_bytes)
+            self.assertEqual((install_dir / "codex.exe").read_bytes(), installed_bytes)
+            self.assert_no_publish_temps(install_dir)
 
     def test_dry_run_reports_desktop_local_cli_routing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -551,7 +577,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assertIn("sourceProfile: release", result.stdout)
             self.assertIn("sourceBuilt: 123s since unix epoch", result.stdout)
 
-    def test_dry_run_reports_stale_target_when_source_tree_is_newer(self) -> None:
+    def test_dry_run_reports_stale_codex_target_when_source_artifact_is_newer(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
             install_dir = Path(temp_dir) / "install"
@@ -560,6 +586,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             target.write_bytes(self.source_exe_bytes)
             old_timestamp = 946684800
             os.utime(target, (old_timestamp, old_timestamp))
+            self.install_matching_publish_helpers(install_dir)
 
             result = self.run_script(
                 "-DryRun",
@@ -577,6 +604,9 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             )
             self.assertIn("sourceTreeNewestWriteUtc:", result.stdout)
             self.assertIn("targetBeforeLastWriteUtc:", result.stdout)
+            self.assert_proof_value(result.stdout, "codexTargetBeforeStale", "True")
+            for helper in ("codeModeHost", "windowsSandboxSetup", "commandRunner"):
+                self.assert_proof_value(result.stdout, helper + "TargetBeforeStale", "False")
             self.assertIn("targetBeforeStale: True", result.stdout)
             self.assertIn(
                 "targetBeforeStaleRemedy: Run just publish-local-codex-final, then restart Codex Desktop.",

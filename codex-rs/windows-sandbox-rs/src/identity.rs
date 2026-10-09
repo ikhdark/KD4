@@ -374,22 +374,19 @@ mod tests {
     fn remove_sandbox_users_file_deletes_existing_file() {
         let codex_home = TempDir::new().expect("tempdir");
         let users_path = sandbox_users_path(codex_home.path());
+        remove_sandbox_users_file(codex_home.path(), "missing creds").expect("missing users");
+        assert!(!users_path.exists());
         fs::create_dir_all(users_path.parent().expect("sandbox secrets dir"))
             .expect("create sandbox secrets dir");
         fs::write(&users_path, "users").expect("write users");
 
         remove_sandbox_users_file(codex_home.path(), "stale creds").expect("remove users");
         assert!(!users_path.exists());
-    }
-
-    #[test]
-    fn remove_sandbox_users_file_ignores_missing_file() {
-        let codex_home = TempDir::new().expect("tempdir");
-        let users_path = sandbox_users_path(codex_home.path());
-
-        remove_sandbox_users_file(codex_home.path(), "stale creds").expect("remove users");
+        remove_sandbox_users_file(codex_home.path(), "already removed").expect("idempotent remove");
         assert!(!users_path.exists());
     }
+
+
 
     #[test]
     fn preserving_proxy_settings_uses_the_existing_marker() {

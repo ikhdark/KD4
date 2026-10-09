@@ -271,22 +271,15 @@ pub(crate) fn model_provider_cache_identity_for_auth_identity(
             return raw.trim().trim_end_matches('/').to_string();
         };
         url.set_fragment(None);
-        let mut query = url
-            .query_pairs()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect::<Vec<_>>();
-        query.sort();
-        url.set_query(None);
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query);
-        }
+        // The request path preserves the base URL query verbatim. Reordering
+        // repeated keys or trimming query values can select another catalog.
         let normalized_path = url.path().trim_end_matches('/').to_string();
         url.set_path(if normalized_path.is_empty() {
             "/"
         } else {
             &normalized_path
         });
-        url.to_string().trim_end_matches('/').to_string()
+        url.to_string()
     }
 
     fn secret_component(domain: &[u8], value: &str) -> String {
@@ -677,6 +670,61 @@ mod tests {
         assert!(!first_identity.contains("secret-one"));
     }
 
+    #[tokio::test]
+    async fn model_cache_keeps_ordered_and_slash_terminated_query_routes_separate() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(|request: &wiremock::Request| {
+                // This backend's routing contract uses the first tenant value,
+                // including its trailing slash, to choose the visible catalog.
+                let tenant = request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "tenant")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                ResponseTemplate::new(200).set_body_json(ModelsResponse {
+                    models: vec![remote_model(&tenant)],
+                })
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
+        let codex_home = unique_test_codex_home("query-routed-cache");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        for (query, expected) in [
+            ("tenant=first&tenant=second", "first"),
+            ("tenant=second&tenant=first", "second"),
+            ("tenant=route/", "route/"),
+            ("tenant=route", "route"),
+        ] {
+            let provider = create_model_provider(
+                ModelProviderInfo::create_openai_provider(Some(format!(
+                    "{}?{query}", server.uri()
+                ))),
+                Some(AuthManager::from_auth_for_testing(
+                    CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                )),
+            );
+            let manager = provider.models_manager("query-routing", codex_home.clone(), None);
+            let catalog = manager
+                .raw_model_catalog(
+                    RefreshStrategy::OnlineIfUncached,
+                    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                catalog.models.iter().map(|model| model.slug.as_str()).collect::<Vec<_>>(),
+                vec![expected]
+            );
+        }
+        server.verify().await;
+        std::fs::remove_dir_all(&codex_home).unwrap();
+    }
+
     #[test]
     fn provider_cache_identity_changes_with_same_mode_account_scope() {
         let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
@@ -820,7 +868,7 @@ mod tests {
             Some(auth_manager),
         );
 
-        provider
+        let setup = provider
             .resolve_client_setup(ProviderAuthScope {
                 agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
                 session_source: SessionSource::Cli,
@@ -830,6 +878,11 @@ mod tests {
             .expect("client setup should resolve");
 
         assert_eq!(resolves.load(Ordering::SeqCst), baseline + 1);
+        assert_eq!(setup.auth.unwrap().get_token().unwrap(), "sk-external");
+        assert_eq!(
+            setup.resolved_auth.auth.to_auth_headers()[http::header::AUTHORIZATION],
+            "Bearer sk-external"
+        );
     }
 
     #[tokio::test]
@@ -906,7 +959,14 @@ mod tests {
             /*auth_manager*/ None,
         );
 
-        assert_eq!(provider.capabilities(), ProviderCapabilities::default());
+        assert_eq!(
+            provider.capabilities(),
+            ProviderCapabilities {
+                namespace_tools: true,
+                image_generation: true,
+                web_search: true,
+            }
+        );
     }
 
     #[tokio::test]

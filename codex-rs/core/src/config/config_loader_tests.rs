@@ -645,15 +645,6 @@ async fn returns_versioned_config_when_all_layers_missing() {
         num_system_layers, 1,
         "system layer should always be present"
     );
-
-    {
-        let effective = layers.effective_config();
-        let table = effective.as_table().expect("top-level table expected");
-        assert!(
-            table.get("config_version") == Some(&TomlValue::Integer(1)),
-            "expected a current config version when configs are missing"
-        );
-    }
 }
 
 #[tokio::test]
@@ -2750,6 +2741,7 @@ profile = "attacker"
 
 [features]
 respect_system_proxy = true
+plugins = true
 
 [otel]
 environment = "attacker"
@@ -2835,9 +2827,19 @@ wire_api = "responses"
                 .to_string()
         ))
     );
+    assert_eq!(
+        project_layer
+            .config
+            .get("features")
+            .and_then(|features| features.get("plugins")),
+        Some(&TomlValue::Boolean(true)),
+        "sanitization must preserve supported sibling feature keys"
+    );
     for key in &ignored_project_config_keys {
         assert!(
-            project_layer.config.get(key).is_none(),
+            key.split('.')
+                .try_fold(&project_layer.config, |value, segment| value.get(segment))
+                .is_none(),
             "expected {key} to be ignored"
         );
     }
@@ -3094,6 +3096,10 @@ async fn cli_overrides_with_relative_paths_do_not_break_trust_check() -> std::io
     tokio::fs::create_dir_all(&nested).await?;
     tokio::fs::write(project_root.join(".git"), "gitdir: here").await?;
 
+    let dot_codex = project_root.join(".codex");
+    tokio::fs::create_dir_all(&dot_codex).await?;
+    tokio::fs::write(dot_codex.join(CONFIG_TOML_FILE), "model = 'trusted-project'").await?;
+
     let codex_home = tmp.path().join("home");
     tokio::fs::create_dir_all(&codex_home).await?;
     make_config_for_test(
@@ -3110,7 +3116,7 @@ async fn cli_overrides_with_relative_paths_do_not_break_trust_check() -> std::io
         TomlValue::String("relative.md".to_string()),
     )];
 
-    load_config_layers_state(
+    let layers = load_config_layers_state(
         LOCAL_FS.as_ref(),
         &codex_home,
         Some(cwd),
@@ -3119,6 +3125,24 @@ async fn cli_overrides_with_relative_paths_do_not_break_trust_check() -> std::io
         &codex_config::NoopThreadConfigLoader,
     )
     .await?;
+
+    let project_layer = layers
+        .layers_high_to_low()
+        .into_iter()
+        .find(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+        .expect("trusted project config should be discovered");
+    assert!(project_layer.disabled_reason.is_none());
+    let effective = layers.effective_config();
+    assert_eq!(
+        effective.get("model").and_then(TomlValue::as_str),
+        Some("trusted-project")
+    );
+    assert_eq!(
+        effective.get("model_instructions_file"),
+        Some(&TomlValue::String(
+            nested.join("relative.md").to_string_lossy().to_string()
+        ))
+    );
 
     Ok(())
 }

@@ -508,6 +508,10 @@ async fn remote_control_enable_returns_connecting_status() -> Result<()> {
     assert!(!received.0.server_name.is_empty());
     assert_eq!(received.0.environment_id.as_deref(), Some("environment-id"));
     assert!(!received.0.installation_id.is_empty());
+    let request_id = mcp.send_remote_control_status_read_request().await?;
+    let status: RemoteControlStatusReadResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(status.0, received.0);
     Ok(())
 }
 
@@ -567,42 +571,54 @@ async fn rpc_updates_durable_preference_but_ephemeral_does_not() -> Result<()> {
         "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
     );
     backend.complete_enrollment()?;
-    wait_for_response(&mut mcp, request_id).await?;
+    let response: RemoteControlEnableResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(response.0.status, RemoteControlConnectionStatus::Connecting);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
         Some(true)
     );
 
     let request_id = mcp.send_remote_control_ephemeral_disable_request().await?;
-    wait_for_response(&mut mcp, request_id).await?;
+    let response: RemoteControlDisableResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(response.0.status, RemoteControlConnectionStatus::Disabled);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
         Some(true)
     );
 
     let request_id = mcp.send_remote_control_disable_request().await?;
-    wait_for_response(&mut mcp, request_id).await?;
+    let response: RemoteControlDisableResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(response.0.status, RemoteControlConnectionStatus::Disabled);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
         Some(false)
     );
 
     let request_id = mcp.send_remote_control_enable_request().await?;
-    wait_for_response(&mut mcp, request_id).await?;
+    let response: RemoteControlEnableResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(response.0.status, RemoteControlConnectionStatus::Connecting);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
         Some(true)
     );
 
     let request_id = mcp.send_remote_control_disable_request().await?;
-    wait_for_response(&mut mcp, request_id).await?;
+    let response: RemoteControlDisableResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(response.0.status, RemoteControlConnectionStatus::Disabled);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
         Some(false)
     );
 
     let request_id = mcp.send_remote_control_ephemeral_enable_request().await?;
-    wait_for_response(&mut mcp, request_id).await?;
+    let response: RemoteControlEnableResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(response.0.status, RemoteControlConnectionStatus::Connecting);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
         Some(false)
@@ -611,44 +627,7 @@ async fn rpc_updates_durable_preference_but_ephemeral_does_not() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn remote_control_status_read_returns_connecting_status_after_enable() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut backend = BlockingRemoteControlBackend::start(codex_home.path()).await?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp.send_remote_control_enable_request().await?;
-    let enroll_request = timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??;
-    assert_eq!(
-        enroll_request,
-        "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
-    );
-    backend.complete_enrollment()?;
-    let _: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    let request_id = mcp.send_remote_control_status_read_request().await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlStatusReadResponse = to_response(response)?;
-
-    assert_eq!(received.0.status, RemoteControlConnectionStatus::Connecting);
-    assert!(!received.0.server_name.is_empty());
-    assert_eq!(received.0.environment_id.as_deref(), Some("environment-id"));
-    assert!(!received.0.installation_id.is_empty());
-    Ok(())
-}
 
 #[tokio::test]
 async fn remote_control_pairing_rejects_invalid_requests_without_backend_requests() -> Result<()> {
@@ -993,6 +972,11 @@ async fn remote_control_client_management_works_while_disabled() -> Result<()> {
         .build()
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let status_request_id = mcp.send_remote_control_status_read_request().await?;
+    let status: RemoteControlStatusReadResponse =
+        to_response(wait_for_response(&mut mcp, status_request_id).await?)?;
+    assert_eq!(status.0.status, RemoteControlConnectionStatus::Disabled);
 
     let request_id = mcp
         .send_remote_control_clients_list_request(RemoteControlClientsListParams {

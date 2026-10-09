@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_dot_changes_animation_variant() {
+    fn ctrl_dot_variants_change_animation_only_on_enabled_press() {
         let mut widget = WelcomeWidget {
             is_logged_in: false,
             animation: AsciiAnimation::with_variants(
@@ -190,40 +190,19 @@ mod tests {
             layout_area: Cell::new(None),
         };
 
-        let before = widget.animation.current_frame();
-        widget.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL));
-        let after = widget.animation.current_frame();
-
-        assert_ne!(
-            before, after,
-            "expected ctrl+. to switch welcome animation variant"
-        );
-    }
-
-    #[test]
-    fn ctrl_shift_dot_changes_animation_variant() {
-        let mut widget = WelcomeWidget {
-            is_logged_in: false,
-            animation: AsciiAnimation::with_variants(
-                FrameRequester::test_dummy(),
-                &VARIANTS,
-                /*variant_idx*/ 0,
-            ),
-            animations_enabled: true,
-            animations_suppressed: Cell::new(false),
-            layout_area: Cell::new(None),
-        };
-
-        let before = widget.animation.current_frame();
-        widget.handle_key_event(KeyEvent::new(
-            KeyCode::Char('.'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
-        let after = widget.animation.current_frame();
-
-        assert_ne!(
-            before, after,
-            "expected ctrl+shift+. to switch welcome animation variant"
-        );
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::CONTROL | KeyModifiers::SHIFT] {
+            let before = widget.animation.current_frame();
+            let event = KeyEvent::new(KeyCode::Char('.'), modifiers);
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                widget.handle_key_event(KeyEvent { kind, ..event });
+                assert_eq!(widget.animation.current_frame(), before);
+            }
+            widget.animations_enabled = false;
+            widget.handle_key_event(event);
+            assert_eq!(widget.animation.current_frame(), before);
+            widget.animations_enabled = true;
+            widget.handle_key_event(event);
+            assert_ne!(widget.animation.current_frame(), before);
+        }
     }
 }

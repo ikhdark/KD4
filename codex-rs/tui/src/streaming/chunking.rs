@@ -303,36 +303,16 @@ mod tests {
     }
 
     #[test]
-    fn smooth_mode_is_default() {
-        let mut policy = AdaptiveChunkingPolicy::default();
-        let now = Instant::now();
-
-        let decision = policy.decide(snapshot(/*queued_lines*/ 1, /*oldest_age_ms*/ 10), now);
-        assert_eq!(decision.mode, ChunkingMode::Smooth);
-        assert_eq!(decision.entered_catch_up, false);
-        assert_eq!(decision.drain_plan, DrainPlan::Single);
-    }
-
-    #[test]
-    fn enters_catch_up_on_depth_threshold() {
-        let mut policy = AdaptiveChunkingPolicy::default();
-        let now = Instant::now();
-
-        let decision = policy.decide(snapshot(/*queued_lines*/ 8, /*oldest_age_ms*/ 10), now);
-        assert_eq!(decision.mode, ChunkingMode::CatchUp);
-        assert_eq!(decision.entered_catch_up, true);
-        assert_eq!(decision.drain_plan, DrainPlan::Batch(8));
-    }
-
-    #[test]
-    fn enters_catch_up_on_age_threshold() {
-        let mut policy = AdaptiveChunkingPolicy::default();
-        let now = Instant::now();
-
-        let decision = policy.decide(snapshot(/*queued_lines*/ 2, /*oldest_age_ms*/ 120), now);
-        assert_eq!(decision.mode, ChunkingMode::CatchUp);
-        assert_eq!(decision.entered_catch_up, true);
-        assert_eq!(decision.drain_plan, DrainPlan::Batch(2));
+    fn smooth_mode_enters_catch_up_at_depth_or_age_boundary() {
+        for (depth, age, catch_up) in [(1, 10, false), (7, 119, false), (8, 10, true), (2, 120, true)] {
+            let mut policy = AdaptiveChunkingPolicy::default();
+            let decision = policy.decide(snapshot(depth, age), Instant::now());
+            assert_eq!(decision, ChunkingDecision {
+                mode: if catch_up { ChunkingMode::CatchUp } else { ChunkingMode::Smooth },
+                entered_catch_up: catch_up,
+                drain_plan: if catch_up { DrainPlan::Batch(depth) } else { DrainPlan::Single },
+            }, "depth={depth}, age={age}");
+        }
     }
 
     #[test]
@@ -372,9 +352,12 @@ mod tests {
         );
         assert_eq!(pre_hold.mode, ChunkingMode::CatchUp);
 
+        let before_boundary = policy.decide(snapshot(2, 40), t0 + Duration::from_millis(449));
+        assert_eq!(before_boundary.mode, ChunkingMode::CatchUp);
+
         let post_hold = policy.decide(
             snapshot(/*queued_lines*/ 2, /*oldest_age_ms*/ 40),
-            t0 + Duration::from_millis(460),
+            t0 + Duration::from_millis(450),
         );
         assert_eq!(post_hold.mode, ChunkingMode::Smooth);
         assert_eq!(post_hold.drain_plan, DrainPlan::Single);

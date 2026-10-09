@@ -48,7 +48,9 @@ where
 
 fn extract_log_field(line: &str, key: &str) -> Option<String> {
     let quoted_prefix = format!("{key}=\"");
-    if let Some(start) = line.find(&quoted_prefix) {
+    if let Some((start, _)) = line.match_indices(&quoted_prefix).find(|(start, _)| {
+        *start == 0 || line[..*start].ends_with([' ', '\t', '{', ','])
+    }) {
         let value_start = start + quoted_prefix.len();
         if let Some(end_rel) = line[value_start..].find('"') {
             return Some(line[value_start..value_start + end_rel].to_string());
@@ -56,7 +58,9 @@ fn extract_log_field(line: &str, key: &str) -> Option<String> {
     }
 
     let bare_prefix = format!("{key}=");
-    for token in line.split_whitespace() {
+    for token in line.split(|character: char| {
+        character.is_whitespace() || matches!(character, '{' | '}' | ',')
+    }) {
         let trimmed = token.trim_end_matches(',');
         if let Some(value) = trimmed.strip_prefix(&bare_prefix) {
             return Some(value.to_string());
@@ -158,6 +162,19 @@ fn extract_log_field_does_not_confuse_similar_keys() {
         extract_log_field(line, "mcp_server_origin"),
         Some("stdio".to_string())
     );
+    assert_eq!(extract_log_field("other_mcp_server=\"stdio\"", "mcp_server"), None);
+}
+
+#[test]
+fn extract_log_field_compares_complete_numeric_span_values() {
+    for line in ["span{input_tokens=3}: close", "event input_tokens=3, next=1"] {
+        assert_eq!(extract_log_field(line, "input_tokens").as_deref(), Some("3"));
+    }
+    assert_eq!(
+        extract_log_field("span{input_tokens=30}: close", "input_tokens").as_deref(),
+        Some("30")
+    );
+    assert_eq!(extract_log_field("other_input_tokens=3", "input_tokens"), None);
 }
 
 #[tokio::test]
@@ -626,10 +643,10 @@ async fn process_sse_emits_completed_telemetry() {
             .find(|line| {
                 line.contains("codex.sse_event")
                     && line.contains("event.kind=response.completed")
-                    && line.contains("input_token_count=3")
-                    && line.contains("output_token_count=5")
-                    && line.contains("cached_token_count=1")
-                    && line.contains("reasoning_token_count=2")
+                    && extract_log_field(line, "input_token_count").as_deref() == Some("3")
+                    && extract_log_field(line, "output_token_count").as_deref() == Some("5")
+                    && extract_log_field(line, "cached_token_count").as_deref() == Some("1")
+                    && extract_log_field(line, "reasoning_token_count").as_deref() == Some("2")
                     && extract_log_field(line, "tool_token_count")
                         .and_then(|tool_tokens| tool_tokens.parse::<i64>().ok())
                         .is_some_and(|tool_tokens| tool_tokens > 0)
@@ -707,11 +724,11 @@ async fn turn_and_completed_response_spans_record_token_usage() {
             line.contains("handle_responses{")
                 && line.contains("otel.name=\"completed\"")
                 && line.contains("codex.request.reasoning_effort=high")
-                && line.contains("gen_ai.usage.input_tokens=3")
-                && line.contains("gen_ai.usage.cache_read.input_tokens=1")
-                && line.contains("gen_ai.usage.output_tokens=5")
-                && line.contains("codex.usage.reasoning_output_tokens=2")
-                && line.contains("codex.usage.total_tokens=9")
+                && extract_log_field(line, "gen_ai.usage.input_tokens").as_deref() == Some("3")
+                && extract_log_field(line, "gen_ai.usage.cache_read.input_tokens").as_deref() == Some("1")
+                && extract_log_field(line, "gen_ai.usage.output_tokens").as_deref() == Some("5")
+                && extract_log_field(line, "codex.usage.reasoning_output_tokens").as_deref() == Some("2")
+                && extract_log_field(line, "codex.usage.total_tokens").as_deref() == Some("9")
         }),
         "missing completed response span token usage\nlogs:\n{logs}"
     );
@@ -719,12 +736,12 @@ async fn turn_and_completed_response_spans_record_token_usage() {
         logs.lines().any(|line| {
             line.contains("turn{otel.name=\"session_task.turn\"")
                 && line.contains("codex.turn.reasoning_effort=high")
-                && line.contains("codex.turn.token_usage.input_tokens=3")
-                && line.contains("codex.turn.token_usage.cached_input_tokens=1")
-                && line.contains("codex.turn.token_usage.non_cached_input_tokens=2")
-                && line.contains("codex.turn.token_usage.output_tokens=5")
-                && line.contains("codex.turn.token_usage.reasoning_output_tokens=2")
-                && line.contains("codex.turn.token_usage.total_tokens=9")
+                && extract_log_field(line, "codex.turn.token_usage.input_tokens").as_deref() == Some("3")
+                && extract_log_field(line, "codex.turn.token_usage.cached_input_tokens").as_deref() == Some("1")
+                && extract_log_field(line, "codex.turn.token_usage.non_cached_input_tokens").as_deref() == Some("2")
+                && extract_log_field(line, "codex.turn.token_usage.output_tokens").as_deref() == Some("5")
+                && extract_log_field(line, "codex.turn.token_usage.reasoning_output_tokens").as_deref() == Some("2")
+                && extract_log_field(line, "codex.turn.token_usage.total_tokens").as_deref() == Some("9")
         }),
         "missing regular turn span token usage\nlogs:\n{logs}"
     );
@@ -1009,7 +1026,7 @@ async fn handle_response_item_records_tool_result_for_function_call() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(|lines: &[&str]| {
         let line = lines
@@ -1058,6 +1075,10 @@ async fn handle_response_item_records_tool_result_for_shell_command_call() {
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .expect("shell telemetry fixture must execute without sandbox setup");
         })
         .build(&server)
         .await
@@ -1094,7 +1115,7 @@ async fn handle_response_item_records_tool_result_for_shell_command_call() {
         })
         .to_string();
         assert_private_tool_result_fields(line, shell_arguments.len())?;
-        if !line.contains("success=false") {
+        if !line.contains("success=true") {
             return Err("missing success field".to_string());
         }
         assert_empty_mcp_tool_fields(line)?;
@@ -1158,10 +1179,10 @@ fn sandbox_outcome_assertion<'a>(
         if !lower.contains(&format!("outcome={expected_outcome}")) {
             return Err(format!("unexpected sandbox outcome for {call_id}"));
         }
-        if !lower.contains("initial_duration_ms=12") {
+        if extract_log_field(&lower, "initial_duration_ms").as_deref() != Some("12") {
             return Err("missing initial_duration_ms field".to_string());
         }
-        if !lower.contains("escalated_duration_ms=34") {
+        if extract_log_field(&lower, "escalated_duration_ms").as_deref() != Some("34") {
             return Err("missing escalated_duration_ms field".to_string());
         }
 

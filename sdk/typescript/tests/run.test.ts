@@ -36,12 +36,15 @@ describe("Codex", () => {
         },
       ];
       expect(result.items).toEqual(expectedItems);
-      expect(result.usage).toEqual({
-        cached_input_tokens: 12,
-        input_tokens: 42,
-        output_tokens: 5,
-        reasoning_output_tokens: 0,
-      });
+      expect(result.finalResponse).toBe("Hi!");
+      expect(result.usage).toEqual(
+        expect.objectContaining({
+          cached_input_tokens: 12,
+          input_tokens: 42,
+          output_tokens: 5,
+          reasoning_output_tokens: 0,
+        }),
+      );
       expect(thread.id).toEqual(expect.any(String));
     } finally {
       cleanup();
@@ -73,55 +76,12 @@ describe("Codex", () => {
       await thread.run("second input");
 
       // Check second request continues the same thread
-      expect(requests.length).toBeGreaterThanOrEqual(2);
+      expect(requests).toHaveLength(2);
       const secondRequest = requests[1];
       expect(secondRequest).toBeDefined();
       const payload = secondRequest!.json;
-
-      const assistantEntry = payload.input.find(
-        (entry: { role: string }) => entry.role === "assistant",
-      );
-      expect(assistantEntry).toBeDefined();
-      const assistantText = assistantEntry?.content?.find(
-        (item: { type: string; text: string }) => item.type === "output_text",
-      )?.text;
-      expect(assistantText).toBe("First response");
-    } finally {
-      cleanup();
-      await close();
-    }
-  });
-
-  it("continues the thread when run is called twice with options", async () => {
-    const { url, close, requests } = await startResponsesTestProxy({
-      statusCode: 200,
-      responseBodies: [
-        sse(
-          responseStarted("response_1"),
-          assistantMessage("First response", "item_1"),
-          responseCompleted("response_1"),
-        ),
-        sse(
-          responseStarted("response_2"),
-          assistantMessage("Second response", "item_2"),
-          responseCompleted("response_2"),
-        ),
-      ],
-    });
-    const { client, cleanup } = createMockClient(url);
-
-    try {
-      const thread = client.startThread();
-      await thread.run("first input");
-      await thread.run("second input");
-
-      // Check second request continues the same thread
-      expect(requests.length).toBeGreaterThanOrEqual(2);
-      const secondRequest = requests[1];
-      expect(secondRequest).toBeDefined();
-      const payload = secondRequest!.json;
-
       expect(payload.input.at(-1)!.content![0]!.text).toBe("second input");
+
       const assistantEntry = payload.input.find(
         (entry: { role: string }) => entry.role === "assistant",
       );

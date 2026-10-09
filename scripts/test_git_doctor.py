@@ -22,8 +22,18 @@ def completed(returncode: int, *, stdout: str = "", stderr: str = ""):
 class GitDoctorTest(unittest.TestCase):
     def test_real_git_success_diagnostics_reach_the_human_report(self):
         with tempfile.TemporaryDirectory() as directory:
-            hook = (Path(directory) / "missing-fsmonitor").as_posix()
-            with mock.patch.dict(
+            repo = Path(directory)
+            subprocess.run(
+                ["git", "init", "--quiet"], cwd=repo,
+                check=True, capture_output=True, timeout=30,
+            )
+            (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "tracked.txt"], cwd=repo,
+                check=True, capture_output=True, timeout=30,
+            )
+            hook = (repo / "missing-fsmonitor").as_posix()
+            with mock.patch.object(git_doctor, "REPO_ROOT", repo), mock.patch.dict(
                 os.environ,
                 {
                     "GIT_CONFIG_COUNT": "1",

@@ -842,38 +842,19 @@ mod tests {
     }
 
     #[test]
-    fn resolves_in_progress_turn_to_active_status() {
-        let status = resolve_thread_status(ThreadStatus::Idle, /*has_in_progress_turn*/ true);
-        assert_eq!(
-            status,
-            ThreadStatus::Active {
-                active_flags: Vec::new(),
-            }
-        );
-
-        let status =
-            resolve_thread_status(ThreadStatus::NotLoaded, /*has_in_progress_turn*/ true);
-        assert_eq!(
-            status,
-            ThreadStatus::Active {
-                active_flags: Vec::new(),
-            }
-        );
-    }
-
-    #[test]
-    fn keeps_status_when_no_in_progress_turn() {
-        assert_eq!(
-            resolve_thread_status(ThreadStatus::Idle, /*has_in_progress_turn*/ false),
-            ThreadStatus::Idle
-        );
-        assert_eq!(
-            resolve_thread_status(
-                ThreadStatus::SystemError,
-                /*has_in_progress_turn*/ false
-            ),
-            ThreadStatus::SystemError
-        );
+    fn in_progress_turn_only_promotes_idle_or_unloaded_status() {
+        let active = ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+        };
+        for (status, in_progress_status) in [
+            (ThreadStatus::Idle, ThreadStatus::Active { active_flags: vec![] }),
+            (ThreadStatus::NotLoaded, ThreadStatus::Active { active_flags: vec![] }),
+            (ThreadStatus::SystemError, ThreadStatus::SystemError),
+            (active.clone(), active),
+        ] {
+            assert_eq!(resolve_thread_status(status.clone(), false), status);
+            assert_eq!(resolve_thread_status(status, true), in_progress_status);
+        }
     }
 
     #[tokio::test]
@@ -1257,7 +1238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_permission_request_releases_state_before_outgoing_queue_drains() {
+    async fn cancelled_requests_release_state_before_outgoing_queue_drains() {
         let (outgoing_tx, outgoing_rx) = mpsc::channel(1);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
@@ -1273,105 +1254,41 @@ mod tests {
             .subscribe(ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id"))
             .await
             .expect("status subscription");
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        timeout(Duration::from_secs(1), async {
             while outgoing_rx.len() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("publication worker fills outgoing queue");
-        assert_eq!(
-            outgoing_rx.len(),
-            1,
-            "initial status fills the real outgoing queue"
-        );
+        assert_eq!(outgoing_rx.len(), 1);
         assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
 
-        let request = manager
-            .note_permission_requested(INTERACTIVE_THREAD_ID)
-            .await;
-        assert_pending_request_counts(&manager, 1, 0);
-        assert_eq!(
-            *subscription.borrow(),
-            ThreadStatus::Active {
-                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
-            }
-        );
+        for permission in [true, false] {
+            let (request, expected_flag) = if permission {
+                let request = manager.note_permission_requested(INTERACTIVE_THREAD_ID).await;
+                assert_pending_request_counts(&manager, 1, 0);
+                (request, ThreadActiveFlag::WaitingOnApproval)
+            } else {
+                let request = manager.note_user_input_requested(INTERACTIVE_THREAD_ID).await;
+                assert_pending_request_counts(&manager, 0, 1);
+                (request, ThreadActiveFlag::WaitingOnUserInput)
+            };
+            assert_eq!(
+                *subscription.borrow(),
+                ThreadStatus::Active { active_flags: vec![expected_flag] }
+            );
 
-        drop(request);
-        // No await, yield, outgoing receive or fresh manager operation can repair this state.
-        assert_pending_request_counts(&manager, 0, 0);
-        assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
-        assert_eq!(
-            outgoing_rx.len(),
-            1,
-            "cleanup must not require draining the queue"
-        );
-        assert_eq!(
-            manager
-                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
-                .await,
-            ThreadStatus::Idle
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_user_input_request_releases_state_before_outgoing_queue_drains() {
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(1);
-        let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        )));
-        manager
-            .upsert_thread(&test_thread(
-                INTERACTIVE_THREAD_ID,
-                codex_app_server_protocol::SessionSource::Cli,
-            ))
-            .await;
-        let subscription = manager
-            .subscribe(ThreadId::from_string(INTERACTIVE_THREAD_ID).expect("valid thread id"))
-            .await
-            .expect("status subscription");
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while outgoing_rx.len() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("publication worker fills outgoing queue");
-        assert_eq!(
-            outgoing_rx.len(),
-            1,
-            "initial status fills the real outgoing queue"
-        );
-        assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
-
-        let request = manager
-            .note_user_input_requested(INTERACTIVE_THREAD_ID)
-            .await;
-        assert_pending_request_counts(&manager, 0, 1);
-        assert_eq!(
-            *subscription.borrow(),
-            ThreadStatus::Active {
-                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
-            }
-        );
-
-        drop(request);
-        // The observer must see rollback immediately, before any asynchronous cleanup runs.
-        assert_pending_request_counts(&manager, 0, 0);
-        assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
-        assert_eq!(
-            outgoing_rx.len(),
-            1,
-            "cleanup must not require draining the queue"
-        );
-        assert_eq!(
-            manager
-                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
-                .await,
-            ThreadStatus::Idle
-        );
+            drop(request);
+            // No await, yield, receive or fresh manager operation can repair this state.
+            assert_pending_request_counts(&manager, 0, 0);
+            assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
+            assert_eq!(outgoing_rx.len(), 1, "cleanup must not require draining the queue");
+            assert_eq!(
+                manager.loaded_status_for_thread(INTERACTIVE_THREAD_ID).await,
+                ThreadStatus::Idle
+            );
+        }
     }
 
     #[test]

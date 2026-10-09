@@ -257,8 +257,8 @@ mod tests {
 
         assert_eq!(
             command_response_timeout(command_timeout),
-            command_timeout + COMMAND_RESPONSE_GRACE_PERIOD
+            Duration::from_secs(40)
         );
-        assert!(command_response_timeout(command_timeout) > command_timeout);
+        assert_eq!(command_response_timeout(Duration::MAX), Duration::MAX);
     }
 }

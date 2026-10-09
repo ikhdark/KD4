@@ -632,7 +632,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/shared-client"))
             .and(header("x-codex-test", "exec-server"))
+            .and(wiremock::matchers::body_bytes(b"payload".to_vec()))
             .respond_with(ResponseTemplate::new(201).set_body_bytes(b"created".to_vec()))
+            .expect(1)
             .mount(&server)
             .await;
         let runner = ReqwestHttpRequestRunner::new(Some(2_000), HttpRedirectPolicy::Follow);

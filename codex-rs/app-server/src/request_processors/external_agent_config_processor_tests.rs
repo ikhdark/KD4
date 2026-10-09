@@ -36,7 +36,11 @@ fn migration_items_that_update_runtime_sources_trigger_refresh() {
     assert!(migration_items_need_runtime_refresh(&[migration_item(
         ExternalAgentConfigMigrationItemType::Plugins,
     )]));
-    assert!(!migration_items_need_runtime_refresh(&[migration_item(
+    for item_type in [
         ExternalAgentConfigMigrationItemType::Sessions,
-    )]));
+        ExternalAgentConfigMigrationItemType::AgentsMd,
+        ExternalAgentConfigMigrationItemType::Subagents,
+    ] {
+        assert!(!migration_items_need_runtime_refresh(&[migration_item(item_type)]));
+    }
 }

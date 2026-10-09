@@ -1,6 +1,7 @@
 use super::PluginResourceLocator;
 use super::ResolvedPlugin;
 use super::ResolvedPluginError;
+use super::ResolvedPluginLocation;
 use crate::manifest::PluginManifest;
 use crate::manifest::PluginManifestHooks;
 use crate::manifest::PluginManifestInterface;
@@ -68,6 +69,14 @@ fn environment_descriptor_binds_every_manifest_resource() {
     )
     .expect("valid descriptor");
 
+    assert_eq!(plugin.selected_root_id(), "selected-demo");
+    assert_eq!(
+        plugin.location(),
+        &ResolvedPluginLocation::Environment {
+            environment_id: "executor-1".to_string(),
+            root: path_uri(&root),
+        }
+    );
     assert_eq!(
         plugin.manifest_path(),
         &resource("executor-1", &manifest_path)
@@ -108,73 +117,52 @@ fn environment_descriptor_rejects_resources_outside_package_root() {
     let cwd = std::env::current_dir().expect("cwd");
     let root = absolute(cwd.join("plugin-root"));
     let outside = absolute(cwd.join("plugin-root-other/.mcp.json"));
-    let manifest = PluginManifest {
-        name: "demo".to_string(),
-        version: None,
-        description: None,
-        keywords: Vec::new(),
-        paths: PluginManifestPaths {
-            skills: Vec::new(),
-            mcp_servers: Some(PluginManifestMcpServers::Path(path_uri(&outside))),
-            apps: None,
-            hooks: None,
-        },
-        interface: None,
-        tool_exposure: None,
-    };
-
-    let err = ResolvedPlugin::from_environment(
-        "selected-demo".to_string(),
-        "executor-1".to_string(),
-        path_uri(&root),
-        path_uri(&root.join(".codex-plugin/plugin.json")),
-        manifest,
-    )
-    .expect_err("outside resource should fail");
-
-    assert_eq!(
-        err,
-        ResolvedPluginError::ResourceOutsideRoot {
-            root: path_uri(&root),
-            path: path_uri(&outside),
+    for field in ["manifest", "skills", "mcp", "apps", "hooks", "composer", "logo", "logo_dark", "screenshots"] {
+        let mut manifest_path = path_uri(&root.join(".codex-plugin/plugin.json"));
+        let mut manifest = PluginManifest {
+            name: "demo".to_string(),
+            version: None,
+            description: None,
+            keywords: Vec::new(),
+            paths: PluginManifestPaths {
+                skills: vec![path_uri(&root.join("skills"))],
+                mcp_servers: None,
+                apps: None,
+                hooks: None,
+            },
+            interface: Some(PluginManifestInterface::default()),
+            tool_exposure: None,
+        };
+        let outside_uri = path_uri(&outside);
+        let interface = manifest.interface.as_mut().unwrap();
+        match field {
+            "manifest" => manifest_path = outside_uri,
+            "skills" => manifest.paths.skills.push(outside_uri),
+            "mcp" => manifest.paths.mcp_servers = Some(PluginManifestMcpServers::Path(outside_uri)),
+            "apps" => manifest.paths.apps = Some(outside_uri),
+            "hooks" => manifest.paths.hooks = Some(PluginManifestHooks::Paths(vec![outside_uri])),
+            "composer" => interface.composer_icon = Some(outside_uri),
+            "logo" => interface.logo = Some(outside_uri),
+            "logo_dark" => interface.logo_dark = Some(outside_uri),
+            "screenshots" => interface.screenshots.push(outside_uri),
+            _ => unreachable!(),
         }
-    );
-}
+        let err = ResolvedPlugin::from_environment(
+            "selected-demo".to_string(),
+            "executor-1".to_string(),
+            path_uri(&root),
+            manifest_path,
+            manifest,
+        )
+        .expect_err("every resource must stay inside the package root");
 
-#[test]
-fn environment_descriptor_rejects_manifest_outside_package_root() {
-    let cwd = std::env::current_dir().expect("cwd");
-    let root = absolute(cwd.join("plugin-root"));
-    let outside = absolute(cwd.join("plugin-root-other/.codex-plugin/plugin.json"));
-    let manifest = PluginManifest {
-        name: "demo".to_string(),
-        version: None,
-        description: None,
-        keywords: Vec::new(),
-        paths: PluginManifestPaths {
-            skills: vec![path_uri(&root.join("skills"))],
-            mcp_servers: None,
-            apps: None,
-            hooks: None,
-        },
-        interface: None,
-        tool_exposure: None,
-    };
-
-    let err = ResolvedPlugin::from_environment(
-        "selected-demo".to_string(),
-        "executor-1".to_string(),
-        path_uri(&root),
-        path_uri(&outside),
-        manifest,
-    )
-    .expect_err("outside manifest should fail even when its resources are inside");
-
-    assert_eq!(
-        err,
-        ResolvedPluginError::ResourceOutsideRoot {
-            root: path_uri(&root),
-            path: path_uri(&outside),
-        }
-    );
+        assert_eq!(
+            err,
+            ResolvedPluginError::ResourceOutsideRoot {
+                root: path_uri(&root),
+                path: path_uri(&outside),
+            },
+            "{field}"
+        );
+    }
 }

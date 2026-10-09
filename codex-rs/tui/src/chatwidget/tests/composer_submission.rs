@@ -451,6 +451,9 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
     chat.set_remote_image_urls(vec![remote_url.clone()]);
 
     chat.open_bug_capture_prompt();
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_no_submit_op(&mut op_rx);
     chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     assert_eq!(chat.remote_image_urls(), vec![remote_url]);
@@ -498,6 +501,31 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
 
     assert_eq!(chat.remote_image_urls(), vec![remote_url]);
     assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn disabled_composer_does_not_dispatch_clipboard_image_paste() {
+    for shutdown in [false, true] {
+        let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+        chat.bottom_pane
+            .set_composer_text("keep draft".to_string(), Vec::new(), Vec::new());
+        if shutdown {
+            chat.show_shutdown_in_progress();
+        } else {
+            chat.bottom_pane.set_composer_input_enabled(false, None);
+        }
+        let draft = chat.bottom_pane.composer_draft_snapshot();
+        while rx.try_recv().is_ok() {}
+
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            // This real routing wrapper panics if it requests asynchronous image-paste work.
+            chat.handle_key_event(KeyEvent::new(KeyCode::Char('v'), modifiers));
+        }
+
+        assert_eq!(chat.bottom_pane.composer_draft_snapshot(), draft);
+        assert!(rx.try_recv().is_err());
+        assert_no_submit_op(&mut op_rx);
+    }
 }
 
 #[tokio::test]
@@ -773,19 +801,20 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
     assert_eq!(chat.active_collaboration_mode_kind(), expected_mode);
 }
 
-#[tokio::test]
-async fn remap_placeholders_uses_attachment_labels() {
+#[test]
+fn remap_placeholders_uses_attachment_labels_or_byte_ranges() {
+    for explicit_labels in [false, true] {
     let placeholder_one = "[Image #1]";
     let placeholder_two = "[Image #2]";
     let text = format!("{placeholder_two} before {placeholder_one}");
     let elements = vec![
         TextElement::new(
             (0..placeholder_two.len()).into(),
-            Some(placeholder_two.to_string()),
+            explicit_labels.then(|| placeholder_two.to_string()),
         ),
         TextElement::new(
             ("[Image #2] before ".len().."[Image #2] before [Image #1]".len()).into(),
-            Some(placeholder_one.to_string()),
+            explicit_labels.then(|| placeholder_one.to_string()),
         ),
     ];
 
@@ -840,69 +869,11 @@ async fn remap_placeholders_uses_attachment_labels() {
         remapped.remote_image_urls,
         vec!["https://example.com/a.png".to_string()]
     );
+    assert_eq!(next_label, 5);
+    }
 }
 
-#[tokio::test]
-async fn remap_placeholders_uses_byte_ranges_when_placeholder_missing() {
-    let placeholder_one = "[Image #1]";
-    let placeholder_two = "[Image #2]";
-    let text = format!("{placeholder_two} before {placeholder_one}");
-    let elements = vec![
-        TextElement::new((0..placeholder_two.len()).into(), /*placeholder*/ None),
-        TextElement::new(
-            ("[Image #2] before ".len().."[Image #2] before [Image #1]".len()).into(),
-            /*placeholder*/ None,
-        ),
-    ];
 
-    let attachments = vec![
-        LocalImageAttachment {
-            placeholder: placeholder_one.to_string(),
-            path: PathBuf::from("/tmp/one.png"),
-        },
-        LocalImageAttachment {
-            placeholder: placeholder_two.to_string(),
-            path: PathBuf::from("/tmp/two.png"),
-        },
-    ];
-    let message = UserMessage {
-        text,
-        text_elements: elements,
-        local_images: attachments,
-        remote_image_urls: Vec::new(),
-        mention_bindings: Vec::new(),
-    };
-    let mut next_label = 3usize;
-    let remapped = remap_placeholders_for_message(message, &mut next_label);
-
-    assert_eq!(remapped.text, "[Image #4] before [Image #3]");
-    assert_eq!(
-        remapped.text_elements,
-        vec![
-            TextElement::new(
-                (0.."[Image #4]".len()).into(),
-                Some("[Image #4]".to_string()),
-            ),
-            TextElement::new(
-                ("[Image #4] before ".len().."[Image #4] before [Image #3]".len()).into(),
-                Some("[Image #3]".to_string()),
-            ),
-        ]
-    );
-    assert_eq!(
-        remapped.local_images,
-        vec![
-            LocalImageAttachment {
-                placeholder: "[Image #3]".to_string(),
-                path: PathBuf::from("/tmp/one.png"),
-            },
-            LocalImageAttachment {
-                placeholder: "[Image #4]".to_string(),
-                path: PathBuf::from("/tmp/two.png"),
-            },
-        ]
-    );
-}
 
 #[tokio::test]
 async fn empty_enter_during_task_does_not_queue() {
@@ -1186,28 +1157,15 @@ async fn unbound_queued_message_edit_does_not_fall_back_to_alt_up() {
 }
 
 #[tokio::test]
-async fn shift_left_edits_most_recent_queued_message_in_warp_terminal() {
-    assert_shift_left_edits_most_recent_queued_message_for_terminal(TerminalInfo {
-        name: TerminalName::WarpTerminal,
-        term_program: None,
-        version: None,
-        term: None,
-        multiplexer: None,
-    })
-    .await;
+async fn shift_left_edits_most_recent_queued_message_in_supported_terminals() {
+    for name in [TerminalName::WarpTerminal, TerminalName::VsCode] {
+        assert_shift_left_edits_most_recent_queued_message_for_terminal(TerminalInfo {
+            name, term_program: None, version: None, term: None, multiplexer: None,
+        }).await;
+    }
 }
 
-#[tokio::test]
-async fn shift_left_edits_most_recent_queued_message_in_vscode_terminal() {
-    assert_shift_left_edits_most_recent_queued_message_for_terminal(TerminalInfo {
-        name: TerminalName::VsCode,
-        term_program: None,
-        version: None,
-        term: None,
-        multiplexer: None,
-    })
-    .await;
-}
+
 
 #[test]
 fn queued_message_edit_binding_mapping_covers_windows_terminals() {
@@ -1505,49 +1463,16 @@ async fn committed_user_message_with_hidden_prompt_context_renders_local_images(
     assert_eq!(local_images, vec![local_image]);
 }
 
-#[tokio::test]
-async fn interrupt_restores_queued_messages_into_composer() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    // Simulate a running task to enable queuing of user inputs.
-    chat.bottom_pane.set_task_running(/*running*/ true);
-
-    // Queue two user messages while the task is running.
-    chat.input_queue
-        .queued_user_messages
-        .push_back(UserMessage::from("first queued".to_string()).into());
-    chat.input_queue
-        .queued_user_messages
-        .push_back(UserMessage::from("second queued".to_string()).into());
-    chat.refresh_pending_input_preview();
-
-    // Deliver an interrupted turn notification as if Esc was pressed.
-    handle_turn_interrupted(&mut chat, "turn-1");
-
-    // Composer should now contain the queued messages joined by newlines, in order.
-    assert_eq!(
-        chat.bottom_pane.composer_text(),
-        "first queued\nsecond queued"
-    );
-
-    // Queue should be cleared and no new user input should have been auto-submitted.
-    assert!(chat.input_queue.queued_user_messages.is_empty());
-    assert!(
-        op_rx.try_recv().is_err(),
-        "unexpected outbound op after interrupt"
-    );
-
-    // Drain rx to avoid unused warnings.
-    let _ = drain_insert_history(&mut rx);
-}
 
 #[tokio::test]
-async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
+async fn interrupt_restores_queued_messages_before_empty_or_existing_draft() {
+    for draft in ["", "current draft"] {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.bottom_pane.set_task_running(/*running*/ true);
     chat.bottom_pane
-        .set_composer_text("current draft".to_string(), Vec::new(), Vec::new());
+        .set_composer_text(draft.to_string(), Vec::new(), Vec::new());
 
     chat.input_queue
         .queued_user_messages
@@ -1561,7 +1486,7 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
 
     assert_eq!(
         chat.bottom_pane.composer_text(),
-        "first queued\nsecond queued\ncurrent draft"
+        if draft.is_empty() { "first queued\nsecond queued" } else { "first queued\nsecond queued\ncurrent draft" }
     );
     assert!(chat.input_queue.queued_user_messages.is_empty());
     assert!(
@@ -1570,6 +1495,7 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
     );
 
     let _ = drain_insert_history(&mut rx);
+    }
 }
 
 #[tokio::test]
@@ -1626,6 +1552,40 @@ async fn queued_edit_preserves_current_draft() {
 }
 
 #[tokio::test]
+async fn held_input_blocks_queued_edit_and_quit_and_survives_clear_history() {
+    for key in [
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+        chat.chat_keymap.edit_queued_message = vec![crate::key_hint::alt(KeyCode::Up)];
+        chat.input_queue
+            .queued_user_messages
+            .push_back(UserMessage::from("queued").into());
+        chat.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        assert!(chat.bottom_pane.is_in_paste_burst());
+        assert!(!chat.bottom_pane.composer_is_empty());
+
+        chat.handle_key_event(key);
+        if key.code == KeyCode::Char('c') {
+            assert!(chat.bottom_pane.composer_is_empty());
+            chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+        } else {
+            // Resolve a held character normally without waiting for a wall-clock timer.
+            chat.handle_key_event(KeyEvent::from(KeyCode::Right));
+        }
+        assert_eq!(chat.bottom_pane.composer_text(), "a");
+        assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+        assert_eq!(chat.input_queue.queued_user_messages[0].text, "queued");
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, AppEvent::Exit(_)));
+        }
+        assert_no_submit_op(&mut op_rx);
+    }
+}
+
+#[tokio::test]
 async fn failed_submission_restores_draft_without_recording_success() {
     for text in ["normal prompt", "!echo hello"] {
         let (mut chat, mut rx, op_rx) = make_chatwidget_manual(None).await;
@@ -1666,6 +1626,20 @@ async fn queued_plain_submission_preserves_shell_escape_policy() {
         |item| matches!(item, UserInput::Text { text, .. } if text == "!explain this literally")
     ));
     assert!(chat.input_queue.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn thread_input_snapshot_preserves_held_keystroke() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+    assert!(chat.bottom_pane.is_in_paste_burst());
+    let snapshot = chat.capture_thread_input_state();
+    chat.restore_thread_input_state(None);
+    assert!(chat.bottom_pane.composer_is_empty());
+    chat.restore_thread_input_state(snapshot);
+    assert_eq!(chat.bottom_pane.composer_text(), "a");
+    assert!(!chat.bottom_pane.is_in_paste_burst());
+    assert_no_submit_op(&mut op_rx);
 }
 
 #[tokio::test]

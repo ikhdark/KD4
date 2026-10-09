@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,12 +61,23 @@ class RolloutAuditCacheTest(unittest.TestCase):
         self.assertEqual(changed["analysisCache"]["status"], "miss")
 
     def test_decode_retention_limits_fall_back_without_losing_records(self):
-        self.source.write_bytes(b'{}\n{}\n')
+        records = [
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "retained"}},
+            {"type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": "retained", "timing": _timing(),
+            }},
+        ]
+        self.source.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
         for limit in ("MAX_DECODED_WIRE_BYTES", "MAX_DECODED_RECORDS"):
             with self.subTest(limit=limit), mock.patch.object(cache, limit, 1):
                 report = self.run_audit(refresh=True)
             self.assertEqual(report["coverage"]["lines"], 2)
             self.assertEqual(report["coverage"]["parseErrorCount"], 0)
+            self.assertEqual(report["coverage"]["validCompleteProfiles"], 1)
+            self.assertEqual(
+                [(turn["turnId"], turn["inclusiveDurationNs"]) for turn in report["perTurn"]],
+                [("retained", 1_000_000_000)],
+            )
 
     def test_reuse_preserves_report_identity_and_skips_analysis(self):
         first = self.run_audit()
@@ -81,6 +94,22 @@ class RolloutAuditCacheTest(unittest.TestCase):
         self.assertEqual(
             audit.bounded_summary(second)["evidence_lineage"], first["evidence_lineage"]
         )
+        # A fresh interpreter cannot reuse process-local objects or index state.
+        child = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import json,sys; from pathlib import Path; "
+             "from unittest import mock; from scripts import kd4_turn_latency_audit as audit; "
+             "patch = mock.patch.object(audit, '_population_report', "
+             "side_effect=AssertionError('persisted report was recomputed')); "
+             "patch.start(); print(json.dumps(audit.analyze_session_path("
+             "Path(sys.argv[1]), Path(sys.argv[2]), cache_dir=Path(sys.argv[3]))))",
+             str(self.source), str(self.root), str(self.cache)],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True,
+            encoding="utf-8", timeout=30, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(json.loads(child.stdout), second)
         first.pop("analysisCache")
         second.pop("analysisCache")
         self.assertEqual(first, second)
@@ -431,8 +460,22 @@ class RolloutAuditCacheTest(unittest.TestCase):
         compressed = self.source.with_name(self.source.name + ".zst")
         compressed.write_bytes(zstd.compress(self.source.read_bytes()))
         self.source.unlink()
-        self.assertEqual(self.run_audit()["analysisCache"]["status"], "miss")
-        self.assertEqual(self.run_audit()["analysisCache"]["status"], "hit")
+        first = self.run_audit()
+        with mock.patch.object(audit, "_population_report", side_effect=AssertionError("recomputed")):
+            second = self.run_audit()
+        self.assertEqual(first["analysisCache"]["status"], "miss")
+        self.assertEqual(second["analysisCache"]["status"], "hit")
+        self.assertEqual(first["coverage"]["lines"], 1)
+        self.assertEqual(first["coverage"]["snapshots"], [{
+            "path": str(compressed.resolve()),
+            "byteLength": compressed.stat().st_size,
+            "sha256": hashlib.sha256(compressed.read_bytes()).hexdigest(),
+        }])
+        self.assertEqual(first["analysisCache"]["report"], second["analysisCache"]["report"])
+        self.assertEqual(
+            {key: value for key, value in first.items() if key != "analysisCache"},
+            {key: value for key, value in second.items() if key != "analysisCache"},
+        )
 
     def test_compressed_decode_retention_is_bounded_by_expanded_bytes(self):
         try:

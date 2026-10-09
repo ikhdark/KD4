@@ -1668,35 +1668,32 @@ command = "repo-server"
         let root = tempfile::TempDir::new().expect("tempdir");
         fs::write(
             root.path().join(".mcp.json"),
-            r#"{
-              "mcpServers": {
-                "enabled": {"command": "enabled-server"},
-                "explicit-disabled": {"command": "disabled-server", "disabled": true},
-                "not-enabled": {"command": "not-enabled-server"}
-              }
-            }"#,
-        )
-        .expect("write mcp");
-        let settings = serde_json::json!({
-            "enabledMcpjsonServers": ["enabled"],
-            "disabledMcpjsonServers": ["explicit-disabled"]
-        });
-
-        assert_eq!(
-            build_mcp_config_from_external(
-                root.path(),
-                /*external_agent_home*/ None,
-                Some(&settings),
-            )
-            .unwrap(),
-            toml::from_str(
-                r#"
-[mcp_servers.enabled]
-command = "enabled-server"
-"#
-            )
-            .unwrap()
-        );
+            r#"{"mcpServers":{
+                "enabled":{"command":"enabled-server"},
+                "explicit-disabled":{"command":"disabled-server","disabled":true},
+                "false-enabled":{"command":"false-enabled-server","enabled":false},
+                "not-enabled":{"command":"not-enabled-server"}
+            }}"#,
+        ).expect("write mcp");
+        for (settings, expected) in [
+            (None, vec!["enabled", "not-enabled"]),
+            (Some(serde_json::json!({"disabledMcpjsonServers":["not-enabled"]})), vec!["enabled"]),
+            (Some(serde_json::json!({"enabledMcpjsonServers":["enabled"]})), vec!["enabled"]),
+            (Some(serde_json::json!({
+                "enabledMcpjsonServers":["enabled","explicit-disabled","false-enabled","not-enabled"],
+                "disabledMcpjsonServers":["not-enabled"]
+            })), vec!["enabled"]),
+        ] {
+            let actual = build_mcp_config_from_external(root.path(), None, settings.as_ref()).unwrap();
+            let expected_servers = expected.into_iter().map(|name| {
+                (name.to_string(), TomlValue::Table(toml::map::Map::from_iter([
+                    ("command".to_string(), TomlValue::String(format!("{name}-server"))),
+                ])))
+            }).collect();
+            assert_eq!(actual, TomlValue::Table(toml::map::Map::from_iter([
+                ("mcp_servers".to_string(), TomlValue::Table(expected_servers)),
+            ])), "settings={settings:?}");
+        }
     }
 
     #[test]
@@ -1708,12 +1705,25 @@ command = "enabled-server"
     }
 
     #[test]
-    fn command_skill_names_must_fit_codex_skill_loader_limit() {
+    fn unsupported_commands_are_skipped_for_each_independent_reason() {
         let root = source_path("commands");
-        let file = source_path("commands/this/is/a/deeply/nested/command/with/a/very/long/name.md");
-        let document = parse_document_content("---\ndescription: Review PR\n---\nReview\n");
-
-        assert!(command_skill_name_if_supported(&root, &file, &document).is_none());
+        for (file, content) in [
+            ("commands/this/is/a/deeply/nested/command/with/a/very/long/name.md", "---\ndescription: Review PR\n---\nReview\n"),
+            ("commands/review.md", "# Notes\n\nThis documents commands.\n"),
+            ("commands/deploy.md", "---\ndescription: Deploy\n---\nDeploy $ARGUMENTS from @release.yaml\n"),
+        ] {
+            let document = parse_document_content(content);
+            assert!(command_skill_name_if_supported(&root, &source_path(file), &document).is_none(), "{file}: {content}");
+        }
+        for body in ["$ARGUMENTS", "$1", "{{ value }}", "!`date`", "! `date`", "@release.yaml"] {
+            let document = parse_document_content(&format!("---\ndescription: Deploy\n---\n{body}\n"));
+            assert!(command_skill_name_if_supported(&root, &source_path("commands/deploy.md"), &document).is_none(), "{body}");
+        }
+        let supported = parse_document_content("---\ndescription: Deploy\n---\nDeploy normally\n");
+        assert_eq!(
+            command_skill_name_if_supported(&root, &source_path("commands/deploy.md"), &supported),
+            Some("source-command-deploy".to_string())
+        );
     }
 
     #[test]
@@ -1745,25 +1755,7 @@ command = "enabled-server"
         );
     }
 
-    #[test]
-    fn commands_with_provider_runtime_expansion_are_skipped() {
-        let root = source_path("commands");
-        let file = source_path("commands/deploy.md");
-        let document = parse_document_content(
-            "---\ndescription: Deploy\n---\nDeploy $ARGUMENTS from @release.yaml\n",
-        );
 
-        assert!(command_skill_name_if_supported(&root, &file, &document).is_none());
-    }
-
-    #[test]
-    fn commands_without_description_are_skipped() {
-        let root = source_path("commands");
-        let file = source_path("commands/review.md");
-        let document = parse_document_content("# Notes\n\nThis documents commands.\n");
-
-        assert!(command_skill_name_if_supported(&root, &file, &document).is_none());
-    }
 
     #[test]
     fn commands_with_unrepresentable_runtime_controls_are_not_offered_or_imported() {

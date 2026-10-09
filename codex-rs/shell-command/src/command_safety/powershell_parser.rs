@@ -1056,7 +1056,14 @@ mod tests {
         else {
             panic!("expected parser analysis");
         };
-        assert!(analysis.direct_argv.is_some());
+        assert_eq!(
+            analysis.direct_argv,
+            Some(PowershellDirectArgvCandidate {
+                argv: vec!["python".to_string()],
+                native_argument_mode: "Standard".to_string(),
+                powershell_version: "7.5.0".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1350,74 +1357,35 @@ mod tests {
     }
 
     #[test]
-    fn parser_process_rejects_stop_parsing_forms() {
+    fn parser_process_rejects_unsupported_top_level_forms() {
         let Some(powershell) = try_find_powershell_executable_blocking() else {
             return;
         };
         let powershell = powershell.as_path().to_str().unwrap();
         let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
 
-        let parsed = parser
-            .parse("git log --% HEAD --output=codex_poc.txt")
-            .unwrap();
-        assert_eq!(parsed, PowershellParseOutcome::Unsupported);
-    }
-
-    #[test]
-    fn parser_process_rejects_param_blocks() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
+        for script in [
+            "git log --% HEAD --output=codex_poc.txt",
+            "param([string]$path = (Get-Location)) Write-Output test",
+            "begin { Set-Content codex_poc.txt pwned } end { Get-Content Cargo.toml }",
+            "using module ./codex_poc.psm1\nGet-Content Cargo.toml",
+            "trap { Set-Content codex_poc.txt pwned; continue } Get-Content missing -ErrorAction Stop",
+        ] {
+            assert_eq!(
+                parser.parse(script).unwrap(),
+                PowershellParseOutcome::Unsupported,
+                "{script}"
+            );
+        }
+        assert_eq!(parser.next_request_id, 5, "each distinct form reached the host");
+        let PowershellParseOutcome::Analysis(analysis) =
+            parser.parse("Write-Output after-rejection").unwrap()
+        else {
+            panic!("rejected forms must not poison subsequent requests");
         };
-        let powershell = powershell.as_path().to_str().unwrap();
-        let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
-
-        let parsed = parser
-            .parse("param([string]$path = (Get-Location)) Write-Output test")
-            .unwrap();
-        assert_eq!(parsed, PowershellParseOutcome::Unsupported);
-    }
-
-    #[test]
-    fn parser_process_rejects_named_blocks() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
-        let powershell = powershell.as_path().to_str().unwrap();
-        let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
-
-        let parsed = parser
-            .parse("begin { Set-Content codex_poc.txt pwned } end { Get-Content Cargo.toml }")
-            .unwrap();
-        assert_eq!(parsed, PowershellParseOutcome::Unsupported);
-    }
-
-    #[test]
-    fn parser_process_rejects_using_statements() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
-        let powershell = powershell.as_path().to_str().unwrap();
-        let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
-
-        let parsed = parser
-            .parse("using module ./codex_poc.psm1\nGet-Content Cargo.toml")
-            .unwrap();
-        assert_eq!(parsed, PowershellParseOutcome::Unsupported);
-    }
-
-    #[test]
-    fn parser_process_rejects_trap_blocks() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
-        let powershell = powershell.as_path().to_str().unwrap();
-        let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
-
-        let parsed = parser
-            .parse(
-                "trap { Set-Content codex_poc.txt pwned; continue } Get-Content missing -ErrorAction Stop",
-            )
-            .unwrap();
-        assert_eq!(parsed, PowershellParseOutcome::Unsupported);
+        assert_eq!(
+            analysis.commands,
+            vec![vec!["Write-Output".to_string(), "after-rejection".to_string()]]
+        );
     }
 }

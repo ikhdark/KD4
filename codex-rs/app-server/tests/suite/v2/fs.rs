@@ -113,9 +113,10 @@ async fn fs_get_metadata_returns_file_size_and_timestamps() -> Result<()> {
             modified_at_ms: stat.modified_at_ms,
         }
     );
-    assert!(
-        stat.modified_at_ms > 0,
-        "modifiedAtMs should be populated for existing files"
+    let modified = std::fs::metadata(&file_path)?.modified()?;
+    assert_eq!(
+        stat.modified_at_ms as u128,
+        modified.duration_since(std::time::UNIX_EPOCH)?.as_millis()
     );
 
     Ok(())
@@ -594,6 +595,24 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     )
     .await?;
 
+    let watch_id = mcp
+        .send_raw_request(
+            "fs/watch",
+            Some(json!({ "watchId": "watch-relative", "path": "relative-path" })),
+        )
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        watch_id,
+        "Invalid request: AbsolutePathBuf deserialized without a base path",
+    )
+    .await?;
+
+    assert!(!codex_home.path().join("blob.bin").exists());
+    assert!(!codex_home.path().join("dest").exists());
+    assert!(!source_dir.join("nested").join("copy").exists());
+    assert_eq!(std::fs::read_to_string(codex_home.path().join("absolute.txt"))?, "hello");
+
     Ok(())
 }
 
@@ -747,26 +766,7 @@ async fn fs_watch_allows_missing_file_targets() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_watch_rejects_relative_paths() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = initialized_mcp(&codex_home).await?;
 
-    let watch_id = mcp
-        .send_raw_request(
-            "fs/watch",
-            Some(json!({ "watchId": "watch-relative", "path": "relative-path" })),
-        )
-        .await?;
-    expect_error_message(
-        &mut mcp,
-        watch_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
-    )
-    .await?;
-
-    Ok(())
-}
 
 fn fs_changed_notification(notification: JSONRPCNotification) -> Result<FsChangedNotification> {
     let params = notification

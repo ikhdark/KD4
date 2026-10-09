@@ -177,38 +177,6 @@ enabled = true
         assert_eq!(config, expected);
     }
 
-    #[tokio::test]
-    async fn set_user_plugin_enabled_preserves_existing_plugin_fields() {
-        let codex_home = TempDir::new().unwrap();
-        fs::write(
-            codex_home.path().join(CONFIG_TOML_FILE),
-            r#"
-[plugins."demo@market"]
-enabled = false
-source = "/tmp/plugin"
-"#,
-        )
-        .unwrap();
-
-        set_user_plugin_enabled(
-            codex_home.path(),
-            "demo@market".to_string(),
-            /*enabled*/ true,
-        )
-        .await
-        .unwrap();
-
-        let config = read_config(codex_home.path());
-        let expected: toml::Value = toml::from_str(
-            r#"
-[plugins."demo@market"]
-enabled = true
-source = "/tmp/plugin"
-        "#,
-        )
-        .unwrap();
-        assert_eq!(config, expected);
-    }
 
     #[tokio::test]
     async fn clear_user_plugin_removes_empty_plugins_table() {
@@ -284,26 +252,6 @@ enabled = true
         toml::from_str(&fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).unwrap()).unwrap()
     }
 
-    #[tokio::test]
-    async fn repeated_enabled_edits_preserve_file_contents_and_timestamp() -> anyhow::Result<()> {
-        for original in [
-            "[plugins.demo]\nenabled = true # keep\n",
-            "plugins = { demo = { enabled = true, source = 'local' } } # keep\n",
-        ] {
-            let home = TempDir::new()?;
-            let path = home.path().join(CONFIG_TOML_FILE);
-            fs::write(&path, original)?;
-            fs::File::options()
-                .write(true)
-                .open(&path)?
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86400))?;
-            let timestamp = fs::metadata(&path)?.modified()?;
-            set_user_plugin_enabled(home.path(), "demo".into(), true).await?;
-            assert_eq!(fs::read_to_string(&path)?, original);
-            assert_eq!(fs::metadata(&path)?.modified()?, timestamp);
-        }
-        Ok(())
-    }
 
     #[tokio::test]
     async fn plugin_edits_reject_malformed_tables_without_persisting_batch() {

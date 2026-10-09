@@ -612,43 +612,16 @@ async fn skills_list_skips_cwd_roots_when_environment_disabled() -> Result<()> {
     Ok(())
 }
 
+
 #[tokio::test]
-async fn skills_list_accepts_relative_cwds() -> Result<()> {
+async fn skills_list_accepts_relative_cwds_and_preserves_requested_order() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let first_cwd = codex_home.path().join("z-first");
+    let second_cwd = codex_home.path().join("a-second");
     let relative_cwd = std::path::PathBuf::from("relative-cwd");
-    std::fs::create_dir_all(codex_home.path().join(&relative_cwd))?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_skills_list_request(SkillsListParams {
-            cwds: vec![relative_cwd.clone()],
-            force_reload: true,
-        })
-        .await?;
-
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(response)?;
-    assert_eq!(data.len(), 1);
-    assert_eq!(data[0].cwd, relative_cwd);
-    assert_eq!(data[0].errors, Vec::new());
-    Ok(())
-}
-
-#[tokio::test]
-async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let first_cwd = TempDir::new()?;
-    let second_cwd = TempDir::new()?;
+    for path in [&first_cwd, &second_cwd, &codex_home.path().join(&relative_cwd)] {
+        std::fs::create_dir_all(path)?;
+    }
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -660,8 +633,9 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
     let request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![
-                first_cwd.path().to_path_buf(),
-                second_cwd.path().to_path_buf(),
+                first_cwd.clone(),
+                relative_cwd.clone(),
+                second_cwd.clone(),
             ],
             force_reload: true,
         })
@@ -678,15 +652,16 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
             .map(|entry| entry.cwd.clone())
             .collect::<Vec<_>>(),
         vec![
-            first_cwd.path().to_path_buf(),
-            second_cwd.path().to_path_buf(),
+            first_cwd.clone(),
+                relative_cwd.clone(),
+            second_cwd.clone(),
         ]
     );
+    assert!(data.iter().all(|entry| entry.errors.is_empty()));
     Ok(())
 }
-
 #[tokio::test]
-async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
+async fn skills_list_force_reload_observes_new_cwd_skills() -> Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
 
@@ -718,28 +693,8 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
             .all(|skill| skill.name != "late-extra-skill")
     );
 
-    let second_request_id = mcp
-        .send_skills_list_request(SkillsListParams {
-            cwds: vec![cwd.path().to_path_buf()],
-            force_reload: false,
-        })
-        .await?;
-    let second_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(second_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data: second_data } = to_response(second_response)?;
-    assert_eq!(second_data.len(), 1);
-    assert!(
-        second_data[0]
-            .skills
-            .iter()
-            .all(|skill| skill.name != "late-extra-skill")
-    );
-
-    // Filesystem notifications may invalidate the cache automatically. Check
-    // reuse before mutation, then verify explicit reload sees the new skill.
+    // Filesystem notifications may also invalidate the cache. This integration
+    // test verifies explicit reload discovers a newly created cwd-local skill.
     let skill_dir = cwd.path().join(".codex/skills/late-extra-skill");
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(
@@ -767,7 +722,6 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
     );
     Ok(())
 }
-
 #[tokio::test]
 async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -890,6 +844,20 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
             .all(|skill| skill.name != "runtime-skill")
     );
 
+    // Leave a nonempty runtime root active at shutdown. Otherwise an
+    // accidentally persisted setting would be hidden by the preceding clear.
+    let set_request_id = mcp
+        .send_skills_extra_roots_set_request(SkillsExtraRootsSetParams {
+            extra_roots: vec![AbsolutePathBuf::from_absolute_path(&extra_skills_root)?],
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(set_request_id)),
+    )
+    .await??;
+    let _: SkillsExtraRootsSetResponse = to_response(response)?;
+    expect_skills_changed_notification(&mut mcp, DEFAULT_TIMEOUT).await?;
     drop(mcp);
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())

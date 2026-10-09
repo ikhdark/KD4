@@ -69,7 +69,7 @@ def nearest_package_root(
         ) or current == codex_rs_root:
             break
         manifest = current / CARGO_MANIFEST
-        if manifest.is_file():
+        if manifest.is_file() and package_name(manifest) is not None:
             result = current
             break
         if (

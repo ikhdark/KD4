@@ -118,14 +118,22 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
 
     // Same request-id on different connections must route independently.
     send_config_read_request(&mut ws1, /*id*/ 77).await?;
-    send_config_read_request(&mut ws2, /*id*/ 77).await?;
+    send_request(
+        &mut ws2,
+        "thread/loaded/list",
+        /*id*/ 77,
+        Some(serde_json::to_value(ThreadLoadedListParams::default())?),
+    )
+    .await?;
     let ws1_config = read_response_for_id(&mut ws1, /*id*/ 77).await?;
     let ws2_config = read_response_for_id(&mut ws2, /*id*/ 77).await?;
 
     assert_eq!(ws1_config.id, RequestId::Integer(77));
     assert_eq!(ws2_config.id, RequestId::Integer(77));
     assert!(ws1_config.result.get("config").is_some());
-    assert!(ws2_config.result.get("config").is_some());
+    let loaded: ThreadLoadedListResponse = to_response(ws2_config)?;
+    assert!(loaded.data.is_empty());
+    assert_eq!(loaded.next_cursor, None);
 
     process
         .kill()

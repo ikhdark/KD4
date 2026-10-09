@@ -802,7 +802,6 @@ async fn content_and_missing_higher_precedence_file_invalidate_cache() {
 
     manager.refresh(&config, &environments).await;
     let first = manager.get_loaded().await.expect("first load");
-    tokio::time::sleep(Duration::from_millis(10)).await;
     fs::write(&agents, "version two").expect("replace same-size contents");
     manager.refresh(&config, &environments).await;
     let changed = manager.get_loaded().await.expect("changed load");
@@ -1049,4 +1048,48 @@ async fn survivability_failed_nearest_source_keeps_priority_under_parent_growth(
     assert!(text.contains("parent current"));
     assert!(!text.contains("parent old"));
     assert_eq!(filesystem.target_stream_calls(), 2, "one read per refresh; no retry");
+}
+#[tokio::test]
+async fn failed_truncated_instruction_reads_preserve_source_counts_and_encoding_notice() {
+    for contents in [b"abcdefgh".to_vec(), b"ab\xffdefgh".to_vec()] {
+        let root = tempfile::tempdir().unwrap();
+        let agents_path = root.path().join("AGENTS.md");
+        fs::write(&agents_path, &contents).unwrap();
+        let mut config = config_for(&root).await;
+        config.project_doc_max_bytes = 4;
+        let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+        let environments = environment_snapshot_with_environment(
+            &config.cwd, 1,
+            Arc::new(Environment::default_for_tests_with_filesystem(filesystem.clone())),
+        );
+        let manager = AgentsMdManager::new(None);
+        let first = manager.refresh_and_observe(&config, &environments).await;
+        let first = first.loaded.unwrap();
+        // The fixture has eight source bytes and a four-byte source allowance.
+        // Generated notices are not source bytes and must not become input on fallback.
+        let expected_body = if contents[2] == 0xff {
+            "ab\u{fffd}d\n\n[Project documentation encoding notice: invalid UTF-8 bytes were replaced with U+FFFD; instructions may be incomplete.]"
+        } else {
+            "abcd"
+        };
+        let expected = format!(
+            "## AGENTS.md instructions from {path}\n\n{expected_body}\n\n[Project documentation truncation notice: source path: {path}; original byte count: 8; retained byte count: 4; omitted byte count: 4.]",
+            path = agents_path.display(),
+        );
+        assert_eq!(first.text(), expected);
+        for _ in 0..2 {
+            filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+            let fallback = manager.refresh_and_observe(&config, &environments).await;
+            assert_eq!(fallback.freshness, AgentsMdFreshness::CachedFallback);
+            let retained = fallback.loaded.unwrap();
+            assert_eq!(retained.text(), expected);
+            assert!(Arc::ptr_eq(&first, &retained));
+        }
+        fs::write(&agents_path, "new!").unwrap();
+        let recovered = manager.refresh_and_observe(&config, &environments).await;
+        assert_eq!(recovered.freshness, AgentsMdFreshness::Refreshed);
+        assert_eq!(recovered.loaded.unwrap().text(), format!(
+            "## AGENTS.md instructions from {}\n\nnew!", agents_path.display(),
+        ));
+    }
 }

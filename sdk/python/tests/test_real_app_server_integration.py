@@ -265,8 +265,8 @@ def test_real_thread_run_convenience_smoke(runtime_env: PreparedRuntimeEnv) -> N
 
     assert isinstance(data["thread_id"], str) and data["thread_id"].strip()
     assert isinstance(data["final_response"], str) and data["final_response"].strip()
-    assert isinstance(data["items_count"], int)
-    assert isinstance(data["has_usage"], bool)
+    assert data["items_count"] > 0
+    assert data["has_usage"] is True
 
 
 def test_real_quickstart_style_flow_smoke(runtime_env: PreparedRuntimeEnv) -> None:
@@ -293,11 +293,11 @@ def test_real_quickstart_style_flow_smoke(runtime_env: PreparedRuntimeEnv) -> No
         "thread_id_is_text": isinstance(data["thread_id"], str) and bool(data["thread_id"].strip()),
         "final_response_is_text": isinstance(data["final_response"], str)
         and bool(data["final_response"].strip()),
-        "items_count_is_int": isinstance(data["items_count"], int),
+        "has_items": data["items_count"] > 0,
     } == {
         "thread_id_is_text": True,
         "final_response_is_text": True,
-        "items_count_is_int": True,
+        "has_items": True,
     }
 
 
@@ -371,8 +371,8 @@ def test_real_async_thread_run_convenience_smoke(
 
     assert isinstance(data["thread_id"], str) and data["thread_id"].strip()
     assert isinstance(data["final_response"], str) and data["final_response"].strip()
-    assert isinstance(data["items_count"], int)
-    assert isinstance(data["has_usage"], bool)
+    assert data["items_count"] > 0
+    assert data["has_usage"] is True
 
 
 def test_notebook_bootstrap_resolves_sdk_and_runtime_from_unrelated_cwd(
@@ -404,14 +404,15 @@ def test_notebook_sync_cell_smoke(runtime_env: PreparedRuntimeEnv) -> None:
             _notebook_cell_source(1),
             _notebook_cell_source(2),
             _notebook_cell_source(4),
+            "assert result.status.value == 'completed'\n"
+            "assert result.items\n"
+            "assert result.final_response.strip()",
         ]
     )
     result = _run_python(runtime_env, source, timeout_s=240)
     assert result.returncode == 0, (
         f"Notebook sync smoke failed.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
-    assert "status:" in result.stdout
-    assert "server:" in result.stdout
 
 
 def test_notebook_advanced_cell_smoke(runtime_env: PreparedRuntimeEnv) -> None:
@@ -447,21 +448,25 @@ def test_real_streaming_smoke_turn_completed(runtime_env: PreparedRuntimeEnv) ->
                 turn = thread.turn("Reply with one short sentence.")
                 saw_delta = False
                 saw_completed = False
+                completed_status = None
                 for event in turn.stream():
                     if event.method == "item/agentMessage/delta":
                         saw_delta = True
                     if event.method == "turn/completed":
                         saw_completed = True
+                        completed_status = event.payload.turn.status.value
                 print(json.dumps({
                     "saw_delta": saw_delta,
                     "saw_completed": saw_completed,
+                    "completed_status": completed_status,
                 }))
             """
         ),
     )
 
     assert data["saw_completed"] is True
-    assert isinstance(data["saw_delta"], bool)
+    assert data["saw_delta"] is True
+    assert data["completed_status"] == "completed"
 
 
 def test_real_turn_interrupt_smoke(runtime_env: PreparedRuntimeEnv) -> None:
@@ -479,13 +484,20 @@ def test_real_turn_interrupt_smoke(runtime_env: PreparedRuntimeEnv) -> None:
                 )
                 turn = thread.turn("Count from 1 to 200 with commas.")
                 turn.interrupt()
+                interrupted = turn.run()
                 follow_up = thread.turn("Say 'ok' only.").run()
-                print(json.dumps({"status": follow_up.status.value}))
+                print(json.dumps({
+                    "interrupted_status": interrupted.status.value,
+                    "status": follow_up.status.value,
+                    "final_response": follow_up.final_response,
+                }))
             """
         ),
     )
 
-    assert data["status"] in {"completed", "failed"}
+    assert data["interrupted_status"] == "interrupted"
+    assert data["status"] == "completed"
+    assert data["final_response"].strip()
 
 
 @pytest.mark.parametrize(("folder", "script"), EXAMPLE_CASES)
@@ -509,7 +521,7 @@ def test_real_examples_run_and_assert(
         assert "thread_id:" in out and "turn_id:" in out and "status:" in out
         assert "items.count:" in out
     elif folder == "03_turn_stream_events":
-        assert "stream.completed:" in out
+        assert "stream.completed: completed" in out
         assert "assistant>" in out
     elif folder == "04_models_and_metadata":
         assert "server:" in out
@@ -521,7 +533,7 @@ def test_real_examples_run_and_assert(
     elif folder == "06_thread_lifecycle_and_controls":
         assert "Lifecycle OK:" in out
     elif folder in {"07_image_and_text", "08_local_image_and_text"}:
-        assert "completed" in out.lower() or "Status:" in out
+        assert "Status: TurnStatus.completed" in out
     elif folder == "09_async_parity":
         assert "Thread:" in out and "Turn:" in out
     elif folder == "10_error_handling_and_retry":
@@ -529,7 +541,7 @@ def test_real_examples_run_and_assert(
     elif folder == "11_cli_mini_app":
         assert "Thread:" in out
         assert out.count("assistant>") >= 2
-        assert out.count("assistant.status>") >= 2
+        assert out.count("assistant.status> completed") >= 2
         assert out.count("usage>") >= 2
     elif folder == "12_turn_params_kitchen_sink":
         assert "Status:" in out

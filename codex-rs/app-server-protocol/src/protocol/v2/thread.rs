@@ -946,7 +946,7 @@ mod mode_mirror_tests {
     use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
 
     #[test]
-    fn thread_modes_round_trip_through_core_contracts() {
+    fn thread_history_mode_defaults_to_legacy() {
         let history: CoreThreadHistoryMode = ThreadHistoryMode::default();
 
         assert_eq!(history, CoreThreadHistoryMode::Legacy);

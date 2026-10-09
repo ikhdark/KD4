@@ -90,6 +90,17 @@ fn mcp_contract_comparison_ignores_callable_aliases_not_schema_or_annotations() 
     sampled.tool.annotations = None;
     sampled.tool.input_schema = Arc::new(serde_json::json!({"type":"object", "required":["path"]}).as_object().unwrap().clone());
     assert!(!mcp_contract_matches(&sampled, &live));
+    for field in ["server", "origin", "connector", "parallel"] {
+        let mut sampled = live.clone();
+        match field {
+            "server" => sampled.server_name = "different-server".into(),
+            "origin" => sampled.server_origin = Some("https://different.example".into()),
+            "connector" => sampled.connector_id = Some("different-connector".into()),
+            "parallel" => sampled.supports_parallel_tool_calls = !live.supports_parallel_tool_calls,
+            _ => unreachable!(),
+        }
+        assert!(!mcp_contract_matches(&sampled, &live), "changed {field}");
+    }
 }
 
 #[test]
@@ -1115,67 +1126,43 @@ fn openai_file_params_are_only_honored_for_codex_apps() {
 }
 
 #[test]
-fn approval_required_when_read_only_false_and_destructive() {
-    let annotations = annotations(Some(false), Some(true), /*open_world*/ None);
-    assert_eq!(requires_mcp_tool_approval(Some(&annotations)), true);
-}
-
-#[test]
-fn approval_required_when_read_only_false_and_open_world() {
-    let annotations = annotations(Some(false), /*destructive*/ None, Some(true));
-    assert_eq!(requires_mcp_tool_approval(Some(&annotations)), true);
-}
-
-#[test]
-fn approval_required_when_destructive_even_if_read_only_true() {
-    let annotations = annotations(Some(true), Some(true), Some(true));
-    assert_eq!(requires_mcp_tool_approval(Some(&annotations)), true);
-}
-
-#[test]
-fn approval_required_when_annotations_are_absent() {
-    assert_eq!(requires_mcp_tool_approval(/*annotations*/ None), true);
-}
-
-#[test]
-fn approval_not_required_when_read_only_and_other_hints_are_absent() {
-    let annotations = annotations(
-        Some(true),
-        /*destructive*/ None,
-        /*open_world*/ None,
-    );
-    assert_eq!(requires_mcp_tool_approval(Some(&annotations)), false);
-}
-
-#[test]
-fn writes_mode_requires_approval_for_non_read_only_tools() {
-    let annotations = annotations(Some(false), Some(false), Some(false));
-    assert_eq!(
-        requires_mcp_tool_approval_for_mode(Some(&annotations), AppToolApproval::Writes),
-        true
-    );
-    assert_eq!(
-        requires_mcp_tool_approval_for_mode(/*annotations*/ None, AppToolApproval::Writes),
-        true
-    );
-}
-
-#[test]
-fn writes_mode_does_not_require_approval_for_read_only_tools() {
-    let annotations = annotations(Some(true), Some(false), Some(true));
-    assert_eq!(
-        requires_mcp_tool_approval_for_mode(Some(&annotations), AppToolApproval::Writes),
-        false
-    );
-}
-
-#[test]
-fn writes_mode_requires_approval_for_contradictory_read_only_hints() {
-    let annotations = annotations(Some(true), Some(true), Some(true));
-    assert!(requires_mcp_tool_approval_for_mode(
-        Some(&annotations),
-        AppToolApproval::Writes,
-    ));
+fn approval_modes_respect_annotation_policy_matrix() {
+    for (hints, auto, writes) in [
+        (None, true, true),
+        (Some(annotations(Some(false), Some(true), None)), true, true),
+        (Some(annotations(Some(false), None, Some(true))), true, true),
+        (
+            Some(annotations(Some(true), Some(true), Some(true))),
+            true,
+            true,
+        ),
+        (Some(annotations(Some(true), None, None)), false, false),
+        (
+            Some(annotations(Some(false), Some(false), Some(false))),
+            false,
+            true,
+        ),
+        (
+            Some(annotations(Some(true), Some(false), Some(true))),
+            false,
+            false,
+        ),
+        (Some(annotations(None, None, None)), true, true),
+    ] {
+        assert_eq!(requires_mcp_tool_approval(hints.as_ref()), auto);
+        for (mode, expected) in [
+            (AppToolApproval::Auto, auto),
+            (AppToolApproval::Writes, writes),
+            (AppToolApproval::Prompt, true),
+            (AppToolApproval::Approve, false),
+        ] {
+            assert_eq!(
+                requires_mcp_tool_approval_for_mode(hints.as_ref(), mode),
+                expected,
+                "mode {mode:?}, annotations {hints:?}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -1792,9 +1779,9 @@ fn sanitize_mcp_tool_result_for_model_rewrites_image_content() {
                 "text": "hello",
             }),
         ],
-        structured_content: None,
+        structured_content: Some(serde_json::json!({"retained": true})),
         is_error: Some(false),
-        meta: None,
+        meta: Some(serde_json::json!({"cursor": "next"})),
     });
     let retained_text_ptr = result.as_ref().expect("MCP result").content[1]["text"]
         .as_str()
@@ -1822,6 +1809,12 @@ fn sanitize_mcp_tool_result_for_model_rewrites_image_content() {
         Some(retained_text_ptr),
         "retained content blocks should be moved into the sanitized result",
     );
+    assert_eq!(
+        got.structured_content,
+        Some(serde_json::json!({"retained": true}))
+    );
+    assert_eq!(got.is_error, Some(false));
+    assert_eq!(got.meta, Some(serde_json::json!({"cursor": "next"})));
 }
 
 #[test]
@@ -3533,7 +3526,7 @@ async fn permission_request_hook_runs_after_remembered_mcp_approval() {
 
 #[tokio::test]
 async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval() {
-    let (session, turn_context, _rx_event) = make_session_and_context_with_rx().await;
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
     {
         let mut active_turn = session.active_turn.lock().await;
         *active_turn = Some(ActiveTurn::default());
@@ -3581,13 +3574,27 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
         })
     };
 
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut approval_task)
-            .await
-            .is_err(),
-        "prompt mode should wait for approval instead of auto-allowing"
-    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx_event.recv().await.expect("approval event channel closed");
+            if matches!(
+                event.msg,
+                EventMsg::RequestUserInput(_) | EventMsg::ElicitationRequest(_)
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("prompt mode should emit an approval request");
+    assert!(futures::poll!(&mut approval_task).is_pending());
     approval_task.abort();
+    assert!(
+        approval_task
+            .await
+            .expect_err("approval task was aborted")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -3625,6 +3632,7 @@ async fn full_access_mode_skips_mcp_tool_approval_for_all_approval_modes() {
 
     for approval_mode in [
         AppToolApproval::Auto,
+        AppToolApproval::Writes,
         AppToolApproval::Prompt,
         AppToolApproval::Approve,
     ] {

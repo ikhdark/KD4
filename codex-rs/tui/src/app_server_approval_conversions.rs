@@ -77,17 +77,58 @@ mod tests {
     #[test]
     fn converts_file_update_changes_to_display() {
         assert_eq!(
-            file_update_changes_to_display(vec![FileUpdateChange {
-                path: "foo.txt".to_string(),
-                kind: PatchChangeKind::Add,
-                diff: "hello\n".to_string(),
-            }]),
-            HashMap::from([(
-                PathBuf::from("foo.txt"),
-                FileChange::Add {
-                    content: "hello\n".to_string(),
+            file_update_changes_to_display(vec![
+                FileUpdateChange {
+                    path: "foo.txt".to_string(),
+                    kind: PatchChangeKind::Add,
+                    diff: "hello\n".to_string(),
                 },
-            )])
+                FileUpdateChange {
+                    path: "deleted.txt".to_string(),
+                    kind: PatchChangeKind::Delete,
+                    diff: "removed\n".to_string(),
+                },
+                FileUpdateChange {
+                    path: "updated.txt".to_string(),
+                    kind: PatchChangeKind::Update { move_path: None },
+                    diff: "-before\n+after\n".to_string(),
+                },
+                FileUpdateChange {
+                    path: "moved.txt".to_string(),
+                    kind: PatchChangeKind::Update {
+                        move_path: Some(PathBuf::from("destination.txt")),
+                    },
+                    diff: "-old\n+new\n".to_string(),
+                },
+            ]),
+            HashMap::from([
+                (
+                    PathBuf::from("foo.txt"),
+                    FileChange::Add {
+                        content: "hello\n".to_string(),
+                    },
+                ),
+                (
+                    PathBuf::from("deleted.txt"),
+                    FileChange::Delete {
+                        content: "removed\n".to_string(),
+                    },
+                ),
+                (
+                    PathBuf::from("updated.txt"),
+                    FileChange::Update {
+                        unified_diff: "-before\n+after\n".to_string(),
+                        move_path: None,
+                    },
+                ),
+                (
+                    PathBuf::from("moved.txt"),
+                    FileChange::Update {
+                        unified_diff: "-old\n+new\n".to_string(),
+                        move_path: Some(PathBuf::from("destination.txt")),
+                    },
+                ),
+            ])
         );
     }
 

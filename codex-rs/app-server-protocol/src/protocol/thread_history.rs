@@ -3938,152 +3938,112 @@ mod tests {
 
     #[test]
     fn preserves_compaction_only_turn() {
-        let items = vec![
-            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: "turn-compact".into(),
-                trace_id: None,
-                started_at: None,
-                model_context_window: None,
-                collaboration_mode_kind: Default::default(),
-            })),
-            RolloutItem::Compacted(CompactedItem {
-                message: String::new(),
-                replacement_history: None,
-                window_number: None,
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
-            }),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
-                surfaced_result: None,
-                turn_id: "turn-compact".into(),
-                last_agent_message: None,
-                error: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                timing: None,
-            })),
-        ];
+        for explicit in [false, true] {
+            let items = vec![
+                RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: "turn-compact".into(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                })),
+                RolloutItem::Compacted(CompactedItem {
+                    message: String::new(),
+                    replacement_history: None,
+                    window_number: None,
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                }),
+                RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    surfaced_result: None,
+                    turn_id: "turn-compact".into(),
+                    last_agent_message: None,
+                    error: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                })),
+            ];
 
-        let turns = build_turns_from_rollout_items(&items);
-        assert_eq!(
-            turns,
-            vec![Turn {
-                id: "turn-compact".into(),
-                status: TurnStatus::Completed,
-                error: None,
-                started_at: None,
-                completed_at: None,
-                duration_ms: None,
-                timing: None,
-                surfaced_result: None,
-                items_view: TurnItemsView::Full,
-                items: Vec::new(),
-            }]
-        );
+            let items = if explicit { &items[..] } else { &items[1..2] };
+            let turns = build_turns_from_rollout_items(items);
+            assert_eq!(
+                turns,
+                vec![Turn {
+                    id: if explicit { "turn-compact" } else { "rollout-0" }.into(),
+                    status: TurnStatus::Completed,
+                    error: None,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    timing: None,
+                    surfaced_result: None,
+                    items_view: TurnItemsView::Full,
+                    items: Vec::new(),
+                }]
+            );
+        }
     }
 
     #[test]
     fn reconstructs_collab_resume_end_item() {
-        let events = vec![
-            EventMsg::UserMessage(UserMessageEvent {
-                client_id: None,
-                message: "resume agent".into(),
-                images: None,
-                text_elements: Vec::new(),
-                local_images: Vec::new(),
-                ..Default::default()
-            }),
-            EventMsg::CollabResumeEnd(codex_protocol::protocol::CollabResumeEndEvent {
-                call_id: "resume-1".into(),
-                completed_at_ms: 0,
-                sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
-                    .expect("valid sender thread id"),
-                receiver_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000002")
-                    .expect("valid receiver thread id"),
-                receiver_agent_nickname: None,
-                receiver_agent_role: None,
-                status: AgentStatus::Completed(None),
-            }),
-        ];
+        for message in [None, Some("result".to_string())] {
+            let events = vec![
+                EventMsg::UserMessage(UserMessageEvent {
+                    client_id: None,
+                    message: "resume agent".into(),
+                    images: None,
+                    text_elements: Vec::new(),
+                    local_images: Vec::new(),
+                    ..Default::default()
+                }),
+                EventMsg::CollabResumeEnd(codex_protocol::protocol::CollabResumeEndEvent {
+                    call_id: "resume-1".into(),
+                    completed_at_ms: 0,
+                    sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+                        .expect("valid sender thread id"),
+                    receiver_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+                        .expect("valid receiver thread id"),
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
+                    status: AgentStatus::Completed(message.clone()),
+                }),
+            ];
 
-        let items = events
-            .into_iter()
-            .map(RolloutItem::EventMsg)
-            .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].items.len(), 2);
-        assert_eq!(
-            turns[0].items[1],
-            ThreadItem::CollabAgentToolCall {
-                id: "resume-1".into(),
-                tool: CollabAgentTool::ResumeAgent,
-                status: CollabAgentToolCallStatus::Completed,
-                sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
-                receiver_thread_ids: vec!["00000000-0000-0000-0000-000000000002".into()],
-                prompt: None,
-                model: None,
-                reasoning_effort: None,
-                agents_states: [(
-                    "00000000-0000-0000-0000-000000000002".into(),
-                    CollabAgentState {
-                        status: crate::protocol::v2::CollabAgentStatus::Completed,
-                        message: None,
-                        surfaced_result: None,
-                        last_agent_message: None,
-                    },
-                )]
+            let items = events
                 .into_iter()
-                .collect(),
-            }
-        );
-    }
-
-    #[test]
-    fn reconstructs_collab_resume_end_preserves_completed_status() {
-        let receiver_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
-            .expect("valid receiver thread id");
-        let events = vec![
-            EventMsg::UserMessage(UserMessageEvent {
-                client_id: None,
-                message: "resume agent".into(),
-                images: None,
-                text_elements: Vec::new(),
-                local_images: Vec::new(),
-                ..Default::default()
-            }),
-            EventMsg::CollabResumeEnd(codex_protocol::protocol::CollabResumeEndEvent {
-                call_id: "resume-completed".into(),
-                completed_at_ms: 0,
-                sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
-                    .expect("valid sender thread id"),
-                receiver_thread_id,
-                receiver_agent_nickname: None,
-                receiver_agent_role: None,
-                status: AgentStatus::Completed(Some("result".to_string())),
-            }),
-        ];
-
-        let items = events
-            .into_iter()
-            .map(RolloutItem::EventMsg)
-            .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
-        let ThreadItem::CollabAgentToolCall { agents_states, .. } = &turns[0].items[1] else {
-            panic!("expected collab agent tool call");
-        };
-
-        assert_eq!(
-            agents_states.get(&receiver_thread_id.to_string()),
-            Some(&CollabAgentState {
-                status: crate::protocol::v2::CollabAgentStatus::Completed,
-                message: Some("result".to_string()),
-                surfaced_result: None,
-                last_agent_message: Some("result".to_string()),
-            })
-        );
+                .map(RolloutItem::EventMsg)
+                .collect::<Vec<_>>();
+            let turns = build_turns_from_rollout_items(&items);
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].items.len(), 2);
+            assert_eq!(
+                turns[0].items[1],
+                ThreadItem::CollabAgentToolCall {
+                    id: "resume-1".into(),
+                    tool: CollabAgentTool::ResumeAgent,
+                    status: CollabAgentToolCallStatus::Completed,
+                    sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
+                    receiver_thread_ids: vec!["00000000-0000-0000-0000-000000000002".into()],
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: [(
+                        "00000000-0000-0000-0000-000000000002".into(),
+                        CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: message.clone(),
+                            surfaced_result: None,
+                            last_agent_message: message,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -4687,6 +4647,10 @@ mod tests {
             CoreHookPromptFragment::from_single_hook("Then summarize cleanly.", "hook-run-2"),
         ])
         .expect("hook prompt message");
+        let codex_protocol::models::ResponseItem::Message { id, .. } = &hook_prompt else {
+            panic!("expected hook prompt message");
+        };
+        let expected_id = id.as_ref().expect("hook prompt identity").to_string();
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
@@ -4723,7 +4687,7 @@ mod tests {
         assert_eq!(
             turns[0].items[1],
             ThreadItem::HookPrompt {
-                id: turns[0].items[1].id().to_string(),
+                id: expected_id,
                 fragments: vec![
                     crate::protocol::v2::HookPromptFragment {
                         text: "Retry with tests.".into(),
@@ -4832,6 +4796,18 @@ mod tests {
             agent_statuses: Vec::new(),
         });
         assert!(builder.active_turn_snapshot().unwrap().items.is_empty());
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 3);
+        for turn in &turns[..2] {
+            assert_eq!(
+                turn.items,
+                vec![ThreadItem::from(wait_history_test_item(
+                    "same",
+                    CoreWaitStatus::InProgress,
+                ))],
+                "ambiguous completion must not mutate either retained owner"
+            );
+        }
     }
 
     #[test]

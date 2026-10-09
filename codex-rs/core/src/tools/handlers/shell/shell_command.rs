@@ -852,16 +852,23 @@ mod tests {
 
     #[test]
     fn forwarded_timeout_preserves_the_legacy_field_for_unified_exec_normalization() {
-        let forwarded = ShellCommandHandler::forward_arguments_to_unified_exec(
-            &json!({"command": "long-running", "timeout_ms": 60_000}).to_string(),
-            "remote",
-            true,
-        )
-        .expect("forward shell_command arguments");
-        let arguments: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
-        assert_eq!(arguments["timeout_ms"], 60_000);
-        assert_eq!(arguments["cmd"], "long-running");
-        crate::tools::handlers::unified_exec::validate_exec_command_arguments(&forwarded)
-            .expect("legacy timeout is accepted with an explicit normalization notice");
+        for (allow_login, login) in [(true, None), (false, None), (true, Some(false)), (false, Some(true))] {
+            let mut input = json!({"command": "long-running", "timeout_ms": 60_000});
+            if let Some(login) = login {
+                input["login"] = json!(login);
+            }
+            let forwarded = ShellCommandHandler::forward_arguments_to_unified_exec(
+                &input.to_string(), "remote", allow_login,
+            )
+            .expect("forward shell_command arguments");
+            let arguments: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+            let mut expected = json!({"cmd": "long-running", "timeout_ms": 60_000, "environment_id": "remote"});
+            if let Some(login) = login.or((!allow_login).then_some(false)) {
+                expected["login"] = json!(login);
+            }
+            assert_eq!(arguments, expected);
+            crate::tools::handlers::unified_exec::validate_exec_command_arguments(&forwarded)
+                .expect("legacy timeout is accepted with an explicit normalization notice");
+        }
     }
 }

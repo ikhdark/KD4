@@ -507,6 +507,7 @@ async fn command_exec_legacy_policy_workspace_write_uses_request_cwd() -> Result
         std::fs::read_to_string(request_cwd.join("request-cwd-write.txt"))?,
         "ok"
     );
+    assert!(!codex_home.join("request-cwd-write.txt").exists());
 
     Ok(())
 }
@@ -1322,6 +1323,7 @@ fn process_with_marker_exists(marker: &str) -> Result<bool> {
         ])
         .output()
         .context("query Windows process command lines")?;
+    anyhow::ensure!(output.status.success(), "process query failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).context("decode PowerShell process output")?;
     Ok(stdout.lines().any(|line| line.contains(marker)))
 }

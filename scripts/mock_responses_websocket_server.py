@@ -152,8 +152,11 @@ async def _handle_replay(websocket: Any, replay: list[dict[str, Any]], *,
                     _dump_json(_event_response_created("replay-warmup")),
                     _dump_json(_event_response_completed("replay-warmup")),
                 ), quiet=quiet)
+            items = request.get("input", [])
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise ValueError(f"request {index}: input must be a list of objects")
             actual_results = {
-                (item["type"], item.get("call_id")): item for item in request.get("input", [])
+                (item["type"], item.get("call_id")): item for item in items
                 if item.get("type") in TOOL_RESULT_TYPES
             }
             known_results.update({

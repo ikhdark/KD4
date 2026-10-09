@@ -193,8 +193,33 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn sdk_context_is_reused_and_managed_auth_bypasses_it() {
+        // A configured bearer token legitimately bypasses SDK initialization.
+        // Isolate this fixture rather than mutate process-global credentials.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "amazon_bedrock::auth::tests::sdk_context_environment_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_remove(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"));
+    }
+
     #[tokio::test]
-    async fn sdk_context_is_reused_and_managed_auth_bypasses_it() {
+    #[ignore = "Runs in a child process without ambient Bedrock bearer auth"]
+    async fn sdk_context_environment_worker() {
         let aws = ModelProviderAwsAuthInfo {
             profile: Some("codex-transport-test-no-credentials".into()),
             region: Some("us-west-2".into()),

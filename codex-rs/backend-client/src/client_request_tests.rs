@@ -52,6 +52,47 @@ fn list_tasks_url_omits_empty_query_and_encodes_all_parameters() {
 }
 
 #[tokio::test]
+async fn analytics_client_does_not_follow_redirects_or_forward_credentials() {
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    let origin = MockServer::start().await;
+    let destination = MockServer::start().await;
+    let client = Client::new_without_redirects(
+        origin.uri(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+    .with_auth_provider(Arc::new(codex_model_provider::BearerAuthProvider::new(
+        "private-token".to_string(),
+    )))
+    .with_chatgpt_account_id("private-account");
+    for target in [&origin, &destination] {
+        origin.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/codex/profiles/me"))
+            .and(header("authorization", "Bearer private-token"))
+            .and(header("chatgpt-account-id", "private-account"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/redirect-target", target.uri()),
+            ))
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let error = client.get_account_profile().await.unwrap_err();
+        assert_eq!(error.status(), Some(StatusCode::TEMPORARY_REDIRECT));
+        let requests = origin.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "same-origin redirects must also be refused");
+        assert!(destination.received_requests().await.unwrap().is_empty());
+        origin.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn migrated_requests_preserve_query_auth_and_json_body() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("HTTP listener should bind");
     let address = listener

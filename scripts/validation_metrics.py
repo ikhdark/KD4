@@ -384,12 +384,22 @@ def read_inputs(paths):
                     if error:
                         unresolved.append({"path": str(path), "line": line, "error": error})
                         continue
-                    row = hydrate_rollout_record(row, path)
+                    try:
+                        row = hydrate_rollout_record(row, path)
+                        if not isinstance(row, dict):
+                            raise ValueError("rollout record must be an object")
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        unresolved.append({"path": str(path), "line": line, "error": str(error)})
+                        continue
                     if row.get("kind") == KIND:
                         records.append(row)
                     elif row.get("type") == "response_item":
                         payload = row.get("payload", {})
-                        if payload.get("type") in {"function_call_output", "custom_tool_call_output"}:
+                        if not isinstance(payload, dict):
+                            unresolved.append({"path": str(path), "line": line,
+                                               "error": "response_item payload must be an object"})
+                            continue
+                        if payload.get("type") in ("function_call_output", "custom_tool_call_output"):
                             for packet in _packets(payload.get("output")):
                                 if packet["kind"] == KIND:
                                     records.append(packet)
@@ -399,10 +409,11 @@ def read_inputs(paths):
                                         if len(data) != packet["bytes"] or hashlib.sha256(data).hexdigest() != packet["sha256"]:
                                             raise ValueError("validation ledger reference hash/size mismatch")
                                         record = json.loads(data)
+                                        _validate(record)
                                         if record.get("run_id") != packet["run_id"]:
                                             raise ValueError("validation ledger reference run_id mismatch")
                                         records.append(record)
-                                    except (OSError, ValueError, KeyError) as error:
+                                    except (OSError, ValueError, TypeError, KeyError) as error:
                                         unresolved.append({"path": str(path), "line": line, "error": str(error)})
                 coverage.append({"path": str(path), "records": count, "bytes": snapshot.byte_length, "sha256": snapshot.sha256})
         else:

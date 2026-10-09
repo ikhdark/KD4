@@ -137,30 +137,60 @@ fn registry_recovery_retry_delay_exponentially_backs_off_and_caps() {
     }
 }
 
-#[test]
-fn recovery_retries_transient_registry_errors() {
-    let error = registry_error(http::StatusCode::TOO_MANY_REQUESTS, /*code*/ None);
+#[tokio::test]
+async fn output_gap_rejects_missing_or_overlapping_terminal_exit() {
+    for exit_seq in [None, Some(0), Some(6)] {
+        let state = SessionState::new(true);
+        let mut events = state.subscribe_events();
+        state.recover_events(ReadResponse {
+            chunks: Vec::new(), next_seq: 7, exited: exit_seq.is_some(),
+            exit_code: exit_seq.map(|_| 7), closed: true, failure: None,
+            output_gap: Some(crate::protocol::ProcessOutputGap { through_seq: 5, exit_seq }),
+            sandbox_denied: false,
+        }).expect_err("close cannot replace or omit the authoritative exit");
+        {
+            let next_event = events.recv();
+            tokio::pin!(next_event);
+            assert!(futures::poll!(&mut next_event).is_pending());
+        }
+        assert_eq!(state.last_published_seq(), 0);
+        assert!(state.ordered_events.lock().unwrap().pending.is_empty());
 
-    assert!(is_retryable_registry_error(&error));
-    assert!(is_retryable_recovery_error(&error));
+        // A rejected replay must not poison a later valid replay. The terminal
+        // events occupy distinct positions after the declared evicted prefix.
+        assert!(state.recover_events(ReadResponse {
+            chunks: Vec::new(), next_seq: 7, exited: true, exit_code: Some(7),
+            closed: true, failure: None,
+            output_gap: Some(crate::protocol::ProcessOutputGap {
+                through_seq: 4, exit_seq: Some(5),
+            }),
+            sandbox_denied: false,
+        }).unwrap());
+        assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 4 });
+        assert!(matches!(events.recv().await.unwrap(),
+            ExecProcessEvent::Exited { seq: 5, exit_code: 7, .. }));
+        assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Closed { seq: 6, .. }));
+    }
 }
 
 #[test]
-fn recovery_retries_environment_offline_conflicts() {
-    let error = registry_error(http::StatusCode::CONFLICT, Some("environment_offline"));
-
-    assert!(is_retryable_registry_error(&error));
-    assert!(is_retryable_recovery_error(&error));
+fn recovery_classifies_registry_status_and_conflict_code() {
+    for (status, code, expected) in [
+        (http::StatusCode::TOO_MANY_REQUESTS, None, true),
+        (http::StatusCode::SERVICE_UNAVAILABLE, None, true),
+        (http::StatusCode::REQUEST_TIMEOUT, None, true),
+        (http::StatusCode::CONFLICT, Some("environment_offline"), true),
+        (http::StatusCode::CONFLICT, Some("registration_conflict"), false),
+        (http::StatusCode::CONFLICT, None, false),
+        (http::StatusCode::UNAUTHORIZED, None, false),
+        (http::StatusCode::FORBIDDEN, Some("environment_offline"), false),
+        (http::StatusCode::NOT_FOUND, None, false),
+    ] {
+        let error = registry_error(status, code);
+        assert_eq!(is_retryable_registry_error(&error), expected, "{status} {code:?}");
+        assert_eq!(is_retryable_recovery_error(&error), expected, "{status} {code:?}");
+    }
 }
-
-#[test]
-fn recovery_does_not_retry_other_registry_conflicts() {
-    let error = registry_error(http::StatusCode::CONFLICT, Some("registration_conflict"));
-
-    assert!(!is_retryable_registry_error(&error));
-    assert!(!is_retryable_recovery_error(&error));
-}
-
 #[test]
 fn process_event_reorder_rejects_oversized_output() {
     let state = SessionState::new(/*recoverable*/ true);

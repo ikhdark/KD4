@@ -321,10 +321,10 @@ async fn registered_large_patch_keeps_native_acknowledgment_and_complete_structu
     assert_eq!(structured["changes_exact"], true);
     assert_eq!(structured["changes"].as_array().unwrap().len(), names.len());
     assert_eq!(
-        structured["changes"][128],
-        json!({
-            "path": cwd.join(&names[128]).unwrap().to_path_buf(), "kind": "add", "move_path": null,
-        })
+        structured["changes"],
+        json!(names.iter().map(|name| json!({
+            "path": cwd.join(name).unwrap().to_path_buf(), "kind": "add", "move_path": null,
+        })).collect::<Vec<_>>())
     );
     for name in names {
         assert_eq!(
@@ -1170,7 +1170,7 @@ async fn patch_workspace_verification_and_approval_share_one_permit() {
 }
 
 #[tokio::test]
-async fn pre_tool_use_payload_uses_freeform_patch_input() {
+async fn hook_payloads_use_freeform_patch_input_and_tool_output() {
     let patch = sample_patch();
     let payload = ToolPayload::Custom {
         input: patch.to_string(),
@@ -1183,6 +1183,20 @@ async fn pre_tool_use_payload_uses_freeform_patch_input() {
         Some(PreToolUsePayload {
             tool_name: HookToolName::apply_patch(),
             tool_input: json!({ "command": patch }),
+        })
+    );
+    let output = ApplyPatchToolOutput::from_text("Success. Updated files.".to_string());
+    assert_eq!(
+        handler.post_tool_use_payload(&invocation, &output),
+        Some(PostToolUsePayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_use_id: "call-apply-patch".to_string(),
+            tool_input: json!({ "command": patch }),
+            tool_response: json!({
+                "text": "Success. Updated files.", "success": true,
+                "changes": [], "changes_exact": true, "environment_id": null,
+                "diagnostics": [],
+            }),
         })
     );
 }
@@ -1204,31 +1218,6 @@ async fn foreign_patch_uses_only_an_external_sandbox_profile() {
     assert_eq!(permissions.additional_permissions, None);
     assert!(!permissions.permissions_preapproved);
     assert_eq!(policy, FileSystemSandboxPolicy::external_sandbox());
-}
-
-#[tokio::test]
-async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
-    let patch = sample_patch();
-    let payload = ToolPayload::Custom {
-        input: patch.to_string(),
-    };
-    let invocation = invocation_for_payload(payload).await;
-    let output = ApplyPatchToolOutput::from_text("Success. Updated files.".to_string());
-    let handler = ApplyPatchHandler::default();
-
-    assert_eq!(
-        handler.post_tool_use_payload(&invocation, &output),
-        Some(PostToolUsePayload {
-            tool_name: HookToolName::apply_patch(),
-            tool_use_id: "call-apply-patch".to_string(),
-            tool_input: json!({ "command": patch }),
-            tool_response: json!({
-                "text": "Success. Updated files.", "success": true,
-                "changes": [], "changes_exact": true, "environment_id": null,
-                "diagnostics": [],
-            }),
-        })
-    );
 }
 
 #[test]
@@ -1649,7 +1638,10 @@ async fn approval_keys_include_move_destination() {
     };
 
     let keys = file_paths_for_action(&action);
-    assert_eq!(keys.len(), 2);
+    assert_eq!(
+        keys,
+        vec![cwd.join("old/name.txt").unwrap(), cwd.join("renamed/dir/name.txt").unwrap()]
+    );
 }
 
 #[test]

@@ -1863,7 +1863,8 @@ mod tests {
         let response = GetAccountRateLimitsResponse {
             rate_limits: rate_limit_snapshot("codex"),
             rate_limits_by_limit_id: Some(HashMap::from([
-                ("codex".to_string(), rate_limit_snapshot("codex")),
+                ("codex".to_string(), rate_limit_snapshot("wrong-inner-id")),
+                ("alias".to_string(), rate_limit_snapshot("codex")),
                 ("other".to_string(), rate_limit_snapshot("other")),
             ])),
             rate_limit_reset_credits: None,
@@ -1872,11 +1873,8 @@ mod tests {
         let snapshots = app_server_rate_limit_snapshots(response);
 
         assert_eq!(
-            snapshots
-                .iter()
-                .map(|snapshot| snapshot.limit_id.as_deref())
-                .collect::<Vec<_>>(),
-            vec![Some("codex"), Some("other")]
+            snapshots,
+            vec![rate_limit_snapshot("codex"), rate_limit_snapshot("other")]
         );
     }
 
@@ -1949,101 +1947,33 @@ mod tests {
                 .active_permission_profile()
                 .map(permission_profile_id_from_active_profile)
         );
-        assert_eq!(params.model_provider, Some(config.model_provider_id));
+        assert_eq!(params.model_provider.as_deref(), Some(config.model_provider_id.as_str()));
         assert_eq!(params.thread_source, Some(ThreadSource::User));
+        assert_eq!(params.session_start_source, None);
+        let clear = thread_start_params_from_config(&config, ThreadParamsMode::Embedded, None, Some(ThreadStartSource::Clear));
+        assert_eq!(clear.session_start_source, Some(ThreadStartSource::Clear));
+        assert_eq!(clear.cwd, params.cwd);
     }
 
     #[tokio::test]
-    async fn thread_start_params_can_mark_clear_source() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = build_config(&temp_dir).await;
-
-        let params = thread_start_params_from_config(
-            &config,
-            ThreadParamsMode::Embedded,
-            /*remote_cwd_override*/ None,
-            Some(ThreadStartSource::Clear),
-        );
-
-        assert_eq!(params.session_start_source, Some(ThreadStartSource::Clear));
-    }
-
-    #[tokio::test]
-    async fn embedded_turn_permissions_use_active_profile_selection() {
+    async fn turn_permissions_preserve_select_or_project_only_explicit_overrides() {
         let cwd = test_path_buf("/workspace/project").abs();
-        let active_permission_profile =
-            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
-
-        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
-            TurnPermissionsOverride::ActiveProfile(active_permission_profile),
-            cwd.as_path(),
-        )
-        .await
-        .expect("turn permissions");
-
-        assert_eq!(sandbox_policy, None);
-        assert_eq!(permission_profile, None);
-        assert_eq!(
-            permissions,
-            Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string())
-        );
+        for (input, expected) in [
+            (TurnPermissionsOverride::Preserve, (None, None, None)),
+            (TurnPermissionsOverride::ActiveProfile(ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE)),
+                (None, None, Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string()))),
+            (TurnPermissionsOverride::ActiveProfile(ActivePermissionProfile::new("strict")),
+                (None, None, Some("strict".to_string()))),
+            (TurnPermissionsOverride::LegacySandbox(PermissionProfile::read_only()),
+                (Some(codex_app_server_protocol::SandboxPolicy::ReadOnly { network_access: false }),
+                 Some(PermissionProfile::read_only()), None)),
+        ] {
+            assert_eq!(turn_permissions_overrides(input, cwd.as_path()).await.expect("turn permissions"), expected);
+        }
     }
 
     #[tokio::test]
-    async fn turn_permissions_preserve_thread_permissions_without_override() {
-        let cwd = test_path_buf("/workspace/project").abs();
-
-        let (sandbox_policy, permission_profile, permissions) =
-            turn_permissions_overrides(TurnPermissionsOverride::Preserve, cwd.as_path())
-                .await
-                .expect("turn permissions");
-
-        assert_eq!(sandbox_policy, None);
-        assert_eq!(permission_profile, None);
-        assert_eq!(permissions, None);
-    }
-
-    #[tokio::test]
-    async fn legacy_turn_permissions_project_to_sandbox_when_explicitly_overridden() {
-        let cwd = test_path_buf("/workspace/project").abs();
-
-        let requested_profile = PermissionProfile::read_only();
-        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
-            TurnPermissionsOverride::LegacySandbox(requested_profile.clone()),
-            cwd.as_path(),
-        )
-        .await
-        .expect("turn permissions");
-
-        assert_eq!(
-            sandbox_policy,
-            Some(codex_app_server_protocol::SandboxPolicy::ReadOnly {
-                network_access: false
-            })
-        );
-        assert_eq!(permission_profile, Some(requested_profile));
-        assert_eq!(permissions, None);
-    }
-
-    #[tokio::test]
-    async fn remote_turn_permissions_preserve_active_profile_selection() {
-        let cwd = test_path_buf("/workspace/project").abs();
-        let active_permission_profile = ActivePermissionProfile::new("strict");
-
-        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
-            TurnPermissionsOverride::ActiveProfile(active_permission_profile),
-            cwd.as_path(),
-        )
-        .await
-        .expect("turn permissions");
-
-        assert_eq!(sandbox_policy, None);
-        assert_eq!(permission_profile, None);
-        assert_eq!(permissions, Some("strict".to_string()));
-    }
-
-    #[tokio::test]
-    async fn thread_lifecycle_params_omit_cwd_without_remote_override_for_remote_sessions() {
+    async fn thread_lifecycle_params_use_only_explicit_remote_cwd_overrides() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
@@ -2053,28 +1983,31 @@ mod tests {
         );
         let expected_runtime_workspace_roots = Some(config.workspace_roots.clone());
 
+        let remote_cwd = PathBuf::from("repo/on/server");
+        for remote_override in [None, Some(remote_cwd.as_path())] {
         let start = thread_start_params_from_config(
             &config,
             ThreadParamsMode::Remote,
-            /*remote_cwd_override*/ None,
+            remote_override,
             /*session_start_source*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
             thread_id,
             ThreadParamsMode::Remote,
-            /*remote_cwd_override*/ None,
+            remote_override,
         );
         let fork = thread_fork_params_from_config(
-            config,
+            config.clone(),
             thread_id,
             ThreadParamsMode::Remote,
-            /*remote_cwd_override*/ None,
+            remote_override,
         );
 
-        assert_eq!(start.cwd, None);
-        assert_eq!(resume.cwd, None);
-        assert_eq!(fork.cwd, None);
+        let expected_cwd = remote_override.map(|_| "repo/on/server");
+        assert_eq!(start.cwd.as_deref(), expected_cwd);
+        assert_eq!(resume.cwd.as_deref(), expected_cwd);
+        assert_eq!(fork.cwd.as_deref(), expected_cwd);
         assert_eq!(
             start.runtime_workspace_roots,
             expected_runtime_workspace_roots
@@ -2098,52 +2031,7 @@ mod tests {
         assert_eq!(fork.permissions, None);
         assert_eq!(start.thread_source, Some(ThreadSource::User));
         assert_eq!(fork.thread_source, Some(ThreadSource::User));
-    }
-
-    #[tokio::test]
-    async fn thread_lifecycle_params_forward_explicit_remote_cwd_override_for_remote_sessions() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = build_config(&temp_dir).await;
-        let thread_id = ThreadId::new();
-        let remote_cwd = PathBuf::from("repo/on/server");
-        let expected_sandbox = codex_app_server_protocol::SandboxMode::from_permission_profile(
-            &config.permissions.effective_permission_profile(),
-            config.cwd.as_path(),
-        );
-
-        let start = thread_start_params_from_config(
-            &config,
-            ThreadParamsMode::Remote,
-            Some(remote_cwd.as_path()),
-            /*session_start_source*/ None,
-        );
-        let resume = thread_resume_params_from_config(
-            config.clone(),
-            thread_id,
-            ThreadParamsMode::Remote,
-            Some(remote_cwd.as_path()),
-        );
-        let fork = thread_fork_params_from_config(
-            config,
-            thread_id,
-            ThreadParamsMode::Remote,
-            Some(remote_cwd.as_path()),
-        );
-
-        assert_eq!(start.cwd.as_deref(), Some("repo/on/server"));
-        assert_eq!(resume.cwd.as_deref(), Some("repo/on/server"));
-        assert_eq!(fork.cwd.as_deref(), Some("repo/on/server"));
-        assert_eq!(start.model_provider, None);
-        assert_eq!(resume.model_provider, None);
-        assert_eq!(fork.model_provider, None);
-        assert_eq!(start.sandbox, expected_sandbox);
-        assert_eq!(resume.sandbox, expected_sandbox);
-        assert_eq!(fork.sandbox, expected_sandbox);
-        assert_eq!(start.permissions, None);
-        assert_eq!(resume.permissions, None);
-        assert_eq!(fork.permissions, None);
-        assert_eq!(start.thread_source, Some(ThreadSource::User));
-        assert_eq!(fork.thread_source, Some(ThreadSource::User));
+        }
     }
 
     #[tokio::test]
@@ -2223,31 +2111,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_fork_params_forward_instruction_overrides() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let mut config = build_config(&temp_dir).await;
-        config.base_instructions = Some("Base override.".to_string());
-        config.developer_instructions = Some("Developer override.".to_string());
-        let thread_id = ThreadId::new();
-
-        let params = thread_fork_params_from_config(
-            config,
-            thread_id,
-            ThreadParamsMode::Embedded,
-            /*remote_cwd_override*/ None,
-        );
-
-        assert_eq!(params.base_instructions.as_deref(), Some("Base override."));
-        assert_eq!(
-            params.developer_instructions.as_deref(),
-            Some("Developer override.")
-        );
-    }
-
-    #[tokio::test]
     async fn terminal_visualization_instructions_are_gated_for_all_tui_thread_flows() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
+        config.base_instructions = Some("Base override.".to_string());
         config.developer_instructions = Some("Developer override.".to_string());
         let thread_id = ThreadId::new();
 
@@ -2270,6 +2137,7 @@ mod tests {
             /*remote_cwd_override*/ None,
         );
 
+        assert_eq!(control_fork.base_instructions.as_deref(), Some("Base override."));
         assert_eq!(control_start.developer_instructions, None);
         assert_eq!(control_resume.developer_instructions, None);
         assert_eq!(
@@ -2298,6 +2166,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
         );
+        assert_eq!(treatment_fork.base_instructions.as_deref(), Some("Base override."));
         let expected = format!(
             "Developer override.\n\n{}",
             crate::terminal_visualization_instructions::TERMINAL_VISUALIZATION_INSTRUCTIONS
@@ -2450,7 +2319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_thread_response_uses_legacy_sandbox_fallback() {
+    async fn remote_thread_response_prefers_canonical_profile_over_legacy_fallback() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
         let cwd = test_path_buf("/tmp/project").abs();
@@ -2459,9 +2328,10 @@ mod tests {
             .expect("read-only profile must be legacy-compatible")
             .into();
 
+        for canonical in [None, Some(PermissionProfile::Disabled)] {
         assert_eq!(
             display_permission_profile_from_thread_response(
-                None,
+                canonical.as_ref(),
                 &sandbox,
                 cwd.as_path(),
                 &config,
@@ -2469,32 +2339,9 @@ mod tests {
             )
             .await
             .expect("thread permissions"),
-            PermissionProfile::read_only()
+            canonical.unwrap_or_else(PermissionProfile::read_only)
         );
-    }
-
-    #[tokio::test]
-    async fn remote_thread_response_prefers_canonical_permission_profile() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = build_config(&temp_dir).await;
-        let cwd = test_path_buf("/tmp/project").abs();
-        let sandbox = PermissionProfile::read_only()
-            .to_legacy_sandbox_policy(cwd.as_path())
-            .expect("read-only profile must be legacy-compatible")
-            .into();
-
-        assert_eq!(
-            display_permission_profile_from_thread_response(
-                Some(&PermissionProfile::Disabled),
-                &sandbox,
-                cwd.as_path(),
-                &config,
-                ThreadParamsMode::Remote,
-            )
-            .await
-            .expect("thread permissions"),
-            PermissionProfile::Disabled
-        );
+        }
     }
 
     #[tokio::test]
@@ -2541,9 +2388,11 @@ mod tests {
             .await
             .expect("history append should succeed");
 
+        let forked_from_id = ThreadId::new();
+        for fork_source in [None, Some(forked_from_id)] {
         let session = thread_session_state_from_thread_response(
             &thread_id.to_string(),
-            /*forked_from_id*/ None,
+            fork_source.map(|id| id.to_string()),
             Some("restore".to_string()),
             /*rollout_path*/ None,
             "gpt-5.4".to_string(),
@@ -2561,41 +2410,15 @@ mod tests {
         .await
         .expect("session should map");
 
+        assert_eq!(session.thread_id, thread_id);
+        assert_eq!(session.forked_from_id, fork_source);
+        assert_eq!(session.thread_name.as_deref(), Some("restore"));
         let metadata = session
             .message_history
             .expect("session should include message-history metadata");
         assert_ne!(metadata.log_id, 0);
         assert_eq!(metadata.entry_count, 2);
-    }
-
-    #[tokio::test]
-    async fn session_configured_preserves_fork_source_thread_id() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = build_config(&temp_dir).await;
-        let thread_id = ThreadId::new();
-        let forked_from_id = ThreadId::new();
-
-        let session = thread_session_state_from_thread_response(
-            &thread_id.to_string(),
-            Some(forked_from_id.to_string()),
-            Some("restore".to_string()),
-            /*rollout_path*/ None,
-            "gpt-5.4".to_string(),
-            "openai".to_string(),
-            /*service_tier*/ None,
-            AskForApproval::Never,
-            PermissionProfile::read_only(),
-            /*active_permission_profile*/ None,
-            test_path_buf("/tmp/project").abs(),
-            Vec::new(),
-            Vec::new(),
-            /*reasoning_effort*/ None,
-            &config,
-        )
-        .await
-        .expect("session should map");
-
-        assert_eq!(session.forked_from_id, Some(forked_from_id));
+        }
     }
 
     #[test]

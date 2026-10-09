@@ -692,10 +692,15 @@ async fn external_agent_config_import_sends_completion_notification_after_pendin
     let completed: ExternalAgentConfigImportCompletedNotification =
         serde_json::from_value(notification.params.expect("completed params"))?;
     assert_eq!(completed.import_id, import_id);
+    assert_eq!(completed.item_type_results.len(), 1);
+    let result = &completed.item_type_results[0];
+    assert_eq!(result.item_type, ExternalAgentConfigMigrationItemType::Plugins);
+    assert!(result.successes.is_empty());
+    assert_eq!(result.failures.len(), 1);
+    assert!(!result.failures[0].message.is_empty());
 
     Ok(())
 }
-
 #[tokio::test]
 async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("follow-up answer").await;
@@ -1053,104 +1058,9 @@ required = true
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_agent_config_import_accepts_detected_session_payload_after_restart() -> Result<()>
-{
-    let server = create_mock_responses_server_repeating_assistant("unused").await;
-    let codex_home = TempDir::new()?;
-    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
-    let project_root = codex_home.path().join("repo");
-    let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
-    let session_path = session_dir.join("session.jsonl");
-    std::fs::create_dir_all(&project_root)?;
-    std::fs::create_dir_all(&session_dir)?;
-    std::fs::write(
-        &session_path,
-        serde_json::json!({
-            "type": "user",
-            "cwd": &project_root,
-            "timestamp": &recent_timestamp,
-            "message": { "content": "first request" },
-        })
-        .to_string(),
-    )?;
-
-    let home_dir = codex_home.path().display().to_string();
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_raw_request(
-            "externalAgentConfig/import",
-            Some(serde_json::json!({
-                "migrationItems": [{
-                    "itemType": "SESSIONS",
-                    "description": "Migrate recent sessions",
-                    "cwd": null,
-                    "details": {
-                        "sessions": [{
-                            "path": session_path,
-                            "cwd": project_root,
-                            "title": "first request"
-                        }]
-                    }
-                }]
-            })),
-        )
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ExternalAgentConfigImportResponse = to_response(response)?;
-    let import_id = assert_import_response(response);
-    let notification = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_notification_message("externalAgentConfig/import/completed"),
-    )
-    .await??;
-    assert_eq!(notification.method, "externalAgentConfig/import/completed");
-    let completed: ExternalAgentConfigImportCompletedNotification =
-        serde_json::from_value(notification.params.expect("completed params"))?;
-    assert_eq!(completed.import_id, import_id);
-
-    let request_id = mcp
-        .send_thread_list_request(ThreadListParams {
-            project_id: None,
-            cursor: None,
-            limit: None,
-            sort_key: None,
-            sort_direction: None,
-            model_providers: None,
-            source_kinds: None,
-            archived: None,
-            cwd: None,
-            use_state_db_only: None,
-            search_term: None,
-            parent_thread_id: None,
-            ancestor_thread_id: None,
-        })
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ThreadListResponse = to_response(response)?;
-    assert_eq!(response.data.len(), 1);
-
-    Ok(())
-}
 
 #[tokio::test]
-async fn external_agent_config_import_skips_already_imported_session_versions() -> Result<()> {
+async fn external_agent_config_import_accepts_detected_payload_and_deduplicates_across_restarts() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("unused").await;
     let codex_home = TempDir::new()?;
     write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
@@ -1194,6 +1104,14 @@ async fn external_agent_config_import_skips_already_imported_session_versions() 
     let detected: ExternalAgentConfigDetectResponse = to_response(response)?;
 
     for _ in 0..2 {
+        drop(mcp);
+        mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
+            .build()
+            .await?;
+        timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
         let request_id = mcp
             .send_raw_request(
                 "externalAgentConfig/import",
@@ -1245,7 +1163,6 @@ async fn external_agent_config_import_skips_already_imported_session_versions() 
 
     Ok(())
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_agent_config_import_compacts_huge_session_before_first_follow_up() -> Result<()> {
     let server = responses::start_mock_server().await;

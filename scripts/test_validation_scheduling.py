@@ -211,7 +211,10 @@ class CrateValidationExecutionTest(unittest.TestCase):
                         cwd=directory, capture_output=True, text=True, timeout=30,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn(expected, result.stdout)
+                    if expected:
+                        self.assertIn(expected, result.stdout)
+                    else:
+                        self.assertEqual(result.stdout, "")
 
     def test_invalid_selection_launches_no_checks(self):
         with mock.patch.object(runner_module, "run_owned") as run:

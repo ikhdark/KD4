@@ -1,6 +1,4 @@
 use super::*;
-use std::hint::black_box;
-use std::time::Instant;
 
 fn message(text: &str, trusted: bool) -> ResponseItem {
     let mut item = ResponseItem::Message {
@@ -41,6 +39,25 @@ fn mixed_injections_still_filter_only_trusted_duplicates() {
         vec![trusted.clone(), untrusted.clone()],
     );
     assert_eq!(filtered, vec![untrusted]);
+}
+
+#[test]
+fn ambiguous_stable_injections_remain_whole() {
+    let trusted = message("<collaboration_mode>unchanged</collaboration_mode>", true);
+    for ambiguous in [
+        ContentItem::OutputText { text: "mixed representation".to_string() },
+        ContentItem::InputText { text: "<permissions instructions>unterminated".to_string() },
+    ] {
+        let mut candidate = trusted.clone();
+        let ResponseItem::Message { content, .. } = &mut candidate else { unreachable!() };
+        content.push(ambiguous);
+        // The filtering contract preserves an ambiguous message as a unit,
+        // even when one recognized section duplicates trusted history.
+        assert_eq!(
+            filter_unchanged_stable_context_items(std::slice::from_ref(&trusted), vec![candidate.clone()]),
+            vec![candidate],
+        );
+    }
 }
 
 #[test]
@@ -96,49 +113,4 @@ fn dynamic_history_preserves_canonical_order_without_rehashing() {
     assert_eq!(dynamic.fingerprint, manifest.fingerprint);
 }
 
-#[test]
-#[ignore = "narrow local cache benchmark; run explicitly with --run-ignored only"]
-fn benchmark_stable_context_cache_processing() {
-    let history = vec![message("<collaboration_mode>unchanged</collaboration_mode>", true); 4096];
-    let identity = "context reuse 測定 ".repeat(16384);
-    let manifest = StableContextManifest::default();
-    let tokens = i64::try_from(approx_token_count(&identity)).unwrap();
-    let mut report = String::new();
-    for case in ["empty_injection", "ordinary_injection", "measured_history"] {
-        let mut samples = Vec::new();
-        for _ in 0..7 {
-            let started = Instant::now();
-            for _ in 0..32 {
-                match case {
-                    "empty_injection" => {
-                        black_box(filter_unchanged_stable_context_items(
-                            black_box(&history),
-                            Vec::new(),
-                        ));
-                    }
-                    "ordinary_injection" => {
-                        black_box(filter_unchanged_stable_context_items(
-                            black_box(&history),
-                            vec![message("ordinary context", false)],
-                        ));
-                    }
-                    _ => {
-                        black_box(manifest.add_dynamic_history(
-                            black_box(identity.as_bytes()),
-                            identity.len() as u64,
-                            tokens,
-                        ));
-                    }
-                }
-            }
-            samples.push(started.elapsed().as_nanos() / 32);
-        }
-        samples.sort_unstable();
-        report.push_str(&format!("cache_benchmark case={case} iterations=224 median_ns={} min_ns={} max_ns={} history_items={} identity_bytes={}\n",
-            samples[3], samples[0], samples[6], history.len(), identity.len()));
-    }
-    eprint!("{report}");
-    if let Some(path) = std::env::var_os("CODEX_CACHE_BENCHMARK_OUTPUT") {
-        std::fs::write(path, report).unwrap();
-    }
-}
+

@@ -30,28 +30,25 @@ fn deserialize_stdio_command_server_config() {
 }
 
 #[test]
-fn deserialize_stdio_command_server_config_with_args() {
-    let cfg: McpServerConfig = toml::from_str(
-        r#"
-            command = "echo"
-            args = ["hello", "world"]
-        "#,
-    )
-    .expect("should deserialize command config");
-
-    assert_eq!(
-        cfg.transport,
-        McpServerTransportConfig::Stdio {
-            command: "echo".to_string(),
-            args: vec!["hello".to_string(), "world".to_string()],
-            env: None,
-            env_vars: Vec::new(),
-            cwd: None,
-        }
-    );
-    assert!(cfg.enabled);
+fn deserialize_stdio_arguments_and_environment_are_preserved() {
+    for env in [None, Some(HashMap::from([("FOO".to_string(), "BAR".to_string())]))] {
+        let suffix = if env.is_some() { "env = { FOO = 'BAR' }" } else { "" };
+        let cfg: McpServerConfig =
+            toml::from_str(&format!("command = 'echo'\nargs = ['hello', 'world']\n{suffix}"))
+                .unwrap();
+        assert_eq!(
+            cfg.transport,
+            McpServerTransportConfig::Stdio {
+                command: "echo".to_string(),
+                args: vec!["hello".to_string(), "world".to_string()],
+                env,
+                env_vars: Vec::new(),
+                cwd: None,
+            }
+        );
+        assert!(cfg.enabled);
+    }
 }
-
 #[test]
 fn deserialize_remote_stdio_server_accepts_foreign_absolute_cwd() {
     let cwd = "/home/openai/share";
@@ -79,29 +76,6 @@ fn deserialize_remote_stdio_server_accepts_foreign_absolute_cwd() {
     );
 }
 
-#[test]
-fn deserialize_stdio_command_server_config_with_arg_with_args_and_env() {
-    let cfg: McpServerConfig = toml::from_str(
-        r#"
-            command = "echo"
-            args = ["hello", "world"]
-            env = { "FOO" = "BAR" }
-        "#,
-    )
-    .expect("should deserialize command config");
-
-    assert_eq!(
-        cfg.transport,
-        McpServerTransportConfig::Stdio {
-            command: "echo".to_string(),
-            args: vec!["hello".to_string(), "world".to_string()],
-            env: Some(HashMap::from([("FOO".to_string(), "BAR".to_string())])),
-            env_vars: Vec::new(),
-            cwd: None,
-        }
-    );
-    assert!(cfg.enabled);
-}
 
 #[test]
 fn deserialize_stdio_command_server_config_with_env_vars() {
@@ -201,30 +175,18 @@ fn deserialize_stdio_command_server_config_with_cwd() {
 }
 
 #[test]
-fn deserialize_disabled_server_config() {
-    let cfg: McpServerConfig = toml::from_str(
-        r#"
-            command = "echo"
-            enabled = false
-        "#,
-    )
-    .expect("should deserialize disabled server config");
-
-    assert!(!cfg.enabled);
-    assert!(!cfg.required);
-}
-
-#[test]
-fn deserialize_required_server_config() {
-    let cfg: McpServerConfig = toml::from_str(
-        r#"
-            command = "echo"
-            required = true
-        "#,
-    )
-    .expect("should deserialize required server config");
-
-    assert!(cfg.required);
+fn deserialize_server_flags_preserves_independent_defaults_and_overrides() {
+    for (settings, enabled, required, parallel) in [
+        ("", true, false, false),
+        ("enabled = false", false, false, false),
+        ("required = true", true, true, false),
+        ("supports_parallel_tool_calls = true", true, false, true),
+    ] {
+        let cfg: McpServerConfig =
+            toml::from_str(&format!("command = 'echo'\n{settings}")).unwrap();
+        assert_eq!((cfg.enabled, cfg.required, cfg.supports_parallel_tool_calls),
+            (enabled, required, parallel), "{settings}");
+    }
 }
 
 #[test]
@@ -296,39 +258,20 @@ fn deserialize_streamable_http_server_config_with_headers() {
 }
 
 #[test]
-fn deserialize_streamable_http_server_config_with_oauth_resource() {
+fn deserialize_streamable_http_server_preserves_oauth_settings() {
     let cfg: McpServerConfig = toml::from_str(
         r#"
-            url = "https://example.com/mcp"
-            oauth_resource = "https://api.example.com"
-        "#,
-    )
-    .expect("should deserialize http config with oauth_resource");
-
-    assert_eq!(
-        cfg.oauth_resource,
-        Some("https://api.example.com".to_string())
-    );
-}
-
-#[test]
-fn deserialize_streamable_http_server_config_with_oauth_client_id() {
-    let cfg: McpServerConfig = toml::from_str(
-        r#"
-            url = "https://example.com/mcp"
-
-            [oauth]
-            client_id = "eci-prd-pub-codex-123"
-        "#,
-    )
-    .expect("should deserialize http config with oauth client id");
-
-    assert_eq!(
-        cfg.oauth,
-        Some(McpServerOAuthConfig {
-            client_id: Some("eci-prd-pub-codex-123".to_string()),
-        })
-    );
+url = "https://example.com/mcp"
+oauth_resource = "https://api.example.com"
+[oauth]
+client_id = "eci-prd-pub-codex-123"
+"#,
+    ).unwrap();
+    assert_eq!(cfg.oauth_resource.as_deref(), Some("https://api.example.com"));
+    assert_eq!(cfg.oauth, Some(McpServerOAuthConfig {
+        client_id: Some("eci-prd-pub-codex-123".to_string()),
+    }));
+    assert_eq!(cfg.oauth_client_id(), Some("eci-prd-pub-codex-123"));
 }
 
 #[test]
@@ -346,18 +289,6 @@ fn deserialize_server_config_with_tool_filters() {
     assert_eq!(cfg.disabled_tools, Some(vec!["blocked".to_string()]));
 }
 
-#[test]
-fn deserialize_server_config_with_parallel_tool_calls() {
-    let cfg: McpServerConfig = toml::from_str(
-        r#"
-            command = "echo"
-            supports_parallel_tool_calls = true
-        "#,
-    )
-    .expect("should deserialize supports_parallel_tool_calls");
-
-    assert!(cfg.supports_parallel_tool_calls);
-}
 
 #[test]
 fn deserialize_server_config_with_default_tool_approval_mode() {
@@ -450,88 +381,37 @@ fn deserialize_ignores_unknown_server_fields() {
 }
 
 #[test]
-fn deserialize_rejects_command_and_url() {
-    toml::from_str::<McpServerConfig>(
-        r#"
-            command = "echo"
-            url = "https://example.com"
-        "#,
-    )
-    .expect_err("should reject command+url");
+fn deserialize_rejects_fields_for_the_wrong_transport() {
+    for (base, transport, invalid_fields) in [
+        ("command = 'echo'", "stdio", vec![
+            ("url", "'https://example.com'"),
+            ("bearer_token_env_var", "'TOKEN'"),
+            ("bearer_token", "'secret'"),
+            ("http_headers", "{ 'X-Foo' = 'bar' }"),
+            ("env_http_headers", "{ 'X-Foo' = 'BAR_ENV' }"),
+            ("oauth", "{ client_id = 'eci-prd-pub-codex-123' }"),
+            ("oauth_resource", "'https://api.example.com'"),
+        ]),
+        ("url = 'https://example.com'", "streamable_http", vec![
+            ("env", "{ FOO = 'BAR' }"),
+            ("args", "['argument']"),
+            ("env_vars", "['TOKEN']"),
+            ("cwd", "'/tmp'"),
+            ("bearer_token", "'secret'"),
+        ]),
+    ] {
+        let _: McpServerConfig = toml::from_str(base).expect("valid transport control");
+        for (field, value) in invalid_fields {
+            let input = format!("{base}\n{field} = {value}");
+            let error = toml::from_str::<McpServerConfig>(&input).unwrap_err();
+            assert_eq!(error.message(), format!("{field} is not supported for {transport}"),
+                "{input}");
+        }
+    }
 }
 
-#[test]
-fn deserialize_rejects_env_for_http_transport() {
-    toml::from_str::<McpServerConfig>(
-        r#"
-            url = "https://example.com"
-            env = { "FOO" = "BAR" }
-        "#,
-    )
-    .expect_err("should reject env for http transport");
-}
 
-#[test]
-fn deserialize_rejects_headers_for_stdio() {
-    toml::from_str::<McpServerConfig>(
-        r#"
-            command = "echo"
-            http_headers = { "X-Foo" = "bar" }
-        "#,
-    )
-    .expect_err("should reject http_headers for stdio transport");
 
-    toml::from_str::<McpServerConfig>(
-        r#"
-            command = "echo"
-            env_http_headers = { "X-Foo" = "BAR_ENV" }
-        "#,
-    )
-    .expect_err("should reject env_http_headers for stdio transport");
-
-    let err = toml::from_str::<McpServerConfig>(
-        r#"
-            command = "echo"
-            oauth = { client_id = "eci-prd-pub-codex-123" }
-        "#,
-    )
-    .expect_err("should reject oauth for stdio transport");
-
-    assert!(
-        err.to_string().contains("oauth is not supported for stdio"),
-        "unexpected error: {err}"
-    );
-
-    let err = toml::from_str::<McpServerConfig>(
-        r#"
-            command = "echo"
-            oauth_resource = "https://api.example.com"
-        "#,
-    )
-    .expect_err("should reject oauth_resource for stdio transport");
-
-    assert!(
-        err.to_string()
-            .contains("oauth_resource is not supported for stdio"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn deserialize_rejects_inline_bearer_token_field() {
-    let err = toml::from_str::<McpServerConfig>(
-        r#"
-            url = "https://example.com"
-            bearer_token = "secret"
-        "#,
-    )
-    .expect_err("should reject bearer_token field");
-
-    assert!(
-        err.to_string().contains("bearer_token is not supported"),
-        "unexpected error: {err}"
-    );
-}
 #[test]
 fn mcp_timeout_conversion_boundaries() {
     for field in ["startup_timeout_sec", "tool_timeout_sec"] {

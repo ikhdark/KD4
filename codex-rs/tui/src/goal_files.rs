@@ -144,26 +144,61 @@ pub(crate) async fn materialize_goal_draft(
 
     // Validate the final reference before creating any directory or writing attachments.
     // Borrow paste payloads and image source paths until this point; do not buffer image bytes.
-    if let Some(path) = output_dir.as_ref() {
-        app_server
-            .fs_create_directory_all_path(path)
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))
-            .with_context(|| format!("Could not create goal attachment directory {path}"))?;
+    let materialized: Result<()> = async {
+        if let Some(path) = output_dir.as_ref() {
+            app_server
+                .fs_create_directory_all_path(path)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))
+                .with_context(|| format!("Could not create goal attachment directory {path}"))?;
+        }
+        for (path, bytes) in paste_files {
+            write_goal_file(app_server, path, bytes.to_vec()).await?;
+        }
+        for (path, source) in image_files {
+            let bytes = tokio::fs::read(source)
+                .await
+                .with_context(|| format!("Could not read goal image {}", source.display()))?;
+            write_goal_file(app_server, path, bytes).await?;
+        }
+        if let Some((path, content)) = objective_file {
+            write_goal_file(app_server, path, content.into_bytes()).await?;
+        }
+        Ok(())
     }
-    for (path, bytes) in paste_files {
-        write_goal_file(app_server, path, bytes.to_vec()).await?;
-    }
-    for (path, source) in image_files {
-        let bytes = tokio::fs::read(source)
-            .await
-            .with_context(|| format!("Could not read goal image {}", source.display()))?;
-        write_goal_file(app_server, path, bytes).await?;
-    }
-    if let Some((path, content)) = objective_file {
-        write_goal_file(app_server, path, content.into_bytes()).await?;
+    .await;
+    if let Err(err) = materialized {
+        // No goal references this fresh directory yet. Roll back partial writes without
+        // buffering all images, preserving the original error even if cleanup fails.
+        if let Some(path) = output_dir.as_ref() {
+            cleanup_uncommitted_goal_files(app_server, path).await;
+        }
+        return Err(err);
     }
     Ok((objective, output_dir))
+}
+
+/// Best-effort rollback of a fresh attachment directory known not to belong to a saved goal.
+pub(crate) async fn cleanup_uncommitted_goal_files(
+    app_server: &mut AppServerSession,
+    path: &GoalFilePath,
+) {
+    // A remote server may stop responding after rejecting a write or goal save. Cleanup
+    // must not indefinitely delay the original error. A dispatched remove may finish later.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        app_server.fs_remove_path(path),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!("failed to clean up uncommitted goal files at {path}: {err}");
+        }
+        Err(_) => {
+            tracing::warn!("timed out cleaning up uncommitted goal files at {path}");
+        }
+    }
 }
 
 pub(crate) async fn objective_text_for_edit(
@@ -262,4 +297,129 @@ fn image_extension(path: &Path) -> String {
         })
         .filter(|extension| !extension.is_empty())
         .unwrap_or_else(|| "png".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_server_session::ThreadParamsMode;
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[tokio::test]
+    async fn materialization_preserves_write_error_when_cleanup_fails_or_stalls() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket");
+            let initialize = socket.next().await.expect("initialize").expect("frame");
+            let initialize: serde_json::Value =
+                serde_json::from_str(initialize.to_text().expect("text")).expect("JSON");
+            assert_eq!(initialize["method"], "initialize");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("initialize response");
+            let initialized = socket.next().await.expect("initialized").expect("frame");
+            let initialized: serde_json::Value =
+                serde_json::from_str(initialized.to_text().expect("text")).expect("JSON");
+            assert_eq!(initialized["method"], "initialized");
+            for cleanup_stalls in [false, true] {
+                let mut created_path = serde_json::Value::Null;
+                for method in ["fs/createDirectory", "fs/writeFile", "fs/remove"] {
+                    let request = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                        .await
+                        .expect("request must arrive")
+                        .expect("request")
+                        .expect("frame");
+                    let request: serde_json::Value =
+                        serde_json::from_str(request.to_text().expect("text")).expect("JSON");
+                    assert_eq!(request["method"], method);
+                    if method == "fs/createDirectory" {
+                        created_path = request["params"]["path"].clone();
+                    } else if method == "fs/remove" {
+                        // Roll back exactly this draft's fresh directory, never the home
+                        // or attachment root which may contain previously committed goals.
+                        assert_eq!(request["params"]["path"], created_path);
+                        if cleanup_stalls {
+                            continue;
+                        }
+                    }
+                    let response = if method == "fs/createDirectory" {
+                        serde_json::json!({"id": request["id"], "result": {}})
+                    } else {
+                        serde_json::json!({"id": request["id"], "error": {
+                            "code": -32000,
+                            "message": if method == "fs/writeFile" { "write denied" } else { "cleanup denied" }
+                        }})
+                    };
+                    socket
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .expect("response");
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(5), released)
+                .await
+                .expect("materialization must return despite unanswered remove")
+                .expect("release peer");
+        });
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            endpoint: RemoteAppServerEndpoint::WebSocket {
+                websocket_url: endpoint,
+                auth_token: None,
+            },
+            client_name: "codex-tui-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await?;
+        let mut session =
+            AppServerSession::new(AppServerClient::Remote(client), ThreadParamsMode::Remote);
+        let home = AppServerPath::from_app_server("/remote/codex");
+        for _ in 0..2 {
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                materialize_goal_draft(
+                    &mut session,
+                    Some(&home),
+                    GoalDraft {
+                        objective: "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("cleanup must not block the original failure")
+            .expect_err("write failure must not become success");
+            let error = format!("{error:#}");
+            assert!(error.contains("Could not write goal file"), "{error}");
+            assert!(error.contains("write denied"), "{error}");
+            assert!(!error.contains("cleanup denied"), "{error}");
+        }
+        release.send(()).expect("release peer");
+        peer.await?;
+        session
+            .shutdown()
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
 }

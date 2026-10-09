@@ -41,26 +41,22 @@ fn detects_agents_instructions_fragment() {
 
 #[test]
 fn renders_agents_instructions_with_legacy_directory_header() {
-    assert_eq!(
-        UserInstructions {
-            directory: Some("/tmp".to_string()),
-            text: "body".to_string(),
-        }
-        .render(),
-        "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
-    );
-}
-
-#[test]
-fn renders_agents_instructions_without_directory_header() {
-    assert_eq!(
-        UserInstructions {
-            directory: None,
-            text: "body".to_string(),
-        }
-        .render(),
-        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
-    );
+    for (directory, expected_header) in [
+        (
+            Some("/tmp".to_string()),
+            "# AGENTS.md instructions for /tmp",
+        ),
+        (None, "# AGENTS.md instructions"),
+    ] {
+        assert_eq!(
+            UserInstructions {
+                directory,
+                text: "body".to_string(),
+            }
+            .render(),
+            format!("{expected_header}\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>")
+        );
+    }
 }
 
 #[test]

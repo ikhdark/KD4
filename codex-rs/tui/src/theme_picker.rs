@@ -478,22 +478,16 @@ mod tests {
     }
 
     #[test]
-    fn theme_picker_uses_half_width_with_stacked_fallback_preview() {
+    fn theme_picker_builds_searchable_items_with_adaptive_preview() {
         let params = build_theme_picker_params(
             /*current_name*/ None, /*codex_home*/ None, /*terminal_width*/ None,
         );
         assert_eq!(params.side_content_width, SideContentWidth::Half);
         assert_eq!(params.side_content_min_width, WIDE_PREVIEW_MIN_WIDTH);
         assert!(params.stacked_side_content.is_some());
-    }
-
-    #[test]
-    fn theme_picker_items_include_search_values_for_preview_mapping() {
-        let params = build_theme_picker_params(
-            /*current_name*/ None, /*codex_home*/ None, /*terminal_width*/ None,
-        );
+        assert!(!params.items.is_empty());
         assert!(
-            params.items.iter().all(|item| item.search_value.is_some()),
+            params.items.iter().all(|item| item.search_value.as_deref() == Some(item.name.as_str())),
             "theme picker preview mapping relies on item search_value to stay aligned with final item order"
         );
     }
@@ -519,14 +513,9 @@ mod tests {
         let last_row = *numbered_rows
             .last()
             .expect("expected at least one preview row");
-        assert!(
-            first_row > 0,
-            "expected top padding before centered preview"
-        );
-        assert!(
-            last_row < 19,
-            "expected bottom padding after centered preview"
-        );
+        assert_eq!(first_row, 6);
+        assert_eq!(last_row, 13);
+        assert_eq!(numbered_rows, (6..14).collect::<Vec<_>>());
 
         let first_line = &lines[first_row];
         assert!(
@@ -538,14 +527,7 @@ mod tests {
             .iter()
             .filter_map(|line| preview_line_marker(line))
             .collect();
-        assert!(
-            markers.contains(&'+'),
-            "expected wide preview to include at least one addition line"
-        );
-        assert!(
-            markers.contains(&'-'),
-            "expected wide preview to include at least one removal line"
-        );
+        assert_eq!(markers, vec![' ', '-', '+', ' ', '-', '+', '+', ' ']);
     }
 
     #[test]

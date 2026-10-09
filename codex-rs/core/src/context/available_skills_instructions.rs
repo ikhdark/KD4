@@ -108,17 +108,6 @@ mod tests {
         }
     }
 
-    /// The catalog advertises `skill:` locators, so the guidance has to name the
-    /// tool that resolves them. Saying "their stated provider" without naming one
-    /// left the model with locators and no way to load them.
-    #[test]
-    fn skill_usage_guidance_names_the_tool_that_loads_skill_locators() {
-        assert!(
-            SKILLS_HOW_TO_USE.contains("`skill:` locators with `read_file`"),
-            "skill locators must name read_file as their provider: {SKILLS_HOW_TO_USE}"
-        );
-    }
-
     #[test]
     fn rendered_skill_catalog_does_not_repeat_shared_usage_guidance() {
         for skill_root_lines in [Vec::new(), vec!["- r0: C:\\workspace\\skills".to_string()]] {
@@ -199,6 +188,7 @@ mod tests {
             .and_then(|text| text.strip_suffix("\n</skills_usage_instructions>"))
             .expect("complete skills-usage markers and heading");
         assert_eq!(body, SKILLS_HOW_TO_USE);
+        assert!(body.contains("`skill:` locators with `read_file`"));
         assert!(body.contains("read each selected `SKILL.md` completely"));
         assert!(body.contains("Do not delegate that reading or interpretation"));
         assert!(body.contains("Read task-required linked instructions"));

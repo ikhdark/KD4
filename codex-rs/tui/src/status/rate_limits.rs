@@ -541,6 +541,16 @@ mod tests {
             ]
         );
         assert_eq!(rows.iter().filter(|row| row.label == "Credits").count(), 2);
+        for (index, expected) in [(0, 10.0), (2, 20.0)] {
+            assert!(matches!(
+                &rows[index].value,
+                super::StatusRateLimitValue::Window { percent_used, resets_at, details }
+                    if *percent_used == expected && resets_at.as_deref() == Some("soon") && details.is_none()
+            ));
+        }
+        for (index, expected) in [(1, "25 credits"), (3, "99 credits")] {
+            assert!(matches!(&rows[index].value, super::StatusRateLimitValue::Text(value) if value == expected));
+        }
     }
 
     #[test]

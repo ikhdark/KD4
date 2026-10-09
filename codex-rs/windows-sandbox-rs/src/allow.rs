@@ -193,77 +193,42 @@ mod tests {
     }
 
     #[test]
-    fn excludes_tmp_env_vars_when_requested() {
+    fn tmp_env_roots_follow_profile_exclusion() {
         let tmp = TempDir::new().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");
         let temp_dir = tmp.path().join("temp");
-        let _ = fs::create_dir_all(&command_cwd);
-        let _ = fs::create_dir_all(&temp_dir);
-
-        let permission_profile = workspace_write_profile(
-            &[],
-            /*exclude_tmpdir_env_var*/ true,
-            /*exclude_slash_tmp*/ false,
-        );
-        let mut env_map = HashMap::new();
-        env_map.insert("TEMP".into(), temp_dir.to_string_lossy().to_string());
-        env_map.insert("TMP".into(), temp_dir.to_string_lossy().to_string());
+        let tmp_dir = tmp.path().join("tmp");
+        for path in [&command_cwd, &temp_dir, &tmp_dir] {
+            fs::create_dir_all(path).expect("create root");
+        }
+        let env_map = HashMap::from([
+            ("TEMP".into(), temp_dir.to_string_lossy().to_string()),
+            ("TMP".into(), tmp_dir.to_string_lossy().to_string()),
+        ]);
         let workspace_roots = workspace_roots_for(command_cwd.as_path());
 
-        let paths = compute_allow_paths(
-            &permission_profile,
-            workspace_roots.as_slice(),
-            &command_cwd,
-            &env_map,
-        );
-
-        assert!(
-            paths
-                .allow
-                .contains(&dunce::canonicalize(&command_cwd).unwrap())
-        );
-        assert!(
-            !paths
-                .allow
-                .contains(&dunce::canonicalize(&temp_dir).unwrap())
-        );
-        assert!(paths.deny.is_empty(), "no deny paths expected");
-    }
-
-    #[test]
-    fn includes_tmp_env_vars_when_requested() {
-        let tmp = TempDir::new().expect("tempdir");
-        let command_cwd = tmp.path().join("workspace");
-        let temp_dir = tmp.path().join("temp");
-        let _ = fs::create_dir_all(&command_cwd);
-        let _ = fs::create_dir_all(&temp_dir);
-
-        let permission_profile = workspace_write_profile(
-            &[],
-            /*exclude_tmpdir_env_var*/ false,
-            /*exclude_slash_tmp*/ false,
-        );
-        let mut env_map = HashMap::new();
-        env_map.insert("TEMP".into(), temp_dir.to_string_lossy().to_string());
-        env_map.insert("TMP".into(), temp_dir.to_string_lossy().to_string());
-        let workspace_roots = workspace_roots_for(command_cwd.as_path());
-
-        let paths = compute_allow_paths(
-            &permission_profile,
-            workspace_roots.as_slice(),
-            &command_cwd,
-            &env_map,
-        );
-
-        let expected_allow: HashSet<PathBuf> = [
-            dunce::canonicalize(&command_cwd).unwrap(),
-            dunce::canonicalize(&temp_dir).unwrap(),
-        ]
-        .into_iter()
-        .collect();
-
-        assert_eq!(expected_allow, paths.allow);
-        assert!(paths.deny.is_empty(), "no deny paths expected");
+        for exclude_tmpdir_env_var in [false, true] {
+            let permission_profile = workspace_write_profile(
+                &[],
+                exclude_tmpdir_env_var,
+                /*exclude_slash_tmp*/ false,
+            );
+            let paths = compute_allow_paths(
+                &permission_profile,
+                workspace_roots.as_slice(),
+                &command_cwd,
+                &env_map,
+            );
+            let mut expected_allow = HashSet::from([canonicalize(&command_cwd).unwrap()]);
+            if !exclude_tmpdir_env_var {
+                expected_allow.extend([
+                    canonicalize(&temp_dir).unwrap(),
+                    canonicalize(&tmp_dir).unwrap(),
+                ]);
+            }
+            assert_eq!(paths.allow, expected_allow, "exclude={exclude_tmpdir_env_var}");
+            assert!(paths.deny.is_empty(), "no deny paths expected");
+        }
     }
 
     #[test]

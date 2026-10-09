@@ -16,28 +16,6 @@ use pretty_assertions::assert_eq;
 use std::path::Path;
 
 #[test]
-fn danger_full_access_is_untagged_even_when_linux_sandbox_defaults_apply() {
-    let actual = permission_profile_sandbox_tag(
-        &PermissionProfile::Disabled,
-        WindowsSandboxLevel::Disabled,
-        /*enforce_managed_network*/ false,
-    );
-    assert_eq!(actual, "none");
-}
-
-#[test]
-fn external_sandbox_keeps_external_tag_when_linux_sandbox_defaults_apply() {
-    let actual = permission_profile_sandbox_tag(
-        &PermissionProfile::External {
-            network: NetworkSandboxPolicy::Enabled,
-        },
-        WindowsSandboxLevel::Disabled,
-        /*enforce_managed_network*/ false,
-    );
-    assert_eq!(actual, "external");
-}
-
-#[test]
 fn default_linux_sandbox_uses_platform_sandbox_tag() {
     let actual = permission_profile_sandbox_tag(
         &PermissionProfile::read_only(),
@@ -52,24 +30,29 @@ fn default_linux_sandbox_uses_platform_sandbox_tag() {
 
 #[test]
 fn profile_sandbox_tag_distinguishes_disabled_from_external() {
-    assert_eq!(
-        permission_profile_sandbox_tag(
-            &PermissionProfile::Disabled,
-            WindowsSandboxLevel::Disabled,
-            /*enforce_managed_network*/ false,
-        ),
-        "none"
-    );
-    assert_eq!(
-        permission_profile_sandbox_tag(
-            &PermissionProfile::External {
-                network: NetworkSandboxPolicy::Restricted,
-            },
-            WindowsSandboxLevel::Disabled,
-            /*enforce_managed_network*/ false,
-        ),
-        "external"
-    );
+    for windows_sandbox_level in [WindowsSandboxLevel::Disabled, WindowsSandboxLevel::Elevated] {
+        assert_eq!(
+            permission_profile_sandbox_tag(
+                &PermissionProfile::Disabled,
+                windows_sandbox_level,
+                /*enforce_managed_network*/ false,
+            ),
+            "none"
+        );
+        for network in [
+            NetworkSandboxPolicy::Restricted,
+            NetworkSandboxPolicy::Enabled,
+        ] {
+            assert_eq!(
+                permission_profile_sandbox_tag(
+                    &PermissionProfile::External { network },
+                    windows_sandbox_level,
+                    /*enforce_managed_network*/ false,
+                ),
+                "external"
+            );
+        }
+    }
 }
 
 #[test]
@@ -131,6 +114,10 @@ fn managed_network_enforcement_tags_unrestricted_profiles_as_sandboxed() {
             /*enforce_managed_network*/ true,
         ),
         expected
+    );
+    assert_eq!(
+        permission_profile_sandbox_tag(&profile, WindowsSandboxLevel::Elevated, true),
+        "windows_elevated"
     );
 }
 

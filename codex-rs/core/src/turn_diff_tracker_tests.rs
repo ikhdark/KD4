@@ -14,7 +14,33 @@ use std::time::Instant;
 use tempfile::tempdir;
 
 fn git_blob_sha1_hex(data: &str) -> String {
-    format!("{:x}", git_blob_sha1_hex_bytes(data.as_bytes()))
+    // Independently computed with Python hashlib.sha1 over Git's blob framing:
+    // b"blob " + str(len(data.encode())).encode() + b"\0" + data.encode().
+    // Do not use the production hashing helper to derive its own expected output.
+    match data {
+        "foo\nbar\n" => "3bd1f0e29744a1f32b08d5650e62e2e62afb177c",
+        "content\n" => "d95f3ad14dee633a758d2e331151e950dd13e4ed",
+        "x\n" => "587be6b4c3f93f93c489c0111bba5596147a26cb",
+        "line\n" => "a999a0c211215fd28e77d6a7c66ade6ec76ccbcb",
+        "line2\n" => "8a6a2d098ecaf90105f1cf2fa90fc4608bb08067",
+        "before\n" => "90be1f3056c4f471f977a28497b8d4b392c55a02",
+        "after\n" => "294186e497a23bf3fbfde12aacc7f720f668fe9a",
+        "same\n" => "1275430f1765c63e539cb0452565563bd6aef6a6",
+        "from\n" => "3940df7cd8791c48c101a7543b3a9fd7ef930e78",
+        "existing\n" => "cbaf024e5e7fa87bdd8ad76b1393d9973585bc97",
+        "new\n" => "3e757656cf36eca53338e520d134963a44f793f8",
+        "baseline\n" => "180b47c18ba7e484fc0d7350bc6cad8ec3423ea0",
+        "revision 0\n" => "1218ba76483e58f3de96b905927706f27cdbc797",
+        "revision 1\n" => "1be5cd3b21f3d4292cce238b68aeb236af358b12",
+        "revision 2\n" => "b96803c38675622e42dd918aadfd8ed34b594db6",
+        "revision 3\n" => "d99e75ab7d419e0c6170c631b22109df4247793b",
+        "revision 4\n" => "61ff198b8142d5b2cba423d15c22be6142bd0ff1",
+        "revision 5\n" => "bd3ae8a69d51173515ab75f02334cbad02fc9009",
+        "revision 6\n" => "5133ebdeba84f67c951fdc4093d7a56b9d4b8883",
+        "revision 7\n" => "b99a891640abeab3c8f45b00116884f117ed2656",
+        _ => panic!("missing independently computed blob fixture: {data:?}"),
+    }
+    .to_string()
 }
 
 async fn apply_verified_patch(root: &Path, patch: &str) -> AppliedPatchDelta {
@@ -290,22 +316,7 @@ fn repository_validation_recipes_remain_observed_instead_of_assumed_read_only() 
     }
 }
 
-#[test]
-fn failed_or_timed_out_mutators_still_create_unknown_mutation_state() {
-    for timed_out in [false, true] {
-        let mut tracker = TurnDiffTracker::new();
-        tracker.record_exec_command_end(
-            &[
-                "pwsh".to_string(),
-                "-Command".to_string(),
-                "Set-Content -LiteralPath a.txt -Value changed; exit 1".to_string(),
-            ],
-            1,
-            timed_out,
-        );
-        assert_eq!(tracker.current_mutation_revision(), 1);
-    }
-}
+
 
 #[test]
 fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
@@ -500,50 +511,27 @@ fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
     ]));
 }
 
-#[test]
-fn arbitrary_script_runners_fail_closed_as_possible_mutations() {
-    for command in [
-        vec!["python".into(), "edit.py".into()],
-        vec!["node".into(), "rewrite.js".into()],
-        vec!["custom-codegen.exe".into()],
-    ] {
-        assert!(
-            command_may_mutate(&command),
-            "unknown executable must fail closed: {command:?}"
-        );
-    }
 
-    // Test runners execute user code and may write workspace files.
-    assert!(command_may_mutate(&[
-        "python".into(),
-        "-m".into(),
-        "pytest".into(),
-    ]));
-    assert!(command_may_mutate(&["cargo".into(), "check".into()]));
-}
 
 #[test]
 fn mutation_classification_separates_known_mutators_from_uncertain_commands() {
     assert!(matches!(
-        command_mutation(
-            &[
-                "powershell.exe".into(),
-                "-Command".into(),
-                "Set-Content out.txt changed".into()
-            ],
-            None,
-        ),
+        command_mutation(&["powershell.exe".into(), "-Command".into(), "Set-Content out.txt changed".into()], None),
         CommandMutation::KnownMutation { .. }
     ));
-    assert_eq!(
-        command_mutation(&["python".into(), "edit.py".into()], None),
-        CommandMutation::Uncertain
-    );
+    for command in [
+        vec!["python", "edit.py"],
+        vec!["node", "rewrite.js"],
+        vec!["custom-codegen.exe"],
+        vec!["python", "-m", "pytest"],
+        vec!["cargo", "check"],
+    ] {
+        let command = command.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(command_mutation(&command, None), CommandMutation::Uncertain, "{command:?}");
+        assert!(command_may_mutate(&command), "{command:?}");
+    }
     assert_eq!(CommandMutation::from(true), CommandMutation::Uncertain);
-    assert_eq!(
-        command_mutation(&["custom-codegen.exe".into()], None),
-        CommandMutation::Uncertain
-    );
+    assert_eq!(CommandMutation::from(false), CommandMutation::ReadOnly);
 }
 
 #[test]
@@ -584,19 +572,67 @@ fn unchanged_uncertain_command_does_not_advance_mutation_revision() {
 }
 
 #[test]
+fn git_output_options_do_not_certify_read_only_commands() {
+    // Git's real --output behavior independently establishes the write; a
+    // subcommand label is insufficient even though ordinary diff only reads.
+    let directory = tempdir().expect("tempdir");
+    fs::write(directory.path().join("before"), "before\n").unwrap();
+    fs::write(directory.path().join("after"), "after\n").unwrap();
+    let output = Command::new("git")
+        .args(["diff", "--no-index", "--output=changes.patch", "before", "after"])
+        .current_dir(directory.path()).output().expect("run real git diff");
+    assert_eq!(output.status.code(), Some(1)); // Different inputs, not a failed write.
+    assert!(fs::read_to_string(directory.path().join("changes.patch")).unwrap().contains("+after"));
+    assert!(Command::new("git").args(["init", "--quiet"]).current_dir(directory.path()).status().unwrap().success());
+    assert!(Command::new("git").args(["add", "before"]).current_dir(directory.path()).status().unwrap().success());
+    let pager = "--open-files-in-pager=echo mutated > pager-marker";
+    let grep = Command::new("git").args(["grep", pager, "before"])
+        .current_dir(directory.path()).output().unwrap();
+    assert!(grep.status.success());
+    assert!(directory.path().join("pager-marker").is_file());
+    for argv in [
+        vec!["git", "grep", pager, "before"],
+        vec!["git", "grep", "-Opager", "before"],
+        vec!["git", "ls-remote", "--upload-pack=helper", "."],
+        vec!["git", "cat-file", "--filters", "HEAD:file"],
+        vec!["git", "-c", "core.fsmonitor=helper", "status"],
+    ] {
+        let command = argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_ne!(command_mutation(&command, None), CommandMutation::ReadOnly, "{command:?}");
+        assert!(!command_is_read_only_git(&command), "{command:?}");
+    }
+    for subcommand in ["diff", "log", "show"] {
+        for flags in [vec!["--output=changes.patch"], vec!["--output", "changes.patch"], vec!["--ext-diff"], vec!["--textconv"]] {
+            let mut command = vec!["git".to_string(), subcommand.to_string()];
+            command.extend(flags.into_iter().map(str::to_owned));
+            assert_ne!(command_mutation(&command, None), CommandMutation::ReadOnly, "{command:?}");
+            assert!(!command_is_read_only_git(&command), "{command:?}");
+            let wrapped = ["bash".to_string(), "-c".to_string(), command.join(" ")];
+            assert_ne!(command_mutation(&wrapped, None), CommandMutation::ReadOnly, "{wrapped:?}");
+        }
+        let safe = ["git".to_string(), subcommand.to_string()];
+        assert_eq!(command_mutation(&safe, None), CommandMutation::ReadOnly);
+        assert!(command_is_read_only_git(&safe));
+    }
+}
+
+#[test]
 fn failed_and_timed_out_known_mutators_still_invalidate_immediately() {
-    for (exit_code, timed_out) in [(1, false), (124, true)] {
+    for (script, exit_code, timed_out) in [
+        ("Set-Content out.txt changed", 1, false),
+        ("Set-Content out.txt changed", 124, true),
+        ("Set-Content -LiteralPath a.txt -Value changed; exit 1", 1, false),
+        ("Set-Content -LiteralPath a.txt -Value changed; exit 1", 1, true),
+    ] {
         let mut tracker = TurnDiffTracker::new();
-        let command = [
-            "powershell.exe".into(),
-            "-Command".into(),
-            "Set-Content out.txt changed".into(),
-        ];
+        let command = ["powershell.exe".into(), "-Command".into(), script.into()];
         let mutation = command_mutation(&command, None);
         tracker.record_exec_command_end_with_mutation_at(
             &command, exit_code, timed_out, "local", None, mutation,
         );
-        assert_eq!(tracker.current_mutation_revision(), 1);
+        assert_eq!(tracker.current_mutation_revision(), 1, "{script}");
+        assert_eq!(tracker.exact_changed_paths(), None, "{script}");
+        assert_eq!(tracker.model_snapshot()["status"], "unavailable");
     }
 }
 
@@ -674,6 +710,8 @@ fn mutation_boundary_mutating_validation_flags_and_package_scripts_fail_closed()
 
 #[test]
 fn mutation_boundary_git_global_options_preserve_read_write_semantics() {
+    // A different read-only repository is not evidence for the caller's cwd.
+    assert!(!command_is_read_only_git(&["git".into(), "-C".into(), ".".into(), "log".into()]));
     for command in [
         vec!["git".into(), "-C".into(), ".".into(), "log".into()],
         vec![
@@ -690,6 +728,13 @@ fn mutation_boundary_git_global_options_preserve_read_write_semantics() {
             "history read must remain non-mutating: {command:?}"
         );
         assert!(command_reads_repository_history(&command));
+    }
+    for command in [
+        vec!["git", "-c", "core.pager=cat", "diff", "--output=changed.patch"],
+        vec!["git", "-C", ".", "diff", "--output=changed.patch"],
+        vec!["git", "-c", "core.pager=touch changed", "log"],
+    ] {
+        assert!(command_may_mutate(&command.into_iter().map(str::to_owned).collect::<Vec<_>>()));
     }
     assert!(command_may_mutate(&[
         "git".into(),
@@ -1118,55 +1163,30 @@ index {left_oid_b}..{right_oid_b}
 }
 
 #[tokio::test]
-async fn reuses_rendered_diffs_for_unchanged_paths() {
-    let dir = tempdir().expect("tempdir");
-    let mut tracker = tracker_with_root(dir.path());
-
-    let add_a = apply_verified_patch(
-        dir.path(),
-        "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
-    )
-    .await;
-    tracker.track_delta("", &add_a);
-    assert_eq!(tracker.rendered_diff_count(), 1);
-
-    let add_b = apply_verified_patch(
-        dir.path(),
-        "*** Begin Patch\n*** Add File: b.txt\n+two\n*** End Patch",
-    )
-    .await;
-    tracker.track_delta("", &add_b);
-
-    assert_eq!(tracker.rendered_diff_count(), 2);
-    assert_eq!(
-        tracker.get_unified_diff(),
-        tracker.get_unified_diff(),
-        "reading the cached aggregate must not render file diffs",
-    );
-    assert_eq!(tracker.rendered_diff_count(), 2);
-}
-
-#[tokio::test]
 async fn repeated_updates_only_rerender_the_touched_path() {
     let dir = tempdir().expect("tempdir");
     let mut tracker = tracker_with_root(dir.path());
-
-    for patch in [
-        "*** Begin Patch\n*** Add File: stable.txt\n+stable\n*** End Patch".to_string(),
-        "*** Begin Patch\n*** Add File: hot.txt\n+value 0\n*** End Patch".to_string(),
-    ] {
-        tracker.track_delta("", &apply_verified_patch(dir.path(), &patch).await);
+    for (index, patch) in [
+        "*** Begin Patch\n*** Add File: stable.txt\n+stable\n*** End Patch",
+        "*** Begin Patch\n*** Add File: hot.txt\n+value 0\n*** End Patch",
+    ].into_iter().enumerate() {
+        tracker.track_delta("", &apply_verified_patch(dir.path(), patch).await);
+        assert_eq!(tracker.rendered_diff_count(), index + 1);
     }
-
-    for value in 1..=40 {
+    for value in 1..=3 {
         let patch = format!(
             "*** Begin Patch\n*** Update File: hot.txt\n@@\n-value {}\n+value {value}\n*** End Patch",
             value - 1,
         );
         tracker.track_delta("", &apply_verified_patch(dir.path(), &patch).await);
+        assert_eq!(tracker.rendered_diff_count(), value + 2);
+        let diff = tracker.get_unified_diff().expect("net diff");
+        assert!(diff.contains("+stable\n"));
+        assert!(diff.contains(&format!("+value {value}\n")));
+        assert!(!diff.contains(&format!("+value {}\n", value - 1)));
+        assert_eq!(tracker.get_unified_diff(), Some(diff));
+        assert_eq!(tracker.rendered_diff_count(), value + 2, "reads must reuse both cached paths");
     }
-
-    assert_eq!(tracker.rendered_diff_count(), 42);
 }
 
 #[tokio::test]

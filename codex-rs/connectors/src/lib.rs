@@ -835,14 +835,14 @@ mod tests {
         for id in ["account-a", "account-b"] {
             write_cached_directory_connectors_in_memory(
                 cache_key(id, false),
-                &[],
+                &[directory_app_to_app_info(app(id, id))],
                 CONNECTORS_CACHE_TTL,
             );
         }
         for id in ["account-a", "account-b"] {
             assert_eq!(
                 unexpired_directory_connectors_in_memory(&cache_key(id, false)),
-                Some(Vec::new())
+                Some(vec![directory_app_to_app_info(app(id, id))])
             );
         }
         for id in 0..MAX_DIRECTORY_CACHE_SCOPES * 2 {
@@ -1211,7 +1211,7 @@ mod tests {
         .await?;
 
         let second = list_all_connectors_with_options(
-            cache_context,
+            cache_context.clone(),
             /*force_refetch*/ false,
             move |_path| async move {
                 anyhow::bail!("cache should have been used");
@@ -1221,6 +1221,8 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(first, second);
+        clear_directory_memory_cache();
+        assert_eq!(cached_directory_connectors(&cache_context), Some(first));
         Ok(())
     }
 
@@ -1482,44 +1484,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["global", "workspace"]
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
-    async fn cached_directory_connectors_reads_directory_disk_cache() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
-
-        let codex_home = TempDir::new()?;
-        let cache_context = cache_context(&codex_home, "disk", false);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let call_counter = Arc::clone(&calls);
-
-        let first = list_all_connectors_with_options(
-            cache_context.clone(),
-            /*force_refetch*/ false,
-            move |_path| {
-                let call_counter = Arc::clone(&call_counter);
-                async move {
-                    call_counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(DirectoryListResponse {
-                        apps: vec![app("alpha", "Alpha")],
-                        next_token: None,
-                    })
-                }
-            },
-        )
-        .await?;
-
-        clear_directory_memory_cache();
-
-        let second = cached_directory_connectors(&cache_context).expect("disk cache should load");
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(first, second);
         Ok(())
     }
 

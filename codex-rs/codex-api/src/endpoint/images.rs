@@ -273,6 +273,7 @@ mod tests {
         assert_eq!(response, expected_response());
 
         let request = captured_request(&transport);
+        assert_eq!(request.method, Method::POST);
         assert_eq!(
             request.url,
             "https://example.com/api/codex/images/generations"
@@ -318,6 +319,7 @@ mod tests {
         assert_eq!(response, expected_response());
 
         let request = captured_request(&transport);
+        assert_eq!(request.method, Method::POST);
         assert_eq!(request.url, "https://example.com/api/codex/images/edits");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
@@ -336,6 +338,7 @@ mod tests {
     async fn image_edit_encodes_large_input_directly_before_authentication() {
         struct InspectingAuth {
             expected: Vec<u8>,
+            calls: AtomicUsize,
         }
 
         impl AuthProvider for InspectingAuth {
@@ -343,6 +346,7 @@ mod tests {
 
             fn apply_auth(&self, request: Request) -> crate::auth::AuthProviderFuture<'_> {
                 Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
                     let body = request.prepare_body_for_send().unwrap();
                     assert_eq!(body.body_bytes().as_ref(), self.expected.as_slice());
                     assert_eq!(body.headers[http::header::CONTENT_TYPE], "application/json");
@@ -364,17 +368,20 @@ mod tests {
         };
         let expected = serde_json::to_vec(&request).unwrap();
         let transport = CapturingTransport::new(response_body());
+        let auth = Arc::new(InspectingAuth {
+            expected: expected.clone(),
+            calls: AtomicUsize::new(0),
+        });
         let client = ImagesClient::new(
             transport.clone(),
             provider(),
-            Arc::new(InspectingAuth {
-                expected: expected.clone(),
-            }),
+            auth.clone(),
         );
         assert_eq!(
             client.edit(&request, HeaderMap::new()).await.unwrap(),
             expected_response()
         );
+        assert_eq!(auth.calls.load(Ordering::SeqCst), 1);
         let captured = captured_request(&transport);
         let actual = captured.prepare_body_for_send().unwrap().body_bytes();
         assert_eq!(actual.as_ref(), expected.as_slice());

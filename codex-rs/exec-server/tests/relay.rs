@@ -120,6 +120,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
     let environment_websocket = accept_websocket(&listener, "environment").await?;
     let executor_public_key = registered_executor_public_key(&registry).await?;
     let harness_identity = NoiseChannelIdentity::generate()?;
+    let expected_harness_key = harness_identity.public_key();
     let client_args = NoiseRendezvousConnectArgs {
         bundle: NoiseRendezvousConnectBundle {
             websocket_url: format!("{rendezvous_url}/relay?role=harness"),
@@ -147,6 +148,20 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
         .await
         .context("Noise harness client should connect")???;
 
+    let requests = registry.received_requests().await.context("registry requests")?;
+    let validations = requests.iter()
+        .filter(|request| request.url.path().ends_with("/validate"))
+        .collect::<Vec<_>>();
+    assert_eq!(validations.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&validations[0].body)?,
+        serde_json::json!({
+            "executor_registration_id": EXECUTOR_REGISTRATION_ID,
+            "harness_public_key": expected_harness_key,
+            "harness_key_authorization": HARNESS_KEY_AUTHORIZATION,
+        })
+    );
+
     let response = client
         .exec(ExecParams {
             process_id: ProcessId::from("proc-1"),
@@ -168,6 +183,24 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
             process_id: ProcessId::from("proc-1"),
         }
     );
+    let completed = timeout(TEST_TIMEOUT, async {
+        let mut after_seq = None;
+        loop {
+            let read = client.read(codex_exec_server::ReadParams {
+                process_id: response.process_id.clone(),
+                after_seq,
+                max_bytes: None,
+                wait_ms: Some(1_000),
+            }).await?;
+            if read.closed {
+                break Ok::<_, codex_exec_server::ExecServerError>(read);
+            }
+            after_seq = read.next_seq.checked_sub(1);
+        }
+    }).await??;
+    assert!(completed.exited);
+    assert_eq!(completed.exit_code, Some(0));
+    assert_eq!(completed.failure, None);
 
     let temp_dir = TempDir::new()?;
     let large_file_path = temp_dir.path().join("large-response.bin");

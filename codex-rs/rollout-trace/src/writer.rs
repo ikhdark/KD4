@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_payload_write_warns_and_returns_none() -> anyhow::Result<()> {
+    fn best_effort_payload_write_returns_none_on_storage_failure() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let writer = TraceWriter::create(
             temp.path(),

@@ -70,8 +70,9 @@ mod tests {
             window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
         };
 
+        let value = serde_json::to_value(&item)?;
         assert_eq!(
-            serde_json::to_value(item)?,
+            value,
             json!({
                 "message": "summary",
                 "window_number": 3,
@@ -80,27 +81,38 @@ mod tests {
                 "window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
             })
         );
+        assert_eq!(serde_json::from_value::<CompactedItem>(value)?, item);
         Ok(())
     }
 
     #[test]
     fn migrates_legacy_numeric_window_id() -> Result<()> {
-        let item = serde_json::from_value::<CompactedItem>(json!({
-            "message": "summary",
-            "window_id": 3,
-        }))?;
-
-        assert_eq!(
-            item,
-            CompactedItem {
-                message: "summary".to_string(),
-                replacement_history: None,
-                window_number: Some(3),
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
+        for (window_number, expected_number) in [(None, 3), (Some(7), 7)] {
+            let mut value = json!({
+                "message": "summary",
+                "window_id": 3,
+            });
+            if let Some(window_number) = window_number {
+                value["window_number"] = json!(window_number);
             }
-        );
+            let item = serde_json::from_value::<CompactedItem>(value)?;
+
+            assert_eq!(
+                item,
+                CompactedItem {
+                    message: "summary".to_string(),
+                    replacement_history: None,
+                    window_number: Some(expected_number),
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(item)?,
+                json!({"message": "summary", "window_number": expected_number})
+            );
+        }
         Ok(())
     }
 }

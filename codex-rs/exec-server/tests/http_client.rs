@@ -44,7 +44,7 @@ const INITIALIZE_METHOD: &str = "initialize";
 const INITIALIZED_METHOD: &str = "initialized";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_BODY_DELTA_CHANNEL_CAPACITY: u64 = 256;
-const OVERFLOWING_BODY_DELTA_FRAMES: u64 = 1_024;
+const OVERFLOWING_BODY_DELTA_FRAMES: u64 = HTTP_BODY_DELTA_CHANNEL_CAPACITY + 1;
 
 /// What this tests: the buffered HTTP helper always sends a buffered
 /// `http/request`, even when a caller accidentally provides streaming flags.
@@ -846,7 +846,8 @@ async fn http_response_body_stream_reports_disconnect_when_queue_is_full() -> Re
             .await
             .context("disconnect should wake the full queued body stream")?
         {
-            Ok(Some(_chunk)) => {
+            Ok(Some(chunk)) => {
+                assert_eq!(chunk, b"x");
                 chunks += 1;
             }
             Ok(None) => bail!("disconnect with a full queue should not look like clean EOF"),
@@ -955,7 +956,8 @@ async fn http_response_body_stream_reports_backpressure_truncation() -> Result<(
             .await
             .context("backpressure should close http body stream")?
         {
-            Ok(Some(_chunk)) => {
+            Ok(Some(chunk)) => {
+                assert_eq!(chunk, b"x");
                 chunks += 1;
             }
             Ok(None) => bail!("backpressure truncation should not look like clean EOF"),
@@ -964,11 +966,11 @@ async fn http_response_body_stream_reports_backpressure_truncation() -> Result<(
     };
     assert_eq!(
         (
-            chunks < OVERFLOWING_BODY_DELTA_FRAMES as usize,
+            chunks,
             error.to_string(),
         ),
         (
-            true,
+            HTTP_BODY_DELTA_CHANNEL_CAPACITY as usize,
             "exec-server protocol error: http response stream `http-1` failed: body delta channel filled before delivery".to_string(),
         )
     );

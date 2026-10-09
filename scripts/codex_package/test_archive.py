@@ -56,6 +56,7 @@ class ResolveZstdCommandTest(unittest.TestCase):
             package_dir.mkdir()
             output = root / "package.tar.zst"
             entries = [package_dir / "codex-package.json"]
+            entries[0].write_bytes(b"{}")
 
             process = mock.Mock()
             process.stdin = io.BytesIO()
@@ -68,7 +69,10 @@ class ResolveZstdCommandTest(unittest.TestCase):
                 mock.patch.object(
                     archive.subprocess, "Popen", return_value=process
                 ) as popen,
-                mock.patch.object(archive, "write_tar_stream") as write_tar_stream,
+                mock.patch.object(
+                    archive, "write_tar_stream", wraps=archive.write_tar_stream
+                ) as write_tar_stream,
+                mock.patch.object(process.stdin, "close") as close_stdin,
             ):
                 archive.write_tar_zst_archive(
                     package_dir,
@@ -76,6 +80,14 @@ class ResolveZstdCommandTest(unittest.TestCase):
                     entries=entries,
                     compression="fast",
                 )
+                close_stdin.assert_called_once_with()
+                process.stdin.seek(0)
+                with tarfile.open(fileobj=process.stdin, mode="r:") as streamed:
+                    self.assertEqual(streamed.getnames(), ["codex-package.json"])
+                    self.assertEqual(
+                        streamed.extractfile("codex-package.json").read(), b"{}"
+                    )
+            process.stdin.close()
 
             cmd = popen.call_args.args[0]
             self.assertEqual(cmd, ["zstd", "-T0", "-1", "-f", "-", "-o", str(output)])
@@ -85,6 +97,7 @@ class ResolveZstdCommandTest(unittest.TestCase):
                 entries=entries,
             )
             process.kill.assert_not_called()
+            process.wait.assert_called_once_with()
 
     def test_tar_zst_none_is_rejected_before_compressor_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -235,6 +248,12 @@ class ArchiveMemberNameTest(unittest.TestCase):
 
             self.assertEqual(first_tgz.read_bytes(), second_tgz.read_bytes())
             self.assertEqual(first_zip.read_bytes(), second_zip.read_bytes())
+            with tarfile.open(first_tgz, "r:gz") as archived:
+                self.assertEqual(archived.getnames(), ["payload.bin"])
+                self.assertEqual(archived.extractfile("payload.bin").read(), b"stable")
+            with zipfile.ZipFile(first_zip) as archived:
+                self.assertEqual(archived.namelist(), ["payload.bin"])
+                self.assertEqual(archived.read("payload.bin"), b"stable")
 
     def test_fast_zip_streams_with_level_one(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -263,22 +282,36 @@ class ArchiveMemberNameTest(unittest.TestCase):
             package_dir = Path(temp_dir) / "package"
             (package_dir / "bin").mkdir(parents=True)
             (package_dir / "bin" / "codex.exe").write_bytes(b"codex")
+            (package_dir / "bin" / "z.exe").write_bytes(b"last")
+            (package_dir / "bin" / "a.exe").write_bytes(b"first")
             (package_dir / "codex-resources").mkdir()
             (package_dir / "codex-path").mkdir()
             (package_dir / "codex-package.json").write_text("{}", encoding="utf-8")
+            (package_dir / "LICENSE").write_bytes(b"license")
+            (package_dir / "NOTICE").write_bytes(b"notice")
             unmanaged = package_dir / "custom-cache" / "secret"
             unmanaged.parent.mkdir()
             unmanaged.write_bytes(b"do not archive")
 
-            members = {
+            members = [
                 path.relative_to(package_dir).as_posix()
                 for path in archive.package_entries(package_dir)
-            }
+            ]
 
-            self.assertIn("bin/codex.exe", members)
-            self.assertIn("codex-package.json", members)
-            self.assertNotIn("custom-cache", members)
-            self.assertNotIn("custom-cache/secret", members)
+            self.assertEqual(
+                members,
+                [
+                    "LICENSE",
+                    "NOTICE",
+                    "bin",
+                    "bin/a.exe",
+                    "bin/codex.exe",
+                    "bin/z.exe",
+                    "codex-package.json",
+                    "codex-path",
+                    "codex-resources",
+                ],
+            )
 
     def test_zip_archive_uses_posix_member_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

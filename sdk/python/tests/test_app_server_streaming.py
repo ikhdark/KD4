@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app_server_harness import AppServerHarness
+from app_server_harness import AppServerHarness, CapturedResponsesRequest
 from app_server_helpers import (
     agent_message_texts,
     agent_message_texts_from_items,
@@ -171,13 +171,20 @@ def test_low_level_async_stream_text_allows_parallel_model_list(tmp_path) -> Non
 
 def test_interleaved_sync_turn_streams_route_by_turn_id(tmp_path) -> None:
     """Two sync streams on one client should consume only their own notifications."""
+
+    def response_for_request(request: CapturedResponsesRequest) -> str:
+        # Associate output with input, not nondeterministic HTTP arrival order.
+        prompt = request.message_input_texts("user")[-1]
+        prefix = {"first": "one-", "second": "two-"}[prompt]
+        return streaming_response(f"{prompt}-stream", f"msg-{prompt}", [prefix, "done"])
+
     with AppServerHarness(tmp_path) as harness:
         harness.responses.enqueue_sse(
-            streaming_response("first-stream", "msg-first", ["one-", "done"]),
+            response_for_request,
             delay_between_events_s=0.01,
         )
         harness.responses.enqueue_sse(
-            streaming_response("second-stream", "msg-second", ["two-", "done"]),
+            response_for_request,
             delay_between_events_s=0.01,
         )
 
@@ -196,21 +203,26 @@ def test_interleaved_sync_turn_streams_route_by_turn_id(tmp_path) -> None:
             first_tail = list(first_stream)
             second_tail = list(second_stream)
 
+    for turn, tail in ((first_turn, first_tail), (second_turn, second_tail)):
+        assert [
+            event.payload.turn.id
+            for event in tail
+            if isinstance(event.payload, TurnCompletedNotification)
+        ] == [turn.id]
+
     assert {
-        "streams": sorted(
-            [
-                (
-                    first_first_delta,
-                    first_second_delta,
-                    agent_message_texts(first_tail),
-                ),
-                (
-                    second_first_delta,
-                    second_second_delta,
-                    agent_message_texts(second_tail),
-                ),
-            ]
-        ),
+        "streams": [
+            (
+                first_first_delta,
+                first_second_delta,
+                agent_message_texts(first_tail),
+            ),
+            (
+                second_first_delta,
+                second_second_delta,
+                agent_message_texts(second_tail),
+            ),
+        ],
     } == {
         "streams": [
             ("one-", "done", ["one-done"]),
@@ -222,15 +234,20 @@ def test_interleaved_sync_turn_streams_route_by_turn_id(tmp_path) -> None:
 def test_interleaved_async_turn_streams_route_by_turn_id(tmp_path) -> None:
     """Two async streams on one client should consume only their own notifications."""
 
+    def response_for_request(request: CapturedResponsesRequest) -> str:
+        prompt = request.message_input_texts("user")[-1]
+        prefix = {"async first": "a1", "async second": "a2"}[prompt]
+        return streaming_response(f"{prefix}-stream", f"msg-{prefix}", [prefix, "-done"])
+
     async def scenario() -> None:
         """Interleave async stream consumers against one app-server process."""
         with AppServerHarness(tmp_path) as harness:
             harness.responses.enqueue_sse(
-                streaming_response("async-first", "msg-async-first", ["a1", "-done"]),
+                response_for_request,
                 delay_between_events_s=0.01,
             )
             harness.responses.enqueue_sse(
-                streaming_response("async-second", "msg-async-second", ["a2", "-done"]),
+                response_for_request,
                 delay_between_events_s=0.01,
             )
 
@@ -249,21 +266,26 @@ def test_interleaved_async_turn_streams_route_by_turn_id(tmp_path) -> None:
                 first_tail = [event async for event in first_stream]
                 second_tail = [event async for event in second_stream]
 
+        for turn, tail in ((first_turn, first_tail), (second_turn, second_tail)):
+            assert [
+                event.payload.turn.id
+                for event in tail
+                if isinstance(event.payload, TurnCompletedNotification)
+            ] == [turn.id]
+
         assert {
-            "streams": sorted(
-                [
-                    (
-                        first_first_delta,
-                        first_second_delta,
-                        agent_message_texts(first_tail),
-                    ),
-                    (
-                        second_first_delta,
-                        second_second_delta,
-                        agent_message_texts(second_tail),
-                    ),
-                ]
-            ),
+            "streams": [
+                (
+                    first_first_delta,
+                    first_second_delta,
+                    agent_message_texts(first_tail),
+                ),
+                (
+                    second_first_delta,
+                    second_second_delta,
+                    agent_message_texts(second_tail),
+                ),
+            ],
         } == {
             "streams": [
                 ("a1", "-done", ["a1-done"]),

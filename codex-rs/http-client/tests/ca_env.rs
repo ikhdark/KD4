@@ -56,7 +56,6 @@ const PROXY_ENV_VARS: &[&str] = &[
 ];
 
 const TEST_CERT_1: &str = include_str!("fixtures/test-ca.pem");
-const TEST_CERT_2: &str = include_str!("fixtures/test-intermediate.pem");
 const TRUSTED_TEST_CERT: &str = include_str!("fixtures/test-ca-trusted.pem");
 
 struct Tls13Material {
@@ -428,25 +427,7 @@ fn assert_token_exchange_request(request: &str) {
     );
 }
 
-#[test]
-fn uses_codex_ca_cert_env() {
-    let temp_dir = TempDir::new().expect("tempdir");
-    let cert_path = write_cert_file(&temp_dir, "ca.pem", TEST_CERT_1);
 
-    let output = run_probe(&[(CODEX_CA_CERT_ENV, cert_path.as_path())]);
-
-    assert!(output.status.success());
-}
-
-#[test]
-fn falls_back_to_ssl_cert_file() {
-    let temp_dir = TempDir::new().expect("tempdir");
-    let cert_path = write_cert_file(&temp_dir, "ssl.pem", TEST_CERT_1);
-
-    let output = run_probe(&[(SSL_CERT_FILE_ENV, cert_path.as_path())]);
-
-    assert!(output.status.success());
-}
 
 #[test]
 fn prefers_codex_ca_cert_over_ssl_cert_file() {
@@ -465,34 +446,53 @@ fn prefers_codex_ca_cert_over_ssl_cert_file() {
 #[test]
 fn handles_multi_certificate_bundle() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let bundle = format!("{TEST_CERT_1}\n{TEST_CERT_2}");
-    let cert_path = write_cert_file(&temp_dir, "bundle.pem", &bundle);
-
-    let output = run_probe(&[(CODEX_CA_CERT_ENV, cert_path.as_path())]);
-
-    assert!(output.status.success());
+    for trusted_root_first in [true, false] {
+        let server = spawn_tls13_test_server();
+        let bundle = if trusted_root_first {
+            format!("{}\n{TEST_CERT_1}", server.ca_cert_pem)
+        } else {
+            format!("{TEST_CERT_1}\n{}", server.ca_cert_pem)
+        };
+        let cert_path = write_cert_file(&temp_dir, "bundle.pem", &bundle);
+        let output = run_probe_posting_to_tls13_server(
+            &[(CODEX_CA_CERT_ENV, cert_path.as_path())],
+            &server.url,
+        );
+        let server_result = server.request_rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            output.status.success(),
+            "bundle probe failed: {}\nserver: {server_result:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let request = server_result
+            .expect("TLS test server should report a request")
+            .expect("the trusted root should work in either bundle position");
+        assert_token_exchange_request(&request);
+    }
 }
 
 #[test]
 fn posts_to_tls13_server_using_custom_ca_bundle() {
-    let temp_dir = TempDir::new().expect("tempdir");
-    let server = spawn_tls13_test_server();
-    let cert_path = write_cert_file(&temp_dir, "tls-ca.pem", &server.ca_cert_pem);
+    for ca_env in [CODEX_CA_CERT_ENV, SSL_CERT_FILE_ENV] {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let server = spawn_tls13_test_server();
+        let cert_path = write_cert_file(&temp_dir, "tls-ca.pem", &server.ca_cert_pem);
 
-    let output =
-        run_probe_posting_to_tls13_server(&[(CODEX_CA_CERT_ENV, cert_path.as_path())], &server.url);
-    let server_result = server.request_rx.recv_timeout(Duration::from_secs(5));
+        let output =
+            run_probe_posting_to_tls13_server(&[(ca_env, cert_path.as_path())], &server.url);
+        let server_result = server.request_rx.recv_timeout(Duration::from_secs(5));
 
-    assert!(
-        output.status.success(),
-        "custom_ca_probe failed\nstdout:\n{}\nstderr:\n{}\nserver:\n{server_result:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let request = server_result
-        .expect("TLS test server should report a request")
-        .expect("TLS test server should accept the probe request");
-    assert_token_exchange_request(&request);
+        assert!(
+            output.status.success(),
+            "custom_ca_probe failed for {ca_env}\nstdout:\n{}\nstderr:\n{}\nserver:\n{server_result:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let request = server_result
+            .expect("TLS test server should report a request")
+            .expect("TLS test server should accept the probe request");
+        assert_token_exchange_request(&request);
+    }
 }
 
 #[test]

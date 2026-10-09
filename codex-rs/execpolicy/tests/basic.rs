@@ -709,46 +709,6 @@ prefix_rule(
 }
 
 #[test]
-fn strictest_decision_wins_across_matches() -> Result<()> {
-    let policy_src = r#"
-prefix_rule(
-    pattern = ["git"],
-    decision = "prompt",
-)
-prefix_rule(
-    pattern = ["git", "commit"],
-    decision = "forbidden",
-)
-    "#;
-    let mut parser = PolicyParser::new();
-    parser.parse("test.rules", policy_src)?;
-    let policy = parser.build();
-
-    let commit = policy.check(&tokens(&["git", "commit", "-m", "hi"]), &allow_all);
-    assert_eq!(
-        Evaluation {
-            decision: Decision::Forbidden,
-            matched_rules: vec![
-                RuleMatch::PrefixRuleMatch {
-                    matched_prefix: tokens(&["git"]),
-                    decision: Decision::Prompt,
-                    resolved_program: None,
-                    justification: None,
-                },
-                RuleMatch::PrefixRuleMatch {
-                    matched_prefix: tokens(&["git", "commit"]),
-                    decision: Decision::Forbidden,
-                    resolved_program: None,
-                    justification: None,
-                },
-            ],
-        },
-        commit
-    );
-    Ok(())
-}
-
-#[test]
 fn strictest_decision_across_multiple_commands() -> Result<()> {
     let policy_src = r#"
 prefix_rule(
@@ -796,6 +756,9 @@ prefix_rule(
         },
         evaluation
     );
+    let commit = policy.check(&commands[1], &allow_all);
+    assert_eq!(commit.decision, Decision::Forbidden);
+    assert_eq!(commit.matched_rules, evaluation.matched_rules[1..]);
     Ok(())
 }
 

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "worker": "remaining_tui",
+  "scope": "Parent-transferred final three core config owners",
+  "coverage": "complete",
+  "unread_ranges": [],
+  "files": [
+    {
+      "path": "codex-rs/core/src/config/mod.rs",
+      "reviewed_lines": [
+        1,
+        4040
+      ],
+      "reviewed_bytes": 163199,
+      "tests_before": 0,
+      "tests_after": 0,
+      "modified": false,
+      "sha256": "918c32208a9fe4e2b09ca70dd3438d70eca8eadbb7c924a931eb0dbf0965abb4"
+    },
+    {
+      "path": "codex-rs/core/src/config/config_tests.rs",
+      "reviewed_original_lines": [
+        1,
+        10567
+      ],
+      "reviewed_original_bytes": 332604,
+      "tests_before": 258,
+      "tests_after": 257,
+      "lines_after": 10416,
+      "bytes_after": 328947,
+      "sha256": "81ba464e7e55bc4b7f0251cf8478b1d2d783350d0385f0fdc4594894071bd33b"
+    },
+    {
+      "path": "codex-rs/core/src/config/config_loader_tests.rs",
+      "reviewed_original_lines": [
+        1,
+        3519
+      ],
+      "reviewed_original_bytes": 109373,
+      "tests_before": 71,
+      "tests_after": 71,
+      "lines_after": 3543,
+      "bytes_after": 110256,
+      "sha256": "d66103e41b98ab6182fd5891f747e44c567338a1edecbf9829bf69750a190d09"
+    }
+  ],
+  "total_original_lines": 18126,
+  "total_original_bytes": 605176,
+  "total_tests_reviewed": 329,
+  "delta": {
+    "lines": -127,
+    "bytes": -2774,
+    "tests": -1
+  },
+  "modified_test_filters": [
+    "config::tests::show_raw_agent_reasoning_runtime_override_wins_over_config",
+    "config::tests::permissions_profiles_allow_missing_or_empty_filesystem_with_warning",
+    "config::tests::test_set_default_oss_provider",
+    "config::tests::multi_agent_v2_rejects_invalid_wait_timeouts",
+    "config::config_loader_tests::project_layer_ignores_unsupported_config_keys",
+    "config::config_loader_tests::returns_versioned_config_when_all_layers_missing",
+    "config::config_loader_tests::cli_overrides_with_relative_paths_do_not_break_trust_check"
+  ],
+  "removed_tests": [
+    "config::tests::permissions_profiles_allow_missing_filesystem_with_warning",
+    "config::tests::permissions_profiles_allow_empty_filesystem_with_warning"
+  ],
+  "changes": [
+    "Raw reasoning config/override 3x3 option matrix, preserving original false/true case and covering explicit false precedence.",
+    "Missing/empty permission filesystems consolidated into two-case test, retaining warnings and adding legacy read-only projection assertion for empty case.",
+    "Rejected OSS provider write now asserts existing config bytes unchanged.",
+    "Nine original wait-timeout fixtures and exact errors mechanically retained in table; tenth case covers default timeout above ceiling.",
+    "Project config denied-key assertion traverses nested TOML rather than querying dotted literal; supported plugins sibling control preserved.",
+    "Removed duplicate effective config-version assertion while retaining original and system/user layer metadata assertions.",
+    "Relative CLI path trust test now creates real project layer, asserts enabled trust and retained model plus cwd-relative path resolution."
+  ],
+  "consumer_evidence": {
+    "owner": "Complete core config mod.rs implementation",
+    "loader": "Complete sanitize_project_config direct read; parent complete codex-config57 Rust files review reused",
+    "other_core_config": "Inherited parent-reviewed config sibling owners reused; no other config files edited"
+  },
+  "validation": {
+    "source_review": "All seven complete changed test functions inspected; final two formatting-only hunks read after patch. Revision-bound patches applied successfully. Timeout preservation count nine verified during transformation.",
+    "runtime": "Not run by worker; root exclusively validates",
+    "no_git_cargo_builds": true
+  },
+  "checkpoint_location": "Workspace fallback because Temp apply_patch is disallowed; authorized by task capsule",
+  "unresolved": []
+}

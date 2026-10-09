@@ -41,7 +41,11 @@ fn subagent_changes_do_not_resend_environment_and_replay_after_loss() {
     assert!(!text.contains("2026-09-28"));
     assert!(!text.contains("<environment_context>"));
     retained.extend(items(delta));
-    assert!(changed.render_history_diff(Some(&next), &retained).is_empty());
+    assert!(
+        changed
+            .render_history_diff(Some(&next), &retained)
+            .is_empty()
+    );
     assert_eq!(changed.render_history_diff(Some(&next), &[]).len(), 2);
     let removed = build("");
     let delta = removed.render_history_diff(Some(&next), &retained);
@@ -106,12 +110,20 @@ fn only_latest_delivered_environment_proves_shell_status_clear_and_removal() {
 
 #[test]
 fn optional_subagent_list_is_bounded_without_truncating_execution_facts() {
-    let state = EnvironmentsState {
+    let mut state = WorldState::default();
+    state.add_section(EnvironmentsState {
         current_date: Some("2026-09-21".into()),
         ..Default::default()
-    }
-    .with_subagents("large optional detail ".repeat(10_000));
-    let text = state.render();
+    });
+    state.add_section(crate::context::world_state::SubagentsState::new(
+        "large optional detail ".repeat(10_000),
+    ));
+    let fragments = state.render_full();
+    assert_eq!(fragments.len(), 2);
+    let text = fragments
+        .iter()
+        .map(|fragment| fragment.render())
+        .collect::<String>();
     assert!(text.len() < 5_000);
     assert!(text.contains("2026-09-21"));
     assert!(text.contains("Additional subagents omitted"));

@@ -108,7 +108,7 @@ fn normalize_newlines(text: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
+async fn windows_unified_exec_preserves_closures_without_powershell_snapshot_replay() -> Result<()> {
     let builder = test_codex().with_config(|config| {
         config
             .features
@@ -138,7 +138,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     // source loses captured variables and module state. Exercise normal execution.
     let end = run_tool_turn_on_harness(
         &harness,
-        "verify PowerShell snapshot replay",
+        "verify PowerShell closure execution without snapshot replay",
         "powershell-snapshot-replay",
         json!({
             "kind": "script",

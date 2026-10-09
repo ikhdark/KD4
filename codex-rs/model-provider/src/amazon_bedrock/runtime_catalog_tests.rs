@@ -4,7 +4,7 @@ use pretty_assertions::assert_eq;
 use super::static_runtime_model_catalog;
 
 #[test]
-fn runtime_catalog_includes_supported_cross_region_models_in_priority_order() {
+fn runtime_catalog_preserves_cross_region_order_and_supported_capabilities() {
     let catalog = static_runtime_model_catalog();
 
     assert_eq!(
@@ -40,12 +40,6 @@ fn runtime_catalog_includes_supported_cross_region_models_in_priority_order() {
             ),
         ]
     );
-}
-
-#[test]
-fn runtime_catalog_disables_unsupported_capabilities() {
-    let catalog = static_runtime_model_catalog();
-    assert_eq!(catalog.models.len(), 12);
     for model in catalog.models {
         assert!(!model.supports_search_tool, "{}", model.slug);
         assert_eq!(model.multi_agent_version, Some(MultiAgentVersion::V1));

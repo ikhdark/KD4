@@ -534,7 +534,11 @@ async fn for_each_rollout_item_streams_items_and_reports_identity() -> std::io::
 
     assert_eq!(loaded_thread_id, Some(thread_id));
     assert_eq!(parse_errors, 0);
-    assert!(matches!(visited.first(), Some(RolloutItem::SessionMeta(_))));
+    let expected = recorded_lines(&rollout_path)?
+        .into_iter()
+        .map(|line| line.item)
+        .collect::<Vec<_>>();
+    assert_eq!(serde_json::to_value(visited)?, serde_json::to_value(expected)?);
     Ok(())
 }
 
@@ -1136,13 +1140,17 @@ async fn concurrent_shutdown_never_acknowledges_items_behind_shutdown() -> std::
         }
     }
     shutdown.await.expect("shutdown task")?;
-    let text = std::fs::read_to_string(rollout_path)?;
-    for message in accepted {
-        assert!(
-            text.contains(&message),
-            "successfully queued item must be persisted before shutdown: {message}"
-        );
-    }
+    accepted.push("before-concurrent-shutdown".to_string());
+    accepted.sort();
+    let mut persisted = recorded_lines(&rollout_path)?
+        .into_iter()
+        .filter_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    persisted.sort();
+    assert_eq!(persisted, accepted, "every accepted item exactly once, no rejected items");
     Ok(())
 }
 
@@ -1247,43 +1255,7 @@ async fn empty_writer_flush_does_not_wait_for_another_append() -> std::io::Resul
     Ok(())
 }
 
-#[tokio::test]
-async fn writer_state_retries_write_error_before_reporting_flush_success() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let rollout_path = home.path().join("rollout.jsonl");
-    File::create(&rollout_path)?;
-    let read_only_file = std::fs::OpenOptions::new().read(true).open(&rollout_path)?;
-    let (_, append_lock) = compression::lock_rollout_for_append_blocking(&rollout_path)?;
-    let mut state = RolloutWriterState::new(
-        Some(JsonlWriter {
-            path: rollout_path.clone(),
-            file: tokio::fs::File::from_std(read_only_file),
-            _append_lock: append_lock,
-            write_fault: None,
-            append_transaction_count: 0,
-        }),
-        /*deferred_log_file_info*/ None,
-        /*meta*/ None,
-        home.path().to_path_buf(),
-        /*known_repository_context*/ None,
-        rollout_path.clone(),
-        Default::default(),
-    );
-    state.add_items(captured(vec![RolloutItem::EventMsg(
-        EventMsg::AgentMessage(AgentMessageEvent {
-            message: "queued-after-writer-error".to_string(),
-            phase: None,
-        }),
-    )]));
 
-    state.flush().await?;
-    let text_after_retry = std::fs::read_to_string(&rollout_path)?;
-    assert!(
-        text_after_retry.contains("queued-after-writer-error"),
-        "flush should retry after reopening and write buffered items"
-    );
-    Ok(())
-}
 
 #[test]
 fn writer_state_defines_manifests_once_then_references_them() {
@@ -1764,22 +1736,26 @@ async fn retried_records_keep_their_capture_time() -> std::io::Result<()> {
         Default::default(),
     );
     let captured_at = OffsetDateTime::now_utc() - Duration::from_secs(3600);
-    state.add_items(vec![CapturedRolloutItem::new(
-        agent_message("survives-the-retry"),
-        captured_at,
-    )]);
+    let messages = ["survives-the-retry", "queued-after-writer-error"];
+    state.add_items(messages.into_iter().map(|message| {
+        CapturedRolloutItem::new(agent_message(message), captured_at)
+    }).collect());
 
     // The first append fails against the read-only handle; the retry reopens
     // and writes the same buffered record.
     state.flush().await?;
 
     let lines = recorded_lines(&rollout_path)?;
-    assert_eq!(lines.len(), 1);
-    assert_eq!(
-        parse_record_timestamp(&lines[0].timestamp),
-        at_record_resolution(captured_at),
-        "a retried record keeps the time it was captured, not the time the retry succeeded"
-    );
+    assert_eq!(lines.len(), messages.len());
+    for (line, message) in lines.iter().zip(messages) {
+        assert_eq!(serde_json::to_value(&line.item)?, serde_json::to_value(agent_message(message))?);
+        assert_eq!(
+            parse_record_timestamp(&line.timestamp),
+            at_record_resolution(captured_at),
+            "a retried record keeps its capture time, not the retry time"
+        );
+    }
+    assert!(state.pending_items.is_empty());
     Ok(())
 }
 

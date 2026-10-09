@@ -384,34 +384,30 @@ fn bundle_shape_tag_describes_sorted_enterprise_sources() {
 }
 
 #[tokio::test]
-async fn get_bundle_skips_non_chatgpt_auth() {
-    let fetcher = Arc::new(StaticBundleClient::new(test_bundle()));
-    let codex_home = tempdir().expect("tempdir");
-    let service = CloudConfigBundleService::new(
-        auth_manager_with_api_key().await,
-        fetcher.clone(),
-        codex_home.path().to_path_buf(),
-        CLOUD_CONFIG_BUNDLE_TIMEOUT,
-    );
+async fn get_bundle_skips_ineligible_auth() {
+    for (case, auth) in [
+        ("api key", auth_manager_with_api_key().await),
+        ("individual", auth_manager_with_plan("pro").await),
+        (
+            "team-like usage based",
+            auth_manager_with_plan("self_serve_business_usage_based").await,
+        ),
+    ] {
+        let fetcher = Arc::new(StaticBundleClient::new(test_bundle()));
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudConfigBundleService::new(
+            auth,
+            fetcher.clone(),
+            codex_home.path().to_path_buf(),
+            CLOUD_CONFIG_BUNDLE_TIMEOUT,
+        );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(None));
-    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
+        assert_eq!(service.load_startup_bundle().await, Ok(None), "{case}");
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0, "{case}");
+    }
 }
 
-#[tokio::test]
-async fn get_bundle_skips_individual_plan() {
-    let fetcher = Arc::new(StaticBundleClient::new(test_bundle()));
-    let codex_home = tempdir().expect("tempdir");
-    let service = CloudConfigBundleService::new(
-        auth_manager_with_plan("pro").await,
-        fetcher.clone(),
-        codex_home.path().to_path_buf(),
-        CLOUD_CONFIG_BUNDLE_TIMEOUT,
-    );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(None));
-    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
-}
 
 #[tokio::test]
 async fn get_bundle_allows_eligible_workspace_plans_and_writes_cache() {
@@ -475,20 +471,7 @@ async fn get_bundle_allows_agent_identity_business_plan() {
     );
 }
 
-#[tokio::test]
-async fn get_bundle_skips_team_like_usage_based_plan() {
-    let fetcher = Arc::new(StaticBundleClient::new(test_bundle()));
-    let codex_home = tempdir().expect("tempdir");
-    let service = CloudConfigBundleService::new(
-        auth_manager_with_plan("self_serve_business_usage_based").await,
-        fetcher.clone(),
-        codex_home.path().to_path_buf(),
-        CLOUD_CONFIG_BUNDLE_TIMEOUT,
-    );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(None));
-    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
-}
 
 #[tokio::test]
 async fn get_bundle_rejects_invalid_remote_bundle_before_cache_write() {
@@ -566,12 +549,16 @@ async fn get_bundle_empty_response_is_success_and_cached() {
 
     assert_eq!(service.load_startup_bundle().await, Ok(None));
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
-    assert!(
-        codex_home
-            .path()
-            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
-            .exists()
+    assert_eq!(
+        create_test_cache(codex_home.path())
+            .load(Some("user-12345"), Some("account-12345"))
+            .await
+            .expect("load empty cached bundle")
+            .bundle,
+        CloudConfigBundle::default()
     );
+    assert_eq!(service.load_startup_bundle().await, Ok(None));
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -584,7 +571,14 @@ async fn get_bundle_uses_cache_when_valid() {
         codex_home.path().to_path_buf(),
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let _ = prime_service.load_startup_bundle().await;
+    assert_eq!(
+        prime_service.load_startup_bundle().await,
+        Ok(Some(bundle.clone()))
+    );
+    create_test_cache(codex_home.path())
+        .load(Some("user-12345"), Some("account-12345"))
+        .await
+        .expect("seed cache must be readable before testing cache selection");
 
     let fetcher = Arc::new(SequenceBundleClient::new(vec![Err(request_error())]));
     let service = CloudConfigBundleService::new(
@@ -608,7 +602,14 @@ async fn get_bundle_ignores_cache_for_different_auth_identity() {
         codex_home.path().to_path_buf(),
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let _ = prime_service.load_startup_bundle().await;
+    assert_eq!(
+        prime_service.load_startup_bundle().await,
+        Ok(Some(test_bundle()))
+    );
+    create_test_cache(codex_home.path())
+        .load(Some("user-12345"), Some("account-12345"))
+        .await
+        .expect("seed cache must be readable before testing cache selection");
 
     let replacement_bundle = CloudConfigBundle {
         config_toml: CloudConfigTomlBundle::default(),
@@ -652,6 +653,7 @@ async fn get_bundle_times_out() {
 
     let result = handle.await.expect("cloud config bundle task");
     let err = result.expect_err("cloud config bundle timeout should fail closed");
+    assert_eq!(err.code(), CloudConfigBundleLoadErrorCode::Timeout);
     assert!(
         err.to_string()
             .contains("timed out waiting for cloud config bundle")
@@ -935,7 +937,14 @@ async fn get_bundle_does_not_use_cache_when_auth_identity_is_incomplete() {
         codex_home.path().to_path_buf(),
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let _ = prime_service.load_startup_bundle().await;
+    assert_eq!(
+        prime_service.load_startup_bundle().await,
+        Ok(Some(test_bundle()))
+    );
+    create_test_cache(codex_home.path())
+        .load(Some("user-12345"), Some("account-12345"))
+        .await
+        .expect("seed cache must be readable before testing cache selection");
 
     let replacement_bundle = CloudConfigBundle {
         config_toml: CloudConfigTomlBundle::default(),

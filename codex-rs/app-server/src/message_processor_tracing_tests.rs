@@ -237,7 +237,7 @@ impl Serialize for SerializationProbe<'_> {
 }
 
 #[test]
-fn unqueued_request_skips_request_size_serialization() {
+fn request_queue_size_serializes_only_queued_requests_and_counts_utf8_bytes() {
     let serializations = AtomicUsize::new(0);
     let probe = SerializationProbe(&serializations);
 
@@ -245,10 +245,6 @@ fn unqueued_request_skips_request_size_serialization() {
     assert_eq!(serializations.load(Ordering::Relaxed), 0);
     assert!(serialized_request_queue_bytes(true, &probe) > 0);
     assert_eq!(serializations.load(Ordering::Relaxed), 1);
-}
-
-#[test]
-fn queued_request_size_matches_compact_json_without_materializing_it() {
     let request = serde_json::json!({
         "input": "multibyte µ payload".repeat(1024),
         "enabled": true,
@@ -529,6 +525,85 @@ impl TracingHarness {
         read_thread_started_notification(&mut self.outgoing_rx).await;
         response
     }
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn config_batch_write_refreshes_live_thread_only_when_requested() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "config_batch_write_refreshes_live_thread_only_when_requested",
+        async {
+            use codex_app_server_protocol::ConfigWriteResponse;
+            use codex_app_server_protocol::ExperimentalFeatureListResponse;
+            use codex_app_server_protocol::WriteStatus;
+
+            let mut harness = TracingHarness::new().await?;
+            let started = harness.start_thread(90_000, None).await;
+            let thread = harness
+                .processor
+                .thread_manager
+                .get_thread(ThreadId::from_string(&started.thread.id)?)
+                .await?;
+            let original = thread.enabled(Feature::AuthElicitation);
+            let config_path = harness._codex_home.path().join("config.toml");
+            for (index, reload, enabled, whole_table) in [
+                (0, false, !original, false),
+                (1, true, !original, false),
+                (2, true, original, true),
+            ] {
+                let (key, value) = if whole_table {
+                    ("features", json!({"auth_elicitation": enabled}))
+                } else {
+                    ("features.auth_elicitation", json!(enabled))
+                };
+                let response: ConfigWriteResponse = harness
+                    .request(
+                        ClientRequest::ConfigBatchWrite {
+                            request_id: RequestId::Integer(90_001 + index * 2),
+                            params: serde_json::from_value(json!({
+                                "filePath": config_path,
+                                "edits": [{"keyPath": key, "value": value, "mergeStrategy": "replace"}],
+                                "reloadUserConfig": reload,
+                            }))?,
+                        },
+                        None,
+                    )
+                    .await;
+                assert_eq!(response.status, WriteStatus::Ok);
+                let persisted: toml::Value =
+                    toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+                assert_eq!(
+                    persisted["features"]["auth_elicitation"].as_bool(),
+                    Some(enabled),
+                );
+                let expected_live = if reload { enabled } else { original };
+                // enabled() reads startup flags; refreshable features are published
+                // through config(), which supplies the next turn's configuration.
+                assert_eq!(thread.enabled(Feature::AuthElicitation), original);
+                assert_eq!(
+                    thread.config().await.features.enabled(Feature::AuthElicitation),
+                    expected_live,
+                );
+                let features: ExperimentalFeatureListResponse = harness
+                    .request(
+                        ClientRequest::ExperimentalFeatureList {
+                            request_id: RequestId::Integer(90_002 + index * 2),
+                            params: serde_json::from_value(json!({"threadId": started.thread.id}))?,
+                        },
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    features.data.iter().find(|feature| feature.name == "auth_elicitation")
+                        .expect("auth_elicitation feature").enabled,
+                    enabled,
+                    "feature listing projects persisted configuration even without runtime reload",
+                );
+            }
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
 }
 
 async fn build_test_config(

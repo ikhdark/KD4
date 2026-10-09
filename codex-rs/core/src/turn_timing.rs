@@ -2022,7 +2022,10 @@ impl TurnTimingState {
             .any(|existing| existing == physical_attempt_id)
         {
             if request.physical_attempt_ids.len() >= MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
-                request.physical_attempt_ids.remove(0);
+                let evicted = request.physical_attempt_ids.remove(0);
+                request.request_sha256_by_attempt.remove(&evicted);
+                request.request_section_sha256_by_attempt.remove(&evicted);
+                request.response_id_by_attempt.remove(&evicted);
             }
             request
                 .physical_attempt_ids

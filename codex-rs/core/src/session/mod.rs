@@ -609,6 +609,23 @@ pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 pub(crate) struct QueuedSubmission {
     pub(crate) submission: Submission,
     pub(crate) mailbox_admission: Option<oneshot::Sender<CodexResult<()>>>,
+    // Held through forwarding, deferred preparation, and dispatch. Dropping any
+    // cancelled or rejected submission releases its admission automatically.
+    pub(crate) preparation_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+fn is_submission_control(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Interrupt
+            | Op::Shutdown
+            | Op::ExecApproval { .. }
+            | Op::PatchApproval { .. }
+            | Op::UserInputAnswer { .. }
+            | Op::RequestPermissionsResponse { .. }
+            | Op::DynamicToolResponse { .. }
+            | Op::ResolveElicitation { .. }
+    )
 }
 
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`] and
@@ -1009,6 +1026,17 @@ impl Codex {
         &self,
         mut sub: Submission,
     ) -> CodexResult<Option<oneshot::Receiver<CodexResult<()>>>> {
+        let preparation_permit = if is_submission_control(&sub.op) {
+            None
+        } else {
+            Some(tokio::select! {
+                biased;
+                _ = self.tx_sub.closed() => return Err(CodexErr::InternalAgentDied),
+                permit = Arc::clone(&self.session.submission_preparation_slots).acquire_owned() => {
+                    permit.map_err(|_| CodexErr::InternalAgentDied)?
+                }
+            })
+        };
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
         }
@@ -1023,6 +1051,7 @@ impl Codex {
             .send(QueuedSubmission {
                 submission: sub,
                 mailbox_admission,
+                preparation_permit,
             })
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
@@ -5732,7 +5761,11 @@ impl Session {
                 self.codex_home().await.as_path(), &self.thread_id().to_string(), &canonical,
             ).await;
             if !artifact.complete {
-                return Err(CodexErr::Fatal(format!("Could not retain complete {source}; context was not admitted.")));
+                let reason = artifact.error.as_deref().unwrap_or("artifact retention byte budget exhausted");
+                return Err(CodexErr::Fatal(format!(
+                    "Could not retain complete {source}; context was not admitted. Retained {} of {} bytes: {reason}",
+                    artifact.retained_bytes, canonical.exact_bytes,
+                )));
             }
             let id = artifact.artifact_id().ok_or_else(|| CodexErr::Fatal(format!("Missing {source} recovery artifact")))?;
             self.try_register_tool_artifact_origin(id.clone(), format!("context:{source}"), canonical.exact_bytes, canonical.sha256.clone()).await?;

@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_bootstrap_unavailable_uses_session_bearer_fallback() {
+    async fn chatgpt_bootstrap_fallback_preserves_bearer_auth_and_cooldown() {
         let server = MockServer::start().await;
         let registration_count = Arc::new(AtomicUsize::new(0));
         mount_transient_agent_registration(
@@ -1113,7 +1113,7 @@ mod tests {
         let fallback = AgentIdentitySessionFallback::default();
 
         let provider_auth = resolve_provider_auth_for_scope(
-            Some(auth_manager),
+            Some(Arc::clone(&auth_manager)),
             Some(&auth),
             &provider,
             provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, fallback.clone()),
@@ -1122,93 +1122,35 @@ mod tests {
         .expect("fallback should resolve bearer auth");
 
         let headers = provider_auth.auth.to_auth_headers();
-        assert_eq!(
-            headers
-                .get(http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer test-access-token")
-        );
-        assert_eq!(
-            headers
-                .get("ChatGPT-Account-ID")
-                .and_then(|value| value.to_str().ok()),
-            Some("account-123")
-        );
+        assert_eq!(headers[http::header::AUTHORIZATION], "Bearer test-access-token");
+        assert_eq!(headers["ChatGPT-Account-ID"], "account-123");
+        assert_eq!(provider_auth.agent_identity_telemetry, None);
         assert!(fallback.is_engaged());
         assert_eq!(registration_count.load(Ordering::SeqCst), 3);
-    }
 
-    #[tokio::test]
-    async fn chatgpt_session_fallback_skips_later_agent_identity_bootstrap() {
-        let server = MockServer::start().await;
-        let registration_count = Arc::new(AtomicUsize::new(0));
-        mount_transient_agent_registration(
-            &server,
-            /*status*/ 503,
-            Arc::clone(&registration_count),
-        )
-        .await;
-        let (_codex_home, auth_manager, auth) = chatgpt_auth_manager(server.uri()).await;
-        let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-        let fallback = AgentIdentitySessionFallback::default();
-
-        resolve_provider_auth_for_scope(
-            Some(Arc::clone(&auth_manager)),
-            Some(&auth),
-            &provider,
-            provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, fallback.clone()),
-        )
-        .await
-        .expect("first fallback should resolve bearer auth");
-        resolve_provider_auth_for_scope(
-            Some(auth_manager),
-            Some(&auth),
-            &provider,
-            provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, fallback),
-        )
-        .await
-        .expect("second fallback should resolve bearer auth");
-
-        assert_eq!(registration_count.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn chatgpt_sessions_share_bootstrap_failure_cooldown() {
-        let server = MockServer::start().await;
-        let registration_count = Arc::new(AtomicUsize::new(0));
-        mount_transient_agent_registration(
-            &server,
-            /*status*/ 503,
-            Arc::clone(&registration_count),
-        )
-        .await;
-        let (_codex_home, auth_manager, auth) = chatgpt_auth_manager(server.uri()).await;
-        let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-        let first_fallback = AgentIdentitySessionFallback::default();
+        // A fresh manager has no failure cooldown to mask a failure to honor the session flag.
+        let fresh_manager = AuthManager::from_auth_for_testing_with_agent_identity_authapi_base_url(
+            auth.clone(),
+            server.uri(),
+        );
         let second_fallback = AgentIdentitySessionFallback::default();
-
-        resolve_provider_auth_for_scope(
-            Some(Arc::clone(&auth_manager)),
-            Some(&auth),
-            &provider,
-            provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, first_fallback.clone()),
-        )
-        .await
-        .expect("first session fallback should resolve bearer auth");
-        resolve_provider_auth_for_scope(
-            Some(auth_manager),
-            Some(&auth),
-            &provider,
-            provider_auth_scope(
-                AgentIdentityAuthPolicy::ChatGptAuth,
-                second_fallback.clone(),
-            ),
-        )
-        .await
-        .expect("second session fallback should resolve bearer auth");
-
-        assert!(first_fallback.is_engaged());
+        for (manager, session_fallback) in [
+            (fresh_manager, fallback),
+            (auth_manager, second_fallback.clone()),
+        ] {
+            let resolved = resolve_provider_auth_for_scope(
+                Some(manager),
+                Some(&auth),
+                &provider,
+                provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, session_fallback.clone()),
+            )
+            .await
+            .expect("subsequent fallback should preserve bearer auth");
+            assert_eq!(resolved.auth.to_auth_headers(), headers);
+            assert_eq!(resolved.agent_identity_telemetry, None);
+            assert!(session_fallback.is_engaged());
+            assert_eq!(registration_count.load(Ordering::SeqCst), 3);
+        }
         assert!(second_fallback.is_engaged());
-        assert_eq!(registration_count.load(Ordering::SeqCst), 3);
     }
 }

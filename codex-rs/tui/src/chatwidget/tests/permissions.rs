@@ -278,8 +278,8 @@ async fn approvals_selection_popup_snapshot_windows_degraded_sandbox() {
     );
 }
 
-#[tokio::test]
-async fn preset_matching_accepts_workspace_write_with_extra_roots() {
+#[test]
+fn preset_matching_accepts_workspace_write_with_extra_roots() {
     let preset = builtin_approval_presets()
         .into_iter()
         .find(|p| p.id == "auto")
@@ -307,8 +307,8 @@ async fn preset_matching_accepts_workspace_write_with_extra_roots() {
     );
 }
 
-#[tokio::test]
-async fn preset_matching_does_not_treat_non_cwd_writable_profile_as_read_only() {
+#[test]
+fn preset_matching_does_not_treat_non_cwd_writable_profile_as_read_only() {
     let preset = builtin_approval_presets()
         .into_iter()
         .find(|p| p.id == "read-only")
@@ -346,21 +346,7 @@ async fn preset_matching_does_not_treat_non_cwd_writable_profile_as_read_only() 
     );
 }
 
-#[tokio::test]
-async fn full_access_confirmation_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let preset = builtin_approval_presets()
-        .into_iter()
-        .find(|preset| preset.id == "full-access")
-        .expect("full access preset");
-    chat.open_full_access_confirmation(
-        preset, /*return_to_permissions*/ false, /*profile_selection*/ None,
-    );
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("full_access_confirmation_popup", popup);
-}
 
 #[tokio::test]
 async fn windows_auto_mode_prompt_requests_enabling_sandbox_feature() {
@@ -435,6 +421,8 @@ async fn startup_windows_sandbox_prompt_only_offers_compatible_modes() {
     chat.set_feature_enabled(Feature::WindowsSandbox, /*enabled*/ false);
     chat.set_feature_enabled(Feature::WindowsSandboxElevated, /*enabled*/ false);
 
+    chat.maybe_prompt_windows_sandbox_enable(/*show_now*/ false);
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
     chat.maybe_prompt_windows_sandbox_enable(/*show_now*/ true);
 
     let popup = render_bottom_popup(&chat, /*width*/ 120);
@@ -477,6 +465,7 @@ async fn startup_windows_sandbox_prompt_blocks_disallowed_unelevated_fallback() 
     chat.maybe_prompt_windows_sandbox_enable(/*show_now*/ true);
 
     let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert_chatwidget_snapshot!("windows_sandbox_required_enable_prompt", popup);
     assert!(
         popup.contains("Your organization requires the default Codex agent sandbox"),
         "expected required sandbox prompt copy: {popup}"
@@ -487,24 +476,7 @@ async fn startup_windows_sandbox_prompt_blocks_disallowed_unelevated_fallback() 
     );
 }
 
-#[tokio::test]
-async fn windows_sandbox_required_enable_prompt_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.config.config_layer_stack =
-        windows_sandbox_requirements_stack(vec![WindowsSandboxModeToml::Elevated]).into();
-    let preset = builtin_approval_presets()
-        .into_iter()
-        .find(|preset| preset.id == "auto")
-        .expect("auto preset");
-
-    chat.open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
-
-    assert_chatwidget_snapshot!(
-        "windows_sandbox_required_enable_prompt",
-        render_bottom_popup(&chat, /*width*/ 120)
-    );
-}
 
 #[tokio::test]
 async fn windows_sandbox_required_enable_prompt_reopens_on_cancel_when_unelevated_allowed() {
@@ -607,19 +579,7 @@ async fn windows_sandbox_required_fallback_prompt_snapshot() {
     assert_chatwidget_snapshot!("windows_sandbox_required_fallback_prompt", popup);
 }
 
-#[tokio::test]
-async fn startup_does_not_prompt_for_windows_sandbox_when_not_requested() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.set_feature_enabled(Feature::WindowsSandbox, /*enabled*/ false);
-    chat.set_feature_enabled(Feature::WindowsSandboxElevated, /*enabled*/ false);
-    chat.maybe_prompt_windows_sandbox_enable(/*show_now*/ false);
-
-    assert!(
-        chat.bottom_pane.no_modal_or_popup_active(),
-        "expected no startup sandbox NUX popup when startup trigger is false"
-    );
-}
 
 #[tokio::test]
 async fn approvals_popup_shows_disabled_presets() {
@@ -780,41 +740,7 @@ async fn permissions_selection_emits_history_cell_when_selection_changes() {
     );
 }
 
-#[tokio::test]
-async fn permissions_selection_history_snapshot_after_mode_switch() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    {
-        chat.config.notices.hide_world_writable_warning = Some(true);
-        chat.set_windows_sandbox_mode(Some(WindowsSandboxModeToml::Unelevated));
-    }
-    chat.open_permissions_popup();
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
-
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-
-    let (preset, return_to_permissions, profile_selection) =
-        std::iter::from_fn(|| rx.try_recv().ok())
-            .find_map(|event| match event {
-                AppEvent::OpenFullAccessConfirmation {
-                    preset,
-                    return_to_permissions,
-                    profile_selection,
-                } => Some((preset, return_to_permissions, profile_selection)),
-                _ => None,
-            })
-            .expect("expected full access confirmation event");
-    chat.open_full_access_confirmation(preset, return_to_permissions, profile_selection);
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1, "expected one mode-switch history cell");
-    assert_chatwidget_snapshot!(
-        "permissions_selection_history_after_mode_switch",
-        lines_to_single_string(&cells[0])
-    );
-}
 
 #[tokio::test]
 async fn permissions_selection_history_snapshot_full_access_to_default() {
@@ -914,7 +840,7 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation() 
             _ => {}
         }
     }
-    {}
+    assert!(cells_before_confirmation.is_empty(), "permissions history must wait for confirmation");
     let (preset, return_to_permissions, profile_selection) =
         open_confirmation_event.expect("expected full access confirmation event");
     chat.open_full_access_confirmation(preset, return_to_permissions, profile_selection);
@@ -925,18 +851,12 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation() 
         "expected full access confirmation popup, got: {popup}"
     );
 
+    assert_chatwidget_snapshot!("full_access_confirmation_popup", popup);
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     let cells_after_confirmation = drain_insert_history(&mut rx);
-    let total_history_cells = cells_before_confirmation.len() + cells_after_confirmation.len();
-    assert_eq!(
-        total_history_cells, 1,
-        "expected one full access history cell total"
-    );
-    let rendered = if !cells_before_confirmation.is_empty() {
-        lines_to_single_string(&cells_before_confirmation[0])
-    } else {
-        lines_to_single_string(&cells_after_confirmation[0])
-    };
+    assert_eq!(cells_after_confirmation.len(), 1);
+    let rendered = lines_to_single_string(&cells_after_confirmation[0]);
+    assert_chatwidget_snapshot!("permissions_selection_history_after_mode_switch", rendered);
     assert!(
         rendered.contains("Permissions updated to Full Access"),
         "expected full access update history message, got: {rendered}"

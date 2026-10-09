@@ -1198,7 +1198,7 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
         ) {
             return true;
         }
-        if is_read_only_git_subcommand(subcommand) {
+        if git_argv_is_read_only(command, subcommand, true) {
             return false;
         }
     }
@@ -1510,9 +1510,38 @@ pub(crate) fn command_is_read_only_git(command: &[String]) -> bool {
     {
         return false;
     }
-    let normalized = normalized_command_tokens(command);
-    let unwrapped = unwrap_command_tokens(&normalized);
-    git_subcommand(unwrapped).is_some_and(is_read_only_git_subcommand)
+    git_subcommand(command).is_some_and(|subcommand| git_argv_is_read_only(command, subcommand, false))
+}
+
+fn git_argv_is_read_only(command: &[String], subcommand: &str, allow_cwd_change: bool) -> bool {
+    // Preserve known presentation-only configuration, not arbitrary executable
+    // overrides. Keep exact argv case: -C changes cwd, whereas -c sets config.
+    let removable = match command.get(1).map(String::as_str) {
+        Some("-ccolor.ui=false" | "-ccore.pager=cat") => 1,
+        Some("-c") if command.get(2).is_some_and(|arg| matches!(arg.as_str(), "color.ui=false" | "core.pager=cat")) => 2,
+        // Changing cwd does not make a read mutate, but its output cannot be
+        // attributed to the caller's cwd without resolving that change.
+        Some("-C") if allow_cwd_change && command.get(2).is_some() => 2,
+        _ => 0,
+    };
+    if removable > 0 {
+        let mut stripped = command.to_vec();
+        stripped.drain(1..=removable);
+        return git_argv_is_read_only(&stripped, subcommand, allow_cwd_change);
+    }
+    if matches!(subcommand, "diff" | "log" | "show") {
+        // These commands can write with --output or invoke external programs.
+        // Do not override the safety owner's rejection with a subcommand label.
+        codex_shell_command::is_safe_command::is_known_safe_direct_argv(command)
+    } else {
+        // Unknown options can run pagers, upload helpers, or content filters.
+        // Preserve ordinary operand-only readers, but do not certify arbitrary
+        // global configuration or unsupported subcommand options as read-only.
+        is_read_only_git_subcommand(subcommand)
+            && command.get(1).is_some_and(|arg| arg == subcommand)
+            && (subcommand == "status"
+                || command.iter().skip(2).all(|arg| !arg.starts_with('-')))
+    }
 }
 
 fn is_read_only_git_subcommand(subcommand: &str) -> bool {

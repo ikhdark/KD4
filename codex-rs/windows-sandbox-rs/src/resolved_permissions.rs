@@ -217,12 +217,14 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let cwd = tmp.path().join("workspace");
         let temp_dir = tmp.path().join("temp");
+        let tmp_dir = tmp.path().join("tmp");
         std::fs::create_dir_all(&cwd).expect("create cwd");
         std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
 
         let mut env_map = HashMap::new();
         env_map.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
-        env_map.insert("TMP".to_string(), temp_dir.to_string_lossy().to_string());
+        env_map.insert("TMP".to_string(), tmp_dir.to_string_lossy().to_string());
 
         let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
             &PermissionProfile::workspace_write(),
@@ -236,6 +238,7 @@ mod tests {
 
         let expected_roots = [
             temp_dir,
+            tmp_dir,
             dunce::canonicalize(&cwd).expect("canonicalize cwd"),
         ]
         .into_iter()
@@ -378,40 +381,23 @@ mod tests {
     }
 
     #[test]
-    fn token_mode_for_profile_without_writable_roots_uses_readonly_capability() {
+    fn token_mode_follows_profile_writable_roots() {
         let tmp = TempDir::new().expect("tempdir");
         let cwd = tmp.path().join("workspace");
         std::fs::create_dir_all(&cwd).expect("create cwd");
         let workspace_roots = workspace_roots_for(cwd.as_path());
-
-        let token_mode = token_mode_for_permission_profile(
-            &PermissionProfile::read_only(),
-            workspace_roots.as_slice(),
-            &cwd,
-            &HashMap::new(),
-        )
-        .expect("token mode");
-
-        assert_eq!(WindowsSandboxTokenMode::ReadOnlyCapability, token_mode);
+        for (profile, expected) in [
+            (PermissionProfile::read_only(), WindowsSandboxTokenMode::ReadOnlyCapability),
+            (PermissionProfile::workspace_write(), WindowsSandboxTokenMode::WritableRootsCapability),
+        ] {
+            let token_mode = token_mode_for_permission_profile(
+                &profile, workspace_roots.as_slice(), &cwd, &HashMap::new(),
+            ).expect("token mode");
+            assert_eq!(token_mode, expected);
+        }
     }
 
-    #[test]
-    fn token_mode_for_profile_with_writable_roots_uses_write_capabilities() {
-        let tmp = TempDir::new().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
-        std::fs::create_dir_all(&cwd).expect("create cwd");
-        let workspace_roots = workspace_roots_for(cwd.as_path());
 
-        let token_mode = token_mode_for_permission_profile(
-            &PermissionProfile::workspace_write(),
-            workspace_roots.as_slice(),
-            &cwd,
-            &HashMap::new(),
-        )
-        .expect("token mode");
-
-        assert_eq!(WindowsSandboxTokenMode::WritableRootsCapability, token_mode);
-    }
 
     #[test]
     fn permission_profile_rejects_disabled_profiles() {

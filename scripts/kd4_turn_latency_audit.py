@@ -2318,9 +2318,11 @@ def analyze_session_path(
         evidence=diagnostic_evidence,
     )
     report["sessionDiagnostics"]["subscriptionUsage"] = subscription_usage.report(parse_error_count)
-    report["requestCostModel"] = _request_cost_model(valid)
+    report["requestCostModel"] = _request_cost_model(valid) if include_tokens else None
     report["requestLedger"] = _request_ledger(valid, ledger_calls, valid_tool_calls, include_tokens)
-    report["outputChannels"] = _output_channels(output_channel_bytes, valid)
+    report["outputChannels"] = _output_channels(
+        output_channel_bytes, valid if include_tokens else []
+    )
     report["checkoutOverlaps"] = _checkout_overlaps(valid, edited_paths)
     if startup_log is not None:
         report["startupTiming"] = _startup_log_report(

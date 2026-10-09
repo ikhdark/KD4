@@ -325,8 +325,26 @@ mod tests {
             skill_inventory: None,
         };
 
-        let projected = fragment.project(&SkillConfigRules::default(), Some(AuthMode::Chatgpt));
+        for (auth_mode, expected_servers, expected_apps) in [
+            (Some(AuthMode::Chatgpt), vec!["alpha", "zeta"], vec!["connector-app"]),
+            (Some(AuthMode::ApiKey), vec!["alpha", "app", "zeta"], vec![]),
+            (None, vec!["alpha", "app", "zeta"], vec!["connector-app"]),
+            // Projection must not mutate the cached fragment across auth changes.
+            (Some(AuthMode::Chatgpt), vec!["alpha", "zeta"], vec!["connector-app"]),
+        ] {
+            let projected = fragment.project(&SkillConfigRules::default(), auth_mode);
 
-        assert_eq!(projected.mcp_server_names, ["alpha", "zeta"]);
+            assert_eq!(projected.mcp_server_names, expected_servers);
+            assert_eq!(
+                projected.app_connector_ids,
+                expected_apps
+                    .into_iter()
+                    .map(|id| AppConnectorId(id.to_string()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(projected.config_name, "example");
+            assert_eq!(projected.display_name, "Example");
+            assert!(!projected.has_skills);
+        }
     }
 }

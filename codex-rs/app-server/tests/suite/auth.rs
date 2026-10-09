@@ -111,7 +111,7 @@ async fn login_with_api_key_via_request(mcp: &mut TestAppServer, api_key: &str) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_no_auth() -> Result<()> {
+async fn get_auth_status_tracks_login_and_respects_token_visibility() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
 
@@ -136,40 +136,43 @@ async fn get_auth_status_no_auth() -> Result<()> {
     )
     .await??;
     let status: GetAuthStatusResponse = to_response(resp)?;
-    assert_eq!(status.auth_method, None, "expected no auth method");
-    assert_eq!(status.auth_token, None, "expected no token");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_with_api_key() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    assert_eq!(
+        status,
+        GetAuthStatusResponse {
+            auth_method: None,
+            auth_token: None,
+            requires_openai_auth: Some(true),
+        }
+    );
 
     login_with_api_key_via_request(&mut mcp, "sk-test-key").await?;
-
-    let request_id = mcp
-        .send_get_auth_status_request(GetAuthStatusParams {
-            include_token: Some(true),
-            refresh_token: Some(false),
-        })
-        .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
-    assert_eq!(status.auth_method, Some(AuthMode::ApiKey));
-    assert_eq!(status.auth_token, Some("sk-test-key".to_string()));
+    for (include_token, refresh_token) in [
+        (None, false),
+        (Some(false), false),
+        (Some(true), false),
+        (Some(true), true),
+    ] {
+        let request_id = mcp
+            .send_get_auth_status_request(GetAuthStatusParams {
+                include_token,
+                refresh_token: Some(refresh_token),
+            })
+            .await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        let status: GetAuthStatusResponse = to_response(response)?;
+        assert_eq!(
+            status,
+            GetAuthStatusResponse {
+                auth_method: Some(AuthMode::ApiKey),
+                auth_token: (include_token == Some(true)).then(|| "sk-test-key".to_string()),
+                requires_openai_auth: Some(true),
+            }
+        );
+    }
     Ok(())
 }
 
@@ -298,75 +301,6 @@ async fn get_auth_status_with_api_key_when_auth_not_required() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_with_api_key_no_include_token() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    login_with_api_key_via_request(&mut mcp, "sk-test-key").await?;
-
-    // Build params via struct so None field is omitted in wire JSON.
-    let params = GetAuthStatusParams {
-        include_token: None,
-        refresh_token: Some(false),
-    };
-    let request_id = mcp.send_get_auth_status_request(params).await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
-    assert_eq!(status.auth_method, Some(AuthMode::ApiKey));
-    assert!(status.auth_token.is_none(), "token must be omitted");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_with_api_key_refresh_requested() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    login_with_api_key_via_request(&mut mcp, "sk-test-key").await?;
-
-    let request_id = mcp
-        .send_get_auth_status_request(GetAuthStatusParams {
-            include_token: Some(true),
-            refresh_token: Some(true),
-        })
-        .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
-    assert_eq!(
-        status,
-        GetAuthStatusResponse {
-            auth_method: Some(AuthMode::ApiKey),
-            auth_token: Some("sk-test-key".to_string()),
-            requires_openai_auth: Some(true),
-        }
-    );
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result<()> {

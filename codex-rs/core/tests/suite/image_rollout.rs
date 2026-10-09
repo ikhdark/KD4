@@ -1,4 +1,5 @@
 use anyhow::Context;
+use base64::Engine;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::PermissionProfile;
@@ -157,6 +158,11 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
         .expect("expected user message with input image in rollout");
 
     let image_url = extract_image_url(&actual).expect("expected image url in rollout");
+    let expected_image_url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(std::fs::read(&abs_path)?)
+    );
+    assert_eq!(image_url, expected_image_url);
     let expected = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -257,8 +263,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
     let rollout_text = read_rollout_text(&rollout_path).await?;
     let actual = find_user_message_with_image(&rollout_text)
         .expect("expected user message with input image in rollout");
-
-    let image_url = extract_image_url(&actual).expect("expected image url in rollout");
+    assert_eq!(extract_image_url(&actual).as_deref(), Some(image_url.as_str()));
     let expected = ResponseItem::Message {
         id: None,
         role: "user".to_string(),

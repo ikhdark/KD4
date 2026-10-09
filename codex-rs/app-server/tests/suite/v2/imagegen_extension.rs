@@ -333,11 +333,17 @@ generatedImage(result);
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     start_image_generation_turn(&mut mcp).await?;
-    timeout(
+    let completed = timeout(
         DEFAULT_READ_TIMEOUT,
         wait_for_image_generation_completed(&mut mcp),
     )
     .await??;
+    let ThreadItem::ImageGeneration(image) = completed.item else {
+        panic!("expected image generation item");
+    };
+    assert_eq!(image.status, "completed");
+    assert_eq!(image.result, RESULT);
+    assert_eq!(std::fs::read(image.saved_path.context("image must be saved")?)?, TINY_PNG_BYTES);
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),

@@ -145,10 +145,27 @@ mod tests {
         let (temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
         enable_secret_auth_storage(&temp_dir)?;
 
+        // Measure refresh planning before inspecting configs warms the load cache.
         queue_best_effort_refresh(&thread_manager, &config_manager).await;
 
         assert_eq!(loader.good_loads.load(Ordering::Relaxed), 1);
         assert_eq!(loader.bad_loads.load(Ordering::Relaxed), 1);
+        for thread_id in thread_manager.list_thread_ids().await {
+            let thread = thread_manager.get_thread(thread_id).await?;
+            if thread.config().await.cwd.ends_with("good") {
+                let refresh_config = build_refresh_config(thread.as_ref(), &config_manager).await?;
+                assert_eq!(
+                    thread.config().await.auth_keyring_backend_kind(),
+                    AuthKeyringBackendKind::Direct
+                );
+                assert_eq!(
+                    serde_json::from_value::<AuthKeyringBackendKind>(
+                        refresh_config.auth_keyring_backend_kind,
+                    )?,
+                    AuthKeyringBackendKind::Secrets
+                );
+            }
+        }
         for thread_id in thread_manager.list_thread_ids().await {
             let thread = thread_manager.get_thread(thread_id).await?;
             let expected = if thread.config().await.cwd.ends_with("good") {
@@ -219,38 +236,6 @@ mod tests {
             .await
             .config()
             .auth_keyring_backend_kind)
-    }
-
-    #[tokio::test]
-    async fn refresh_config_uses_latest_auth_keyring_backend() -> anyhow::Result<()> {
-        let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
-        std::fs::write(
-            temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
-            "[features]\nsecret_auth_storage = true\n",
-        )?;
-
-        let mut good_thread = None;
-        for thread_id in thread_manager.list_thread_ids().await {
-            let thread = thread_manager.get_thread(thread_id).await?;
-            let thread_config = thread.config().await;
-            if thread_config.cwd.ends_with("good") {
-                good_thread = Some(thread);
-                break;
-            }
-        }
-        let thread = good_thread.expect("good test thread should exist");
-
-        let refresh_config = build_refresh_config(thread.as_ref(), &config_manager).await?;
-        let backend = serde_json::from_value::<AuthKeyringBackendKind>(
-            refresh_config.auth_keyring_backend_kind,
-        )?;
-
-        assert_eq!(
-            thread.config().await.auth_keyring_backend_kind(),
-            AuthKeyringBackendKind::Direct
-        );
-        assert_eq!(backend, AuthKeyringBackendKind::Secrets);
-        Ok(())
     }
 
     async fn refresh_test_state() -> anyhow::Result<(

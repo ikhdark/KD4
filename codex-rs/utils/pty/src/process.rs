@@ -696,7 +696,14 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stdout_rx.len() < stdout_rx.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the consumer queue must fill before draining starts");
+        assert!(!producer.is_finished(), "full output must backpressure the producer");
         let received = tokio::time::timeout(Duration::from_secs(5), async {
             let mut received = Vec::new();
             while let Some(chunk) = stdout_rx.recv().await {
@@ -849,15 +856,15 @@ mod tests {
         let stdout_task = tokio::spawn(async move { collect_split_output(stdout_rx).await });
 
         exit_tx.send(0).expect("send exit code");
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        stdout_tx.send(b"tail".to_vec())?;
-        drop(stdout_tx);
-
         let timeout = tokio::time::Duration::from_secs(2);
         let code = tokio::time::timeout(timeout, exit_rx)
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for driver exit"))?
             .unwrap_or(-1);
+        assert!(_session.has_exited());
+        assert_eq!(_session.exit_code(), Some(0));
+        stdout_tx.send(b"tail".to_vec())?;
+        drop(stdout_tx);
         let stdout = tokio::time::timeout(timeout, stdout_task)
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stdout"))??;

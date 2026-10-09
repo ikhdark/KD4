@@ -178,7 +178,9 @@ class RolloutSnapshotTest(unittest.TestCase):
                         rollout_snapshot, "read_rollout_snapshot",
                         wraps=rollout_snapshot.read_rollout_snapshot,
                     ) as read:
-                        with rollout_snapshot.read_rollout_snapshot(source) as snapshot:
+                        captured_snapshot = rollout_snapshot.read_rollout_snapshot(source)
+                        with captured_snapshot as snapshot:
+                            self.assertIs(snapshot, captured_snapshot)
                             source.write_bytes(b"changed after capture")
                             for _ in range(2):
                                 with snapshot.open_lines() as lines:
@@ -194,11 +196,66 @@ class RolloutSnapshotTest(unittest.TestCase):
                         with snapshot:
                             self.fail("closed snapshot must not be reopened")
 
+    def test_failed_capture_closes_the_unreturned_spool(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rollout.jsonl"
+            source.write_bytes(b'{}\n')
+            for failure in ("shrink", OSError("disk full"), KeyboardInterrupt()):
+                with self.subTest(failure=failure):
+                    spool = tempfile.SpooledTemporaryFile(max_size=1)
+                    self.addCleanup(spool.close)
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(mock.patch.object(
+                            rollout_snapshot.tempfile, "SpooledTemporaryFile", return_value=spool
+                        ))
+                        if failure == "shrink":
+                            metadata = mock.Mock(st_size=source.stat().st_size + 1)
+                            stack.enter_context(mock.patch.object(
+                                rollout_snapshot.os, "fstat", return_value=metadata
+                            ))
+                            error = OSError
+                        else:
+                            stack.enter_context(mock.patch.object(spool, "write", side_effect=failure))
+                            error = type(failure)
+                        with self.assertRaises(error):
+                            rollout_snapshot.read_rollout_snapshot(source)
+                    # No snapshot was returned, so no consumer can own this handle.
+                    self.assertTrue(spool.closed)
+                    self.assertEqual(source.read_bytes(), b'{}\n')
+
+    def test_payload_sync_failure_cleans_temporary_files_before_snapshot_publication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "sessions" / "rollout.jsonl"
+            source.parent.mkdir()
+            data = b'{"type":"event_msg","payload":{}}'
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            (directory / f"{digest}.json").write_bytes(data)
+            source.write_text(json.dumps({"type": "rollout_payload_artifact", "payload": {
+                "sha256": digest, "bytes": len(data), "item_type": "event_msg",
+            }}) + "\n", encoding="utf-8")
+            output = Path(temp) / "export" / "snapshot.jsonl"
+            output.parent.mkdir()
+            output.write_bytes(b"previous evidence")
+            for failure in (OSError("disk full"), KeyboardInterrupt()):
+                with (
+                    self.subTest(failure=type(failure).__name__),
+                    mock.patch.object(rollout_snapshot.os, "fsync", side_effect=failure),
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    self.assertRaises(type(failure)),
+                ):
+                    rollout_snapshot.main([str(source), "--output", str(output)])
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(output.read_bytes(), b"previous evidence")
+                self.assertEqual(list(rollout_snapshot.rollout_payload_root(output).iterdir()), [])
+                self.assertEqual((directory / f"{digest}.json").read_bytes(), data)
+
     def test_snapshot_context_propagates_errors_and_supports_explicit_closing(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "rollout.jsonl"
             source.write_bytes(b'{}\n')
-            for exception in (ValueError("audit failed"), KeyboardInterrupt()):
+            for exception in (ValueError("audit failed"), RuntimeError("consumer failed"), KeyboardInterrupt()):
                 with self.subTest(exception=type(exception).__name__):
                     with self.assertRaises(type(exception)) as caught:
                         with rollout_snapshot.read_rollout_snapshot(source) as snapshot:
@@ -207,25 +264,6 @@ class RolloutSnapshotTest(unittest.TestCase):
                     self.assertTrue(snapshot.stream.closed)
             with contextlib.closing(rollout_snapshot.read_rollout_snapshot(source)) as snapshot:
                 self.assertEqual(snapshot.data, b'{}\n')
-            self.assertTrue(snapshot.stream.closed)
-
-    def test_snapshot_context_owns_stream_on_success_and_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "session.jsonl"
-            path.write_bytes(b'{"type":"event_msg","payload":{}}\n')
-            snapshot = rollout_snapshot.read_rollout_snapshot(path)
-            with snapshot as current:
-                self.assertIs(current, snapshot)
-                self.assertEqual(current.data, path.read_bytes())
-                self.assertFalse(current.stream.closed)
-            self.assertTrue(snapshot.stream.closed)
-            with self.assertRaisesRegex(ValueError, "already closed"):
-                with snapshot:
-                    self.fail("closed snapshots cannot be reused")
-            snapshot = rollout_snapshot.read_rollout_snapshot(path)
-            with self.assertRaisesRegex(RuntimeError, "consumer failed"):
-                with snapshot:
-                    raise RuntimeError("consumer failed")
             self.assertTrue(snapshot.stream.closed)
 
     def test_export_reuses_authenticated_bytes_but_rechecks_changed_artifacts(self):
@@ -478,9 +516,9 @@ class RolloutSnapshotTest(unittest.TestCase):
                 self.assertEqual(
                     action["canonical"]["startToFirstDomainActionMs"]["p50"], 12.5
                 )
-            snapshot = rollout_snapshot.read_rollout_snapshot(plain)
-            self.assertEqual(snapshot.text_lines(), data.decode().splitlines())
-            standalone = kd4_first_useful_action_analysis.analyze_snapshots([snapshot])
+            with rollout_snapshot.read_rollout_snapshot(plain) as snapshot:
+                self.assertEqual(snapshot.text_lines(), data.decode().splitlines())
+                standalone = kd4_first_useful_action_analysis.analyze_snapshots([snapshot])
             self.assertEqual(standalone["completedTurnCount"], 1)
             self.assertEqual(
                 standalone["canonical"]["startToFirstDomainActionMs"]["p50"], 12.5
@@ -502,9 +540,15 @@ class RolloutSnapshotTest(unittest.TestCase):
                 b"stale compressed sibling"
             )
             report = kd4_turn_latency_audit.analyze_session_path(root, root)
+            data = b'{"type":"session_meta","payload":{}}\n'
+            expected = {
+                "path": str(plain.resolve()),
+                "byteLength": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
             self.assertEqual(
                 report["coverage"]["snapshots"],
-                [rollout_snapshot.read_rollout_snapshot(plain).metadata()],
+                [expected],
             )
             self.assertEqual(report["coverage"]["parseErrorCount"], 0)
             self.assertEqual(
@@ -565,6 +609,7 @@ class RolloutSnapshotTest(unittest.TestCase):
             with path.open("ab", buffering=0) as writer:
                 writer.write(initial)
                 snapshot = rollout_snapshot.read_rollout_snapshot(path)
+                self.addCleanup(snapshot.close)
                 writer.write(appended)
 
             self.assertEqual(snapshot.data, initial)

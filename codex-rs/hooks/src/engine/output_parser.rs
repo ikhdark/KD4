@@ -609,72 +609,27 @@ mod tests {
     }
 
     #[test]
-    fn permission_request_rejects_explicit_null_reserved_fields() {
+    fn permission_request_rejects_reserved_fields_including_explicit_null() {
         for field in ["updatedInput", "updatedPermissions"] {
-            let parsed = parse_permission_request(
-                &json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PermissionRequest",
-                        "decision": {"behavior": "allow", field: null}
-                    }
-                })
-                .to_string(),
-            )
-            .expect("parse presence-aware output");
-            assert_eq!(parsed.decision, None);
-            assert_eq!(
-                parsed.invalid_reason,
-                Some(format!(
-                    "PermissionRequest hook returned unsupported {field}"
-                ))
-            );
+            for value in [json!(null), json!({})] {
+                let parsed = parse_permission_request(
+                    &json!({
+                        "continue": true,
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": {"behavior": "allow", field: value}
+                        }
+                    })
+                    .to_string(),
+                )
+                .expect("parse presence-aware output");
+                assert_eq!(parsed.decision, None);
+                assert_eq!(
+                    parsed.invalid_reason,
+                    Some(format!("PermissionRequest hook returned unsupported {field}"))
+                );
+            }
         }
-    }
-
-    #[test]
-    fn permission_request_rejects_reserved_updated_input_field() {
-        let parsed = parse_permission_request(
-            &json!({
-                "continue": true,
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {
-                        "behavior": "allow",
-                        "updatedInput": {}
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("permission request hook output should parse");
-
-        assert_eq!(
-            parsed.invalid_reason,
-            Some("PermissionRequest hook returned unsupported updatedInput".to_string())
-        );
-    }
-
-    #[test]
-    fn permission_request_rejects_reserved_updated_permissions_field() {
-        let parsed = parse_permission_request(
-            &json!({
-                "continue": true,
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {
-                        "behavior": "allow",
-                        "updatedPermissions": {}
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("permission request hook output should parse");
-
-        assert_eq!(
-            parsed.invalid_reason,
-            Some("PermissionRequest hook returned unsupported updatedPermissions".to_string())
-        );
     }
 
     #[test]

@@ -3,6 +3,19 @@
   "runners": [
     {
       "programs": ["python", "python3", "py"],
+      "prefixes": [["scripts/root_maintenance.py", "test-python"]],
+      "options": {"-B": 0, "-u": 0},
+      "allow_extra_args": true,
+      "operations": ["test"]
+    },
+    {
+      "programs": ["node"],
+      "prefixes": [["scripts/run-python.js", "scripts/root_maintenance.py", "test-python"]],
+      "allow_extra_args": true,
+      "operations": ["test"]
+    },
+    {
+      "programs": ["python", "python3", "py"],
       "prefixes": [["scripts/rust_build_status.py", "run-lane"]],
       "options": {"-I": 0, "-B": 0, "-u": 0},
       "allow_extra_args": true,

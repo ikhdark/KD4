@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_reflow_target_prevents_repeated_reschedule() {
+    fn pending_reflow_target_prevents_reschedule_until_cleared() {
         let mut state = TranscriptReflowState::default();
         state.note_width(/*width*/ 80);
 
@@ -249,16 +249,8 @@ mod tests {
         state.schedule_debounced(/*target_width*/ Some(100));
 
         assert!(!state.reflow_needed_for_width(/*width*/ 100));
-    }
-
-    #[test]
-    fn clear_pending_reflow_allows_same_width_to_be_rescheduled() {
-        let mut state = TranscriptReflowState::default();
-        state.note_width(/*width*/ 80);
-        state.schedule_debounced(/*target_width*/ Some(100));
-
         state.clear_pending_reflow();
-
+        assert!(!state.has_pending_reflow());
         assert!(state.reflow_needed_for_width(/*width*/ 100));
     }
 
@@ -272,31 +264,33 @@ mod tests {
     }
 
     #[test]
-    fn take_stream_finish_reflow_needed_drains_resize_request() {
-        let mut state = TranscriptReflowState::default();
-        state.mark_resize_requested_during_stream();
-
-        assert!(state.take_stream_finish_reflow_needed());
-        assert!(!state.take_stream_finish_reflow_needed());
-    }
-
-    #[test]
-    fn take_stream_finish_reflow_needed_drains_ran_during_stream() {
-        let mut state = TranscriptReflowState::default();
-        state.mark_ran_during_stream();
-
-        assert!(state.take_stream_finish_reflow_needed());
-        assert!(!state.take_stream_finish_reflow_needed());
+    fn take_stream_finish_reflow_needed_drains_each_flag_and_their_combination() {
+        for (requested, ran) in [(true, false), (false, true), (true, true)] {
+            let mut state = TranscriptReflowState::default();
+            if requested {
+                state.mark_resize_requested_during_stream();
+            }
+            if ran {
+                state.mark_ran_during_stream();
+            }
+            assert!(state.take_stream_finish_reflow_needed());
+            assert!(!state.take_stream_finish_reflow_needed());
+        }
     }
 
     #[test]
     fn clear_resets_stream_reflow_flags() {
         let mut state = TranscriptReflowState::default();
+        state.note_width(80);
+        state.schedule_debounced(Some(100));
         state.mark_ran_during_stream();
         state.mark_resize_requested_during_stream();
 
         state.clear();
 
         assert!(!state.take_stream_finish_reflow_needed());
+        assert!(!state.has_pending_reflow());
+        assert!(state.reflow_needed_for_width(100));
+        assert!(state.note_width(80).initialized);
     }
 }

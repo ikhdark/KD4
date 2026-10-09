@@ -823,14 +823,20 @@ mod tests {
             key,
             McpDeferredJobs::job_key(&info, r#"{"task":"y"}"#, "call-1")
         );
-        assert_ne!(
-            key,
-            McpDeferredJobs::job_key(
-                &tool_info("other", "other", "task"),
-                r#"{"task":"x"}"#,
-                "call-1"
-            )
-        );
+        for other in [
+            tool_info("other", "sample_tools", "task"),
+            tool_info("sample", "sample_tools", "other_task"),
+        ] {
+            assert_ne!(
+                key,
+                McpDeferredJobs::job_key(
+                    &other,
+                    r#"{"opts":{"a":[2],"b":1},"task":"x"}"#,
+                    "call-1"
+                ),
+                "server and tool identity must each distinguish otherwise identical calls",
+            );
+        }
 
         assert_ne!(
             McpDeferredJobs::job_key(&info, r#"{"task":"x"}"#, "call-1"),

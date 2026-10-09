@@ -454,5 +454,12 @@ mod tests {
         let op = AppCommand::bug_create("private report text".to_string());
 
         assert!(!outbound_op_is_loggable(&op));
+        assert!(outbound_op_is_loggable(&AppCommand::compact()));
+        let record = inbound_app_event_record(&AppEvent::CodexOp(op));
+        assert_eq!(record["variant"], "BugCreate");
+        assert_eq!(record["dir"], "to_tui");
+        assert_eq!(record["kind"], "app_event");
+        assert_eq!(record.as_object().unwrap().len(), 4);
+        assert!(!record.to_string().contains("private report text"));
     }
 }

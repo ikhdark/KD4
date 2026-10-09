@@ -276,9 +276,19 @@ mod tests {
         std::fs::write(&binary, b"running-build").unwrap();
         let running_hash = codex_utils_build_info::file_sha256(binary.as_path()).unwrap();
         let same = published_identity(Some(&binary), &running_hash, dir.path());
+        assert_eq!(same.0.as_deref(), Some(running_hash.as_str()));
         assert_eq!(same.1, Some(true));
+        assert_eq!(same.2.as_deref(), Some(dir.path()));
         assert_eq!(same.3, Some(true));
+        let different_home =
+            published_identity(Some(&binary), &running_hash, &dir.path().join("other-home"));
+        assert_eq!(different_home.1, Some(true));
+        assert_eq!(different_home.3, Some(false));
         std::fs::write(&binary, b"replacement-build-at-identical-path").unwrap();
+        let different_build = published_identity(Some(&binary), &running_hash, dir.path());
+        assert_ne!(different_build.0.as_deref(), Some(running_hash.as_str()));
+        assert_eq!(different_build.1, Some(false));
+        assert_eq!(different_build.3, Some(true));
         let changed = published_identity(Some(&binary), &running_hash, &dir.path().join("other-home"));
         assert_eq!(changed.1, Some(false));
         assert_eq!(changed.3, Some(false));
@@ -346,37 +356,29 @@ mod tests {
     }
 
     #[test]
-    fn build_warnings_ignore_unknown_dirty_state() {
-        assert!(
-            build_warnings(
-                BuildInfo {
-                    version: "0.1.0",
-                    commit: "unknown",
-                    dirty: "unknown",
-                    profile: "release",
-                    built: "unknown",
-                },
-                true,
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn build_warnings_ignore_dirty_build_without_local_target() {
-        assert!(
-            build_warnings(
-                BuildInfo {
-                    version: "0.1.0",
-                    commit: "abc123",
-                    dirty: "true",
-                    profile: "debug",
-                    built: "now",
-                },
-                false,
-            )
-            .is_empty()
-        );
+    fn build_warnings_require_a_known_dirty_build_and_local_target() {
+        for (dirty, local_target) in [
+            ("unknown", true),
+            ("false", true),
+            ("unknown", false),
+            ("false", false),
+            ("true", false),
+        ] {
+            assert!(
+                build_warnings(
+                    BuildInfo {
+                        version: "0.1.0",
+                        commit: "abc123",
+                        dirty,
+                        profile: "release",
+                        built: "now",
+                    },
+                    local_target,
+                )
+                .is_empty(),
+                "dirty={dirty}, local_target={local_target}"
+            );
+        }
     }
 
     #[test]

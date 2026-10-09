@@ -114,11 +114,8 @@ fn body_contains(req: &wiremock::Request, text: &str) -> bool {
 }
 
 async fn run_local_image_turn(detail: Option<ImageDetail>) -> Result<Vec<Value>> {
-    // Two Codex turns hit the mock model (session start + turn/start).
-    let responses = vec![
-        create_final_assistant_message_sse_response("Done")?,
-        create_final_assistant_message_sse_response("Done")?,
-    ];
+    // Thread creation does not sample; only turn/start calls the model.
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
     // Use the unchecked variant because the strict matcher does not currently
     // cover image-bearing request payloads.
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
@@ -172,11 +169,16 @@ async fn run_local_image_turn(detail: Option<ImageDetail>) -> Result<Vec<Value>>
     let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
     assert!(!turn.id.is_empty());
 
-    timeout(
+    let completed = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    let completed: TurnCompletedNotification =
+        serde_json::from_value(completed.params.context("turn/completed params")?)?;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.id, turn.id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
 
     received_response_input_images(&server).await
 }
@@ -1579,14 +1581,15 @@ async fn turn_start_rejects_unknown_environment_before_starting_turn() -> Result
 
 #[tokio::test]
 async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<()> {
-    // Provide a mock server and config so model wiring is valid.
-    // Three Codex turns hit the mock model (session start + two turn/start calls).
-    let responses = vec![
-        create_final_assistant_message_sse_response("Done")?,
-        create_final_assistant_message_sse_response("Done")?,
-        create_final_assistant_message_sse_response("Done")?,
-    ];
-    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            create_final_assistant_message_sse_response("Done")?,
+            create_final_assistant_message_sse_response("Done")?,
+        ],
+    )
+    .await;
 
     let codex_home = TempDir::new()?;
     create_config_toml(
@@ -1720,6 +1723,11 @@ async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<(
     assert_eq!(completed2.turn.status, TurnStatus::Completed);
     assert_eq!(completed2.turn.items_view, TurnItemsView::NotLoaded);
     assert!(completed2.turn.items.is_empty());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body_json()["model"], "mock-model");
+    assert_eq!(requests[1].body_json()["model"], "mock-model-override");
 
     Ok(())
 }
@@ -2288,8 +2296,9 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
     )
     .await?;
     let mut saw_resolved = false;
+    let completion_deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
-        let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+        let message = timeout_at(completion_deadline, mcp.read_next_message()).await??;
         let JSONRPCMessage::Notification(notification) = message else {
             continue;
         };
@@ -2336,11 +2345,27 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
     )
     .await??;
 
-    // Ensure we do NOT receive a CommandExecutionRequestApproval request before task completes
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
+    // The notification helper buffers requests, so inspect every message rather
+    // than allowing an unexpected approval request to hide behind completion.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match mcp.read_next_message().await? {
+                JSONRPCMessage::Request(request) => {
+                    anyhow::bail!("unexpected approval request with approval_policy=never: {request:?}");
+                }
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "turn/completed" =>
+                {
+                    let completed: TurnCompletedNotification =
+                        serde_json::from_value(notification.params.context("completion params")?)?;
+                    assert_eq!(completed.thread_id, thread.id);
+                    assert_eq!(completed.turn.status, TurnStatus::Completed);
+                    return Ok::<(), anyhow::Error>(());
+                }
+                _ => {}
+            }
+        }
+    })
     .await??;
 
     Ok(())
@@ -4022,17 +4047,40 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     assert_eq!(id, "patch-call-2");
     assert_eq!(status, PatchApplyStatus::InProgress);
 
-    // If the server incorrectly emits FileChangeRequestApproval, the helper below will error
-    // (it bails on unexpected JSONRPCMessage::Request), causing the test to fail.
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("item/completed"),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
+    // Inspect requests explicitly: notification-only reads buffer them.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        let mut patch_completed = false;
+        loop {
+            match mcp.read_next_message().await? {
+                JSONRPCMessage::Request(request) => {
+                    anyhow::bail!("AcceptForSession unexpectedly requested approval: {request:?}");
+                }
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "item/completed" =>
+                {
+                    let completed: ItemCompletedNotification =
+                        serde_json::from_value(notification.params.context("item/completed params")?)?;
+                    if let ThreadItem::FileChange { id, status, .. } = completed.item
+                        && id == "patch-call-2"
+                    {
+                        assert_eq!(status, PatchApplyStatus::Completed);
+                        patch_completed = true;
+                    }
+                }
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "turn/completed" =>
+                {
+                    let completed: TurnCompletedNotification =
+                        serde_json::from_value(notification.params.context("completion params")?)?;
+                    assert_eq!(completed.thread_id, thread.id);
+                    assert_eq!(completed.turn.status, TurnStatus::Completed);
+                    assert!(patch_completed, "patch completion must precede turn completion");
+                    return Ok::<(), anyhow::Error>(());
+                }
+                _ => {}
+            }
+        }
+    })
     .await??;
 
     assert_eq!(std::fs::read_to_string(readme_path)?, "updated line\n");

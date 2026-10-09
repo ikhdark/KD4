@@ -114,6 +114,11 @@ mod tests {
     fn test_session_id_default_is_not_zeroes() {
         let id = SessionId::default();
         assert_ne!(id.uuid, Uuid::nil());
+        assert_eq!(id.uuid.get_version(), Some(uuid::Version::SortRand));
+        assert_eq!(
+            serde_json::from_value::<SessionId>(serde_json::to_value(id).unwrap()).unwrap(),
+            id
+        );
     }
 
     #[test]

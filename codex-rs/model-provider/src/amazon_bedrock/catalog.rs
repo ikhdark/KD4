@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_uses_mantle_model_ids_as_slugs() {
+    fn catalog_preserves_model_order_and_enforces_bedrock_limits() {
         let catalog = static_model_catalog();
 
         assert_eq!(
@@ -236,12 +236,6 @@ mod tests {
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
             ]
         );
-    }
-
-    #[test]
-    fn gpt_5_bedrock_models_use_bedrock_context_window() {
-        let catalog = static_model_catalog();
-
         for model in catalog.models {
             let expected = match model.slug.as_str() {
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID => (
@@ -256,15 +250,19 @@ mod tests {
                 "{}",
                 model.slug
             );
-        }
-    }
-
-    #[test]
-    fn gpt_5_bedrock_models_do_not_include_availability_nux_or_upgrade() {
-        let catalog = static_model_catalog();
-
-        for model in catalog.models {
-            assert_eq!((model.availability_nux, model.upgrade), (None, None));
+            assert_eq!((&model.availability_nux, &model.upgrade), (&None, &None));
+            assert_eq!(model.additional_speed_tiers, Vec::<String>::new());
+            assert_eq!(model.service_tiers, Vec::new());
+            assert_eq!(model.default_service_tier, None);
+            assert_eq!(
+                model.service_tier_for_request(Some("priority".to_string())),
+                None
+            );
+            assert_eq!(
+                model
+                    .service_tier_for_request(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
+                None
+            );
         }
     }
 
@@ -317,23 +315,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gpt_5_bedrock_models_only_allow_default_service_tier() {
-        let catalog = static_model_catalog();
-
-        for model in catalog.models {
-            assert_eq!(model.additional_speed_tiers, Vec::<String>::new());
-            assert_eq!(model.service_tiers, Vec::new());
-            assert_eq!(model.default_service_tier, None);
-            assert_eq!(
-                model.service_tier_for_request(Some("priority".to_string())),
-                None
-            );
-            assert_eq!(
-                model
-                    .service_tier_for_request(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
-                None
-            );
-        }
-    }
 }

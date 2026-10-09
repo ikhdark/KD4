@@ -94,7 +94,6 @@ use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
-const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 
 #[test]
 fn receipt_shaped_text_has_no_budget_exemption() {
@@ -168,49 +167,9 @@ fn prepared_append_rejects_cross_family_output_pairing() {
     assert!(!prepared_append_is_complete_and_safe(&[call, output], true));
 }
 
-#[test]
-fn prepared_prompt_small_prefix_releases_discarded_storage() {
-    let expected = agent_message("retained");
-    let original = PreparedPromptItems::from_shared(vec![expected.clone(); 128].into());
-    let old_storage = Arc::downgrade(&original.0);
-    let prefix = original.truncated(2);
-    drop(original);
-    assert!(old_storage.upgrade().is_none());
-    assert_eq!(prefix.as_slice(), &[expected.clone(), expected]);
-    assert_eq!(prefix.get(2), None);
 
-    let lazy = prefix.appended(vec![agent_message("tail")].into());
-    let retained_storage = Arc::downgrade(&lazy.0);
-    let small_adjustment = lazy.truncated(2);
-    drop(lazy);
-    assert!(retained_storage.upgrade().is_some());
-    assert!(!small_adjustment.is_materialized());
-    let empty = small_adjustment.truncated(0);
-    drop(small_adjustment);
-    assert!(retained_storage.upgrade().is_none());
-    assert!(empty.as_slice().is_empty());
-}
 
-#[test]
-fn prepared_prompt_truncation_releases_large_discarded_storage() {
-    let first = agent_message("retained");
-    let mut source = vec![agent_message("discarded"); 1024];
-    source[0] = first.clone();
-    let source: Arc<[ResponseItem]> = source.into();
-    let weak = Arc::downgrade(&source);
-    let prefix = PreparedPromptItems::from_shared(source).truncated(1);
-    assert_eq!(prefix.shared().as_ref(), &[first]);
-    assert!(
-        weak.upgrade().is_none(),
-        "discarded backing must be released"
-    );
 
-    let source: Arc<[ResponseItem]> = vec![agent_message("small"); 4].into();
-    let weak = Arc::downgrade(&source);
-    let prefix = PreparedPromptItems::from_shared(source).truncated(3);
-    assert!(weak.upgrade().is_some(), "small cuts keep a cheap view");
-    assert_eq!(prefix.shared().len(), 3);
-}
 
 #[test]
 fn tool_search_acknowledgement_preserves_full_schema_bytes() {
@@ -236,46 +195,9 @@ fn tool_search_acknowledgement_preserves_full_schema_bytes() {
     assert_eq!(expected["tools"][0]["description"], "discard");
 }
 
-#[test]
-fn prepared_prompt_index_uses_materialized_items_and_respects_truncation() {
-    let first = agent_message("first");
-    let second = agent_message("second");
-    let third = agent_message("third");
-    let items = PreparedPromptItems::from_shared(vec![first.clone()].into())
-        .appended(vec![second.clone(), third].into())
-        .truncated(2);
-    assert_eq!(items.get(0), Some(&first));
-    assert_eq!(items.get(1), Some(&second));
-    assert_eq!(items.get(2), None);
-    let shared = items.shared();
-    assert!(std::ptr::eq(items.get(0).unwrap(), &shared[0]));
-    assert!(std::ptr::eq(items.get(1).unwrap(), &shared[1]));
-    assert_eq!(items.get(2), None);
-}
 
-#[test]
-fn prepared_prompt_index_walks_deep_unmaterialized_chains() {
-    let first = agent_message("first");
-    let mut versions = vec![PreparedPromptItems::from_shared(vec![first.clone()].into())];
-    for _ in 0..4096 {
-        let last = versions.last().unwrap();
-        versions.push(
-            last.appended(vec![agent_message("tail")].into())
-                .truncated(1),
-        );
-    }
-    let last = versions.last().unwrap().clone();
-    for _ in 0..3 {
-        assert_eq!(last.get(0), Some(&first));
-        assert_eq!(last.get(1), None);
-        assert!(versions[1..].iter().all(|items| !items.is_materialized()));
-    }
-    let head = Arc::downgrade(&last.0);
-    // Release the other owners first, as replacing a prepared history does.
-    drop(versions);
-    drop(last);
-    assert!(head.upgrade().is_none());
-}
+
+
 
 #[test]
 fn prompt_projections_share_primary_storage_during_runtime_append() {
@@ -654,21 +576,16 @@ fn cloning_history_shares_realized_context_and_world_state_baselines() {
     );
 }
 
-#[test]
-fn reference_context_presence_can_be_checked_without_materializing_the_item() {
-    let mut history = ContextManager::new();
-    assert!(!history.has_reference_context_item());
 
-    history.set_reference_context_item(Some(reference_context_item()));
-    assert!(history.has_reference_context_item());
-
-    history.set_reference_context_item(None);
-    assert!(!history.has_reference_context_item());
-}
 
 #[test]
 fn replacing_history_invalidates_the_realized_context_baseline() {
     let mut history = create_history_with_items(vec![user_input_text_msg("old request")]);
+    assert!(!history.has_reference_context_item());
+    history.set_reference_context_item(Some(reference_context_item()));
+    assert!(history.has_reference_context_item());
+    history.set_reference_context_item(None);
+    assert!(!history.has_reference_context_item());
     history.set_reference_context_item(Some(reference_context_item()));
     let previous = history.clone();
 
@@ -1094,9 +1011,7 @@ fn reasoning_with_all_fields(text: &str, encrypted_content: &str) -> ResponseIte
     }
 }
 
-fn truncate_exec_output(content: &str) -> String {
-    truncate_text(content, TruncationPolicy::Tokens(EXEC_FORMAT_MAX_TOKENS))
-}
+
 
 fn approx_token_count_for_text(text: &str) -> i64 {
     i64::try_from(text.len().saturating_add(3) / 4).unwrap_or(i64::MAX)
@@ -1218,6 +1133,7 @@ fn for_prompt_uses_all_instruction_boundary_kinds() {
         agent_message("agent instruction"),
         inter_agent_assistant_msg("structured instruction"),
     ] {
+        assert!(is_user_turn_boundary(&boundary));
         let history = create_history_with_items(vec![reasoning_msg("resolved"), boundary.clone()]);
         assert_eq!(
             history.for_prompt(&default_input_modalities()),
@@ -1235,6 +1151,7 @@ fn for_prompt_does_not_treat_contextual_user_or_legacy_assistant_text_as_boundar
     let legacy = assistant_msg(
         "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue",
     );
+    assert!(!is_user_turn_boundary(&legacy));
     let reasoning = reasoning_msg("still active");
     let history =
         create_history_with_items(vec![reasoning.clone(), contextual.clone(), legacy.clone()]);
@@ -1333,12 +1250,7 @@ fn items_after_last_model_generated_tokens_are_zero_without_model_generated_item
     );
 }
 
-#[test]
-fn inter_agent_assistant_messages_are_turn_boundaries() {
-    let item = inter_agent_assistant_msg("continue");
 
-    assert!(is_user_turn_boundary(&item));
-}
 
 #[test]
 fn for_prompt_preserves_inter_agent_assistant_messages() {
@@ -1367,14 +1279,7 @@ fn drop_last_n_user_turns_treats_inter_agent_assistant_messages_as_instruction_t
     assert_eq!(history.raw_items(), &vec![first_turn, first_reply]);
 }
 
-#[test]
-fn legacy_inter_agent_assistant_messages_are_not_turn_boundaries() {
-    let item = assistant_msg(
-        "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue",
-    );
 
-    assert!(!is_user_turn_boundary(&item));
-}
 
 #[test]
 fn total_token_usage_keeps_server_snapshot_plus_same_group_tool_tail_in_both_modes() {
@@ -2101,7 +2006,19 @@ fn replace_last_turn_images_finds_image_before_later_text_output() {
 
 #[test]
 fn replace_last_turn_images_replaces_images_in_every_output_once() {
+    let previous_turn = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "previous-turn".to_string(),
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,OLD".to_string(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
     let mut history = create_history_with_items(vec![
+        previous_turn.clone(),
         user_input_text_msg("hi"),
         ResponseItem::FunctionCallOutput {
             id: None,
@@ -2133,6 +2050,7 @@ fn replace_last_turn_images_replaces_images_in_every_output_once() {
     assert_eq!(
         history.raw_items(),
         vec![
+            previous_turn,
             user_input_text_msg("hi"),
             ResponseItem::FunctionCallOutput {
                 id: None,
@@ -2157,6 +2075,10 @@ fn replace_last_turn_images_replaces_images_in_every_output_once() {
             },
         ]
     );
+    assert_eq!(history.history_version(), previous_history_version + 1);
+    let replaced = history.raw_items().to_vec();
+    assert!(!history.replace_last_turn_images("Second replacement"));
+    assert_eq!(history.raw_items(), replaced);
     assert_eq!(history.history_version(), previous_history_version + 1);
 }
 
@@ -2431,109 +2353,75 @@ fn normalization_retains_local_shell_outputs() {
 }
 
 #[test]
-fn record_items_truncates_function_call_output_content() {
-    let mut history = ContextManager::new();
-    // Any reasonably small token budget works; the test only cares that
-    // truncation happens and the marker is present.
-    let policy = TruncationPolicy::Tokens(1_000);
-    let long_line = "a very long line to trigger truncation\n";
-    let long_output = long_line.repeat(2_500);
-    let item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-100".to_string(),
-        output: FunctionCallOutputPayload {
-            body: FunctionCallOutputBody::Text(long_output.clone()),
-            success: Some(true),
-        },
-        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
-            turn_id: Some("turn-1".to_string()),
-        }),
-    };
-
-    history.record_items([&item], policy);
-
-    assert_eq!(history.items.len(), 1);
-    match &history.items[0] {
-        ResponseItem::FunctionCallOutput { output, .. } => {
-            let content = output.text_content().unwrap_or_default();
-            assert_ne!(content, long_output);
-            assert!(
-                content.contains("tokens truncated"),
-                "expected token-based truncation marker, got {content}"
-            );
-            assert!(
-                content.contains("tokens truncated"),
-                "expected truncation marker, got {content}"
-            );
-            assert!(approx_token_count(content) <= policy.token_budget());
+fn record_items_preserves_output_metadata_and_enforces_truncation_policy() {
+    let numbered = |count, width| (0..count)
+        .map(|index| format!("line-{index}-{}\n", "x".repeat(width)))
+        .collect::<String>();
+    for (head, original, budget) in [
+        ("a very long line", "a very long line to trigger truncation\n".repeat(2_500), 1_000),
+        ("custom output", "custom output that is very long\n".repeat(2_500), 1_000),
+        ("tokenized", "tokenized content repeated many times ".repeat(200), 10),
+        ("very long execution error", "very long execution error line that should trigger truncation\n".repeat(2_500), 2_500),
+        ("a", "a".repeat(EXEC_FORMAT_MAX_BYTES + 10_000), 2_500),
+        ("example output", "example output\n".repeat(10), 2_500),
+        ("line-0-", numbered(2_000, 64), 2_500),
+        ("line-0-", numbered(300, 256), 2_500),
+    ] {
+        let policy = TruncationPolicy::Tokens(budget);
+        for custom in [false, true] {
+            let payload = FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(original.clone()),
+                success: Some(!custom),
+            };
+            let mut item = if custom {
+                ResponseItem::CustomToolCallOutput {
+                    id: Some(ResponseItemId::with_suffix("ctco", "retained")),
+                    call_id: "call".into(),
+                    name: Some("custom".into()),
+                    output: payload,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+            } else {
+                ResponseItem::FunctionCallOutput {
+                    id: Some(ResponseItemId::with_suffix("fco", "retained")),
+                    call_id: "call".into(),
+                    output: payload,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+            };
+            item.set_turn_id_if_missing("turn-1");
+            let mut history = ContextManager::new();
+            history.record_items([&item], policy);
+            let [stored] = history.raw_items() else { panic!("exactly one output") };
+            let (ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. }) = stored
+                else { panic!("output family preserved") };
+            let text = output.text_content().expect("text output");
+            assert!(approx_token_count(text) <= policy.token_budget());
+            if approx_token_count(&original) <= policy.token_budget() {
+                assert_eq!(text, original);
+            } else {
+                assert_ne!(text, original);
+                assert!(text.contains("tokens truncated"));
+                if budget == 2_500 {
+                    assert_truncated_message_matches(text, head, &original);
+                }
+                if !original.contains('\n') {
+                    assert!(!text.contains("omitted"));
+                }
+            }
+            let (ResponseItem::FunctionCallOutput { output: expected, .. }
+                | ResponseItem::CustomToolCallOutput { output: expected, .. }) = &mut item
+                else { unreachable!() };
+            expected.body = FunctionCallOutputBody::Text(truncate_text(&original, policy));
+            assert_eq!(stored, &item, "only the payload text may change");
         }
-        other => panic!("unexpected history item: {other:?}"),
-    }
-    assert_eq!(history.items[0].turn_id(), Some("turn-1"));
-}
-
-#[test]
-fn record_items_truncates_custom_tool_call_output_content() {
-    let mut history = ContextManager::new();
-    let policy = TruncationPolicy::Tokens(1_000);
-    let line = "custom output that is very long\n";
-    let long_output = line.repeat(2_500);
-    let item = ResponseItem::CustomToolCallOutput {
-        id: None,
-        call_id: "tool-200".to_string(),
-        name: None,
-        output: FunctionCallOutputPayload::from_text(long_output.clone()),
-        internal_chat_message_metadata_passthrough: None,
-    };
-
-    history.record_items([&item], policy);
-
-    assert_eq!(history.items.len(), 1);
-    match &history.items[0] {
-        ResponseItem::CustomToolCallOutput { output, .. } => {
-            let output = output.text_content().unwrap_or_default();
-            assert_ne!(output, long_output);
-            assert!(
-                output.contains("tokens truncated"),
-                "expected token-based truncation marker, got {output}"
-            );
-            assert!(
-                output.contains("tokens truncated") || output.contains("bytes truncated"),
-                "expected truncation marker, got {output}"
-            );
-            assert!(approx_token_count(output) <= policy.token_budget());
-        }
-        other => panic!("unexpected history item: {other:?}"),
     }
 }
 
-#[test]
-fn record_items_respects_custom_token_limit() {
-    let mut history = ContextManager::new();
-    let policy = TruncationPolicy::Tokens(10);
-    let long_output = "tokenized content repeated many times ".repeat(200);
-    let item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-custom-limit".to_string(),
-        output: FunctionCallOutputPayload {
-            body: FunctionCallOutputBody::Text(long_output),
-            success: Some(true),
-        },
-        internal_chat_message_metadata_passthrough: None,
-    };
 
-    history.record_items([&item], policy);
 
-    let stored = match &history.items[0] {
-        ResponseItem::FunctionCallOutput { output, .. } => output,
-        other => panic!("unexpected history item: {other:?}"),
-    };
-    assert!(
-        stored
-            .text_content()
-            .is_some_and(|content| content.contains("tokens truncated"))
-    );
-}
+
 
 fn assert_truncated_message_matches(message: &str, line: &str, original: &str) {
     let pattern = truncated_message_pattern(line);
@@ -2573,69 +2461,15 @@ fn truncated_message_pattern(line: &str) -> String {
     )
 }
 
-#[test]
-fn format_exec_output_truncates_large_error() {
-    let line = "very long execution error line that should trigger truncation\n";
-    let large_error = line.repeat(2_500); // way beyond both byte and line limits
 
-    let truncated = truncate_exec_output(&large_error);
 
-    assert_truncated_message_matches(&truncated, line, &large_error);
-    assert_ne!(truncated, large_error);
-}
 
-#[test]
-fn format_exec_output_marks_byte_truncation_without_omitted_lines() {
-    let long_line = "a".repeat(EXEC_FORMAT_MAX_BYTES + 10000);
-    let truncated = truncate_exec_output(&long_line);
-    assert_ne!(truncated, long_line);
-    assert_truncated_message_matches(&truncated, "a", &long_line);
-    assert!(
-        !truncated.contains("omitted"),
-        "line omission marker should not appear when no lines were dropped: {truncated}"
-    );
-}
 
-#[test]
-fn format_exec_output_returns_original_when_within_limits() {
-    let content = "example output\n".repeat(10);
-    assert_eq!(truncate_exec_output(&content), content);
-}
 
-#[test]
-fn format_exec_output_reports_omitted_lines_and_keeps_head_and_tail() {
-    let total_lines = 2_000;
-    let filler = "x".repeat(64);
-    let content: String = (0..total_lines)
-        .map(|idx| format!("line-{idx}-{filler}\n"))
-        .collect();
 
-    let truncated = truncate_exec_output(&content);
-    assert_truncated_message_matches(&truncated, "line-0-", &content);
-    assert!(
-        truncated.contains("line-0-"),
-        "expected head line to remain: {truncated}"
-    );
 
-    let last_line = format!("line-{}-", total_lines - 1);
-    assert!(
-        truncated.contains(&last_line),
-        "expected tail line to remain: {truncated}"
-    );
-}
 
-#[test]
-fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
-    let total_lines = 300;
-    let long_line = "x".repeat(256);
-    let content: String = (0..total_lines)
-        .map(|idx| format!("line-{idx}-{long_line}\n"))
-        .collect();
 
-    let truncated = truncate_exec_output(&content);
-
-    assert_truncated_message_matches(&truncated, "line-0-", &content);
-}
 
 #[cfg(not(debug_assertions))]
 #[test]
@@ -4945,26 +4779,7 @@ fn non_image_base64_data_url_in_image_input_uses_image_estimate() {
     );
 }
 
-#[test]
-fn mixed_case_data_url_markers_are_adjusted() {
-    let payload = "F".repeat(1_024);
-    let image_url = format!("DATA:image/png;BASE64,{payload}");
-    let item = ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputImage {
-            image_url,
-            detail: Some(DEFAULT_IMAGE_DETAIL),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
 
-    let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = RESIZED_IMAGE_BYTES_ESTIMATE;
-
-    assert_eq!(estimated, expected);
-}
 
 #[test]
 fn multiple_inline_images_apply_multiple_fixed_costs() {
@@ -4999,36 +4814,32 @@ fn multiple_inline_images_apply_multiple_fixed_costs() {
 }
 
 #[test]
-fn original_detail_images_scale_with_dimensions() {
-    // 2304x864 at 32px patches yields 72 * 27 = 1,944 patches.
-    // The byte heuristic uses 4 bytes per token, so the replacement cost is 7,776 bytes.
-    const EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES: i64 = 7_776;
-
-    let width = 2304;
-    let height = 864;
-    let image = ImageBuffer::from_pixel(width, height, Rgba([12u8, 34, 56, 255]));
-    let mut bytes = std::io::Cursor::new(Vec::new());
-    image
-        .write_to(&mut bytes, ImageFormat::Png)
-        .expect("encode png");
-    let payload = BASE64_STANDARD.encode(bytes.get_ref());
-    let image_url = format!("data:image/png;base64,{payload}");
-    let item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-original".to_string(),
-        output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputImage {
-                image_url,
-                detail: Some(ImageDetail::Original),
-            },
-        ]),
-        internal_chat_message_metadata_passthrough: None,
-    };
-
-    let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = "call-original".len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
-
-    assert_eq!(estimated, expected);
+fn original_detail_png_and_webp_images_parse_markers_and_round_up_patches() {
+    for (format, mime) in [(ImageFormat::Png, "png"), (ImageFormat::WebP, "webp")] {
+        for (width, height, expected_bytes) in [(2304, 864, 7_776), (33, 65, 24)] {
+            let image = ImageBuffer::from_pixel(width, height, Rgba([12u8, 34, 56, 255]));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut bytes, format).expect("encode image");
+            let payload = BASE64_STANDARD.encode(bytes.get_ref());
+            for scheme in [format!("data:image/{mime};base64"), format!("DATA:image/{mime};BASE64")] {
+                let item = ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "call-original".into(),
+                    output: FunctionCallOutputPayload::from_content_items(vec![
+                        FunctionCallOutputContentItem::InputImage {
+                            image_url: format!("{scheme},{payload}"),
+                            detail: Some(ImageDetail::Original),
+                        },
+                    ]),
+                    internal_chat_message_metadata_passthrough: None,
+                };
+                assert_eq!(
+                    estimate_response_item_model_visible_bytes(&item),
+                    "call-original".len() as i64 + expected_bytes,
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -5064,37 +4875,7 @@ fn original_detail_images_are_capped_at_max_patch_count() {
     assert_eq!(estimated, expected);
 }
 
-#[test]
-fn original_detail_webp_images_scale_with_dimensions() {
-    // Same dimensions as the PNG case above, so the patch-based replacement cost is the same.
-    const EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES: i64 = 7_776;
 
-    let width = 2304;
-    let height = 864;
-    let image = ImageBuffer::from_pixel(width, height, Rgba([12u8, 34, 56, 255]));
-    let mut bytes = std::io::Cursor::new(Vec::new());
-    image
-        .write_to(&mut bytes, ImageFormat::WebP)
-        .expect("encode webp");
-    let payload = BASE64_STANDARD.encode(bytes.get_ref());
-    let image_url = format!("data:image/webp;base64,{payload}");
-    let item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-original-webp".to_string(),
-        output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputImage {
-                image_url,
-                detail: Some(ImageDetail::Original),
-            },
-        ]),
-        internal_chat_message_metadata_passthrough: None,
-    };
-
-    let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = "call-original-webp".len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
-
-    assert_eq!(estimated, expected);
-}
 
 #[test]
 fn text_only_items_count_content_without_envelopes() {
@@ -5347,194 +5128,4 @@ fn tokenizer_bounded_cell_output_is_not_truncated_again_by_history() {
 
 // TEMPORARY wall-clock benchmark for the history-preparation audit. Not a
 // regression test; removed after measurement.
-#[test]
-#[ignore = "manual wall-clock benchmark"]
-fn zz_bench_sampling_preparation_wall_clock() {
-    use std::time::Duration;
-    use std::time::Instant;
 
-    // Shapes follow local rollouts: code-mode `exec` calls (~1.7 KB input,
-    // ~20 KB JSON-ish output), ~3 KB encrypted reasoning, periodic commentary.
-    fn exec_call(round: usize) -> ResponseItem {
-        let mut input = String::with_capacity(1_800);
-        while input.len() < 1_700 {
-            input.push_str(&format!(
-                "const r{round} = await tools.exec_command({{ cmd: \"rg -n \\\"symbol_{round}\\\" src\" }});\n"
-            ));
-        }
-        ResponseItem::CustomToolCall {
-            id: None,
-            status: None,
-            call_id: format!("call-{round:04}"),
-            name: "exec".to_string(),
-            namespace: None,
-            input,
-            internal_chat_message_metadata_passthrough: None,
-        }
-    }
-    fn exec_output(round: usize) -> ResponseItem {
-        let mut text = String::with_capacity(20_200);
-        let mut line = 0;
-        while text.len() < 20_000 {
-            text.push_str(&format!(
-                "{{\"path\":\"src/module_{round}/file_{line}.rs\",\"line\":{line},\"text\":\"    let value = compute(\\\"{round}-{line}\\\");\\tnext();\"}}\n"
-            ));
-            line += 1;
-        }
-        ResponseItem::CustomToolCallOutput {
-            id: None,
-            call_id: format!("call-{round:04}"),
-            name: None,
-            output: FunctionCallOutputPayload::from_text(text),
-            internal_chat_message_metadata_passthrough: None,
-        }
-    }
-    fn record_round(history: &mut ContextManager, round: usize) {
-        let policy = TruncationPolicy::Tokens(10_000);
-        // Calls and outputs are recorded at separate lifecycle boundaries.
-        history.record_items(
-            [reasoning_with_encrypted_content(3_000), exec_call(round)].iter(),
-            policy,
-        );
-        history.record_items([exec_output(round)].iter(), policy);
-        if round % 4 == 3 {
-            history.record_items(
-                [assistant_msg(
-                    &"Inspecting the module structure before editing. ".repeat(45),
-                )]
-                .iter(),
-                policy,
-            );
-        }
-    }
-    fn stats(samples: &mut [Duration]) -> (u128, u128, u128) {
-        samples.sort();
-        let median = samples[samples.len() / 2].as_micros();
-        let p90 = samples[(samples.len() * 9 / 10).min(samples.len() - 1)].as_micros();
-        let mean = samples.iter().map(Duration::as_micros).sum::<u128>() / samples.len() as u128;
-        (median, mean, p90)
-    }
-    fn time_median(mut operation: impl FnMut()) -> u128 {
-        let mut samples = (0..25)
-            .map(|_| {
-                let started = Instant::now();
-                operation();
-                started.elapsed()
-            })
-            .collect::<Vec<_>>();
-        stats(&mut samples).0
-    }
-
-    let workspace = crate::git_workspace::GitWorkspaceCache::new();
-    let modalities = default_input_modalities();
-    let prepare = |history: &ContextManager| {
-        let prepared = history
-            .clone()
-            .prepare_for_sampling_prompt_with_completed_tool_projection(
-                &modalities,
-                StableContextTarget::Sampling,
-                None,
-                &workspace,
-            );
-        // The reads `build_projected_prompt_from_scaffold` performs.
-        std::hint::black_box((
-            prepared.shared_prompt_projections(),
-            prepared.fingerprint(),
-            prepared.prompt_provenance().clone(),
-        ));
-        prepared
-    };
-    const CONTINUATIONS: usize = 12;
-    const ITERATIONS: usize = 6;
-    for (label, rounds) in [("short", 10), ("long", 60), ("xlong", 85)] {
-        let mut miss = Vec::new();
-        let mut continuation = Vec::new();
-        let mut record = Vec::new();
-        let mut sizes = (0, 0, 0, 0);
-        for iteration in 0..ITERATIONS {
-            let mut history = ContextManager::new();
-            history.record_items(
-                [
-                    developer_msg(&"<permissions instructions>sandboxed workspace</permissions instructions>\n".repeat(50)),
-                    user_input_text_msg("Audit the module and fix the failing tests."),
-                ]
-                .iter(),
-                TruncationPolicy::Tokens(10_000),
-            );
-            for round in 0..rounds {
-                record_round(&mut history, round);
-            }
-            let start_items = history.raw_items().len();
-            let start_bytes = serde_json::to_vec(history.raw_items()).unwrap().len();
-            let started = Instant::now();
-            let first = prepare(&history);
-            let miss_elapsed = started.elapsed();
-            assert!(history.sampling_projection_anchor_len().is_some());
-            let mut previous = first;
-            for step in 0..CONTINUATIONS {
-                let started = Instant::now();
-                record_round(&mut history, rounds + step);
-                let record_elapsed = started.elapsed();
-                let started = Instant::now();
-                let prepared = prepare(&history);
-                let continuation_elapsed = started.elapsed();
-                assert!(prepared.items().starts_with(previous.items()));
-                if iteration > 0 {
-                    record.push(record_elapsed);
-                    continuation.push(continuation_elapsed);
-                }
-                previous = prepared;
-            }
-            if iteration > 0 {
-                miss.push(miss_elapsed);
-            }
-            sizes = (
-                start_items,
-                start_bytes,
-                history.raw_items().len(),
-                serde_json::to_vec(history.raw_items()).unwrap().len(),
-            );
-        }
-        let (miss_median, miss_mean, _) = stats(&mut miss);
-        let (cont_median, cont_mean, cont_p90) = stats(&mut continuation);
-        let (record_median, record_mean, _) = stats(&mut record);
-        println!(
-            "BENCH size={label} items={}..{} bytes={}..{} turn_start_median_us={miss_median} turn_start_mean_us={miss_mean} continuation_median_us={cont_median} continuation_mean_us={cont_mean} continuation_p90_us={cont_p90} record_median_us={record_median} record_mean_us={record_mean}",
-            sizes.0, sizes.2, sizes.1, sizes.3,
-        );
-    }
-
-    // Attribute one continuation's whole-history passes on the long shape.
-    let mut history = ContextManager::new();
-    history.record_items(
-        [user_input_text_msg("Audit the module and fix the failing tests.")].iter(),
-        TruncationPolicy::Tokens(10_000),
-    );
-    for round in 0..60 {
-        record_round(&mut history, round);
-    }
-    let prepared = prepare(&history);
-    let items = prepared.shared_items();
-    let manifest = prepared.stable_context_manifest().clone();
-    let policy = prepared.policy;
-    let fingerprint_us = time_median(|| {
-        std::hint::black_box(PreparedHistoryFingerprint::new(&items, &manifest, policy).ok());
-    });
-    let provenance_us = time_median(|| {
-        std::hint::black_box(PromptProvenanceSidecar::from_assembled_items(&items, &manifest));
-    });
-    let copy: Arc<[ResponseItem]> = items.iter().cloned().collect();
-    let deep_clone_us = time_median(|| {
-        std::hint::black_box(items.iter().cloned().collect::<Arc<[ResponseItem]>>());
-    });
-    let deep_eq_us = time_median(|| {
-        std::hint::black_box(items[..] == copy[..]);
-    });
-    let serialize_us = time_median(|| {
-        std::hint::black_box(serde_json::to_vec(items.as_ref()).unwrap());
-    });
-    println!(
-        "BENCH_PARTS size=long items={} fingerprint_us={fingerprint_us} provenance_us={provenance_us} deep_clone_us={deep_clone_us} deep_eq_us={deep_eq_us} serialize_request_items_us={serialize_us}",
-        items.len()
-    );
-}

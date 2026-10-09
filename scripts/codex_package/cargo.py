@@ -810,7 +810,7 @@ def read_source_build_stamp(
         return None
     try:
         stamp = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if (
         not isinstance(stamp, dict)

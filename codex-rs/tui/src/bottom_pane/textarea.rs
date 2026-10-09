@@ -2250,7 +2250,9 @@ mod tests {
         let mut t = TextArea::new();
         t.set_vim_enabled(/*enabled*/ true);
 
-        t.input(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        t.input(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(t.vim_mode_label(), Some("Insert"));
+        assert_eq!(t.cursor(), 0);
         t.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert_eq!(t.vim_mode_label(), Some("Normal"));
@@ -2324,31 +2326,23 @@ mod tests {
     }
 
     #[test]
-    fn vim_shift_c_changes_to_line_end_and_enters_insert_mode() {
-        let mut t = ta_with("hello world\nnext line");
-        t.set_cursor(/*pos*/ 6);
-        t.set_vim_enabled(/*enabled*/ true);
-
-        t.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SHIFT));
-
-        assert_eq!(t.text(), "hello \nnext line");
-        assert_eq!(t.vim_mode_label(), Some("Insert"));
-        assert_eq!(t.cursor(), 6);
-        assert_eq!(t.kill_buffer, "world");
+    fn vim_change_to_line_end_accepts_both_shift_encodings() {
+        for (key, modifiers) in [
+            ('c', KeyModifiers::SHIFT),
+            ('C', KeyModifiers::NONE),
+        ] {
+            let mut t = ta_with("hello world\nnext line");
+            t.set_cursor(/*pos*/ 6);
+            t.set_vim_enabled(/*enabled*/ true);
+            t.input(KeyEvent::new(KeyCode::Char(key), modifiers));
+            assert_eq!(t.text(), "hello \nnext line");
+            assert_eq!(t.vim_mode_label(), Some("Insert"));
+            assert_eq!(t.cursor(), 6);
+            assert_eq!(t.kill_buffer, "world");
+        }
     }
 
-    #[test]
-    fn vim_uppercase_c_changes_to_line_end() {
-        let mut t = ta_with("hello world\nnext line");
-        t.set_cursor(/*pos*/ 6);
-        t.set_vim_enabled(/*enabled*/ true);
 
-        t.input(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
-
-        assert_eq!(t.text(), "hello \nnext line");
-        assert_eq!(t.vim_mode_label(), Some("Insert"));
-        assert_eq!(t.cursor(), 6);
-    }
 
     #[test]
     fn vim_s_substitutes_current_character_and_enters_insert_mode() {
@@ -2424,30 +2418,19 @@ mod tests {
     }
 
     #[test]
-    fn vim_o_opens_line_below_on_inserted_line() {
-        let mut t = ta_with("one\ntwo");
-        t.set_cursor(/*pos*/ 1);
-        t.set_vim_enabled(/*enabled*/ true);
-
-        t.input(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
-
-        assert_eq!(t.text(), "one\n\ntwo");
-        assert_eq!(t.vim_mode_label(), Some("Insert"));
-        assert_eq!(t.cursor(), "one\n".len());
+    fn vim_o_opens_line_below_current_line() {
+        for (input, expected) in [("one\ntwo", "one\n\ntwo"), ("one", "one\n")] {
+            let mut t = ta_with(input);
+            t.set_cursor(/*pos*/ 1);
+            t.set_vim_enabled(/*enabled*/ true);
+            t.input(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+            assert_eq!(t.text(), expected);
+            assert_eq!(t.vim_mode_label(), Some("Insert"));
+            assert_eq!(t.cursor(), "one\n".len());
+        }
     }
 
-    #[test]
-    fn vim_o_opens_line_below_final_line_and_moves_to_new_line() {
-        let mut t = ta_with("one");
-        t.set_cursor(/*pos*/ 1);
-        t.set_vim_enabled(/*enabled*/ true);
 
-        t.input(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
-
-        assert_eq!(t.text(), "one\n");
-        assert_eq!(t.vim_mode_label(), Some("Insert"));
-        assert_eq!(t.cursor(), "one\n".len());
-    }
 
     #[test]
     fn vim_delete_word() {
@@ -2809,30 +2792,22 @@ mod tests {
     }
 
     #[test]
-    fn kill_current_line_removes_current_line_linewise() {
-        let mut t = ta_with("abc\ndef\nghi");
-        t.set_cursor(/*pos*/ 5);
-
-        t.kill_current_line();
-
-        assert_eq!(t.text(), "abc\nghi");
-        assert_eq!(t.cursor(), 4);
-        assert_eq!(t.kill_buffer, "def\n");
-        assert_eq!(t.kill_buffer_kind, KillBufferKind::Linewise);
+    fn kill_current_line_removes_only_current_line_linewise() {
+        for (input, expected, killed) in [
+            ("abc\ndef\nghi", "abc\nghi", "def\n"),
+            ("abc\ndef", "abc\n", "def"),
+        ] {
+            let mut t = ta_with(input);
+            t.set_cursor(/*pos*/ 5);
+            t.kill_current_line();
+            assert_eq!(t.text(), expected);
+            assert_eq!(t.cursor(), 4);
+            assert_eq!(t.kill_buffer, killed);
+            assert_eq!(t.kill_buffer_kind, KillBufferKind::Linewise);
+        }
     }
 
-    #[test]
-    fn kill_current_line_keeps_previous_newline_for_final_line() {
-        let mut t = ta_with("abc\ndef");
-        t.set_cursor(/*pos*/ 5);
 
-        t.kill_current_line();
-
-        assert_eq!(t.text(), "abc\n");
-        assert_eq!(t.cursor(), 4);
-        assert_eq!(t.kill_buffer, "def");
-        assert_eq!(t.kill_buffer_kind, KillBufferKind::Linewise);
-    }
 
     #[test]
     fn kill_whole_line_keymap_dispatch_uses_linewise_kill() {
@@ -3027,24 +3002,15 @@ mod tests {
     #[test]
     fn cursor_left_and_right_handle_graphemes() {
         let mut t = ta_with("a👍b");
-        t.set_cursor(t.text().len());
-
-        t.move_cursor_left(); // before 'b'
-        let after_first_left = t.cursor();
-        t.move_cursor_left(); // before '👍'
-        let after_second_left = t.cursor();
-        t.move_cursor_left(); // before 'a'
-        let after_third_left = t.cursor();
-
-        assert!(after_first_left < t.text().len());
-        assert!(after_second_left < after_first_left);
-        assert!(after_third_left < after_second_left);
-
-        // Move right back to end safely
-        t.move_cursor_right();
-        t.move_cursor_right();
-        t.move_cursor_right();
-        assert_eq!(t.cursor(), t.text().len());
+        for expected in ["a👍".len(), "a".len(), 0, 0] {
+            t.move_cursor_left();
+            assert_eq!(t.cursor(), expected);
+        }
+        for expected in ["a".len(), "a👍".len(), "a👍b".len(), "a👍b".len()] {
+            t.move_cursor_right();
+            assert_eq!(t.cursor(), expected);
+        }
+        assert_eq!(t.text(), "a👍b");
     }
 
     #[test]
@@ -3268,13 +3234,12 @@ mod tests {
         t.move_cursor_down();
         // On first move down, we should land on second line, at col 0 (target col remembered as 0)
         let pos_after_down = t.cursor();
-        assert!(pos_after_down >= second_line_start);
+        assert_eq!(pos_after_down, second_line_start);
 
         // Move down again to third line; clamp to its length
         t.move_cursor_down();
         let third_line_start = t.text().find("mid").unwrap();
-        let third_line_end = third_line_start + 3;
-        assert!(t.cursor() >= third_line_start && t.cursor() <= third_line_end);
+        assert_eq!(t.cursor(), third_line_start);
 
         // Moving down at last line jumps to end
         t.move_cursor_down();
@@ -3420,13 +3385,13 @@ mod tests {
         let mut t = ta_with("hello world here");
         let area = Rect::new(0, 0, 6, 10); // width 6 -> wraps words
         // desired height counts wrapped lines
-        assert!(t.desired_height(area.width) >= 3);
+        assert_eq!(t.desired_height(area.width), 3);
 
         // Place cursor in "world"
         let world_start = t.text().find("world").unwrap();
         t.set_cursor(world_start + 3);
-        let (_x, y) = t.cursor_pos(area).unwrap();
-        assert_eq!(y, 1); // world should be on second wrapped line
+        let (x, y) = t.cursor_pos(area).unwrap();
+        assert_eq!((x, y), (3, 1)); // world should be on second wrapped line
 
         // With state and small height, cursor is mapped onto visible row
         let mut state = TextAreaState::default();
@@ -3439,8 +3404,9 @@ mod tests {
         let mut buf = Buffer::empty(small_area);
         ratatui::widgets::StatefulWidgetRef::render_ref(&(&t), small_area, &mut buf, &mut state);
         // After render, state.scroll should be adjusted so cursor row fits
-        let effective_lines = t.desired_height(small_area.width);
-        assert!(state.scroll < usize::from(effective_lines));
+        assert_eq!(state.scroll, 1);
+        let row: String = (0..small_area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(row, "world ");
     }
 
     #[test]
@@ -3731,7 +3697,7 @@ mod tests {
         // Down again should cross the logical newline to the next visual line ("word3"), clamped to its length if needed
         t.move_cursor_down();
         let start_word3 = t.text().find("word3").unwrap();
-        assert!(t.cursor() >= start_word3 && t.cursor() <= start_word3 + "word3".len());
+        assert_eq!(t.cursor(), start_word3 + 1);
     }
 
     #[test]
@@ -3740,14 +3706,14 @@ mod tests {
         let mut t = ta_with("👍👍👍👍");
         let _ = t.desired_height(/*width*/ 3);
 
-        // Put cursor after the second emoji (which should be on first wrapped line)
+        // Put cursor after the second emoji (the start of the third wrapped line)
         t.set_cursor("👍👍".len());
 
         // Move down should go to the start of the next wrapped line (same column preserved but clamped)
         t.move_cursor_down();
-        // We expect to land somewhere within the third emoji or at the start of it
+        // Width three holds one two-cell emoji per row.
         let pos_after_down = t.cursor();
-        assert!(pos_after_down >= "👍👍".len());
+        assert_eq!(pos_after_down, "👍👍👍".len());
 
         // Moving up should take us back to the original position
         t.move_cursor_up();

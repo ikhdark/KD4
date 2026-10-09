@@ -280,7 +280,21 @@ mod imp {
             record.EventType = KEY_EVENT as u16;
             // SAFETY: The zeroed record contains a valid zeroed KEY_EVENT_RECORD.
             let mut key = unsafe { record.Event.KeyEvent };
+            key.wRepeatCount = 1;
+            key.uChar.UnicodeChar = u16::from(b'x');
+            record.Event.KeyEvent = key;
+            append_response_records(&mut bytes, &[record]);
+            assert!(bytes.is_empty(), "key releases must not enter the response");
             key.bKeyDown = 1;
+            key.uChar.UnicodeChar = 0;
+            record.Event.KeyEvent = key;
+            append_response_records(&mut bytes, &[record]);
+            assert!(bytes.is_empty(), "non-character key presses must be ignored");
+            key.uChar.UnicodeChar = 0x1234;
+            record.Event.KeyEvent = key;
+            append_response_records(&mut bytes, &[record]);
+            assert_eq!(bytes, b"?");
+            bytes.clear();
             key.wRepeatCount = u16::MAX;
             key.uChar.UnicodeChar = u16::from(b'x');
             record.Event.KeyEvent = key;

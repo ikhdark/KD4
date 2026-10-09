@@ -707,6 +707,7 @@ mod tests {
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let path =
             write_session_file(home.path(), "2025-01-03T12-30-00", uuid).expect("session file");
+        let original = std::fs::read(&path).expect("original rollout");
 
         let staged = store
             .stage_thread_deletes(&[thread_id])
@@ -715,7 +716,7 @@ mod tests {
         assert!(!path.exists());
         drop(staged);
 
-        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).expect("restored rollout"), original);
     }
 
     #[tokio::test]

@@ -414,69 +414,29 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
         Some(&json!(false))
     );
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn experimental_feature_enablement_set_ignores_removed_features() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let enablement = BTreeMap::from([
-        ("mentions_v2".to_string(), true),
-        ("remote_control".to_string(), false),
-    ]);
-
-    let actual = set_experimental_feature_enablement(&mut mcp, enablement).await?;
-
-    assert_eq!(
-        actual,
-        ExperimentalFeatureEnablementSetResponse {
-            enablement: BTreeMap::new(),
-        }
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn experimental_feature_enablement_set_empty_map_is_no_op() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    set_experimental_feature_enablement(
+    let actual = set_experimental_feature_enablement(
         &mut mcp,
-        BTreeMap::from([("auth_elicitation".to_string(), true)]),
-    )
-    .await?;
-    let actual = set_experimental_feature_enablement(&mut mcp, BTreeMap::new()).await?;
+        BTreeMap::from([("remote_plugin".to_string(), false)]),
+    ).await?;
+    assert_eq!(actual.enablement, BTreeMap::from([("remote_plugin".to_string(), false)]));
+    let ConfigReadResponse { config, .. } = read_config(&mut mcp, None).await?;
+    let features = config.additional.get("features").expect("feature map");
+    assert_eq!(features.get("auth_elicitation"), Some(&json!(true)));
+    assert_eq!(features.get("remote_plugin"), Some(&json!(false)));
+    assert_eq!(features.get("tool_suggest"), Some(&json!(false)));
 
-    assert_eq!(
-        actual,
-        ExperimentalFeatureEnablementSetResponse {
-            enablement: BTreeMap::new(),
-        }
-    );
-
-    let ConfigReadResponse { config, .. } = read_config(&mut mcp, /*cwd*/ None).await?;
-
-    assert_eq!(
-        config
-            .additional
-            .get("features")
-            .and_then(|features| features.get("auth_elicitation")),
-        Some(&json!(true))
-    );
-
+    for ignored in [
+        BTreeMap::new(),
+        BTreeMap::from([
+            ("mentions_v2".to_string(), true),
+            ("remote_control".to_string(), false),
+        ]),
+    ] {
+        let actual = set_experimental_feature_enablement(&mut mcp, ignored).await?;
+        assert_eq!(actual.enablement, BTreeMap::new());
+        let unchanged = read_config(&mut mcp, None).await?;
+        assert_eq!(unchanged.config.additional.get("features"), Some(features));
+    }
     Ok(())
 }
 

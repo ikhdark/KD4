@@ -416,6 +416,8 @@ mod tests {
             (Some("image_gen"), "imagegen", ToolCallKind::ImageGeneration),
             (Some("web"), "run", ToolCallKind::Web),
             (None, "apply_patch", ToolCallKind::ApplyPatch),
+            (None, "interrupt_agent", ToolCallKind::CloseAgent),
+            (None, "imagegen", ToolCallKind::ImageGeneration),
         ] {
             let temp = tempfile::TempDir::new()?;
             let writer = Arc::new(TraceWriter::create(
@@ -439,7 +441,13 @@ mod tests {
             );
             let event: crate::RawTraceEvent =
                 serde_json::from_str(&std::fs::read_to_string(temp.path().join("trace.jsonl"))?)?;
+            assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+            assert_eq!(event.codex_turn_id.as_deref(), Some("turn-1"));
             let RawTraceEventPayload::ToolCallStarted {
+                tool_call_id,
+                model_visible_call_id,
+                code_mode_runtime_tool_id,
+                requester,
                 kind,
                 invocation_payload: Some(payload),
                 ..
@@ -448,6 +456,10 @@ mod tests {
                 panic!("dispatch start missing")
             };
             assert_eq!(kind, expected_kind);
+            assert_eq!(tool_call_id, "tool-call-1");
+            assert_eq!(model_visible_call_id.as_deref(), Some("call-1"));
+            assert_eq!(code_mode_runtime_tool_id, None);
+            assert_eq!(requester, RawToolCallRequester::Model);
             let value: JsonValue =
                 serde_json::from_str(&std::fs::read_to_string(temp.path().join(payload.path))?)?;
             assert_eq!(
@@ -487,6 +499,12 @@ mod tests {
 
     #[test]
     fn suppresses_only_noncanonical_dispatch_boundaries() {
+        assert!(!suppresses_tool_dispatch_trace(&invocation(
+            codex_code_mode::PUBLIC_TOOL_NAME,
+            None,
+            ToolDispatchRequester::Model { model_visible_call_id: "call-function".into() },
+            ToolDispatchPayload::Function { arguments: "{}".into() },
+        )));
         assert!(suppresses_tool_dispatch_trace(&invocation(
             codex_code_mode::PUBLIC_TOOL_NAME,
             /*tool_namespace*/ None,
@@ -517,22 +535,6 @@ mod tests {
                 input: "payload".to_string(),
             },
         )));
-    }
-
-    #[test]
-    fn classifies_interrupt_agent_as_close_agent() {
-        assert_eq!(
-            dispatched_tool_kind("interrupt_agent", None),
-            ToolCallKind::CloseAgent
-        );
-    }
-
-    #[test]
-    fn classifies_imagegen_as_image_generation() {
-        assert_eq!(
-            dispatched_tool_kind("imagegen", None),
-            ToolCallKind::ImageGeneration
-        );
     }
 
     fn invocation(

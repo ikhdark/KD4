@@ -1097,7 +1097,18 @@ impl TestAppServer {
         }
         match tokio::time::timeout(
             read_timeout,
-            self.read_stream_until_notification_message("turn/completed"),
+            self.read_stream_until_matching_notification(
+                "turn/completed for interrupted turn",
+                |notification| {
+                    notification.method == "turn/completed"
+                        && notification.params.as_ref().is_some_and(|params| {
+                            serde_json::from_value::<TurnCompletedNotification>(params.clone())
+                                .is_ok_and(|completed| {
+                                    completed.thread_id == thread_id && completed.turn.id == turn_id
+                                })
+                        })
+                },
+            ),
         )
         .await
         {
@@ -1817,6 +1828,82 @@ impl Drop for TestAppServer {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn interrupt_cleanup_requires_matching_thread_and_turn() -> anyhow::Result<()> {
+        for include_target in [false, true] {
+            let completed = |thread_id: &str, turn_id: &str| {
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {"id": turn_id, "items": [], "status": "interrupted"}
+                    }
+                })
+            };
+            let unrelated = [
+                completed("other-thread", "target-turn"),
+                completed("target-thread", "other-turn"),
+            ];
+            let mut messages = vec![serde_json::json!({"id": 0, "result": {}})];
+            messages.extend(unrelated.clone());
+            if include_target {
+                messages.push(completed("target-thread", "target-turn"));
+            }
+            // Feed the real stdio reader, not a substitute for the matching helper.
+            // EOF makes a missing target fail promptly rather than relying on timing.
+            #[cfg(unix)]
+            let (program, script) = (
+                Path::new("/bin/sh"),
+                format!(
+                    "read -r interrupt; printf '%s\\n' {}",
+                    messages
+                        .iter()
+                        .map(|message| format!("'{message}'"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+            #[cfg(windows)]
+            let (program, script) = (
+                Path::new("powershell.exe"),
+                format!(
+                    "$null = [Console]::ReadLine(); {}",
+                    messages
+                        .iter()
+                        .map(|message| format!("[Console]::WriteLine('{message}');"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+            #[cfg(unix)]
+            let args = ["-c", script.as_str()];
+            #[cfg(windows)]
+            let args = ["-NoProfile", "-NonInteractive", "-Command", script.as_str()];
+            let mut server = TestAppServer::builder()
+                .without_auto_env()
+                .with_plugin_startup_tasks()
+                .with_program(program)
+                .with_args(&args)
+                .build()
+                .await?;
+            let result = server
+                .interrupt_turn_and_wait_for_aborted(
+                    "target-thread".to_string(),
+                    "target-turn".to_string(),
+                    Duration::from_secs(10),
+                )
+                .await;
+            assert_eq!(result.is_ok(), include_target, "{result:?}");
+            // Unrelated completions belong to their own consumers and must remain buffered.
+            assert_eq!(server.pending_messages.len(), unrelated.len());
+            for expected in unrelated {
+                let actual = server.read_next_message().await?;
+                assert_eq!(serde_json::to_value(actual)?, expected);
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cancelled_message_read_preserves_partial_json_and_following_message()

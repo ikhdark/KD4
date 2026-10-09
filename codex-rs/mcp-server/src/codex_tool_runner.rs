@@ -594,18 +594,22 @@ mod tests {
     #[test]
     fn call_tool_result_includes_thread_id_in_structured_content() {
         let thread_id = ThreadId::new();
-        let result = create_call_tool_result_with_thread_id(
-            thread_id,
-            "done".to_string(),
-            /*is_error*/ None,
-        );
-        assert_eq!(
-            result.structured_content,
-            Some(json!({
-                "threadId": thread_id,
-                "content": "done",
-            }))
-        );
+        for is_error in [None, Some(false), Some(true)] {
+            let result = create_call_tool_result_with_thread_id(
+                thread_id,
+                "done".to_string(),
+                is_error,
+            );
+            assert_eq!(result.content, vec![rmcp::model::Content::text("done")]);
+            assert_eq!(result.is_error, is_error);
+            assert_eq!(
+                result.structured_content,
+                Some(json!({
+                    "threadId": thread_id,
+                    "content": "done",
+                }))
+            );
+        }
     }
 
     #[test]
@@ -623,6 +627,8 @@ mod tests {
             Some(surfaced_result.clone()),
         );
 
+        assert_eq!(result.content, vec![rmcp::model::Content::text("")]);
+        assert_eq!(result.is_error, None);
         assert_eq!(
             result.structured_content,
             Some(json!({

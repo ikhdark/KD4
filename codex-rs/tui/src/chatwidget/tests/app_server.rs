@@ -244,6 +244,10 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
     assert_eq!(event_turn_id, turn_id);
     assert_eq!(model, "faster-model");
     assert_matches!(turn, Op::UserTurn { .. });
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|event| {
+        !matches!(event, AppEvent::RetrySafetyBufferedTurn { .. })
+    }));
     assert!(
         !render_bottom_popup(&chat, /*width*/ 80)
             .contains("Press enter to confirm or esc to go back")
@@ -928,16 +932,16 @@ async fn live_app_server_file_change_item_started_preserves_changes() {
     );
 
     let cells = drain_insert_history(&mut rx);
-    assert!(!cells.is_empty(), "expected patch history to be rendered");
+    assert_eq!(cells.len(), 1, "expected one patch history cell");
     let transcript = lines_to_single_string(cells.last().expect("patch cell"));
     assert!(
-        transcript.contains("Added foo.txt") || transcript.contains("Edited foo.txt"),
+        transcript.contains("Added foo.txt"),
         "expected patch summary to include foo.txt, got: {transcript}"
     );
 }
 
 #[tokio::test]
-async fn patch_stream_updates_active_cell_and_is_replaced_by_final_item() {
+async fn patch_stream_is_replaced_by_started_item_without_duplicate_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let changes = vec![FileUpdateChange {
         path: "streamed.txt".to_string(),
@@ -1597,6 +1601,9 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
     );
     drain_insert_history(&mut rx);
 
+    assert_eq!(chat.bottom_pane.status_widget().expect("retry status").header(), "Reconnecting... 1/5");
+    assert!(chat.status_state.retry_status_header.is_some());
+
     chat.handle_server_notification(
         ServerNotification::AgentMessageDelta(
             codex_app_server_protocol::AgentMessageDeltaNotification {
@@ -1774,26 +1781,7 @@ async fn live_app_server_model_verification_renders_warning() {
     assert!(rendered.contains("https://chatgpt.com/cyber"));
 }
 
-#[tokio::test]
-async fn live_app_server_invalid_thread_name_update_is_ignored() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let thread_id = ThreadId::new();
-    chat.thread_id = Some(thread_id);
-    chat.thread_name = Some("original name".to_string());
 
-    chat.handle_server_notification(
-        ServerNotification::ThreadNameUpdated(
-            codex_app_server_protocol::ThreadNameUpdatedNotification {
-                thread_id: "not-a-thread-id".to_string(),
-                thread_name: Some("bad update".to_string()),
-            },
-        ),
-        /*replay_kind*/ None,
-    );
-
-    assert_eq!(chat.thread_id, Some(thread_id));
-    assert_eq!(chat.thread_name, Some("original name".to_string()));
-}
 
 #[tokio::test]
 async fn live_app_server_thread_name_update_shows_resume_hint() {
@@ -1801,6 +1789,19 @@ async fn live_app_server_thread_name_update_shows_resume_hint() {
     let thread_id =
         ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").expect("thread id");
     chat.thread_id = Some(thread_id);
+    chat.thread_name = Some("original name".to_string());
+    chat.handle_server_notification(
+        ServerNotification::ThreadNameUpdated(
+            codex_app_server_protocol::ThreadNameUpdatedNotification {
+                thread_id: "not-a-thread-id".to_string(),
+                thread_name: Some("bad update".to_string()),
+            },
+        ),
+        None,
+    );
+    assert_eq!(chat.thread_id, Some(thread_id));
+    assert_eq!(chat.thread_name.as_deref(), Some("original name"));
+    assert!(drain_insert_history(&mut rx).is_empty());
 
     chat.handle_server_notification(
         ServerNotification::ThreadNameUpdated(

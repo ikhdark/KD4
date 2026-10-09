@@ -837,20 +837,21 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
     let schema = unified_exec_output_schema();
     let validator = jsonschema::validator_for(&schema).unwrap();
     assert!(!validator.is_valid(&json!({"wall_time_seconds": 1.0, "output": "partial"})));
-    for (process_id, exit_code, process_exited, expected) in [
-        (Some(42), None, false, "running"),
-        (None, Some(0), true, "exited"),
-        (None, Some(1), true, "exited"),
-        (Some(42), Some(0), true, "exited"), // exited with output left to drain
-        (None, None, true, "exited"),        // terminal, exit code unavailable
-        (None, None, false, "unknown"),
+    for (process_id, exit_code, process_exited, search_no_match, expected) in [
+        (Some(42), None, false, false, "running"),
+        (None, Some(0), true, false, "exited"),
+        (None, Some(1), true, false, "exited"),
+        (None, Some(1), true, true, "exited"),
+        (Some(42), Some(0), true, false, "exited"), // exited with output left to drain
+        (None, None, true, false, "exited"),        // terminal, exit code unavailable
+        (None, None, false, false, "unknown"),
     ] {
         let output = ExecCommandToolOutput {
             output_ranges: None,
             process_output: Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
                 aggregated_output: b"evidence".to_vec(),
                 stdout: b"{}".to_vec(),
-                stderr: b"progress".to_vec(),
+                stderr: if search_no_match { Vec::new() } else { b"progress".to_vec() },
                 aggregated_output_is_exact: true,
                 streams_are_exact: true,
             })),
@@ -863,10 +864,22 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
             truncation_policy: TruncationPolicy::Tokens(10_000),
             max_output_tokens: Some(0),
             process_id,
-            session_capabilities: None,
+            session_capabilities: process_id.map(|_| crate::tools::context::ExecSessionCapabilities {
+                incarnation: uuid::Uuid::nil(),
+                stdin: false,
+                interrupt: false,
+                cancellation: true,
+                polling: true,
+                observation: Some(crate::tools::context::ExecSilenceObservation {
+                    silent_for_ms: 60_000,
+                    reason: crate::tools::context::ExecObservationReason::NoOutputObserved,
+                    process_exited,
+                    termination_requested: false,
+                }),
+            }),
             exit_code,
             process_exited,
-            search_no_match: false,
+            search_no_match,
             original_token_count: Some(2),
             hook_command: None,
             raw_output_artifact: None,
@@ -879,10 +892,19 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
         assert_eq!(result["execution_state"], expected);
         assert_eq!(result["exit_code"], json!(exit_code));
         assert!(validator.is_valid(&result), "{result}");
+        assert_eq!(result.get("search_no_match"), search_no_match.then_some(&json!(true)));
+        if process_id.is_some() {
+            assert_eq!(result["session_capabilities"]["observation"]["silent_for_ms"], 60_000);
+            for invalid_value in [json!(-1), json!(1.5), json!("60000")] {
+                let mut invalid = result.clone();
+                invalid["session_capabilities"]["observation"]["silent_for_ms"] = invalid_value;
+                assert!(!validator.is_valid(&invalid));
+            }
+        }
         assert_eq!(result["streams_complete"], process_exited && process_id.is_none());
         if result["streams_complete"] == true {
             assert_eq!(result["stdout"], "{}");
-            assert_eq!(result["stderr"], "progress");
+            assert_eq!(result["stderr"], if search_no_match { "" } else { "progress" });
         } else {
             assert!(result.get("stdout").is_none());
         }

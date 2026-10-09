@@ -281,9 +281,10 @@ mod tests {
     fn start_and_finish_update_running_state() {
         let mut state = TurnLifecycleState::new(/*prevent_idle_sleep*/ false);
 
-        state.start(Instant::now());
+        let now = Instant::now();
+        state.start(now);
         assert!(state.agent_turn_running);
-        assert!(state.goal_status_active_turn_started_at.is_some());
+        assert_eq!(state.goal_status_active_turn_started_at, Some(now));
         assert!(state.sleep_inhibitor.is_turn_running());
 
         state.finish();
@@ -303,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_sleep_prevention_preserves_running_state() {
+    fn reapplying_disabled_sleep_prevention_preserves_running_state() {
         let mut state = TurnLifecycleState::new(/*prevent_idle_sleep*/ false);
         state.restore_running(/*running*/ true, Instant::now());
 
@@ -316,12 +317,12 @@ mod tests {
     #[test]
     fn external_sleep_inhibitor_commands_are_platform_specific() {
         assert_eq!(
-            external_sleep_inhibitor_command("linux").map(|(program, _)| program),
-            Some("systemd-inhibit")
+            external_sleep_inhibitor_command("linux"),
+            Some(("systemd-inhibit", &["--what=idle", "--mode=block", "--who=codex"][..]))
         );
         assert_eq!(
-            external_sleep_inhibitor_command("macos").map(|(program, _)| program),
-            Some("caffeinate")
+            external_sleep_inhibitor_command("macos"),
+            Some(("caffeinate", &["-i"][..]))
         );
         assert_eq!(external_sleep_inhibitor_command("windows"), None);
     }

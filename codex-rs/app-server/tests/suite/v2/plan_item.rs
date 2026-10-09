@@ -117,9 +117,13 @@ async fn plan_mode_without_proposed_plan_does_not_emit_plan_item() -> Result<()>
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let _turn = start_plan_mode_turn(&mut mcp).await?;
-    let (_, completed_items, plan_deltas, _) = collect_turn_notifications(&mut mcp).await?;
+    let turn = start_plan_mode_turn(&mut mcp).await?;
+    let (started_items, completed_items, plan_deltas, completed) = collect_turn_notifications(&mut mcp).await?;
     wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
+    assert_eq!(completed.turn.id, turn.id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+    assert!(completed_items.iter().any(|item| matches!(item, ThreadItem::AgentMessage { text, .. } if text == "Done")));
+    assert!(!started_items.iter().any(|item| matches!(item, ThreadItem::Plan { .. })));
 
     let has_plan_item = completed_items
         .iter()

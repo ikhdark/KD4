@@ -20,6 +20,9 @@ class RustToolEnvTest(unittest.TestCase):
         self.assertEqual(updates["RUSTC_WRAPPER"], "/tools/sccache")
         self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "100G")
         self.assertEqual(
+            updates["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"], "/tools/lld-link"
+        )
+        self.assertEqual(
             updates["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"], "/tools/lld-link"
         )
         self.assertEqual(
@@ -90,6 +93,14 @@ class RustToolEnvTest(unittest.TestCase):
                 candidate.parent.mkdir(parents=True)
                 candidate.write_text("", encoding="utf-8")
 
+            self.assertEqual(
+                rust_tool_env.find_windows_lld_link(
+                    {"SCOOP": str(scoop), "USERPROFILE": str(user)},
+                    which=lambda _program: "path-linker",
+                    default_path=default,
+                ),
+                "path-linker",
+            )
             result = rust_tool_env.find_windows_lld_link(
                 {"SCOOP": str(scoop), "USERPROFILE": str(user)},
                 which=lambda _program: None,
@@ -105,7 +116,10 @@ class RustToolEnvTest(unittest.TestCase):
                 ),
                 str(user_linker),
             )
+            # A directory is not an executable. Skip it rather than masking
+            # the next usable fallback (or advertising a broken linker).
             user_linker.unlink()
+            user_linker.mkdir()
             self.assertEqual(
                 rust_tool_env.find_windows_lld_link(
                     {"SCOOP": str(scoop), "USERPROFILE": str(user)},
@@ -115,7 +129,14 @@ class RustToolEnvTest(unittest.TestCase):
                 str(default),
             )
 
-        self.assertEqual(result, str(expected))
+            default.unlink()
+            self.assertIsNone(
+                rust_tool_env.find_windows_lld_link(
+                    {"SCOOP": str(scoop), "USERPROFILE": str(user)},
+                    which=lambda _program: None,
+                    default_path=default,
+                )
+            )
 
 
 if __name__ == "__main__":

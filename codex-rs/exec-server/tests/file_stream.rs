@@ -57,6 +57,7 @@ async fn stream_stops_after_an_exact_block_boundary() -> Result<()> {
         chunks.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
         vec![BLOCK_SIZE, BLOCK_SIZE]
     );
+    assert!(chunks.iter().all(|chunk| chunk.iter().all(|byte| *byte == b'x')));
     Ok(())
 }
 

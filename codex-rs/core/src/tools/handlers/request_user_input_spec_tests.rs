@@ -165,86 +165,40 @@ fn normalize_request_user_input_args_rejects_missing_options() {
 
 #[test]
 fn normalize_request_user_input_args_clamps_out_of_range_auto_resolution_ms() {
-    let args = RequestUserInputArgs {
-        questions: vec![RequestUserInputQuestion {
-            id: "confirm".to_string(),
-            header: "Confirm".to_string(),
-            question: "Proceed?".to_string(),
-            is_other: false,
-            is_secret: false,
-            options: Some(vec![RequestUserInputQuestionOption {
-                label: "Yes (Recommended)".to_string(),
-                description: "Continue.".to_string(),
-            }]),
-        }],
-        auto_resolution_ms: Some(MIN_AUTO_RESOLUTION_MS - 1),
+    let question = RequestUserInputQuestion {
+        id: "confirm".to_string(),
+        header: "Confirm".to_string(),
+        question: "Proceed?".to_string(),
+        is_other: false,
+        is_secret: false,
+        options: Some(vec![RequestUserInputQuestionOption {
+            label: "Yes (Recommended)".to_string(),
+            description: "Continue.".to_string(),
+        }]),
     };
-
-    assert_eq!(
-        normalize_request_user_input_args(args.clone()),
-        Ok(RequestUserInputArgs {
-            questions: vec![RequestUserInputQuestion {
-                is_other: true,
-                ..args.questions[0].clone()
-            }],
-            auto_resolution_ms: Some(MIN_AUTO_RESOLUTION_MS),
-        })
-    );
-    assert_eq!(
-        normalize_request_user_input_args(RequestUserInputArgs {
-            auto_resolution_ms: Some(MAX_AUTO_RESOLUTION_MS + 1),
-            ..args.clone()
-        }),
-        Ok(RequestUserInputArgs {
-            questions: vec![RequestUserInputQuestion {
-                is_other: true,
-                ..args.questions[0].clone()
-            }],
-            auto_resolution_ms: Some(MAX_AUTO_RESOLUTION_MS),
-        })
-    );
-}
-
-#[test]
-fn normalize_request_user_input_args_accepts_auto_resolution_boundaries() {
-    let args = RequestUserInputArgs {
-        questions: vec![RequestUserInputQuestion {
-            id: "confirm".to_string(),
-            header: "Confirm".to_string(),
-            question: "Proceed?".to_string(),
-            is_other: false,
-            is_secret: false,
-            options: Some(vec![RequestUserInputQuestionOption {
-                label: "Yes (Recommended)".to_string(),
-                description: "Continue.".to_string(),
-            }]),
-        }],
-        auto_resolution_ms: Some(MIN_AUTO_RESOLUTION_MS),
-    };
-
-    assert_eq!(
-        normalize_request_user_input_args(args.clone()),
-        Ok(RequestUserInputArgs {
-            questions: vec![RequestUserInputQuestion {
-                is_other: true,
-                ..args.questions[0].clone()
-            }],
-            auto_resolution_ms: Some(MIN_AUTO_RESOLUTION_MS),
-        })
-    );
-    assert_eq!(
-        normalize_request_user_input_args(RequestUserInputArgs {
-            auto_resolution_ms: Some(MAX_AUTO_RESOLUTION_MS),
-            ..args.clone()
-        }),
-        Ok(RequestUserInputArgs {
-            questions: vec![RequestUserInputQuestion {
-                is_other: true,
-                ..args.questions[0].clone()
-            }],
-            auto_resolution_ms: Some(MAX_AUTO_RESOLUTION_MS),
-        })
-    );
+    for (input, expected) in [
+        (None, None),
+        (Some(MIN_AUTO_RESOLUTION_MS - 1), Some(MIN_AUTO_RESOLUTION_MS)),
+        (Some(MIN_AUTO_RESOLUTION_MS), Some(MIN_AUTO_RESOLUTION_MS)),
+        (Some(120_000), Some(120_000)),
+        (Some(MAX_AUTO_RESOLUTION_MS), Some(MAX_AUTO_RESOLUTION_MS)),
+        (Some(MAX_AUTO_RESOLUTION_MS + 1), Some(MAX_AUTO_RESOLUTION_MS)),
+    ] {
+        assert_eq!(
+            normalize_request_user_input_args(RequestUserInputArgs {
+                questions: vec![question.clone()],
+                auto_resolution_ms: input,
+            }),
+            Ok(RequestUserInputArgs {
+                questions: vec![RequestUserInputQuestion {
+                    is_other: true,
+                    ..question.clone()
+                }],
+                auto_resolution_ms: expected,
+            }),
+            "auto_resolution_ms={input:?}",
+        );
+    }
 }
 
 #[test]

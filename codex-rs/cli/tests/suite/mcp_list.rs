@@ -2,8 +2,6 @@ use anyhow::Result;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::load_global_mcp_servers;
-use predicates::prelude::PredicateBooleanExt;
-use predicates::str::contains;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -11,22 +9,13 @@ use tempfile::TempDir;
 
 use super::codex_command;
 
-#[test]
-fn list_shows_empty_state() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut cmd = codex_command(codex_home.path())?;
-    let output = cmd.args(["mcp", "list"]).output()?;
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("No MCP servers configured yet."));
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn list_and_get_render_expected_output() -> Result<()> {
     let codex_home = TempDir::new()?;
+
+    let output = codex_command(codex_home.path())?.args(["mcp", "list"]).output()?;
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout)?.contains("No MCP servers configured yet."));
 
     let mut add = codex_command(codex_home.path())?;
     add.args([
@@ -65,6 +54,7 @@ async fn list_and_get_render_expected_output() -> Result<()> {
     assert!(stdout.contains("docs"));
     assert!(stdout.contains("docs-server"));
     assert!(stdout.contains("TOKEN=*****"));
+    assert!(!stdout.contains("secret"));
     assert!(stdout.contains("APP_TOKEN=*****"));
     assert!(stdout.contains("WORKSPACE_ID=*****"));
     assert!(stdout.contains("Status"));
@@ -121,33 +111,34 @@ async fn list_and_get_render_expected_output() -> Result<()> {
     assert!(stdout.contains("command: docs-server"));
     assert!(stdout.contains("args: --port 4000"));
     assert!(stdout.contains("env: TOKEN=*****"));
+    assert!(!stdout.contains("secret"));
     assert!(stdout.contains("APP_TOKEN=*****"));
     assert!(stdout.contains("WORKSPACE_ID=*****"));
     assert!(stdout.contains("enabled: true"));
     assert!(stdout.contains("remove: codex mcp remove docs"));
 
-    let mut get_json_cmd = codex_command(codex_home.path())?;
-    get_json_cmd
-        .args(["mcp", "get", "docs", "--json"])
-        .assert()
-        .success()
-        .stdout(contains("\"name\": \"docs\"").and(contains("\"enabled\": true")));
-
     for args in [
         vec!["mcp", "list", "--json"],
         vec!["mcp", "get", "docs", "--json"],
     ] {
-        let hidden = codex_command(codex_home.path())?
-            .args(&args)
-            .assert()
-            .success();
-        let hidden: JsonValue = serde_json::from_slice(&hidden.get_output().stdout)?;
+        let hidden: JsonValue = if args[1] == "list" {
+            parsed.clone()
+        } else {
+            let output = codex_command(codex_home.path())?
+                .args(&args)
+                .assert()
+                .success();
+            serde_json::from_slice(&output.get_output().stdout)?
+        };
         let entry = if hidden.is_array() {
             &hidden[0]
         } else {
             &hidden
         };
         assert_eq!(entry["transport"]["env"]["TOKEN"], "*****");
+        assert_eq!(entry["name"], "docs");
+        assert_eq!(entry["enabled"], true);
+        assert!(!hidden.to_string().contains("secret"));
         let revealed = codex_command(codex_home.path())?
             .args(&args)
             .arg("--show-secrets")

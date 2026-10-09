@@ -82,38 +82,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reduced_motion_activity_indicator_uses_explicit_fallback() {
-        assert_eq!(
-            activity_indicator(
-                /*start_time*/ None,
-                MotionMode::Reduced,
-                ReducedMotionIndicator::Hidden,
-            ),
-            None
-        );
-        assert_eq!(
-            activity_indicator(
-                /*start_time*/ None,
-                MotionMode::Reduced,
-                ReducedMotionIndicator::StaticBullet,
-            ),
-            Some("•".dim())
-        );
-    }
-
-    #[test]
-    fn reduced_motion_shimmer_text_is_plain_text() {
-        assert_eq!(
-            shimmer_text("Loading", MotionMode::Reduced),
-            vec!["Loading".into()]
-        );
-        assert_eq!(
-            shimmer_text("", MotionMode::Reduced),
-            Vec::<Span<'static>>::new()
-        );
-    }
-
-    #[test]
     fn disabled_animations_keep_motion_output_static() {
         let motion_mode = MotionMode::from_animations_enabled(false);
         let now = Instant::now();
@@ -135,10 +103,9 @@ mod tests {
                 Some("•".dim())
             );
         }
-        assert_eq!(
-            shimmer_text("Loading 界", motion_mode),
-            vec![Span::raw("Loading 界")]
-        );
+        for text in ["Loading", "Loading 界"] {
+            assert_eq!(shimmer_text(text, motion_mode), vec![Span::raw(text)]);
+        }
         assert_eq!(shimmer_text("", motion_mode), Vec::<Span<'static>>::new());
         assert!(
             activity_indicator(

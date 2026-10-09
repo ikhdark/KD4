@@ -227,6 +227,18 @@ mod tests {
         }
         assert!(Arc::ptr_eq(&largest_compaction_request_input(&prompt),
             &prompt.stable_context_tool_history_fallback_input));
+        for largest_index in 0..4 {
+            let inputs: [Arc<[ResponseItem]>; 4] = std::array::from_fn(|index| {
+                Arc::clone(if index == largest_index { &large } else { &small })
+            });
+            let [input, stable_context_fallback_input, tool_history_fallback_input,
+                stable_context_tool_history_fallback_input] = inputs;
+            let prompt = Prompt {
+                input, stable_context_fallback_input, tool_history_fallback_input,
+                stable_context_tool_history_fallback_input, ..Default::default()
+            };
+            assert!(Arc::ptr_eq(&largest_compaction_request_input(&prompt), &large));
+        }
     }
 
     #[test]

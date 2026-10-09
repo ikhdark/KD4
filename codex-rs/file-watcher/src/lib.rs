@@ -442,6 +442,7 @@ pub struct DebouncedWatchReceiver {
     rx: Receiver,
     interval: Duration,
     pending: PendingChanges,
+    deadline: Option<Instant>,
 }
 
 impl DebouncedWatchReceiver {
@@ -451,6 +452,7 @@ impl DebouncedWatchReceiver {
             rx,
             interval,
             pending: PendingChanges::default(),
+            deadline: None,
         }
     }
 
@@ -460,7 +462,9 @@ impl DebouncedWatchReceiver {
             let event = self.rx.recv().await?;
             self.pending.merge(event);
         }
-        let deadline = Instant::now() + self.interval;
+        // Retain the first-event boundary when a caller cancels and recreates
+        // recv (for example in select!), just as we retain its pending paths.
+        let deadline = *self.deadline.get_or_insert(Instant::now() + self.interval);
 
         loop {
             tokio::select! {
@@ -473,6 +477,7 @@ impl DebouncedWatchReceiver {
         }
 
         // Merging never empties pending changes, so this batch is non-empty.
+        self.deadline = None;
         self.pending.take()
     }
 }

@@ -782,6 +782,12 @@ async fn exec_command_consumes_pushed_remote_process_events(
             assert!(saw_exec_command_begin);
             assert_eq!(output.matches(RECOVERED_OUTPUT).count(), 1, "{output}");
             assert_eq!(output.matches(RETAINED_OUTPUT).count(), 1, "{output}");
+            let expected_output = format!(
+                "{RECOVERED_OUTPUT}{}{RETAINED_OUTPUT}{}",
+                "x".repeat((REPLAY_RETAINED_OUTPUT_SEQ - 2) as usize),
+                "x".repeat((REPLAY_OUTPUT_EVENT_COUNT - REPLAY_RETAINED_OUTPUT_SEQ) as usize),
+            );
+            assert!(output.contains(&expected_output), "replay output must be complete and ordered: {output}");
             assert_eq!(process_read_requests, 1, "expected replay recovery read");
         }
     }

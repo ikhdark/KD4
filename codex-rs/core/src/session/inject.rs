@@ -476,70 +476,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_response_item_is_pending_steering_before_subscription() {
-        let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
-        let turn_state = {
-            let mut active_turn = session.active_turn.lock().await;
-            Arc::clone(
-                &active_turn
-                    .get_or_insert_with(ActiveTurn::default)
-                    .turn_state,
-            )
-        };
+    async fn injected_items_preserve_payload_and_distinguish_internal_context_from_steering() {
+        for internal in [false, true] {
+            let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
+            let turn_state = {
+                let mut active_turn = session.active_turn.lock().await;
+                Arc::clone(
+                    &active_turn
+                        .get_or_insert_with(ActiveTurn::default)
+                        .turn_state,
+                )
+            };
+            let item = objective_update_item();
+            let expected = if internal {
+                session
+                    .inject_internal_if_running(vec![item.clone()])
+                    .await
+                    .expect("active-turn internal injection should succeed");
+                TurnInput::InternalResponseItem(item)
+            } else {
+                session
+                    .inject_if_running(vec![item.clone()])
+                    .await
+                    .expect("active-turn injection should succeed");
+                TurnInput::ResponseItem(item)
+            };
 
-        session
-            .inject_if_running(vec![objective_update_item()])
-            .await
-            .expect("active-turn injection should succeed");
-
-        let (_activity_rx, pending_activity) = session
-            .input_queue
-            .subscribe_activity(
-                Some(turn_state.as_ref()),
-                /*has_internal_completion*/ false,
-            )
-            .await;
-        assert_eq!(pending_activity, Some(InputQueueActivity::Steer));
-    }
-
-    #[tokio::test]
-    async fn injected_internal_response_is_model_visible_without_becoming_steering() {
-        let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
-        let turn_state = {
-            let mut active_turn = session.active_turn.lock().await;
-            Arc::clone(
-                &active_turn
-                    .get_or_insert_with(ActiveTurn::default)
-                    .turn_state,
-            )
-        };
-
-        session
-            .inject_internal_if_running(vec![objective_update_item()])
-            .await
-            .expect("active-turn internal injection should succeed");
-
-        let (_activity_rx, pending_activity) = session
-            .input_queue
-            .subscribe_activity(
-                Some(turn_state.as_ref()),
-                /*has_internal_completion*/ false,
-            )
-            .await;
-        assert_eq!(pending_activity, None);
-        assert!(
-            !session
+            let (_activity_rx, pending_activity) = session
                 .input_queue
-                .has_pending_input(&session.active_turn)
-                .await
-        );
-        assert!(matches!(
-            session
-                .input_queue
-                .take_pending_input_for_turn_state(turn_state.as_ref())
-                .await
-                .as_slice(),
-            [TurnInput::InternalResponseItem(_)]
-        ));
+                .subscribe_activity(
+                    Some(turn_state.as_ref()),
+                    /*has_internal_completion*/ false,
+                )
+                .await;
+            assert_eq!(pending_activity, (!internal).then_some(InputQueueActivity::Steer));
+            assert_eq!(
+                session.input_queue.has_pending_input(&session.active_turn).await,
+                !internal
+            );
+            assert_eq!(
+                session
+                    .input_queue
+                    .take_pending_input_for_turn_state(turn_state.as_ref())
+                    .await,
+                vec![expected]
+            );
+        }
     }
 }

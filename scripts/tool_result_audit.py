@@ -505,6 +505,15 @@ def execution_context_audit(records):
         output["raw_replay_estimated_tokens"] = ((output["bytes"] + 3) // 4) * exposure
     reconciliation = {"status": "unavailable", "last_token_count": last_reported_usage,
                       "request_minus_cumulative": {}}
+    # Observed sums are useful, but cannot fill missing request fields with zero
+    # when deriving totals or claiming agreement with cumulative usage.
+    complete_fields = set(usage)
+    for turn in turns:
+        for request in turn["rounds"]:
+            complete_fields.intersection_update(
+                key for key, value in request["provider_usage"].items()
+                if type(value) is int and value >= 0
+            )
     if last_reported_usage is not None:
         fields = {
             "input_tokens": ("inputTokens",),
@@ -515,7 +524,7 @@ def execution_context_audit(records):
         }
         for name, keys in fields.items():
             reported = last_reported_usage["usage"].get(name)
-            if type(reported) is int and all(key in usage for key in keys):
+            if type(reported) is int and all(key in complete_fields for key in keys):
                 reconciliation["request_minus_cumulative"][name] = sum(usage[key] for key in keys) - reported
         differences = reconciliation["request_minus_cumulative"]
         if differences:
@@ -544,7 +553,7 @@ def execution_context_audit(records):
         "provider_usage_reconciliation": reconciliation,
         "provider_uncached_input_tokens": usage["inputTokens"]
         - usage["cachedInputTokens"]
-        if usage
+        if {"inputTokens", "cachedInputTokens"} <= complete_fields
         else None,
         "repeated_uncached_input_tokens": None,
         "local_prompt_category_totals": dict(categories),

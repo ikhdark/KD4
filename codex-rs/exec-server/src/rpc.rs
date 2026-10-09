@@ -1133,12 +1133,9 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_client_timeout_covers_stalled_outbound_queue() {
-        assert_timeout_covers_stalled_outbound_queue(false).await;
-    }
-
-    #[tokio::test]
-    async fn rpc_client_cleanup_timeout_covers_stalled_outbound_queue() {
-        assert_timeout_covers_stalled_outbound_queue(true).await;
+        for cleanup in [false, true] {
+            assert_timeout_covers_stalled_outbound_queue(cleanup).await;
+        }
     }
 
     #[tokio::test]

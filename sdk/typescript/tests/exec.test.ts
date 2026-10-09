@@ -58,18 +58,22 @@ function createEarlyExitChild(exitCode = 2): FakeChildProcess {
 }
 
 function createCompletedChild(
-  stderr: Buffer,
+  stderr: Buffer | Buffer[],
   exitCode: number,
   delayStderrUntilAfterExit = false,
 ): FakeChildProcess {
   const child = new FakeChildProcess();
+  const endStderr = () => {
+    for (const chunk of Array.isArray(stderr) ? stderr : [stderr]) child.stderr.write(chunk);
+    child.stderr.end();
+  };
   setImmediate(() => {
     if (delayStderrUntilAfterExit) {
       child.stdout.end();
       child.emit("exit", exitCode, null);
-      setImmediate(() => child.stderr.end(stderr));
+      setImmediate(endStderr);
     } else {
-      child.stderr.end(stderr);
+      endStderr();
       child.stdout.end();
       child.emit("exit", exitCode, null);
     }
@@ -97,6 +101,11 @@ describe("CodexExec", () => {
       value: 'x"\\\nflag=true\t',
       literal: String.raw`"x\"\\\nflag=true\t"`,
     },
+    {
+      // TOML forbids a literal DEL even though JSON permits it.
+      value: "x\u007fy",
+      literal: String.raw`"x\u007fy"`,
+    },
   ])("escapes public thread config arguments for $literal", async ({ value, literal }) => {
     const { Codex } = await import("../src/codex");
     spawnMock.mockClear();
@@ -122,6 +131,25 @@ describe("CodexExec", () => {
       `web_search=${literal}`,
       "--config",
       `approval_policy=${literal}`,
+    ]);
+  });
+
+  it("escapes TOML strings and quoted keys inside config arrays", async () => {
+    const { Codex } = await import("../src/codex");
+    spawnMock.mockClear();
+    spawnMock.mockReturnValue(
+      createCompletedChild(Buffer.alloc(0), 0) as unknown as child_process.ChildProcess,
+    );
+    await new Codex({
+      codexPathOverride: "codex",
+      config: { rules: [{ "key\u007f": "value\u007f" }] },
+    }).startThread().run("hello");
+
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      "exec",
+      "--experimental-json",
+      "--config",
+      String.raw`rules=[{"key\u007f" = "value\u007f"}]`,
     ]);
   });
 
@@ -186,29 +214,41 @@ describe("CodexExec", () => {
     }
   });
 
-  it("bounds and renders a newline-free stderr tail on failure", async () => {
-    const { CodexExec } = await import("../src/exec");
-    spawnMock.mockClear();
-    const child = createCompletedChild(newlineFreeStderrOverCap(), 2, true);
-    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+  it.each(["single", "chunked"])(
+    "bounds and renders a newline-free stderr tail on failure (%s)",
+    async (delivery) => {
+      const { CodexExec } = await import("../src/exec");
+      spawnMock.mockClear();
+      const stderr = newlineFreeStderrOverCap();
+      const chunks =
+        delivery === "single"
+          ? stderr
+          : Array.from({ length: Math.ceil(stderr.length / 4093) }, (_, index) =>
+              stderr.subarray(index * 4093, (index + 1) * 4093),
+            );
+      const child = createCompletedChild(chunks, 2, true);
+      spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
 
-    const exec = new CodexExec("codex");
-    let error: unknown;
-    try {
-      for await (const _ of exec.run({ input: "hi" })) {
-        // no-op
+      const exec = new CodexExec("codex");
+      let error: unknown;
+      try {
+        for await (const _ of exec.run({ input: "hi" })) {
+          // no-op
+        }
+      } catch (caught) {
+        error = caught;
       }
-    } catch (caught) {
-      error = caught;
-    }
 
-    expect(error).toBeInstanceOf(Error);
-    const message = (error as Error).message;
-    expect(message).toContain(STDERR_TRUNCATION_MARKER);
-    expect(message).toContain("END");
-    expect(message).not.toContain("discard-me");
-    expect(message).not.toContain("\ufffd");
-  });
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toBe(
+        "Codex Exec exited with code 2: " +
+          STDERR_TRUNCATION_MARKER +
+          String.fromCodePoint(0x1f642).repeat(16_383) +
+          "END",
+      );
+    },
+  );
 
   it("drains over-cap newline-free stderr when the child succeeds", async () => {
     const { CodexExec } = await import("../src/exec");
@@ -293,6 +333,7 @@ describe("CodexExec", () => {
     expect(resumeIndex).toBeGreaterThan(-1);
     expect(imageIndex).toBeGreaterThan(-1);
     expect(resumeIndex).toBeLessThan(imageIndex);
+    expect(commandArgs!.slice(resumeIndex)).toEqual(["resume", "thread-id", "--image", "img.png"]);
   });
 
   it("allows overriding the env passed to the Codex CLI", async () => {
@@ -336,7 +377,7 @@ describe("CodexExec", () => {
       expect(spawnEnv.CUSTOM_ENV).toBe("custom");
       expect(spawnEnv.CODEX_ENV_SHOULD_NOT_LEAK).toBeUndefined();
       expect(spawnEnv.CODEX_API_KEY).toBe("test");
-      expect(spawnEnv.CODEX_INTERNAL_ORIGINATOR_OVERRIDE).toBeDefined();
+      expect(spawnEnv.CODEX_INTERNAL_ORIGINATOR_OVERRIDE).toBe("codex_sdk_ts");
       expect(commandArgs).toContain("--config");
       expect(commandArgs).toContain(`openai_base_url=${JSON.stringify("https://example.test")}`);
     } finally {

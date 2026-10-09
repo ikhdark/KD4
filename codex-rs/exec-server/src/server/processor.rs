@@ -586,8 +586,23 @@ mod tests {
         send_request(&mut writer, /*id*/ 2, ENVIRONMENT_INFO_METHOD, &()).await;
         send_request(&mut writer, /*id*/ 3, ENVIRONMENT_INFO_METHOD, &()).await;
 
-        let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 2).await;
-        let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 3).await;
+        timeout(Duration::from_secs(1), async {
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let line = lines.next_line().await.expect("read response").expect("response line");
+                let JSONRPCMessage::Response(JSONRPCResponse { id, result }) =
+                    serde_json::from_str(&line).expect("decode JSON-RPC response")
+                else {
+                    panic!("expected environment response: {line}");
+                };
+                let _: EnvironmentInfo = serde_json::from_value(result).expect("environment info");
+                ids.push(id);
+            }
+            // Independent scalar requests correlate by id, not completion order.
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&RequestId::Integer(2)));
+            assert!(ids.contains(&RequestId::Integer(3)));
+        }).await.expect("both pipelined requests must complete");
 
         drop(writer);
         drop(lines);
@@ -934,8 +949,20 @@ mod tests {
             },
         )
         .await;
+        timeout(
+            Duration::from_secs(1),
+            registry
+                .process_for_test(&initialize_response.session_id)
+                .await
+                .wait_for_read_wait(),
+        )
+        .await
+        .expect("read must be pending before disconnect");
         drop(first_writer);
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        timeout(Duration::from_secs(1), first_task)
+            .await
+            .expect("disconnect must cancel the pending read")
+            .expect("first processor should join");
 
         let (mut second_writer, mut second_lines, second_task) =
             spawn_test_connection(Arc::clone(&registry), "second");
@@ -959,10 +986,6 @@ mod tests {
             second_initialize_response.session_id,
             initialize_response.session_id
         );
-        timeout(Duration::from_secs(1), first_task)
-            .await
-            .expect("first processor should exit")
-            .expect("first processor should join");
         send_notification(&mut second_writer, INITIALIZED_METHOD, &()).await;
 
         send_request(

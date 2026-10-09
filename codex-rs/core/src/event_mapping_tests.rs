@@ -64,21 +64,13 @@ fn contextual_user_content_requires_nonempty_exclusively_contextual_fragments() 
 
 #[test]
 fn recognizes_skills_instructions_as_contextual_developer_content() {
-    assert!(is_contextual_dev_message_content(&[
-        ContentItem::InputText {
-            text: format!("{SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills"),
-        },
-    ]));
-}
-
-#[test]
-fn recognizes_skills_usage_instructions_as_contextual_developer_content() {
-    let content = vec![ContentItem::InputText {
-        text: format!("{SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG}\n## How to use skills"),
-    }];
-
-    assert!(is_contextual_dev_message_content(&content));
-    assert!(!has_non_contextual_dev_message_content(&content));
+    for prefix in [SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG] {
+        let content = vec![ContentItem::InputText {
+            text: format!("{prefix}\n## Skills"),
+        }];
+        assert!(is_contextual_dev_message_content(&content), "{prefix}");
+        assert!(!has_non_contextual_dev_message_content(&content), "{prefix}");
+    }
 }
 
 #[test]
@@ -537,10 +529,12 @@ fn parses_agent_message() {
 
     match turn_item {
         TurnItem::AgentMessage(message) => {
-            let Some(AgentMessageContent::Text { text }) = message.content.first() else {
-                panic!("expected agent message text content");
-            };
-            assert_eq!(text, "Hello from Codex");
+            assert_eq!(message.id, "msg_1");
+            assert_eq!(message.phase, None);
+            assert!(matches!(
+                message.content.as_slice(),
+                [AgentMessageContent::Text { text }] if text == "Hello from Codex"
+            ));
         }
         other => panic!("expected TurnItem::AgentMessage, got {other:?}"),
     }
@@ -569,6 +563,8 @@ fn parses_reasoning_summary_and_raw_content() {
 
     match turn_item {
         TurnItem::Reasoning(reasoning) => {
+            // Event consumers correlate reasoning updates by the upstream item ID.
+            assert_eq!(reasoning.id, "rs_1");
             assert_eq!(
                 reasoning.summary_text,
                 vec!["Step 1".to_string(), "Step 2".to_string()]
@@ -602,6 +598,7 @@ fn parses_reasoning_including_raw_content() {
 
     match turn_item {
         TurnItem::Reasoning(reasoning) => {
+            assert_eq!(reasoning.id, "rs_2");
             assert_eq!(reasoning.summary_text, vec!["Summarized step".to_string()]);
             assert_eq!(
                 reasoning.raw_content,

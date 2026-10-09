@@ -324,16 +324,11 @@ impl ContextualUserFragment for OverlappingMarkerFragment {
 }
 
 #[test]
-fn marker_registration_rejects_overlapping_markers() {
+fn marker_registration_distinguishes_overlapping_from_complete_markers() {
     let registration = FragmentRegistrationProxy::<OverlappingMarkerFragment>::new();
     assert!(!registration.matches_text("abc"));
     assert!(!registration.matches_text(" \nABC\t "));
     assert!(!registration.matches_text("wrong prefix bc"));
-}
-
-#[test]
-fn marker_registration_accepts_empty_body_and_whitespace_and_case_variants() {
-    let registration = FragmentRegistrationProxy::<OverlappingMarkerFragment>::new();
     let rendered = OverlappingMarkerFragment.render();
     assert_eq!(rendered, "abbc");
     assert!(registration.matches_text(&rendered));

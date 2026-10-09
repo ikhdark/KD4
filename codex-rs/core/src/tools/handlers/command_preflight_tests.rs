@@ -433,20 +433,21 @@ fn rg_supported_executables_share_scope_and_dependency_classification() {
     use crate::tools::handlers::command_search::rg_search_path_operands;
 
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    std::fs::create_dir(root.join("src")).unwrap();
-    for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE", "C:\\tools\\rg.exe"] {
-        let command = strings(&[program, "needle", "src"]);
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .unwrap()
-            .expect(program);
-        assert_eq!(
-            search.scope_identity,
-            dunce::canonicalize(root.join("src"))
+    let root = &dunce::canonicalize(temp.path()).unwrap();
+    for exists in [false, true] {
+        if exists {
+            std::fs::create_dir(root.join("src")).unwrap();
+        }
+        for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE", "C:\\tools\\rg.exe"] {
+            let command = strings(&[program, "needle", "src"]);
+            let search = classify_rg_search_narrowing(&command, None, root, root)
                 .unwrap()
-                .to_string_lossy()
-        );
-        assert_eq!(rg_search_path_operands(&[command]), Some(strings(&["src"])));
+                .expect(program);
+            assert_eq!(search.scope_identity, root.join("src").to_string_lossy());
+            assert!(search.query_identity.contains("needle"));
+            assert!(search.state_paths.contains(&root.join("src")));
+            assert_eq!(rg_search_path_operands(&[command]), Some(strings(&["src"])));
+        }
     }
     let command = strings(&["pwsh", "-Command", "ripgrep needle src"]);
     let search = classify_rg_search_narrowing(&command, Some(ShellType::PowerShell), root, root)
@@ -496,26 +497,6 @@ fn search_operands_respect_option_values_and_terminators() {
 }
 
 #[test]
-fn search_executable_aliases_have_consistent_dependency_extraction() {
-    use crate::tools::handlers::command_search::rg_search_path_operands;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = &dunce::canonicalize(temp.path()).unwrap();
-    for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE"] {
-        let command = strings(&[program, "needle", "src"]);
-        assert_eq!(
-            rg_search_path_operands(std::slice::from_ref(&command)),
-            Some(strings(&["src"]))
-        );
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .unwrap()
-            .expect("every supported executable must be classified");
-        assert!(search.query_identity.contains("needle"));
-        assert!(search.state_paths.contains(&root.join("src")));
-    }
-}
-
-#[test]
 fn search_root_is_discovered_only_after_a_search_is_identified() {
     use crate::tools::handlers::command_search::classify_rg_search_with_repository;
     let root = Path::new("workspace");
@@ -551,10 +532,11 @@ async fn expensive_search_scope_remains_searchable_without_reusable_miss_evidenc
     for index in 0..600 {
         std::fs::write(root.join("ignored").join(format!("{index}.txt")), "needle").unwrap();
     }
-    let command = strings(&["rg", "needle", "."]);
+    let command = strings(&["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "."]);
     let mut search = classify_rg_search_narrowing(&command, None, root, root)
         .unwrap()
         .unwrap();
+    assert!(search.can_record_miss, "the fixture must attempt scope capture");
     let identity = search.search_identity.clone();
     crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut search).await;
     assert_eq!(search.scope_state_identity, None);
@@ -969,41 +951,19 @@ async fn search_scope_state_ignores_unrelated_content_and_detects_target_changes
         .expect("rg search");
     crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut after_relevant)
         .await;
+    let relevant_identity = after_relevant.scope_state_identity
+        .expect("changed target scope remains observable");
     assert_ne!(
-        after_relevant.scope_state_identity.as_deref(),
-        Some(first_identity.as_str()),
+        relevant_identity,
+        first_identity,
         "a target change must invalidate the scoped miss"
     );
 }
 
 #[test]
-fn normalizes_direct_argv_git_status_without_reporting_a_repair() {
-    let invocation = CommandInvocation::Argv {
-        program: "git".to_string(),
-        args: strings(&["status", "--short", "--branch"]),
-    };
-
-    let outcome = preflight_invocation_with_equivalent_repair(
-        &invocation,
-        &invocation.to_direct_argv().expect("argv"),
-        None,
-    )
-    .expect("git status should disable optional locks");
-
-    assert_eq!(
-        outcome.invocation,
-        CommandInvocation::Argv {
-            program: "git".to_string(),
-            args: strings(&["--no-optional-locks", "status", "--short", "--branch"]),
-        }
-    );
-    assert!(!outcome.repaired());
-    assert_eq!(outcome.repair_notice, None);
-}
-
-#[test]
 fn git_status_normalization_preserves_global_options_and_is_idempotent() {
     for args in [
+        strings(&["status", "--short", "--branch"]),
         strings(&["-C", "work tree", "status", "--short"]),
         strings(&["--git-dir=repo.git", "--work-tree", "work tree", "status"]),
         strings(&["-Cstatus", "-c", "color.ui=false", "status", "--porcelain"]),
@@ -1028,6 +988,7 @@ fn git_status_normalization_preserves_global_options_and_is_idempotent() {
             }
         );
         assert!(!outcome.repaired());
+        assert_eq!(outcome.repair_notice, None);
         let repeated = preflight_invocation_with_equivalent_repair(
             &outcome.invocation,
             &outcome.invocation.to_direct_argv().unwrap(),
@@ -1894,16 +1855,31 @@ fn preflight_requires_explicit_powershell_for_cmdlets_and_rejects_invalid_source
 
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_command_analysis_does_not_stall_the_async_runtime() {
-    let analysis = crate::tools::run_blocking_command_analysis(|| {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let analysis = crate::tools::run_blocking_command_analysis(move || {
+        started_tx.send(()).expect("notify runtime that analysis started");
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("runtime must resume while blocking analysis is pending");
         42
     });
     tokio::pin!(analysis);
 
-    tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-        result = &mut analysis => panic!("blocking analysis completed on the runtime thread: {result:?}"),
-    }
+    // A timer race can fail merely because the executor was descheduled until
+    // both timers elapsed. Instead, the worker cannot finish until this
+    // current-thread runtime has actually resumed and explicitly releases it.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            biased;
+            result = &mut analysis => panic!("analysis completed before runtime release: {result:?}"),
+            started = started_rx => started.expect("blocking worker starts"),
+        }
+    })
+    .await
+    .expect("blocking worker start is bounded");
+    assert!(futures::poll!(&mut analysis).is_pending());
+    release_tx.send(()).expect("release blocking worker");
 
     assert_eq!(analysis.await.expect("blocking worker"), 42);
 }

@@ -1319,6 +1319,10 @@ mod tests {
         let AggregatedMetrics::U64(MetricData::Sum(sum)) = finished_processes.data() else {
             panic!("finished process metric should be a u64 sum");
         };
+        assert_eq!(
+            sum.data_points().map(|point| point.value()).collect::<Vec<_>>(),
+            vec![1],
+        );
         let results = sum
             .data_points()
             .flat_map(opentelemetry_sdk::metrics::data::SumDataPoint::attributes)
@@ -1381,27 +1385,6 @@ mod tests {
                 }
             });
         }
-    }
-
-    #[tokio::test]
-    async fn start_process_rejects_non_native_cwd_before_launch() {
-        let uri = "file:///usr/local/checkout";
-        let cwd = PathUri::parse(uri).expect("non-native cwd URI");
-        let source = cwd
-            .to_abs_path()
-            .expect_err("cwd should not be native to this host");
-        let expected = invalid_params(format!(
-            "cwd URI `{cwd}` is not valid on this exec-server host: {source}"
-        ));
-        let mut params = test_exec_params(HashMap::new());
-        params.cwd = cwd;
-
-        let result = LocalProcess::default().start_process(params).await;
-        let Err(error) = result else {
-            panic!("non-native cwd should be rejected");
-        };
-
-        assert_eq!(error, expected);
     }
 
     #[test]

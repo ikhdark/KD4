@@ -370,6 +370,17 @@ async fn rollback_imported_session(
     state_db: Option<&StateDbHandle>,
     thread_id: ThreadId,
 ) -> Result<(), String> {
+    if let Some(local_store) = thread_store
+        .as_any()
+        .downcast_ref::<codex_thread_store::LocalThreadStore>()
+    {
+        // MessageProcessor constructs the local store and importer with the same state DB.
+        // Keep staged files and that DB's commit under the existing cancellation-safe owner.
+        return local_store
+            .rollback_created_thread(thread_id)
+            .await
+            .map_err(|err| format!("failed to roll back local imported session: {err}"));
+    }
     let discard_result = thread_store.discard_thread(thread_id).await;
     match thread_store
         .delete_thread(DeleteThreadParams { thread_id })
@@ -485,8 +496,13 @@ mod tests {
         assert_eq!(calls.delete_thread, 1);
     }
 
-    #[tokio::test]
-    async fn rollback_removes_materialized_local_rollout_and_state() {
+    async fn materialized_local_rollback_fixture() -> (
+        TempDir,
+        LocalThreadStore,
+        StateDbHandle,
+        ThreadId,
+        PathBuf,
+    ) {
         let root = TempDir::new().expect("tempdir");
         let codex_home = root.path().join("codex-home");
         let sqlite_home = root.path().join("sqlite-home");
@@ -551,6 +567,14 @@ mod tests {
             .await
             .expect("insert thread state");
 
+        (root, thread_store, state_db, thread_id, rollout_path)
+    }
+
+    #[tokio::test]
+    async fn rollback_removes_materialized_local_rollout_and_state() {
+        let (_root, thread_store, state_db, thread_id, rollout_path) =
+            materialized_local_rollback_fixture().await;
+
         rollback_imported_session(&thread_store, Some(&state_db), thread_id)
             .await
             .expect("rollback");
@@ -567,5 +591,85 @@ mod tests {
             thread_store.live_rollout_path(thread_id).await,
             Err(ThreadStoreError::ThreadNotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn rollback_local_primary_failure_preserves_rollout_and_state_for_retry() {
+        use sqlx::Connection;
+        let (_root, thread_store, state_db, thread_id, rollout_path) =
+            materialized_local_rollback_fixture().await;
+        let original = std::fs::read(&rollout_path).expect("original rollout");
+        let before = state_db.get_thread(thread_id).await.unwrap().unwrap();
+        let mut connection = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(codex_state::state_db_path(state_db.codex_home())),
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TRIGGER reject_import_rollback BEFORE DELETE ON threads BEGIN SELECT RAISE(ABORT, 'blocked import rollback'); END")
+            .execute(&mut connection).await.unwrap();
+
+        let error = rollback_imported_session(&thread_store, Some(&state_db), thread_id)
+            .await
+            .expect_err("primary transaction must fail");
+        assert!(error.contains("blocked import rollback"));
+        assert_eq!(std::fs::read(&rollout_path).unwrap(), original);
+        assert_eq!(state_db.get_thread(thread_id).await.unwrap(), Some(before));
+
+        sqlx::query("DROP TRIGGER reject_import_rollback")
+            .execute(&mut connection).await.unwrap();
+        rollback_imported_session(&thread_store, Some(&state_db), thread_id)
+            .await
+            .expect("retry rollback");
+        assert!(!rollout_path.exists());
+        assert!(state_db.get_thread(thread_id).await.unwrap().is_none());
+        connection.close().await.unwrap();
+        state_db.close().await;
+    }
+
+    #[tokio::test]
+    async fn rollback_local_completion_survives_cancelled_import_waiter() {
+        use sqlx::Connection;
+        use std::time::Duration;
+        let (_root, thread_store, state_db, thread_id, rollout_path) =
+            materialized_local_rollback_fixture().await;
+        let mut connection = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(codex_state::logs_db_path(state_db.codex_home())),
+        )
+        .await
+        .unwrap();
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut connection).await.unwrap();
+        let deleting_store = thread_store.clone();
+        let deleting_db = state_db.clone();
+        let task = tokio::spawn(async move {
+            rollback_imported_session(&deleting_store, Some(&deleting_db), thread_id).await
+        });
+        // The auxiliary database blocks after the primary commit. Cancellation must not
+        // restore the staged rollout or strand the owned compatibility cleanup.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state_db.get_thread(thread_id).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("primary commit");
+        assert!(!rollout_path.exists());
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.expect_err("cancelled waiter").is_cancelled());
+        assert!(!rollout_path.exists());
+        sqlx::query("ROLLBACK").execute(&mut connection).await.unwrap();
+        connection.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while thread_store.live_rollout_path(thread_id).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned rollback releases writer after auxiliary cleanup");
+        assert!(!rollout_path.exists());
+        assert!(state_db.get_thread(thread_id).await.unwrap().is_none());
+        state_db.close().await;
     }
 }

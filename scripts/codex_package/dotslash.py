@@ -424,7 +424,7 @@ def read_json_stamp(path: Path) -> dict | None:
 
     try:
         stamp = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         stamp = None
     _JSON_STAMP_CACHE[path] = (cache_key, stamp)
     return stamp

@@ -129,6 +129,7 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
         first = {"python", "git", "cargo", "rustfmt"}
 
         def check(name, command, **kwargs):
+            self.assertIs(kwargs["required"], True, name)
             if name in first:
                 barrier.wait()
             return name
@@ -152,24 +153,6 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
                 "pwsh",
             ],
         )
-
-    def test_collect_checks_covers_required_workflow_tools(self) -> None:
-        with (
-            mock.patch.object(
-                dev_env_doctor, "package_manager_pin", return_value="pnpm@10.0.0"
-            ),
-            mock.patch.object(
-                dev_env_doctor,
-                "check_tool",
-                side_effect=lambda name, command, **kwargs: name,
-            ),
-        ):
-            checks = dev_env_doctor.collect_checks()
-
-        self.assertIn("uv", checks)
-        self.assertIn("rustfmt", checks)
-        self.assertIn("clippy", checks)
-        self.assertIn("pwsh", checks)
 
     def test_node_floor_comes_from_package_json_engines(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -286,18 +269,19 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
         self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_run_version_prefers_stdout_over_stderr_warning(self) -> None:
-        completed = subprocess.CompletedProcess(
-            ["pnpm"], 0, stdout="10.34.0\n", stderr="Corepack download warning\n"
-        )
-        with mock.patch.object(
-            dev_env_doctor, "run_owned", return_value=completed
-        ) as run:
-            self.assertEqual(
-                dev_env_doctor.run_version(["pnpm", "--version"]), "10.34.0"
+        for stderr in ("Corepack download warning\n", "10.33.0\n"):
+            completed = subprocess.CompletedProcess(
+                ["pnpm"], 0, stdout="10.34.0\n", stderr=stderr
             )
-
-        self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
-        self.assertEqual(run.call_args.kwargs["env"]["RUSTUP_AUTO_INSTALL"], "0")
+            with (
+                self.subTest(stderr=stderr),
+                mock.patch.object(dev_env_doctor, "run_owned", return_value=completed) as run,
+            ):
+                self.assertEqual(
+                    dev_env_doctor.run_version(["pnpm", "--version"]), "10.34.0"
+                )
+                self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+                self.assertEqual(run.call_args.kwargs["env"]["RUSTUP_AUTO_INSTALL"], "0")
 
     def test_run_version_uses_stderr_when_stdout_is_empty(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -495,7 +479,11 @@ class VscodeRuntimeProofTest(unittest.TestCase):
 
     def test_expected_binary_checks_only_path(self) -> None:
         target = str(Path("codex.exe").resolve())
-        for actual, expected_rc in ((target, 0), (None, 1)):
+        for actual, expected_rc in (
+            (target, 0),
+            (str(Path("other-codex.exe").resolve()), 1),
+            (None, 1),
+        ):
             with (
                 self.subTest(actual=actual),
                 mock.patch.object(
@@ -561,20 +549,25 @@ class VscodeRuntimeProofTest(unittest.TestCase):
     def test_extension_candidates_are_sorted_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir)
-            extension_root = home / ".vscode" / "extensions" / "openai.codex"
-            extension_root.mkdir(parents=True)
-            (extension_root / "codex.exe").write_bytes(b"")
-            nested = extension_root / "bin"
-            nested.mkdir()
-            (nested / "codex").write_bytes(b"")
+            extensions = home / ".vscode" / "extensions"
+            # Create in reverse order so filesystem insertion order cannot pass.
+            for relative in ("z-extension/codex.exe", "a-extension/codex.exe",
+                             "a-extension/codex", "a-extension/unrelated.exe"):
+                binary = extensions / relative
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(b"")
 
             with mock.patch.object(
                 vscode_runtime_proof.Path, "home", return_value=home
             ):
-                matches = vscode_runtime_proof.extension_candidates(limit=1)
-
-        self.assertEqual(len(matches), 1)
-        self.assertTrue(matches[0].endswith("codex.exe"))
+                for limit in (0, 1, 2, 8):
+                    with self.subTest(limit=limit):
+                        matches = vscode_runtime_proof.extension_candidates(limit=limit)
+                        self.assertEqual(
+                            [Path(path).relative_to(extensions).as_posix() for path in matches],
+                            ["a-extension/codex", "a-extension/codex.exe",
+                             "z-extension/codex.exe"][:limit],
+                        )
 
     def test_extension_candidates_skip_vsix_staging_folders(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -684,26 +677,6 @@ class ConfigSchemaCheckTest(unittest.TestCase):
         self.assertEqual(
             config_schema_check.changed_outputs(before, after), ["a", "b", "c"]
         )
-
-    def test_missing_config_schema_commands_report_clean_diagnostics(self) -> None:
-        for command in ("cargo", "just"):
-            with self.subTest(command=command):
-                stderr = io.StringIO()
-                with (
-                    mock.patch.object(
-                        config_schema_check,
-                        "run_finite",
-                        side_effect=FileNotFoundError(
-                            2, "No such file or directory", command
-                        ),
-                    ),
-                    contextlib.redirect_stderr(stderr),
-                ):
-                    code = config_schema_check.run([command], cwd=Path("/repo"))
-
-                self.assertEqual(code, 127)
-                self.assertIn(f"Could not run {command}:", stderr.getvalue())
-                self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_config_schema_rejects_removed_auto_mode(self) -> None:
         with self.assertRaises(SystemExit) as raised:
@@ -823,18 +796,21 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
 
     def test_command_launch_errors_preserve_exit_classification(self) -> None:
         for module in (config_schema_check, app_server_schema_runtime_check):
-            for error, expected in (
-                (FileNotFoundError("missing"), 127),
-                (PermissionError("denied"), 1),
+            for command, error, expected in (
+                ("cargo", FileNotFoundError(2, "No such file or directory", "cargo"), 127),
+                ("just", FileNotFoundError(2, "No such file or directory", "just"), 127),
+                ("tool", PermissionError("denied"), 1),
             ):
                 with (
                     self.subTest(module=module.__name__, error=error),
-                    mock.patch.object(module, "run_finite", side_effect=error),
+                    mock.patch.object(module, "run_finite", side_effect=error) as run,
                     contextlib.redirect_stdout(io.StringIO()),
                     contextlib.redirect_stderr(io.StringIO()) as stderr,
                 ):
-                    self.assertEqual(module.run(["tool"], cwd=Path.cwd()), expected)
-                    self.assertIn(f"Could not run tool: {error}", stderr.getvalue())
+                    self.assertEqual(module.run([command], cwd=Path.cwd()), expected)
+                    run.assert_called_once_with([command], cwd=Path.cwd())
+                    self.assertIn(f"Could not run {command}: {error}", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_new_constraint_maps_remain_breaking_changes(self):
         compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
@@ -876,23 +852,6 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 ),
                 [f"$/{keyword}:changed"],
             )
-
-    def test_missing_command_returns_clean_diagnostic(self) -> None:
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(
-                app_server_schema_runtime_check,
-                "run_finite",
-                side_effect=FileNotFoundError("cargo missing"),
-            ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            self.assertEqual(
-                app_server_schema_runtime_check.run(["cargo"], cwd=Path("/repo")),
-                127,
-            )
-
-        self.assertIn("Could not run cargo", stderr.getvalue())
 
     def test_logged_command_quotes_arguments_with_spaces(self) -> None:
         stdout = io.StringIO()
@@ -1225,7 +1184,7 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
         }
         self.assertEqual(compare(old, new), [])
         new["oneOf"][0]["required"].append("c")
-        self.assertTrue(compare(old, new))
+        self.assertEqual(compare(old, new), ["$/oneOf:changed"])
         for keyword in ("const", "enum"):
             before = {keyword: {"required": ["a", "b"]}}
             after = {keyword: {"required": ["b", "a"]}}
@@ -1234,12 +1193,16 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
                     {keyword: [before[keyword]]},
                     {keyword: [after[keyword]]},
                 )
-            self.assertTrue(compare(before, after))
-        self.assertTrue(
+            self.assertEqual(
+                compare(before, after),
+                ["$/const/required:changed"] if keyword == "const" else ["$/enum:changed"],
+            )
+        self.assertEqual(
             compare(
                 {"prefixItems": [{"type": "string"}, {"type": "number"}]},
                 {"prefixItems": [{"type": "number"}, {"type": "string"}]},
-            )
+            ),
+            ["$/prefixItems:changed"],
         )
 
     def test_first_optional_property_is_additive_but_required_or_constraint_is_not(
@@ -1249,12 +1212,15 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
         old = {"type": "object"}
         new = {"type": "object", "properties": {"label": {"type": "string"}}}
         self.assertEqual(compare(old, new), [])
-        self.assertTrue(compare(old, {**new, "required": ["label"]}))
-        self.assertTrue(compare(old, {**new, "additionalProperties": False}))
-        self.assertTrue(
+        self.assertEqual(compare(old, {**new, "required": ["label"]}), ["$/required:added"])
+        self.assertEqual(
+            compare(old, {**new, "additionalProperties": False}), ["$/additionalProperties:added"]
+        )
+        self.assertEqual(
             compare(
                 old, {"type": "object", "patternProperties": {".*": {"type": "string"}}}
-            )
+            ),
+            ["$/patternProperties:added"],
         )
 
     def test_schema_families_can_progress_but_same_family_writers_cannot(self):

@@ -383,12 +383,23 @@ mod tests {
             }),
         ))
         .expect("serialize rollout line");
-        std::fs::write(&rollout_path, format!("{valid_line}\n{{"))?;
+        let latest_cwd = temp_dir.path().join("latest");
+        let latest_context = serde_json::to_string(&rollout_line(
+            "t1",
+            "turn_context",
+            serde_json::json!({"cwd": latest_cwd, "model": "latest-model"}),
+        ))
+        .expect("serialize turn context");
+        std::fs::write(
+            &rollout_path,
+            format!("{{\n{valid_line}\n{{\n{latest_context}\n{{"),
+        )?;
 
         let state = read_rollout_resume_state(&rollout_path).await?;
 
         assert_eq!(state.thread_id, Some(thread_id));
-        assert_eq!(state.cwd, Some(cwd));
+        assert_eq!(state.cwd, Some(latest_cwd));
+        assert_eq!(state.model.as_deref(), Some("latest-model"));
         Ok(())
     }
 }

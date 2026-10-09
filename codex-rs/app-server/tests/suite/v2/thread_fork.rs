@@ -678,15 +678,27 @@ async fn thread_fork_can_exclude_turns_and_skip_restored_token_usage() -> Result
     assert_eq!(thread.preview, "Saved user message");
     assert!(thread.turns.is_empty());
 
-    let note = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/tokenUsage/updated"),
-    )
-    .await;
-    assert!(
-        note.is_err(),
-        "excludeTurns=true should not replay token usage"
-    );
+    // The fork handler emits restored usage before thread/started. Use that
+    // positive ordering barrier instead of waiting 25 seconds for silence.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let JSONRPCMessage::Notification(notification) = mcp.read_next_message().await? else {
+                continue;
+            };
+            if notification.method == "thread/tokenUsage/updated" {
+                anyhow::bail!("excludeTurns=true should not replay token usage");
+            }
+            if notification.method == "thread/started" {
+                let started: ThreadStartedNotification = serde_json::from_value(
+                    notification.params.expect("thread/started params"),
+                )?;
+                assert_eq!(started.thread.id, thread.id);
+                assert!(started.thread.turns.is_empty());
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
 
     Ok(())
 }
@@ -1002,7 +1014,9 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
     assert_eq!(thread.turns.len(), 1, "expected copied fork history");
 
     let turn = &thread.turns[0];
-    assert_eq!(turn.status, TurnStatus::Completed);
+    // ForkSnapshot::Interrupted closes the source's unfinished user-only turn,
+    // regardless of whether the fork has local persistence.
+    assert_eq!(turn.status, TurnStatus::Interrupted);
     assert_eq!(turn.items.len(), 1, "expected user message item");
     match &turn.items[0] {
         ThreadItem::UserMessage { content, .. } => {
@@ -1104,6 +1118,66 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
     )
     .await??;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn ephemeral_fork_preserves_completed_turn_boundary() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread: source, .. } = to_response(response)?;
+    let turn_id = complete_text_turn(&mut mcp, &source.id, "finished source turn").await?;
+    let source_path = source.path.expect("persistent source path");
+    let source_contents = std::fs::read(&source_path)?;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source.id.clone(),
+            ephemeral: true,
+            ..Default::default()
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread, .. } = to_response(response)?;
+    assert!(thread.ephemeral);
+    assert_eq!(thread.path, None);
+    assert_eq!(thread.forked_from_id, Some(source.id));
+    assert_eq!(thread.turns.len(), 1);
+    assert_eq!(thread.turns[0].id, turn_id);
+    assert_eq!(thread.turns[0].status, TurnStatus::Completed);
+    assert_eq!(thread.turns[0].items.len(), 2);
+    assert!(
+        matches!(&thread.turns[0].items[0], ThreadItem::UserMessage { content, .. }
+        if content == &vec![UserInput::Text {
+            text: "finished source turn".to_string(),
+            text_elements: Vec::new(),
+        }])
+    );
+    assert!(
+        matches!(&thread.turns[0].items[1], ThreadItem::AgentMessage { text, .. }
+        if text == "Done")
+    );
+    assert_eq!(std::fs::read(source_path)?, source_contents);
     Ok(())
 }
 

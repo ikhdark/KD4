@@ -53,7 +53,7 @@ fn notice(item: &Value) -> Option<(String, Value)> {
     Some((prefix.to_owned(), serde_json::from_str(&record).unwrap()))
 }
 
-fn freshness(body: &Value) -> Vec<Value> {
+pub(super) fn freshness(body: &Value) -> Vec<Value> {
     body["input"]
         .as_array()
         .unwrap()

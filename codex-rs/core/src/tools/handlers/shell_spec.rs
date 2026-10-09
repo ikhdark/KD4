@@ -456,7 +456,18 @@ fn unified_exec_output_schema() -> Value {
                     "stdin": {"type": "boolean"},
                     "interrupt": {"type": "boolean"},
                     "cancellation": {"type": "boolean"},
-                    "polling": {"type": "boolean"}
+                    "polling": {"type": "boolean"},
+                    "observation": {
+                        "type": "object",
+                        "properties": {
+                            "silent_for_ms": {"type": "integer", "minimum": 0},
+                            "reason": {"enum": ["no_output_observed"]},
+                            "process_exited": {"type": "boolean"},
+                            "termination_requested": {"type": "boolean"}
+                        },
+                        "required": ["silent_for_ms", "reason", "process_exited", "termination_requested"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["stdin", "interrupt", "cancellation", "polling", "incarnation"],
                 "additionalProperties": false
@@ -479,6 +490,7 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Command process state, independent of the exec cell. Unknown explicitly means no live handle or terminal outcome is available."
             },
             "process_exited": { "type": "boolean" },
+            "search_no_match": { "type": "boolean" },
             "output_complete": { "type": "boolean" },
             "output_reduced": { "type": "boolean" },
             "original_token_count_is_approximate": { "type": "boolean" },

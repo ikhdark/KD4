@@ -237,9 +237,12 @@ async fn thread_shell_command_errors_when_thread_has_no_selected_environment() -
             command: "pwd".to_string(),
         })
         .await?;
-    let error = mcp
-        .read_stream_until_error_message(RequestId::Integer(shell_id))
-        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(shell_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32603);
     assert_eq!(error.error.message, "thread has no selected environment");
 
     Ok(())
@@ -393,10 +396,13 @@ async fn serve_remote_user_shell(listener: TcpListener) -> Result<()> {
             }
             Some("process/read") => {
                 let process_id = request["params"]["processId"].as_str();
+                let after_seq = request["params"]["afterSeq"].as_u64().unwrap_or(0);
+                // Exit and stream closure each occupy an event sequence even
+                // though process/read returns only output chunks explicitly.
                 let result = if process_id == shell_snapshot_process_id.as_deref() {
                     json!({
                         "chunks": [],
-                        "nextSeq": 0,
+                        "nextSeq": 3,
                         "exited": true,
                         "exitCode": 0,
                         "closed": true,
@@ -405,13 +411,20 @@ async fn serve_remote_user_shell(listener: TcpListener) -> Result<()> {
                     })
                 } else {
                     assert_eq!(process_id, shell_process_id.as_deref());
-                    json!({
-                        "chunks": [{
+                    // afterSeq is exclusive. A bounded read may report closed
+                    // with output, so keep serving until the caller drains it.
+                    let chunks = if after_seq < 1 {
+                        vec![json!({
                             "seq": 1,
                             "stream": "stdout",
                             "chunk": BASE64_STANDARD.encode("remote shell output\n"),
-                        }],
-                        "nextSeq": 2,
+                        })]
+                    } else {
+                        Vec::new()
+                    };
+                    json!({
+                        "chunks": chunks,
+                        "nextSeq": if after_seq < 1 { 2 } else { 4 },
                         "exited": true,
                         "exitCode": 0,
                         "closed": true,
@@ -424,7 +437,7 @@ async fn serve_remote_user_shell(listener: TcpListener) -> Result<()> {
                     json!({"id": request["id"], "result": result}),
                 )
                 .await?;
-                if process_id == shell_process_id.as_deref() {
+                if process_id == shell_process_id.as_deref() && after_seq >= 1 {
                     return Ok(());
                 }
             }
@@ -662,10 +675,13 @@ async fn wait_for_command_execution_started(
     mcp: &mut TestAppServer,
     expected_id: Option<&str>,
 ) -> Result<ItemStartedNotification> {
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
-        let notif = mcp
-            .read_stream_until_notification_message("item/started")
-            .await?;
+        let notif = tokio::time::timeout_at(
+            deadline,
+            mcp.read_stream_until_notification_message("item/started"),
+        )
+        .await??;
         let started: ItemStartedNotification = serde_json::from_value(
             notif
                 .params
@@ -684,8 +700,13 @@ async fn wait_for_command_execution_started_by_source(
     mcp: &mut TestAppServer,
     expected_source: CommandExecutionSource,
 ) -> Result<ItemStartedNotification> {
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
-        let started = wait_for_command_execution_started(mcp, /*expected_id*/ None).await?;
+        let started = tokio::time::timeout_at(
+            deadline,
+            wait_for_command_execution_started(mcp, /*expected_id*/ None),
+        )
+        .await??;
         let ThreadItem::CommandExecution { source, .. } = &started.item else {
             continue;
         };
@@ -699,10 +720,13 @@ async fn wait_for_command_execution_completed(
     mcp: &mut TestAppServer,
     expected_id: Option<&str>,
 ) -> Result<ItemCompletedNotification> {
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
-        let notif = mcp
-            .read_stream_until_notification_message("item/completed")
-            .await?;
+        let notif = tokio::time::timeout_at(
+            deadline,
+            mcp.read_stream_until_notification_message("item/completed"),
+        )
+        .await??;
         let completed: ItemCompletedNotification = serde_json::from_value(
             notif
                 .params
@@ -721,10 +745,13 @@ async fn wait_for_command_execution_output_delta(
     mcp: &mut TestAppServer,
     item_id: &str,
 ) -> Result<CommandExecutionOutputDeltaNotification> {
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
-        let notif = mcp
-            .read_stream_until_notification_message("item/commandExecution/outputDelta")
-            .await?;
+        let notif = tokio::time::timeout_at(
+            deadline,
+            mcp.read_stream_until_notification_message("item/commandExecution/outputDelta"),
+        )
+        .await??;
         let delta: CommandExecutionOutputDeltaNotification = serde_json::from_value(
             notif
                 .params

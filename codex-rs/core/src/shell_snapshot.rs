@@ -1060,18 +1060,23 @@ pub(crate) async fn run_remote_snapshot_process_before(
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let mut exit_code = None;
+            let mut closed = false;
             loop {
                 let response = process
                     .read(
                         after_seq,
                         Some(SNAPSHOT_OUTPUT_LIMIT_BYTES.saturating_add(1)),
-                        Some(1_000),
+                        Some(if closed { 0 } else { 1_000 }),
                     )
                     .await
                     .context("Failed to read remote snapshot command output")?;
                 if let Some(failure) = response.failure {
                     bail!("Remote snapshot command failed: {failure}");
                 }
+                if response.output_gap.is_some() {
+                    bail!("Remote snapshot command output was lost");
+                }
+                let drained = response.chunks.is_empty();
                 for chunk in response.chunks {
                     after_seq = Some(chunk.seq);
                     let bytes = chunk.chunk.into_inner();
@@ -1088,7 +1093,10 @@ pub(crate) async fn run_remote_snapshot_process_before(
                 }
                 after_seq = response.next_seq.checked_sub(1).or(after_seq);
                 exit_code = response.exit_code.or(exit_code);
-                if response.closed {
+                closed = response.closed;
+                // Closure describes the process, not whether a bounded page
+                // contains its final output. Drain through an empty closed page.
+                if closed && drained {
                     break;
                 }
             }

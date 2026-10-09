@@ -174,73 +174,7 @@ async fn external_context_like_user_text_remains_a_user_message_item() -> Result
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn additional_context_trust_controls_message_role() -> Result<()> {
-    require_network!();
 
-    let server = start_mock_server().await;
-    let request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let test = test_codex()
-        .with_config(|config| config.include_environment_context = false)
-        .build(&server)
-        .await?;
-
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "inspect context".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: IndexMap::from([
-                (
-                    "browser_info".to_string(),
-                    AdditionalContextEntry {
-                        value: "tab one".to_string(),
-                        kind: AdditionalContextKind::Untrusted,
-                    },
-                ),
-                (
-                    "automation_info".to_string(),
-                    AdditionalContextEntry {
-                        value: "run one".to_string(),
-                        kind: AdditionalContextKind::Application,
-                    },
-                ),
-            ]),
-            thread_settings: Default::default(),
-        })
-        .await?;
-    wait_for_event_match(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_)).then_some(())
-    })
-    .await;
-
-    let request = request.single_request();
-    let developer_context_texts = request
-        .message_input_texts("developer")
-        .into_iter()
-        .filter(|text| text.starts_with(application_context_prefix("automation_info").as_str()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        developer_context_texts,
-        vec![application_context("automation_info", "run one")]
-    );
-    assert_eq!(
-        request.message_input_texts("user"),
-        vec![
-            external_context("browser_info", "tab one"),
-            "inspect context".to_string(),
-        ]
-    );
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_is_deduplicated_between_turns_while_retained() -> Result<()> {

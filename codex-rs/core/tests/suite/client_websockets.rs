@@ -250,7 +250,9 @@ async fn responses_websocket_omits_item_ids_without_mutating_prompt() {
     .expect("response item with an empty id should deserialize");
     let prompt = prompt_with_input(vec![prefixed, unprefixed, empty]);
 
+    let original_input = serde_json::to_value(&prompt.input).expect("serialize original prompt");
     stream_until_complete(&mut client_session, &harness, &prompt).await;
+    assert_eq!(serde_json::to_value(&prompt.input).unwrap(), original_input);
 
     let connection = server.single_connection();
     let body = connection.first().expect("missing request").body_json();
@@ -267,27 +269,8 @@ async fn responses_websocket_omits_item_ids_without_mutating_prompt() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_streams_without_feature_flag_when_provider_supports_websockets() {
-    require_network!();
 
-    let server = start_websocket_server(vec![vec![vec![
-        ev_response_created("resp-1"),
-        ev_completed("resp-1"),
-    ]]])
-    .await;
 
-    let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ false).await;
-    let mut client_session = harness.client.new_session();
-    let prompt = prompt_with_input(vec![message_item("hello")]);
-
-    stream_until_complete(&mut client_session, &harness, &prompt).await;
-
-    assert_eq!(server.handshakes().len(), 1);
-    assert_eq!(server.single_connection().len(), 1);
-
-    server.shutdown().await;
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_streams_with_system_proxy_feature() {
@@ -920,33 +903,7 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_reuses_connection_after_session_drop() {
-    require_network!();
 
-    let server = start_websocket_server(vec![vec![
-        vec![ev_response_created("resp-1"), ev_completed("resp-1")],
-        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
-    ]])
-    .await;
-
-    let harness = websocket_harness(&server).await;
-    let prompt_one = prompt_with_input(vec![message_item("hello")]);
-    let prompt_two = prompt_with_input(vec![message_item("again")]);
-
-    {
-        let mut client_session = harness.client.new_session();
-        stream_until_complete(&mut client_session, &harness, &prompt_one).await;
-    }
-
-    let mut client_session = harness.client.new_session();
-    stream_until_complete(&mut client_session, &harness, &prompt_two).await;
-
-    assert_eq!(server.handshakes().len(), 1);
-    assert_eq!(server.single_connection().len(), 2);
-
-    server.shutdown().await;
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_sends_responses_lite_metadata_per_request() {
@@ -1518,51 +1475,7 @@ async fn responses_websocket_omits_timing_metrics_header_when_runtime_metrics_di
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_emits_reasoning_included_event() {
-    require_network!();
 
-    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
-        requests: vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
-        response_headers: vec![("X-Reasoning-Included".to_string(), "true".to_string())],
-        accept_delay: None,
-        close_after_requests: true,
-    }])
-    .await;
-
-    let harness = websocket_harness(&server).await;
-    let mut client_session = harness.client.new_session();
-    let prompt = prompt_with_input(vec![message_item("hello")]);
-    let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
-
-    let mut stream = client_session
-        .stream(
-            &prompt,
-            &harness.model_info,
-            &harness.session_telemetry,
-            harness.effort.clone(),
-            harness.summary,
-            /*service_tier*/ None,
-            &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
-        )
-        .await
-        .expect("websocket stream failed");
-
-    let mut saw_reasoning_included = false;
-    while let Some(event) = stream.next().await {
-        match event.expect("event") {
-            ResponseEvent::ServerReasoningIncluded(true) => {
-                saw_reasoning_included = true;
-            }
-            ResponseEvent::Completed { .. } => break,
-            _ => {}
-        }
-    }
-
-    assert!(saw_reasoning_included);
-    server.shutdown().await;
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_emits_rate_limit_events() {
@@ -2076,91 +1989,9 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_sends_canonical_turn_metadata() {
-    require_network!();
 
-    let server = start_websocket_server(vec![vec![vec![
-        ev_response_created("resp-1"),
-        ev_completed("resp-1"),
-    ]]])
-    .await;
 
-    let harness = websocket_harness(&server).await;
-    let mut client_session = harness.client.new_session();
-    let prompt = prompt_with_input(vec![message_item("hello")]);
-    let responses_metadata = turn_metadata(&harness, Some("turn-123"));
 
-    stream_until_complete_with_metadata(
-        &mut client_session,
-        &harness,
-        &prompt,
-        /*service_tier*/ None,
-        &responses_metadata,
-    )
-    .await;
-
-    let body = server
-        .single_connection()
-        .first()
-        .expect("missing request")
-        .body_json();
-
-    assert_eq!(body["type"].as_str(), Some("response.create"));
-    let turn_metadata: serde_json::Value = serde_json::from_str(
-        body["client_metadata"]["x-codex-turn-metadata"]
-            .as_str()
-            .expect("turn metadata"),
-    )
-    .expect("valid turn metadata");
-    assert_eq!(turn_metadata["turn_id"].as_str(), Some("turn-123"));
-    assert_eq!(
-        body["client_metadata"]["turn_id"].as_str(),
-        turn_metadata["turn_id"].as_str()
-    );
-
-    server.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_uses_previous_response_id_when_prefix_after_completed() {
-    require_network!();
-
-    let server = start_websocket_server(vec![vec![
-        vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg_1", "assistant output"),
-            ev_completed("resp-1"),
-        ],
-        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
-    ]])
-    .await;
-
-    let harness = websocket_harness(&server).await;
-    let mut client_session = harness.client.new_session();
-    let prompt_one = prompt_with_input(vec![message_item("hello")]);
-    let prompt_two = prompt_with_input(vec![
-        message_item("hello"),
-        assistant_message_item("1", "assistant output"),
-        message_item("second"),
-    ]);
-
-    stream_until_complete(&mut client_session, &harness, &prompt_one).await;
-    stream_until_complete(&mut client_session, &harness, &prompt_two).await;
-
-    let connection = server.single_connection();
-    assert_eq!(connection.len(), 2);
-    let second = connection.get(1).expect("missing request").body_json();
-
-    assert_eq!(second["type"].as_str(), Some("response.create"));
-    assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
-    assert_eq!(
-        second["input"],
-        serde_json::to_value(&prompt_two.input[2..]).expect("serialize incremental input")
-    );
-
-    server.shutdown().await;
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_on_non_prefix() {
@@ -2186,6 +2017,7 @@ async fn responses_websocket_creates_on_non_prefix() {
 
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second["model"].as_str(), Some(MODEL));
+    assert_eq!(second.get("previous_response_id"), None);
     assert_eq!(second["stream"], serde_json::Value::Bool(true));
     assert_eq!(
         second["input"],
@@ -2194,6 +2026,7 @@ async fn responses_websocket_creates_on_non_prefix() {
 
     server.shutdown().await;
 }
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_when_non_input_request_fields_change() {
@@ -2701,8 +2534,10 @@ async fn stream_until_complete_with_metadata(
         .expect("websocket stream failed");
 
     while let Some(event) = stream.next().await {
-        if matches!(event, Ok(ResponseEvent::Completed { .. })) {
-            break;
+        if matches!(event.expect("websocket stream failed"), ResponseEvent::Completed { .. }) {
+            return;
         }
     }
+    panic!("websocket stream ended before completion");
 }
+

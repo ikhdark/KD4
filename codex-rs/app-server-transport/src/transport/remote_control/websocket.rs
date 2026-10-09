@@ -2253,34 +2253,20 @@ mod tests {
     }
 
     #[test]
-    fn mark_recovery_auth_change_seen_marks_only_recovery_revision_seen() {
-        let (auth_change_tx, mut auth_change_rx) = watch::channel(0u64);
-        let auth_change_revision_before_recovery = *auth_change_rx.borrow();
-        auth_change_tx.send_modify(|revision| *revision += 1);
-
-        mark_recovery_auth_change_seen(&mut auth_change_rx, auth_change_revision_before_recovery);
-
-        assert!(
-            !auth_change_rx
-                .has_changed()
-                .expect("auth change watch should remain open")
-        );
-    }
-
-    #[test]
-    fn mark_recovery_auth_change_seen_preserves_racing_auth_change() {
-        let (auth_change_tx, mut auth_change_rx) = watch::channel(0u64);
-        let auth_change_revision_before_recovery = *auth_change_rx.borrow();
-        auth_change_tx.send_modify(|revision| *revision += 1);
-        auth_change_tx.send_modify(|revision| *revision += 1);
-
-        mark_recovery_auth_change_seen(&mut auth_change_rx, auth_change_revision_before_recovery);
-
-        assert!(
-            auth_change_rx
-                .has_changed()
-                .expect("auth change watch should remain open")
-        );
+    fn mark_recovery_auth_change_seen_preserves_only_racing_changes() {
+        for changes in [1, 2] {
+            let (auth_change_tx, mut auth_change_rx) = watch::channel(0u64);
+            let before_recovery = *auth_change_rx.borrow();
+            for _ in 0..changes {
+                auth_change_tx.send_modify(|revision| *revision += 1);
+            }
+            mark_recovery_auth_change_seen(&mut auth_change_rx, before_recovery);
+            assert_eq!(
+                auth_change_rx.has_changed().expect("auth watch should remain open"),
+                changes == 2,
+            );
+            assert_eq!(*auth_change_rx.borrow(), changes);
+        }
     }
 
     pub(super) async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
@@ -2947,7 +2933,8 @@ mod tests {
         );
         let mut expected_enrollment =
             remote_control_enrollment(Some(TEST_REMOTE_CONTROL_SERVER_TOKEN));
-        expected_enrollment.clear_server_token();
+        expected_enrollment.remote_control_token = None;
+        expected_enrollment.expires_at = None;
         assert_eq!(*current_enrollment.lock().await, Some(expected_enrollment));
         assert_eq!(
             status_rx.borrow().clone(),
@@ -3130,9 +3117,7 @@ mod tests {
 
         status_publisher.publish_environment_id(/*environment_id*/ None);
         assert!(
-            timeout(Duration::from_millis(20), status_rx.changed())
-                .await
-                .is_err()
+            !status_rx.has_changed().expect("status watch should remain open")
         );
 
         status_publisher.publish_environment_id(Some("env_first".to_string()));
@@ -3152,9 +3137,7 @@ mod tests {
 
         status_publisher.publish_environment_id(Some("env_first".to_string()));
         assert!(
-            timeout(Duration::from_millis(20), status_rx.changed())
-                .await
-                .is_err()
+            !status_rx.has_changed().expect("status watch should remain open")
         );
 
         status_publisher.publish_status(RemoteControlConnectionStatus::Connected);
@@ -3205,9 +3188,7 @@ mod tests {
 
         status_publisher.publish_environment_id(Some("env_disabled".to_string()));
         assert!(
-            timeout(Duration::from_millis(20), status_rx.changed())
-                .await
-                .is_err()
+            !status_rx.has_changed().expect("status watch should remain open")
         );
     }
 
@@ -3814,7 +3795,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_buffer_acks_by_stream_id() {
+    fn outbound_buffer_acks_only_matching_stream_through_the_acknowledged_sequence() {
         let (mut outbound_buffer, used_rx) = BoundedOutboundBuffer::new();
         let client_1 = ClientId("client-1".to_string());
         let client_2 = ClientId("client-2".to_string());
@@ -3839,6 +3820,10 @@ mod tests {
             "first-client-new-stream",
         ));
 
+        outbound_buffer.insert(&server_envelope(&client_1, "stream-1", 4, "future"));
+        outbound_buffer.ack(&client_1, &stream_1, 0, None);
+        assert_eq!(*used_rx.borrow(), 4);
+
         outbound_buffer.ack(
             &client_1, &stream_1, /*acked_seq_id*/ 3, /*acked_segment_id*/ None,
         );
@@ -3856,54 +3841,12 @@ mod tests {
         retained.sort_unstable();
         assert_eq!(
             retained,
-            vec![("client-1", "stream-2", 3), ("client-2", "stream-1", 2)]
+            vec![("client-1", "stream-1", 4), ("client-1", "stream-2", 3), ("client-2", "stream-1", 2)]
         );
+        assert_eq!(*used_rx.borrow(), 3);
+        outbound_buffer.ack(&client_1, &stream_1, 4, None);
         assert_eq!(*used_rx.borrow(), 2);
-    }
-
-    #[test]
-    fn outbound_buffer_retains_unacked_messages_until_ack_advances() {
-        let (mut outbound_buffer, used_rx) = BoundedOutboundBuffer::new();
-        let client_1 = ClientId("client-1".to_string());
-        let client_2 = ClientId("client-2".to_string());
-        let stream_1 = StreamId("stream-1".to_string());
-
-        outbound_buffer.insert(&server_envelope(
-            &client_1,
-            "stream-1",
-            /*seq_id*/ 1,
-            "first-old",
-        ));
-        outbound_buffer.insert(&server_envelope(
-            &client_1,
-            "stream-2",
-            /*seq_id*/ 2,
-            "first-new",
-        ));
-        outbound_buffer.insert(&server_envelope(
-            &client_2, "stream-1", /*seq_id*/ 3, "second",
-        ));
-
-        outbound_buffer.ack(
-            &client_1, &stream_1, /*acked_seq_id*/ 1, /*acked_segment_id*/ None,
-        );
-
-        let mut retained = outbound_buffer
-            .server_envelopes()
-            .map(|server_envelope| {
-                (
-                    server_envelope.client_id.0.as_str(),
-                    server_envelope.stream_id.0.as_str(),
-                    server_envelope.seq_id,
-                )
-            })
-            .collect::<Vec<_>>();
-        retained.sort_unstable();
-        assert_eq!(
-            retained,
-            vec![("client-1", "stream-2", 2), ("client-2", "stream-1", 3)]
-        );
-        assert_eq!(*used_rx.borrow(), 2);
+        assert!(!outbound_buffer.buffer_by_stream.contains_key(&(client_1, stream_1)));
     }
 
     #[test]

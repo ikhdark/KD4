@@ -42,13 +42,13 @@ fn custom_tool_output_last_non_empty_text(req: &ResponsesRequest, call_id: &str)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_call_standalone_web_search() -> Result<()> {
-    assert_code_mode_standalone_web_search(WebSearchMode::Live, serde_json::json!(true)).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_call_indexed_standalone_web_search() -> Result<()> {
-    assert_code_mode_standalone_web_search(WebSearchMode::Indexed, serde_json::json!("indexed"))
-        .await
+    for (mode, expected) in [
+        (WebSearchMode::Live, serde_json::json!(true)),
+        (WebSearchMode::Indexed, serde_json::json!("indexed")),
+    ] {
+        assert_code_mode_standalone_web_search(mode, expected).await?;
+    }
+    Ok(())
 }
 
 async fn assert_code_mode_standalone_web_search(

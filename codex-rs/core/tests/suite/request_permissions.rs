@@ -958,7 +958,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_request() -> Result<()>
+async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Result<()>
 {
     require_network!();
 
@@ -1075,8 +1075,12 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
     Ok(())
 }
 
+#[test_case(true; "inline_feature_enabled")]
+#[test_case(false; "inline_feature_disabled")]
 #[tokio::test(flavor = "current_thread")]
-async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Result<()> {
+async fn request_permissions_grants_apply_to_later_shell_command_calls(
+    inline_permission_feature: bool,
+) -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
@@ -1090,10 +1094,12 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
             .permissions
             .set_permission_profile(permission_profile_for_config)
             .expect("set permission profile");
-        config
-            .features
-            .enable(Feature::ExecPermissionApprovals)
-            .expect("test config should allow feature update");
+        if inline_permission_feature {
+            config.features.enable(Feature::ExecPermissionApprovals)
+        } else {
+            config.features.disable(Feature::ExecPermissionApprovals)
+        }
+        .expect("test config should allow feature update");
         config
             .features
             .enable(Feature::RequestPermissionsTool)
@@ -1184,116 +1190,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn request_permissions_grants_apply_to_later_shell_command_calls_without_inline_permission_feature()
--> Result<()> {
-    require_network!();
 
-    let server = start_mock_server().await;
-    let approval_policy = AskForApproval::OnRequest;
-    let permission_profile = workspace_write_excluding_tmp();
-    let permission_profile_for_config = workspace_write_excluding_tmp();
-
-    let mut builder = test_codex().with_config(move |config| {
-        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .permissions
-            .set_permission_profile(permission_profile_for_config)
-            .expect("set permission profile");
-        config
-            .features
-            .enable(Feature::RequestPermissionsTool)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build(&server).await?;
-
-    let outside_dir = tempfile::tempdir()?;
-    let outside_write = outside_dir
-        .path()
-        .join("sticky-shell-feature-independent.txt");
-    let command = write_and_read_command(&outside_write, "sticky-shell-feature-independent-ok");
-    let requested_permissions = requested_directory_write_permissions(outside_dir.path());
-    let normalized_requested_permissions =
-        normalized_directory_write_permissions(outside_dir.path())?;
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-sticky-shell-independent-1"),
-                request_permissions_tool_event(
-                    "permissions-call",
-                    "Allow writing outside the workspace",
-                    &requested_permissions,
-                )?,
-                ev_completed("resp-sticky-shell-independent-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-sticky-shell-independent-2"),
-                shell_command_event("shell-call", &command)?,
-                ev_completed("resp-sticky-shell-independent-2"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-sticky-shell-independent-3"),
-                ev_assistant_message("msg-sticky-shell-independent-1", "done"),
-                ev_completed("resp-sticky-shell-independent-3"),
-            ]),
-        ],
-    )
-    .await;
-
-    submit_turn(
-        &test,
-        "write outside the workspace without inline permission feature",
-        approval_policy,
-        permission_profile,
-    )
-    .await?;
-
-    let granted_permissions = expect_request_permissions_event(&test, "permissions-call").await;
-    assert_eq!(
-        granted_permissions,
-        normalized_requested_permissions.clone()
-    );
-    test.codex
-        .submit(Op::RequestPermissionsResponse {
-            id: "permissions-call".to_string(),
-            response: RequestPermissionsResponse {
-                permissions: normalized_requested_permissions.clone(),
-                scope: PermissionGrantScope::Turn,
-            },
-        })
-        .await?;
-
-    if let Some(approval) = wait_for_exec_approval_or_completion(&test).await {
-        test.codex
-            .submit(Op::ExecApproval {
-                id: approval.effective_approval_id(),
-                turn_id: None,
-                decision: ReviewDecision::Approved,
-            })
-            .await?;
-        wait_for_completion(&test).await;
-    }
-
-    let shell_output = responses
-        .function_call_output_text("shell-call")
-        .map(|output| json!({ "output": output }))
-        .expect("expected shell-call output");
-    let result = parse_result(&shell_output);
-    assert!(
-        result.exit_code.is_none_or(|exit_code| exit_code == 0),
-        "expected success output, got exit_code={:?}, stdout={:?}",
-        result.exit_code,
-        result.stdout
-    );
-    assert_eq!(result.stdout.trim(), "sticky-shell-feature-independent-ok");
-    assert_eq!(
-        fs::read_to_string(&outside_write)?,
-        "sticky-shell-feature-independent-ok"
-    );
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "current_thread")]
 async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() -> Result<()> {
@@ -1603,6 +1500,14 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
         ]),
     )
     .await;
+    let results = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-turn-2", "grant expired"),
+            ev_completed("resp-turn-4"),
+        ]),
+    )
+    .await;
 
     submit_turn(
         &test,
@@ -1613,6 +1518,9 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
     .await?;
     wait_for_completion(&test).await;
 
+    let output = results.single_request().function_call_output_text("exec-call")
+        .expect("expired grant returns a model-visible rejection");
+    assert!(output.contains("missing `additional_permissions`"), "{output}");
     assert!(
         !later_turn_write.exists(),
         "a turn-scoped grant must not authorize execution in a later turn"

@@ -118,18 +118,12 @@ struct CompactionTextOmissionReceiptV1 {
 /// Pre-turn/manual compaction variants use `AtStart` so the next request retains the same
 /// cacheable initial-context prefix instead of appending a fresh copy after the summary.
 ///
-/// The test-only `BeforeLastUserMessage` variant preserves coverage for legacy replacement-history
-/// ordering. `AtStart` keeps the summary or compaction item last while preserving the stable prompt
-/// prefix in production.
-///
-/// `DoNotInject` is likewise test-only: every production compaction path now restores initial
+/// `DoNotInject` is test-only: every production compaction path now restores initial
 /// context, capturing a world-state snapshot when the caller did not already have one. It is
 /// retained so tests can exercise compaction without building that snapshot.
 #[derive(Clone, Debug)]
 pub(crate) enum InitialContextInjection {
     AtStart(Arc<WorldState>),
-    #[cfg(test)]
-    BeforeLastUserMessage(Arc<WorldState>),
     #[cfg(test)]
     DoNotInject,
 }
@@ -146,16 +140,6 @@ pub(crate) async fn build_compaction_initial_context(
     // Return the rendered state with its items so history and its baseline stay identical.
     match initial_context_injection {
         InitialContextInjection::AtStart(world_state) => {
-            let (items, delivered_snapshot, fragment_digests) = sess
-                .build_initial_context_with_world_state_and_provenance(
-                    turn_context,
-                    world_state.as_ref(),
-                )
-                .await;
-            (items, Some(delivered_snapshot), fragment_digests)
-        }
-        #[cfg(test)]
-        InitialContextInjection::BeforeLastUserMessage(world_state) => {
             let (items, delivered_snapshot, fragment_digests) = sess
                 .build_initial_context_with_world_state_and_provenance(
                     turn_context,
@@ -786,10 +770,6 @@ async fn run_compact_task_inner_impl(
         #[cfg(test)]
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::AtStart(_) => {
-            Some(turn_context.to_turn_context_item_async().await)
-        }
-        #[cfg(test)]
-        InitialContextInjection::BeforeLastUserMessage(_) => {
             Some(turn_context.to_turn_context_item_async().await)
         }
     };
@@ -2367,76 +2347,11 @@ pub(crate) fn insert_compaction_initial_context(
             initial_context
         }
         #[cfg(test)]
-        InitialContextInjection::BeforeLastUserMessage(_) => {
-            insert_initial_context_before_last_real_user_or_summary(
-                compacted_history,
-                initial_context,
-            )
-        }
-        #[cfg(test)]
         InitialContextInjection::DoNotInject => compacted_history,
     }
 }
 
-/// Inserts canonical initial context into compacted replacement history at the
-/// model-expected boundary.
-///
-/// Placement rules:
-/// - Prefer immediately before the last real user message.
-/// - If no real user messages remain, insert before the compaction summary so
-///   the summary stays last.
-/// - If there are no user messages, insert before the last compaction item so
-///   that item remains last (remote compaction may return only compaction items).
-/// - If there are no user messages or compaction items, append the context.
-#[cfg(test)]
-pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
-    mut compacted_history: Vec<ResponseItem>,
-    initial_context: Vec<ResponseItem>,
-) -> Vec<ResponseItem> {
-    let mut last_user_or_summary_index = None;
-    let mut last_real_user_index = None;
-    for (i, item) in compacted_history.iter().enumerate().rev() {
-        if is_compaction_summary_item(item) {
-            last_user_or_summary_index.get_or_insert(i);
-            continue;
-        }
-        let Some(TurnItem::UserMessage(_)) = crate::event_mapping::parse_turn_item(item) else {
-            continue;
-        };
-        // Compaction summaries are encoded as user messages, so track both:
-        // the last real user message (preferred insertion point) and the last
-        // user-message-like item (fallback summary insertion point).
-        last_user_or_summary_index.get_or_insert(i);
-        last_real_user_index = Some(i);
-        break;
-    }
-    let last_compaction_index = compacted_history
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, item)| {
-            matches!(
-                item,
-                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-            )
-            .then_some(i)
-        });
-    let insertion_index = last_real_user_index
-        .or(last_user_or_summary_index)
-        .or(last_compaction_index);
 
-    // Re-inject canonical context from the current session since we stripped it
-    // from the pre-compaction history. Prefer placing it before the last real
-    // user message; if there is no real user message left, place it before the
-    // summary or compaction item so the compaction item remains last.
-    if let Some(insertion_index) = insertion_index {
-        compacted_history.splice(insertion_index..insertion_index, initial_context);
-    } else {
-        compacted_history.extend(initial_context);
-    }
-
-    compacted_history
-}
 
 pub(crate) fn build_compacted_history(
     initial_context: Vec<ResponseItem>,

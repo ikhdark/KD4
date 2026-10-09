@@ -65,6 +65,12 @@ mod tests {
         let line = ansi_escape_line("\u{1b}[31mleft\tright\u{1b}[0m");
 
         assert_eq!(line_text(&line), "left    right");
+        assert!(
+            line.spans.iter().filter(|span| !span.content.is_empty()).all(|span| {
+                span.style.fg == Some(ratatui::style::Color::Red)
+            }),
+            "ANSI foreground color must survive conversion, not just be stripped"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from scripts import kd4_first_useful_action_analysis as analysis
+from scripts import kd4_turn_latency_audit as audit
 from scripts.rollout_snapshot import read_rollout_snapshot
 
 
@@ -16,7 +17,9 @@ def record(timestamp: str, record_type: str, payload: dict[str, object]) -> str:
 class FirstUsefulActionAnalysisTest(unittest.TestCase):
     def test_mixed_schema_coverage_quantiles_and_exclusions_from_snapshot(self):
         rows = []
-        for version, latency in ((25, 10), (26, 20), (27, 30), (27, 40)):
+        # Preserve each schema's samples, but not latency order: interpolation
+        # must sort observations rather than accidentally use rollout order.
+        for version, latency in ((27, 30), (25, 10), (27, 40), (26, 20)):
             milestones = {
                 "firstUsefulActionMs": latency,
                 "firstDomainActionMs": latency,
@@ -55,7 +58,8 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rollout.jsonl"
             path.write_text("\n".join(rows), encoding="utf-8")
-            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+            with read_rollout_snapshot(path) as snapshot:
+                result = analysis.analyze_snapshots([snapshot])
         self.assertEqual(result["recordCount"], 12)
         self.assertEqual(result["startedTurnCount"], 6)
         self.assertEqual(result["completedTurnCount"], 4)
@@ -166,7 +170,8 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                     },
                 )
             )
-            report = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+            with read_rollout_snapshot(path) as snapshot:
+                report = analysis.analyze_snapshots([snapshot])
             self.assertEqual(report["canonicalTurnCount"], 0)
         self.assertEqual(report["exclusions"]["incompleteCanonicalMilestones"], 1)
 
@@ -174,7 +179,8 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rollout.jsonl"
             path.write_text("\n".join(rows), encoding="utf-8")
-            return analysis.analyze_snapshots([read_rollout_snapshot(path)])
+            with read_rollout_snapshot(path) as snapshot:
+                return analysis.analyze_snapshots([snapshot])
 
     def canonical_turn(self, milestones: dict, *, valid: bool = True) -> list[str]:
         return [
@@ -218,6 +224,27 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
         self.assertEqual(
             result["exclusionRates"]["invalidTimingProfiles"]["rate"], 0.5
         )
+
+    def test_malformed_milestones_preserve_valid_turns_through_audit(self):
+        # Malformed offsets are unavailable, not zero; one damaged terminal
+        # must not prevent the audit from reporting another measured turn.
+        for malformed in (None, "bad", [1], True, {
+            "firstUsefulActionMs": 2**2048, "firstDomainActionMs": 100,
+        }):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "rollout.jsonl"
+                rows = self.canonical_turn(malformed) + self.canonical_turn({
+                    "firstUsefulActionMs": 100, "firstDomainActionMs": 100,
+                    "firstModelOutputMs": 2**2048,
+                })
+                path.write_text("\n".join(rows), encoding="utf-8")
+                result = audit.analyze_session_path(path, Path(temp))["firstUsefulActionAnalysis"]
+                useful = result["canonical"]["startToFirstUsefulActionMs"]
+                self.assertEqual((useful["count"], useful["p50"], useful["coverage"]), (1, 100, 0.5))
+                self.assertEqual(result["exclusions"]["incompleteCanonicalMilestones"], 1)
+                model = result["canonical"]["startToFirstModelOutputMs"]
+                self.assertEqual(model["count"], 0)
+                self.assertIsNone(model["p50"])
 
     def test_out_of_order_milestone_interval_is_not_zero_latency(self):
         # Input recorded after the first useful tool was accepted (mid-turn
@@ -389,7 +416,8 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+            with read_rollout_snapshot(path) as snapshot:
+                result = analysis.analyze_snapshots([snapshot])
 
         self.assertEqual(result["legacyReconstructedTurnCount"], 1)
         self.assertEqual(
@@ -439,7 +467,8 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+            with read_rollout_snapshot(path) as snapshot:
+                result = analysis.analyze_snapshots([snapshot])
 
         self.assertEqual(result["canonicalTurnCount"], 1)
         self.assertEqual(result["legacyReconstructedTurnCount"], 0)
@@ -508,9 +537,14 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = analysis.analyze_snapshots([read_rollout_snapshot(path)])
+            with read_rollout_snapshot(path) as snapshot:
+                result = analysis.analyze_snapshots([snapshot])
         self.assertEqual(result["canonicalTurnCount"], 0)
         self.assertEqual(result["legacyReconstructedTurnCount"], 1)
+        legacy = result["legacyReconstructed"]
+        self.assertEqual(legacy["startToUsefulToolEmittedMs"]["p50"], 500)
+        self.assertEqual(legacy["userInputEventToUsefulToolEmittedMs"]["p50"], 400)
+        self.assertIsNone(result["canonical"]["startToFirstDomainActionMs"]["p50"])
 
     def test_useful_tool_classification_excludes_control_and_discovery(self) -> None:
         self.assertFalse(analysis.is_useful_tool("functions.wait_agent"))

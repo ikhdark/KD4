@@ -1003,6 +1003,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_socks5_tcp_uses_mitm_in_limited_mode() {
         let mut settings = NetworkProxyConfig {
+            allow_local_binding: true,
             enabled: true,
             mode: NetworkMode::Limited,
             mitm: true,
@@ -1022,7 +1023,12 @@ mod tests {
         .await
         .expect("limited-mode HTTPS should use MITM");
 
-        assert!(matches!(result.conn, Socks5TcpConnection::Mitm { .. }));
+        let Socks5TcpConnection::Mitm { target, mode, .. } = result.conn else {
+            panic!("limited-mode HTTPS must select MITM");
+        };
+        assert_eq!(target.host.to_string(), "example.com");
+        assert_eq!(target.port, 443);
+        assert_eq!(mode, NetworkMode::Limited);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1097,12 +1103,19 @@ mod tests {
         .await
         .expect("brokered TLS should defer MITM until protocol detection");
 
-        assert!(matches!(result.conn, Socks5TcpConnection::DetectTls { .. }));
+        let Socks5TcpConnection::DetectTls { target, mode, allow_local_binding, .. } = result.conn else {
+            panic!("brokered nonstandard port must select TLS detection");
+        };
+        assert_eq!(target.host.to_string(), "api.openai.com");
+        assert_eq!(target.port, 8443);
+        assert_eq!(mode, NetworkMode::Full);
+        assert!(!allow_local_binding);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_socks5_tcp_blocks_limited_mode_without_mitm_state() {
         let mut settings = NetworkProxyConfig {
+            allow_local_binding: true,
             enabled: true,
             mode: NetworkMode::Limited,
             ..NetworkProxyConfig::default()
@@ -1130,6 +1143,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_socks5_tcp_uses_mitm_for_hooked_host_in_full_mode() {
         let mut settings = NetworkProxyConfig {
+            allow_local_binding: true,
             enabled: true,
             mode: NetworkMode::Full,
             mitm: true,
@@ -1158,12 +1172,18 @@ mod tests {
         .await
         .expect("hooked HTTPS should use MITM");
 
-        assert!(matches!(result.conn, Socks5TcpConnection::Mitm { .. }));
+        let Socks5TcpConnection::Mitm { target, mode, .. } = result.conn else {
+            panic!("hooked HTTPS must select MITM");
+        };
+        assert_eq!(target.host.to_string(), "api.github.com");
+        assert_eq!(target.port, 443);
+        assert_eq!(mode, NetworkMode::Full);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_socks5_tcp_blocks_hooked_non_https_host_in_full_mode() {
         let mut settings = NetworkProxyConfig {
+            allow_local_binding: true,
             enabled: true,
             mode: NetworkMode::Full,
             mitm: true,

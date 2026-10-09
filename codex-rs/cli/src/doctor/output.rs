@@ -1398,68 +1398,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_human_report_includes_details_by_default_without_color() {
-        let rendered = render_human_report(&sample_report(), detailed_no_color_unicode_options());
-        let expected = format!(
-            "\
-Codex Doctor v0.0.0
 
-Notes
-   ⚠ terminal     narrow terminal
-   ✗ auth         token expired - Run `codex login`.
-─────────────────────────────────────────────────────────────
-
-Environment
-  ✓ system       en-US
-      os                       Windows 11
-      OS language              en-US
-      VISUAL                   code --wait
-      EDITOR                   notepad.exe
-      PAGER                    more.com
-      GIT_PAGER                delta
-      GH_PAGER                 more.com
-      LESS                     FRX
-  ✓ runtime      running local build on windows-x86_64
-  ✓ install      consistent
-      managed by               npm: no · bun: no · pnpm: no · package root —
-  ✓ search       search is OK (bundled)
-  ✓ git          git version 2.54.0
-      selected git             C:\\Program Files\\Git\\cmd\\git.exe
-      version                  git version 2.54.0
-      repo detected            true
-  ⚠ terminal     narrow terminal
-  ✓ title        default · project codex
-      title source             default
-      title items              activity, project-name
-      project value            codex
-  ✓ state        state paths inspectable
-
-Configuration
-  ✗ auth         token expired — Run `codex login`.
-      OPENAI_API_KEY           present
-
-Updates
-  ✓ updates      update configuration is locally consistent
-
-Connectivity
-  ✓ network      network environment readable
-  ✓ websocket    Responses WebSocket handshake succeeded
-  ✓ reachability active provider endpoints are reachable over HTTP
-
-Background Server
-  ✓ app-server   background server is not running
-
-{}
-12 ok · 2 notes · 1 warn · 1 fail failed
-
---summary compact output           --all expand truncated lists
---json redacted report
-",
-            "─".repeat(SEPARATOR_WIDTH)
-        );
-        assert_eq!(rendered, expected);
-    }
 
     #[test]
     fn render_human_report_snapshot_covers_environment_rows() {
@@ -1596,19 +1535,7 @@ Run codex doctor without --summary for detailed diagnostics.
         assert_eq!(rendered, expected);
     }
 
-    #[test]
-    fn render_human_report_includes_redacted_details() {
-        let rendered = render_human_report(
-            &sample_report(),
-            HumanOutputOptions {
-                show_details: true,
-                show_all: false,
-                ascii: false,
-                color_enabled: false,
-            },
-        );
-        assert!(rendered.contains("      OPENAI_API_KEY           present"));
-    }
+
 
     #[test]
     fn render_human_report_explains_terminal_warning_issue() {
@@ -1784,46 +1711,27 @@ Run codex doctor without --summary for detailed diagnostics.
     }
 
     #[test]
-    fn redact_detail_sanitizes_urls() {
-        let redacted = redact_detail(
-            "reachability failed: https://user:pass@example.com/mcp?x=abc#frag (connect failed)",
-        );
-
-        assert_eq!(
-            redacted,
-            "reachability failed: https://example.com/mcp (connect failed)"
-        );
+    fn redact_detail_removes_secrets_and_preserves_presence_information() {
+        for (input, expected) in [
+            ("reachability failed: https://user:pass@example.com/mcp?x=abc#frag (connect failed)",
+             "reachability failed: https://example.com/mcp (connect failed)"),
+            ("reachability failed: https://example.com/mcp/abc123xyz",
+             "reachability failed: https://example.com/mcp/<redacted>"),
+            ("auth env vars present: OPENAI_API_KEY, CODEX_API_KEY",
+             "auth env vars present: OPENAI_API_KEY, CODEX_API_KEY"),
+            ("stored ChatGPT tokens: true", "stored ChatGPT tokens: true"),
+            ("stored ChatGPT tokens: false", "stored ChatGPT tokens: false"),
+            ("stored ChatGPT tokens: sensitive-token", "stored ChatGPT tokens: <redacted>"),
+        ] {
+            assert_eq!(redact_detail(input), expected, "{input}");
+        }
     }
 
-    #[test]
-    fn redact_detail_sanitizes_secret_url_path_segments() {
-        let redacted = redact_detail("reachability failed: https://example.com/mcp/abc123xyz");
 
-        assert_eq!(
-            redacted,
-            "reachability failed: https://example.com/mcp/<redacted>"
-        );
-    }
 
-    #[test]
-    fn redact_detail_preserves_env_var_names() {
-        assert_eq!(
-            redact_detail("auth env vars present: OPENAI_API_KEY, CODEX_API_KEY"),
-            "auth env vars present: OPENAI_API_KEY, CODEX_API_KEY"
-        );
-    }
 
-    #[test]
-    fn redact_detail_preserves_secret_presence_booleans() {
-        assert_eq!(
-            redact_detail("stored ChatGPT tokens: true"),
-            "stored ChatGPT tokens: true"
-        );
-        assert_eq!(
-            redact_detail("stored ChatGPT tokens: false"),
-            "stored ChatGPT tokens: false"
-        );
-    }
+
+
 
     #[test]
     fn render_human_report_can_emit_color() {

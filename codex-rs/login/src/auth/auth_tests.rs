@@ -49,8 +49,10 @@ async fn refresh_without_id_token() {
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
     );
+    let expected_tokens = storage.load().unwrap().unwrap().tokens.unwrap();
     let updated = super::persist_tokens(
         &storage,
+        &expected_tokens,
         /*id_token*/ None,
         Some("new-access-token".to_string()),
         Some("new-refresh-token".to_string()),
@@ -1561,7 +1563,7 @@ async fn configured_auth_keeps_cached_credentials_after_permanent_reload_failure
 
     assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 1);
 
-    assert_eq!(manager.auth().await, Some(auth.clone()));
+    assert_eq!(manager.auth().await.unwrap().api_key(), Some("configured-token"));
     assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
     assert_eq!(
         manager
@@ -1571,7 +1573,7 @@ async fn configured_auth_keeps_cached_credentials_after_permanent_reload_failure
         "external auth failed"
     );
 
-    assert_eq!(manager.auth().await, Some(auth));
+    assert_eq!(manager.auth().await.unwrap().api_key(), Some("configured-token"));
     assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
 }
 
@@ -1656,6 +1658,7 @@ async fn configured_external_auth_is_immutable_and_process_local() {
 
     assert!(manager.has_configured_external_auth());
     assert_eq!(manager.auth().await, Some(auth.clone()));
+    assert_eq!(manager.auth_cached().unwrap().get_token().unwrap(), access_token);
     assert!(matches!(
         manager
             .set_external_auth(Arc::new(StaticExternalAuth(auth.clone())))
@@ -1670,6 +1673,7 @@ async fn configured_external_auth_is_immutable_and_process_local() {
     assert_eq!(logout_error.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(manager.has_configured_external_auth());
     assert_eq!(manager.auth_cached(), Some(auth));
+    assert_eq!(manager.auth_cached().unwrap().get_token().unwrap(), access_token);
 
     assert!(!get_auth_file(codex_home.path()).exists());
     let ephemeral_storage = create_auth_storage(
@@ -2852,14 +2856,13 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
 
 #[tokio::test]
 #[serial(codex_auth_env)]
-async fn agent_identity_plan_type_maps_raw_enterprise_alias() {
-    assert_agent_identity_plan_alias(json!("hc"), AccountPlanType::Enterprise).await;
-}
-
-#[tokio::test]
-#[serial(codex_auth_env)]
-async fn agent_identity_plan_type_maps_raw_education_alias() {
-    assert_agent_identity_plan_alias(json!("education"), AccountPlanType::Edu).await;
+async fn agent_identity_plan_type_maps_raw_aliases() {
+    for (raw, expected) in [
+        ("hc", AccountPlanType::Enterprise),
+        ("education", AccountPlanType::Edu),
+    ] {
+        assert_agent_identity_plan_alias(json!(raw), expected).await;
+    }
 }
 
 async fn assert_agent_identity_plan_alias(
@@ -2900,171 +2903,47 @@ async fn assert_agent_identity_plan_alias(
 
 #[tokio::test]
 #[serial(codex_auth_env)]
-async fn plan_type_maps_known_plan() {
-    let codex_home = tempdir().unwrap();
-    let _access_token_guard = remove_access_token_env_var();
-    let _jwt = write_auth_file(
-        AuthFileParams {
-            openai_api_key: None,
-            chatgpt_plan_type: Some("pro".to_string()),
-            chatgpt_account_id: None,
-        },
-        codex_home.path(),
-    )
-    .expect("failed to write auth file");
+async fn account_plan_type_maps_stored_known_unknown_and_missing_claims() {
+    for (raw, expected) in [
+        (Some("pro"), AccountPlanType::Pro),
+        (
+            Some("self_serve_business_usage_based"),
+            AccountPlanType::SelfServeBusinessUsageBased,
+        ),
+        (
+            Some("enterprise_cbp_usage_based"),
+            AccountPlanType::EnterpriseCbpUsageBased,
+        ),
+        (Some("mystery-tier"), AccountPlanType::Unknown),
+        (None, AccountPlanType::Unknown),
+    ] {
+        let codex_home = tempdir().unwrap();
+        let _access_token_guard = remove_access_token_env_var();
+        let _jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: raw.map(str::to_string),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write auth file");
 
-    let auth = super::load_auth(
-        codex_home.path(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*allowed_login_methods*/ None,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::Direct,
-        /*agent_identity_authapi_base_url*/ None,
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .expect("load auth")
-    .expect("auth available");
+        let auth = super::load_auth(
+            codex_home.path(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*allowed_login_methods*/ None,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::Direct,
+            /*agent_identity_authapi_base_url*/ None,
+            &crate::test_support::transport_default_auth_route_config(),
+        )
+        .await
+        .expect("load auth")
+        .expect("auth available");
 
-    pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Pro));
-}
-
-#[tokio::test]
-#[serial(codex_auth_env)]
-async fn plan_type_maps_self_serve_business_usage_based_plan() {
-    let codex_home = tempdir().unwrap();
-    let _access_token_guard = remove_access_token_env_var();
-    let _jwt = write_auth_file(
-        AuthFileParams {
-            openai_api_key: None,
-            chatgpt_plan_type: Some("self_serve_business_usage_based".to_string()),
-            chatgpt_account_id: None,
-        },
-        codex_home.path(),
-    )
-    .expect("failed to write auth file");
-
-    let auth = super::load_auth(
-        codex_home.path(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*allowed_login_methods*/ None,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::Direct,
-        /*agent_identity_authapi_base_url*/ None,
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .expect("load auth")
-    .expect("auth available");
-
-    pretty_assertions::assert_eq!(
-        auth.account_plan_type(),
-        Some(AccountPlanType::SelfServeBusinessUsageBased)
-    );
-}
-
-#[tokio::test]
-#[serial(codex_auth_env)]
-async fn plan_type_maps_enterprise_cbp_usage_based_plan() {
-    let codex_home = tempdir().unwrap();
-    let _access_token_guard = remove_access_token_env_var();
-    let _jwt = write_auth_file(
-        AuthFileParams {
-            openai_api_key: None,
-            chatgpt_plan_type: Some("enterprise_cbp_usage_based".to_string()),
-            chatgpt_account_id: None,
-        },
-        codex_home.path(),
-    )
-    .expect("failed to write auth file");
-
-    let auth = super::load_auth(
-        codex_home.path(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*allowed_login_methods*/ None,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::Direct,
-        /*agent_identity_authapi_base_url*/ None,
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .expect("load auth")
-    .expect("auth available");
-
-    pretty_assertions::assert_eq!(
-        auth.account_plan_type(),
-        Some(AccountPlanType::EnterpriseCbpUsageBased)
-    );
-}
-
-#[tokio::test]
-#[serial(codex_auth_env)]
-async fn plan_type_maps_unknown_to_unknown() {
-    let codex_home = tempdir().unwrap();
-    let _access_token_guard = remove_access_token_env_var();
-    let _jwt = write_auth_file(
-        AuthFileParams {
-            openai_api_key: None,
-            chatgpt_plan_type: Some("mystery-tier".to_string()),
-            chatgpt_account_id: None,
-        },
-        codex_home.path(),
-    )
-    .expect("failed to write auth file");
-
-    let auth = super::load_auth(
-        codex_home.path(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*allowed_login_methods*/ None,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::Direct,
-        /*agent_identity_authapi_base_url*/ None,
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .expect("load auth")
-    .expect("auth available");
-
-    pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
-}
-
-#[tokio::test]
-#[serial(codex_auth_env)]
-async fn missing_plan_type_maps_to_unknown() {
-    let codex_home = tempdir().unwrap();
-    let _access_token_guard = remove_access_token_env_var();
-    let _jwt = write_auth_file(
-        AuthFileParams {
-            openai_api_key: None,
-            chatgpt_plan_type: None,
-            chatgpt_account_id: None,
-        },
-        codex_home.path(),
-    )
-    .expect("failed to write auth file");
-
-    let auth = super::load_auth(
-        codex_home.path(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*allowed_login_methods*/ None,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::Direct,
-        /*agent_identity_authapi_base_url*/ None,
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .expect("load auth")
-    .expect("auth available");
-
-    pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
+        pretty_assertions::assert_eq!(auth.account_plan_type(), Some(expected));
+    }
 }

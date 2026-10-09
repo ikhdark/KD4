@@ -1032,35 +1032,42 @@ mod tests {
     }
 
     #[test]
-    fn payload_defaults_otel_absent() {
+    fn payload_defaults_and_optional_settings_are_preserved() {
         let payload: Payload = serde_json::from_value(payload_json()).expect("payload");
 
         assert_eq!(payload.otel, None);
-    }
+        assert_eq!(payload.mode, super::SetupMode::Full);
+        assert!(!payload.refresh_only);
+        assert!(!payload.allow_local_binding);
+        assert!(payload.deny_read_paths.is_empty());
+        assert!(payload.deny_write_paths.is_empty());
 
-    #[test]
-    fn payload_accepts_provision_only_mode() {
-        let mut payload = payload_json();
-        payload["mode"] = json!("provision-only");
-        let payload: Payload = serde_json::from_value(payload).expect("payload");
-
-        assert_eq!(payload.mode, super::SetupMode::ProvisionOnly);
-    }
-
-    #[test]
-    fn payload_accepts_otel_settings() {
-        let mut payload = payload_json();
-        payload["otel"] = json!({
-            "environment": "prod",
-        });
-        let payload: Payload = serde_json::from_value(payload).expect("payload");
-
-        assert_eq!(
-            payload.otel,
-            Some(StatsigMetricsSettings {
-                environment: "prod".to_string(),
-            })
-        );
+        for provision_only in [false, true] {
+            for with_otel in [false, true] {
+                let mut payload = payload_json();
+                if provision_only {
+                    payload["mode"] = json!("provision-only");
+                }
+                if with_otel {
+                    payload["otel"] = json!({ "environment": "prod" });
+                }
+                let payload: Payload = serde_json::from_value(payload).expect("payload");
+                assert_eq!(
+                    payload.mode,
+                    if provision_only {
+                        super::SetupMode::ProvisionOnly
+                    } else {
+                        super::SetupMode::Full
+                    }
+                );
+                assert_eq!(
+                    payload.otel,
+                    with_otel.then(|| StatsigMetricsSettings {
+                        environment: "prod".to_string(),
+                    })
+                );
+            }
+        }
     }
 
     #[test]
@@ -1166,6 +1173,11 @@ mod tests {
         assert!(deny_sids.contains(&active_sid));
         assert!(!deny_sids.contains(&stale_sid));
         assert!(!deny_sids.contains(&caps.workspace));
+
+        let fallback_sids =
+            workspace_write_cap_sids_for_path(&codex_home, &workspace, &[], &deny_path)
+                .expect("empty roots fall back to command cwd");
+        assert_eq!(fallback_sids, vec![workspace_sid]);
     }
 
     #[test]

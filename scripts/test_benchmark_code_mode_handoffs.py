@@ -78,6 +78,13 @@ class CodeModeHandoffsBenchmarkTest(unittest.TestCase):
         for row in report["scenarios"]:
             self.assertEqual(len(row["wallMs"]), 1)
             self.assertGreaterEqual(row["medianMs"], 0)
+            self.assertEqual(row["medianMs"], row["wallMs"][0])
+        # Overall timing must aggregate the measured scenarios, not publish a
+        # plausible-looking zero alongside otherwise correct scenario rows.
+        total = sum(row["wallMs"][0] for row in report["scenarios"])
+        self.assertGreater(total, 0)
+        self.assertEqual(report["wallMs"], [total])
+        self.assertEqual(report["medianMs"], total)
         runtime = REPO_ROOT / "codex-rs" / "code-mode" / "src" / "runtime"
         for source in report["sources"]:
             raw = (runtime / source["path"]).read_bytes()
@@ -91,17 +98,23 @@ class CodeModeHandoffsBenchmarkTest(unittest.TestCase):
             raw = (runtime / name).read_bytes()
             sources.append({"path": name, "bytes": len(raw),
                             "sha256": hashlib.sha256(raw).hexdigest(), "text": raw.decode("utf-8")})
-        sources[0]["text"] += "corrupt"
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / "snapshot.json"
             output = Path(directory) / "report.json"
-            snapshot.write_text(json.dumps({"kind": "retained_direct_file_read", "sources": sources}),
-                                encoding="utf-8")
-            result = self.run_benchmark(script, "--profile", "critical-path", "--runs", "1",
-                                        "--source-snapshot", str(snapshot), "--output", str(output))
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("source snapshot identity mismatch", result.stderr)
-            self.assertFalse(output.exists())
+            original = sources[0]["text"]
+            for corruption in (original + "corrupt", "!" + original[1:]):
+                with self.subTest(size_changed=len(corruption) != len(original)):
+                    # Equal-length corruption must fail the hash check, not
+                    # merely the byte-count check exercised by appended text.
+                    sources[0]["text"] = corruption
+                    snapshot.write_text(json.dumps({"kind": "retained_direct_file_read", "sources": sources}),
+                                        encoding="utf-8")
+                    result = self.run_benchmark(script, "--profile", "critical-path", "--runs", "1",
+                                                "--source-snapshot", str(snapshot), "--output", str(output))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("source snapshot identity mismatch", result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertFalse(output.exists())
 
     def test_uncertainty_gate_rejects_faster_unsupported_answers_and_missing_cases(self):
         fixture = json.loads((REPO_ROOT / "scripts/fixtures/uncertainty_evaluation.json").read_text())

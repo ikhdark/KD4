@@ -503,6 +503,15 @@ mod binding_state_tests {
             .find(|row| row.context == "global" && row.action == "toggle_vim_mode")
             .unwrap();
         assert!(!toggle.is_unbound());
+        assert_eq!(toggle.binding_summary, "unbound");
+        for (runtime, expected_in_unbound_tab) in [(&runtime, false), (&RuntimeKeymap::defaults(), true)] {
+            let params = build_keymap_picker_params(runtime, &TuiKeymap::default());
+            let tab = params.tabs.iter().find(|tab| tab.id == KEYMAP_UNBOUND_TAB_ID).unwrap();
+            assert_eq!(
+                tab.items.iter().any(|item| item.name == "Toggle Vim Mode"),
+                expected_in_unbound_tab,
+            );
+        }
         let defaults = build_keymap_rows(
             &RuntimeKeymap::defaults(),
             &TuiKeymap::default(),

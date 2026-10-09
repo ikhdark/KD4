@@ -728,6 +728,26 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+
+        let mut forced_request = None;
+        send_app_list_updated_notification(
+            &outgoing, &shared, &mut forced_request, Vec::new(), false,
+        ).await;
+        assert!(matches!(
+            receiver.try_recv().expect("force refresh bypasses cross-request deduplication"),
+            crate::outgoing_message::OutgoingEnvelope::Broadcast {
+                message: crate::outgoing_message::OutgoingMessage::AppServerNotification(
+                    ServerNotification::AppListUpdated(AppListUpdatedNotification { data })
+                ),
+            } if data.is_empty()
+        ));
+        send_app_list_updated_notification(
+            &outgoing, &shared, &mut forced_request, Vec::new(), false,
+        ).await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ), "force refresh still deduplicates within its own request");
     }
 
     impl Drop for DropFlag {
@@ -755,15 +775,19 @@ mod tests {
             tokio::pin!(accessible_loader);
             tokio::pin!(directory_loader);
 
+            let started = tokio::time::Instant::now();
             let result = next_app_list_load(
                 accessible_loader.as_mut(),
                 directory_loader.as_mut(),
                 /*accessible_loaded*/ false,
                 /*all_loaded*/ false,
-                tokio::time::Instant::now() + Duration::from_secs(1),
+                started + APP_LIST_LOAD_TIMEOUT,
             )
             .await;
-            assert!(result.is_err());
+            assert_eq!(result.err(), Some(internal_error(format!(
+                "timed out waiting for app lists after {} seconds", APP_LIST_LOAD_TIMEOUT.as_secs()
+            ))));
+            assert_eq!(started.elapsed(), APP_LIST_LOAD_TIMEOUT);
         }
 
         assert!(accessible_dropped.load(Ordering::Acquire));

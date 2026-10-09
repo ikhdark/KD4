@@ -19,14 +19,7 @@ use std::collections::BTreeMap;
 use toml::Table;
 use toml::Value as TomlValue;
 
-#[test]
-fn removed_memory_features_are_not_registered() {
-    for key in ["memories", "memory_tool"] {
-        assert!(!is_known_feature_key(key));
-        assert_eq!(feature_for_key(key), None);
-        assert_eq!(user_settable_feature_for_key(key), None);
-    }
-}
+
 
 #[test]
 fn unknown_feature_settings_emit_a_visible_warning_for_booleans_and_tables() {
@@ -139,42 +132,13 @@ fn user_settable_registry_excludes_internal_features_and_legacy_aliases() {
     assert!(user_settable_features().all(|spec| !matches!(spec.stage, Stage::Internal)));
 }
 
-#[test]
-fn removed_approval_reviewer_features_are_unknown() {
-    for key in ["auto_review", "guardian_approval"] {
-        assert_eq!(feature_requirement_for_key(key), None, "{key}");
-        assert_eq!(user_settable_feature_for_key(key), None, "{key}");
-        assert_eq!(feature_for_key(key), None, "{key}");
-    }
-}
 
-#[test]
-fn deleted_zombie_feature_keys_are_unknown() {
-    for key in ["artifact", "enable_mcp_apps", "realtime_conversation"] {
-        assert_eq!(feature_for_key(key), None, "{key}");
-        assert_eq!(user_settable_feature_for_key(key), None, "{key}");
-    }
-}
-
-#[test]
-fn under_development_features_are_disabled_by_default() {
-    let defaults = Features::with_defaults();
-    for spec in crate::FEATURES {
-        if matches!(spec.stage, Stage::UnderDevelopment) {
-            assert_eq!(
-                defaults.enabled(spec.id),
-                false,
-                "feature `{}` is under development and must be disabled in resolved defaults",
-                spec.key
-            );
-        }
-    }
-}
 
 #[test]
 fn default_enabled_features_are_stable() {
     let defaults = Features::with_defaults();
     for spec in crate::FEATURES {
+        assert_eq!(defaults.enabled(spec.id), spec.default_enabled, "{}", spec.key);
         if defaults.enabled(spec.id) {
             assert!(
                 matches!(spec.stage, Stage::Stable),
@@ -189,6 +153,14 @@ fn default_enabled_features_are_stable() {
 #[test]
 fn retired_feature_keys_are_unknown_and_ignored_by_feature_sources() {
     for key in [
+        "memories",
+        "memory_tool",
+        "auto_review",
+        "guardian_approval",
+        "artifact",
+        "enable_mcp_apps",
+        "realtime_conversation",
+        "imagegenext",
         "terminal_resize_reflow",
         "apps_mcp_path_override",
         "item_ids",
@@ -209,6 +181,8 @@ fn retired_feature_keys_are_unknown_and_ignored_by_feature_sources() {
     ] {
         assert!(!is_known_feature_key(key), "{key}");
         assert_eq!(feature_for_key(key), None, "{key}");
+        assert_eq!(user_settable_feature_for_key(key), None, "{key}");
+        assert_eq!(feature_requirement_for_key(key), None, "{key}");
 
         let features_toml = FeaturesToml::from(BTreeMap::from([(key.to_string(), true)]));
         let features = Features::from_sources(
@@ -400,6 +374,10 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
         ),
         (Feature::RequestPermissionsTool, "request_permissions_tool"),
         (Feature::MultiAgentV2, "multi_agent_v2"),
+        (Feature::ImageGeneration, "image_generation"),
+        (Feature::ToolCallMcpElicitation, "tool_call_mcp_elicitation"),
+        (Feature::AuthElicitation, "auth_elicitation"),
+        (Feature::Collab, "multi_agent"),
     ] {
         assert_eq!(feature_for_key(key), Some(feature), "{key}");
         assert_eq!(feature.stage(), Stage::Stable, "{key}");
@@ -545,16 +523,7 @@ computer_use = {enabled}
     }
 }
 
-#[test]
-fn image_generation_is_stable_and_legacy_alias_is_unknown() {
-    assert_eq!(Feature::ImageGeneration.stage(), Stage::Stable);
-    assert_eq!(Feature::ImageGeneration.default_enabled(), true);
-    assert_eq!(
-        feature_for_key("image_generation"),
-        Some(Feature::ImageGeneration)
-    );
-    assert_eq!(feature_for_key("imagegenext"), None);
-}
+
 
 #[test]
 fn image_generation_toggle_resolves_feature_state() {
@@ -570,21 +539,7 @@ fn image_generation_toggle_resolves_feature_state() {
     assert!(features.enabled(Feature::ImageGeneration));
 }
 
-#[test]
-fn tool_call_mcp_elicitation_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::ToolCallMcpElicitation.stage(), Stage::Stable);
-    assert_eq!(Feature::ToolCallMcpElicitation.default_enabled(), true);
-}
 
-#[test]
-fn auth_elicitation_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::AuthElicitation.stage(), Stage::Stable);
-    assert_eq!(Feature::AuthElicitation.default_enabled(), true);
-    assert_eq!(
-        feature_for_key("auth_elicitation"),
-        Some(Feature::AuthElicitation)
-    );
-}
 
 #[test]
 fn renamed_feature_variants_keep_canonical_config_keys() {
@@ -605,11 +560,7 @@ fn renamed_feature_variants_keep_canonical_config_keys() {
     }
 }
 
-#[test]
-fn multi_agent_is_stable_and_enabled_by_default() {
-    assert_eq!(Feature::Collab.stage(), Stage::Stable);
-    assert_eq!(Feature::Collab.default_enabled(), true);
-}
+
 
 #[test]
 fn enable_fanout_is_under_development() {

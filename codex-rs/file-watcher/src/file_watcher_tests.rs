@@ -273,6 +273,45 @@ async fn debounced_receiver_coalesces_each_event_batch() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn debounced_receiver_keeps_first_event_deadline_across_cancellation() {
+    let (tx, rx) = watch_channel();
+    let mut debounced = DebouncedWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
+    let started_at = Instant::now();
+
+    tx.add_changed_paths(&[path("a")]).await;
+    for _ in 0..3 {
+        let mut receive = Box::pin(debounced.recv());
+        tokio::select! {
+            biased;
+            event = &mut receive => panic!("debounce window has not elapsed: {event:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(TEST_THROTTLE_INTERVAL / 5).await;
+        drop(receive);
+    }
+    tx.add_changed_paths(&[path("b")]).await;
+    assert_eq!(
+        debounced.recv().await,
+        Some(FileWatcherEvent {
+            paths: vec![path("a"), path("b")],
+            rescan_required: false,
+        })
+    );
+    // The documented fixed window starts with a, not the latest recv call.
+    assert_eq!(Instant::now() - started_at, TEST_THROTTLE_INTERVAL);
+
+    tx.add_changed_paths(&[path("c")]).await;
+    assert_eq!(
+        debounced.recv().await,
+        Some(FileWatcherEvent {
+            paths: vec![path("c")],
+            rescan_required: false,
+        })
+    );
+    assert_eq!(Instant::now() - started_at, TEST_THROTTLE_INTERVAL * 2);
+}
+
 #[tokio::test]
 async fn debounced_receiver_flushes_pending_on_shutdown() {
     let (tx, rx) = watch_channel();
@@ -310,12 +349,13 @@ async fn subscriber_buffer_overflow_retains_coarse_path_evidence() {
     let event = rx.recv().await.expect("compressed change event");
     assert!(!event.rescan_required);
     assert!(event.paths.len() < SUBSCRIBER_PATH_BUFFER_CAPACITY);
-    assert!(
-        event
-            .paths
-            .iter()
-            .any(|changed| path("workspace/generated/changed-0").starts_with(changed))
-    );
+    for original in &paths {
+        assert!(
+            event.paths.iter().any(|changed| original.starts_with(changed)),
+            "lost evidence for {}: {:?}", original.display(), event.paths
+        );
+    }
+    assert!(event.paths.iter().all(|changed| changed.starts_with("workspace/generated")));
 }
 
 #[test]
@@ -353,7 +393,10 @@ fn register_dedupes_by_path_and_scope() {
 
     let watcher = Arc::new(FileWatcher::noop());
     let (subscriber, _rx) = watcher.add_subscriber();
-    let _first = subscriber.register_path(skills.clone(), /*recursive*/ false);
+    let _first = subscriber.register_paths(vec![
+        WatchPath { path: skills.clone(), recursive: false },
+        WatchPath { path: skills.clone(), recursive: false },
+    ]).expect("deduplicate one registration batch");
     let _second = subscriber.register_path(skills.clone(), /*recursive*/ false);
     let _third = subscriber.register_path(skills.clone(), /*recursive*/ true);
     let _fourth = subscriber.register_path(other_skills.clone(), /*recursive*/ true);
@@ -377,20 +420,22 @@ fn watch_registration_drop_unregisters_paths() {
     assert_eq!(watcher.watch_counts_for_test(&skills), None);
 }
 
-#[test]
-fn subscriber_drop_unregisters_paths() {
+#[tokio::test]
+async fn subscriber_drop_unregisters_paths_and_closes_receiver() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let skills = temp_dir.path().join("skills");
     std::fs::create_dir(&skills).expect("create skills dir");
 
     let watcher = Arc::new(FileWatcher::noop());
-    let registration = {
-        let (subscriber, _rx) = watcher.add_subscriber();
-        subscriber.register_path(skills.clone(), /*recursive*/ true)
-    };
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let registration = subscriber.register_path(skills.clone(), /*recursive*/ true);
+    assert_eq!(watcher.watch_counts_for_test(&skills), Some((0, 1)));
+    drop(subscriber);
 
     assert_eq!(watcher.watch_counts_for_test(&skills), None);
+    assert_eq!(timeout(Duration::from_secs(1), rx.recv()).await.expect("closed recv timeout"), None);
     drop(registration);
+    assert_eq!(watcher.watch_counts_for_test(&skills), None);
 }
 
 #[test]
@@ -528,19 +573,6 @@ async fn failed_unwatch_is_reconciled_after_logical_registration_is_removed() {
     })
     .await
     .expect("failed unwatch should be reconciled");
-}
-
-#[tokio::test]
-async fn receiver_closes_when_subscriber_drops() {
-    let watcher = Arc::new(FileWatcher::noop());
-    let (subscriber, mut rx) = watcher.add_subscriber();
-
-    drop(subscriber);
-
-    let closed = timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("closed recv timeout");
-    assert_eq!(closed, None);
 }
 
 #[tokio::test]
@@ -1241,17 +1273,24 @@ async fn unrelated_events_skip_fallback_watch_resolution() {
 
 #[tokio::test]
 async fn non_recursive_watch_ignores_grandchildren() {
+    let directory = tempfile::tempdir().expect("existing watched directory");
+    let child = directory.path().join("SKILL.md");
     let watcher = Arc::new(FileWatcher::noop());
     let (subscriber, rx) = watcher.add_subscriber();
-    let _registration = subscriber.register_path(path("/tmp/skills"), /*recursive*/ false);
+    let _registration = subscriber.register_path(directory.path().to_path_buf(), /*recursive*/ false);
     let mut rx = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
 
     watcher
-        .send_paths_for_test(vec![path("/tmp/skills/nested/SKILL.md")])
+        .send_paths_for_test(vec![directory.path().join("nested").join("SKILL.md")])
         .await;
 
     let event = timeout(TEST_THROTTLE_INTERVAL, rx.recv()).await;
     assert_eq!(event.is_err(), true);
+    watcher.send_paths_for_test(vec![child.clone()]).await;
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv()).await.expect("direct child event"),
+        Some(FileWatcherEvent { paths: vec![child], rescan_required: false })
+    );
 }
 
 #[tokio::test]
@@ -1286,7 +1325,7 @@ async fn ancestor_events_notify_child_watches() {
 
 #[tokio::test]
 async fn missing_file_watch_reports_requested_path_when_parent_changes() {
-    // Parent events for a newly-created target should report the requested file.
+    // Parent changes report creation and deletion, but not unrelated siblings.
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let missing_file = temp_dir.path().join("FETCH_HEAD");
 
@@ -1312,34 +1351,6 @@ async fn missing_file_watch_reports_requested_path_when_parent_changes() {
         .expect("missing file change");
     assert_eq!(
         event,
-        FileWatcherEvent {
-            paths: vec![missing_file],
-            rescan_required: false,
-        }
-    );
-}
-
-#[tokio::test]
-async fn missing_file_watch_reports_requested_path_when_parent_delete_event_arrives() {
-    // Parent events should report both creation and deletion of a fallback target.
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let missing_file = temp_dir.path().join("FETCH_HEAD");
-
-    let watcher = Arc::new(FileWatcher::noop());
-    let (subscriber, rx) = watcher.add_subscriber();
-    let _registration = subscriber.register_path(missing_file.clone(), /*recursive*/ false);
-    let mut rx = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
-
-    std::fs::write(&missing_file, "origin/main\n").expect("write missing file");
-    watcher
-        .send_paths_for_test(vec![temp_dir.path().into()])
-        .await;
-    let created = timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("created event timeout")
-        .expect("created event");
-    assert_eq!(
-        created,
         FileWatcherEvent {
             paths: vec![missing_file.clone()],
             rescan_required: false,

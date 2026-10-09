@@ -1,0 +1,187 @@
+{
+  "assignment_count": 62,
+  "coverage_count": 62,
+  "reviewed_paths": [
+    "codex-rs/windows-sandbox-rs/src/allow.rs",
+    "codex-rs/windows-sandbox-rs/src/deny_read_resolver.rs",
+    "codex-rs/windows-sandbox-rs/src/resolved_permissions.rs",
+    "codex-rs/windows-sandbox-rs/src/spawn_prep.rs",
+    "codex-rs/windows-sandbox-rs/src/env.rs",
+    "codex-rs/windows-sandbox-rs/src/cap.rs",
+    "codex-rs/windows-sandbox-rs/src/audit.rs",
+    "codex-rs/windows-sandbox-rs/src/acl.rs",
+    "codex-rs/windows-sandbox-rs/src/deny_read_acl.rs",
+    "codex-rs/windows-sandbox-rs/src/deny_read_state.rs",
+    "codex-rs/windows-sandbox-rs/src/path_normalization.rs",
+    "codex-rs/windows-sandbox-rs/src/dpapi.rs",
+    "codex-rs/windows-sandbox-rs/src/desktop.rs",
+    "codex-rs/windows-sandbox-rs/src/proc_thread_attr.rs",
+    "codex-rs/windows-sandbox-rs/src/process.rs",
+    "codex-rs/windows-sandbox-rs/src/winutil.rs",
+    "codex-rs/windows-sandbox-rs/src/ssh_config_dependencies.rs",
+    "codex-rs/windows-sandbox-rs/src/sandbox_utils.rs",
+    "codex-rs/windows-sandbox-rs/src/logging.rs",
+    "codex-rs/windows-sandbox-rs/src/workspace_acl.rs",
+    "codex-rs/windows-sandbox-rs/src/stdio_bridge.rs",
+    "codex-rs/windows-sandbox-rs/src/stdio_bridge_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/wrapper.rs",
+    "codex-rs/windows-sandbox-rs/src/wrapper_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/setup_error.rs",
+    "codex-rs/windows-sandbox-rs/src/setup_protocol.rs",
+    "codex-rs/windows-sandbox-rs/build.rs",
+    "codex-rs/windows-sandbox-rs/src/identity.rs",
+    "codex-rs/windows-sandbox-rs/src/setup.rs",
+    "codex-rs/windows-sandbox-rs/src/helper_materialization.rs",
+    "codex-rs/windows-sandbox-rs/src/wfp/filter_specs.rs",
+    "codex-rs/windows-sandbox-rs/src/wfp_setup.rs",
+    "codex-rs/windows-sandbox-rs/src/hide_users.rs",
+    "codex-rs/windows-sandbox-rs/src/wfp.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_mutex.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_mutex_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/read_acl_mutex.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_runtime_bin.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_runtime_bin_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/command_runner/win/cwd_junction.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/firewall.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs",
+    "codex-rs/windows-sandbox-rs/src/token.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs"
+  ],
+  "inherited_reviewed_paths": [
+    "codex-rs/windows-sandbox-rs/build.rs",
+    "codex-rs/windows-sandbox-rs/src/lib.rs",
+    "codex-rs/windows-sandbox-rs/src/wrapper.rs",
+    "codex-rs/windows-sandbox-rs/src/wrapper_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/env.rs",
+    "codex-rs/windows-sandbox-rs/src/path_normalization.rs",
+    "codex-rs/windows-sandbox-rs/src/logging.rs",
+    "codex-rs/windows-sandbox-rs/src/setup_protocol.rs",
+    "codex-rs/windows-sandbox-rs/src/setup_error.rs",
+    "codex-rs/windows-sandbox-rs/src/resolved_permissions.rs",
+    "codex-rs/windows-sandbox-rs/src/stdio_bridge.rs",
+    "codex-rs/windows-sandbox-rs/src/stdio_bridge_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/process.rs",
+    "codex-rs/windows-sandbox-rs/src/proc_thread_attr.rs",
+    "codex-rs/windows-sandbox-rs/src/sandbox_utils.rs",
+    "codex-rs/windows-sandbox-rs/src/workspace_acl.rs",
+    "codex-rs/windows-sandbox-rs/src/winutil.rs",
+    "codex-rs/windows-sandbox-rs/src/elevated_impl.rs",
+    "codex-rs/windows-sandbox-rs/src/identity.rs",
+    "codex-rs/windows-sandbox-rs/src/dpapi.rs",
+    "codex-rs/windows-sandbox-rs/src/hide_users.rs",
+    "codex-rs/windows-sandbox-rs/src/desktop.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/tests.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/backends/mod.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/backends/windows_common.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs",
+    "codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_mutex.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_mutex_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_runtime_bin.rs",
+    "codex-rs/windows-sandbox-rs/src/bin/setup_main/win/setup_runtime_bin_tests.rs",
+    "codex-rs/windows-sandbox-rs/src/conpty/mod.rs",
+    "codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs",
+    "codex-rs/windows-sandbox-rs/src/elevated/mod.rs",
+    "codex-rs/windows-sandbox-rs/src/elevated/runner_pipe.rs",
+    "codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs"
+  ],
+  "coverage_provenance": "47 complete continuation reads/semantic reviews; original39 recovered by validation_recovery from windows_batch1..5 semantic receipt. Union62; overlap24. No unread assigned files.",
+  "changes": [
+    {
+      "file": "allow.rs",
+      "filters": [
+        "tmp_env_roots_follow_profile_exclusion"
+      ],
+      "delta": -1,
+      "detail": "Includes/excludes temp cases combined; TEMP/TMP distinct; exact sets."
+    },
+    {
+      "file": "spawn_prep.rs",
+      "filters": [
+        "legacy_spawn_env_applies_offline_network_rewrite"
+      ],
+      "delta": -2,
+      "detail": "Replace two boolean-only network tests by real legacy enabled/disabled prep assertions; existing disabled integration preserved."
+    },
+    {
+      "file": "sandbox_utils.rs",
+      "filters": [
+        "injects_worktree_root_without_overwriting_existing_config"
+      ],
+      "delta": -1,
+      "detail": "Directory/gitfile cases matrix retaining both and adding existing config append preservation."
+    },
+    {
+      "file": "path_normalization.rs",
+      "filters": [
+        "canonical_path_key_normalizes_case_and_separators"
+      ],
+      "delta": 0,
+      "detail": "Distinct path negative prevents vacuous constant-key implementation."
+    },
+    {
+      "file": "setup.rs",
+      "filters": [
+        "setup_completion_requires_ready_artifacts",
+        "setup_marker_request_mismatch_reason_tracks_offline_firewall_fields"
+      ],
+      "delta": -1,
+      "detail": "Prove ready success, independently outdated users/marker, malformed marker; consolidate online/offline drift tests with isolated ports/local binding controls."
+    },
+    {
+      "file": "helper_materialization.rs",
+      "filters": [
+        "public_resolution_reports_reused_materialization"
+      ],
+      "delta": -3,
+      "detail": "Fold duplicate private missing/reused copy and directory join checks into actual public resolution lifecycle; exact path and bytes asserted."
+    },
+    {
+      "file": "wfp.rs",
+      "filters": [
+        "proxy_ports_are_normalized_within_fixed_filter_slots",
+        "static_ale_port_blocks_exclude_loopback_proxy_ports"
+      ],
+      "delta": 0,
+      "detail": "Fixed-slot exact max/overflow guards and non-vacuous complete static port coverage."
+    },
+    {
+      "file": "bin/setup_main/win/firewall.rs",
+      "filters": [
+        "local_policy_modify_state_distinguishes_query_failure_from_ineffective_policy",
+        "production_firewall_rule_network_scopes_are_accepted_by_firewall_com"
+      ],
+      "delta": -2,
+      "detail": "Three policy tests merged, adds COM query failure classification. Complement boundaries include adjacent/duplicate/zero/end ports and singleton ranges."
+    },
+    {
+      "file": "bin/setup_main/win/sandbox_users.rs",
+      "filters": [
+        "secrets_writer_persists_distinct_encrypted_credentials"
+      ],
+      "delta": 0,
+      "detail": "Replace serde self-roundtrip with real secrets writer disk data, current version/usernames, independently DPAPI decrypted distinct credentials."
+    },
+    {
+      "file": "bin/setup_main/win.rs",
+      "filters": [
+        "payload_defaults_and_optional_settings_are_preserved",
+        "deny_path_outside_active_roots_falls_back_to_all_active_root_sids"
+      ],
+      "delta": -2,
+      "detail": "Consolidate three payload tests, preserve absent/present telemetry and provision mode, assert compatibility defaults; real SID selector empty-root fallback added."
+    }
+  ],
+  "prior_definition_delta": -8,
+  "definition_delta": -12,
+  "combined_definition_delta": -20,
+  "remaining": [],
+  "validation": "Source/consumer and affected-test review completed. No Git, Cargo, builds, tests, or formatter run; runtime verification parent-owned and unverified.",
+  "notes": "Temp checkpoint write was blocked; this workspace fallback is user-authorized. Earlier11 modified files preserved. No production edits."
+}

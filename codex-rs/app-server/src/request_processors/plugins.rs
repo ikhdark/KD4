@@ -201,6 +201,57 @@ fn convert_configured_marketplace_plugin_to_plugin_summary(
     }
 }
 
+async fn hydrate_remote_plugin_local_versions(
+    codex_home: &Path,
+    plugins: Vec<&mut PluginSummary>,
+) -> Result<(), JSONRPCErrorError> {
+    let plugins = plugins
+        .into_iter()
+        .filter(|plugin| matches!(plugin.source, PluginSource::Remote))
+        .collect::<Vec<_>>();
+    if plugins.is_empty() {
+        return Ok(());
+    }
+    let identities = plugins
+        .iter()
+        .map(|plugin| (plugin.id.clone(), plugin.remote_plugin_id.clone()))
+        .collect::<Vec<_>>();
+    let codex_home = codex_home.to_path_buf();
+    // Remote account state cannot establish the package present on this device.
+    // Reuse Store's active-version selection and read all local evidence off the async worker.
+    let versions = tokio::task::spawn_blocking(move || {
+        let store = codex_core_plugins::store::PluginStore::new(codex_home);
+        identities
+            .into_iter()
+            .map(|(id, remote_id)| {
+                let id = PluginId::parse(&id).ok()?;
+                let version = store.active_plugin_version(&id)?;
+                if let Some(stored_remote_id) = store.remote_plugin_id(&id).ok()?
+                    && Some(stored_remote_id) != remote_id
+                {
+                    return None;
+                }
+                let root = store.plugin_root(&id, &version);
+                let manifest = codex_core_plugins::manifest::load_plugin_manifest(root.as_path())?;
+                if manifest.name != id.plugin_name() {
+                    return None;
+                }
+                // Legacy cache entries can omit manifest.version; their validated cache
+                // directory still records the version materialized by the installer.
+                manifest.version.or_else(|| {
+                    (version != codex_core_plugins::store::DEFAULT_PLUGIN_VERSION).then_some(version)
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|err| internal_error(format!("failed to read local plugin versions: {err}")))?;
+    for (plugin, version) in plugins.into_iter().zip(versions) {
+        plugin.local_version = version;
+    }
+    Ok(())
+}
+
 fn remote_installed_plugin_visible_marketplaces(config: &Config) -> Vec<&'static str> {
     let mut marketplaces = Vec::new();
     if config.features.enabled(Feature::RemotePlugin) {
@@ -798,6 +849,13 @@ impl PluginRequestProcessor {
             Vec::new()
         };
 
+        hydrate_remote_plugin_local_versions(
+            config.codex_home.as_path(),
+            data.iter_mut()
+                .flat_map(|marketplace| &mut marketplace.plugins)
+                .collect(),
+        )
+        .await?;
         Ok(PluginListResponse {
             marketplaces: data,
             marketplace_load_errors,
@@ -871,6 +929,13 @@ impl PluginRequestProcessor {
             config.features.enabled(Feature::RemotePlugin),
         );
 
+        hydrate_remote_plugin_local_versions(
+            config.codex_home.as_path(),
+            data.iter_mut()
+                .flat_map(|marketplace| &mut marketplace.plugins)
+                .collect(),
+        )
+        .await?;
         Ok(PluginInstalledResponse {
             marketplaces: data,
             marketplace_load_errors,
@@ -1029,7 +1094,7 @@ impl PluginRequestProcessor {
         let auth = self.auth_manager.auth().await;
         plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
 
-        let plugin = match read_source {
+        let mut plugin = match read_source {
             Ok(marketplace_path) => {
                 let request = PluginReadRequest {
                     plugin_name,
@@ -1188,6 +1253,8 @@ impl PluginRequestProcessor {
             }
         };
 
+        hydrate_remote_plugin_local_versions(config.codex_home.as_path(), vec![&mut plugin.summary])
+            .await?;
         Ok(PluginReadResponse { plugin })
     }
 
@@ -1348,7 +1415,7 @@ impl PluginRequestProcessor {
             config.chatgpt_base_url.clone(),
             config.http_client_factory(),
         );
-        let data = codex_core_plugins::remote::list_remote_plugin_shares(
+        let mut data = codex_core_plugins::remote::list_remote_plugin_shares(
             &remote_plugin_service_config,
             auth.as_ref(),
             config.codex_home.as_path(),
@@ -1367,7 +1434,12 @@ impl PluginRequestProcessor {
                 local_plugin_path,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+        hydrate_remote_plugin_local_versions(
+            config.codex_home.as_path(),
+            data.iter_mut().map(|item| &mut item.plugin).collect(),
+        )
+        .await?;
         Ok(PluginShareListResponse { data })
     }
 

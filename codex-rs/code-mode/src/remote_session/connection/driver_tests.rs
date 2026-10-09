@@ -12,6 +12,10 @@ use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::host::ClientToHost;
+use codex_code_mode_protocol::host::FramedReader;
+use codex_code_mode_protocol::host::FramedWriter;
+use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
 use codex_code_mode_protocol::host::HostResponse;
@@ -237,7 +241,13 @@ async fn continuous_events_do_not_starve_termination_commands() {
     let events = traffic.await.unwrap();
     let events_per_second = events as f64 / traffic_started.elapsed().as_secs_f64();
     eprintln!("terminate dispatch latency={latency:?}; ordinary events={events}; events/s={events_per_second:.0}");
-    assert!(frame.unwrap().is_some());
+    let frame = frame.unwrap().unwrap();
+    let mut bytes = Vec::new();
+    FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
+    let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
+    assert!(matches!(message, ClientToHost::Request {
+        id, request: HostRequest::Terminate { cell_id, .. },
+    } if id == RequestId::new(3) && cell_id.as_str() == "1"));
     assert!(events > 0);
 }
 
@@ -415,7 +425,19 @@ async fn stale_generation_wait_recovers_only_terminal_receipts_without_execute()
             caller_cancellation: CancellationToken::new(),
             response_tx,
         }).await.unwrap();
-        harness.outgoing_rx.recv().await.unwrap();
+        let frame = harness.outgoing_rx.recv().await.unwrap();
+        let mut bytes = Vec::new();
+        FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
+        let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
+        let ClientToHost::Request { id, request: HostRequest::Wait { request, .. } } = message else {
+            panic!("receipt recovery must send a wait, never execute");
+        };
+        assert_eq!(id, RequestId::new(2));
+        assert_eq!(request.cell_id.as_str(), old_id.as_str());
+        assert_eq!(request.yield_time_ms, 1);
+        let recovery = request.recovery.unwrap();
+        assert!(recovery.terminal_only);
+        assert_eq!(recovery.path, std::env::temp_dir().join("receipt-recovery-test.json"));
         let response = if live_response {
             WireRuntimeResponse::Yielded { cell_id: old_id.clone().into(), content_items: Vec::new() }
         } else {
@@ -592,7 +614,7 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
         }))
         .await
         .expect("reused delegate request");
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.invocations.load(Ordering::Relaxed), 1);
@@ -862,7 +884,7 @@ async fn completed_delegate_request_id_cannot_be_reused() {
         }))
         .await
         .expect("reused delegate request");
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.notifications.load(Ordering::Relaxed), 1);
@@ -899,10 +921,16 @@ async fn delegate_task_panic_becomes_tool_error_without_killing_connection() {
         }))
         .await
         .expect("delegate request");
-    tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
+    let frame = tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
         .await
         .expect("delegate response timeout")
         .expect("delegate response frame");
+    let mut bytes = Vec::new();
+    FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
+    let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
+    assert!(matches!(message, ClientToHost::DelegateResponse {
+        id, result: WireResult::Err { message },
+    } if id == DelegateRequestId::new(7) && message == "code-mode delegate task failed: task panicked"));
 
     assert!(harness.alive.load(Ordering::Acquire));
     harness
@@ -943,7 +971,7 @@ async fn delegate_for_unknown_cell_fails_connection_without_invocation() {
         }))
         .await
         .expect("delegate request");
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.invocations.load(Ordering::Relaxed), 0);
@@ -979,10 +1007,12 @@ async fn delegate_after_cell_close_fails_connection_without_invocation() {
         }))
         .await
         .expect("delegate request");
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.invocations.load(Ordering::Relaxed), 0);
+    assert_eq!(delegate.notifications.load(Ordering::Relaxed), 0);
+    assert_eq!(*delegate.closed_cells.lock().unwrap(), vec![CellId::new("1".to_string())]);
 }
 
 #[tokio::test]
@@ -1132,10 +1162,20 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
         })
         .await
         .expect("wait command");
-    tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
+    let frame = tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
         .await
         .expect("wait frame timeout")
         .expect("wait frame");
+    let mut bytes = Vec::new();
+    FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
+    let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
+    let ClientToHost::Request { id, request: HostRequest::Wait { request, .. } } = message else {
+        panic!("expected a wait frame");
+    };
+    assert_eq!(id, RequestId::new(3));
+    assert_eq!(request.cell_id.as_str(), "1");
+    assert_eq!(request.yield_time_ms, 300_001, "duration must not be clamped in transport");
+    assert!(request.recovery.is_none());
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::Response {
@@ -1520,7 +1560,7 @@ async fn connection_failure_closes_every_live_cell_once() {
     harness
         .command_tx
         .send(DriverCommand::Execute {
-            session,
+            session: session.clone(),
             request: ExecuteRequest {
                 state_path: None,
                 tool_call_id: "call-1".to_string(),
@@ -1552,6 +1592,7 @@ async fn connection_failure_closes_every_live_cell_once() {
         .await
         .expect("execute reply")
         .expect("execute session");
+    let second = harness.start_cell(session, 3, "2").await;
     harness
         .event_tx
         .send(DriverEvent::Failed("host crashed".to_string()))
@@ -1560,10 +1601,11 @@ async fn connection_failure_closes_every_live_cell_once() {
     tokio::time::timeout(Duration::from_secs(1), cleanup.wait())
         .await
         .expect("session cleanup timeout");
-    assert_eq!(
-        *delegate.closed_cells.lock().expect("closed cells lock"),
-        vec![CellId::new("1".to_string())]
-    );
+    assert_eq!(_started.started.initial_response().await, Err("host crashed".into()));
+    assert_eq!(second.initial_response().await, Err("host crashed".into()));
+    let mut closed = delegate.closed_cells.lock().unwrap().clone();
+    closed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    assert_eq!(closed, vec![CellId::new("1".to_string()), CellId::new("2".to_string())]);
 }
 
 #[tokio::test]
@@ -1640,12 +1682,9 @@ async fn aborting_driver_marks_connection_dead_and_closes_cells() {
     harness.outgoing_rx.recv().await.expect("wait frame");
 
     harness.driver_task.abort();
-    for _ in 0..10 {
-        if !harness.alive.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let error = tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task)
+        .await.expect("aborted driver must finish").unwrap_err();
+    assert!(error.is_cancelled());
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert!(harness.cancellation.is_cancelled());

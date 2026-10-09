@@ -562,132 +562,84 @@ mod tests {
 
     #[test]
     fn collab_resume_end_maps_to_item_completed_resume_agent() {
-        let event = CollabResumeEndEvent {
-            call_id: "call-2".to_string(),
-            completed_at_ms: 456,
-            sender_thread_id: ThreadId::new(),
-            receiver_thread_id: ThreadId::new(),
-            receiver_agent_nickname: None,
-            receiver_agent_role: None,
-            status: codex_protocol::protocol::AgentStatus::NotFound,
-        };
-
-        let receiver_id = event.receiver_thread_id.to_string();
-        let notification = item_event_to_server_notification(
-            EventMsg::CollabResumeEnd(event.clone()),
-            "thread-2",
-            "turn-2",
-        );
-        assert_item_completed_server_notification(
-            notification,
-            ItemCompletedNotification {
-                thread_id: "thread-2".to_string(),
-                turn_id: "turn-2".to_string(),
-                completed_at_ms: event.completed_at_ms,
-                item: ThreadItem::CollabAgentToolCall {
-                    id: event.call_id,
-                    tool: CollabAgentTool::ResumeAgent,
-                    status: CollabAgentToolCallStatus::Failed,
-                    sender_thread_id: event.sender_thread_id.to_string(),
-                    receiver_thread_ids: vec![receiver_id.clone()],
-                    prompt: None,
-                    model: None,
-                    reasoning_effort: None,
-                    agents_states: [(
-                        receiver_id,
-                        CollabAgentState::from(codex_protocol::protocol::AgentStatus::NotFound),
-                    )]
-                    .into_iter()
-                    .collect(),
+        for (status, call_status, state_status, message) in [
+            (
+                codex_protocol::protocol::AgentStatus::NotFound,
+                CollabAgentToolCallStatus::Failed,
+                CollabAgentStatus::NotFound,
+                None,
+            ),
+            (
+                codex_protocol::protocol::AgentStatus::Completed(Some("implemented".into())),
+                CollabAgentToolCallStatus::Completed,
+                CollabAgentStatus::Completed,
+                Some("implemented".to_string()),
+            ),
+        ] {
+            let event = CollabResumeEndEvent {
+                call_id: "call-2".to_string(),
+                completed_at_ms: 456,
+                sender_thread_id: ThreadId::new(),
+                receiver_thread_id: ThreadId::new(),
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
+                status,
+            };
+            let receiver_id = event.receiver_thread_id.to_string();
+            let notification = item_event_to_server_notification(
+                EventMsg::CollabResumeEnd(event.clone()), "thread-2", "turn-2",
+            );
+            assert_item_completed_server_notification(
+                notification,
+                ItemCompletedNotification {
+                    thread_id: "thread-2".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    completed_at_ms: 456,
+                    item: ThreadItem::CollabAgentToolCall {
+                        id: event.call_id,
+                        tool: CollabAgentTool::ResumeAgent,
+                        status: call_status,
+                        sender_thread_id: event.sender_thread_id.to_string(),
+                        receiver_thread_ids: vec![receiver_id.clone()],
+                        prompt: None,
+                        model: None,
+                        reasoning_effort: None,
+                        agents_states: [(receiver_id, CollabAgentState {
+                            status: state_status,
+                            message: message.clone(),
+                            surfaced_result: None,
+                            last_agent_message: message,
+                        })].into_iter().collect(),
+                    },
                 },
-            },
-        );
-    }
-
-    #[test]
-    fn collab_resume_end_preserves_completed_status() {
-        let receiver_thread_id = ThreadId::new();
-        let event = CollabResumeEndEvent {
-            call_id: "call-completed".to_string(),
-            completed_at_ms: 789,
-            sender_thread_id: ThreadId::new(),
-            receiver_thread_id,
-            receiver_agent_nickname: None,
-            receiver_agent_role: None,
-            status: codex_protocol::protocol::AgentStatus::Completed(Some(
-                "implemented".to_string(),
-            )),
-        };
-
-        let notification = item_event_to_server_notification(
-            EventMsg::CollabResumeEnd(event),
-            "thread-gated",
-            "turn-gated",
-        );
-        let ServerNotification::ItemCompleted(ItemCompletedNotification { item, .. }) =
-            notification
-        else {
-            panic!("expected item completed notification");
-        };
-        let ThreadItem::CollabAgentToolCall { agents_states, .. } = item else {
-            panic!("expected collab agent tool call");
-        };
-
-        assert_eq!(
-            agents_states.get(&receiver_thread_id.to_string()),
-            Some(&CollabAgentState {
-                status: CollabAgentStatus::Completed,
-                message: Some("implemented".to_string()),
-                surfaced_result: None,
-                last_agent_message: Some("implemented".to_string()),
-            })
-        );
-    }
-
-    #[test]
-    fn exec_command_output_delta_maps_to_command_execution_output_delta() {
-        let notification = item_event_to_server_notification(
-            EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                call_id: "call-1".to_string(),
-                stream: ExecOutputStream::Stdout,
-                chunk: b"hello".to_vec(),
-            }),
-            "thread-1",
-            "turn-1",
-        );
-
-        assert_command_execution_output_delta_server_notification(
-            notification,
-            CommandExecutionOutputDeltaNotification {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                item_id: "call-1".to_string(),
-                delta: "hello".to_string(),
-                stream: Some(ExecOutputStream::Stdout),
-                decoding_lossy: Some(false),
-            },
-        );
+            );
+        }
     }
 
     #[test]
     fn interleaved_output_preserves_stream_and_decoding_provenance() {
-        for (stream, chunk, lossy) in [
-            (ExecOutputStream::Stdout, b"out".to_vec(), false),
-            (ExecOutputStream::Stderr, vec![0xff], true),
-            (ExecOutputStream::Stdout, b"next".to_vec(), false),
+        for (stream, chunk, expected, lossy) in [
+            (ExecOutputStream::Stdout, b"hello".to_vec(), "hello", false),
+            (ExecOutputStream::Stdout, b"out".to_vec(), "out", false),
+            (ExecOutputStream::Stderr, vec![0xff], "\u{fffd}", true),
+            (ExecOutputStream::Stdout, b"next".to_vec(), "next", false),
         ] {
             let notification = item_event_to_server_notification(
                 EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                    call_id: "command".into(), stream: stream.clone(), chunk: chunk.clone(),
+                    call_id: "command".into(), stream: stream.clone(), chunk,
                 }), "thread", "turn",
             );
-            let ServerNotification::CommandExecutionOutputDelta(delta) = notification else {
-                panic!("expected exactly one output notification");
-            };
-            assert_eq!(delta.stream, Some(stream));
-            assert_eq!(delta.decoding_lossy, Some(lossy));
-            assert_eq!(delta.delta, String::from_utf8_lossy(&chunk));
-            assert_eq!(delta.item_id, "command");
+            assert_command_execution_output_delta_server_notification(
+                notification,
+                CommandExecutionOutputDeltaNotification {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item_id: "command".into(),
+                    delta: expected.into(),
+                    stream: Some(stream),
+                    decoding_lossy: Some(lossy),
+                },
+            );
         }
     }
 }

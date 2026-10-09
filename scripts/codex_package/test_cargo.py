@@ -227,6 +227,18 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 )
                 self.assertEqual(run.call_count, before + 1)
 
+    def test_invalid_utf8_source_stamp_rebuilds_instead_of_reusing(self):
+        # The source-build cache is optional: unreadable evidence must rebuild,
+        # never authorize reuse or prevent a requested build.
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, run, _, _ = fixture
+            outputs = build_source_binaries(spec, variant, **kwargs)
+            path = source_build_stamp_path(cargo_package_target_dir(spec, "release"))
+            path.write_bytes(b"\xff")
+            self.assertEqual(build_source_binaries(spec, variant, **kwargs), outputs)
+            self.assertEqual(run.call_count, 2)
+            self.assertIsInstance(json.loads(path.read_bytes()), dict)
+
     def test_environment_rustflags_cannot_replace_checked_in_target_flags(self):
         # Cargo lets RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, even when empty,
         # replace the target rustflags that give packaged binaries their 8 MiB
@@ -539,33 +551,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         command_identity.start()
         self.addCleanup(command_identity.stop)
 
-    def test_windows_package_with_prebuilt_entrypoint_and_helpers_builds_nothing(
-        self,
-    ) -> None:
-        self.assertEqual(
-            source_binaries_for_target(
-                TARGET_SPECS["x86_64-pc-windows-msvc"],
-                PACKAGE_VARIANTS["codex"],
-                build_entrypoint=False,
-                build_code_mode_host=False,
-                build_codex_command_runner=False,
-                build_codex_windows_sandbox_setup=False,
-            ),
-            [],
-        )
-
-    def test_missing_windows_helpers_are_built(self) -> None:
-        self.assertEqual(
-            source_binaries_for_target(
-                TARGET_SPECS["x86_64-pc-windows-msvc"],
-                PACKAGE_VARIANTS["codex"],
-                build_entrypoint=False,
-                build_code_mode_host=False,
-                build_codex_command_runner=True,
-                build_codex_windows_sandbox_setup=True,
-            ),
-            ["codex-command-runner", "codex-windows-sandbox-setup"],
-        )
 
     def test_missing_code_mode_host_is_built_for_every_variant(self) -> None:
         for variant in PACKAGE_VARIANTS.values():
@@ -697,7 +682,13 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                             "lld-link": "C:/LLVM/bin/lld-link.exe",
                         }.get(program)
 
-                    with mock.patch("shutil.which", side_effect=fake_which):
+                    with (
+                        mock.patch("shutil.which", side_effect=fake_which),
+                        mock.patch.object(
+                            cargo_module, "source_tree_fingerprint",
+                            return_value=fixed_source_fingerprint(),
+                        ),
+                    ):
                         with mock.patch("subprocess.run", side_effect=fake_run):
                             build_source_binaries(
                                 TARGET_SPECS["x86_64-pc-windows-msvc"],
@@ -710,8 +701,21 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                                 codex_windows_sandbox_setup_bin=None,
                                 release_version="1.2.3",
                             )
+                            target_dir_arg = calls[0].cmd[
+                                calls[0].cmd.index("--target-dir") + 1
+                            ]
+                            self.assertTrue(
+                                source_build_stamp_path(Path(target_dir_arg)).is_file()
+                            )
 
-        self.assertGreaterEqual(len(calls), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [
+                calls[0].cmd[i + 1]
+                for i, arg in enumerate(calls[0].cmd) if arg == "--bin"
+            ],
+            ["codex", "codex-code-mode-host", "codex-command-runner", "codex-windows-sandbox-setup"],
+        )
         for call in calls:
             self.assertEqual(call.cwd, codex_rs)
             self.assertTrue(call.check)
@@ -1267,60 +1271,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             )
             self.assertEqual(run.call_count, 2)
 
-    def test_entrypoint_and_windows_helpers_build_in_one_cargo_invocation(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            codex_rs = root / "codex-rs"
-            calls: list[SubprocessCall] = []
-
-            def fake_run(cmd, *, cwd, check, env):
-                calls.append(
-                    SubprocessCall(cmd=list(cmd), cwd=Path(cwd), check=check, env=env)
-                )
-                write_bins_for_cmd(
-                    cmd,
-                    env=env,
-                    spec=TARGET_SPECS["x86_64-pc-windows-msvc"],
-                    profile="release",
-                )
-
-            with (
-                mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs),
-                mock.patch.object(
-                    cargo_module,
-                    "source_tree_fingerprint",
-                    return_value={"status": "ok", "digest": "unchanged source"},
-                ),
-            ):
-                with mock.patch.dict(os.environ, {}, clear=True):
-                    with mock.patch("subprocess.run", side_effect=fake_run):
-                        build_source_binaries(
-                            TARGET_SPECS["x86_64-pc-windows-msvc"],
-                            PACKAGE_VARIANTS["codex"],
-                            cargo="cargo",
-                            profile="release",
-                            entrypoint_bin=None,
-                            code_mode_host_bin=None,
-                            codex_command_runner_bin=None,
-                            codex_windows_sandbox_setup_bin=None,
-                        )
-
-            self.assertEqual(len(calls), 1)
-            self.assertIn("codex", calls[0].cmd)
-            self.assertIn("codex-code-mode-host", calls[0].cmd)
-            self.assertIn("codex-command-runner", calls[0].cmd)
-            self.assertIn("codex-windows-sandbox-setup", calls[0].cmd)
-            self.assertTrue(
-                source_build_stamp_path(
-                    codex_rs
-                    / "target"
-                    / "package"
-                    / "x86_64-pc-windows-msvc-release"
-                    / "toolchain-c2379b1792c5f5e0854d"
-                ).is_file()
-            )
 
     def test_reused_entrypoint_builds_only_missing_windows_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1356,9 +1306,13 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                         )
 
         self.assertEqual(len(calls), 1)
-        self.assertNotIn("codex", calls[0].cmd)
-        self.assertIn("codex-command-runner", calls[0].cmd)
-        self.assertIn("codex-windows-sandbox-setup", calls[0].cmd)
+        self.assertEqual(
+            [
+                calls[0].cmd[i + 1]
+                for i, arg in enumerate(calls[0].cmd) if arg == "--bin"
+            ],
+            ["codex-command-runner", "codex-windows-sandbox-setup"],
+        )
 
     def test_cargo_success_without_expected_binary_fails_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1383,32 +1337,37 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                             )
 
     def test_cargo_failure_names_build_context(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codex_rs = Path(temp_dir) / "codex-rs"
-
-            def fake_run(cmd, *, cwd, check, env):
-                raise subprocess.CalledProcessError(101, cmd)
-
-            with mock.patch.object(cargo_module, "CODEX_RS_ROOT", codex_rs):
-                with mock.patch.dict(os.environ, {}, clear=True):
-                    with mock.patch("subprocess.run", side_effect=fake_run):
-                        with self.assertRaisesRegex(
-                            RuntimeError,
-                            "bins=codex,codex-code-mode-host,codex-command-runner,"
-                            "codex-windows-sandbox-setup "
-                            ".*target=x86_64-pc-windows-msvc "
-                            ".*profile=release .*exit_code=101",
-                        ):
-                            build_source_binaries(
-                                TARGET_SPECS["x86_64-pc-windows-msvc"],
-                                PACKAGE_VARIANTS["codex"],
-                                cargo="cargo",
-                                profile="release",
-                                entrypoint_bin=None,
-                                code_mode_host_bin=None,
-                                codex_command_runner_bin=None,
-                                codex_windows_sandbox_setup_bin=None,
-                            )
+        for failure in (subprocess.CalledProcessError(101, ["cargo"]), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), self.package_fixture() as fixture:
+                spec, variant, kwargs, run, _, _ = fixture
+                compile = run.side_effect
+                outputs = build_source_binaries(spec, variant, **kwargs)
+                stamp = source_build_stamp_path(cargo_package_target_dir(spec, "release"))
+                self.assertTrue(stamp.is_file())
+                previous = {path: path.read_bytes() for path in vars(outputs).values()}
+                run.side_effect = failure
+                expected = (
+                    self.assertRaises(KeyboardInterrupt)
+                    if isinstance(failure, KeyboardInterrupt)
+                    else self.assertRaisesRegex(
+                        RuntimeError,
+                        "bins=codex,codex-code-mode-host,codex-command-runner,"
+                        "codex-windows-sandbox-setup "
+                        ".*target=x86_64-pc-windows-msvc "
+                        ".*profile=release .*exit_code=101",
+                    )
+                )
+                with expected:
+                    build_source_binaries(spec, variant, **kwargs, force_rebuild=True)
+                self.assertEqual(run.call_count, 2)
+                self.assertFalse(stamp.exists(), "failed rebuild must revoke the old proof")
+                self.assertEqual({path: path.read_bytes() for path in previous}, previous)
+                run.side_effect = compile
+                self.assertEqual(build_source_binaries(spec, variant, **kwargs), outputs)
+                self.assertEqual(run.call_count, 3)
+                self.assertTrue(stamp.is_file())
+                self.assertEqual(build_source_binaries(spec, variant, **kwargs), outputs)
+                self.assertEqual(run.call_count, 3)
 
     def test_invalid_explicit_output_path_fails_before_cargo(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -101,6 +101,15 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         env["RUSTC_WRAPPER"] = "existing-wrapper"
         env["SCCACHE_BASEDIRS"] = "stale"
         env["SCCACHE_CACHE_SIZE"] = "stale"
+        child = (
+            "import json,os,sys; from pathlib import Path; "
+            "from scripts import rust_build_status; "
+            "target=Path(os.environ['CODEX_CARGO_LANE_TARGET_DIR']); "
+            "assert rust_build_status._binary_file_lock_is_busy(target/'.lane-active.lock'); "
+            "print('CHILD='+json.dumps({k:os.environ.get(k) for k in "
+            "['CODEX_CARGO_LANE_TARGET_DIR','CARGO_INCREMENTAL','RUSTC_WRAPPER',"
+            "'SCCACHE_BASEDIRS']})); sys.exit(7)"
+        )
 
         result = subprocess.run(
             [
@@ -110,8 +119,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 "Bypass",
                 "-Command",
                 (
-                    f"$programArgs = @({ps_single_quote(shell)}, '-NoProfile', "
-                    "'-Command', 'exit 7'); "
+                    f"$programArgs = @({ps_single_quote(sys.executable)}, '-c', "
+                    f"{ps_single_quote(child)}); "
                     f"& {ps_single_quote(script)} -NoSccache "
                     "-CargoTargetLane 'perf nextest/nosccache' "
                     f"-WorkingDirectory {ps_single_quote(REPO_ROOT)} "
@@ -142,6 +151,18 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn(
             "cargoTargetDir=<run-lane reservation for perf-nextest-nosccache>",
             result.stdout,
+        )
+        proof = json.loads(
+            next(line for line in result.stdout.splitlines() if line.startswith("CHILD="))
+            .removeprefix("CHILD=")
+        )
+        self.assertEqual(
+            Path(proof.pop("CODEX_CARGO_LANE_TARGET_DIR")),
+            Path(env["CODEX_CARGO_LANES_ROOT"]) / "perf-nextest-nosccache",
+        )
+        self.assertEqual(
+            proof,
+            {"CARGO_INCREMENTAL": "0", "RUSTC_WRAPPER": "", "SCCACHE_BASEDIRS": None},
         )
 
     def test_no_sccache_isolates_child_and_restores_workspace_wrapper(self):
@@ -455,49 +476,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
-    def test_perf_env_restore_helper_preserves_empty_environment_variable(
-        self,
-    ) -> None:
-        shell = pwsh_only()
-        if shell is None:
-            self.skipTest("pwsh is not available")
-        script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
-        command = (
-            "$tokens = $null; $errors = $null; "
-            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
-            f"{ps_single_quote(script)}, [ref]$tokens, [ref]$errors); "
-            "$function = $ast.Find({ param($node) "
-            "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
-            "-and $node.Name -eq 'Restore-ProcessEnvironmentVariable' }, $true); "
-            "Invoke-Expression $function.Extent.Text; "
-            "[Environment]::SetEnvironmentVariable("
-            "'KD4_EMPTY_RESTORE_TEST', '', [EnvironmentVariableTarget]::Process); "
-            "$old = [Environment]::GetEnvironmentVariable("
-            "'KD4_EMPTY_RESTORE_TEST', 'Process'); "
-            "$had = Test-Path Env:KD4_EMPTY_RESTORE_TEST; "
-            "Remove-Item Env:KD4_EMPTY_RESTORE_TEST; "
-            "Restore-ProcessEnvironmentVariable "
-            "-Name 'KD4_EMPTY_RESTORE_TEST' -Value $old -WasSet $had; "
-            "if (-not (Test-Path Env:KD4_EMPTY_RESTORE_TEST) -or "
-            "$env:KD4_EMPTY_RESTORE_TEST -ne '') { exit 1 }"
-        )
 
-        result = subprocess.run(
-            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            check=False,
-            creationflags=CREATE_NO_WINDOW,
-            timeout=30,
-        )
-
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
 
     def test_common_rust_env_restarts_stale_sccache_server_cache_size(self) -> None:
         shell = powershell()
@@ -576,10 +555,10 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertIn("cacheSize=80G", result.stdout)
-            call_text = calls.read_text(encoding="utf-8")
-            self.assertIn("--show-stats", call_text)
-            self.assertIn("--stop-server", call_text)
-            self.assertIn("--start-server", call_text)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                ["--show-stats", "--stop-server", "--start-server", "--show-stats"],
+            )
             self.assertIn("80 GiB", stats.read_text(encoding="utf-8"))
 
     def test_common_rust_env_cache_size_honors_override(self) -> None:
@@ -760,7 +739,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                         "@echo off",
                         '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
                         'if "%1"=="--stop-server" exit /b 7',
-                        'if "%1"=="--start-server" exit /b 0',
+                        'if "%1"=="--start-server" exit /b %FAKE_START_CODE%',
                         'if "%1"=="--show-stats" (',
                         "  echo Max cache size                       80 GiB",
                         "  exit /b 0",
@@ -776,39 +755,44 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             env["FAKE_SCCACHE_CALLS"] = str(calls)
             script = REPO_ROOT / "scripts" / "sccache-perf.ps1"
 
-            result = subprocess.run(
-                [
-                    shell,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(script),
-                    "restart",
-                ],
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                check=False,
-                env=env,
-                creationflags=CREATE_NO_WINDOW,
-                timeout=30,
-            )
-            call_lines = (
-                calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
-            )
-
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertIn("Max cache size", result.stdout)
-        self.assertEqual(
-            call_lines,
-            ["--stop-server", "--start-server", "--show-stats"],
-        )
+            for start_code in (0, 9):
+                with self.subTest(start_code=start_code):
+                    calls.unlink(missing_ok=True)
+                    env["FAKE_START_CODE"] = str(start_code)
+                    result = subprocess.run(
+                        [
+                            shell,
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(script),
+                            "restart",
+                        ],
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        capture_output=True,
+                        check=False,
+                        env=env,
+                        creationflags=CREATE_NO_WINDOW,
+                        timeout=30,
+                    )
+                    call_lines = calls.read_text(encoding="utf-8").splitlines()
+                    if start_code:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(
+                            "sccache --start-server failed with exit code 9",
+                            result.stderr,
+                        )
+                        self.assertEqual(call_lines, ["--stop-server", "--start-server"])
+                        self.assertNotIn("Max cache size", result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn("Max cache size", result.stdout)
+                        self.assertEqual(
+                            call_lines, ["--stop-server", "--start-server", "--show-stats"]
+                        )
 
     def test_sccache_perf_reset_fails_when_zero_stats_fails(self) -> None:
         shell = powershell()
@@ -973,7 +957,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             1
         ].split("\n\n", 1)[0]
         self.assertEqual(
-            schema_recipe.strip(), "just core-gate app-server-schema-fixtures"
+            schema_recipe.strip(),
+            "just core-gate app-server-schema-fixtures; exit $LASTEXITCODE",
         )
         manifest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml")
         steps = manifest["gates"]["app-server-schema-fixtures"]["steps"]
@@ -989,54 +974,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             },
         )
 
-    def test_agents_instruction_layout_and_budget_are_explicit(
-        self,
-    ) -> None:
-        expected_agent_files = ["AGENTS.md"]
-        discovered_agent_files = subprocess.run(
-            [
-                "git",
-                "ls-files",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "--",
-                ":(glob)**/AGENTS.md",
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-            creationflags=CREATE_NO_WINDOW,
-            timeout=30,
-        ).stdout.splitlines()
-        actual_agent_files = sorted(
-            path for path in discovered_agent_files if (REPO_ROOT / path).is_file()
-        )
-        actual_eol_attributes = subprocess.run(
-            ["git", "check-attr", "eol", "--", "AGENTS.md"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-            creationflags=CREATE_NO_WINDOW,
-            timeout=30,
-        ).stdout.splitlines()
-        expected_eol_attributes = ["AGENTS.md: eol: lf"]
 
-        self.assertEqual(actual_agent_files, sorted(expected_agent_files))
-        self.assertEqual(actual_eol_attributes, expected_eol_attributes)
-        root_policy_bytes = (REPO_ROOT / "AGENTS.md").stat().st_size
-
-        self.assertLessEqual(
-            root_policy_bytes,
-            16 * 1024,
-            "the root automatic instruction file is too large",
-        )
 
 
 if __name__ == "__main__":

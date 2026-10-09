@@ -65,6 +65,14 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
     assert_eq!(response_codex_home, expected_codex_home);
     assert_eq!(platform_family, std::env::consts::FAMILY);
     assert_eq!(platform_os, std::env::consts::OS);
+    let receipt_path = codex_home
+        .path()
+        .join("runtime/desktop-app-server-runtime.json");
+    let receipt = fs_wait::wait_for_path_exists(&receipt_path, Duration::from_secs(1)).await;
+    assert!(
+        receipt.is_err(),
+        "non-Desktop client wrote {receipt_path:?}"
+    );
     Ok(())
 }
 
@@ -261,39 +269,6 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn initialize_non_desktop_client_does_not_write_desktop_runtime_receipt() -> Result<()> {
-    let responses = Vec::new();
-    let server = create_mock_responses_server_sequence_unchecked(responses).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.initialize_with_client_info(ClientInfo {
-            name: "codex_vscode".to_string(),
-            title: Some("Codex VS Code Extension".to_string()),
-            version: "0.1.0".to_string(),
-        }),
-    )
-    .await??;
-
-    let receipt_path = codex_home
-        .path()
-        .join("runtime/desktop-app-server-runtime.json");
-    let receipt = fs_wait::wait_for_path_exists(&receipt_path, Duration::from_secs(1)).await;
-    assert!(
-        receipt.is_err(),
-        "non-Desktop client wrote {receipt_path:?}"
-    );
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn initialize_rejects_invalid_client_name() -> Result<()> {

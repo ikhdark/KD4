@@ -178,42 +178,26 @@ mod tests {
     }
 
     #[test]
-    fn collect_from_pairs_redacts_whitespace_and_empty_values() {
-        let diagnostics = FeedbackDiagnostics::collect_from_pairs([
-            ("HTTP_PROXY", "  proxy with spaces  "),
-            ("HTTPS_PROXY", ""),
-        ]);
-
-        assert_eq!(
-            diagnostics,
-            FeedbackDiagnostics {
-                diagnostics: vec![FeedbackDiagnostic {
-                    headline: "Proxy environment variables are set and may affect connectivity."
-                        .to_string(),
-                    details: vec![
-                        "HTTP_PROXY is set; value redacted".to_string(),
-                        "HTTPS_PROXY is set; value redacted".to_string(),
-                    ],
-                },],
-            }
-        );
-    }
-
-    #[test]
-    fn collect_from_pairs_never_reports_invalid_values() {
-        let proxy_value = "not a valid proxy";
-        let diagnostics = FeedbackDiagnostics::collect_from_pairs([("HTTP_PROXY", proxy_value)]);
-
-        assert_eq!(
-            diagnostics,
-            FeedbackDiagnostics {
-                diagnostics: vec![FeedbackDiagnostic {
-                    headline: "Proxy environment variables are set and may affect connectivity."
-                        .to_string(),
-                    details: vec!["HTTP_PROXY is set; value redacted".to_string()],
-                },],
-            }
-        );
+    fn collect_from_pairs_redacts_whitespace_empty_and_invalid_values() {
+        for pairs in [
+            vec![("HTTP_PROXY", "  proxy with spaces  "), ("HTTPS_PROXY", "")],
+            vec![("HTTP_PROXY", "not a valid proxy")],
+        ] {
+            let details = pairs
+                .iter()
+                .map(|(key, _)| format!("{key} is set; value redacted"))
+                .collect();
+            assert_eq!(
+                FeedbackDiagnostics::collect_from_pairs(pairs),
+                FeedbackDiagnostics {
+                    diagnostics: vec![FeedbackDiagnostic {
+                        headline: "Proxy environment variables are set and may affect connectivity."
+                            .to_string(),
+                        details,
+                    }],
+                }
+            );
+        }
     }
 
     #[test]

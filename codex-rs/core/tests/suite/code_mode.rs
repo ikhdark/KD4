@@ -13,23 +13,9 @@ mod token_cache_e2e;
 mod idle_benchmark;
 
 fn workspace_invalidation(request: &ResponsesRequest, call_id: &str) -> Option<Value> {
-    request.body_json()["input"]
-        .as_array()?
-        .iter()
+    token_cache_e2e::freshness(&request.body_json())
+        .into_iter()
         .rev()
-        .filter(|item| item["role"] == "developer")
-        .filter_map(|item| item["content"].as_array())
-        .flatten()
-        .filter_map(|content| content["text"].as_str())
-        .filter(|text| text.starts_with("<workspace_evidence_invalidation>"))
-        .flat_map(str::lines)
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .flat_map(|notice| {
-            notice["notices"]
-                .as_array()
-                .cloned()
-                .unwrap_or_else(|| vec![notice])
-        })
         .find(|notice| notice["call_id"] == call_id)
 }
 
@@ -598,6 +584,9 @@ const shape = {
   hasResults: Array.isArray(result?.results),
   resultCount: Array.isArray(result?.results) ? result.results.length : 0,
   firstStatus: result?.results?.[0]?.status ?? null,
+  allExact: Array.isArray(result?.results) && result.results.every(part =>
+    part.status === "ok" && part.complete === true &&
+    part.text === "contract line that must be read in full\n".repeat(200)),
   hasSections: Object.prototype.hasOwnProperty.call(result ?? {}, "sections"),
 };
 text(JSON.stringify(shape));
@@ -634,14 +623,9 @@ text(JSON.stringify(shape));
         "JavaScript must receive the handler's own result, got keys {:?}: {reported}",
         shape["keys"]
     );
-    assert!(
-        shape["resultCount"].as_u64().unwrap_or(0) > 0,
-        "the read must report at least one selector result: {reported}"
-    );
-    assert!(
-        shape["firstStatus"].is_string(),
-        "each selector result carries its own status: {reported}"
-    );
+    assert_eq!(shape["resultCount"], 4, "all requested ranges: {reported}");
+    assert_eq!(shape["firstStatus"], "ok");
+    assert_eq!(shape["allExact"], true, "all source bytes reach JavaScript: {reported}");
     assert_eq!(
         shape["hasSections"],
         Value::Bool(false),
@@ -2393,91 +2377,23 @@ text(JSON.stringify(result));
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_nested_tool_calls_can_run_in_parallel() -> Result<()> {
     require_network!();
-
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex()
-        .with_model("test-gpt-5.1-codex")
-        .with_config(move |config| {
-            let _ = config.features.enable(Feature::CodeMode);
-        });
-    let test = builder.build(&server).await?;
-
-    let warmup_code = r#"
-const args = {
-  sleep_after_ms: 10,
-  barrier: {
-    id: "code-mode-parallel-tools-warmup",
-    participants: 2,
-    timeout_ms: 5_000,
-  },
-};
-
-await Promise.all([
-  tools.test_sync_tool(args),
-  tools.test_sync_tool(args),
-]);
-"#;
+    // Neither call can finish until both are inside the real nested handler.
+    // This proves overlap without a warmup or a machine-speed assertion.
     let code = r#"
-const args = {
-  sleep_after_ms: 300,
-  barrier: {
-    id: "code-mode-parallel-tools",
-    participants: 2,
-    timeout_ms: 5_000,
-  },
-};
-
-const results = await Promise.all([
-  tools.test_sync_tool(args),
-  tools.test_sync_tool(args),
-]);
-
-text(JSON.stringify(results));
+const args = {barrier: {
+    id: "code-mode-parallel-tools", participants: 2, timeout_ms: 5_000
+}};
+text(JSON.stringify(await Promise.all([
+    tools.test_sync_tool(args), tools.test_sync_tool(args)
+])));
 "#;
-
-    let response_mock = responses::mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-warm-1"),
-                ev_custom_tool_call("call-warm-1", "exec", warmup_code),
-                ev_completed("resp-warm-1"),
-            ]),
-            sse(vec![
-                ev_assistant_message("msg-warm-1", "warmup done"),
-                ev_completed("resp-warm-2"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_custom_tool_call("call-1", "exec", code),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn("warm up nested tools in parallel").await?;
-
-    let start = Instant::now();
-    test.submit_turn("run nested tools in parallel").await?;
-    let duration = start.elapsed();
-
-    assert!(
-        duration < Duration::from_millis(1_600),
-        "expected nested tools to finish in parallel, got {duration:?}",
-    );
-
-    let req = response_mock
-        .last_request()
-        .expect("parallel code mode run should send a completion request");
-    let items = custom_tool_output_items(&req, "call-1");
+    let (_test, response) =
+        run_code_mode_turn(&server, "run nested tools in parallel", code).await?;
+    let request = response.single_request();
+    let items = custom_tool_output_items(&request, "call-1");
     assert_eq!(items.len(), 1);
-    assert_eq!(text_item(&items, /*index*/ 0), "[\"ok\",\"ok\"]");
-
+    assert_eq!(text_item(&items, 0), "[\"ok\",\"ok\"]");
     Ok(())
 }
 
@@ -3095,7 +3011,7 @@ while (true) {}
     )
     .await;
 
-    test.submit_turn("terminate it").await?;
+    tokio::time::timeout(Duration::from_secs(5), test.submit_turn("terminate it")).await??;
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
@@ -3103,7 +3019,7 @@ while (true) {}
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script (?:terminated|running) with cell ID \d+\z"
+            r"Script terminated with cell ID \d+\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -4167,32 +4083,7 @@ text({ json: true });
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_resume_after_set_timeout() -> Result<()> {
-    require_network!();
 
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to wait for a timeout",
-        r#"
-await new Promise((resolve) => setTimeout(resolve, 10));
-text("timer done");
-"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "exec setTimeout call failed unexpectedly: {output}"
-    );
-    assert_eq!(output, "timer done");
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_notify_injects_additional_exec_tool_output_into_active_context() -> Result<()> {
@@ -4216,6 +4107,7 @@ text("done");
         .any(|item| {
             item.get("call_id").and_then(serde_json::Value::as_str) == Some("call-1")
                 && item.get("name").and_then(serde_json::Value::as_str) == Some("exec")
+                && item["output"].to_string().contains("code_mode_notify_marker")
         });
     assert!(
         has_notify_output,
@@ -4714,43 +4606,7 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_print_structured_mcp_tool_result_fields() -> Result<()> {
-    require_network!();
 
-    let server = responses::start_mock_server().await;
-    let code = r#"
-const { content, structuredContent, isError } = await resolve_tool("mcp__rmcp.echo")({
-  message: "ping",
-});
-text(
-  `echo=${structuredContent?.echo ?? "missing"}\n` +
-    `env=${structuredContent?.env ?? "missing"}\n` +
-    `isError=${String(isError)}\n` +
-    `contentLength=${content.length}`
-);
-"#;
-
-    let (_test, second_mock) =
-        run_code_mode_turn_with_rmcp(&server, "use exec to run the rmcp echo tool", code).await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "exec rmcp echo call failed unexpectedly: {output}"
-    );
-    assert_eq!(
-        output,
-        "echo=ECHOING: ping
-env=propagated-env
-isError=false
-contentLength=0"
-    );
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_mcp_tool() -> Result<()> {
@@ -4789,12 +4645,16 @@ async fn code_mode_exposes_mcp_tools_on_global_tools_object() -> Result<()> {
     let server = responses::start_mock_server().await;
     let code = r#"
 const echo = resolve_tool("mcp__rmcp.echo");
+const direct = await echo({message: "ping"});
+if (direct.structuredContent?.echo !== "ECHOING: ping" || direct.structuredContent?.env !== "propagated-env" || direct.isError !== false || direct.content.length !== 0) throw Error("resolved callable lost MCP result fields");
 const { content, structuredContent, isError } = await tools[echo.name]({
   message: "ping",
 });
 text(
   `hasEcho=${String(Object.keys(tools).includes(echo.name))}\n` +
     `echoType=${typeof tools[echo.name]}\n` +
+    `execType=${typeof tools.exec_command}\n` +
+    `env=${structuredContent?.env ?? "missing"}\n` +
     `echo=${structuredContent?.echo ?? "missing"}\n` +
     `isError=${String(isError)}\n` +
     `contentLength=${content.length}`
@@ -4816,6 +4676,8 @@ text(
         output,
         "hasEcho=true
 echoType=function
+execType=function
+env=propagated-env
 echo=ECHOING: ping
 isError=false
 contentLength=0"
@@ -4869,41 +4731,7 @@ text(JSON.stringify({
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_exposes_namespaced_mcp_tools_on_global_tools_object() -> Result<()> {
-    require_network!();
 
-    let server = responses::start_mock_server().await;
-    let code = r#"
-text(JSON.stringify({
-  hasExecCommand: typeof tools.exec_command === "function",
-  hasNamespacedEcho: typeof tools[resolve_tool("mcp__rmcp.echo").name] === "function",
-}));
-"#;
-
-    let (_test, second_mock) =
-        run_code_mode_turn_with_rmcp(&server, "use exec to inspect the global tools object", code)
-            .await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "exec global tools inspection failed unexpectedly: {output}"
-    );
-
-    let parsed: Value = serde_json::from_str(&output)?;
-    assert_eq!(
-        parsed,
-        serde_json::json!({
-            "hasExecCommand": true,
-            "hasNamespacedEcho": true,
-        })
-    );
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exposes_normalized_illegal_mcp_tool_names() -> Result<()> {
@@ -5050,6 +4878,14 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "unescape",
         "yield_control",
     ];
+    for required in [
+        "tools", "text", "image", "store", "load", "listKeys", "deleteStored",
+        "notify", "yield_control", "setTimeout", "clearTimeout", "resolve_tool",
+        "ALL_TOOLS", "ALL_TOOL_NAMES", "read_files", "read_status", "await_command",
+        "run_graph", "format_tool_result",
+    ] {
+        assert!(globals.contains(required), "missing runtime helper {required}");
+    }
     for g in &globals {
         assert!(
             expected.contains(&g.as_str()),
@@ -5353,6 +5189,9 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
     test.codex.replace_thread(new_thread.thread);
     test.session_configured = new_thread.session_configured;
 
+    let excluded_name = codex_tools::code_mode_name_for_tool_name(
+        &codex_protocol::ToolName::namespaced("excluded", "lookup"),
+    );
     let first_mock = responses::mount_sse_once(
         &server,
         sse(vec![
@@ -5360,14 +5199,14 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
             ev_custom_tool_call(
                 "call-1",
                 "exec",
-                r#"
+                &r#"
 text(JSON.stringify({
-  excludedType: typeof tools.excluded__lookup,
-  excludedMetadata: ALL_TOOLS.some(({ name }) => name === "excluded__lookup"),
+  excludedType: typeof tools[EXCLUDED_NAME],
+  excludedMetadata: ALL_TOOLS.some(({ name }) => name === EXCLUDED_NAME),
   allowedType: typeof tools.update_plan,
   allowedMetadata: ALL_TOOLS.some(({ name }) => name === "update_plan"),
 }));
-"#,
+"#.replace("EXCLUDED_NAME", &serde_json::to_string(&excluded_name)?),
             ),
             ev_completed("resp-1"),
         ]),

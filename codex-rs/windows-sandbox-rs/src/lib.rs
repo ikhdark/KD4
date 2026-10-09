@@ -88,18 +88,19 @@ mod wait_timeout_tests {
 
     #[test]
     fn retained_capture_marks_truncation_only_after_observing_excess_bytes() {
-        let mut capture = RetainedCapture::new(Some(4));
-        capture.append(b"abcd");
-        let (bytes, truncated) = capture.into_parts();
-        assert_eq!(bytes, b"abcd");
-        assert!(!truncated);
-
-        let mut capture = RetainedCapture::new(Some(4));
-        capture.append(b"abcd");
-        capture.append(b"e");
-        let (bytes, truncated) = capture.into_parts();
-        assert_eq!(bytes, b"abcd");
-        assert!(truncated);
+        for (cap, chunks, expected, truncated) in [
+            (None, vec![b"abc".as_slice(), b"def", b""], b"abcdef".as_slice(), false),
+            (Some(0), vec![b"".as_slice()], b"".as_slice(), false),
+            (Some(0), vec![b"a".as_slice(), b""], b"".as_slice(), true),
+            (Some(4), vec![b"ab".as_slice(), b"cd", b""], b"abcd".as_slice(), false),
+            (Some(4), vec![b"abc".as_slice(), b"def", b""], b"abcd".as_slice(), true),
+        ] {
+            let mut capture = RetainedCapture::new(cap);
+            for chunk in chunks {
+                capture.append(chunk);
+            }
+            assert_eq!(capture.into_parts(), (expected.to_vec(), truncated), "cap={cap:?}");
+        }
     }
 }
 
@@ -1182,23 +1183,19 @@ mod windows_impl {
         }
 
         #[test]
-        fn applies_network_block_when_access_is_disabled() {
-            assert!(should_apply_network_block(&workspace_profile(
-                NetworkSandboxPolicy::Restricted
-            )));
+        fn network_block_follows_profile_network_policy() {
+            for (profile, blocked) in [
+                (workspace_profile(NetworkSandboxPolicy::Restricted), true),
+                (workspace_profile(NetworkSandboxPolicy::Enabled), false),
+                (PermissionProfile::read_only(), true),
+            ] {
+                assert_eq!(should_apply_network_block(&profile), blocked);
+            }
         }
 
-        #[test]
-        fn skips_network_block_when_access_is_allowed() {
-            assert!(!should_apply_network_block(&workspace_profile(
-                NetworkSandboxPolicy::Enabled
-            )));
-        }
 
-        #[test]
-        fn applies_network_block_for_read_only() {
-            assert!(should_apply_network_block(&PermissionProfile::read_only()));
-        }
+
+
 
         fn capture_pipe_with_open_writer() -> (super::CapturePipeReader, HANDLE) {
             let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) =
@@ -1297,10 +1294,15 @@ mod windows_impl {
         fn stopped_capture_reader_bounds_continuous_writer_drain() {
             let (reader, out_w) = capture_pipe_with_open_writer();
             let out_w_addr = out_w as usize;
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
             let writer = std::thread::spawn(move || {
                 let out_w = out_w_addr as HANDLE;
                 let chunk = [b'x'; 64];
+                let mut started_tx = Some(started_tx);
                 while write_pipe(out_w, &chunk).is_ok() {
+                    if let Some(started_tx) = started_tx.take() {
+                        let _ = started_tx.send(());
+                    }
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 // SAFETY: The writer thread received sole ownership of out_w and has finished its
@@ -1309,7 +1311,7 @@ mod windows_impl {
                     CloseHandle(out_w);
                 }
             });
-            std::thread::sleep(Duration::from_millis(20));
+            started_rx.recv_timeout(Duration::from_secs(5)).expect("writer produced output");
 
             let started_at = Instant::now();
             let output = reader.stop_and_collect();

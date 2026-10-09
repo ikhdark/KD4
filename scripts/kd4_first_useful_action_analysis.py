@@ -178,32 +178,35 @@ def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
     )
 
 
+def _valid_milestones(timing: dict[str, Any]) -> dict[str, float]:
+    milestones = timing.get("milestones")
+    if not isinstance(milestones, dict):
+        return {}
+    result = {}
+    for key, value in milestones.items():
+        if type(value) not in (int, float):
+            continue
+        try:
+            value = float(value)
+        except OverflowError:
+            continue
+        if math.isfinite(value) and value >= 0:
+            result[key] = value
+    return result
+
+
 def canonical_milestones(timing: Any) -> dict[str, float] | None:
     """Require the domain/useful pair; other boundaries have separate coverage."""
     if not isinstance(timing, dict):
         return None
     version = timing.get("schemaVersion")
-    milestones = timing.get("milestones")
+    milestones = _valid_milestones(timing)
     if (
         isinstance(version, int)
         and version >= CANONICAL_TIMING_SCHEMA_VERSION
-        and isinstance(milestones, dict)
-        and all(
-            isinstance(milestones.get(key), (int, float))
-            and not isinstance(milestones[key], bool)
-            and math.isfinite(milestones[key])
-            and milestones[key] >= 0
-            for key in ("firstDomainActionMs", "firstUsefulActionMs")
-        )
+        and all(key in milestones for key in ("firstDomainActionMs", "firstUsefulActionMs"))
     ):
-        return {
-            key: float(value)
-            for key, value in milestones.items()
-            if isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-            and value >= 0
-        }
+        return milestones
     return None
 
 
@@ -341,15 +344,7 @@ def analyze_records(
                 # milestones from such a profile are not measurements.
                 exclusions["invalidTimingProfiles"] += 1
             elif canonical_schema:
-                independent_rows.append(
-                    {
-                        key: value
-                        for key, value in (timing.get("milestones") or {}).items()
-                        if type(value) in (int, float)
-                        and math.isfinite(value)
-                        and value >= 0
-                    }
-                )
+                independent_rows.append(_valid_milestones(timing))
                 milestones = canonical_milestones(timing)
                 if milestones is not None:
                     canonical_rows.append(milestones)

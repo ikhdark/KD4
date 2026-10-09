@@ -2091,30 +2091,7 @@ mod tests {
         })
     }
 
-    #[test]
-    fn verify_server_notification_serialization() {
-        let notification =
-            ServerNotification::AccountLoginCompleted(AccountLoginCompletedNotification {
-                login_id: Some(Uuid::nil().to_string()),
-                success: true,
-                error: None,
-            });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
-        assert_eq!(
-            json!({
-                "method": "account/login/completed",
-                "params": {
-                    "loginId": Uuid::nil().to_string(),
-                    "success": true,
-                    "error": null,
-                },
-            }),
-            serde_json::to_value(jsonrpc_notification)
-                .expect("ensure the strum macros serialize the method field correctly"),
-            "ensure the strum macros serialize the method field correctly"
-        );
-    }
 
     #[test]
     fn verify_account_login_completed_notification_serialization() {
@@ -2356,7 +2333,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn send_response_routes_to_target_connection() {
+    async fn send_response_routes_to_target_and_clears_registered_context() {
         let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
         let outgoing =
             OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
@@ -2365,6 +2342,14 @@ mod tests {
             request_id: RequestId::Integer(7),
         };
 
+        outgoing
+            .register_request_context(RequestContext::new(
+                request_id.clone(),
+                tracing::info_span!("app_server.request", rpc.method = "thread/start"),
+                None,
+            ))
+            .await;
+        assert_eq!(outgoing.request_context_count().await, 1);
         outgoing
             .send_response(
                 request_id.clone(),
@@ -2394,38 +2379,10 @@ mod tests {
             }
             other => panic!("expected targeted response envelope, got: {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn send_response_clears_registered_request_context() {
-        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
-        let outgoing =
-            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
-        let request_id = ConnectionRequestId {
-            connection_id: ConnectionId(42),
-            request_id: RequestId::Integer(7),
-        };
-
-        outgoing
-            .register_request_context(RequestContext::new(
-                request_id.clone(),
-                tracing::info_span!("app_server.request", rpc.method = "thread/start"),
-                /*parent_trace*/ None,
-            ))
-            .await;
-        assert_eq!(outgoing.request_context_count().await, 1);
-
-        outgoing
-            .send_response(
-                request_id,
-                ClientResponsePayload::ThreadArchive(
-                    codex_app_server_protocol::ThreadArchiveResponse {},
-                ),
-            )
-            .await;
-
         assert_eq!(outgoing.request_context_count().await, 0);
     }
+
+
 
     #[tokio::test]
     async fn send_error_routes_to_target_connection() {
@@ -2793,13 +2750,13 @@ mod tests {
 
     #[tokio::test]
     async fn receipt_latency_uses_writer_time_even_when_later_enqueue_delays_collection() {
-        let started = Instant::now();
+        let started = Instant::now() - Duration::from_secs(1);
         let (first_tx, first_rx) = oneshot::channel();
         first_tx.send(started + Duration::from_millis(2)).unwrap();
         // Collection cannot begin until the later recipient's enqueue settles.
         let (second_tx, second_rx) = oneshot::channel();
         second_tx.send(started + Duration::from_millis(80)).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Both writer timestamps precede collection without a wall-clock sleep.
         let outcomes = collect_turn_delivery_outcomes(vec![
             PendingTurnDeliveryReceipt { connection_id: ConnectionId(1), receiver: Some(first_rx), immediate_outcome: None },
             PendingTurnDeliveryReceipt { connection_id: ConnectionId(2), receiver: Some(second_rx), immediate_outcome: None },
@@ -2807,6 +2764,7 @@ mod tests {
         assert_eq!(outcomes[0].successful_elapsed_ms, Some(2));
         assert_eq!(outcomes[0].post_core_delivery_latency_ms, Some(7));
         assert_eq!(outcomes[1].successful_elapsed_ms, Some(80));
+        assert_eq!(outcomes[1].post_core_delivery_latency_ms, Some(85));
     }
 
     #[tokio::test]
@@ -2862,7 +2820,7 @@ mod tests {
             .await;
         outgoing
             .register_request_context(RequestContext::new(
-                open_connection_request,
+                open_connection_request.clone(),
                 tracing::info_span!("app_server.request", rpc.method = "turn/start"),
                 /*parent_trace*/ None,
             ))
@@ -2871,7 +2829,9 @@ mod tests {
 
         outgoing.connection_closed(ConnectionId(9)).await;
 
-        assert_eq!(outgoing.request_context_count().await, 1);
+        let contexts = outgoing.request_contexts.lock().await;
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts.contains_key(&open_connection_request));
     }
 
     #[tokio::test]
@@ -3221,12 +3181,10 @@ mod tests {
             "request registration must retain the active-connection snapshot lock",
         );
 
-        let close_outgoing = Arc::clone(&outgoing);
-        let close_task =
-            tokio::spawn(async move { close_outgoing.connection_closed(connection_id).await });
-        tokio::task::yield_now().await;
+        let close_task = outgoing.connection_closed(connection_id);
+        tokio::pin!(close_task);
         assert!(
-            !close_task.is_finished(),
+            futures::poll!(&mut close_task).is_pending(),
             "disconnect cleanup must wait until callback registration completes",
         );
 
@@ -3237,8 +3195,7 @@ mod tests {
             .expect("request registration task should not panic");
         timeout(Duration::from_secs(1), close_task)
             .await
-            .expect("disconnect cleanup should finish")
-            .expect("disconnect cleanup task should not panic");
+            .expect("disconnect cleanup should finish");
         let error = timeout(Duration::from_secs(1), wait_for_result)
             .await
             .expect("disconnect should resolve the callback")
@@ -3317,7 +3274,14 @@ mod tests {
                 .expect("settlement wakes capacity wait")
                 .unwrap()
                 .unwrap();
-            assert_eq!(result.await.unwrap().is_err(), cancel);
+            assert_eq!(
+                result.await.unwrap(),
+                if cancel {
+                    Err(internal_error("cancelled"))
+                } else {
+                    Ok(json!({"decision": "accept"}))
+                },
+            );
             assert_eq!(
                 rx.len(),
                 1,
@@ -3545,19 +3509,14 @@ mod tests {
             .await;
         let request_id = request_id.expect("request admitted");
 
-        let replay_outgoing = Arc::clone(&outgoing);
-        let replay_task = tokio::spawn(async move {
-            replay_outgoing
-                .replay_requests_to_connection_for_thread(
-                    resumed_connection,
-                    thread_id,
-                    /*experimental_api_enabled*/ false,
-                )
-                .await;
-        });
-        tokio::task::yield_now().await;
+        let replay_task = outgoing.replay_requests_to_connection_for_thread(
+            resumed_connection,
+            thread_id,
+            /*experimental_api_enabled*/ false,
+        );
+        tokio::pin!(replay_task);
         assert!(
-            !replay_task.is_finished(),
+            futures::poll!(&mut replay_task).is_pending(),
             "the full channel should hold replay at capacity reservation"
         );
 
@@ -3574,8 +3533,7 @@ mod tests {
         let _original_delivery = rx.recv().await.expect("original request delivery");
         timeout(Duration::from_secs(1), replay_task)
             .await
-            .expect("replay should finish after capacity becomes available")
-            .expect("replay task should not panic");
+            .expect("replay should finish after capacity becomes available");
 
         assert!(
             rx.try_recv().is_err(),
@@ -3654,6 +3612,14 @@ mod tests {
                 .await
                 .expect("request admitted")
         });
+        timeout(Duration::from_secs(1), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first recipient fills transport before partial failure");
+        rx.close();
         let first_delivery = timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("first delivery should not time out")
@@ -3662,8 +3628,7 @@ mod tests {
             OutgoingEnvelope::ToConnection { connection_id, .. } => connection_id,
             envelope => panic!("unexpected first delivery: {envelope:?}"),
         };
-        assert!([first_connection, second_connection].contains(&delivered_connection));
-        drop(rx);
+        assert_eq!(delivered_connection, first_connection);
 
         let (request_id, wait_for_result) = timeout(Duration::from_secs(1), send_task)
             .await
@@ -3671,6 +3636,11 @@ mod tests {
             .expect("send task should not panic");
         assert_eq!(outgoing.pending_callback_count().await, 1);
 
+        assert!(rx.recv().await.is_none(), "second recipient was never published");
+        outgoing
+            .notify_client_response(second_connection, request_id.clone(), json!({"unauthorized": true}))
+            .await;
+        assert_eq!(outgoing.pending_callback_count().await, 1);
         let expected_result = json!({"contentItems": [], "success": true});
         outgoing
             .notify_client_response(delivered_connection, request_id, expected_result.clone())
@@ -4447,8 +4417,9 @@ mod tests {
             .expect("request admitted");
 
         outgoing
-            .notify_client_response(other_connection, request_id.clone(), json!({"answers": {}}))
+            .notify_client_response(other_connection, request_id.clone(), json!({"unauthorized": true}))
             .await;
+        assert_eq!(outgoing.pending_callback_count().await, 1);
 
         outgoing
             .notify_client_response(allowed_connection, request_id, json!({"answers": {}}))

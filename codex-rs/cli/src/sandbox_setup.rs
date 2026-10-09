@@ -143,27 +143,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_managed_user_identity() {
-        let command = SandboxSetupCommand::try_parse_from([
-            "setup",
-            "--elevated",
-            "--user",
-            "DOMAIN\\alice",
-            "--codex-home",
-            r"C:\Users\alice\.codex",
-        ])
-        .expect("parse");
-
-        assert!(command.elevated_sandbox_level);
-        assert_eq!(command.user.as_deref(), Some(r"DOMAIN\alice"));
-        assert!(!command.current_user);
-        assert_eq!(
-            command.codex_home.as_deref(),
-            Some(std::path::Path::new(r"C:\Users\alice\.codex"))
-        );
-    }
-
-    #[test]
     fn requires_explicit_user_identity() {
         let err = SandboxSetupCommand::try_parse_from(["setup", "--elevated"])
             .expect_err("parse should fail");
@@ -194,6 +173,12 @@ mod tests {
         .expect("setup command");
 
         assert_eq!(command.user.as_deref(), Some(r"DOMAIN\alice"));
+        assert!(command.elevated_sandbox_level);
+        assert!(!command.current_user);
+        assert_eq!(command.setup_level().expect("elevated setup"), SandboxSetupLevel::Elevated);
+        let identity = resolve_sandbox_setup_identity(&command).expect("managed identity");
+        assert_eq!(identity.real_user, r"DOMAIN\alice");
+        assert_eq!(identity.codex_home, PathBuf::from(r"C:\Users\alice\.codex"));
     }
 
     #[test]

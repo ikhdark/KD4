@@ -3133,6 +3133,45 @@ mod tests {
     use codex_protocol::permissions::FileSystemSandboxPolicy;
     use codex_protocol::permissions::NetworkSandboxPolicy;
 
+    #[tokio::test]
+    async fn request_filtering_and_errors_do_not_leave_pending_turn_state() {
+        use crate::analytics_client_tests::sample_turn_start_request;
+        use crate::analytics_client_tests::sample_turn_start_response;
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        reducer.ingest(AnalyticsFact::ClientRequest {
+            connection_id: 7,
+            request_id: RequestId::Integer(3),
+            request: Box::new(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(3),
+                params: codex_app_server_protocol::ThreadArchiveParams { thread_id: "thread-2".into() },
+            }),
+        }, &mut out).await;
+        assert!(reducer.requests.is_empty(), "untracked requests must not retain correlation state");
+        for rejected in [false, true] {
+            if rejected {
+                reducer.ingest(AnalyticsFact::ClientRequest {
+                    connection_id: 7,
+                    request_id: RequestId::Integer(3),
+                    request: Box::new(sample_turn_start_request("thread-2", 3)),
+                }, &mut out).await;
+                assert_eq!(reducer.requests.len(), 1, "positive control: start request is retained");
+                reducer.ingest(AnalyticsFact::ErrorResponse {
+                    connection_id: 7, request_id: RequestId::Integer(3), error_type: None,
+                }, &mut out).await;
+                assert!(reducer.requests.is_empty(), "error must remove pending request");
+            }
+            reducer.ingest(AnalyticsFact::ClientResponse {
+                connection_id: 7,
+                request_id: RequestId::Integer(3),
+                response: Box::new(sample_turn_start_response("turn-2")),
+                thread_originator: None,
+            }, &mut out).await;
+            assert!(reducer.turns.is_empty(), "late response must not resurrect ignored or failed request");
+            assert!(out.is_empty());
+        }
+    }
+
     fn started_tool(turn_id: &str) -> AnalyticsFact {
         AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
             codex_app_server_protocol::ItemStartedNotification {

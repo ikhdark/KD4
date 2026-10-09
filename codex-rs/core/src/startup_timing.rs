@@ -449,6 +449,7 @@ mod tests {
 
         let snapshot = timing.complete_snapshot();
         assert!(snapshot.profile_valid);
+        assert_eq!(snapshot.inclusive_duration_ns, 36);
         assert_eq!(snapshot.phases.session_initialization_ns, 5);
         assert_eq!(snapshot.phases.transport_preconnect_ns, 31);
         assert_eq!(snapshot.phases.prewarm_preparation_ns, 11);
@@ -456,6 +457,8 @@ mod tests {
         assert_eq!(snapshot.prewarm_status.as_deref(), Some("ready"));
 
         clock.advance(100);
+        timing.record_prewarm_status("late update");
+        drop(timing.begin_phase(StartupPhase::ExecutorReadiness));
         assert_eq!(timing.complete_snapshot(), snapshot);
     }
 

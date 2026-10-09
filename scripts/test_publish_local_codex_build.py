@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+import hashlib
 import json
 import re
 import os
@@ -24,6 +25,44 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
+    def test_build_failure_restores_environment_and_removes_temporary_config(self) -> None:
+        # Failure before Cargo is just as much a scoped build as Cargo failure:
+        # imported callers must retain their cwd/environment and no temp config.
+        for boundary in (
+            "Assert-RustyV8ArchiveReadyForPublish", "Enable-BuildMetadataForPublish",
+            "Enable-SccacheForPublish", "Set-CodexRustMsvcLinkerEnvironment",
+            "Invoke-CargoForPublish",
+        ):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                env = clean_env()
+                env.update(TEMP=str(root), TMP=str(root))
+                command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly -NoSccache
+$names = @('CARGO_TARGET_DIR', 'CODEX_BUILD_COMMIT', 'CODEX_BUILD_DIRTY', 'CODEX_BUILD_PROFILE', 'CODEX_BUILD_TIMESTAMP', 'RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER', 'SCCACHE_BASEDIRS', 'SCCACHE_CACHE_SIZE', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER', 'CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER')
+foreach ($name in $names) {{ [Environment]::SetEnvironmentVariable($name, "before-$name", 'Process') }}
+$before = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 'Process') }})
+$cwd = (Get-Location).Path
+function {boundary} {{ throw 'fixture build failure' }}
+try {{
+    Invoke-CodexBuild -RepoRoot {ps_single_quote(self.repo_root)} -Profile release
+    throw 'expected build failure'
+}} catch {{
+    if ($_.Exception.Message -ne 'fixture build failure') {{ throw }}
+}}
+@{{ before = $before; after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 'Process') }}); cwdBefore = $cwd; cwdAfter = (Get-Location).Path }} | ConvertTo-Json -Compress
+"""
+                result = subprocess.run(
+                    [self.shell, "-NoProfile", "-Command", command], env=env,
+                    capture_output=True, text=True, check=False,
+                    timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                state = json.loads(result.stdout.splitlines()[-1])
+                self.assertEqual(state["after"], state["before"])
+                self.assertEqual(state["cwdAfter"], state["cwdBefore"])
+                self.assertEqual(list(root.iterdir()), [])
+
     def test_rusty_v8_target_prefers_rust_toolchain_host(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_bin = Path(temp_dir)
@@ -75,17 +114,23 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
             calls = temp_path / "cargo-calls.txt"
+            linker = fake_bin / "lld-link.cmd"
+            linker.write_text("@echo fixture-linker\r\n", encoding="utf-8")
             self.write_fake_cargo(
                 fake_bin,
                 "echo fake cargo %*",
                 f'echo invoked>>"{calls}"',
                 "echo cargo progress 1>&2",
                 "echo cargoTargetDirEnv=%CARGO_TARGET_DIR%",
+                "echo linkerX64=%CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER%",
+                "echo linkerArm64=%CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER%",
                 profile="release",
             )
             env = clean_env()
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
             env["CARGO_TARGET_DIR"] = str(temp_path / "inherited-target")
+            for arch in ("X86_64", "AARCH64"):
+                env.pop(f"CARGO_TARGET_{arch}_PC_WINDOWS_MSVC_LINKER", None)
 
             result = self.run_script(
                 "-Profile",
@@ -105,6 +150,19 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("target\\publish-release", result.stdout)
             self.assertNotRegex(result.stdout, r"fake cargo .* check ")
             self.assertEqual(calls.read_text().splitlines(), ["invoked"])
+            self.assertIn(
+                "-p codex-cli -p codex-code-mode-host -p codex-windows-sandbox --profile release",
+                result.stdout,
+            )
+            self.assertIn(f"linkerX64={linker}", result.stdout)
+            self.assertIn(f"linkerArm64={linker}", result.stdout)
+            for relative, expected in (
+                ("codex.exe", self.source_exe_bytes),
+                ("codex-code-mode-host.exe", self.source_code_mode_host_bytes),
+                ("codex-resources/codex-windows-sandbox-setup.exe", self.source_windows_sandbox_setup_bytes),
+                ("codex-resources/codex-command-runner.exe", self.source_command_runner_bytes),
+            ):
+                self.assertEqual((install_dir / relative).read_bytes(), expected)
             self.assertIn("cargoTargetDirEnv=", result.stdout)
             self.assertNotIn("inherited-target", result.stdout)
             self.assert_no_publish_temps(install_dir)
@@ -149,6 +207,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 "buildStamp",
                 "written: content and artifact hashes recorded",
             )
+            self.assertEqual(built_code_mode_host.stat().st_mtime, sidecar_timestamp)
             self.assert_proof_value(
                 result.stdout,
                 "sourceBuildFreshnessBasis",
@@ -194,11 +253,21 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 0,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertTrue(stamp.exists())
+            metadata = json.loads(stamp.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["schemaVersion"], 3)
+            self.assertEqual(metadata["profile"], "local-release")
+            self.assertRegex(metadata["sourceFingerprint"], r"\A[0-9a-f]{64}\Z")
+            for key, artifact in zip(
+                ("codexSha256", "codeModeHostSha256",
+                 "windowsSandboxSetupSha256", "commandRunnerSha256"),
+                self.built_artifact_paths(),
+                strict=True,
+            ):
+                self.assertEqual(metadata[key], hashlib.sha256(artifact.read_bytes()).hexdigest())
             self.assertIn("action: build-only", result.stdout)
             self.assertIn("buildOnly: true", result.stdout)
-            self.assertIn("builtCodexPath:", result.stdout)
-            self.assertIn("buildStampPath:", result.stdout)
+            self.assert_proof_value(result.stdout, "builtCodexPath", str(self.built_artifact_paths()[0]))
+            self.assert_proof_value(result.stdout, "buildStampPath", str(stamp))
             self.assertIn("fake cargo build --target-dir ", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertNotIn("sourceSha256:", result.stdout)
@@ -206,7 +275,9 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertNotIn("publishLock:", result.stdout)
             self.assertNotIn("desktopLocalCliRouting:", result.stdout)
             self.assertNotIn("doctorCommand:", result.stdout)
-            self.assertFalse((install_dir / "codex.exe").exists())
+            self.assertFalse(install_dir.exists())
+            self.assertFalse((install_dir.parent / "publisher-backups").exists())
+            self.assert_no_publish_temps(install_dir)
 
     def test_build_only_auto_skip_reuses_and_invalidates_content_stamp(self) -> None:
         self.init_repo_fixture()
@@ -674,14 +745,14 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 "cargoRustcWrapperConfig: <none: disabled by -NoSccache>",
                 result.stdout,
             )
-            self.assertIn("rustcWrapperEnv=", result.stdout)
-            self.assertIn("cargoBuildRustcWrapperEnv=", result.stdout)
-            self.assertNotIn("rustcWrapperEnv=sccache", result.stdout)
-            self.assertNotIn("cargoBuildRustcWrapperEnv=sccache", result.stdout)
-            self.assertIn("workspaceWrapperEnv=", result.stdout)
-            self.assertIn("cargoWorkspaceWrapperEnv=", result.stdout)
-            self.assertNotIn("workspaceWrapperEnv=sccache", result.stdout)
-            self.assertNotIn("cargoWorkspaceWrapperEnv=sccache", result.stdout)
+            for name in (
+                "rustcWrapperEnv", "cargoBuildRustcWrapperEnv",
+                "workspaceWrapperEnv", "cargoWorkspaceWrapperEnv",
+            ):
+                self.assertEqual(
+                    [line for line in result.stdout.splitlines() if line.startswith(name + "=")],
+                    [name + "="],
+                )
             self.assertIn("fake cargo --config ", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertIn("[build]", result.stdout)
@@ -886,6 +957,7 @@ $after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 
                 "echo metadata timestamp=%CODEX_BUILD_TIMESTAMP%",
             )
             env = clean_env()
+            env.pop("SOURCE_DATE_EPOCH", None)
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
 
             result = self.run_script(
@@ -910,7 +982,25 @@ $after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 
                 r"^metadata timestamp=(.+)$", result.stdout, re.MULTILINE
             )
             self.assertIsNotNone(timestamp, result.stdout)
-            self.assertIsNotNone(datetime.fromisoformat(timestamp.group(1).strip()))
+            self.assertEqual(
+                datetime.fromisoformat(timestamp.group(1).strip()).timestamp(),
+                FIXTURE_TIME,
+            )
+            epoch_result = self.run_script(
+                "-NoSccache", "-InstallDir", str(install_dir),
+                env={**env, "SOURCE_DATE_EPOCH": "123456789"},
+            )
+            self.assertEqual(
+                epoch_result.returncode, 0, epoch_result.stdout + epoch_result.stderr
+            )
+            epoch_timestamp = re.search(
+                r"^metadata timestamp=(.+)$", epoch_result.stdout, re.MULTILINE
+            )
+            self.assertIsNotNone(epoch_timestamp, epoch_result.stdout)
+            self.assertEqual(
+                datetime.fromisoformat(epoch_timestamp.group(1).strip()).timestamp(),
+                123456789,
+            )
             self.assert_no_publish_temps(install_dir)
 
     def test_build_modes_reject_explicit_source_binaries(self) -> None:
@@ -934,25 +1024,27 @@ $after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 
                 / "codex-local-publish-local-release.stamp"
             )
 
-            for mode in (
-                (),
-                ("-AutoSkipBuild",),
-                ("-BuildOnly",),
-                ("-TestRun",),
-                ("-DryRun",),
+            source_arguments = (
+                ("-SourceExe", str(foreign_codex)),
+                ("-SourceCodeModeHostExe", str(self.source_code_mode_host)),
+                ("-SourceWindowsSandboxSetupExe", str(self.source_windows_sandbox_setup)),
+                ("-SourceCommandRunnerExe", str(self.source_command_runner)),
+            )
+            for mode, explicit_sources in (
+                (mode, sources)
+                for mode in (
+                    (), ("-AutoSkipBuild",), ("-BuildOnly",), ("-TestRun",), ("-DryRun",),
+                )
+                for sources in (
+                    tuple(arg for pair in source_arguments for arg in pair),
+                    *source_arguments,
+                )
             ):
-                with self.subTest(mode=mode):
+                with self.subTest(mode=mode, explicit_sources=explicit_sources):
                     install_dir = temp_path / ("install" + "".join(mode))
                     result = self.run_script(
                         *mode,
-                        "-SourceExe",
-                        str(foreign_codex),
-                        "-SourceCodeModeHostExe",
-                        str(self.source_code_mode_host),
-                        "-SourceWindowsSandboxSetupExe",
-                        str(self.source_windows_sandbox_setup),
-                        "-SourceCommandRunnerExe",
-                        str(self.source_command_runner),
+                        *explicit_sources,
                         "-InstallDir",
                         str(install_dir),
                         env=env,

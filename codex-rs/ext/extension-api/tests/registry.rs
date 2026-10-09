@@ -10,6 +10,9 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::McpServerContribution;
+use codex_extension_api::McpServerContributionContext;
+use codex_extension_api::McpServerContributor;
 use codex_extension_api::PromptFragment;
 use codex_extension_api::PromptSlot;
 use codex_extension_api::ThreadLifecycleContributor;
@@ -111,6 +114,19 @@ impl ConfigContributor<()> for AllContributors {}
 
 impl TokenUsageContributor for AllContributors {}
 
+impl McpServerContributor<()> for AllContributors {
+    fn id(&self) -> &'static str {
+        "all-contributors"
+    }
+
+    fn contribute<'a>(
+        &'a self,
+        _context: McpServerContributionContext<'a, ()>,
+    ) -> ExtensionFuture<'a, Vec<McpServerContribution>> {
+        Box::pin(std::future::ready(Vec::new()))
+    }
+}
+
 impl TurnInputContributor for AllContributors {
     fn contribute<'a>(
         &'a self,
@@ -161,8 +177,8 @@ impl TurnItemContributor for AllContributors {
     }
 }
 
-#[tokio::test]
-async fn build_round_trips_every_contributor_category() {
+#[test]
+fn build_round_trips_every_contributor_category() {
     let contributor = Arc::new(AllContributors);
     let mut builder = ExtensionRegistryBuilder::<()>::new();
     builder.thread_lifecycle_contributor(contributor.clone());
@@ -170,6 +186,7 @@ async fn build_round_trips_every_contributor_category() {
     builder.config_contributor(contributor.clone());
     builder.token_usage_contributor(contributor.clone());
     builder.prompt_contributor(contributor.clone());
+    builder.mcp_server_contributor(contributor.clone());
     builder.turn_input_contributor(contributor.clone());
     builder.tool_contributor(contributor.clone());
     builder.tool_lifecycle_contributor(contributor.clone());
@@ -181,6 +198,8 @@ async fn build_round_trips_every_contributor_category() {
     assert_eq!(registry.config_contributors().len(), 1);
     assert_eq!(registry.token_usage_contributors().len(), 1);
     assert_eq!(registry.context_contributors().len(), 1);
+    assert_eq!(registry.mcp_server_contributors().len(), 1);
+    assert_eq!(registry.mcp_server_contributors()[0].id(), "all-contributors");
     assert_eq!(registry.turn_input_contributors().len(), 1);
     assert_eq!(registry.tool_contributors().len(), 1);
     assert_eq!(

@@ -26,30 +26,19 @@ fn config_schema_matches_fixture() {
         "regenerate the config schema fixture with `just config-schema-regenerate <owner>`"
     );
 
-    // Make sure the version in the repo matches exactly: https://github.com/openai/codex/pull/10977.
+    // Keep both the returned bytes and the public writer tied to the exact fixture.
     let fixture = fixture.replace("\r\n", "\n");
     let generated = String::from_utf8(schema_json).expect("schema JSON is UTF-8");
-
     assert_eq!(
         trim_single_trailing_newline(&fixture),
         trim_single_trailing_newline(&generated),
         "fixture should match exactly with generated schema"
     );
-}
-
-#[test]
-fn config_schema_writer_preserves_exact_fixture_bytes() {
     let tmp = TempDir::new().expect("create temp dir");
     let path = tmp.path().join("config.schema.json");
     write_config_schema(&path).expect("write schema");
-    let actual = std::fs::read_to_string(path).expect("read schema");
-    let fixture = include_str!("../../core/config.schema.json").replace("\r\n", "\n");
-    assert_eq!(
-        trim_single_trailing_newline(&actual),
-        trim_single_trailing_newline(&fixture)
-    );
+    assert_eq!(std::fs::read_to_string(path).expect("read schema"), generated);
 }
-
 #[test]
 fn config_schema_hides_unsupported_inline_mcp_bearer_token() {
     let schema_json = config_schema_json().expect("serialize config schema");

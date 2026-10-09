@@ -197,29 +197,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_basic_scalar() {
-        let v = parse_toml_value("42").expect("parse");
-        assert_eq!(v.as_integer(), Some(42));
-    }
-
-    #[test]
-    fn parses_bool() {
-        let true_literal = parse_toml_value("true").expect("parse");
-        assert_eq!(true_literal.as_bool(), Some(true));
-
-        let false_literal = parse_toml_value("false").expect("parse");
-        assert_eq!(false_literal.as_bool(), Some(false));
+    fn parses_toml_value_types() {
+        for (input, expected) in [
+            ("42", Value::Integer(42)),
+            ("true", Value::Boolean(true)),
+            ("false", Value::Boolean(false)),
+            ("[1, 2, 3]", Value::Array(vec![1.into(), 2.into(), 3.into()])),
+            ("{a = 1, b = 2}", Value::Table(toml::Table::from_iter([
+                ("a".to_string(), Value::Integer(1)),
+                ("b".to_string(), Value::Integer(2)),
+            ]))),
+        ] {
+            assert_eq!(parse_toml_value(input).expect("parse"), expected, "{input}");
+        }
     }
 
     #[test]
     fn fails_on_unquoted_string() {
         assert!(parse_toml_value("hello").is_err());
-    }
-
-    #[test]
-    fn parses_array() {
-        let v = parse_toml_value("[1, 2, 3]").expect("parse");
-        assert_eq!(v, Value::Array(vec![1.into(), 2.into(), 3.into()]));
     }
 
     #[test]
@@ -260,11 +255,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_inline_table() {
-        let v = parse_toml_value("{a = 1, b = 2}").expect("parse");
-        let tbl = v.as_table().expect("table");
-        assert_eq!(tbl.get("a").unwrap().as_integer(), Some(1));
-        assert_eq!(tbl.get("b").unwrap().as_integer(), Some(2));
-    }
 }

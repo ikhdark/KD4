@@ -126,6 +126,10 @@ async fn logout_with_revoke_uses_stored_auth_when_access_token_env_is_set() -> R
 
     assert!(removed);
     assert!(!codex_home.path().join("auth.json").exists());
+    let requests = server.received_requests().await.context("revoke requests")?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body_json::<Value>()?["token"], REFRESH_TOKEN);
+    assert_eq!(requests[0].body_json::<Value>()?["token_type_hint"], "refresh_token");
     server.verify().await;
     Ok(())
 }

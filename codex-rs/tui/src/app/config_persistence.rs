@@ -456,12 +456,6 @@ impl App {
         self.chat_widget.set_tui_theme(Some(name));
     }
 
-    #[cfg(test)]
-    pub(super) fn sync_tui_pet_selection(&mut self, pet: String) {
-        self.config.tui_pet = Some(pet.clone());
-        self.chat_widget.set_tui_pet(Some(pet));
-    }
-
     pub(super) fn sync_tui_pet_disabled(&mut self) {
         let pet = crate::pets::DISABLED_PET_ID.to_string();
         self.config.tui_pet = Some(pet.clone());
@@ -877,19 +871,6 @@ terminal_resize_reflow_max_rows = 9000
         assert_eq!(
             app.chat_widget.config_ref().tui_theme.as_deref(),
             Some("dracula")
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_tui_pet_selection_updates_chat_widget_config_copy() {
-        let mut app = make_test_app().await;
-
-        app.sync_tui_pet_selection("chefito".to_string());
-
-        assert_eq!(app.config.tui_pet.as_deref(), Some("chefito"));
-        assert_eq!(
-            app.chat_widget.config_ref().tui_pet.as_deref(),
-            Some("chefito")
         );
     }
 

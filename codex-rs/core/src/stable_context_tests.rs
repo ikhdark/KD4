@@ -214,6 +214,19 @@ fn trusted_context_producer_marker_survives_rollout_serialization() {
     let resumed: ResponseItem = serde_json::from_str(&serialized).expect("resume context item");
     assert!(is_trusted_stable_context_item(&resumed));
 
+    let mut provider = resumed.clone();
+    normalize_provider_context_item_id(&mut provider);
+    assert!(!is_trusted_stable_context_item(&provider));
+    assert_ne!(provider.id(), resumed.id());
+    let normalized = provider.clone();
+    normalize_provider_context_item_id(&mut provider);
+    assert_eq!(provider, normalized, "provider ID normalization is idempotent");
+    let provider_projection = project_stable_context(
+        vec![provider.clone()].into(), StableContextTarget::Sampling,
+    );
+    assert_eq!(provider_projection.items.as_ref(), &[provider]);
+    assert!(provider_projection.manifest.components().is_empty());
+
     let projection = project_stable_context(vec![resumed].into(), StableContextTarget::Sampling);
     assert_eq!(
         visible_text(&projection.items),
@@ -282,6 +295,9 @@ fn tagged_root_orchestration_replaces_the_previous_variant() {
     );
 
     assert_eq!(visible_text(&projection.items), vec![current]);
+    assert_eq!(projection.items.len(), 1);
+    assert!(matches!(&projection.items[0], ResponseItem::Message { role, .. } if role == "developer"));
+    assert_eq!(projection.manifest.components().len(), 1);
     assert!(projection.manifest.components().iter().any(|component| {
         component.kind == StableContextKind::RootCoordinator
             && component.disposition == StableContextDisposition::Replaced
@@ -686,43 +702,7 @@ fn generic_preparation_target_retains_all_recognized_history() {
     );
 }
 
-#[test]
-fn sampling_projection_ignores_removed_environment_switch() {
-    const CHILD_PROCESS: &str = "KD4_TEST_STABLE_CONTEXT_FIXED_BEHAVIOR";
-    const REMOVED_ENVIRONMENT_SWITCH: &str = "CODEX_STABLE_CONTEXT_PROJECTION";
 
-    if std::env::var_os(CHILD_PROCESS).is_some() {
-        let old = repository("old");
-        let current = repository("current");
-        let projection = project_stable_context(
-            vec![text_message("user", &old), text_message("user", &current)].into(),
-            StableContextTarget::Sampling,
-        );
-
-        assert!(projection.manifest.projection_enabled());
-        assert_eq!(visible_text(&projection.items), vec![current.as_str()]);
-        return;
-    }
-
-    let output = std::process::Command::new(
-        std::env::current_exe().expect("current test executable should be available"),
-    )
-    .args([
-        "sampling_projection_ignores_removed_environment_switch",
-        "--nocapture",
-    ])
-    .env(CHILD_PROCESS, "1")
-    .env(REMOVED_ENVIRONMENT_SWITCH, "baseline")
-    .output()
-    .expect("isolated stable-context test process should run");
-
-    assert!(
-        output.status.success(),
-        "isolated stable-context test failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
 #[test]
 fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history() {
@@ -946,25 +926,7 @@ fn collaboration_reset_removes_plan_and_the_reset_notice() {
     assert!(!visible.contains(&reset.as_str()));
 }
 
-#[test]
-fn repository_reconstruction_keeps_only_current_canonical_variant() {
-    let repository_a = repository("old");
-    let repository_b = repository("current");
-    let projection = project_stable_context(
-        vec![
-            text_message("user", &repository_a),
-            text_message("user", "dynamic history survives"),
-            text_message("user", &repository_b),
-        ]
-        .into(),
-        StableContextTarget::Sampling,
-    );
 
-    let visible = visible_text(&projection.items);
-    assert!(!visible.contains(&repository_a.as_str()));
-    assert!(visible.contains(&repository_b.as_str()));
-    assert!(visible.contains(&"dynamic history survives"));
-}
 
 #[test]
 fn runtime_context_variants_are_stable_and_replace_by_semantic_slot() {

@@ -176,47 +176,6 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
     Ok(())
 }
 
-#[tokio::test]
-async fn thread_start_rejects_hidden_dynamic_tools_without_namespace() -> Result<()> {
-    let server = MockServer::start().await;
-
-    let codex_home = TempDir::new()?;
-    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let dynamic_tool = DynamicToolSpec::Function(DynamicToolFunctionSpec {
-        name: "hidden_tool".to_string(),
-        description: "Hidden dynamic tool".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false,
-        }),
-        defer_loading: true,
-    });
-
-    let thread_req = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            dynamic_tools: Some(vec![dynamic_tool]),
-            ..Default::default()
-        })
-        .await?;
-    let error = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    assert_eq!(error.error.code, -32600);
-    assert!(error.error.message.contains("hidden_tool"));
-    assert!(error.error.message.contains("namespace"));
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
@@ -236,6 +195,20 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     for (dynamic_tools, expected_error) in [
+        (
+            json!([{
+                "type": "function",
+                "name": "hidden_tool",
+                "description": "Hidden dynamic tool",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                },
+                "deferLoading": true,
+            }]),
+            "hidden_tool",
+        ),
         (
             json!([
                 {
@@ -341,6 +314,9 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
             "unexpected error: {}",
             error.error.message
         );
+        if expected_error == "hidden_tool" {
+            assert!(error.error.message.contains("namespace"));
+        }
         assert_eq!(std::fs::read_to_string(&config_path)?, original_config);
     }
 

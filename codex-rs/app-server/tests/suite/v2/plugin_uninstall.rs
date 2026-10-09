@@ -34,6 +34,7 @@ const WORKSPACE_REMOTE_PLUGIN_ID: &str = "plugins_69f27c3e67848191a45cbaa5f2adb3
 async fn plugin_uninstall_removes_plugin_cache_and_config_entry() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_installed_plugin(&codex_home, "debug", "sample-plugin")?;
+    write_installed_plugin(&codex_home, "debug", "keep-plugin")?;
     std::fs::write(
         codex_home.path().join("config.toml"),
         r#"[features]
@@ -41,6 +42,9 @@ plugins = true
 
 [plugins."sample-plugin@debug"]
 enabled = true
+
+[plugins."keep-plugin@debug"]
+enabled = false
 "#,
     )?;
 
@@ -71,7 +75,19 @@ enabled = true
             .exists()
     );
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    assert!(!config.contains(r#"[plugins."sample-plugin@debug"]"#));
+    let config: toml::Value = toml::from_str(&config)?;
+    assert!(config["plugins"].get("sample-plugin@debug").is_none());
+    assert_eq!(
+        config["plugins"]["keep-plugin@debug"]["enabled"].as_bool(),
+        Some(false)
+    );
+    let retained_manifest = codex_home
+        .path()
+        .join("plugins/cache/debug/keep-plugin/local/.codex-plugin/plugin.json");
+    assert_eq!(
+        std::fs::read_to_string(&retained_manifest)?,
+        r#"{"name":"keep-plugin"}"#
+    );
 
     let request_id = mcp.send_plugin_uninstall_request(params).await?;
     let response: JSONRPCResponse = timeout(
@@ -82,6 +98,14 @@ enabled = true
     let response: PluginUninstallResponse = to_response(response)?;
     assert_eq!(response, PluginUninstallResponse {});
 
+    let after_retry: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    assert_eq!(after_retry, config);
+    assert_eq!(
+        std::fs::read_to_string(retained_manifest)?,
+        r#"{"name":"keep-plugin"}"#
+    );
     Ok(())
 }
 

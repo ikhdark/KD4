@@ -38,15 +38,6 @@ fn test_cp866_shell_output() {
 }
 
 #[test]
-fn test_windows_1252_smart_decoding() {
-    // Smart detection should turn fancy quotes/dashes into the proper Unicode glyphs.
-    assert_eq!(
-        decode_shell_output(b"\x93\x94 test \x96 dash"),
-        "\u{201C}\u{201D} test \u{2013} dash"
-    );
-}
-
-#[test]
 fn test_smart_decoding_improves_over_lossy_utf8() {
     // Regression guard: String::from_utf8_lossy() alone used to emit replacement chars here.
     let bytes = b"\x93\x94 test \x96 dash";

@@ -183,44 +183,25 @@ async fn connection_retry_honors_policy_and_non_idempotent_replay_boundary() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn zero_retries_makes_one_request() {
-    let attempts = Arc::new(AtomicU64::new(0));
-    let attempts_for_op = attempts.clone();
+async fn retry_budget_counts_retries_after_the_initial_request() {
+    for max_retries in [0, 4] {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_for_op = attempts.clone();
 
-    let result = run_with_retry(retry_policy(0), request, move |_request, attempt| {
-        let attempts = attempts_for_op.clone();
-        async move {
-            attempts.fetch_add(1, Ordering::Relaxed);
-            assert_eq!(attempt, 0);
-            Err::<(), _>(TransportError::Network("network unavailable".to_string()))
-        }
-    })
-    .await;
+        let result = run_with_retry(retry_policy(max_retries), request, move |_request, attempt| {
+            let attempts = attempts_for_op.clone();
+            async move {
+                assert_eq!(attempts.fetch_add(1, Ordering::Relaxed), attempt);
+                Err::<(), _>(TransportError::Network("network unavailable".to_string()))
+            }
+        })
+        .await;
 
-    assert!(
-        matches!(result, Err(TransportError::Network(message)) if message == "network unavailable")
-    );
-    assert_eq!(attempts.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn four_retries_make_at_most_five_requests() {
-    let attempts = Arc::new(AtomicU64::new(0));
-    let attempts_for_op = attempts.clone();
-
-    let result = run_with_retry(retry_policy(4), request, move |_request, _attempt| {
-        let attempts = attempts_for_op.clone();
-        async move {
-            attempts.fetch_add(1, Ordering::Relaxed);
-            Err::<(), _>(TransportError::Network("still unavailable".to_string()))
-        }
-    })
-    .await;
-
-    assert!(
-        matches!(result, Err(TransportError::Network(message)) if message == "still unavailable")
-    );
-    assert_eq!(attempts.load(Ordering::Relaxed), 5);
+        assert!(
+            matches!(result, Err(TransportError::Network(message)) if message == "network unavailable")
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), max_retries + 1);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -285,7 +266,7 @@ async fn final_underlying_error_is_preserved() {
     let attempts = Arc::new(AtomicU64::new(0));
     let attempts_for_op = attempts.clone();
 
-    let result = run_with_retry(retry_policy(2), request, move |_request, _attempt| {
+    let result = run_with_retry(retry_policy(2), request, move |_request, attempt| {
         let attempts = attempts_for_op.clone();
         async move {
             attempts.fetch_add(1, Ordering::Relaxed);
@@ -296,7 +277,7 @@ async fn final_underlying_error_is_preserved() {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 url: Some("https://example.test".to_string()),
                 headers: Some(headers),
-                body: Some("provider failure".to_string()),
+                body: Some(format!("provider failure on attempt {attempt}")),
             })
         }
     })
@@ -320,7 +301,7 @@ async fn final_underlying_error_is_preserved() {
             .and_then(|headers| headers.get("x-request-id")),
         Some(&HeaderValue::from_static("request-123"))
     );
-    assert_eq!(body.as_deref(), Some("provider failure"));
+    assert_eq!(body.as_deref(), Some("provider failure on attempt 2"));
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
 }
 

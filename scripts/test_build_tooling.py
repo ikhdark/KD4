@@ -442,7 +442,8 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             "run",
             side_effect=just_shell.subprocess.TimeoutExpired(["tool"], 2),
         ) as run:
-            self.assertFalse(just_shell.tool_runs(["tool"], timeout=2))
+            # An inconclusive probe must not become a cached negative result.
+            self.assertIsNone(just_shell.tool_runs(["tool"], timeout=2))
 
         self.assertEqual(run.call_args.kwargs["timeout"], 2)
 
@@ -451,12 +452,22 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_dir = Path(temp_dir)
-            with mock.patch.object(just_shell, "tool_runs", return_value=True) as run:
+            with (
+                mock.patch.object(just_shell, "tool_runs", return_value=True) as run,
+                mock.patch.object(
+                    just_shell.os, "replace", wraps=just_shell.os.replace
+                ) as replace,
+            ):
                 self.assertTrue(
                     just_shell.cached_tool_runs(
                         ["tool", "--version"], cache_dir=cache_dir
                     )
                 )
+            replace.assert_called_once()
+            self.assertTrue(
+                just_shell.read_cached_tool_run(["tool", "--version"], cache_dir)
+            )
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
             with mock.patch.object(
                 just_shell,
                 "tool_runs",
@@ -467,8 +478,40 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                         ["tool", "--version"], cache_dir=cache_dir
                     )
                 )
+            self.assertEqual(
+                just_shell.tool_run_cache_path(
+                    ["tool", "--version"], cache_dir
+                ).read_bytes(),
+                b"ok",
+            )
+            # A second process must consume the persisted bytes, not a module
+            # dictionary populated by the writer in this process.
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import importlib.util, sys\n"
+                    "from pathlib import Path\n"
+                    "sys.path.insert(0, sys.argv[3])\n"
+                    "spec = importlib.util.spec_from_file_location('probe', sys.argv[1])\n"
+                    "module = importlib.util.module_from_spec(spec)\n"
+                    "spec.loader.exec_module(module)\n"
+                    "def unexpected_probe(command):\n"
+                    "    raise AssertionError('fresh process did not read persisted probe')\n"
+                    "module.tool_runs = unexpected_probe\n"
+                    "assert module.cached_tool_runs(['tool', '--version'], cache_dir=Path(sys.argv[2]))\n",
+                    str(just_shell.__file__),
+                    str(cache_dir),
+                    str(REPO_ROOT / "scripts"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
 
-        run.assert_called_once()
+        run.assert_called_once_with(["tool", "--version"])
 
     def test_local_just_shell_does_not_keep_one_shot_process_probe_cache(
         self,
@@ -480,6 +523,30 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             self.assertTrue(just_shell.cached_tool_runs(["tool", "--version"]))
 
         self.assertEqual(run.call_count, 2)
+
+    def test_local_just_shell_corrupt_probe_cache_is_replaced_from_real_probe(self):
+        # A disposable cache is not a prerequisite: malformed persisted bytes
+        # must trigger a real probe, not prevent otherwise usable recipes.
+        shell = load_just_shell_module()
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            for content in (b"unknown", b"\xff"):
+                for exit_code in (0, 7):
+                    with self.subTest(content=content, exit_code=exit_code):
+                        command = [sys.executable, "-c", f"raise SystemExit({exit_code})"]
+                        cache = shell.tool_run_cache_path(command, cache_dir)
+                        cache.write_bytes(content)
+                        self.assertIsNone(shell.read_cached_tool_run(command, cache_dir))
+                        self.assertEqual(
+                            shell.cached_tool_runs(command, cache_dir=cache_dir),
+                            exit_code == 0,
+                        )
+                        self.assertEqual(cache.read_bytes(), b"ok" if exit_code == 0 else b"fail")
+                        with mock.patch.object(shell, "tool_runs", side_effect=AssertionError("must use repaired cache")):
+                            self.assertEqual(
+                                shell.cached_tool_runs(command, cache_dir=cache_dir),
+                                exit_code == 0,
+                            )
 
     def test_local_just_shell_inconclusive_tool_probe_proceeds_without_cache(
         self,
@@ -503,21 +570,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(run.call_count, 2)
 
-    def test_local_just_shell_writes_probe_cache_by_atomic_replace(self) -> None:
-        just_shell = load_just_shell_module()
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_dir = Path(temp_dir)
-            command = ["tool", "--version"]
-            original_replace = just_shell.os.replace
-            with mock.patch.object(
-                just_shell.os, "replace", wraps=original_replace
-            ) as replace:
-                just_shell.write_cached_tool_run(command, cache_dir, True)
-
-            self.assertTrue(just_shell.read_cached_tool_run(command, cache_dir))
-            replace.assert_called_once()
-            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
 
     def test_local_just_shell_tool_probe_cache_tracks_tool_identity(self) -> None:
         just_shell = load_just_shell_module()
@@ -526,12 +579,20 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             root = Path(temp_dir)
             tool = root / "tool.exe"
             tool.write_text("one", encoding="utf-8")
+            timestamp = 1_700_000_000_000_000_000
+            os.utime(tool, ns=(timestamp, timestamp))
             first = just_shell.tool_run_cache_path([str(tool), "--version"], root)
             tool.write_text("two larger", encoding="utf-8")
-            os.utime(tool, None)
+            os.utime(tool, ns=(timestamp, timestamp))
             second = just_shell.tool_run_cache_path([str(tool), "--version"], root)
+            # Separate size and timestamp changes: either alone invalidates a
+            # probe, including replacing an executable with a same-sized build.
+            tool.write_text("new larger", encoding="utf-8")
+            os.utime(tool, ns=(timestamp, timestamp + 1_000_000_000))
+            third = just_shell.tool_run_cache_path([str(tool), "--version"], root)
 
         self.assertNotEqual(first, second)
+        self.assertNotEqual(second, third)
 
     def test_local_just_shell_accepts_timestamp_rounding(self) -> None:
         just_shell = load_just_shell_module()
@@ -757,7 +818,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         nextest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
 
         self.assertIn(
-            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\\scripts\\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast @forwarded_args',
+            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\\scripts\\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-fail-fast @forwarded_args',
             justfile,
         )
         profiles = nextest["profile"]
@@ -825,7 +886,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )[0]
         self.assertIn('$env:NEXTEST_PROFILE = "fast"', no_sccache_recipe)
         self.assertIn(
-            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\\scripts\\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast --timings @forwarded_args',
+            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\\scripts\\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-fail-fast --timings @forwarded_args',
             justfile,
         )
         self.assertNotIn("changed-validation", justfile)

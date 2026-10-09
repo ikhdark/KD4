@@ -369,6 +369,8 @@ mod tests {
             limit: Option<i64>,
             cursor: Option<&str>,
         ) -> Result<codex_cloud_tasks_client::TaskListPage, CloudTaskError> {
+            assert_eq!(limit, Some(20));
+            assert_eq!(cursor, None);
             let key = env.map(str::to_string);
             let titles = self
                 .by_env
@@ -385,7 +387,7 @@ mod tests {
                     environment_id: env.map(str::to_string),
                     environment_label: None,
                     summary: codex_cloud_tasks_client::DiffSummary::default(),
-                    is_review: false,
+                    is_review: t == "review-only",
                     attempt_total: Some(1),
                 });
             }
@@ -513,15 +515,17 @@ mod tests {
     async fn load_tasks_uses_env_parameter() {
         // Arrange: env-specific task titles
         let mut by_env = std::collections::HashMap::new();
-        by_env.insert(None, vec!["root-1", "root-2"]);
+        by_env.insert(None, vec!["root-1", "review-only", "root-2"]);
         by_env.insert(Some("env-A".to_string()), vec!["A-1"]);
         by_env.insert(Some("env-B".to_string()), vec!["B-1", "B-2", "B-3"]);
         let backend = FakeBackend { by_env };
 
         // Act + Assert
         let root = load_tasks(&backend, /*env*/ None).await.unwrap();
-        assert_eq!(root.len(), 2);
-        assert_eq!(root[0].title, "root-1");
+        assert_eq!(
+            root.iter().map(|task| task.title.as_str()).collect::<Vec<_>>(),
+            vec!["root-1", "root-2"]
+        );
 
         let a = load_tasks(&backend, Some("env-A")).await.unwrap();
         assert_eq!(a.len(), 1);

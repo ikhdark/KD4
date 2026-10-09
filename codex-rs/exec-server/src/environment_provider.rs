@@ -99,103 +99,41 @@ pub(crate) fn normalize_exec_server_url(exec_server_url: Option<String>) -> (Opt
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use pretty_assertions::assert_eq;
 
     use super::*;
 
     #[tokio::test]
-    async fn default_provider_requests_local_environment_when_url_is_missing() {
-        let provider = DefaultEnvironmentProvider::new(/*exec_server_url*/ None);
-        let snapshot = provider.snapshot().await.expect("environments");
-        let EnvironmentProviderSnapshot {
-            environments,
-            default,
-            include_local,
-        } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
-
-        assert!(include_local);
-        assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
-        assert!(!environments.contains_key(REMOTE_ENVIRONMENT_ID));
-        assert_eq!(
-            default,
-            EnvironmentDefault::EnvironmentId(LOCAL_ENVIRONMENT_ID.to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn default_provider_requests_local_environment_when_url_is_empty() {
-        let provider = DefaultEnvironmentProvider::new(Some(String::new()));
-        let snapshot = provider.snapshot().await.expect("environments");
-        let EnvironmentProviderSnapshot {
-            environments,
-            default,
-            include_local,
-        } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
-
-        assert!(include_local);
-        assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
-        assert!(!environments.contains_key(REMOTE_ENVIRONMENT_ID));
-        assert_eq!(
-            default,
-            EnvironmentDefault::EnvironmentId(LOCAL_ENVIRONMENT_ID.to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn default_provider_omits_local_environment_for_none_value() {
-        let provider = DefaultEnvironmentProvider::new(Some("none".to_string()));
-        let snapshot = provider.snapshot().await.expect("environments");
-        let EnvironmentProviderSnapshot {
-            environments,
-            default,
-            include_local,
-        } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
-
-        assert!(!include_local);
-        assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
-        assert!(!environments.contains_key(REMOTE_ENVIRONMENT_ID));
-        assert_eq!(default, EnvironmentDefault::Disabled);
-    }
-
-    #[tokio::test]
-    async fn default_provider_adds_remote_environment_for_websocket_url() {
-        let provider = DefaultEnvironmentProvider::new(Some("ws://127.0.0.1:8765".to_string()));
-        let snapshot = provider.snapshot().await.expect("environments");
-        let EnvironmentProviderSnapshot {
-            environments,
-            default,
-            include_local,
-        } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
-
-        assert!(!include_local);
-        assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
-        let remote_environment = &environments[REMOTE_ENVIRONMENT_ID];
-        assert!(remote_environment.is_remote());
-        assert_eq!(
-            remote_environment.exec_server_url(),
-            Some("ws://127.0.0.1:8765")
-        );
-        assert_eq!(
-            default,
-            EnvironmentDefault::EnvironmentId(REMOTE_ENVIRONMENT_ID.to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn default_provider_normalizes_exec_server_url() {
-        let provider = DefaultEnvironmentProvider::new(Some(" ws://127.0.0.1:8765 ".to_string()));
-        let snapshot = provider.snapshot().await.expect("environments");
-        let environments: HashMap<_, _> = snapshot.environments.into_iter().collect();
-
-        assert_eq!(
-            environments[REMOTE_ENVIRONMENT_ID].exec_server_url(),
-            Some("ws://127.0.0.1:8765")
-        );
+    async fn default_provider_normalizes_urls_and_selects_complete_snapshot() {
+        for (url, expected_remote, disabled) in [
+            (None, None, false),
+            (Some(""), None, false),
+            (Some(" \t "), None, false),
+            (Some("none"), None, true),
+            (Some(" NoNe "), None, true),
+            (Some("ws://127.0.0.1:8765"), Some("ws://127.0.0.1:8765"), false),
+            (Some(" ws://127.0.0.1:8765 "), Some("ws://127.0.0.1:8765"), false),
+        ] {
+            let snapshot = DefaultEnvironmentProvider::new(url.map(str::to_string))
+                .snapshot().await.expect("environments");
+            assert_eq!(snapshot.include_local, !disabled && expected_remote.is_none());
+            assert_eq!(
+                snapshot.default,
+                if disabled {
+                    EnvironmentDefault::Disabled
+                } else {
+                    EnvironmentDefault::EnvironmentId(
+                        if expected_remote.is_some() { REMOTE_ENVIRONMENT_ID } else { LOCAL_ENVIRONMENT_ID }.to_string()
+                    )
+                }
+            );
+            assert_eq!(snapshot.environments.len(), usize::from(expected_remote.is_some()));
+            if let Some(expected_remote) = expected_remote {
+                let (id, environment) = &snapshot.environments[0];
+                assert_eq!(id, REMOTE_ENVIRONMENT_ID);
+                assert!(environment.is_remote());
+                assert_eq!(environment.exec_server_url(), Some(expected_remote));
+            }
+        }
     }
 }

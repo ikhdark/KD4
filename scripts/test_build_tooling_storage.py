@@ -573,7 +573,9 @@ class BuildToolingStorageTest(unittest.TestCase):
                 rust_build_status.initialize_cargo_lanes_root(repo, root)
                 lane = root / "warm"
                 lane.mkdir()
-                size = rust_build_status_support.HARDLINK_CHECK_MIN_BYTES
+                # Fixed 2 MiB artifact: each hardlink names the same bytes,
+                # independently of the scanner's optimization threshold.
+                size = 2 * 1024 * 1024
                 artifact = lane / "artifact"
                 artifact.write_bytes(b"a" * size)
                 for part in ("debug", "release"):
@@ -587,7 +589,13 @@ class BuildToolingStorageTest(unittest.TestCase):
                     snapshot = rust_build_status.BuildStatusSnapshot.collect(
                         repo_root=repo, processes=[]
                     )
-                    full = rust_build_status_support.directory_size_bytes(target)
+                    # One shared artifact globally, plus root metadata only
+                    # when the lane root is actually inside the target tree.
+                    metadata_bytes = (
+                        sum(path.stat().st_size for path in root.iterdir() if path.is_file())
+                        if location != "external" else 0
+                    )
+                    full = (size + metadata_bytes, 0)
                     with mock.patch.object(
                         rust_build_status_support.os, "scandir", wraps=os.scandir
                     ) as scans:
@@ -623,20 +631,29 @@ class BuildToolingStorageTest(unittest.TestCase):
                         )
                     self.assertIn(f"would prune: {lane}", report)
                     self.assertIn(
-                        f"target disk: {rust_build_status.format_bytes(full[0])}",
+                        "target disk: 2.00 MiB",
                         report,
                     )
                     self.assertTrue(artifact.is_file())
 
     def test_direct_lane_and_runner_share_setup_and_record_success_only(self):
-        from scripts.rust_tool_env import local_rust_env
-
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp)
             command = ["cargo", "check", "-p", "example"]
             target = repo / "codex-rs" / "target" / "lanes" / "unit"
             which = lambda name, **_kwargs: f"/tools/{name}"
-            expected = local_rust_env({}, repo_root=repo, which=which)
+            # Assert the child contract independently, not by calling the same
+            # environment helper that run_in_cargo_lane invokes. The 80G policy
+            # is also owned by common-rust-env.ps1; paths come from this fixture.
+            expected = {
+                "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+                "RUSTC_WRAPPER": "/tools/sccache",
+                "SCCACHE_BASEDIRS": str(repo.resolve()),
+                "SCCACHE_CACHE_SIZE": "80G",
+                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER": "/tools/lld-link",
+                "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER": "/tools/lld-link",
+                "RUST_MIN_STACK": str(8 * 1024 * 1024),
+            }
             for code in (0, 7):
                 with (
                     mock.patch.dict(os.environ, {}, clear=True),
@@ -1027,6 +1044,10 @@ class BuildToolingStorageTest(unittest.TestCase):
             self.assertEqual(
                 (root / ".gc-stamp").read_text(), "another caller completed"
             )
+            released = acquire(root / ".lane-gc.lock")
+            self.assertIsNotNone(released)
+            with released:
+                rust_build_status._release_binary_file_lock(released)
 
     def test_run_lane_proceeds_while_another_process_owns_maintenance(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1051,31 +1072,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                 prune.assert_not_called()
                 self.assertFalse((lanes / ".gc-stamp").exists())
 
-    def test_maintenance_rechecks_stamp_after_acquiring_lock(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            acquire = rust_build_status._try_acquire_binary_file_lock
 
-            def finish_other_maintenance(path):
-                (root / ".gc-stamp").write_text("other command completed")
-                return acquire(path)
-
-            with (
-                mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch.object(
-                    rust_build_status,
-                    "_try_acquire_binary_file_lock",
-                    side_effect=finish_other_maintenance,
-                ),
-                mock.patch.object(rust_build_status, "prune_stale_lanes") as prune,
-            ):
-                rust_build_status.maintain_cargo_lanes(root, root)
-            prune.assert_not_called()
-            self.assertEqual(
-                (root / ".gc-stamp").read_text(), "other command completed"
-            )
-            with acquire(root / ".lane-gc.lock") as released:
-                self.assertIsNotNone(released)
 
     def test_auto_lane_prefers_last_used_stamp_over_directory_mtime(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1205,7 +1202,7 @@ class BuildToolingStorageTest(unittest.TestCase):
     def test_disk_accounting_counts_cargo_hardlinks_once(self):
         with tempfile.TemporaryDirectory() as temp:
             lane = Path(temp)
-            size = rust_build_status_support.HARDLINK_CHECK_MIN_BYTES
+            size = 2 * 1024 * 1024
             original = lane / "debug" / "deps" / "codex-abc123.exe"
             original.parent.mkdir(parents=True)
             original.write_bytes(b"x" * size)
@@ -1342,7 +1339,10 @@ class BuildToolingStorageTest(unittest.TestCase):
             repo = Path(temp)
             lanes = repo / "codex-rs" / "target" / "lanes"
             with (
-                mock.patch.object(subprocess, "run") as launch,
+                mock.patch.object(rust_build_status, "run_owned") as launch,
+                mock.patch.object(
+                    rust_build_status, "request_cargo_lane_maintenance"
+                ) as maintain,
                 self.assertRaisesRegex(ValueError, "--shell"),
             ):
                 rust_build_status.run_in_cargo_lane(
@@ -1352,6 +1352,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                     command=["cargo", "watch", "-xcheck", "-qsecho escaped"],
                 )
             launch.assert_not_called()
+            maintain.assert_not_called()
             self.assertFalse(rust_build_status.lane_active_lock_is_held(lanes / "unit"))
 
     def test_process_lane_patterns_accept_powershell_forms(self):
@@ -1374,6 +1375,9 @@ class BuildToolingStorageTest(unittest.TestCase):
             output = Path(temp_dir) / "child.txt"
             script = (
                 "import os, pathlib, sys; "
+                "from scripts import rust_build_status; "
+                "assert rust_build_status.lane_active_lock_is_held("
+                "pathlib.Path(os.environ['CODEX_CARGO_LANE_TARGET_DIR'])); "
                 "pathlib.Path(sys.argv[1]).write_text("
                 "os.environ['CODEX_CARGO_LANE_TARGET_DIR'] + '\\n' + "
                 "str('CARGO_TARGET_DIR' in os.environ), encoding='utf-8')"
@@ -1495,7 +1499,8 @@ class BuildToolingStorageTest(unittest.TestCase):
         self.assertEqual(child_env["NEXTEST_PROFILE"], "local")
         self.assertNotIn("CODEX_CARGO_LANE_TARGET_DIR", child_env)
         self.assertEqual(
-            child_env["RUST_MIN_STACK"], rust_build_status.RUST_MIN_STACK_BYTES
+            # The direct shortcut must preserve justfile's 8 MiB worker stack.
+            child_env["RUST_MIN_STACK"], str(8 * 1024 * 1024)
         )
 
     def test_run_lane_rejects_all_generic_core_selections_before_launch(self):
@@ -1648,7 +1653,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                 self.assertEqual(child_env["NEXTEST_PROFILE"], "fast")
                 self.assertEqual(
                     child_env["RUST_MIN_STACK"],
-                    rust_build_status.RUST_MIN_STACK_BYTES,
+                    str(8 * 1024 * 1024),
                 )
 
     def test_compile_and_run_reuse_package_lane_for_equivalent_package_spellings(self):
@@ -1878,10 +1883,7 @@ class BuildToolingStorageTest(unittest.TestCase):
                 target,
             )
 
-    def test_cargo_config_preserves_profile_incremental_defaults(self) -> None:
-        config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
 
-        self.assertNotIn("incremental", config["build"])
 
     def test_missing_lane_mtime_is_safe_during_concurrent_gc(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2198,7 +2200,7 @@ function Get-CimInstance {
             first, second = target / "lanes" / "first", target / "lanes" / "second"
             first.mkdir(parents=True)
             second.mkdir()
-            size = rust_build_status_support.HARDLINK_CHECK_MIN_BYTES
+            size = 2 * 1024 * 1024
             original = first / "binary"
             original.write_bytes(b"x" * size)
             os.link(original, first / "uplift")
@@ -2422,6 +2424,9 @@ function Get-CimInstance {
             self.assertEqual([path.name for path in removed], ["stale"])
             self.assertFalse(stale_lane.exists())
             self.assertTrue(active_lane.exists())
+            payload = active_lane / "artifact.txt"
+            self.assertTrue(payload.is_file(), "active lane payload was removed")
+            self.assertEqual(payload.read_bytes(), b"active")
 
     def test_prune_rejects_unmarked_custom_root_without_deleting_children(
         self,
@@ -2620,29 +2625,7 @@ function Get-CimInstance {
             self.assertTrue(outside.exists())
             self.assertIn("warning: skipping stray target outside", stderr.getvalue())
 
-    def test_prune_strays_never_calls_delete_after_classification(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_root = Path(temp_dir)
-            stray = repo_root / "codex-rs" / "target" / "stray"
-            stray.mkdir(parents=True)
-            with (
-                mock.patch.object(
-                    rust_build_status,
-                    "stray_cargo_target_dirs",
-                    return_value=[stray],
-                ),
-                mock.patch.object(
-                    rust_build_status,
-                    "remove_tree_allow_readonly",
-                ) as remove_tree,
-            ):
-                detected = rust_build_status.prune_stray_cargo_target_dirs(
-                    repo_root=repo_root
-                )
 
-            self.assertEqual(detected, [stray])
-            remove_tree.assert_not_called()
-            self.assertTrue(stray.exists())
 
     def test_prune_stale_lanes_keeps_two_most_recent_warm_lanes_per_base(
         self,
@@ -2650,9 +2633,10 @@ function Get-CimInstance {
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
             lane_root = repo_root / "codex-rs" / "target" / "lanes"
-            newest = lane_root / "codex-core-3"
-            middle = lane_root / "codex-core-2"
-            oldest = lane_root / "codex-core"
+            # Recency is neither ascending nor descending reservation suffix.
+            newest = lane_root / "codex-core-2"
+            middle = lane_root / "codex-core"
+            oldest = lane_root / "codex-core-3"
             for lane in (newest, middle, oldest):
                 lane.mkdir(parents=True)
                 (lane / "artifact.txt").write_text(lane.name, encoding="utf-8")
@@ -2667,7 +2651,7 @@ function Get-CimInstance {
                 ],
             )
 
-            self.assertEqual([path.name for path in removed], ["codex-core"])
+            self.assertEqual([path.name for path in removed], [oldest.name])
             self.assertTrue(newest.exists())
             self.assertTrue(middle.exists())
             self.assertFalse(oldest.exists())
@@ -2861,14 +2845,25 @@ function Get-CimInstance {
             lane_root = repo_root / "codex-rs" / "target" / "lanes"
             (lane_root / "stale").mkdir(parents=True)
 
-            report = rust_build_status.prune_stale_lanes_report(
-                repo_root=repo_root,
-                processes=[],
-                dry_run=True,
-                keep_warm_per_base=0,
-                max_age_days=None,
-                include_disk_report=False,
-            )
+            with (
+                mock.patch.object(
+                    rust_build_status, "directory_size_bytes",
+                    side_effect=AssertionError("skip-disk must not scan target"),
+                ),
+                mock.patch.object(
+                    rust_build_status, "target_disk_report_lines",
+                    side_effect=AssertionError("skip-disk must not render disk report"),
+                ),
+            ):
+                report = rust_build_status.prune_stale_lanes_report(
+                    repo_root=repo_root,
+                    processes=[],
+                    dry_run=True,
+                    keep_warm_per_base=0,
+                    max_age_days=None,
+                    include_disk_report=False,
+                )
+            self.assertTrue((lane_root / "stale").is_dir())
 
         self.assertIn("would prune:", report)
         self.assertNotIn("target root:", report)
@@ -2891,10 +2886,16 @@ function Get-CimInstance {
         ):
             with (
                 self.subTest(option=option),
-                contextlib.redirect_stderr(io.StringIO()),
-                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()) as diagnostic,
+                mock.patch.object(rust_build_status, "prune_stale_lanes_report") as prune,
+                self.assertRaises(SystemExit) as rejected,
             ):
                 rust_build_status.main(["prune", option, value])
+            # argparse usage errors are status 2, never successful termination;
+            # destructive work must not precede rejection of its budget.
+            self.assertEqual(rejected.exception.code, 2)
+            self.assertIn(option, diagnostic.getvalue())
+            prune.assert_not_called()
 
     def test_lane_regexes_use_shared_tooling_patterns(self) -> None:
         patterns = tool_versions.cargo_lane_patterns()

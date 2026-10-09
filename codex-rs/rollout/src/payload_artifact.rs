@@ -8,7 +8,7 @@ use codex_protocol::protocol::{EventMsg, RolloutItem};
 
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
-const KIND: &str = "rollout_payload_artifact";
+pub(crate) const KIND: &str = "rollout_payload_artifact";
 
 #[derive(Default)]
 struct PendingSync {

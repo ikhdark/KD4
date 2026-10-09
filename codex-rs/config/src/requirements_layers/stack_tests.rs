@@ -105,6 +105,9 @@ enabled = true
 [permissions.filesystem]
 deny_read = ["./private"]
 
+[marketplaces]
+restrict_to_allowed_sources = true
+
 [marketplaces.allowed_sources.local]
 source = "local"
 path = "../plugins"
@@ -134,6 +137,9 @@ enabled = true
 [permissions.filesystem]
 deny_read = [{:?}]
 
+[marketplaces]
+restrict_to_allowed_sources = true
+
 [marketplaces.allowed_sources.local]
 source = "local"
 path = "../plugins"
@@ -160,6 +166,7 @@ fn invalid_lower_layer_cannot_be_hidden_for_either_input_representation() {
             layer("high", "High", "allowed_approval_policies = ['never']"),
         ])
         .expect_err("validate every layer before merging");
+        assert!(err.to_string().contains("Bad layer (bad)"), "{err}");
         let RequirementsCompositionError::Parse {
             layer_source,
             message,
@@ -681,131 +688,61 @@ allowed_sandbox_implementations = ["elevated"]
 }
 
 #[test]
-fn remote_sandbox_config_is_applied_per_layer() {
-    let composed = compose_requirements_for_hostname(
-        vec![
-            layer(
-                "req_low",
-                "Low",
-                r#"
-allowed_sandbox_modes = ["read-only"]
-"#,
-            ),
-            layer(
-                "req_high",
-                "High",
-                r#"
+fn remote_sandbox_selectors_override_only_matching_layers() {
+    for (hostname, expected) in [
+        (Some("BUILD-01.EXAMPLE.COM."), "workspace-write"),
+        (Some("linux-01.example.com"), "read-only"),
+        (None, "read-only"),
+    ] {
+        let composed = compose_requirements_for_hostname(
+            vec![
+                layer("low", "Low", "allowed_sandbox_modes = ['read-only']"),
+                layer(
+                    "high",
+                    "High",
+                    r#"
 [[remote_sandbox_config]]
 hostname_patterns = ["build-*.example.com"]
 allowed_sandbox_modes = ["workspace-write"]
 "#,
-            ),
-        ],
-        Some("BUILD-01.EXAMPLE.COM."),
-    )
-    .expect("compose requirements")
-    .expect("requirements present")
-    .into_toml();
-
-    assert_eq!(
-        composed,
-        expected_requirements(
-            r#"
-allowed_sandbox_modes = ["workspace-write"]
-"#
+                ),
+            ],
+            hostname,
         )
-    );
+        .expect("compose requirements")
+        .expect("requirements present")
+        .into_toml();
+        assert_eq!(
+            composed,
+            expected_requirements(format!("allowed_sandbox_modes = ['{expected}']")),
+            "{hostname:?}"
+        );
+    }
 }
 
-#[test]
-fn unmatched_remote_sandbox_config_does_not_shadow_lower_layers() {
-    let composed = compose_requirements_for_hostname(
-        vec![
-            layer(
-                "req_low",
-                "Low",
-                r#"
-allowed_sandbox_modes = ["read-only"]
-"#,
-            ),
-            layer(
-                "req_high",
-                "High",
-                r#"
-[[remote_sandbox_config]]
-hostname_patterns = ["mac-*.example.com"]
-allowed_sandbox_modes = ["workspace-write"]
-"#,
-            ),
-        ],
-        Some("linux-01.example.com"),
-    )
-    .expect("compose requirements")
-    .expect("requirements present")
-    .into_toml();
-
-    assert_eq!(
-        composed,
-        expected_requirements(
-            r#"
-allowed_sandbox_modes = ["read-only"]
-"#
-        )
-    );
-}
 
 #[test]
-fn hostname_resolver_is_not_called_without_remote_sandbox_config() {
-    let calls = Cell::<usize>::default();
-    let composed = compose_requirements_with_hostname_resolver(
-        vec![layer(
-            "req",
-            "No remote selector",
-            r#"
-allowed_sandbox_modes = ["read-only"]
-"#,
-        )],
-        || {
-            calls.set(calls.get() + 1);
-            Some("build-01.example.com".to_string())
-        },
-    )
-    .expect("compose requirements")
-    .expect("requirements present")
-    .into_toml();
-
-    assert_eq!(calls.get(), 0);
-    assert_eq!(
-        composed,
-        expected_requirements(
-            r#"
-allowed_sandbox_modes = ["read-only"]
-"#
-        )
-    );
-}
-
-#[test]
-fn hostname_resolver_is_not_called_for_empty_remote_sandbox_config() {
-    let calls = Cell::<usize>::default();
-    let composed = compose_requirements_with_hostname_resolver(
-        [
-            layer("low", "Low", "allowed_sandbox_modes = ['read-only']"),
-            layer("high", "High", "remote_sandbox_config = []"),
-        ],
-        || {
+fn hostname_resolution_is_lazy_for_absent_and_empty_selectors() {
+    for selector in [None, Some("remote_sandbox_config = []")] {
+        let calls = Cell::<usize>::default();
+        let mut layers = vec![layer("low", "Low", "allowed_sandbox_modes = ['read-only']")];
+        if let Some(selector) = selector {
+            layers.push(layer("high", "High", selector));
+        }
+        let composed = compose_requirements_with_hostname_resolver(layers, || {
             calls.set(calls.get() + 1);
             Some("build.example.com".to_string())
-        },
-    )
-    .expect("compose requirements")
-    .expect("requirements present");
-    assert_eq!(calls.get(), 0);
-    assert_eq!(
-        composed.into_toml(),
-        expected_requirements("allowed_sandbox_modes = ['read-only']")
-    );
+        })
+        .expect("compose requirements")
+        .expect("requirements present");
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            composed.into_toml(),
+            expected_requirements("allowed_sandbox_modes = ['read-only']")
+        );
+    }
 }
+
 
 #[test]
 fn hostname_resolver_is_called_once_for_multiple_remote_sandbox_layers() {
@@ -1350,18 +1287,6 @@ deny_read = ['C:\high', 'C:\shared', 'C:\low', 'C:\other']
     );
 }
 
-#[test]
-fn parse_error_names_layer() {
-    let err = compose(vec![layer(
-        "req_bad",
-        "Bad layer",
-        "allowed_approval_policies = [1]",
-    )])
-    .expect_err("invalid layer should fail");
-
-    assert!(err.to_string().contains("Bad layer (req_bad)"));
-    assert!(err.to_string().contains("allowed_approval_policies"));
-}
 
 #[test]
 fn marketplace_allowed_sources_use_default_toml_merge() {
@@ -1476,40 +1401,4 @@ reff = "main"
     assert!(err.to_string().contains("unknown field `reff`"));
 }
 
-#[test]
-fn local_marketplace_path_is_not_resolved_during_requirements_merge() {
-    let base_dir = TempDir::new().expect("create requirements base directory");
-    let base_dir = AbsolutePathBuf::try_from(base_dir.path().to_path_buf())
-        .expect("absolute requirements base directory");
-    let composed = compose(vec![
-        layer(
-            "req_local",
-            "Local marketplace path",
-            r#"
-[marketplaces]
-restrict_to_allowed_sources = true
 
-[marketplaces.allowed_sources.local]
-source = "local"
-path = "../plugins"
-"#,
-        )
-        .with_base_dir(base_dir),
-    ])
-    .expect("compose requirements")
-    .expect("requirements present");
-
-    assert_eq!(
-        composed,
-        expected_requirements(
-            r#"
-[marketplaces]
-restrict_to_allowed_sources = true
-
-[marketplaces.allowed_sources.local]
-source = "local"
-path = "../plugins"
-"#,
-        )
-    );
-}

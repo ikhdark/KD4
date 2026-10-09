@@ -95,7 +95,6 @@ fn backup_folder(backups: &[RuntimeDbBackup]) -> Option<&Path> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -118,8 +117,10 @@ mod tests {
             vec![&failed_db_path]
         );
         assert!(!tokio::fs::try_exists(failed_db_path.as_path()).await?);
-        assert!(tokio::fs::try_exists(state_path.as_path()).await?);
-        assert!(tokio::fs::try_exists(backups[0].backup_path.as_path()).await?);
+        assert_eq!(tokio::fs::read(&state_path).await?, b"state");
+        assert_eq!(tokio::fs::read(&backups[0].backup_path).await?, b"logs");
+        assert_eq!(backup_folder(&backups), backups[0].backup_path.parent());
+        assert_eq!(backup_folder(&[]), None);
         Ok(())
     }
 
@@ -138,20 +139,11 @@ mod tests {
 
         assert_eq!(backups.len(), 1);
         assert!(tokio::fs::metadata(sqlite_home.as_path()).await?.is_dir());
-        assert!(tokio::fs::try_exists(backups[0].backup_path.as_path()).await?);
+        assert_eq!(
+            tokio::fs::read(&backups[0].backup_path).await?,
+            b"not-a-directory"
+        );
         Ok(())
     }
 
-    #[test]
-    fn backup_folder_uses_parent_of_first_backup_path() {
-        let backups = vec![RuntimeDbBackup {
-            original_path: PathBuf::from("/tmp/state_5.sqlite"),
-            backup_path: PathBuf::from("/tmp/db-backups/sqlite-1-0/state_5.sqlite"),
-        }];
-
-        assert_eq!(
-            backup_folder(&backups),
-            Some(Path::new("/tmp/db-backups/sqlite-1-0"))
-        );
-    }
 }

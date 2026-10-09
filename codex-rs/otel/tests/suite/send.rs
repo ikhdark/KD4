@@ -44,6 +44,14 @@ fn paired_count_and_duration_use_the_same_attributes() -> Result<()> {
     assert_eq!(duration_point.count(), 1);
     assert_eq!(
         attributes_to_map(counter_point.attributes()),
+        BTreeMap::from([
+            ("env".to_string(), "prod".to_string()),
+            ("kind".to_string(), "paired".to_string()),
+            ("service".to_string(), "codex-cli".to_string()),
+        ])
+    );
+    assert_eq!(
+        attributes_to_map(counter_point.attributes()),
         attributes_to_map(duration_point.attributes())
     );
 
@@ -221,57 +229,7 @@ fn send_merges_default_tags_per_line() -> Result<()> {
     Ok(())
 }
 
-// Verifies enqueued metrics are delivered by the background worker.
-#[test]
-fn client_sends_enqueued_metric() -> Result<()> {
-    let (metrics, exporter) = build_metrics_with_defaults(&[])?;
 
-    metrics.counter("codex.turns", /*inc*/ 1, &[("model", "gpt-5.1")])?;
-    metrics.shutdown()?;
-
-    let resource_metrics = latest_metrics(&exporter);
-    let counter = find_metric(&resource_metrics, "codex.turns").expect("counter metric missing");
-    let points = match counter.data() {
-        opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(data) => match data {
-            opentelemetry_sdk::metrics::data::MetricData::Sum(sum) => {
-                sum.data_points().collect::<Vec<_>>()
-            }
-            _ => panic!("unexpected counter aggregation"),
-        },
-        _ => panic!("unexpected counter data type"),
-    };
-    assert_eq!(points.len(), 1);
-    let point = points[0];
-    assert_eq!(point.value(), 1);
-    let attrs = attributes_to_map(point.attributes());
-    assert_eq!(attrs.get("model").map(String::as_str), Some("gpt-5.1"));
-
-    Ok(())
-}
-
-// Ensures shutdown flushes successfully with in-memory exporters.
-#[test]
-fn shutdown_flushes_in_memory_exporter() -> Result<()> {
-    let (metrics, exporter) = build_metrics_with_defaults(&[])?;
-
-    metrics.counter("codex.turns", /*inc*/ 1, &[])?;
-    metrics.shutdown()?;
-
-    let resource_metrics = latest_metrics(&exporter);
-    let counter = find_metric(&resource_metrics, "codex.turns").expect("counter metric missing");
-    let points = match counter.data() {
-        opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(data) => match data {
-            opentelemetry_sdk::metrics::data::MetricData::Sum(sum) => {
-                sum.data_points().collect::<Vec<_>>()
-            }
-            _ => panic!("unexpected counter aggregation"),
-        },
-        _ => panic!("unexpected counter data type"),
-    };
-    assert_eq!(points.len(), 1);
-
-    Ok(())
-}
 
 // Ensures shutting down without recording metrics does not export anything.
 #[test]

@@ -400,12 +400,16 @@ mod tests {
 
     #[test]
     fn stdout_writer_batches_queued_messages_without_changing_wire_bytes() {
+        for (count, text, expected_batches) in [
+            (128, "streamed \"text\"\nλ".to_string(), 4),
+            (3, "x".repeat(64 * 1024), 3),
+        ] {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut expected = Vec::new();
-        for id in 0..128 {
-            let message = writer_test_message(id, "streamed \"text\"\nλ");
+        for id in 0..count {
+            let message = writer_test_message(id, &text);
             let wire: OutgoingJsonRpcMessage =
-                writer_test_message(id, "streamed \"text\"\nλ").into();
+                writer_test_message(id, &text).into();
             serde_json::to_writer(&mut expected, &wire).unwrap();
             expected.push(b'\n');
             tx.try_send(message).ok().unwrap();
@@ -414,7 +418,8 @@ mod tests {
         let mut writer = RecordingWriter::default();
         write_outgoing_messages(rx, &mut writer).unwrap();
         assert_eq!(writer.bytes, expected);
-        assert_eq!((writer.writes, writer.flushes), (4, 4));
+        assert_eq!((writer.writes, writer.flushes), (expected_batches, expected_batches));
+        }
     }
 
     #[test]
@@ -439,21 +444,6 @@ mod tests {
         drop(tx);
         writer.join().unwrap().unwrap();
         flushed.expect("single message must be flushed promptly");
-    }
-
-    #[test]
-    fn stdout_writer_bounds_batches_by_bytes() {
-        let (tx, rx) = mpsc::channel(3);
-        for id in 0..3 {
-            tx.try_send(writer_test_message(id, &"x".repeat(64 * 1024)))
-                .ok()
-                .unwrap();
-        }
-        drop(tx);
-        let mut writer = RecordingWriter::default();
-        write_outgoing_messages(rx, &mut writer).unwrap();
-        assert_eq!((writer.writes, writer.flushes), (3, 3));
-        assert_eq!(writer.bytes.iter().filter(|&&b| b == b'\n').count(), 3);
     }
 
     #[test]

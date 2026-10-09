@@ -51,35 +51,28 @@ fn lock_path_is_stable_for_all_writers() {
 fn atomically_replaces_existing_contents() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("state.json");
-    std::fs::write(&target, "old").unwrap();
-
-    let _lock = codex_file_system::acquire_atomic_write_lock(&target).unwrap();
-    codex_file_system::write_atomically(&target, "new").unwrap();
-
-    assert_eq!(std::fs::read_to_string(target).unwrap(), "new");
-}
-
-#[test]
-fn atomically_replaces_existing_contents_with_bytes() {
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("state.bin");
-    std::fs::write(&target, b"old").unwrap();
-
-    codex_file_system::write_bytes_atomically(&target, &[0, 1, 2, 255]).unwrap();
-
-    assert_eq!(std::fs::read(target).unwrap(), [0, 1, 2, 255]);
-}
-
-#[test]
-fn replacement_detaches_only_the_addressed_hardlink() {
-    let directory = tempfile::tempdir().unwrap();
-    let destination = directory.path().join("target");
-    let alias = directory.path().join("alias");
-    std::fs::write(&destination, b"old").unwrap();
-    std::fs::hard_link(&destination, &alias).unwrap();
-    codex_file_system::write_bytes_atomically_without_sync(&destination, b"new").unwrap();
-    assert_eq!(std::fs::read(&destination).unwrap(), b"new");
-    assert_eq!(std::fs::read(&alias).unwrap(), b"old");
+    let alias = temp.path().join("original");
+    for (contents, sync) in [
+        (b"new".as_slice(), true),
+        (&[0, 1, 2, 255], true),
+        (b"new".as_slice(), false),
+    ] {
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::hard_link(&target, &alias).unwrap();
+        let _lock = codex_file_system::acquire_atomic_write_lock(&target).unwrap();
+        if !sync {
+            codex_file_system::write_bytes_atomically_without_sync(&target, contents).unwrap();
+        } else if contents == b"new" {
+            codex_file_system::write_atomically(&target, "new").unwrap();
+        } else {
+            codex_file_system::write_bytes_atomically(&target, contents).unwrap();
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+        // A truncating write has the same final bytes but incorrectly mutates
+        // every link to the old object instead of replacing this entry.
+        assert_eq!(std::fs::read(&alias).unwrap(), b"old");
+        std::fs::remove_file(&alias).unwrap();
+    }
 }
 
 #[test]
@@ -122,38 +115,38 @@ fn unsynced_write_preserves_read_only_and_missing_parent() {
     readonly.set_readonly(true);
     std::fs::set_permissions(&target, readonly).unwrap();
     let result = codex_file_system::write_bytes_atomically_without_sync(&target, b"after");
-    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(std::fs::read(&target).unwrap(), b"before");
     assert!(std::fs::metadata(&target).unwrap().permissions().readonly());
     std::fs::set_permissions(&target, original_permissions).unwrap();
     let missing = temp.path().join("missing/child.txt");
-    assert!(codex_file_system::write_bytes_atomically_without_sync(&missing, b"after").is_err());
+    assert_eq!(
+        codex_file_system::write_bytes_atomically_without_sync(&missing, b"after")
+            .unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
     assert!(!missing.parent().unwrap().exists());
-}
-
-#[test]
-fn unsynced_write_preserves_original_without_delete_sharing() {
-    use std::os::windows::fs::OpenOptionsExt;
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("open.txt");
-    std::fs::write(&target, "before").unwrap();
-    let _reader = std::fs::OpenOptions::new().read(true).share_mode(3).open(&target).unwrap();
-    codex_file_system::write_bytes_atomically_without_sync(&target, b"after")
-        .expect_err("publication must not fall back to truncation");
-    assert_eq!(std::fs::read(&target).unwrap(), b"before");
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
 }
 
 #[test]
 fn unsynced_failed_write_does_not_truncate_or_leak_staging() {
     use std::os::windows::fs::OpenOptionsExt;
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("locked.txt");
-    std::fs::write(&target, "before").unwrap();
-    let _reader = std::fs::OpenOptions::new().read(true).share_mode(1).open(&target).unwrap();
-    let error = codex_file_system::write_bytes_atomically_without_sync(&target, b"after").unwrap_err();
-    // Replacement can report access denied or sharing violation on Windows.
-    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
-    assert_eq!(std::fs::read(&target).unwrap(), b"before");
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    // Both handles deny delete sharing. Mode 3 still allows writing, exposing
+    // an incorrect fallback to truncation that mode 1 would also block.
+    for share_mode in [1, 3] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("locked.txt");
+        std::fs::write(&target, "before").unwrap();
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(share_mode)
+            .open(&target)
+            .unwrap();
+        let error = codex_file_system::write_bytes_atomically_without_sync(&target, b"after")
+            .expect_err("publication must not fall back to truncation");
+        // Replacement can report access denied or sharing violation on Windows.
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "share mode {share_mode}: {error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
 }

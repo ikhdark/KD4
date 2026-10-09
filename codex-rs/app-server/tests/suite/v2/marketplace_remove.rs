@@ -51,6 +51,8 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()> {
     let codex_home = TempDir::new()?;
     record_user_marketplace(codex_home.path(), "debug", &configured_marketplace_update())?;
     write_installed_marketplace(codex_home.path(), "debug")?;
+    record_user_marketplace(codex_home.path(), "tools", &configured_marketplace_update())?;
+    write_installed_marketplace(codex_home.path(), "tools")?;
     let installed_root = marketplace_install_root(codex_home.path()).join("debug");
 
     let mut mcp = TestAppServer::builder()
@@ -82,26 +84,15 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()> {
     );
 
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    assert!(!config.contains("[marketplaces.debug]"));
+    let config: toml::Table = config.parse()?;
+    assert!(config["marketplaces"].get("debug").is_none());
+    assert!(config["marketplaces"].get("tools").is_some());
+    assert!(marketplace_install_root(codex_home.path()).join("tools").exists());
     assert!(
         !marketplace_install_root(codex_home.path())
             .join("debug")
             .exists()
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn marketplace_remove_rejects_unknown_marketplace() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
     let request_id = mcp
         .send_marketplace_remove_request(MarketplaceRemoveParams {
             marketplace_name: "debug".to_string(),
@@ -121,3 +112,5 @@ async fn marketplace_remove_rejects_unknown_marketplace() -> Result<()> {
     );
     Ok(())
 }
+
+

@@ -1032,10 +1032,15 @@ mod tests {
     fn turn_started_claims_the_origin_reserved_for_its_canonical_id() {
         let mut state = ThreadState::default();
         let turn_id = "turn-1".to_string();
-        state
-            .turn_origin_tracker()
+        let tracker = state.turn_origin_tracker();
+        let cancelled = tracker.reserve(turn_id.clone(), ConnectionId(6));
+        drop(cancelled);
+        assert_eq!(tracker.take(&turn_id), None);
+        let replaced = tracker.reserve(turn_id.clone(), ConnectionId(6));
+        tracker
             .reserve(turn_id.clone(), ConnectionId(7))
             .commit();
+        drop(replaced);
 
         state.track_current_turn_event(
             &turn_id,
@@ -1053,15 +1058,7 @@ mod tests {
             Some(ConnectionId(7))
         );
         assert_eq!(state.turn_summary.started_at, Some(42));
-    }
-
-    #[test]
-    fn cancelled_turn_origin_reservation_is_removed() {
-        let tracker = TurnOriginTracker::default();
-        let reservation = tracker.reserve("turn-1".to_string(), ConnectionId(7));
-        drop(reservation);
-
-        assert_eq!(tracker.take("turn-1"), None);
+        assert_eq!(tracker.take(&turn_id), None);
     }
 
     #[test]
@@ -1570,55 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn seeded_turn_index_pages_without_replaying_full_history() {
-        let mut items = Vec::new();
-        for (turn_id, message) in [("turn-1", "first"), ("turn-2", "second")] {
-            items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
-                    turn_id: turn_id.to_string(),
-                    trace_id: None,
-                    started_at: None,
-                    model_context_window: None,
-                    collaboration_mode_kind: ModeKind::Default,
-                },
-            )));
-            items.push(RolloutItem::EventMsg(EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
-                    client_id: None,
-                    message: message.to_string(),
-                    images: None,
-                    local_images: Vec::new(),
-                    text_elements: Vec::new(),
-                    ..Default::default()
-                },
-            )));
-            items.push(RolloutItem::EventMsg(terminal_event(turn_id, message)));
-        }
-
-        let mut state = ThreadState::default();
-        state.seed_turn_index_from_history(&items);
-
-        let newest = state
-            .indexed_turns_page(None, 1, SortDirection::Desc)
-            .expect("valid page")
-            .expect("initialized index");
-        assert_eq!(newest.turns[0].id, "turn-2");
-        assert!(newest.more_turns_available);
-
-        let older = state
-            .indexed_turns_page(
-                Some(("turn-2", /*include_anchor*/ false)),
-                1,
-                SortDirection::Desc,
-            )
-            .expect("valid page")
-            .expect("initialized index");
-        assert_eq!(older.turns[0].id, "turn-1");
-        assert!(!older.more_turns_available);
-    }
-
-    #[test]
-    fn seeded_item_index_pages_without_replaying_full_history() {
+    fn seeded_turn_and_item_indexes_page_without_replaying_full_history() {
         let mut items = Vec::new();
         for (turn_id, message) in [("turn-1", "first"), ("turn-2", "second")] {
             items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -1651,6 +1600,24 @@ mod tests {
 
         let mut state = ThreadState::default();
         state.seed_turn_index_from_history(&items);
+
+        let newest = state
+            .indexed_turns_page(None, 1, SortDirection::Desc)
+            .expect("valid page")
+            .expect("initialized index");
+        assert_eq!(newest.turns[0].id, "turn-2");
+        assert!(newest.more_turns_available);
+
+        let older = state
+            .indexed_turns_page(
+                Some(("turn-2", /*include_anchor*/ false)),
+                1,
+                SortDirection::Desc,
+            )
+            .expect("valid page")
+            .expect("initialized index");
+        assert_eq!(older.turns[0].id, "turn-1");
+        assert!(!older.more_turns_available);
 
         let first = state
             .indexed_items_page(None, None, 2, SortDirection::Asc)

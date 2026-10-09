@@ -408,7 +408,7 @@ fn test_apply_patch_cli_rejects_overlapping_eof_chunks() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_apply_patch_cli_reports_committed_prefix() -> anyhow::Result<()> {
+fn test_apply_patch_cli_rejects_unreadable_destination_without_committed_prefix() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     // An unreadable destination is rejected in preflight, before the prefix
     // can commit. It must not be reported as a partially applied patch.

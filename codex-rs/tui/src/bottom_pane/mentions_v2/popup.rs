@@ -249,7 +249,10 @@ mod tests {
         let area = Rect::new(0, 0, 30, 1);
         let mut buf = Buffer::empty(area);
         popup.render_ref(area, &mut buf);
-        assert_eq!(buf[(2, 0)].symbol(), "l");
+        assert_eq!(
+            (2..12).map(|x| buf[(x, 0)].symbol()).collect::<String>(),
+            "loading..."
+        );
         popup.set_file_matches("alpha", vec![file_match(1)], true);
         assert_eq!(popup.selected(), None);
 

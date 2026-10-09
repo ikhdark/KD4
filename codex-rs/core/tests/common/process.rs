@@ -50,6 +50,72 @@ fn parse_pid(pid: &str) -> anyhow::Result<u32> {
 /// Upper bound on reaping a contained root after its process tree is terminated.
 const CONTAINED_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Captures a fixture command without allowing inherited descendant pipes to
+/// outlive its deadline. Live terminal mirroring is best effort; pipe capture
+/// remains complete on success. As with ordinary terminal printing, a blocked
+/// terminal writer itself is outside the asynchronous pipe deadline.
+pub async fn capture_contained_command(
+    command: &mut tokio::process::Command,
+    timeout: Duration,
+    mirror_output: bool,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = ContainedChild::spawn(command).map_err(std::io::Error::other)?;
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_chunk = [0; 4096];
+    let mut stderr_chunk = [0; 4096];
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut status = None;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if stdout_done && stderr_done && let Some(status) = status {
+            return Ok(std::process::Output { status, stdout, stderr });
+        }
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("process/output deadline exceeded\nstdout: {}\nstderr: {}",
+                        String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr)),
+                ));
+            }
+            result = child.wait(), if status.is_none() => {
+                status = Some(result?);
+                // Root exit is not pipe EOF when a descendant inherited stdio.
+                // The fixture owns that tree, including after the root exits.
+                child.request_tree_termination();
+            }
+            result = stdout_pipe.read(&mut stdout_chunk), if !stdout_done => {
+                let count = result?;
+                stdout_done = count == 0;
+                stdout.extend_from_slice(&stdout_chunk[..count]);
+                if mirror_output && count != 0 {
+                    let _ = std::io::stdout().write_all(&stdout_chunk[..count]);
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            result = stderr_pipe.read(&mut stderr_chunk), if !stderr_done => {
+                let count = result?;
+                stderr_done = count == 0;
+                stderr.extend_from_slice(&stderr_chunk[..count]);
+                if mirror_output && count != 0 {
+                    let _ = std::io::stderr().write_all(&stderr_chunk[..count]);
+                    let _ = std::io::stderr().flush();
+                }
+            }
+        }
+    }
+}
+
 /// A fixture child process that owns its whole process tree.
 ///
 /// On Windows the child starts suspended, joins a kill-on-close Job Object, and

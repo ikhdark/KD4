@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn final_message_prefers_latest_agent_message_and_falls_back_to_plan() {
-        let items = vec![
+        let mut items = vec![
             ThreadItem::Plan {
                 id: "plan".to_string(),
                 text: "latest plan".to_string(),
@@ -175,5 +175,12 @@ mod tests {
             final_message_from_turn_items(&items[..1]),
             Some("latest plan".to_string())
         );
+        items.push(ThreadItem::Plan {
+            id: "newer-plan".to_string(),
+            text: "newer plan".to_string(),
+        });
+        assert_eq!(final_message_from_turn_items(&items), Some("latest answer".to_string()));
+        assert_eq!(final_message_from_turn_items(&[items[0].clone(), items[3].clone()]), Some("newer plan".to_string()));
+        assert_eq!(final_message_from_turn_items(&[]), None);
     }
 }

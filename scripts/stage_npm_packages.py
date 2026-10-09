@@ -963,7 +963,8 @@ def bounded_log(text: str, *, max_chars: int = MAX_CAPTURED_LOG_CHARS) -> str:
         return text
     half = max_chars // 2
     omitted = len(text) - (half * 2)
-    return text[:half] + f"\n...[truncated {omitted} chars]...\n" + text[-half:]
+    tail = text[-half:] if half else ""
+    return text[:half] + f"\n...[truncated {omitted} chars]...\n" + tail
 
 
 def tarball_name_for_package(package: str, version: str) -> str:

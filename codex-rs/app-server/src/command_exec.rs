@@ -1302,13 +1302,11 @@ mod tests {
         assert_eq!(converted.rows, 40);
         assert_eq!(converted.cols, 120);
 
-        let invalid = PtyTerminalSize { rows: 0, cols: 1 };
-        let error = terminal_size_from_protocol(invalid, "process")
-            .expect_err("zero rows should be rejected");
-        assert_eq!(
-            error.message,
-            "process size rows and cols must be greater than 0"
-        );
+        for (rows, cols) in [(0, 1), (1, 0), (0, 0)] {
+            let error = terminal_size_from_protocol(PtyTerminalSize { rows, cols }, "process")
+                .expect_err("zero dimensions should be rejected");
+            assert_eq!(error, invalid_params("process size rows and cols must be greater than 0"));
+        }
     }
 
     #[tokio::test]
@@ -1391,6 +1389,7 @@ mod tests {
         writer_tx
             .try_send(vec![b'x'])
             .expect("pre-fill driver stdin queue");
+        let writer_probe = writer_tx.clone();
         let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
         let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
         drop(stdout_tx);
@@ -1443,6 +1442,13 @@ mod tests {
             })
             .await
             .expect("queue write control");
+        timeout(Duration::from_secs(1), async {
+            // The third sender proves the stdin worker reached the full driver.
+            while writer_probe.strong_count() < 3 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("stdin worker must block before termination is requested");
+        assert!(matches!(write_response_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
         let (terminate_response_tx, terminate_response_rx) = oneshot::channel();
         control_tx
             .send(CommandControlRequest {
@@ -1452,12 +1458,6 @@ mod tests {
             .await
             .expect("queue terminate control");
 
-        assert!(
-            timeout(Duration::from_millis(100), &mut write_response_rx)
-                .await
-                .is_err(),
-            "backpressured write should remain pending",
-        );
         timeout(Duration::from_secs(1), terminate_response_rx)
             .await
             .expect("terminate response timed out")
@@ -1481,7 +1481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn windows_sandbox_process_ids_reject_write_requests() {
+    async fn windows_sandbox_process_ids_reject_write_and_terminate_requests() {
         let manager = CommandExecManager::default();
         let request_id = ConnectionRequestId {
             connection_id: ConnectionId(11),
@@ -1504,7 +1504,7 @@ mod tests {
                     outgoing_tx,
                     codex_analytics::AnalyticsEventsClient::disabled(),
                 )),
-                request_id,
+                request_id.clone(),
                 CommandExecWriteParams {
                     process_id: "proc-11".to_string(),
                     delta_base64: Some(STANDARD.encode("hello")),
@@ -1520,30 +1520,12 @@ mod tests {
             err.message,
             "command/exec/write, command/exec/terminate, and command/exec/resize are not supported for windows sandbox processes"
         );
-    }
-
-    #[tokio::test]
-    async fn windows_sandbox_process_ids_reject_terminate_requests() {
-        let manager = CommandExecManager::default();
-        let request_id = ConnectionRequestId {
-            connection_id: ConnectionId(12),
-            request_id: codex_app_server_protocol::RequestId::Integer(2),
-        };
-        let process_id = ConnectionProcessId {
-            connection_id: request_id.connection_id,
-            process_id: InternalProcessId::Client("proc-12".to_string()),
-        };
-        manager
-            .sessions
-            .lock()
-            .await
-            .insert(process_id, CommandExecSession::UnsupportedWindowsSandbox);
 
         let err = manager
             .terminate(
                 request_id,
                 CommandExecTerminateParams {
-                    process_id: "proc-12".to_string(),
+                    process_id: "proc-11".to_string(),
                 },
             )
             .await

@@ -656,7 +656,15 @@ fn annotate_schema_constraints(
     if map.contains_key("oneOf") {
         annotations.push("oneOf: exactly one branch must match".to_string());
     }
-    for keyword in ["not", "if", "then", "else", "$dynamicRef", "$recursiveRef"] {
+    // These constraints are not expressible by the current structural
+    // projection. Preserve the authoritative schema through the existing
+    // incomplete-projection recovery path rather than silently dropping them.
+    for keyword in [
+        "not", "if", "then", "else", "$dynamicRef", "$recursiveRef",
+        "uniqueItems", "contains", "minContains", "maxContains", "unevaluatedItems",
+        "minProperties", "maxProperties", "propertyNames", "unevaluatedProperties",
+        "dependentRequired", "dependentSchemas", "dependencies",
+    ] {
         if map.contains_key(keyword) {
             budget.incomplete = true;
             annotations.push(format!("unprojected keyword: {keyword}"));

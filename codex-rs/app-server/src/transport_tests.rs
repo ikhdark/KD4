@@ -133,135 +133,58 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
 async fn to_connection_notification_respects_opt_out_filters() {
     let connection_id = ConnectionId(7);
     let (writer_tx, mut writer_rx) = mpsc::channel(1);
-    let initialized = Arc::new(AtomicBool::new(true));
-    let opted_out_notification_methods =
-        Arc::new(OutboundNotificationOptOuts::new(HashSet::from([
-            "configWarning".to_string(),
-        ])));
-
-    let mut connections = HashMap::new();
-    connections.insert(
-        connection_id,
-        OutboundConnectionState::new(
-            writer_tx,
-            initialized,
-            Arc::new(AtomicBool::new(true)),
-            opted_out_notification_methods,
-            /*disconnect_sender*/ None,
-            CancellationToken::new(),
-        ),
-    );
-
-    route_outgoing_envelope(
-        &mut connections,
-        OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "task_started".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-            write_complete_tx: None,
-        },
-    )
-    .await;
-
-    assert!(
-        matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-        "opted-out notification should be dropped"
-    );
-}
-
-#[tokio::test]
-async fn to_connection_notifications_are_dropped_for_opted_out_clients() {
-    let connection_id = ConnectionId(10);
-    let (writer_tx, mut writer_rx) = mpsc::channel(1);
-
-    let mut connections = HashMap::new();
-    connections.insert(
+    let opt_outs = Arc::new(OutboundNotificationOptOuts::new(HashSet::new()));
+    let mut connections = HashMap::from([(
         connection_id,
         OutboundConnectionState::new(
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(OutboundNotificationOptOuts::new(HashSet::from([
-                "configWarning".to_string(),
-            ]))),
-            /*disconnect_sender*/ None,
+            Arc::clone(&opt_outs),
+            None,
             CancellationToken::new(),
         ),
-    );
+    )]);
 
-    route_outgoing_envelope(
-        &mut connections,
-        OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "task_started".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-            write_complete_tx: None,
-        },
-    )
-    .await;
+    for (methods, should_deliver) in [
+        (vec!["configWarning"], false),
+        (vec!["thread/started"], true),
+        (vec![], true),
+        (vec!["thread/started", "configWarning"], false),
+        (vec![], true),
+    ] {
+        assert!(opt_outs.replace(methods.iter().map(|method| (*method).to_string()).collect()));
+        route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "task_started".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
+                write_complete_tx: None,
+            },
+        )
+        .await;
 
-    assert!(
-        matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-        "opted-out notifications should not reach clients"
-    );
-}
-
-#[tokio::test]
-async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
-    let connection_id = ConnectionId(11);
-    let (writer_tx, mut writer_rx) = mpsc::channel(1);
-
-    let mut connections = HashMap::new();
-    connections.insert(
-        connection_id,
-        OutboundConnectionState::new(
-            writer_tx,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
-            /*disconnect_sender*/ None,
-            CancellationToken::new(),
-        ),
-    );
-
-    route_outgoing_envelope(
-        &mut connections,
-        OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "task_started".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-            write_complete_tx: None,
-        },
-    )
-    .await;
-
-    let message = writer_rx
-        .try_recv()
-        .expect("notification should reach non-opted-out clients");
-    assert!(matches!(
-        message.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "task_started"
-    ));
+        if should_deliver {
+            let queued = writer_rx.try_recv().expect("non-opted-out notification must arrive");
+            assert!(matches!(
+                queued.message,
+                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification { summary, .. }
+                )) if summary == "task_started"
+            ));
+        }
+        assert!(
+            matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "unexpected notification with opt-outs {methods:?}"
+        );
+    }
 }
 
 #[tokio::test]

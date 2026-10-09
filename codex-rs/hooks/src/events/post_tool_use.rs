@@ -548,7 +548,13 @@ mod tests {
     #[test]
     fn preview_and_completed_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-456");
-        let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
+        let mut unmatched = handler();
+        unmatched.matcher = Some(common::HookMatcher::new("^Write$").expect("valid matcher"));
+        let mut handlers = [handler(), unmatched];
+        let plan = plan(&handlers, &request.tool_name, &request.matcher_aliases);
+        handlers[0].command = "changed after planning".to_string();
+        assert_eq!(plan.matched.len(), 1);
+        assert_eq!(plan.matched[0].command, "python3 post_tool_use_hook.py");
         let runs = preview(&plan, &request.tool_use_id, &ScopedRunGate::unscoped());
 
         assert_eq!(runs.len(), 1);
@@ -568,6 +574,19 @@ mod tests {
         let completed = common::hook_completed_for_tool_use(parsed.completed, &request.tool_use_id);
 
         assert_eq!(completed.run.id, runs[0].id);
+        let before_reuse = chrono::Utc::now().timestamp();
+        let reused = preview(&plan, "another-call", &ScopedRunGate::unscoped());
+        let after_reuse = chrono::Utc::now().timestamp();
+        assert_eq!(reused.len(), 1);
+        assert!((before_reuse..=after_reuse).contains(&reused[0].started_at));
+        let mut expected = runs[0].clone();
+        // Reusing a plan creates a new run, not a frozen copy of its timestamp.
+        expected.started_at = reused[0].started_at;
+        expected.id = format!(
+            "post-tool-use:0:{}:another-call",
+            test_path_buf("/tmp/hooks.json").display()
+        );
+        assert_eq!(reused, vec![expected]);
     }
 
     #[test]
@@ -587,16 +606,7 @@ mod tests {
         assert_eq!(completed[0].run.id, runs[0].id);
     }
 
-    #[test]
-    fn confirmed_performance_post_tool_use_plan_reuses_selected_handlers() {
-        let request = request_for_tool_use("tool-call-456");
-        let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
 
-        let gate = ScopedRunGate::unscoped();
-        assert_eq!(plan.matched.len(), 1);
-        assert_eq!(preview(&plan, &request.tool_use_id, &gate).len(), 1);
-        assert_eq!(preview(&plan, "another-call", &gate).len(), 1);
-    }
 
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {

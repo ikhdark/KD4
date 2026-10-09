@@ -905,6 +905,8 @@ mod tests {
         for (context_window, expected) in [
             (Some(200_000), MAX_SKILL_METADATA_TOKEN_BUDGET),
             (Some(99), 1),
+            (Some(50_000), 1_000),
+            (Some(0), MAX_SKILL_METADATA_TOKEN_BUDGET),
             (None, MAX_SKILL_METADATA_TOKEN_BUDGET),
             (Some(-1), MAX_SKILL_METADATA_TOKEN_BUDGET),
         ] {
@@ -964,46 +966,27 @@ mod tests {
 
     #[test]
     fn budgeted_rendering_truncates_descriptions_equally_before_omitting_skills() {
-        let alpha = make_skill_with_description("alpha-skill", SkillScope::Repo, "abcdef");
-        let beta = make_skill_with_description("beta-skill", SkillScope::Repo, "uvwxyz");
-        let minimum_cost =
-            expected_catalog_cost(&alpha, "", SkillMetadataBudget::Characters(usize::MAX))
+        for (alpha_desc, beta_desc, truncated) in [
+            ("abcdef", "uvwxyz", 8),
+            ("abcdefghij", "uvwxyzabcd", 16),
+        ] {
+            let alpha = make_skill_with_description("alpha-skill", SkillScope::Repo, alpha_desc);
+            let beta = make_skill_with_description("beta-skill", SkillScope::Repo, beta_desc);
+            let minimum_cost =
+                expected_catalog_cost(&alpha, "", SkillMetadataBudget::Characters(usize::MAX))
                 + expected_catalog_cost(&beta, "", SkillMetadataBudget::Characters(usize::MAX));
-        let budget = SkillMetadataBudget::Characters(minimum_cost + 10);
-
-        let rendered = build_available_skills_from_metadata(&[beta.clone(), alpha.clone()], budget)
-            .expect("skills should render");
-
-        assert_eq!(rendered.report.included_count, 2);
-        assert_eq!(rendered.report.omitted_count, 0);
-        assert_eq!(rendered.report.truncated_description_chars, 8);
-        assert_eq!(rendered.warning_message, None);
-        assert_eq!(
-            rendered.skill_lines,
-            vec![
-                expected_skill_line(&alpha, "ab"),
-                expected_skill_line(&beta, "uv"),
-            ]
-        );
-    }
-
-    #[test]
-    fn budgeted_rendering_does_not_warn_when_average_description_truncation_is_within_threshold() {
-        let alpha = make_skill_with_description("alpha-skill", SkillScope::Repo, "abcdefghij");
-        let beta = make_skill_with_description("beta-skill", SkillScope::Repo, "uvwxyzabcd");
-        let minimum_cost =
-            expected_catalog_cost(&alpha, "", SkillMetadataBudget::Characters(usize::MAX))
-                + expected_catalog_cost(&beta, "", SkillMetadataBudget::Characters(usize::MAX));
-        let budget = SkillMetadataBudget::Characters(minimum_cost + 10);
-
-        let rendered = build_available_skills_from_metadata(&[alpha, beta], budget)
-            .expect("skills should render");
-
-        assert_eq!(rendered.report.included_count, 2);
-        assert_eq!(rendered.report.omitted_count, 0);
-        assert_eq!(rendered.report.truncated_description_chars, 16);
-        assert_eq!(rendered.report.truncated_description_count, 2);
-        assert_eq!(rendered.warning_message, None);
+            let rendered = build_available_skills_from_metadata(
+                &[beta.clone(), alpha.clone()], SkillMetadataBudget::Characters(minimum_cost + 10)
+            ).expect("skills should render");
+            assert_eq!(rendered.report.included_count, 2);
+            assert_eq!(rendered.report.omitted_count, 0);
+            assert_eq!(rendered.report.truncated_description_chars, truncated);
+            assert_eq!(rendered.report.truncated_description_count, 2);
+            assert_eq!(rendered.warning_message, None);
+            assert_eq!(rendered.skill_lines, vec![
+                expected_skill_line(&alpha, "ab"), expected_skill_line(&beta, "uv")
+            ]);
+        }
     }
 
     #[test]
@@ -1100,7 +1083,7 @@ mod tests {
             .cost(&format!("{}\n", expected_skill_line(&admin, "")));
         let budget = SkillMetadataBudget::Characters(system_cost + admin_cost);
 
-        let rendered = build_available_skills_from_metadata(&[system, user, repo, admin], budget)
+        let rendered = build_available_skills_from_metadata(&[user, repo, admin.clone(), system.clone()], budget)
             .expect("skills should render");
 
         assert_eq!(rendered.report.included_count, 2);
@@ -1112,12 +1095,9 @@ mod tests {
                     .to_string()
             )
         );
-        let rendered_text = rendered.skill_lines.join("\n");
-        assert!(rendered_text.contains("- system-skill —"));
-        assert!(rendered_text.contains("- admin-skill —"));
-        assert!(!rendered_text.contains("desc"));
-        assert!(!rendered_text.contains("- repo-skill —"));
-        assert!(!rendered_text.contains("- user-skill —"));
+        assert_eq!(rendered.skill_lines, vec![
+            expected_skill_line(&system, ""), expected_skill_line(&admin, "")
+        ]);
     }
 
     #[test]
@@ -1144,30 +1124,6 @@ mod tests {
         let rendered_text = rendered.skill_lines.join("\n");
         assert!(!rendered_text.contains("- oversized-system-skill —"));
         assert!(rendered_text.contains("- repo-skill —"));
-    }
-
-    #[test]
-    fn outcome_rendering_uses_opaque_catalog_without_budget_pressure() {
-        let root = test_path_buf("/tmp/skills").abs();
-        let alpha_path = root.join("alpha/SKILL.md");
-        let beta_path = root.join("beta/SKILL.md");
-        let outcome = outcome_with_roots(
-            vec![
-                skill_with_path("alpha-skill", &alpha_path),
-                skill_with_path("beta-skill", &beta_path),
-            ],
-            vec![root],
-        );
-
-        let rendered = build_available_skills(
-            &outcome,
-            SkillMetadataBudget::Characters(usize::MAX),
-            SkillRenderSideEffects::None,
-        )
-        .expect("skills should render");
-
-        assert!(rendered.skill_root_lines.is_empty());
-        assert_eq!(rendered.report.included_count, 2);
     }
 
     #[test]

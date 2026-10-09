@@ -236,41 +236,16 @@ mod tests {
     }
 
     #[test]
-    fn debug_command_still_resolves_for_dispatch() {
-        let cmd = find_builtin_command("debug-config", all_enabled_flags());
-        assert_eq!(cmd, Some(SlashCommand::DebugConfig));
-    }
-
-    #[test]
-    fn clear_command_resolves_for_dispatch() {
-        assert_eq!(
-            find_builtin_command("clear", all_enabled_flags()),
-            Some(SlashCommand::Clear)
-        );
-    }
-
-    #[test]
-    fn goal_command_allows_extra_os_for_dispatch() {
-        assert_eq!(
-            find_builtin_command("goooooooooooal", all_enabled_flags()),
-            Some(SlashCommand::Goal)
-        );
-    }
-
-    #[test]
-    fn stop_command_resolves_for_dispatch() {
-        assert_eq!(
-            find_builtin_command("stop", all_enabled_flags()),
-            Some(SlashCommand::Stop)
-        );
-    }
-
-    #[test]
-    fn clean_command_alias_resolves_for_dispatch() {
-        assert_eq!(
-            find_builtin_command("clean", all_enabled_flags()),
-            Some(SlashCommand::Stop)
-        );
+    fn builtin_names_and_aliases_resolve_for_dispatch() {
+        for (name, expected) in [
+            ("debug-config", SlashCommand::DebugConfig),
+            ("clear", SlashCommand::Clear),
+            ("goooooooooooal", SlashCommand::Goal),
+            ("stop", SlashCommand::Stop),
+            ("clean", SlashCommand::Stop),
+        ] {
+            assert_eq!(find_builtin_command(name, all_enabled_flags()), Some(expected), "{name}");
+        }
     }
 
     #[test]
@@ -362,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_command_is_hidden_from_input_when_account_token_activity_is_disabled() {
+    fn disabled_token_activity_hides_usage_from_popup_but_allows_dispatch_error() {
         let mut flags = all_enabled_flags();
         flags.token_activity_command_enabled = false;
         assert_eq!(
@@ -371,12 +346,6 @@ mod tests {
                 .find(|(_, command)| *command == SlashCommand::Usage),
             None
         );
-    }
-
-    #[test]
-    fn usage_command_exact_lookup_still_resolves_when_account_token_activity_is_disabled() {
-        let mut flags = all_enabled_flags();
-        flags.token_activity_command_enabled = false;
         assert_eq!(
             find_builtin_command("usage", flags),
             Some(SlashCommand::Usage)

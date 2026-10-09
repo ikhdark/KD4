@@ -77,24 +77,20 @@ fn windows_absolute_program_paths_use_windows_display_quoting() {
 
 #[test]
 fn non_absolute_or_already_quoted_programs_keep_posix_display() {
+    // The display must preserve argv under POSIX parsing. Its spelling need not
+    // choose single quotes over equivalent double quotes and escapes. Decode it
+    // instead of using production's join helper to generate the expected value.
     for command in [
-        vec!["/bin/bash".to_string(), "echo hi".to_string()],
-        vec![
-            "\"C:\\Program Files\\tool.exe\"".to_string(),
-            "argument with space".to_string(),
-        ],
-        vec!["C:tool.exe".to_string(), "argument with space".to_string()],
-        vec![
-            r"\Windows\tool.exe".to_string(),
-            "argument with space".to_string(),
-        ],
-        vec![r".\tool.exe".to_string(), "argument with space".to_string()],
-        vec!["pwsh.exe".to_string(), "argument with space".to_string()],
+        vec!["/bin/bash", "echo hi"],
+        vec![r#""C:\Program Files\tool.exe""#, "argument with space"],
+        vec!["C:tool.exe", "argument with space"],
+        vec![r"\Windows\tool.exe", "argument with space"],
+        vec![r".\tool.exe", "argument with space"],
+        vec!["pwsh.exe", "argument with space"],
     ] {
-        assert_eq!(
-            command_display_string(&command),
-            codex_shell_command::parse_command::shlex_join(&command)
-        );
+        let command = command.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let display = command_display_string(&command);
+        assert_eq!(shlex::split(&display), Some(command));
     }
 }
 

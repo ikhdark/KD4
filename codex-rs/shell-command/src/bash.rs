@@ -462,8 +462,12 @@ mod tests {
     fn repeated_parses_reuse_the_thread_local_parser() {
         let initializations_before = BASH_PARSER_INITIALIZATIONS.get();
 
-        assert!(try_parse_shell("echo one").is_some());
-        assert!(try_parse_shell("echo two").is_some());
+        for word in ["one", "two"] {
+            assert_eq!(
+                parse_seq(&format!("echo {word}")),
+                Some(vec![vec!["echo".to_string(), word.to_string()]])
+            );
+        }
 
         assert!(
             BASH_PARSER_INITIALIZATIONS
@@ -588,23 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_trailing_operator_parse_error() {
-        assert!(parse_seq("ls &&").is_none());
-    }
-
-    #[test]
-    fn rejects_empty_command_position_with_leading_operator() {
-        assert!(parse_seq("&& ls").is_none());
-    }
-
-    #[test]
-    fn rejects_empty_command_position_with_double_separator() {
-        assert!(parse_seq("ls ;; pwd").is_none());
-    }
-
-    #[test]
-    fn rejects_empty_command_position_with_empty_pipeline_segment() {
-        assert!(parse_seq("ls | | wc").is_none());
+    fn rejects_malformed_operator_sequences() {
+        for script in ["ls &&", "&& ls", "ls ;; pwd", "ls | | wc"] {
+            assert!(parse_seq(script).is_none(), "{script}");
+        }
     }
 
     #[test]

@@ -158,7 +158,7 @@ async fn device_code_login_integration_succeeds() -> anyhow::Result<()> {
     )
     .context("auth.json should load after login succeeds")?
     .context("auth.json written")?;
-    // assert_eq!(auth.openai_api_key.as_deref(), Some("api-key-321"));
+    assert_eq!(auth.openai_api_key, None);
     let tokens = auth.tokens.expect("tokens persisted");
     assert_eq!(tokens.access_token, "access-token-123");
     assert_eq!(tokens.refresh_token, "refresh-token-123");
@@ -250,7 +250,7 @@ async fn device_code_login_integration_handles_usercode_http_failure() -> anyhow
 }
 
 #[tokio::test]
-async fn device_code_login_integration_persists_without_api_key_on_exchange_failure()
+async fn device_code_login_persists_tokens_without_account_claim_or_api_key_exchange()
 -> anyhow::Result<()> {
     require_network!();
 
@@ -300,6 +300,13 @@ async fn device_code_login_integration_persists_without_api_key_on_exchange_fail
     assert_eq!(tokens.access_token, "access-token-123");
     assert_eq!(tokens.refresh_token, "refresh-token-123");
     assert_eq!(tokens.id_token.raw_jwt, jwt);
+    assert_eq!(tokens.account_id, None);
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.iter().filter(|request| request.url.path() == "/oauth/token").count(),
+        1,
+        "device login exchanges its authorization code, not an API key"
+    );
     Ok(())
 }
 
@@ -344,11 +351,7 @@ async fn device_code_login_integration_handles_error_payload() -> anyhow::Result
         .await
         .expect_err("integration failure path should return error");
 
-    // Accept either the specific error payload, a 400, or a 404 (since the client may return 404 if the flow is incomplete)
-    assert!(
-        err.to_string().contains("authorization_declined") || err.to_string().contains("401"),
-        "Expected an authorization_declined / 400 / 404 error, got {err:?}"
-    );
+    assert_eq!(err.to_string(), "device auth failed with status 401 Unauthorized");
 
     let auth = load_auth_dot_json(
         codex_home.path(),

@@ -601,160 +601,71 @@ mod disable_powershell_profile_tests {
 
     #[test]
     fn inserts_no_profile_for_elevated_windows_sandbox() {
-        let command = vec![
-            "powershell.exe".to_string(),
-            "-Command".to_string(),
-            "Write-Output ok".to_string(),
-        ];
-
-        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
-            WindowsSandboxLevel::Elevated,
-            false,
-        );
-
-        assert_eq!(
-            rewritten,
-            vec![
-                "powershell.exe".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Write-Output ok".to_string(),
-            ]
-        );
+        for (flag, script) in [
+            ("-Command", "Write-Output ok"),
+            ("-EncodedCommand", "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA"),
+        ] {
+            for (level, managed_network) in [
+                (WindowsSandboxLevel::Elevated, false),
+                (WindowsSandboxLevel::RestrictedToken, true),
+            ] {
+                let command = vec!["powershell.exe".to_string(), flag.into(), script.into()];
+                assert_eq!(
+                    disable_powershell_profile_for_elevated_windows_sandbox(
+                        &command,
+                        Some(&ShellType::PowerShell),
+                        SandboxType::WindowsRestrictedToken,
+                        level,
+                        managed_network,
+                    ),
+                    vec!["powershell.exe", "-NoProfile", flag, script],
+                    "flag={flag}, level={level:?}, managed_network={managed_network}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn inserts_no_profile_before_encoded_command() {
-        let command = vec![
-            "powershell.exe".to_string(),
-            "-EncodedCommand".to_string(),
-            "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA".to_string(),
-        ];
-
-        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
-            WindowsSandboxLevel::Elevated,
-            false,
-        );
-
-        assert_eq!(
-            rewritten,
-            vec![
-                "powershell.exe".to_string(),
-                "-NoProfile".to_string(),
-                "-EncodedCommand".to_string(),
-                "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn preserves_existing_no_profile() {
-        let command = vec![
-            "pwsh.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "Write-Output ok".to_string(),
-        ];
-
-        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
-            WindowsSandboxLevel::Elevated,
-            false,
-        );
-
-        assert_eq!(rewritten, command);
-    }
-
-    #[test]
-    fn leaves_legacy_restricted_token_backend_alone() {
-        let command = vec![
-            "powershell.exe".to_string(),
-            "-Command".to_string(),
-            "Write-Output ok".to_string(),
-        ];
-
-        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
-            WindowsSandboxLevel::RestrictedToken,
-            false,
-        );
-
-        assert_eq!(rewritten, command);
-    }
-
-    #[test]
-    fn inserts_no_profile_when_managed_network_promotes_restricted_token_backend() {
-        let command = vec![
-            "powershell.exe".to_string(),
-            "-Command".to_string(),
-            "Write-Output ok".to_string(),
-        ];
-
-        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
-            WindowsSandboxLevel::RestrictedToken,
-            true,
-        );
-
-        assert_eq!(
-            rewritten,
-            vec![
-                "powershell.exe".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Write-Output ok".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn leaves_unsandboxed_attempts_alone() {
-        let command = vec![
-            "powershell.exe".to_string(),
-            "-Command".to_string(),
-            "Write-Output ok".to_string(),
-        ];
-
-        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&ShellType::PowerShell),
-            SandboxType::None,
-            WindowsSandboxLevel::Elevated,
-            false,
-        );
-
-        assert_eq!(rewritten, command);
-    }
-
-    #[test]
-    fn leaves_non_powershell_alone() {
-        let command = vec![
-            "/bin/bash".to_string(),
-            "-lc".to_string(),
-            "echo ok".to_string(),
-        ];
-
-        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&ShellType::Bash),
-            SandboxType::WindowsRestrictedToken,
-            WindowsSandboxLevel::Elevated,
-            false,
-        );
-
-        assert_eq!(rewritten, command);
+    fn preserves_commands_that_do_not_require_profile_rewriting() {
+        for (command, shell_type, sandbox, level) in [
+            (
+                vec!["pwsh.exe", "-NoProfile", "-Command", "Write-Output ok"],
+                ShellType::PowerShell,
+                SandboxType::WindowsRestrictedToken,
+                WindowsSandboxLevel::Elevated,
+            ),
+            (
+                vec!["powershell.exe", "-Command", "Write-Output ok"],
+                ShellType::PowerShell,
+                SandboxType::WindowsRestrictedToken,
+                WindowsSandboxLevel::RestrictedToken,
+            ),
+            (
+                vec!["powershell.exe", "-Command", "Write-Output ok"],
+                ShellType::PowerShell,
+                SandboxType::None,
+                WindowsSandboxLevel::Elevated,
+            ),
+            (
+                vec!["/bin/bash", "-lc", "echo ok"],
+                ShellType::Bash,
+                SandboxType::WindowsRestrictedToken,
+                WindowsSandboxLevel::Elevated,
+            ),
+        ] {
+            let command = command.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                disable_powershell_profile_for_elevated_windows_sandbox(
+                    &command,
+                    Some(&shell_type),
+                    sandbox,
+                    level,
+                    false,
+                ),
+                command,
+                "shell={shell_type:?}, sandbox={sandbox:?}, level={level:?}"
+            );
+        }
     }
 }
 
@@ -852,12 +763,13 @@ mod shell_snapshot_replay_tests {
             &command,
             &shell,
             remote_path,
-            &format!("@rem Snapshot file\r\n{CMD_SNAPSHOT_FORMAT_HEADER}\r\n"),
+            &format!("@rem Snapshot file\r\n{CMD_SNAPSHOT_FORMAT_HEADER}\r\n@set CODEX_CMD_VALUE=100%%^^^&! %%PATH%%\r\n"),
             &HashMap::new(),
             &mut env,
         );
 
         assert_eq!(rewritten, command);
+        assert_eq!(env.get("CODEX_CMD_VALUE").map(String::as_str), Some("100%^&! %PATH%"));
         assert!(!env.contains_key("__CODEX_SNAPSHOT_FILE"));
     }
 

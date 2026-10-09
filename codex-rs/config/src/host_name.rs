@@ -49,23 +49,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn normalize_fqdn_candidate_accepts_dns_qualified_name() {
-        assert_eq!(
-            normalize_fqdn_candidate("runner-01.ci.example.com"),
-            Some("runner-01.ci.example.com".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_fqdn_candidate_rejects_short_name() {
-        assert_eq!(normalize_fqdn_candidate("runner-01"), None);
-    }
-
-    #[test]
-    fn normalize_fqdn_candidate_trims_trailing_dot_and_normalizes_case() {
-        assert_eq!(
-            normalize_fqdn_candidate("RUNNER-01.CI.EXAMPLE.COM."),
-            Some("runner-01.ci.example.com".to_string())
-        );
+    fn normalize_fqdn_candidate_requires_a_qualified_normalized_name() {
+        for (input, expected) in [
+            ("runner-01.ci.example.com", Some("runner-01.ci.example.com")),
+            ("RUNNER-01.CI.EXAMPLE.COM.", Some("runner-01.ci.example.com")),
+            ("  RUNNER-01.CI.EXAMPLE.COM.  ", Some("runner-01.ci.example.com")),
+            ("runner-01", None),
+            ("runner-01.", None),
+            ("", None),
+            ("   ", None),
+            (".", None),
+        ] {
+            assert_eq!(normalize_fqdn_candidate(input).as_deref(), expected, "{input:?}");
+        }
     }
 }

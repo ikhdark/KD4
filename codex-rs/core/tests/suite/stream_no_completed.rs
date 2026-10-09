@@ -132,7 +132,12 @@ async fn retries_on_early_close() {
     ));
 
     // Wait until TurnComplete (should succeed after the classified retry).
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate requires terminal completion");
+    };
+    assert_eq!(completed.error, None);
 
     let requests = server.requests().await;
     assert_eq!(

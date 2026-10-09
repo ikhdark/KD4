@@ -130,12 +130,16 @@ fn test_codex() -> TestCodexBuilder {
 }
 
 async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
-    wait_for_event_with_timeout(
+    let event = wait_for_event_with_timeout(
         codex,
         |ev| matches!(ev, EventMsg::TurnComplete(_)),
         REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT,
     )
     .await;
+    let EventMsg::TurnComplete(turn) = event else {
+        unreachable!("predicate accepts only turn completion");
+    };
+    assert!(turn.error.is_none(), "remote-compaction turn failed: {turn:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

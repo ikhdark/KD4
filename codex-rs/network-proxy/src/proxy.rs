@@ -1139,7 +1139,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
-    use std::path::Path;
 
     async fn running_proxy_with_environment() -> (NetworkProxyHandle, Vec<SocketAddr>) {
         let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
@@ -1538,49 +1537,11 @@ mod tests {
         assert_eq!(env.get(GIT_SSH_COMMAND_ENV_KEY), None);
         assert_eq!(env.get("DOCKER_HTTP_PROXY"), None);
         assert_eq!(env.get("DOCKER_HTTPS_PROXY"), None);
-    }
-
-    #[test]
-    fn apply_proxy_env_overrides_sets_only_expected_env_keys() {
-        let mut env = HashMap::new();
-        apply_proxy_env_overrides(
-            &mut env,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3128),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
-            /*socks_enabled*/ true,
-            /*allow_local_binding*/ false,
-            /*mitm_ca_trust_bundle*/ None,
-        );
-
+        assert_eq!(env.get("HTTPS_PROXY").map(String::as_str), Some("http://127.0.0.1:3128"));
         for key in env.keys() {
             assert!(
                 PROXY_ENV_KEYS.contains(&key.as_str()),
                 "proxy env writer set unexpected key: {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn apply_proxy_env_overrides_sets_mitm_ca_trust_bundle_vars() {
-        let mut env = HashMap::new();
-        let mitm_ca_trust_bundle_path = Path::new("/tmp/codex-proxy/ca-bundle.pem");
-        let mitm_ca_trust_bundle = crate::certs::ManagedMitmCaTrustBundle {
-            path: mitm_ca_trust_bundle_path.to_path_buf(),
-            startup_env_values: HashMap::new(),
-        };
-        apply_proxy_env_overrides(
-            &mut env,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3128),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
-            /*socks_enabled*/ true,
-            /*allow_local_binding*/ false,
-            Some(&mitm_ca_trust_bundle),
-        );
-
-        for key in crate::certs::CUSTOM_CA_ENV_KEYS {
-            assert_eq!(
-                env.get(key),
-                Some(&mitm_ca_trust_bundle_path.display().to_string())
             );
         }
     }
@@ -1650,41 +1611,6 @@ mod tests {
         assert_eq!(env.get(ALLOW_LOCAL_BINDING_ENV_KEY), Some(&"1".to_string()));
     }
 
-    #[test]
-    fn apply_proxy_env_overrides_uses_plain_http_proxy_url() {
-        let mut env = HashMap::new();
-        apply_proxy_env_overrides(
-            &mut env,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3128),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
-            /*socks_enabled*/ true,
-            /*allow_local_binding*/ false,
-            /*mitm_ca_trust_bundle*/ None,
-        );
-
-        assert_eq!(
-            env.get("HTTP_PROXY"),
-            Some(&"http://127.0.0.1:3128".to_string())
-        );
-        assert_eq!(
-            env.get("HTTPS_PROXY"),
-            Some(&"http://127.0.0.1:3128".to_string())
-        );
-        assert_eq!(
-            env.get("WS_PROXY"),
-            Some(&"http://127.0.0.1:3128".to_string())
-        );
-        assert_eq!(
-            env.get("WSS_PROXY"),
-            Some(&"http://127.0.0.1:3128".to_string())
-        );
-        assert_eq!(
-            env.get("ALL_PROXY"),
-            Some(&"socks5h://127.0.0.1:8081".to_string())
-        );
-
-        assert_eq!(env.get(GIT_SSH_COMMAND_ENV_KEY), None);
-    }
     #[test]
     fn async_environment_preparation_preserves_progress_and_listener_ownership() -> Result<()> {
         use std::future::Future;

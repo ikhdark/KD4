@@ -2023,6 +2023,10 @@ mod tests {
                 }
                 other => panic!("expected cleanup terminate request, got {other:?}"),
             };
+            let terminate_params: crate::protocol::TerminateParams =
+                serde_json::from_value(terminate.params.expect("cleanup parameters"))
+                    .expect("decode cleanup parameters");
+            assert_eq!(terminate_params.process_id, start_params.process_id);
             write_jsonrpc_line(
                 &mut server_writer,
                 JSONRPCMessage::Response(JSONRPCResponse {
@@ -2103,7 +2107,6 @@ mod tests {
         let _ = release_server_tx.send(());
         server.await.expect("server task should finish");
     }
-
     #[tokio::test]
     async fn process_start_error_precedes_cleanup_completion() {
         let (client_stdin, server_reader) = duplex(1 << 20);
@@ -3368,50 +3371,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn recovery_reads_independent_processes_before_a_held_reply() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
-        let (disconnect, disconnected) = oneshot::channel();
-        let (finish, finished) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut first = accept_websocket(&listener).await;
-            complete_websocket_initialize(&mut first, "parallel-replay", None).await;
-            disconnected.await.unwrap();
-            drop(first);
-            let mut resumed = accept_websocket(&listener).await;
-            complete_websocket_session_initialize(&mut resumed, "parallel-replay", Some("parallel-replay")).await;
-            let JSONRPCMessage::Request(first) = read_jsonrpc_websocket(&mut resumed).await else { panic!("first read") };
-            let JSONRPCMessage::Request(second) = timeout(Duration::from_millis(300),
-                read_jsonrpc_websocket(&mut resumed)).await.expect("second process must be inspected before first replies")
-                else { panic!("second read") };
-            for request in [second, first] {
-                assert_eq!(request.method, EXEC_READ_METHOD);
-                write_jsonrpc_websocket(&mut resumed, JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id,
-                    result: serde_json::to_value(ReadResponse {
-                        chunks: vec![crate::protocol::ProcessOutputChunk {
-                            seq: 1, stream: crate::protocol::ExecOutputStream::Stdout, chunk: b"recovered".to_vec().into(),
-                        }], next_seq: 2, exited: false, exit_code: None, closed: false, failure: None, output_gap: None, sandbox_denied: false,
-                    }).unwrap(),
-                })).await;
-            }
-            finished.await.unwrap();
-        });
-        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::websocket_url(websocket_url, Duration::from_secs(1)));
-        let client = lazy.get().await.unwrap();
-        let a = client.register_session(&ProcessId::from("a")).await.unwrap();
-        let b = client.register_session(&ProcessId::from("b")).await.unwrap();
-        let mut a_events = a.subscribe_events();
-        let mut b_events = b.subscribe_events();
-        disconnect.send(()).unwrap();
-        for events in [&mut a_events, &mut b_events] {
-            assert!(matches!(timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap(),
-                ExecProcessEvent::Output(chunk) if chunk.seq == 1 && chunk.chunk.0 == b"recovered"));
-        }
-        finish.send(()).unwrap();
-        server.await.unwrap();
-    }
+
 
     #[tokio::test]
     async fn failed_process_start_cleanup_does_not_block_other_process_recovery() {
@@ -4299,8 +4259,11 @@ mod tests {
             .await
             .expect("quiet session should register");
         let mut quiet_wake_rx = quiet_session.subscribe_wake();
+        let mut quiet_events = quiet_session.subscribe_events();
+        let mut noisy_events = _noisy_session.subscribe_events();
+        let _noisy_wake_rx = _noisy_session.subscribe_wake();
 
-        for seq in 0..=4096 {
+        for seq in 1..=super::PROCESS_EVENT_CHANNEL_CAPACITY as u64 + 1 {
             notifications_tx
                 .send(JSONRPCMessage::Notification(JSONRPCNotification {
                     method: EXEC_OUTPUT_DELTA_METHOD.to_string(),
@@ -4339,6 +4302,18 @@ mod tests {
             .expect("quiet session should receive wake before timeout")
             .expect("quiet wake channel should stay open");
         assert_eq!(*quiet_wake_rx.borrow(), 1);
+        assert_eq!(
+            quiet_events.recv().await.expect("quiet exit event"),
+            ExecProcessEvent::Exited {
+                seq: 1,
+                exit_code: 17,
+                sandbox_denied: Some(false),
+            }
+        );
+        assert!(matches!(
+            noisy_events.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+        ));
 
         drop(notifications_tx);
         drop(client);

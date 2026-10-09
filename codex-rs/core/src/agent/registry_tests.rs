@@ -39,11 +39,6 @@ fn format_agent_nickname_adds_ordinals_after_reset() {
 }
 
 #[test]
-fn session_depth_defaults_to_zero_for_root_sources() {
-    assert_eq!(session_depth(&SessionSource::Cli), 0);
-}
-
-#[test]
 fn thread_spawn_depth_increments_and_enforces_limit() {
     let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: ThreadId::new(),
@@ -58,22 +53,34 @@ fn thread_spawn_depth_increments_and_enforces_limit() {
         child_depth,
         /*max_depth*/ 1
     ));
-}
-
-#[test]
-fn non_thread_spawn_subagents_default_to_depth_zero() {
-    let session_source = SessionSource::SubAgent(SubAgentSource::Review);
-    assert_eq!(session_depth(&session_source), 0);
-    assert_eq!(next_thread_spawn_depth(&session_source), 1);
+    for source in [SessionSource::Cli, SessionSource::SubAgent(SubAgentSource::Review)] {
+        assert_eq!(session_depth(&source), 0);
+        assert_eq!(next_thread_spawn_depth(&source), 1);
+    }
     assert!(!exceeds_thread_spawn_depth_limit(
         /*depth*/ 1, /*max_depth*/ 1
     ));
+    assert!(!exceeds_thread_spawn_depth_limit(
+        /*depth*/ 0, /*max_depth*/ 1
+    ));
+    let saturated = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: i32::MAX,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    assert_eq!(next_thread_spawn_depth(&saturated), i32::MAX);
 }
 
 #[test]
 fn reservation_drop_releases_slot() {
     let registry = Arc::new(AgentRegistry::default());
     let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
+    assert!(matches!(
+        registry.reserve_spawn_slot(Some(1)),
+        Err(CodexErr::AgentLimitReached { max_threads: 1 })
+    ));
     drop(reservation);
 
     let reservation = registry.reserve_spawn_slot(Some(1)).expect("slot released");

@@ -155,6 +155,10 @@ mod tests {
             .mark_backfill_running()
             .await
             .expect("mark backfill running");
+        let started = runtime.get_backfill_state().await.expect("running state");
+        assert_eq!(started.status, crate::BackfillStatus::Running);
+        assert_eq!(started.last_watermark, None);
+        assert_eq!(started.last_success_at, None);
         runtime
             .checkpoint_backfill("sessions/2026/01/27/rollout-a.jsonl")
             .await
@@ -197,6 +201,20 @@ mod tests {
         );
         assert!(completed.last_success_at.is_some());
 
+        runtime.close().await;
+        let reopened = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("reopen runtime");
+        assert_eq!(reopened.get_backfill_state().await.expect("persisted state"), completed);
+        reopened
+            .mark_backfill_complete(None)
+            .await
+            .expect("complete without replacing watermark");
+        assert_eq!(
+            reopened.get_backfill_state().await.expect("preserved watermark").last_watermark,
+            completed.last_watermark
+        );
+        reopened.close().await;
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
@@ -216,10 +234,13 @@ mod tests {
             .await
             .expect("acquire write lock");
 
-        let state = runtime
-            .get_backfill_state()
-            .await
-            .expect("get backfill state");
+        let state = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.get_backfill_state(),
+        )
+        .await
+        .expect("reads must not wait for the writer slot")
+        .expect("get backfill state");
         assert_eq!(state, crate::BackfillState::default());
 
         write_transaction

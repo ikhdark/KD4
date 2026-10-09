@@ -650,104 +650,25 @@ interface:
 #[tokio::test]
 async fn loads_skill_policy_from_yaml() {
     let codex_home = tempfile::tempdir().expect("tempdir");
-    let skill_path = write_skill(&codex_home, "demo", "policy-skill", "from json");
-    let skill_dir = skill_path.parent().expect("skill dir");
-
-    write_skill_metadata_at(
-        skill_dir,
-        r#"
-policy:
-  allow_implicit_invocation: false
-"#,
-    );
-
+    let skill_path = write_skill(&codex_home, "demo", "policy-skill", "from yaml");
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(outcome.skills.len(), 1);
-    assert_eq!(
-        outcome.skills[0].policy,
-        Some(SkillPolicy {
-            allow_implicit_invocation: Some(false),
-            products: vec![],
-        })
-    );
-    assert!(outcome.allowed_skills_for_implicit_invocation().is_empty());
-}
-
-#[tokio::test]
-async fn empty_skill_policy_defaults_to_allow_implicit_invocation() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let skill_path = write_skill(&codex_home, "demo", "policy-empty", "from json");
-    let skill_dir = skill_path.parent().expect("skill dir");
-
-    write_skill_metadata_at(
-        skill_dir,
-        r#"
-policy: {}
-"#,
-    );
-
-    let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(outcome.skills.len(), 1);
-    assert_eq!(
-        outcome.skills[0].policy,
-        Some(SkillPolicy {
-            allow_implicit_invocation: None,
-            products: vec![],
-        })
-    );
-    assert_eq!(
-        outcome.allowed_skills_for_implicit_invocation(),
-        outcome.skills
-    );
-}
-
-#[tokio::test]
-async fn loads_skill_policy_products_from_yaml() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let skill_path = write_skill(&codex_home, "demo", "policy-products", "from yaml");
-    let skill_dir = skill_path.parent().expect("skill dir");
-
-    write_skill_metadata_at(
-        skill_dir,
-        r#"
-policy:
-  products:
-    - codex
-    - CHATGPT
-    - atlas
-"#,
-    );
-
-    let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(outcome.skills.len(), 1);
-    assert_eq!(
-        outcome.skills[0].policy,
-        Some(SkillPolicy {
-            allow_implicit_invocation: None,
-            products: vec![Product::Codex, Product::Chatgpt, Product::Atlas],
-        })
-    );
+    for (metadata, implicit, products) in [
+        ("policy:\n  allow_implicit_invocation: false\n", Some(false), vec![]),
+        ("policy: {}\n", None, vec![]),
+        ("policy:\n  products:\n    - codex\n    - CHATGPT\n    - atlas\n", None,
+            vec![Product::Codex, Product::Chatgpt, Product::Atlas]),
+    ] {
+        write_skill_metadata_at(skill_path.parent().unwrap(), metadata);
+        let outcome = load_skills_for_test(&cfg).await;
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let mut expected = expected_user_skill(&skill_path, "policy-skill", "from yaml");
+        expected.policy = Some(SkillPolicy { allow_implicit_invocation: implicit, products });
+        assert_eq!(outcome.skills, vec![expected.clone()]);
+        assert_eq!(
+            outcome.allowed_skills_for_implicit_invocation(),
+            if implicit == Some(false) { vec![] } else { vec![expected] }
+        );
+    }
 }
 
 #[tokio::test]
@@ -1382,53 +1303,17 @@ async fn nearest_valid_nested_plugin_namespace_overrides_outer_namespace() {
         "search description",
     );
 
-    let outcome = load_user_skills_root(&skills_root).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![expected_user_skill(
-            &skill_path,
-            "nested:search-skill",
-            "search description",
-        )]
-    );
-}
-
-#[tokio::test]
-async fn invalid_nested_plugin_manifest_falls_back_to_outer_namespace() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let outer_plugin_root = root.path().join("outer-plugin");
-    write_plugin_manifest(&outer_plugin_root, r#"{"name":"outer"}"#);
-    let skills_root = outer_plugin_root.join("skills");
-    let nested_plugin_root = skills_root.join("nested-plugin");
-    write_plugin_manifest(&nested_plugin_root, "not json");
-    let skill_path = write_skill_at(
-        &nested_plugin_root.join("skills"),
-        "search",
-        "search-skill",
-        "search description",
-    );
-
-    let outcome = load_user_skills_root(&skills_root).await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![expected_user_skill(
-            &skill_path,
-            "outer:search-skill",
-            "search description",
-        )]
-    );
+    for (manifest, expected_name) in [
+        (r#"{"name":"nested"}"#, "nested:search-skill"),
+        ("not json", "outer:search-skill"),
+    ] {
+        write_plugin_manifest(&nested_plugin_root, manifest);
+        let outcome = load_user_skills_root(&skills_root).await;
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.skills, vec![expected_user_skill(
+            &skill_path, expected_name, "search description"
+        )]);
+    }
 }
 
 // Directory symlinks on Windows can require Developer Mode or administrator privileges.
@@ -1436,7 +1321,7 @@ async fn invalid_nested_plugin_manifest_falls_back_to_outer_namespace() {
 // Directory symlinks on Windows can require Developer Mode or administrator privileges.
 
 #[tokio::test]
-async fn plugin_skill_name_length_limit_allows_max_qualified_name() {
+async fn plugin_skill_name_length_enforces_qualified_boundary() {
     let root = tempfile::tempdir().expect("tempdir");
     let plugin_name = "p".repeat(MAX_NAME_LEN - 1);
     let skill_name = "s".repeat(MAX_NAME_LEN);
@@ -1450,75 +1335,33 @@ async fn plugin_skill_name_length_limit_allows_max_qualified_name() {
     )
     .unwrap();
 
-    let outcome = load_skills_from_roots(
-        [SkillRoot {
-            path: plugin_root.join("skills").abs(),
-            scope: SkillScope::User,
-            file_system: Arc::clone(&LOCAL_FS),
-            plugin_id: Some("sample@test".to_string()),
-            plugin_namespace: Some(plugin_name.clone()),
-            plugin_root: Some(plugin_root.abs()),
-        }],
-        /*plugin_skill_snapshots*/ None,
-    )
-    .await;
-
-    assert!(
-        outcome.errors.is_empty(),
-        "unexpected errors: {:?}",
-        outcome.errors
-    );
-    assert_eq!(
-        outcome.skills,
-        vec![SkillMetadata {
-            name: format!("{plugin_name}:{skill_name}"),
-            description: "search sample data".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&skill_path),
-            scope: SkillScope::User,
-            plugin_id: Some("sample@test".to_string()),
-        }]
-    );
-}
-
-#[tokio::test]
-async fn plugin_skill_name_length_limit_rejects_overlong_qualified_name() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let plugin_name = "p".repeat(MAX_NAME_LEN);
-    let skill_name = "s".repeat(MAX_NAME_LEN);
-    let plugin_root = root.path().join("plugins").join(&plugin_name);
-    let frontmatter = format!("name: {skill_name}\ndescription: search sample data");
-    write_raw_skill_at(&plugin_root.join("skills"), "sample-search", &frontmatter);
-    fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
-    fs::write(
-        plugin_root.join(".codex-plugin/plugin.json"),
-        format!(r#"{{"name":"{plugin_name}"}}"#),
-    )
-    .unwrap();
-
-    let outcome = load_skills_from_roots(
-        [SkillRoot {
-            path: plugin_root.join("skills").abs(),
-            scope: SkillScope::User,
-            file_system: Arc::clone(&LOCAL_FS),
-            plugin_id: Some("sample@test".to_string()),
-            plugin_namespace: Some(plugin_name.clone()),
-            plugin_root: Some(plugin_root.abs()),
-        }],
-        /*plugin_skill_snapshots*/ None,
-    )
-    .await;
-
-    assert_eq!(outcome.skills, Vec::new());
-    assert_eq!(outcome.errors.len(), 1);
-    assert!(
-        outcome.errors[0].message.contains("invalid qualified name"),
-        "expected qualified name length error, got: {:?}",
-        outcome.errors
-    );
+    for (namespace, allowed) in [(plugin_name.clone(), true), ("p".repeat(MAX_NAME_LEN), false)] {
+        let outcome = load_skills_from_roots(
+            [SkillRoot {
+                path: plugin_root.join("skills").abs(),
+                scope: SkillScope::User,
+                file_system: Arc::clone(&LOCAL_FS),
+                plugin_id: Some("sample@test".to_string()),
+                plugin_namespace: Some(namespace.clone()),
+                plugin_root: Some(plugin_root.abs()),
+            }],
+            None,
+        ).await;
+        if allowed {
+            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+            let mut expected = expected_user_skill(
+                &skill_path, &format!("{namespace}:{skill_name}"), "search sample data"
+            );
+            expected.plugin_id = Some("sample@test".to_string());
+            assert_eq!(outcome.skills, vec![expected]);
+        } else {
+            assert!(outcome.skills.is_empty());
+            assert_eq!(outcome.errors, vec![SkillError {
+                path: normalized(&skill_path),
+                message: "invalid qualified name: exceeds maximum length of 128 characters".to_string(),
+            }]);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1745,6 +1588,7 @@ async fn preserves_overlong_descriptions() {
         outcome.errors
     );
     assert_eq!(outcome.skills.len(), 1);
+    assert_eq!(outcome.skills[0].description, max_desc);
 
     let too_long_desc = "\u{1F4A1}".repeat(MAX_DESCRIPTION_LEN + 1);
     write_skill(&codex_home, "too-long", "too-long", &too_long_desc);

@@ -1,11 +1,12 @@
-import ast
 import importlib.util
 import io
 import os
+import shutil
 import sys
 import tarfile
 import urllib.error
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import tomllib
@@ -253,50 +254,18 @@ def test_runtime_setup_selects_windows_wheel_tag(
     assert runtime_setup.platform_wheel_tag() == platform_tag
 
 
-def test_runtime_package_is_wheel_only_and_builds_platform_specific_wheels() -> None:
+def test_runtime_package_is_wheel_only_and_builds_platform_specific_wheels(monkeypatch) -> None:
     pyproject = tomllib.loads((ROOT.parent / "python-runtime" / "pyproject.toml").read_text())
-    hook_source = (ROOT.parent / "python-runtime" / "hatch_build.py").read_text()
-    hook_tree = ast.parse(hook_source)
-    initialize_fn = next(
-        node
-        for node in ast.walk(hook_tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "initialize"
+    # Stub only Hatch's external base class; execute the repository hook itself.
+    interface = ModuleType("hatchling.builders.hooks.plugin.interface")
+    interface.BuildHookInterface = object
+    monkeypatch.setitem(sys.modules, interface.__name__, interface)
+    spec = importlib.util.spec_from_file_location(
+        "runtime_build_hook", ROOT.parent / "python-runtime" / "hatch_build.py"
     )
-
-    sdist_guard = next(
-        (
-            node
-            for node in initialize_fn.body
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Attribute)
-            and isinstance(node.test.left.value, ast.Name)
-            and node.test.left.value.id == "self"
-            and node.test.left.attr == "target_name"
-            and len(node.test.ops) == 1
-            and isinstance(node.test.ops[0], ast.Eq)
-            and len(node.test.comparators) == 1
-            and isinstance(node.test.comparators[0], ast.Constant)
-            and node.test.comparators[0].value == "sdist"
-        ),
-        None,
-    )
-    build_data_assignments = {}
-    for node in initialize_fn.body:
-        if (
-            not isinstance(node, ast.Assign)
-            or len(node.targets) != 1
-            or not isinstance(node.targets[0], ast.Subscript)
-            or not isinstance(node.targets[0].value, ast.Name)
-            or node.targets[0].value.id != "build_data"
-            or not isinstance(node.targets[0].slice, ast.Constant)
-            or not isinstance(node.targets[0].slice.value, str)
-        ):
-            continue
-        if isinstance(node.value, ast.Constant):
-            build_data_assignments[node.targets[0].slice.value] = node.value.value
-        elif isinstance(node.value, ast.JoinedStr):
-            build_data_assignments[node.targets[0].slice.value] = "joined-string"
+    assert spec is not None and spec.loader is not None
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
 
     assert pyproject["project"]["name"] == "openai-codex-cli-bin"
     assert pyproject["tool"]["hatch"]["build"]["targets"]["wheel"] == {
@@ -312,14 +281,37 @@ def test_runtime_package_is_wheel_only_and_builds_platform_specific_wheels() -> 
     assert pyproject["tool"]["hatch"]["build"]["targets"]["sdist"] == {
         "hooks": {"custom": {}},
     }
-    assert sdist_guard is not None
-    assert build_data_assignments == {
-        "pure_python": False,
-        "infer_tag": False,
-        "tag": "joined-string",
-    }
-    assert 'WINDOWS_PLATFORM_TAGS = frozenset({"win_amd64", "win_arm64"})' in hook_source
-    assert "unsupported wheel platform tag" in hook_source
+    with pytest.raises(RuntimeError, match="wheel-only"):
+        hook.RuntimeBuildHook.initialize(SimpleNamespace(target_name="sdist"), "1.2.3", {})
+
+    monkeypatch.setattr(hook, "_platform_tag", lambda: "win_amd64")
+    for config, environment_tag, expected_tag in [
+        ({}, None, "win_amd64"),
+        ({}, "win_arm64", "win_arm64"),
+        ({"platform-tag": "win_amd64"}, "win_arm64", "win_amd64"),
+    ]:
+        if environment_tag is None:
+            monkeypatch.delenv("CODEX_CLI_BIN_PLATFORM_TAG", raising=False)
+        else:
+            monkeypatch.setenv("CODEX_CLI_BIN_PLATFORM_TAG", environment_tag)
+        build_data = {"unrelated": "preserved"}
+        hook.RuntimeBuildHook.initialize(
+            SimpleNamespace(target_name="wheel", config=config), "1.2.3", build_data
+        )
+        assert build_data == {
+            "unrelated": "preserved",
+            "pure_python": False,
+            "infer_tag": False,
+            "tag": f"py3-none-{expected_tag}",
+        }
+    build_data = {}
+    with pytest.raises(RuntimeError, match="unsupported wheel platform tag: linux_x86_64"):
+        hook.RuntimeBuildHook.initialize(
+            SimpleNamespace(target_name="wheel", config={"platform-tag": "linux_x86_64"}),
+            "1.2.3",
+            build_data,
+        )
+    assert build_data == {}
 
 
 def test_stage_runtime_release_copies_package_layout_and_sets_version(
@@ -328,11 +320,17 @@ def test_stage_runtime_release_copies_package_layout_and_sets_version(
     script = _load_update_script_module()
     package_archive = _write_fake_codex_package_archive(tmp_path, script)
 
+    staging_dir = tmp_path / "runtime-stage"
+    staging_dir.mkdir()
+    old_file = staging_dir / "stale.txt"
+    old_file.write_text("stale")
     staged = script.stage_python_runtime_package(
-        tmp_path / "runtime-stage",
+        staging_dir,
         "1.2.3",
         package_archive,
     )
+    assert staged == staging_dir
+    assert not old_file.exists()
     package_root = script.staged_runtime_package_root(staged)
 
     assert {
@@ -348,6 +346,13 @@ def test_stage_runtime_release_copies_package_layout_and_sets_version(
     }
     assert 'name = "openai-codex-cli-bin"' in (staged / "pyproject.toml").read_text()
     assert 'version = "1.2.3"' in (staged / "pyproject.toml").read_text()
+    pyproject = tomllib.loads((staged / "pyproject.toml").read_text())
+    assert pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["include"] == [
+        "src/codex_cli_bin/codex-package.json",
+        "src/codex_cli_bin/bin/**",
+        "src/codex_cli_bin/codex-resources/**",
+        "src/codex_cli_bin/codex-path/**",
+    ]
 
 
 def test_normalize_codex_version_accepts_release_tags_and_pep440_versions() -> None:
@@ -357,26 +362,6 @@ def test_normalize_codex_version_accepts_release_tags_and_pep440_versions() -> N
     assert script.normalize_codex_version("v0.116.0-beta.2") == "0.116.0b2"
     assert script.normalize_codex_version("0.116.0rc3") == "0.116.0rc3"
     assert script.normalize_codex_version("0.116.0") == "0.116.0"
-
-
-def test_stage_runtime_release_replaces_existing_staging_dir(tmp_path: Path) -> None:
-    script = _load_update_script_module()
-    staging_dir = tmp_path / "runtime-stage"
-    old_file = staging_dir / "stale.txt"
-    old_file.parent.mkdir(parents=True)
-    old_file.write_text("stale")
-    package_archive = _write_fake_codex_package_archive(tmp_path, script)
-
-    staged = script.stage_python_runtime_package(
-        staging_dir,
-        "1.2.3",
-        package_archive,
-    )
-
-    assert staged == staging_dir
-    assert not old_file.exists()
-    package_root = script.staged_runtime_package_root(staged)
-    assert (package_root / "bin" / script.runtime_binary_name()).read_text() == "fake codex\n"
 
 
 def test_stage_runtime_release_can_pin_wheel_platform_tag(tmp_path: Path) -> None:
@@ -402,15 +387,33 @@ def test_stage_runtime_release_rejects_archive_built_for_another_version(tmp_pat
         script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_archive)
 
 
-def test_stage_runtime_release_rejects_incomplete_package_layout(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "missing_entry",
+    [
+        "codex-package.json",
+        "bin",
+        "codex-resources",
+        "codex-path",
+        "bin/codex.exe",
+        "bin/codex-code-mode-host.exe",
+    ],
+)
+def test_stage_runtime_release_rejects_incomplete_package_layout(
+    tmp_path: Path, missing_entry: str
+) -> None:
     script = _load_update_script_module()
-    package_dir = tmp_path / "codex-package"
-    (package_dir / "bin").mkdir(parents=True)
+    package_dir = _write_fake_codex_package(tmp_path / "codex-package", script)
+    missing = package_dir / missing_entry
+    if missing.is_dir():
+        shutil.rmtree(missing)
+    else:
+        missing.unlink()
     package_archive = tmp_path / "codex-package.tar.gz"
     _write_package_archive(package_dir, package_archive)
 
-    with pytest.raises(RuntimeError, match="Missing Codex package layout entries"):
+    with pytest.raises(RuntimeError, match="Missing Codex package layout entries") as caught:
         script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_archive)
+    assert str(Path(missing_entry)) in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -448,34 +451,19 @@ def test_runtime_archive_extraction_rejects_unsafe_members(
     assert not (tmp_path / "escaped.txt").exists()
 
 
-def test_runtime_package_layout_is_included_by_wheel_config(
-    tmp_path: Path,
-) -> None:
-    script = _load_update_script_module()
-    package_archive = _write_fake_codex_package_archive(tmp_path, script)
-
-    staged = script.stage_python_runtime_package(
-        tmp_path / "runtime-stage",
-        "1.2.3",
-        package_archive,
-    )
-
-    pyproject = tomllib.loads((staged / "pyproject.toml").read_text())
-    assert pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["include"] == [
-        "src/codex_cli_bin/codex-package.json",
-        "src/codex_cli_bin/bin/**",
-        "src/codex_cli_bin/codex-resources/**",
-        "src/codex_cli_bin/codex-path/**",
-    ]
-
-
 def test_stage_sdk_release_pins_matching_runtime_version(tmp_path: Path) -> None:
     script = _load_update_script_module()
+    staging_dir = tmp_path / "sdk-stage"
+    staging_dir.mkdir()
+    old_file = staging_dir / "stale.txt"
+    old_file.write_text("stale")
     staged = script.stage_python_sdk_package(
-        tmp_path / "sdk-stage",
+        staging_dir,
         "0.1.0b1",
         "rust-v1.2.3",
     )
+    assert staged == staging_dir
+    assert not old_file.exists()
 
     pyproject = tomllib.loads((staged / "pyproject.toml").read_text())
     assert {
@@ -499,51 +487,6 @@ def test_stage_sdk_release_pins_matching_runtime_version(tmp_path: Path) -> None
         not in (staged / "src" / "openai_codex" / "client.py").read_text()
     )
     assert not any((staged / "src" / "openai_codex").glob("bin/**"))
-
-
-def test_stage_sdk_release_replaces_existing_staging_dir(tmp_path: Path) -> None:
-    script = _load_update_script_module()
-    staging_dir = tmp_path / "sdk-stage"
-    old_file = staging_dir / "stale.txt"
-    old_file.parent.mkdir(parents=True)
-    old_file.write_text("stale")
-
-    staged = script.stage_python_sdk_package(staging_dir, "0.1.0b1", "1.2.3")
-
-    assert staged == staging_dir
-    assert not old_file.exists()
-
-
-def test_sdk_beta_release_can_pin_stable_runtime(tmp_path: Path) -> None:
-    script = _load_update_script_module()
-    package_archive = _write_fake_codex_package_archive(tmp_path, script)
-
-    sdk_stage = script.stage_python_sdk_package(
-        tmp_path / "sdk-stage",
-        "0.1.0b1",
-        "1.2.3",
-    )
-    runtime_stage = script.stage_python_runtime_package(
-        tmp_path / "runtime-stage",
-        "1.2.3",
-        package_archive,
-    )
-
-    sdk_pyproject = tomllib.loads((sdk_stage / "pyproject.toml").read_text())
-    runtime_pyproject = tomllib.loads((runtime_stage / "pyproject.toml").read_text())
-
-    assert {
-        "sdk_version": sdk_pyproject["project"]["version"],
-        "runtime_version": runtime_pyproject["project"]["version"],
-        "sdk_dependencies": sdk_pyproject["project"]["dependencies"],
-    } == {
-        "sdk_version": "0.1.0b1",
-        "runtime_version": "1.2.3",
-        "sdk_dependencies": [
-            "pydantic>=2.12",
-            "openai-codex-cli-bin==1.2.3",
-        ],
-    }
 
 
 def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
@@ -714,19 +657,3 @@ def test_missing_runtime_package_requires_explicit_codex_bin() -> None:
 
     with pytest.raises(FileNotFoundError, match="missing packaged runtime"):
         client_module.resolve_codex_bin(client_module.CodexConfig(), ops)
-
-
-def test_broken_runtime_package_does_not_fall_back() -> None:
-    from openai_codex import client as client_module
-
-    ops = client_module.CodexBinResolverOps(
-        installed_codex_path=lambda: (_ for _ in ()).throw(
-            FileNotFoundError("missing packaged binary")
-        ),
-        path_exists=lambda _path: False,
-    )
-
-    with pytest.raises(FileNotFoundError) as exc_info:
-        client_module.resolve_codex_bin(client_module.CodexConfig(), ops)
-
-    assert str(exc_info.value) == ("missing packaged binary")

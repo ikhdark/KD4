@@ -72,6 +72,7 @@ $protoDir = $ProgramArgs[-1]
     $true
 )
 [System.IO.File]::WriteAllLines($env:CARGO_LANE_LOG, $ProgramArgs)
+[System.IO.File]::WriteAllText($env:CARGO_LANE_LOG + '.protoc', [string]$env:PROTOC)
 exit 0
 """,
     )
@@ -144,7 +145,9 @@ class GenerateConfigProtoTest(unittest.TestCase):
             env=fixture.env,
         )
 
-    def assert_lane_args(self, fixture: ProtoFixture) -> None:
+    def assert_lane_args(
+        self, fixture: ProtoFixture, *, protoc: Path | None = None
+    ) -> None:
         lane_args = fixture.cargo_lane_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(
             lane_args[:-1],
@@ -158,6 +161,10 @@ class GenerateConfigProtoTest(unittest.TestCase):
             ],
         )
         self.assertTrue(lane_args[-1].endswith("proto"), lane_args[-1])
+        self.assertEqual(
+            Path(str(fixture.cargo_lane_log) + ".protoc").read_text(encoding="utf-8"),
+            str(protoc if protoc is not None else fixture.default_protoc),
+        )
 
     def test_checked_binding_is_pinned_to_lf_in_worktrees(self) -> None:
         path = "codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs"
@@ -216,7 +223,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(f"Using protoc: {path_protoc}", result.stdout)
             self.assertNotIn(f"Using protoc: {fixture.default_protoc}", result.stdout)
-            self.assert_lane_args(fixture)
+            self.assert_lane_args(fixture, protoc=path_protoc)
 
     def test_explicit_protoc_precedes_environment_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -242,7 +249,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             )
             self.assertIn(f"Using protoc: {explicit_protoc}", result.stdout)
             self.assertNotIn(f"Using protoc: {env_protoc}", result.stdout)
-            self.assert_lane_args(fixture)
+            self.assert_lane_args(fixture, protoc=explicit_protoc)
 
     def test_stale_check_fails_without_replacing_binding_or_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

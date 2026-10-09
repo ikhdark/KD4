@@ -269,17 +269,27 @@ mod tests {
             template_params: Vec::new(),
         }];
 
-        assert_eq!(
-            render_mcp_tool_approval_template_from_templates(
-                &templates,
-                "codex_apps",
-                Some("calendar"),
-                Some("Calendar"),
-                Some("delete_event"),
-                Some(&json!({})),
-            ),
-            None
-        );
+        for (server, connector, title) in [
+            ("codex_apps", Some("calendar"), Some("delete_event")),
+            ("another_server", Some("calendar"), Some("create_event")),
+            ("codex_apps", Some("another_connector"), Some("create_event")),
+            ("codex_apps", None, Some("create_event")),
+            ("codex_apps", Some("calendar"), None),
+            ("codex_apps", Some("calendar"), Some(" ")),
+        ] {
+            assert_eq!(
+                render_mcp_tool_approval_template_from_templates(
+                    &templates,
+                    server,
+                    connector,
+                    Some("Calendar"),
+                    title,
+                    Some(&json!({})),
+                ),
+                None,
+                "server={server}, connector={connector:?}, title={title:?}"
+            );
+        }
     }
 
     #[test]

@@ -59,20 +59,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_default_model_for_provider_lmstudio() {
-        let result = get_default_model_for_oss_provider(LMSTUDIO_OSS_PROVIDER_ID);
-        assert_eq!(result, Some(codex_lmstudio::DEFAULT_OSS_MODEL));
-    }
-
-    #[test]
-    fn test_get_default_model_for_provider_ollama() {
-        let result = get_default_model_for_oss_provider(OLLAMA_OSS_PROVIDER_ID);
-        assert_eq!(result, Some(codex_ollama::DEFAULT_OSS_MODEL));
-    }
-
-    #[test]
-    fn test_get_default_model_for_provider_unknown() {
-        let result = get_default_model_for_oss_provider("unknown-provider");
-        assert_eq!(result, None);
+    fn default_model_matches_provider() {
+        for (provider, expected) in [
+            (LMSTUDIO_OSS_PROVIDER_ID, Some(codex_lmstudio::DEFAULT_OSS_MODEL)),
+            (OLLAMA_OSS_PROVIDER_ID, Some(codex_ollama::DEFAULT_OSS_MODEL)),
+            ("unknown-provider", None),
+        ] {
+            assert_eq!(get_default_model_for_oss_provider(provider), expected, "{provider}");
+        }
     }
 }

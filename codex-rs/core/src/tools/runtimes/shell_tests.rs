@@ -127,6 +127,9 @@ async fn command_progress_resets_stall_deadline() {
         observer,
         std::time::Duration::from_secs(10),
     ));
+    // Start the detector before advancing time; otherwise the first deadline
+    // could start at t=9 and a detector that ignores progress would also pass.
+    tokio::task::yield_now().await;
 
     tokio::time::advance(std::time::Duration::from_secs(9)).await;
     progress.record_output();

@@ -667,7 +667,11 @@ async fn code_mode_failure_returns_to_model_for_repair() -> Result<()> {
     assert!(closure.unresolved_calls.is_empty());
     assert!(closure.orphan_calls.is_empty());
     assert!(closure.complete);
-    let follow_up = harness.follow_up.single_request().body_json().to_string();
+    let follow_up = harness
+        .follow_up
+        .single_request()
+        .custom_tool_call_output("call-1")
+        .to_string();
     assert!(
         follow_up.contains("terminal failure marker"),
         "the repair request must contain the failed exec result: {follow_up}"
@@ -777,10 +781,31 @@ async fn code_mode_nested_nonzero_returns_to_model_for_repair() -> Result<()> {
     assert!(closure.unresolved_calls.is_empty());
     assert!(closure.orphan_calls.is_empty());
     assert!(closure.complete);
-    let follow_up = harness.follow_up.single_request().body_json().to_string();
-    assert!(
-        follow_up.contains("exit code 7") || follow_up.contains("exit 7"),
-        "the repair request must contain the nested command failure: {follow_up}"
+    let follow_up = harness
+        .follow_up
+        .single_request()
+        .custom_tool_call_output("call-1");
+    let records = serde_json::Deserializer::from_str(
+        follow_up["output"]
+            .as_str()
+            .expect("the repair request must contain textual tool output"),
+    )
+    .into_iter::<serde_json::Value>()
+    .collect::<serde_json::Result<Vec<_>>>()?;
+    let failures: Vec<_> = records
+        .iter()
+        .filter_map(|record| record.get("nested_command_failure"))
+        .collect();
+    assert_eq!(failures.len(), 1, "repair output: {follow_up}");
+    assert_eq!(
+        failures[0],
+        &serde_json::json!({
+            "call_id": nested.call_id,
+            "exit_code": 7,
+            "execution_state": "exited",
+            "process_exited": true,
+            "error": null,
+        })
     );
 
     Ok(())

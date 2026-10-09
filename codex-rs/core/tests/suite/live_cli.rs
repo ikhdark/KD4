@@ -20,131 +20,29 @@ fn resolve_codex_binary() -> Result<PathBuf, codex_utils_cargo_bin::CargoBinErro
     codex_utils_cargo_bin::cargo_bin("codex")
 }
 
-fn wait_for_child(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> std::io::Result<Option<std::process::ExitStatus>> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
-    }
-}
-
-/// Helper that spawns the binary inside a TempDir with minimal flags. Returns (Assert, TempDir).
+/// Runs the real CLI with live output and the same contained capture path as
+/// hermetic subprocess tests. No output-reader thread can outlive the command.
 fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
-    #![expect(clippy::unwrap_used)]
-    use std::io::Read;
-    use std::io::Write;
-    use std::thread;
-
     let dir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let codex_home = home.path().join(".codex");
     std::fs::create_dir_all(&codex_home).unwrap();
-
-    // Build a plain `std::process::Command` so we have full control over the underlying stdio
-    // handles. `assert_cmd`’s own `Command` wrapper always forces stdout/stderr to be piped
-    // internally which prevents us from streaming them live to the terminal (see its `spawn`
-    // implementation). Instead we configure the std `Command` ourselves, then later hand the
-    // resulting `Output` to `assert_cmd` for the familiar assertions.
-
-    let mut cmd = Command::new(resolve_codex_binary().unwrap());
-    cmd.current_dir(dir.path());
-    cmd.env("OPENAI_API_KEY", require_api_key());
-    cmd.env("HOME", home.path());
-    cmd.env("CODEX_HOME", &codex_home);
-
-    // We want three things at once:
-    //   1. live streaming of the child’s stdout/stderr while the test is running
-    //   2. captured output so we can keep using assert_cmd’s `Assert` helpers
-    //   3. cross‑platform behavior (best effort)
-    //
-    // To get that we:
-    //   • set both stdout and stderr to `piped()` so we can read them programmatically
-    //   • spawn a thread for each stream that copies bytes into two sinks:
-    //       – the parent process’ stdout/stderr for live visibility
-    //       – an in‑memory buffer so we can pass it to `assert_cmd` later
-
-    // Pass the prompt through the `--` separator so the CLI knows when user input ends.
-    cmd.arg("--allow-no-git-exec")
-        .arg("-v")
+    let mut command = tokio::process::Command::new(resolve_codex_binary().unwrap());
+    command
+        .current_dir(dir.path())
+        .env("OPENAI_API_KEY", require_api_key())
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_home)
+        .arg("exec")
+        .arg("--skip-git-repo-check")
         .arg("--")
         .arg(prompt);
-
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().expect("failed to spawn codex");
-
-    // Send the terminating newline so Session::run exits after the first turn.
-    child
-        .stdin
-        .as_mut()
-        .expect("child stdin unavailable")
-        .write_all(b"\n")
-        .expect("failed to write to child stdin");
-
-    // Helper that tees a ChildStdout/ChildStderr into both the parent’s stdio and a Vec<u8>.
-    fn tee<R: Read + Send + 'static>(
-        mut reader: R,
-        mut writer: impl Write + Send + 'static,
-    ) -> thread::JoinHandle<Vec<u8>> {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        writer.write_all(&chunk[..n]).ok();
-                        writer.flush().ok();
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    Err(_) => break,
-                }
-            }
-            buf
-        })
-    }
-
-    let stdout_handle = tee(
-        child.stdout.take().expect("child stdout"),
-        std::io::stdout(),
-    );
-    let stderr_handle = tee(
-        child.stderr.take().expect("child stderr"),
-        std::io::stderr(),
-    );
-
-    let status = match wait_for_child(&mut child, Duration::from_secs(5 * 60))
-        .expect("failed to wait on child")
-    {
-        Some(status) => status,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            panic!("live codex CLI exceeded the five-minute deadline");
-        }
-    };
-    let stdout = stdout_handle.join().expect("stdout thread panicked");
-    let stderr = stderr_handle.join().expect("stderr thread panicked");
-
-    let output = std::process::Output {
-        status,
-        stdout,
-        stderr,
-    };
-
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let output = runtime.block_on(core_test_support::process::capture_contained_command(
+        &mut command,
+        Duration::from_secs(5 * 60),
+        /*mirror_output*/ true,
+    )).expect("live codex CLI should finish within its process/output deadline");
     (output.assert(), dir)
 }
 
@@ -175,46 +73,91 @@ fn live_print_working_directory() {
         .stdout(predicate::str::contains(dir.path().to_string_lossy()));
 }
 
-#[test]
-fn run_codex_times_out() {
-    let spawn_child = |sleep: bool| {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--exact")
-            .arg("suite::live_cli::timeout_test_child")
-            .arg("--nocapture")
-            .stdout(Stdio::null())
+#[tokio::test]
+async fn run_codex_times_out() {
+    let command = |sleep: bool| {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command.arg("--exact").arg("suite::live_cli::timeout_test_child").arg("--nocapture")
             .env_remove("CODEX_LIVE_CLI_TIMEOUT_CHILD");
         if sleep {
             command.env("CODEX_LIVE_CLI_TIMEOUT_CHILD", "1");
         }
-        command.spawn().expect("spawn timeout test child")
+        command
     };
-
-    // A child that exits before the deadline must report its status, so a
-    // helper that always times out cannot pass the deadline check below.
-    let mut exiting = spawn_child(/*sleep*/ false);
-    let status =
-        wait_for_child(&mut exiting, Duration::from_secs(30)).expect("poll exiting test child");
-    assert!(
-        status.is_some_and(|status| status.success()),
-        "exiting child should report success before the deadline: {status:?}"
-    );
-
-    let mut child = spawn_child(/*sleep*/ true);
-    let status =
-        wait_for_child(&mut child, Duration::from_millis(25)).expect("poll timeout test child");
-    assert!(
-        status.is_none(),
-        "child should still be running at the deadline"
-    );
-    child.kill().expect("kill timeout test child");
-    child.wait().expect("reap timeout test child");
+    let output = core_test_support::process::capture_contained_command(
+        &mut command(false), Duration::from_secs(30), false,
+    ).await.expect("exiting child should finish");
+    assert!(output.status.success());
+    let started = Instant::now();
+    let error = core_test_support::process::capture_contained_command(
+        &mut command(true), Duration::from_millis(100), false,
+    ).await.expect_err("sleeping child must time out");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[test]
 fn timeout_test_child() {
     if std::env::var_os("CODEX_LIVE_CLI_TIMEOUT_CHILD").is_some() {
         std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn contained_capture_terminates_descendants_holding_both_pipes() {
+    for wait_in_root in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("descendant.pid");
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command.arg("--exact").arg("suite::live_cli::pipe_holding_test_child").arg("--nocapture")
+            .env("CODEX_PIPE_HOLDER_ROLE", "root")
+            .env("CODEX_PIPE_HOLDER_PID", &pid_path)
+            .env("CODEX_PIPE_HOLDER_WAIT", if wait_in_root { "1" } else { "0" });
+        let started = Instant::now();
+        let result = core_test_support::process::capture_contained_command(
+            &mut command, Duration::from_secs(5), false,
+        ).await;
+        let stdout_line = format!("stdout:{}", "x".repeat(12_000));
+        let stderr_line = format!("stderr:{}", "y".repeat(12_000));
+        if wait_in_root {
+            let error = result.expect_err("root and inherited pipes must time out");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let diagnostics = error.to_string();
+            assert!(diagnostics.contains(&stdout_line));
+            assert!(diagnostics.contains(&stderr_line));
+        } else {
+            let output = result.expect("root exit must close descendant pipes");
+            assert!(output.status.success());
+            assert!(String::from_utf8(output.stdout).unwrap().lines().any(|line| line == stdout_line));
+            assert!(String::from_utf8(output.stderr).unwrap().lines().any(|line| line == stderr_line));
+        }
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let pid = std::fs::read_to_string(&pid_path).expect("descendant was spawned");
+        core_test_support::process::wait_for_process_exit(&pid).await.unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn pipe_holding_test_child() {
+    match std::env::var("CODEX_PIPE_HOLDER_ROLE").as_deref() {
+        Ok("root") => {
+            let descendant = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact").arg("suite::live_cli::pipe_holding_test_child").arg("--nocapture")
+                .env("CODEX_PIPE_HOLDER_ROLE", "descendant")
+                .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
+                .spawn().unwrap();
+            std::fs::write(std::env::var_os("CODEX_PIPE_HOLDER_PID").unwrap(), descendant.id().to_string()).unwrap();
+            println!("stdout:{}", "x".repeat(12_000));
+            eprintln!("stderr:{}", "y".repeat(12_000));
+            if std::env::var("CODEX_PIPE_HOLDER_WAIT").as_deref() == Ok("1") {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            // The parent capture owns the entire Job, even after this root exits.
+            drop(descendant);
+        }
+        Ok("descendant") => std::thread::sleep(Duration::from_secs(30)),
+        _ => {}
     }
 }

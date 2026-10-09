@@ -205,15 +205,14 @@ fn remote_control_server_request_error_classifies_status_before_timeout() {
 }
 
 #[tokio::test]
-async fn request_timeout_before_response_headers_is_transient() {
-    let err = timed_out_request(/*partial_response*/ None).await;
-    assert_transient_timeout(&err, /*expected_status*/ None);
-}
-
-#[tokio::test]
-async fn response_body_timeout_is_transient() {
-    let err = timed_out_request(Some(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{")).await;
-    assert_transient_timeout(&err, Some(StatusCode::OK));
+async fn request_timeouts_before_headers_and_during_body_are_transient() {
+    for (partial_response, expected_status) in [
+        (None, None),
+        (Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{"[..]), Some(StatusCode::OK)),
+    ] {
+        let err = timed_out_request(partial_response).await;
+        assert_transient_timeout(&err, expected_status);
+    }
 }
 
 #[test]

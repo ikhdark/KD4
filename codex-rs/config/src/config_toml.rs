@@ -1086,7 +1086,8 @@ region = "us-west-2"
     #[test]
     fn current_config_serializes_its_format_boundary() {
         let serialized = toml::to_string(&ConfigToml::default()).expect("config should serialize");
-        assert!(serialized.contains("config_version = 1"));
+        let value: toml::Value = toml::from_str(&serialized).expect("valid serialized config");
+        assert_eq!(value["config_version"].as_integer(), Some(1));
     }
 
     #[test]
@@ -1140,35 +1141,25 @@ region = "us-west-2"
     }
 
     #[test]
-    fn forced_chatgpt_workspace_id_accepts_single_string() {
-        let config: ConfigToml = toml::from_str(&format!(
-            r#"forced_chatgpt_workspace_id = "{WORKSPACE_ID_A}""#
-        ))
-        .expect("single workspace id should deserialize");
-
-        assert_eq!(
-            config
-                .forced_chatgpt_workspace_id
-                .expect("workspace id should be set")
-                .into_vec(),
-            vec![WORKSPACE_ID_A.to_string()]
-        );
-    }
-
-    #[test]
-    fn forced_chatgpt_workspace_id_accepts_string_list() {
-        let config: ConfigToml = toml::from_str(&format!(
-            r#"forced_chatgpt_workspace_id = ["{WORKSPACE_ID_A}", "{WORKSPACE_ID_B}"]"#
-        ))
-        .expect("workspace id list should deserialize");
-
-        assert_eq!(
-            config
-                .forced_chatgpt_workspace_id
-                .expect("workspace ids should be set")
-                .into_vec(),
-            vec![WORKSPACE_ID_A.to_string(), WORKSPACE_ID_B.to_string()]
-        );
+    fn forced_chatgpt_workspace_id_accepts_single_and_multiple_ids() {
+        for (input, expected) in [
+            (format!(r#""{WORKSPACE_ID_A}""#), vec![WORKSPACE_ID_A]),
+            (
+                format!(r#"["{WORKSPACE_ID_A}", "{WORKSPACE_ID_B}"]"#),
+                vec![WORKSPACE_ID_A, WORKSPACE_ID_B],
+            ),
+        ] {
+            let config: ConfigToml =
+                toml::from_str(&format!("forced_chatgpt_workspace_id = {input}"))
+                    .expect("workspace ids should deserialize");
+            assert_eq!(
+                config
+                    .forced_chatgpt_workspace_id
+                    .expect("workspace ids")
+                    .into_vec(),
+                expected
+            );
+        }
     }
 
     #[test]

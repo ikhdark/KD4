@@ -2758,7 +2758,10 @@ fn canonical_tool_invocation_sha256(
         }),
         ToolPayload::Custom { input } => serde_json::json!({
             "kind": "custom",
-            "input": canonical_json_argument(input),
+            // Freeform grammars own their text semantics. JSON-shaped text is
+            // not permission to equate distinct raw invocations for replay or
+            // failure resolution.
+            "input": input,
         }),
     };
     let bytes = serde_json::to_vec(&canonicalize_json(&value)).ok()?;

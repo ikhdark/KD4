@@ -213,6 +213,23 @@ fn cold_review_context_is_attempt_bound_and_structurally_excludes_worker_history
         },
     )
     .expect("valid cold-review context");
+    assert_eq!(context.assignment, assignment);
+    assert_eq!(context.attempt_id, attempt_id);
+    assert_eq!(context.applicable_instructions, vec!["nearest AGENTS policy"]);
+    assert_eq!(context.attempt_specific_diff, "diff --git a/src/lib.rs b/src/lib.rs");
+    assert_eq!(context.relevant_contracts, vec!["source owner contract"]);
+    assert_eq!(context.nearest_tests, vec!["owner_test"]);
+    assert_eq!(
+        context.observed_writes,
+        vec![ColdReviewWriteEvidence {
+            path: "src/lib.rs".to_string(),
+            pre_write_hash: Some("before".to_string()),
+            pre_write_existed: true,
+            final_hash: Some("after".to_string()),
+            final_write_existed: Some(true),
+            attribution_confidence: AttributionConfidence::Definitive,
+        }]
+    );
     let serialized = serde_json::to_value(&context).expect("serialize cold-review context");
     let keys = serialized
         .as_object()
@@ -512,7 +529,7 @@ fn cold_review_write_identity_uses_platform_case_rules_and_rejects_duplicates() 
         attempt_id,
         applicable_instructions: vec![],
         attempt_specific_diff: String::new(),
-        observed_writes: vec![evidence("src/A.rs"), evidence("src/a.rs")],
+        observed_writes: vec![evidence("src/a.rs"), evidence("src/A.rs")],
         relevant_contracts: vec![],
         nearest_tests: vec![],
     };

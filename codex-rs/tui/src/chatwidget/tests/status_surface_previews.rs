@@ -107,6 +107,17 @@ async fn status_surface_preview_lines_live_only_snapshot() {
     );
 
     assert_chatwidget_snapshot!("status_surface_previews_live_only", snapshot);
+    chat.config.tui_terminal_title = Some(vec![
+        "project-name".to_string(),
+        "thread-title".to_string(),
+        "git-branch".to_string(),
+        "task-progress".to_string(),
+    ]);
+
+    assert_chatwidget_snapshot!(
+        "terminal_title_setup_popup_live_only",
+        terminal_title_popup_snapshot(&mut chat)
+    );
 }
 
 #[tokio::test]
@@ -148,6 +159,27 @@ async fn status_surface_preview_lines_hardcoded_only_snapshot() {
     );
 
     assert_chatwidget_snapshot!("status_surface_previews_hardcoded_only", snapshot);
+    chat.config.tui_status_line = Some(vec![
+        "project-name".to_string(),
+        "git-branch".to_string(),
+        "thread-title".to_string(),
+    ]);
+
+    assert_chatwidget_snapshot!(
+        "status_line_setup_popup_hardcoded_only",
+        status_line_popup_snapshot(&mut chat)
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    chat.config.tui_terminal_title = Some(vec![
+        "thread-title".to_string(),
+        "git-branch".to_string(),
+        "task-progress".to_string(),
+    ]);
+
+    assert_chatwidget_snapshot!(
+        "terminal_title_setup_popup_hardcoded_only",
+        terminal_title_popup_snapshot(&mut chat)
+    );
 }
 
 #[tokio::test]
@@ -166,20 +198,7 @@ async fn thread_title_falls_back_to_thread_id_when_unnamed() {
     );
 }
 
-#[tokio::test]
-async fn status_line_setup_popup_hardcoded_only_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.config.tui_status_line = Some(vec![
-        "project-name".to_string(),
-        "git-branch".to_string(),
-        "thread-title".to_string(),
-    ]);
 
-    assert_chatwidget_snapshot!(
-        "status_line_setup_popup_hardcoded_only",
-        status_line_popup_snapshot(&mut chat)
-    );
-}
 
 #[tokio::test]
 async fn status_line_setup_popup_workspace_headline_snapshot() {
@@ -231,6 +250,25 @@ async fn status_surface_preview_lines_rate_limits_snapshot() {
     );
 
     assert_chatwidget_snapshot!("status_surface_previews_rate_limits", snapshot);
+    chat.config.tui_status_line = Some(vec![
+        "five-hour-limit".to_string(),
+        "weekly-limit".to_string(),
+    ]);
+
+    assert_chatwidget_snapshot!(
+        "status_line_setup_popup_rate_limits",
+        status_line_popup_snapshot(&mut chat)
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    chat.config.tui_terminal_title = Some(vec![
+        "five-hour-limit".to_string(),
+        "weekly-limit".to_string(),
+    ]);
+
+    assert_chatwidget_snapshot!(
+        "terminal_title_setup_popup_rate_limits",
+        terminal_title_popup_snapshot(&mut chat)
+    );
 }
 
 #[tokio::test]
@@ -276,20 +314,7 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
     );
 }
 
-#[tokio::test]
-async fn status_line_setup_popup_rate_limits_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    cache_rate_limit_snapshot(&mut chat);
-    chat.config.tui_status_line = Some(vec![
-        "five-hour-limit".to_string(),
-        "weekly-limit".to_string(),
-    ]);
 
-    assert_chatwidget_snapshot!(
-        "status_line_setup_popup_rate_limits",
-        status_line_popup_snapshot(&mut chat)
-    );
-}
 
 #[tokio::test]
 async fn status_line_setup_popup_mixed_snapshot() {
@@ -308,40 +333,9 @@ async fn status_line_setup_popup_mixed_snapshot() {
     );
 }
 
-#[tokio::test]
-async fn terminal_title_setup_popup_live_only_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    cache_project_root(&mut chat, "preview-live-root");
-    chat.status_line_branch = Some("feature/live-preview-branch".to_string());
-    chat.thread_name = Some("Live preview thread".to_string());
-    chat.transcript.last_plan_progress = Some((2, 5));
-    chat.config.tui_terminal_title = Some(vec![
-        "project-name".to_string(),
-        "thread-title".to_string(),
-        "git-branch".to_string(),
-        "task-progress".to_string(),
-    ]);
 
-    assert_chatwidget_snapshot!(
-        "terminal_title_setup_popup_live_only",
-        terminal_title_popup_snapshot(&mut chat)
-    );
-}
 
-#[tokio::test]
-async fn terminal_title_setup_popup_hardcoded_only_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.config.tui_terminal_title = Some(vec![
-        "thread-title".to_string(),
-        "git-branch".to_string(),
-        "task-progress".to_string(),
-    ]);
 
-    assert_chatwidget_snapshot!(
-        "terminal_title_setup_popup_hardcoded_only",
-        terminal_title_popup_snapshot(&mut chat)
-    );
-}
 
 #[tokio::test]
 async fn terminal_title_setup_popup_mixed_snapshot() {
@@ -359,20 +353,7 @@ async fn terminal_title_setup_popup_mixed_snapshot() {
     );
 }
 
-#[tokio::test]
-async fn terminal_title_setup_popup_rate_limits_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    cache_rate_limit_snapshot(&mut chat);
-    chat.config.tui_terminal_title = Some(vec![
-        "five-hour-limit".to_string(),
-        "weekly-limit".to_string(),
-    ]);
 
-    assert_chatwidget_snapshot!(
-        "terminal_title_setup_popup_rate_limits",
-        terminal_title_popup_snapshot(&mut chat)
-    );
-}
 
 #[tokio::test]
 async fn missing_project_root_uses_different_status_and_title_preview_sources() {
@@ -397,10 +378,8 @@ async fn terminal_title_preview_uses_title_truncation_for_live_values() {
         &mut chat,
         &[TerminalTitleItem::Thread, TerminalTitleItem::GitBranch],
     );
-    let truncated_thread =
-        ChatWidget::truncate_terminal_title_part(long_thread.to_string(), /*max_chars*/ 48);
-    let truncated_branch =
-        ChatWidget::truncate_terminal_title_part(long_branch.to_string(), /*max_chars*/ 32);
-
-    assert_eq!(preview, format!("{truncated_thread} | {truncated_branch}"));
+    assert_eq!(
+        preview,
+        "This thread title is intentionally much longe... | feature/this-branch-name-is-i..."
+    );
 }

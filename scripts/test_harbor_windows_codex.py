@@ -66,7 +66,16 @@ class TerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("setsid timeout -k 5s 9s bash -lc", call["command"])
         self.assertNotIn("env", call)
         self.assertEqual(result["return_code"], 7)
-        self.assertEqual(len(list(self.logs.glob("terminal-*.json"))), 1)
+        self.assertEqual(len(self.environment.calls), 1)
+        self.assertEqual(call["timeout_sec"], 24)
+        self.assertEqual(result["command"], "printf 'héllo'")
+        self.assertEqual(result["cwd"], "/app/a b")
+        self.assertEqual(result["timeout_sec"], 9)
+        self.assertEqual(result["stdout"], "sandbox-marker\n")
+        self.assertEqual(result["stderr"], "")
+        logs = list(self.logs.glob("terminal-*.json"))
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(json.loads(logs[0].read_text(encoding="utf-8")), result)
         self.assertFalse(self.terminal.active)
 
     async def test_invalid_arguments_never_reach_environment(self):
@@ -171,9 +180,14 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
         rpc = AppServer(proc, terminal, io.StringIO(), context)
         await rpc.receive()
         await rpc.receive()
-        self.assertTrue(proc.sent[0]["result"]["success"])
-        self.assertEqual(proc.sent[0]["result"]["contentItems"][0]["type"], "inputText")
+        terminal.execute.assert_awaited_once_with("sandbox_terminal", {"command": "echo x"})
+        self.assertEqual(proc.sent, [{"id": 9, "result": {
+            "success": True,
+            "contentItems": [{"type": "inputText", "text": '{"return_code": 1}'}],
+        }}])
+        self.assertEqual(context.n_input_tokens, 10)
         self.assertEqual(context.n_cache_tokens, 3)
+        self.assertEqual(context.n_output_tokens, 2)
 
     async def test_duplicate_and_unexpected_requests_fail_closed(self):
         frame = {"id": 9, "method": "item/tool/call", "params": {"callId": "call", "tool": "sandbox_terminal", "arguments": {"command": "x"}}}
@@ -280,6 +294,16 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(config["agents"][0]["name"], "scripts.harbor_windows_codex:WindowsPatchReplay")
         self.assertFalse(config.get("verifier", {}).get("disable", False))
         self.assertEqual(find_patch(source, "instance_a").read_bytes(), b"")
+        duplicate = source / "instance_a__duplicate"
+        (duplicate / "agent").mkdir(parents=True)
+        result_path = duplicate / "result.json"
+        result_path.write_text(json.dumps({"task_name": "instance_a"}))
+        (duplicate / "agent" / "model.patch").write_bytes(b"")
+        with self.assertRaisesRegex(ValueError, "Ambiguous"):
+            launcher.build_command(args)
+        with self.assertRaisesRegex(ValueError, "found 2"):
+            find_patch(source, "instance_a")
+        result_path.unlink()
         (source / "instance_a__trial" / "agent" / "model.patch").unlink()
         with self.assertRaisesRegex(ValueError, "missing"):
             launcher.build_command(args)

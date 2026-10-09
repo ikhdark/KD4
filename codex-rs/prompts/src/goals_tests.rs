@@ -217,7 +217,7 @@ fn protocol_maximum_objective_survives_worst_case_escaping() {
         budget_limit_prompt(&goal(ThreadGoalStatus::BudgetLimited)),
         objective_updated_prompt(&goal(ThreadGoalStatus::Active)),
     ] {
-        assert!(prompt.contains("TAIL"));
+        assert!(prompt.contains(&objective.replace('&', "&amp;")));
         assert!(!prompt.contains(GOAL_OBJECTIVE_TRUNCATED_MARKER));
     }
 }

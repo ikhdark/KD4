@@ -969,9 +969,12 @@ async fn termination_claim_prevents_stored_value_commit() {
 fn failed_completion_delivery_rebuffers_the_event() {
     let cell_state = CellState::new(CancellationToken::new());
     let event = CellEvent::Completed {
-        output_loss: None,
-        content_items: Vec::new(),
-        error_text: None,
+        output_loss: Some(codex_code_mode_protocol::OutputLoss {
+            discarded_items: 2,
+            discarded_bytes_lower_bound: 17,
+        }),
+        content_items: vec![OutputItem::Text { text: "retained λ\n".into() }],
+        error_text: Some("original failure".into()),
     };
     assert_eq!(
         cell_state.commit_completion(

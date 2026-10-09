@@ -16,58 +16,44 @@ fn known_model_info() -> ModelInfo {
 }
 
 #[test]
-fn warns_when_code_mode_is_enabled_without_model_selector() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::CodeMode);
-
-    assert_eq!(
-        unsupported_code_mode_warning(&known_model_info(), &features),
-        Some(format!(
-            "Code Mode is enabled in configuration, but model `{MODEL_SLUG}` does not advertise Code Mode support. This may degrade model performance. Disable `features.code_mode` and `features.code_mode_only`, or select a model whose metadata enables Code Mode."
-        ))
-    );
-}
-
-#[test]
-fn warns_when_code_mode_only_is_enabled_without_model_selector() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::CodeModeOnly);
-
-    assert!(unsupported_code_mode_warning(&known_model_info(), &features).is_some());
-}
-
-#[test]
-fn does_not_warn_when_code_mode_is_disabled() {
-    let mut features = Features::with_defaults();
-    features.disable(Feature::CodeMode);
-    features.disable(Feature::CodeModeOnly);
-    assert_eq!(
-        unsupported_code_mode_warning(&known_model_info(), &features),
-        None
-    );
-}
-
-#[test]
-fn does_not_warn_when_model_has_tool_mode_selector() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::CodeModeOnly);
-
-    for tool_mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
-        let model_info = ModelInfo {
-            tool_mode: Some(tool_mode),
-            ..known_model_info()
-        };
-        assert_eq!(unsupported_code_mode_warning(&model_info, &features), None);
+fn warning_policy_covers_features_metadata_and_model_selectors() {
+    for code_mode in [false, true] {
+        for code_mode_only in [false, true] {
+            let mut features = Features::with_defaults();
+            features.disable(Feature::CodeMode);
+            features.disable(Feature::CodeModeOnly);
+            if code_mode {
+                features.enable(Feature::CodeMode);
+            }
+            if code_mode_only {
+                features.enable(Feature::CodeModeOnly);
+            }
+            for fallback in [false, true] {
+                for tool_mode in [
+                    None,
+                    Some(ToolMode::Direct),
+                    Some(ToolMode::CodeMode),
+                    Some(ToolMode::CodeModeOnly),
+                ] {
+                    let should_warn = (code_mode || code_mode_only)
+                        && !fallback
+                        && tool_mode.is_none();
+                    let model_info = ModelInfo {
+                        tool_mode,
+                        used_fallback_model_metadata: fallback,
+                        ..known_model_info()
+                    };
+                    let expected = should_warn.then(|| format!(
+                        "Code Mode is enabled in configuration, but model `{MODEL_SLUG}` does not advertise Code Mode support. This may degrade model performance. Disable `features.code_mode` and `features.code_mode_only`, or select a model whose metadata enables Code Mode."
+                    ));
+                    assert_eq!(
+                        unsupported_code_mode_warning(&model_info, &features),
+                        expected,
+                        "code_mode={code_mode}, code_mode_only={code_mode_only}, fallback={fallback}, tool_mode={:?}",
+                        model_info.tool_mode
+                    );
+                }
+            }
+        }
     }
-}
-
-#[test]
-fn fallback_metadata_only_uses_existing_warning() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::CodeMode);
-
-    assert_eq!(
-        unsupported_code_mode_warning(&model_info_from_slug(MODEL_SLUG), &features),
-        None
-    );
 }

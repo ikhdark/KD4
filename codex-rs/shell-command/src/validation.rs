@@ -604,6 +604,14 @@ fn execution_mode(binary: &str, args: &[String], operation: ValidationOperation)
         return Mode::CompilationOnly;
     }
     if binary == "cargo" && let Ok(Some(index)) = cargo_subcommand_index(args) {
+        // Cargo forwards arguments after `--` to libtest. Its help flags
+        // display usage and exit without running any tests or benchmarks.
+        if matches!(args[index].as_str(), "test" | "t" | "bench")
+            && let Some(separator) = args[index + 1..].iter().position(|arg| arg == "--")
+            && args[index + separator + 2..].iter().any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+        {
+            return Mode::Listing;
+        }
         match args[index].as_str() {
             "fmt" => return if has(&["--check"]) { Mode::Checking } else { Mode::Mutation },
             "clippy" if has(&["--fix"]) => return Mode::Mutation,
@@ -849,8 +857,6 @@ fn python_operation(args: &[String]) -> Option<ValidationOperation> {
             "-b" | "-B"
                 | "-d"
                 | "-E"
-                | "-h"
-                | "--help"
                 | "-i"
                 | "-I"
                 | "-O"
@@ -861,8 +867,6 @@ fn python_operation(args: &[String]) -> Option<ValidationOperation> {
                 | "-S"
                 | "-u"
                 | "-v"
-                | "-V"
-                | "--version"
                 | "-x"
         ) {
             index += 1;
@@ -1399,22 +1403,32 @@ mod tests {
 
     #[test]
     fn operation_recognizer_keeps_supported_runner_families() {
-        for invocation in [
-            argv("cargo", &["test", "--all-features"]),
-            argv("pytest", &["-q"]),
-            argv("python", &["-m", "unittest", "discover"]),
-            argv("dotnet", &["test", "--no-restore"]),
-            argv("go", &["test", "./..."]),
-            argv("npm", &["run", "test:unit", "--", "--watch=false"]),
-            argv("pnpm", &["run", "lint"]),
-            argv("yarn", &["test"]),
-            argv("mvn", &["test", "-Dgroups=unit"]),
-            argv("gradlew", &[":module:test", "--continue"]),
-            argv("just", &["fmt", "--unstable"]),
-            argv("make", &["tests"]),
-            argv("task", &["check"]),
+        use ValidationOperation::{Check, Lint, Test};
+        for (invocation, operation) in [
+            (argv("cargo", &["test", "--all-features"]), Test),
+            (argv("pytest", &["-q"]), Test),
+            (argv("python", &["-m", "unittest", "discover"]), Test),
+            (argv("dotnet", &["test", "--no-restore"]), Test),
+            (argv("go", &["test", "./..."]), Test),
+            (argv("npm", &["run", "test:unit", "--", "--watch=false"]), Test),
+            (argv("pnpm", &["run", "lint"]), Lint),
+            (argv("yarn", &["test"]), Test),
+            (argv("mvn", &["test", "-Dgroups=unit"]), Test),
+            (argv("gradlew", &[":module:test", "--continue"]), Test),
+            (argv("just", &["fmt", "--unstable"]), Lint),
+            (argv("make", &["tests"]), Test),
+            (argv("task", &["check"]), Check),
         ] {
-            assert!(is_validation(&invocation), "{invocation:?}");
+            let mode = match operation {
+                Test => ValidationExecutionMode::Execution,
+                Check | Lint => ValidationExecutionMode::Checking,
+                _ => unreachable!("table contains only test/check/lint"),
+            };
+            assert_eq!(invocation, ValidationClassification::Validation {
+                leaves: vec![ValidationCommandDescriptor { operation, mode }],
+                has_unclassified_targets: false,
+                exit_code_is_authoritative: true,
+            });
         }
     }
 
@@ -1538,11 +1552,13 @@ mod tests {
     }
 
     #[test]
-    fn cargo_test_binary_arguments_do_not_request_cargo_help() {
-        for args in [
-            vec!["test", "--", "--help"],
-            vec!["test", "--", "-h"],
-            vec!["+stable", "test", "--", "--exact", "help"],
+    fn cargo_test_binary_help_does_not_prove_execution() {
+        for (args, operation, mode) in [
+            (vec!["test", "--", "--help"], ValidationOperation::Test, ValidationExecutionMode::Listing),
+            (vec!["test", "--", "-h"], ValidationOperation::Test, ValidationExecutionMode::Listing),
+            (vec!["t", "--", "--help"], ValidationOperation::Test, ValidationExecutionMode::Listing),
+            (vec!["bench", "--", "--help"], ValidationOperation::Bench, ValidationExecutionMode::Listing),
+            (vec!["+stable", "test", "--", "--exact", "help"], ValidationOperation::Test, ValidationExecutionMode::Execution),
         ] {
             assert!(matches!(
                 argv("cargo", &args),
@@ -1550,9 +1566,30 @@ mod tests {
                     leaves,
                     has_unclassified_targets: false,
                     exit_code_is_authoritative: true,
-                } if leaves == vec![ValidationCommandDescriptor { operation: ValidationOperation::Test, mode: ValidationExecutionMode::Execution }]
+                } if leaves == vec![ValidationCommandDescriptor { operation, mode }]
             ), "{args:?}");
         }
+    }
+
+    #[test]
+    fn python_interpreter_help_and_version_do_not_run_modules() {
+        // Python's interpreter help specifies that these options print and
+        // exit before executing the module; flags after -m belong to it.
+        for flag in ["-h", "--help", "-V", "--version"] {
+            assert_eq!(
+                argv("python", &["-I", flag, "-m", "pytest"]),
+                ValidationClassification::NonValidation,
+                "{flag}",
+            );
+        }
+        assert!(matches!(
+            argv("python", &["-I", "-B", "-m", "unittest"]),
+            ValidationClassification::Validation { leaves, .. }
+                if leaves == vec![ValidationCommandDescriptor {
+                    operation: ValidationOperation::Test,
+                    mode: ValidationExecutionMode::Execution,
+                }]
+        ));
     }
 
     #[test]

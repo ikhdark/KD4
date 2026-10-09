@@ -243,6 +243,7 @@ async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
     })
     .await?;
     let direct_tools = tool_names(&direct_body);
+    assert!(!direct_tools.is_empty(), "direct mode must still advertise executable tools");
     assert!(
         direct_tools
             .iter()
@@ -414,6 +415,7 @@ async fn remote_multi_agent_selector_overrides_feature_flags() -> Result<()> {
     })
     .await?;
     let disabled_tools = tool_names(&disabled_body);
+    assert!(!disabled_tools.is_empty(), "disabling agents must preserve other tools");
     assert!(disabled_tools.iter().all(|name| !matches!(
         name.as_str(),
         "multi_agent_v1"

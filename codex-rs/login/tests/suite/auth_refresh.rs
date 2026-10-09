@@ -729,72 +729,6 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
 
 #[serial_test::serial(auth_env)]
 #[tokio::test]
-async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Result<()> {
-    require_network!();
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-            "error": {
-                "code": "refresh_token_expired"
-            }
-        })))
-        .expect(0)
-        .mount(&server)
-        .await;
-
-    let ctx = RefreshTokenTestContext::new(&server).await?;
-    let stale_refresh = Utc::now() - Duration::days(9);
-    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens),
-        last_refresh: Some(stale_refresh),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-    ctx.write_auth(&initial_auth).await?;
-
-    let fresh_refresh = Utc::now() - Duration::days(1);
-    let disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
-    let disk_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(disk_tokens.clone()),
-        last_refresh: Some(fresh_refresh),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )?;
-
-    let cached_auth = ctx
-        .auth_manager
-        .auth()
-        .await
-        .context("auth should reload from disk")?;
-    let cached = cached_auth
-        .get_token_data()
-        .context("token data should reload from disk")?;
-    assert_eq!(cached, disk_tokens);
-
-    let stored = ctx.load_auth()?;
-    assert_eq!(stored, disk_auth);
-
-    server.verify().await;
-    Ok(())
-}
-
-#[serial_test::serial(auth_env)]
-#[tokio::test]
 async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Result<()> {
     require_network!();
 
@@ -853,136 +787,69 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
 async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
     require_network!();
 
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-            "error": {
-                "code": "refresh_token_reused"
-            }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    for status in [400, 401] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                "error": {
+                    "code": "refresh_token_reused"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    let ctx = RefreshTokenTestContext::new(&server).await?;
-    let initial_last_refresh = Utc::now() - Duration::days(1);
-    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-    ctx.write_auth(&initial_auth).await?;
+        let ctx = RefreshTokenTestContext::new(&server).await?;
+        let initial_last_refresh = Utc::now() - Duration::days(1);
+        let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
+        let initial_auth = AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
+            openai_api_key: None,
+            tokens: Some(initial_tokens.clone()),
+            last_refresh: Some(initial_last_refresh),
+            agent_identity: None,
+            personal_access_token: None,
+            bedrock_api_key: None,
+        };
+        ctx.write_auth(&initial_auth).await?;
 
-    let first_err = ctx
-        .auth_manager
-        .refresh_token()
-        .await
-        .err()
-        .context("first refresh should fail")?;
-    assert_eq!(
-        first_err.failed_reason(),
-        Some(RefreshTokenFailedReason::Exhausted)
-    );
+        let first_err = ctx
+            .auth_manager
+            .refresh_token()
+            .await
+            .err()
+            .context("first refresh should fail")?;
+        assert_eq!(
+            first_err.failed_reason(),
+            Some(RefreshTokenFailedReason::Exhausted)
+        );
 
-    let second_err = ctx
-        .auth_manager
-        .refresh_token()
-        .await
-        .err()
-        .context("second refresh should fail without retrying")?;
-    assert_eq!(
-        second_err.failed_reason(),
-        Some(RefreshTokenFailedReason::Exhausted)
-    );
+        let second_err = ctx
+            .auth_manager
+            .refresh_token()
+            .await
+            .err()
+            .context("second refresh should fail without retrying")?;
+        assert_eq!(
+            second_err.failed_reason(),
+            Some(RefreshTokenFailedReason::Exhausted)
+        );
 
-    let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
-    let cached_auth = ctx
-        .auth_manager
-        .auth()
-        .await
-        .context("auth should remain cached")?;
-    let cached = cached_auth
-        .get_token_data()
-        .context("token data should remain cached")?;
-    assert_eq!(cached, initial_tokens);
+        let stored = ctx.load_auth()?;
+        assert_eq!(stored, initial_auth);
+        let cached_auth = ctx
+            .auth_manager
+            .auth()
+            .await
+            .context("auth should remain cached")?;
+        let cached = cached_auth
+            .get_token_data()
+            .context("token data should remain cached")?;
+        assert_eq!(cached, initial_tokens);
 
-    server.verify().await;
-    Ok(())
-}
-
-#[serial_test::serial(auth_env)]
-#[tokio::test]
-async fn refresh_token_does_not_retry_after_bad_request_reused_failure() -> Result<()> {
-    require_network!();
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": {
-                "code": "refresh_token_reused"
-            }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let ctx = RefreshTokenTestContext::new(&server).await?;
-    let initial_last_refresh = Utc::now() - Duration::days(1);
-    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-    ctx.write_auth(&initial_auth).await?;
-
-    let first_err = ctx
-        .auth_manager
-        .refresh_token()
-        .await
-        .err()
-        .context("first refresh should fail")?;
-    assert_eq!(
-        first_err.failed_reason(),
-        Some(RefreshTokenFailedReason::Exhausted)
-    );
-
-    let second_err = ctx
-        .auth_manager
-        .refresh_token()
-        .await
-        .err()
-        .context("second refresh should fail without retrying")?;
-    assert_eq!(
-        second_err.failed_reason(),
-        Some(RefreshTokenFailedReason::Exhausted)
-    );
-
-    let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
-    let cached_auth = ctx
-        .auth_manager
-        .auth()
-        .await
-        .context("auth should remain cached")?;
-    let cached = cached_auth
-        .get_token_data()
-        .context("token data should remain cached")?;
-    assert_eq!(cached, initial_tokens);
-
-    server.verify().await;
+        server.verify().await;
+    }
     Ok(())
 }
 
@@ -1347,6 +1214,100 @@ async fn unauthorized_recovery_requires_chatgpt_auth() -> Result<()> {
     Ok(())
 }
 
+#[serial_test::serial(auth_env)]
+#[tokio::test]
+async fn refresh_response_preserves_auth_replaced_during_http_request() -> Result<()> {
+    require_network!();
+    let _access_token_guard = EnvGuard::remove(codex_login::CODEX_ACCESS_TOKEN_ENV_VAR);
+
+    for replacement_kind in ["api_key", "other_account", "newer_tokens", "logout", "unchanged"] {
+        let server = MockServer::start().await;
+        let ctx = RefreshTokenTestContext::new(&server).await?;
+        let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
+        let initial_auth = AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
+            openai_api_key: None,
+            tokens: Some(initial_tokens.clone()),
+            last_refresh: Some(Utc::now()),
+            agent_identity: None,
+            personal_access_token: None,
+            bedrock_api_key: None,
+        };
+        ctx.write_auth(&initial_auth).await?;
+        let replacement = match replacement_kind {
+            "api_key" => Some(AuthDotJson {
+                auth_mode: Some(AuthMode::ApiKey),
+                openai_api_key: Some("replacement-api-key".into()),
+                tokens: None,
+                ..initial_auth.clone()
+            }),
+            "other_account" | "newer_tokens" => {
+                let mut tokens = build_tokens("replacement-access", "replacement-refresh");
+                if replacement_kind == "other_account" {
+                    tokens.account_id = Some("other-account".into());
+                }
+                Some(AuthDotJson {
+                    tokens: Some(tokens),
+                    ..initial_auth.clone()
+                })
+            }
+            "logout" => None,
+            _ => Some(initial_auth.clone()),
+        };
+        let response_replacement = replacement.clone();
+        let codex_home = ctx.codex_home.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["refresh_token"], INITIAL_REFRESH_TOKEN);
+                // Replace real storage after the old token reaches the server, before its
+                // response reaches the real AuthManager persistence path.
+                if let Some(auth) = &response_replacement {
+                    save_auth(
+                        &codex_home,
+                        auth,
+                        AuthCredentialsStoreMode::File,
+                        AuthKeyringBackendKind::default(),
+                    )
+                    .unwrap();
+                } else {
+                    std::fs::remove_file(codex_home.join("auth.json")).unwrap();
+                }
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "refreshed-access",
+                    "refresh_token": "refreshed-refresh",
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = ctx.auth_manager.refresh_token_from_authority().await;
+        let stored = load_auth_dot_json(
+            ctx.codex_home.path(),
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )?;
+        if replacement_kind == "unchanged" {
+            result.context("unchanged credentials should still refresh")?;
+            assert_eq!(
+                stored.context("refreshed auth should exist")?.tokens,
+                Some(TokenData {
+                    access_token: "refreshed-access".into(),
+                    refresh_token: "refreshed-refresh".into(),
+                    ..initial_tokens
+                })
+            );
+        } else {
+            assert!(result.is_err(), "stale refresh should fail: {replacement_kind}");
+            assert_eq!(stored, replacement, "replacement must remain intact: {replacement_kind}");
+        }
+        server.verify().await;
+    }
+    Ok(())
+}
+
 struct RefreshTokenTestContext {
     codex_home: TempDir,
     auth_manager: Arc<AuthManager>,
@@ -1406,6 +1367,13 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
+    fn remove(key: &'static str) -> Self {
+        let original = std::env::var_os(key);
+        // SAFETY: callers hold the same auth_env serial guard as the other auth tests.
+        unsafe { std::env::remove_var(key) };
+        Self { key, original }
+    }
+
     fn set(key: &'static str, value: String) -> Self {
         let original = std::env::var_os(key);
         // SAFETY: these tests execute serially, so updating the process environment is safe.

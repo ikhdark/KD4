@@ -644,8 +644,12 @@ async fn test_list_conversations_latest_first() {
         .join("01")
         .join(format!("rollout-2025-01-01T12-00-00-{u1}.jsonl"));
 
-    let updated_times: Vec<Option<String>> =
-        page.items.iter().map(|i| i.updated_at.clone()).collect();
+    // The fixture explicitly sets mtime; do not use the result as its own oracle.
+    let updated_times = [
+        Some("2025-01-03T12:00:00Z".to_string()),
+        Some("2025-01-02T12:00:00Z".to_string()),
+        Some("2025-01-01T12:00:00Z".to_string()),
+    ];
 
     let expected = ThreadsPage {
         items: vec![
@@ -800,8 +804,10 @@ async fn test_pagination_cursor() {
         .join("03")
         .join("04")
         .join(format!("rollout-2025-03-04T09-00-00-{u4}.jsonl"));
-    let updated_page1: Vec<Option<String>> =
-        page1.items.iter().map(|i| i.updated_at.clone()).collect();
+    let updated_page1 = [
+        Some("2025-03-05T09:00:00Z".to_string()),
+        Some("2025-03-04T09:00:00Z".to_string()),
+    ];
     let expected_cursor1 = parse_cursor(format!("2025-03-04T09-00-00|{u4}").as_str()).unwrap();
     let expected_page1 = ThreadsPage {
         items: vec![
@@ -878,8 +884,10 @@ async fn test_pagination_cursor() {
         .join("03")
         .join("02")
         .join(format!("rollout-2025-03-02T09-00-00-{u2}.jsonl"));
-    let updated_page2: Vec<Option<String>> =
-        page2.items.iter().map(|i| i.updated_at.clone()).collect();
+    let updated_page2 = [
+        Some("2025-03-03T09:00:00Z".to_string()),
+        Some("2025-03-02T09:00:00Z".to_string()),
+    ];
     let expected_cursor2 = parse_cursor(format!("2025-03-02T09-00-00|{u2}").as_str()).unwrap();
     let expected_page2 = ThreadsPage {
         items: vec![
@@ -950,8 +958,7 @@ async fn test_pagination_cursor() {
         .join("03")
         .join("01")
         .join(format!("rollout-2025-03-01T09-00-00-{u1}.jsonl"));
-    let updated_page3: Vec<Option<String>> =
-        page3.items.iter().map(|i| i.updated_at.clone()).collect();
+    let updated_page3 = [Some("2025-03-01T09:00:00Z".to_string())];
     let expected_page3 = ThreadsPage {
         items: vec![ThreadItem {
             path: p1,
@@ -1145,8 +1152,8 @@ async fn test_get_thread_contents() {
             model_provider: Some(TEST_PROVIDER.to_string()),
             cli_version: Some("test_version".to_string()),
             created_at: Some(ts.into()),
-            recency_at: page.items[0].updated_at.clone(),
-            updated_at: page.items[0].updated_at.clone(),
+            recency_at: Some("2025-04-01T10:30:00Z".to_string()),
+            updated_at: Some("2025-04-01T10:30:00Z".to_string()),
         }],
         next_cursor: None,
         num_scanned_files: 1,
@@ -1396,6 +1403,9 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
         };
         writeln!(file, "{}", serde_json::to_string(&response_line)?)?;
     }
+    let expected_updated = chrono::DateTime::parse_from_rfc3339("2025-06-02T09:10:11Z")?
+        .with_timezone(&chrono::Utc);
+    file.set_times(FileTimes::new().set_modified(expected_updated.into()))?;
     drop(file);
 
     let provider_filter = provider_vec(&[TEST_PROVIDER]);
@@ -1418,9 +1428,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .expect("updated_at set from file mtime");
-    let now = chrono::Utc::now();
-    let age = now - updated;
-    assert!(age.num_seconds().abs() < 30);
+    assert_eq!(updated, expected_updated);
 
     Ok(())
 }
@@ -1492,8 +1500,10 @@ async fn test_cursor_preserves_same_second_filesystem_ties() {
         .join("07")
         .join("01")
         .join(format!("rollout-2025-07-01T00-00-00-{u1}.jsonl"));
-    let updated_page1: Vec<Option<String>> =
-        page1.items.iter().map(|i| i.updated_at.clone()).collect();
+    let updated_page1 = [
+        Some("2025-07-01T00:00:00Z".to_string()),
+        Some("2025-07-01T00:00:00Z".to_string()),
+    ];
     let expected_cursor1 = parse_cursor(format!("{ts}|{u2}").as_str()).unwrap();
     let expected_page1 = ThreadsPage {
         items: vec![
@@ -1558,7 +1568,7 @@ async fn test_cursor_preserves_same_second_filesystem_ties() {
     )
     .await
     .unwrap();
-    let updated_page2 = page2.items.first().and_then(|item| item.updated_at.clone());
+    let updated_page2 = Some("2025-07-01T00:00:00Z".to_string());
     let expected_page2 = ThreadsPage {
         items: vec![ThreadItem {
             path: p1,

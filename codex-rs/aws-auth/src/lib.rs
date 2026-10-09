@@ -175,31 +175,45 @@ mod tests {
 
     #[tokio::test]
     async fn sign_adds_sigv4_headers_and_preserves_existing_headers() {
-        let signed = test_context(/*session_token*/ None)
-            .sign_at(
-                test_request(),
-                UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            )
-            .await
-            .expect("request should sign");
+        for session_token in [None, Some("session-token")] {
+            let signed = test_context(session_token)
+                .sign_at(
+                    test_request(),
+                    UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                )
+                .await
+                .expect("request should sign");
 
-        assert_eq!(
-            signing::header_value(&signed.headers, http::header::CONTENT_TYPE.as_str()),
-            Some("application/json".to_string())
-        );
-        assert_eq!(
-            signing::header_value(&signed.headers, "x-test-header"),
-            Some("present".to_string())
-        );
-        assert_eq!(
-            signed.url,
-            "https://bedrock-runtime.us-east-1.amazonaws.com/v1/responses"
-        );
-        assert!(
-            signing::header_value(&signed.headers, http::header::AUTHORIZATION.as_str())
-                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 "))
-        );
-        assert!(signing::header_value(&signed.headers, "x-amz-date").is_some());
+            assert_eq!(
+                signing::header_value(&signed.headers, http::header::CONTENT_TYPE.as_str()),
+                Some("application/json".to_string())
+            );
+            assert_eq!(
+                signing::header_value(&signed.headers, "x-test-header"),
+                Some("present".to_string())
+            );
+            assert_eq!(
+                signed.url,
+                "https://bedrock-runtime.us-east-1.amazonaws.com/v1/responses"
+            );
+            let authorization =
+                signing::header_value(&signed.headers, http::header::AUTHORIZATION.as_str())
+                    .expect("SigV4 authorization header");
+            assert!(
+                authorization.starts_with(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-east-1/bedrock/aws4_request, "
+                ),
+                "{authorization}"
+            );
+            assert_eq!(
+                signing::header_value(&signed.headers, "x-amz-date"),
+                Some("20231114T221320Z".to_string())
+            );
+            assert_eq!(
+                signing::header_value(&signed.headers, "x-amz-security-token"),
+                session_token.map(str::to_string)
+            );
+        }
     }
 
     #[test]
@@ -227,22 +241,6 @@ mod tests {
         assert!(
             !AwsAuthError::Credentials(CredentialsError::unhandled("unexpected response"))
                 .is_retryable()
-        );
-    }
-
-    #[tokio::test]
-    async fn sign_includes_session_token_when_credentials_have_one() {
-        let signed = test_context(Some("session-token"))
-            .sign_at(
-                test_request(),
-                UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            )
-            .await
-            .expect("request should sign");
-
-        assert_eq!(
-            signing::header_value(&signed.headers, "x-amz-security-token"),
-            Some("session-token".to_string())
         );
     }
 

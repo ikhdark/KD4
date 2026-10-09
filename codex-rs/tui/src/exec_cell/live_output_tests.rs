@@ -124,8 +124,12 @@ fn retained_output_stays_within_the_live_byte_budget() {
     let lines: Vec<_> = output.lines().collect();
     assert_eq!(output.total_lines(), 181);
     assert_eq!(output.retained_lines(), 101);
-    assert!(lines.first().expect("head line").starts_with("head-1 "));
-    assert!(lines[50].starts_with("head-131 "));
+    assert_eq!(lines.len(), 101);
+    for (line, number) in lines.iter().zip((1..=50).chain(131..=180)) {
+        assert!(line.starts_with(&format!("head-{number} ")), "{number}");
+        assert!(line.ends_with(&format!(" tail-{number}")), "{number}");
+    }
+    assert_eq!(output.lines().rev().collect::<Vec<_>>(), lines.iter().rev().cloned().collect::<Vec<_>>());
     assert!(lines.last().expect("tail line").ends_with(" partial-tail"));
     assert_eq!(
         output.transcript_lines().nth(50).expect("omission line"),

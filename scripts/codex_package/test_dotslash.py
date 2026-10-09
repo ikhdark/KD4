@@ -45,24 +45,10 @@ class DotSlashCacheStampTest(unittest.TestCase):
 
             self.assertEqual(first["name"], "first")
             self.assertIs(first, second)
-
-    def test_clear_runtime_caches_clears_manifest_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            manifest = Path(temp_dir) / "artifact"
-            manifest.write_text(
-                '#!/usr/bin/env dotslash\n{"name": "first", "platforms": {}}\n',
-                encoding="utf-8",
-            )
-
-            first = dotslash.load_manifest(manifest)
-            manifest.write_text(
-                '{"name": "second", "platforms": {}}\n', encoding="utf-8"
-            )
             dotslash.clear_runtime_caches()
-            second = dotslash.load_manifest(manifest)
-
-            self.assertEqual(first["name"], "first")
-            self.assertEqual(second["name"], "second")
+            refreshed = dotslash.load_manifest(manifest)
+            self.assertEqual(refreshed["name"], "second")
+            self.assertIsNot(refreshed, first)
 
     def test_cached_archive_is_reverified(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -101,6 +87,18 @@ class DotSlashCacheStampTest(unittest.TestCase):
             self.assertFalse(dotslash.archive_is_valid(archive_path, artifact, "rg"))
             self.assertFalse(archive_path.exists())
 
+    def test_invalid_utf8_extracted_stamp_is_a_cache_miss(self) -> None:
+        # A cache stamp is optional proof, not an input requirement. Corruption
+        # must cause revalidation rather than block use of the source archive.
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory) / "rg.exe"
+            dest.write_bytes(b"previous executable")
+            stamp = dotslash.extracted_member_stamp_path(dest)
+            stamp.write_bytes(b"\xff")
+            artifact = DotSlashArtifact(1, "0" * 64, "zip", "rg.exe", "file:///rg.zip")
+            self.assertFalse(dotslash.extracted_member_is_valid(dest, artifact))
+            self.assertEqual(dest.read_bytes(), b"previous executable")
+
     def test_same_size_corrupt_archive_is_rejected_and_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = Path(temp_dir) / "rg.zip"
@@ -119,21 +117,6 @@ class DotSlashCacheStampTest(unittest.TestCase):
             self.assertFalse(dotslash.archive_is_valid(archive_path, artifact, "rg"))
             self.assertFalse(archive_path.exists())
             self.assertFalse(dotslash.verified_archive_stamp_path(archive_path).exists())
-
-    def test_extracted_member_stamp_validates_warm_destination(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            dest = Path(temp_dir) / "rg"
-            dest.write_text("rg", encoding="utf-8")
-            artifact = DotSlashArtifact(
-                size=3,
-                digest="0" * 64,
-                archive_format="zip",
-                archive_member="rg",
-                url="https://example.test/rg.zip",
-            )
-            dotslash.write_extracted_member_stamp(dest, artifact)
-
-            self.assertTrue(dotslash.extracted_member_is_valid(dest, artifact))
 
     def test_fetch_uses_extracted_stamp_before_archive_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

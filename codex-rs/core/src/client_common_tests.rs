@@ -257,6 +257,9 @@ fn serializes_text_schema_with_non_strict_format() {
     let format = text_controls.format.expect("format field");
     assert!(!format.strict);
     assert_eq!(format.schema, schema);
+    let serialized = serde_json::to_value(&format).expect("serialized format");
+    assert_eq!(serialized["strict"], false);
+    assert_eq!(serialized["schema"], schema);
 }
 
 #[test]

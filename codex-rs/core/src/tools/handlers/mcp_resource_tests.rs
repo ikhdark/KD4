@@ -190,16 +190,6 @@ async fn step_context_with_blocked_mcp_server(
 }
 
 #[test]
-fn resource_with_server_serializes_server_field() {
-    let entry = ResourceWithServer::new("test".to_string(), resource("memo://id", "memo"));
-    let value = serde_json::to_value(&entry).expect("serialize resource");
-
-    assert_eq!(value["server"], json!("test"));
-    assert_eq!(value["uri"], json!("memo://id"));
-    assert_eq!(value["name"], json!("memo"));
-}
-
-#[test]
 fn list_resources_payload_from_single_server_copies_next_cursor() {
     let result = ListResourcesResult {
         meta: None,
@@ -218,7 +208,10 @@ fn list_resources_payload_from_single_server_copies_next_cursor() {
     assert_eq!(value["nextCursor"], json!("cursor-1"));
     let resources = value["resources"].as_array().expect("resources array");
     assert_eq!(resources.len(), 1);
-    assert_eq!(resources[0]["server"], json!("srv"));
+    assert_eq!(
+        resources[0],
+        json!({"server": "srv", "uri": "memo://id", "name": "memo"})
+    );
 }
 
 #[test]
@@ -269,9 +262,13 @@ fn list_resources_payload_from_all_servers_is_sorted() {
 
 #[test]
 fn call_tool_result_from_content_marks_success() {
-    let result = call_tool_result_from_content("{}", Some(true));
-    assert_eq!(result.is_error, Some(false));
-    assert_eq!(result.content.len(), 1);
+    for (success, is_error) in [(Some(true), Some(false)), (Some(false), Some(true)), (None, None)] {
+        let result = call_tool_result_from_content("resource body", success);
+        assert_eq!(result.is_error, is_error);
+        assert_eq!(result.content, vec![json!({"type": "text", "text": "resource body"})]);
+        assert_eq!(result.structured_content, None);
+        assert_eq!(result.meta, None);
+    }
 }
 
 #[test]

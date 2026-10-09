@@ -43,7 +43,7 @@
 
 * For Rust CLI/app-server harness changes, preserve retained-output completeness, continuation/recovery, evidence freshness, and live-operation lifecycle contracts through their real consumers. Follow the active tool contracts and base instructions rather than copying generic harness rules into this file.
 * Keep default bounded tool displays unless the next decision requires more source. Retain complete bulk evidence before projecting it; recover only missing ranges instead of rerunning producers or requesting oversized output by default. Smaller displays must not reduce required audit coverage.
-* Compare matched tasks by correct outcomes, total wall-clock time, input/output tokens, requests, tool calls, validation, retries, output recovery, and compactions. Separate model workflow choices from runtime changes; moving a wait into request normalization is not itself evidence of a slowdown. Report unmeasured phases and do not claim end-to-end gains from passing tests or microbenchmarks alone.
+* Compare matched tasks by correct outcomes, total wall-clock time, input/output tokens, requests, tool calls, validation, retries, output recovery, and compactions. Separate model workflow choices from runtime changes; moving a wait into request normalization is not itself evidence of a slowdown. Report unmeasured phases and do not claim end-to-end gains from passing tests or microbenchmarks alone. Do not focus on savings that do not add up to a material improvement.
 
 ## Session logs
 

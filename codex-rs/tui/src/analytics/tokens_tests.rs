@@ -19,6 +19,14 @@ fn tokens_use_text_components_and_keep_daily_totals_across_groupings() {
     .unwrap();
     let by_model = history(response, AccountAnalyticsGrouping::Model, date, date).unwrap();
     assert_eq!(
+        by_model.data[0].values,
+        vec![AccountAnalyticsValue {
+            key: "gpt-5".into(),
+            label: "gpt-5".into(),
+            value: 100.0,
+        }]
+    );
+    assert_eq!(
         (by_type.unit, by_type.data[0].total, by_model.data[0].total),
         (AccountAnalyticsUnit::Tokens, 100.0, 100.0)
     );
@@ -57,6 +65,29 @@ fn token_model_filter_retains_components_and_freshness() {
         "date":"2026-09-01", "models":[{"model":"alpha", "uncached_text_input_tokens":10,"cached_text_input_tokens":20,"text_output_tokens":30}]
     }]})).unwrap(), AccountAnalyticsGrouping::TokenType, date, date).unwrap();
     assert_eq!(selected, expected);
+    assert_eq!(
+        selected.updated_at,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2026-09-02T00:00:00Z")
+                .unwrap()
+                .timestamp()
+        )
+    );
+    assert_eq!(
+        selected.data,
+        vec![AccountAnalyticsDay {
+            date,
+            total: 60.0,
+            values: [("Cached input", 20.0), ("Output", 30.0), ("Uncached input", 10.0)]
+                .into_iter()
+                .map(|(key, value)| AccountAnalyticsValue {
+                    key: key.into(),
+                    label: key.into(),
+                    value,
+                })
+                .collect(),
+        }]
+    );
     assert_eq!(
         history(response, AccountAnalyticsGrouping::TokenType, date, date)
             .unwrap()

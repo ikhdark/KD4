@@ -1,0 +1,199 @@
+RUST AFFECTED-AREA SUITE RUNS AND FIXES
+Date: 2026-10-09
+Repository: C:\Users\kuh\Desktop\kd4
+
+OUTCOME
+Executed all 44 selected named targets plus a combined full test run for
+22 affected packages, using the local nextest profile, no retries,
+and the shared core-tests lane. This is affected-area validation, not a
+claim that every workspace target or platform was executed.
+All observed failures have successful relevant reruns. Core's full run had
+4,704 passes and one failure; only its corrected fixture was rerun.
+No snapshot was accepted merely because it matched current output.
+Subagents implemented bounded fixes; a separate agent reviewed plugin wiring.
+
+FIX 1: CORE FORK SNAPSHOT FIXTURE (TEST CONFIGURATION ONLY)
+File: C:\Users\kuh\Desktop\kd4\codex-rs\core\src\session\tests.rs
+Failure: fork_startup_context_then_first_turn_diff_snapshot received optional
+agent usage hints and tool discovery instructions from implicit defaults.
+Independent expectation: this scenario checks inherited parent context,
+changed permission policy, and first-turn collaboration-mode differences.
+Agent catalog availability is not its purpose; its existing expected snapshot
+remains unchanged, including the multi-agent policy.
+Fix: explicitly select V2 policy, disable tool-search support for this fixture,
+and omit optional root/subagent usage hints.
+Assertion: exact snapshot still verifies the intended context and deltas.
+It does not verify the optional hint/discovery features disabled here.
+The initial Disabled-policy attempt was rejected because it removed required
+policy content. The final focused rerun passed.
+Evidence: 2921f290-7612-428e-8795-da38f5fd35d7 (1 passed).
+
+FIX 2: REPORT ACTUAL LOCALLY MATERIALIZED PLUGIN VERSION (PRODUCTION)
+Files:
+C:\Users\kuh\Desktop\kd4\codex-rs\app-server\src\request_processors\plugins.rs
+C:\Users\kuh\Desktop\kd4\codex-rs\app-server\src\request_processors\plugins_tests.rs
+C:\Users\kuh\Desktop\kd4\codex-rs\app-server\tests\suite\v2\plugin_list.rs
+Failure: a remote plugin summary returned local_version=None even though the
+fixture had a materialized local package. The earlier backend-only correction
+was incomplete; the failing expectation was independently justified.
+Written contract: local_version describes the materialized local package,
+not the remote advertised version or the backend's installed flag.
+Fix: hydrate remote summaries using existing PluginStore selection and parsed
+local manifest evidence. Wired list, installed, read, and share-list RPC paths.
+Reject mismatched stored remote identity, malformed metadata, and mismatched
+manifest names. Prefer manifest version; allow concrete legacy cache version
+but do not report the placeholder directory label "local" as a version.
+Non-remote summaries are left unchanged.
+Real-path integration fixture now distinguishes local 0.9.0 from remote 1.2.3;
+after removing the package it requires None even while backend installed=true.
+The values are deliberately distinct fixture inputs, not inferred from output.
+A real-filesystem helper test additionally verifies identity/corruption rejection,
+manifest precedence, legacy fallback, placeholder exclusion, clearing stale
+values, and preservation of all other summary fields.
+Assertions still do not establish concurrent-install consistency or filesystem
+latency/cancellation guarantees.
+Validation: full plugin suite 123 passed; app-server library 509 passed after
+production change; subsequently added adversarial test 1 passed.
+Evidence: f4456672-7094-4fca-b709-6f44c3ee42cf,
+ac3b50bb-7a92-45bf-ae06-218263d58b39,
+ff87ecd1-ec9d-484b-8b24-a323fa094642.
+
+FIX 3: REMOTE SHELL TEST PEER DRAINING (FIXTURE ONLY)
+File:
+C:\Users\kuh\Desktop\kd4\codex-rs\app-server\tests\suite\v2\thread_shell_command.rs
+Failure: the fake WebSocket peer disconnected immediately after returning
+output, before the real collector's final bounded read. The test timed out.
+Independent requirement: closed process state does not guarantee that a
+bounded output page contains all buffered output. Exclusive afterSeq reads
+must permit the caller to drain remaining output without duplicating it.
+Fix: honor afterSeq and serve a final empty closed page before disconnecting.
+An initial sequence-number-only correction was insufficient; its cause claim
+was revised after the second failure. No production collector change was made.
+Existing exact cwd, command, completed status, output, and exit-code assertions
+remain. Exact aggregate output rejects duplication or loss for this fixture.
+The real app-server/collector path is exercised against a fake remote peer;
+this is not a test against a separately deployed remote executor.
+Validation: full app_server_environments suite 32 passed.
+Evidence: 3ff78470-93cb-4edf-b1b4-5000ec5d2650.
+
+VALIDATION INVOCATION CORRECTION (NOT A CODE FIX)
+The combined generic Cargo run omitted the Windows sandbox helper-path setup
+provided by the named runner. Ten filesystem tests failed with:
+launch runner codex-command-runner.exe (exists: false).
+The full Windows filesystem target had already passed 42 tests. All ten exact
+failed tests were then rerun through its owning named runner and passed.
+No test assertion, application behavior, or runner implementation was changed.
+Evidence: 055369f8-597c-4d95-8313-330989518568 (10 passed).
+
+NAMED FULL-TARGET RESULTS
+Counts are successful executions in each full run, not a deduplicated total.
+core_lib is explicitly the original full run plus its successful failed-test
+rerun, not a second full clean run. Other rows are latest full-target passes.
+Target | passes | result | validation run ID
+core_lib | 4704 | 1 initially failed; corrected test rerun passed | 985fd032-b726-4c7a-bbcf-34c9093fb39f
+core_cli_workspace | 38 | passed | 0d5fcfab-b7b8-4515-a3aa-58502433923c
+core_code_mode_mcp | 138 | passed | a0ff2e21-1f12-4ad5-9ddf-64278d0eb379
+core_exec_permissions | 103 | passed | 5d3fbb9e-819b-41e3-9a2f-d7908c7271c0
+core_thread_state | 92 | passed | e0257148-ce01-494f-804f-a0fd0fdfbc96
+core_transport_telemetry | 108 | passed | 7b9c8c26-4b51-4b9f-bf5a-c8da30cf6b54
+core_agents_review | 80 | passed | 900d1202-bbaf-4bea-9af3-605bdedef0c5
+core_model_prompt_runtime | 81 | passed | 1e122d85-27d8-43d5-8ae0-ba957711accf
+tui_lib | 3016 | passed | 350efe73-2f20-4054-80eb-c434e7ab16f9
+app_server_lib | 509 | passed | ac3b50bb-7a92-45bf-ae06-218263d58b39
+app_server_initialize | 121 | passed | 29fc8161-8b1b-43bd-8e9c-46ac3ae998ab
+app_server_sessions | 133 | passed | 99cee57c-3aba-493c-b04e-eb5adf74b30d
+app_server_plugins | 123 | passed | f4456672-7094-4fca-b709-6f44c3ee42cf
+app_server_transport | 42 | passed | 9520c025-9272-4e1c-a4cd-9f4c6ae96383
+app_server_environments | 32 | passed | 3ff78470-93cb-4edf-b1b4-5000ec5d2650
+app_server_threads | 82 | passed | 01c02ca8-5e8a-4d8f-98d8-fd84d705508b
+app_server_accounts | 77 | passed | 375e6a87-decf-4ea8-8763-6b641cfd13e0
+exec_server_lib | 280 | passed | 615f35c3-759d-45a6-9d15-461db1769016
+exec_server_file_system_windows | 42 | passed | f476803c-4425-497d-aec4-47beac18f0c4
+config_lib | 237 | passed | 8c972937-67d8-4599-b07e-9b834c6a145c
+shell_command_lib | 235 | passed | caf04897-399d-42ce-a5a9-a4d028b2cff0
+agent_task_store_lib | 81 | passed | 765e46d0-c961-42e6-9fef-4ae1beb815ff
+app_server_protocol_lib | 306 | passed | c9193100-d12a-4bda-832a-ea88d0fc31b2
+http_client_lib | 108 | passed | 20297ead-3b03-491a-ad41-636f8feb4906
+login_lib | 134 | passed | 8cffffc0-ad6e-48c0-8ef1-c68a95861d50
+app_server_transport_lib | 189 | passed | b57dd6a5-e12f-40da-b44e-29db0c9091c2
+model_provider_lib | 76 | passed | 404bf589-da67-4d34-9968-c003ee85d788
+ollama_lib | 20 | passed | 9dfa8762-ec31-40d2-9e6f-677b8a53cf1d
+codex_api_lib | 152 | passed | 1ed706b3-9e21-495e-af26-5bcddb5e1bca
+rmcp_client_lib | 118 | passed | eb93ced6-c349-4ce5-be95-da85b13d9994
+rollout_lib | 174 | passed | 56623123-1c7b-40d0-b6fc-e3c6b6c2f89a
+thread_store_lib | 155 | passed | 80e626c2-2668-4a74-a91e-1df2b34c68d7
+state_lib | 162 | passed | 8162be82-1d8d-4d7f-9532-b783e778301d
+apply_patch_lib | 108 | passed | 9b639455-e19a-460f-be24-1ffa10b1bd81
+code_mode_lib | 215 | passed | 8544ba86-e863-4cf6-9dce-47e13c7ca1ac
+code_mode_protocol_lib | 105 | passed | 70c69053-230c-494a-ac00-af1215df78e4
+tools_lib | 124 | passed | 1ad979a3-eb2a-4ee9-92e3-f303d0ee7d9e
+code_mode_host_stdio | 14 | passed | 65eebb6d-3c4a-45e5-b781-c509ae79a553
+output_truncation_lib | 56 | passed | d75e4235-ab5a-4488-b930-5f0fb69b8cbf
+windows_sandbox_lib | 172 | passed | 04292121-e790-4b81-9bd0-be6f9ee039f5
+windows_command_runner_bin | 3 | passed | 2e62b8a4-a258-470a-82f8-62c63b48f731
+backend_client_lib | 45 | passed | 74f127e6-cd8b-433b-8e5a-f3e1f77df5e8
+goal_extension_backend | 27 | passed | 78f9667a-a3ed-435e-928d-44210a1072e1
+goal_accounting | 6 | passed | 3db67b13-f9db-4421-addd-b72a2947ea48
+
+ADDITIONAL COMBINED PACKAGE RUN
+Run ID: 2e0680e0-9b4a-4ad6-a2c2-c0225d3c1e7d
+47 binaries; 2,152 tests executed: 2,142 passed, 10 helper-setup failures.
+11 tests skipped by the existing configuration.
+The ten failures subsequently passed via the named runner as detailed above.
+No unrelated passing tests were rerun solely to produce a clean aggregate.
+This package run overlaps some named-library/Windows-filesystem coverage.
+Packages selected:
+  core_test_support
+  app_test_support
+  codex-app-server-test-client
+  codex-external-agent-sessions
+  codex-models-manager
+  codex-hooks
+  codex-utils-image
+  codex-cloud-tasks
+  codex-exec
+  codex-core-plugins
+  codex-network-proxy
+  codex-file-watcher
+  codex-git-utils
+  codex-otel
+  codex-rollout-trace
+  codex-agent-identity
+  codex-responses-api-proxy
+  codex-chatgpt
+  codex-exec-server
+  codex-login
+  codex-rmcp-client
+  codex-mcp-server
+
+EVIDENCE LOCATION
+Named-target metrics:
+C:\Users\kuh\Desktop\kd4\codex-rs\target\lanes\core-tests\test-runner-logs\validation-<run-ID>.json
+Each contains the corresponding recorded test identities and outcome.
+Combined package stdout/stderr:
+C:\Users\kuh\Desktop\kd4\codex-rs\target\lanes\core-tests\test-runner-logs\suite-generic-packages-2681facf-0361-44dc-aaab-16628ab1eae9.log
+SHA-256 at capture:
+a5eb09658d632716498ce7f2051516bd35b2ddef6a1d5e430c0b52d7c2c9f1bd
+Full named-command logs and failure stderr are retained in that same directory.
+
+LIMITATIONS / UNRESOLVED EXPECTATIONS
+- Results describe the tested snapshots. Later unrelated edits are not validated
+  by these receipts. Automatic unknown-currentness notices were not treated as
+  proof of change or as requests to repeat expensive suites.
+- Standard ignored/live-credential/live-model and unsupported-platform exclusions
+  were not force-enabled. Windows validation does not establish Linux/macOS
+  behavior. Nextest runs do not constitute a workspace-wide doctest run.
+- The core full run excluded 9 ignored tests. The combined package run skipped
+  11; these are not a deduplicated global exclusion count.
+- Plugin hydration uses an awaited readonly blocking filesystem batch without
+  an internal storage deadline. No lock cycle was found, but slow/blocked OS
+  reads cannot be cancelled by dropping the request; workers may outlive it.
+  Blocking-pool contention, concurrent installation, and end-to-end latency
+  effects are unverified. No performance improvement is claimed.
+- Existing warnings were not changed merely to make output cleaner.
+- Passing these suites does not establish that every older expectation is
+  independently justified. Earlier review's unresolved arbitrary numeric/
+  cosmetic policy expectations, the vacuous built_tools_uses_step_mcp_runtime
+  assertion, auto-deny contract contradiction, and private-hash calibrations
+  were not silently resolved or changed by this validation task.
+

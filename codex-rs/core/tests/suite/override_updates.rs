@@ -40,7 +40,7 @@ async fn persisted_thread_settings(path: &std::path::Path) -> Result<Vec<ThreadS
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_settings_update_without_user_turn_records_permissions_update() -> Result<()> {
+async fn thread_settings_updates_without_user_turn_persist_cumulative_snapshots() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
@@ -58,23 +58,6 @@ async fn thread_settings_update_without_user_turn_records_permissions_update() -
     )
     .await?;
 
-    test.codex.submit(Op::Shutdown).await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
-
-    let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let settings = persisted_thread_settings(&rollout_path).await?;
-    assert_eq!(settings.len(), 1);
-    assert_eq!(settings[0].approval_policy, AskForApproval::Never);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_settings_update_without_user_turn_records_environment_update() -> Result<()> {
-    require_network!();
-
-    let server = start_mock_server().await;
-    let test = test_codex().build(&server).await?;
     let new_cwd = TempDir::new()?;
     let environments = local_selections(new_cwd.abs());
 
@@ -87,24 +70,6 @@ async fn thread_settings_update_without_user_turn_records_environment_update() -
     )
     .await?;
 
-    test.codex.submit(Op::Shutdown).await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
-
-    let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let settings = persisted_thread_settings(&rollout_path).await?;
-    assert_eq!(settings.len(), 1);
-    assert_eq!(settings[0].environments.as_ref(), Some(&environments));
-    assert_eq!(settings[0].cwd, new_cwd.abs());
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_settings_update_without_user_turn_records_collaboration_update() -> Result<()> {
-    require_network!();
-
-    let server = start_mock_server().await;
-    let test = test_codex().build(&server).await?;
     let collab_text = "override collaboration instructions";
     let collaboration_mode = collab_mode_with_instructions(Some(collab_text));
 
@@ -122,8 +87,16 @@ async fn thread_settings_update_without_user_turn_records_collaboration_update()
 
     let rollout_path = test.codex.rollout_path().expect("rollout path");
     let settings = persisted_thread_settings(&rollout_path).await?;
-    assert_eq!(settings.len(), 1);
-    assert_eq!(settings[0].collaboration_mode, collaboration_mode);
+    assert_eq!(settings.len(), 3);
+    assert_eq!(settings[0].approval_policy, AskForApproval::Never);
+    assert_eq!(settings[0].cwd, test.config.cwd);
+    assert_eq!(settings[1].approval_policy, AskForApproval::Never);
+    assert_eq!(settings[1].environments.as_ref(), Some(&environments));
+    assert_eq!(settings[1].cwd, new_cwd.abs());
+    assert_eq!(settings[2].approval_policy, AskForApproval::Never);
+    assert_eq!(settings[2].environments.as_ref(), Some(&environments));
+    assert_eq!(settings[2].cwd, new_cwd.abs());
+    assert_eq!(settings[2].collaboration_mode, collaboration_mode);
 
     Ok(())
 }

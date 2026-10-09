@@ -396,7 +396,7 @@ mod tests {
         backend.save_file(&file)?;
 
         let error = backend
-            .load_file()
+            .list(None)
             .expect_err("must reject newer schema version");
         assert!(
             error.to_string().contains("newer than supported version"),

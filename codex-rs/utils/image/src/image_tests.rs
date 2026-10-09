@@ -132,6 +132,16 @@ fn downscales_large_image() {
         let image = ImageBuffer::from_pixel(4096, 2048, Rgba([200u8, 10, 10, 255]));
         let original_bytes = image_bytes(&image, format);
 
+        let original = load_for_prompt_bytes(
+            Path::new("in-memory-image"),
+            original_bytes.clone(),
+            PromptImageMode::Original,
+        )
+        .expect("preserve large original image");
+        assert_eq!((original.width, original.height), (4096, 2048));
+        assert_eq!(original.mime, mime);
+        assert_eq!(original.bytes.as_ref(), original_bytes);
+
         let processed = load_for_prompt_bytes(
             Path::new("in-memory-image"),
             original_bytes,
@@ -167,6 +177,7 @@ fn downscales_tall_image_to_fit_square_bounds() {
     assert_eq!(processed.width, 512);
     assert_eq!(processed.height, MAX_DIMENSION);
     assert_eq!(processed.mime, "image/png");
+    assert_eq!(image::load_from_memory(&processed.bytes).unwrap().dimensions(), (512, 2048));
 }
 
 #[test]
@@ -283,24 +294,6 @@ fn resizing_drops_non_rgb_icc_profile() {
 }
 
 #[test]
-fn preserves_large_image_in_original_mode() {
-    let image = ImageBuffer::from_pixel(4096, 2048, Rgba([180u8, 30, 30, 255]));
-    let original_bytes = image_bytes(&image, ImageFormat::Png);
-
-    let processed = load_for_prompt_bytes(
-        Path::new("in-memory-image"),
-        original_bytes.clone(),
-        PromptImageMode::Original,
-    )
-    .expect("process image");
-
-    assert_eq!(processed.width, 4096);
-    assert_eq!(processed.height, 2048);
-    assert_eq!(processed.mime, "image/png");
-    assert_eq!(processed.bytes.as_ref(), original_bytes);
-}
-
-#[test]
 fn data_url_processing_preserves_supported_source_bytes() {
     let image = ImageBuffer::from_pixel(64, 32, Rgba([10u8, 20, 30, 255]));
     let original_bytes = image_bytes(&image, ImageFormat::Png);
@@ -331,6 +324,7 @@ fn data_url_processing_converts_gif_to_png() {
         image::guess_format(&processed.bytes).expect("detect processed format"),
         ImageFormat::Png
     );
+    assert_eq!(image::load_from_memory(&processed.bytes).unwrap().to_rgba8(), image);
 }
 
 #[test]
@@ -365,6 +359,7 @@ fn resize_with_limits_respects_dimension_and_patch_budgets() {
     .expect("process image with explicit limits");
 
     assert_eq!((processed.width, processed.height), (1600, 1600));
+    assert_eq!(image::load_from_memory(&processed.bytes).unwrap().dimensions(), (1600, 1600));
 }
 
 #[test]
@@ -492,7 +487,17 @@ fn cache_reuses_buffers_and_separates_resize_modes() {
         |mode| load_for_prompt_bytes(Path::new("cache.png"), input.clone(), mode).unwrap();
     let first = process(PromptImageMode::Original);
     let second = process(PromptImageMode::Original);
-    assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+    // The global cache is best-effort: concurrent tests may hold its lock or
+    // evict this entry, so the loader promises equal content, not Arc identity.
+    assert_eq!(first.bytes, second.bytes);
+    let cache = ImageCache::new(NonZeroUsize::new(1).expect("cache capacity"));
+    let key = ImageCacheKey {
+        digest: sha1_digest(&input),
+        mode: PromptImageMode::Original,
+    };
+    cache_image(&cache, key, first.clone(), first.bytes.len());
+    let cached = cache.get(&key).expect("uncontended cache retains image");
+    assert!(Arc::ptr_eq(&first.bytes, &cached.bytes));
     let resized = process(PromptImageMode::ResizeWithLimits(PromptImageResizeLimits {
         max_dimension: 16,
         max_patches: 1,

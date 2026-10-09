@@ -4,6 +4,41 @@ use codex_utils_cargo_bin::find_resource;
 use tempfile::TempDir;
 use tokio::process::Command;
 
+// The complete added file specified by task_turn_fixture.json, not output
+// captured from apply_diff_from_task.
+const EXPECTED_FIBONACCI: &str = r#"#!/usr/bin/env node
+
+function fibonacci(n) {
+  if (n < 0) {
+    throw new Error("n must be non-negative");
+  }
+  let a = 0;
+  let b = 1;
+  for (let i = 0; i < n; i++) {
+    const next = a + b;
+    a = b;
+    b = next;
+  }
+  return a;
+}
+
+function printUsage() {
+  console.log("Usage: node scripts/fibonacci.js <n>");
+}
+
+if (require.main === module) {
+  const arg = process.argv[2];
+  if (arg === undefined || isNaN(Number(arg))) {
+    printUsage();
+    process.exit(1);
+  }
+  const n = Number(arg);
+  console.log(fibonacci(n));
+}
+
+module.exports = fibonacci;
+"#;
+
 /// Creates a temporary git repository with initial commit
 async fn create_temp_git_repo() -> anyhow::Result<TempDir> {
     let temp_dir = TempDir::new()?;
@@ -120,25 +155,8 @@ fn test_apply_command_creates_fibonacci_file() {
 
     // Verify the file contents match expected
     let contents = std::fs::read_to_string(&fibonacci_path).expect("Failed to read fibonacci.js");
-    assert!(
-        contents.contains("function fibonacci(n)"),
-        "fibonacci.js doesn't contain expected function"
-    );
-    assert!(
-        contents.contains("#!/usr/bin/env node"),
-        "fibonacci.js doesn't have shebang"
-    );
-    assert!(
-        contents.contains("module.exports = fibonacci;"),
-        "fibonacci.js doesn't export function"
-    );
-
-    // Verify file has correct number of lines (31 as specified in fixture)
-    let line_count = contents.lines().count();
-    assert_eq!(
-        line_count, 31,
-        "fibonacci.js should have 31 lines, got {line_count}",
-    );
+    // Git may honor a CRLF checkout policy; all logical contents must match.
+    assert_eq!(contents.replace("\r\n", "\n"), EXPECTED_FIBONACCI);
 }
 
 #[tokio::test]
@@ -169,7 +187,7 @@ async fn test_apply_command_accepts_diff_carried_as_output_diff_item() {
 
     let contents = std::fs::read_to_string(repo_path.join("scripts/fibonacci.js"))
         .expect("Failed to read fibonacci.js");
-    assert!(contents.contains("module.exports = fibonacci;"));
+    assert_eq!(contents.replace("\r\n", "\n"), EXPECTED_FIBONACCI);
 }
 
 #[tokio::test]
@@ -212,33 +230,28 @@ console.log(fib(10));
         .await
         .expect("Failed to commit conflicting file");
 
-    let original_dir = std::env::current_dir().expect("Failed to get current dir");
-    std::env::set_current_dir(repo_path).expect("Failed to change directory");
-    struct DirGuard(std::path::PathBuf);
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _guard = DirGuard(original_dir);
-
     let task_response = mock_get_task_with_fixture()
         .await
         .expect("Failed to load fixture");
 
-    let apply_result = apply_diff_from_task(task_response, Some(repo_path.to_path_buf())).await;
-
+    let error = apply_diff_from_task(task_response, Some(repo_path.to_path_buf()))
+        .await
+        .expect_err("Expected apply to fail due to merge conflicts");
     assert!(
-        apply_result.is_err(),
-        "Expected apply to fail due to merge conflicts"
+        error.to_string().contains("Git apply failed")
+            && error.to_string().contains("conflicts=1"),
+        "expected a reported patch conflict, got: {error}"
     );
 
     let contents = std::fs::read_to_string(&fibonacci_path).expect("Failed to read fibonacci.js");
 
+    // Git may write LF or CRLF according to the checkout's line-ending policy.
     assert!(
-        contents.contains("<<<<<<< HEAD")
-            || contents.contains("=======")
-            || contents.contains(">>>>>>> "),
+        contents.lines().any(|line| line.starts_with("<<<<<<< "))
+            && contents.lines().any(|line| line == "=======")
+            && contents.lines().any(|line| line.starts_with(">>>>>>> "))
+            && contents.contains("function fib(num)")
+            && contents.contains("function fibonacci(n)"),
         "fibonacci.js should contain merge conflict markers, got: {contents}",
     );
 }

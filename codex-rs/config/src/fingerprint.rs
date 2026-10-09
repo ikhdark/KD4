@@ -1,4 +1,3 @@
-use crate::ConfigLayerMetadata;
 use crate::key_aliases::normalized_with_key_aliases;
 use crate::schema::canonicalize;
 use serde_json::Value as JsonValue;
@@ -7,11 +6,11 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use toml::Value as TomlValue;
 
-pub(super) fn record_origins(
+pub(super) fn record_origins<T: Clone>(
     value: &TomlValue,
-    meta: &ConfigLayerMetadata,
+    meta: &T,
     path: &mut Vec<String>,
-    origins: &mut HashMap<String, ConfigLayerMetadata>,
+    origins: &mut HashMap<String, T>,
 ) {
     match value {
         TomlValue::Table(table) => {

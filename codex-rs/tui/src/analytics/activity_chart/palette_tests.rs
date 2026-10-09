@@ -85,58 +85,31 @@ fn truecolor_palette_blends_empty_cell_for_light_background() {
 }
 
 #[test]
-fn ansi16_palette_uses_theme_accent_without_green_fallback() {
-    let default_fg = Some((240, 240, 240));
-    let default_bg = Some((0, 0, 0));
-    let active_style = Style::default().fg(Color::Magenta).bold();
-    let palette = TokenActivityPalette::from_parts(
-        default_fg,
-        default_bg,
-        StdoutColorLevel::Ansi16,
-        active_style,
-    );
-
-    assert_eq!(palette.for_level(/*level*/ 0), Style::default().dim());
-    assert_eq!(palette.for_level(/*level*/ 1), active_style);
-    assert_eq!(palette.for_bar_level(/*level*/ 4), active_style);
-    assert!(!palette.uses_color);
-}
-
-#[test]
-fn non_rgb_theme_accent_remains_active_fallback() {
-    let default_fg = Some((240, 240, 240));
-    let default_bg = Some((0, 0, 0));
-    let active_style = Style::default().fg(Color::Cyan).bold();
-    let palette = TokenActivityPalette::from_parts(
-        default_fg,
-        default_bg,
-        StdoutColorLevel::TrueColor,
-        active_style,
-    );
-
-    assert_eq!(palette.for_level(/*level*/ 1), active_style);
-    assert!(
-        palette
-            .for_level(/*level*/ 1)
-            .add_modifier
-            .contains(Modifier::BOLD)
-    );
-    assert!(!palette.uses_color);
-}
-
-#[test]
-fn missing_terminal_colors_use_theme_accent_fallback() {
-    let default_fg = None;
-    let default_bg = Some((0, 0, 0));
-    let active_style = Style::default().fg(Color::Blue).bold();
-    let palette = TokenActivityPalette::from_parts(
-        default_fg,
-        default_bg,
-        StdoutColorLevel::TrueColor,
-        active_style,
-    );
-
-    assert_eq!(palette.for_level(/*level*/ 0), Style::default().dim());
-    assert_eq!(palette.for_level(/*level*/ 4), active_style);
-    assert!(!palette.uses_color);
+fn unsupported_colors_preserve_theme_accent_and_distinct_empty_cells() {
+    let fg = Some((240, 240, 240));
+    let bg = Some((0, 0, 0));
+    let rgb = rgb_color((100, 200, 50));
+    for (fg, bg, color_level, accent) in [
+        (fg, bg, StdoutColorLevel::Ansi16, Color::Magenta),
+        (fg, bg, StdoutColorLevel::TrueColor, Color::Cyan),
+        (None, bg, StdoutColorLevel::TrueColor, Color::Blue),
+        // RGB accents isolate the color-depth and missing-default branches:
+        // non-RGB accents would fall back before either condition is tested.
+        (fg, bg, StdoutColorLevel::Ansi16, rgb),
+        (fg, bg, StdoutColorLevel::Unknown, rgb),
+        (None, bg, StdoutColorLevel::TrueColor, rgb),
+        (fg, None, StdoutColorLevel::TrueColor, rgb),
+    ] {
+        let active_style = Style::default().fg(accent).bold();
+        let palette = TokenActivityPalette::from_parts(fg, bg, color_level, active_style);
+        assert!(!palette.uses_color);
+        assert_eq!(palette.for_level(0), Style::default().dim());
+        assert_eq!(palette.glyph(TokenActivityView::Daily, 0), "□");
+        for level in 1..=4 {
+            assert_eq!(palette.for_level(level), active_style);
+            assert_eq!(palette.for_bar_level(level), active_style);
+            assert!(palette.for_level(level).add_modifier.contains(Modifier::BOLD));
+            assert_eq!(palette.glyph(TokenActivityView::Daily, level), "■");
+        }
+    }
 }

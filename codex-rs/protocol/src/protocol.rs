@@ -6656,75 +6656,21 @@ mod tests {
     }
 
     #[test]
-    fn granular_approval_config_mcp_elicitation_flag_is_field_driven() {
-        assert!(
-            GranularApprovalConfig {
-                sandbox_approval: false,
-                rules: false,
-                skill_approval: false,
-                request_permissions: false,
-                mcp_elicitations: true,
-            }
-            .allows_mcp_elicitations()
-        );
-        assert!(
-            !GranularApprovalConfig {
-                sandbox_approval: false,
-                rules: false,
-                skill_approval: false,
-                request_permissions: false,
-                mcp_elicitations: false,
-            }
-            .allows_mcp_elicitations()
-        );
-    }
-
-    #[test]
-    fn granular_approval_config_skill_approval_flag_is_field_driven() {
-        assert!(
-            GranularApprovalConfig {
-                sandbox_approval: false,
-                rules: false,
-                skill_approval: true,
-                request_permissions: false,
-                mcp_elicitations: false,
-            }
-            .allows_skill_approval()
-        );
-        assert!(
-            !GranularApprovalConfig {
-                sandbox_approval: false,
-                rules: false,
-                skill_approval: false,
-                request_permissions: false,
-                mcp_elicitations: false,
-            }
-            .allows_skill_approval()
-        );
-    }
-
-    #[test]
-    fn granular_approval_config_request_permissions_flag_is_field_driven() {
-        assert!(
-            GranularApprovalConfig {
-                sandbox_approval: false,
-                rules: false,
-                skill_approval: false,
-                request_permissions: true,
-                mcp_elicitations: false,
-            }
-            .allows_request_permissions()
-        );
-        assert!(
-            !GranularApprovalConfig {
-                sandbox_approval: false,
-                rules: false,
-                skill_approval: false,
-                request_permissions: false,
-                mcp_elicitations: false,
-            }
-            .allows_request_permissions()
-        );
+    fn granular_approval_config_flags_are_independent() {
+        for flags in 0..32 {
+            let config = GranularApprovalConfig {
+                sandbox_approval: flags & 1 != 0,
+                rules: flags & 2 != 0,
+                skill_approval: flags & 4 != 0,
+                request_permissions: flags & 8 != 0,
+                mcp_elicitations: flags & 16 != 0,
+            };
+            assert_eq!(config.allows_sandbox_approval(), flags & 1 != 0);
+            assert_eq!(config.allows_rules_approval(), flags & 2 != 0);
+            assert_eq!(config.allows_skill_approval(), flags & 4 != 0);
+            assert_eq!(config.allows_request_permissions(), flags & 8 != 0);
+            assert_eq!(config.allows_mcp_elicitations(), flags & 16 != 0);
+        }
     }
 
     #[test]
@@ -7850,22 +7796,50 @@ mod tests {
     }
 
     #[test]
-    fn rollout_line_rejects_legacy_fields_and_future_versions() {
-        let current_with_legacy_field = json!({
+    fn rollout_line_rejects_legacy_fields_and_future_versions() -> Result<()> {
+        let mut current_with_legacy_field = json!({
             "timestamp": "2026-08-24T00:00:00Z",
             "format_version": CURRENT_ROLLOUT_FORMAT_VERSION,
             "type": "turn_context",
-            "payload": { "summary": "auto" }
+            "payload": {
+                "cwd": test_path_buf("/tmp"),
+                "approval_policy": "never",
+                "sandbox_policy": { "type": "danger-full-access" },
+                "model": "gpt-5",
+                "summary": "auto",
+            }
         });
-        assert!(serde_json::from_value::<RolloutLine>(current_with_legacy_field).is_err());
+        let error = serde_json::from_value::<RolloutLine>(current_with_legacy_field.clone())
+            .err()
+            .expect("current rollouts must reject legacy summary");
+        assert_eq!(
+            error.to_string(),
+            "rollout format version 1 does not accept turn_context.summary"
+        );
+        current_with_legacy_field["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("summary");
+        // The fixture must otherwise be valid, so an unrelated decode failure cannot pass.
+        serde_json::from_value::<RolloutLine>(current_with_legacy_field)?;
 
+        let future_version = CURRENT_ROLLOUT_FORMAT_VERSION + 1;
         let future = json!({
             "timestamp": "2026-08-24T00:00:00Z",
-            "format_version": CURRENT_ROLLOUT_FORMAT_VERSION + 1,
+            "format_version": future_version,
             "type": "event_msg",
             "payload": { "type": "shutdown_complete" }
         });
-        assert!(serde_json::from_value::<RolloutLine>(future).is_err());
+        let error = serde_json::from_value::<RolloutLine>(future)
+            .err()
+            .expect("future rollout versions must be rejected");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported rollout format version {future_version}; this build supports version {CURRENT_ROLLOUT_FORMAT_VERSION}"
+            )
+        );
+        Ok(())
     }
 
     #[test]

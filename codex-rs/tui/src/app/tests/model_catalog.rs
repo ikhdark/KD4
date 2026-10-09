@@ -55,8 +55,8 @@ fn model_migration_copy_to_plain_text(copy: &crate::model_migration::ModelMigrat
     s
 }
 
-#[tokio::test]
-async fn model_migration_prompt_only_shows_for_deprecated_models() {
+#[test]
+fn model_migration_prompt_supports_configured_upgrades_and_rejects_self_target() {
     let seen = BTreeMap::new();
     let presets = model_presets_with_test_upgrades();
     assert!(should_show_model_migration_prompt(
@@ -303,8 +303,8 @@ async fn accepted_model_migration_persists_target_default_reasoning_effort() {
     }
 }
 
-#[tokio::test]
-async fn model_migration_prompt_respects_seen_mapping_and_self_target() {
+#[test]
+fn model_migration_prompt_respects_seen_mapping_and_self_target() {
     let mut seen = BTreeMap::new();
     seen.insert("gpt-5.4-mini".to_string(), "gpt-5.6-luna".to_string());
     assert!(should_show_model_migration_prompt(
@@ -373,8 +373,8 @@ fn model_migration_handles_removed_mini_selection_without_overriding_catalog() {
     ));
 }
 
-#[tokio::test]
-async fn model_migration_prompt_skips_when_target_missing_or_hidden() {
+#[test]
+fn model_migration_prompt_skips_when_target_missing_or_hidden() {
     let mut available = all_model_presets();
     let mut current = available
         .iter()

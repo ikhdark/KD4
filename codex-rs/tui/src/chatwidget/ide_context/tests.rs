@@ -132,14 +132,14 @@ async fn deferred_shell_submission_does_not_fetch_or_overtake() {
     chat.submit_user_message("first".into());
     let id = pending_id(&chat);
     chat.submit_user_message("!echo hello".into());
-    assert_no_turn(&mut op_rx);
+    assert!(op_rx.try_recv().is_err());
     chat.on_ide_context_completed(id, Ok(context("first.rs")));
     assert!(text(&next_turn(&mut op_rx)).ends_with("first"));
-    let shell = std::iter::from_fn(|| op_rx.try_recv().ok())
-        .find(|op| matches!(op, AppCommand::RunUserShellCommand { .. }));
+    let shell = op_rx.try_recv().expect("deferred shell command");
     assert!(
-        matches!(shell, Some(AppCommand::RunUserShellCommand { command }) if command == "echo hello")
+        matches!(shell, AppCommand::RunUserShellCommand { command } if command == "echo hello")
     );
+    assert!(op_rx.try_recv().is_err());
     assert!(!chat.ide_context.prompt_pending());
     assert!(chat.input_queue.queued_user_messages.is_empty());
 }
@@ -209,6 +209,28 @@ async fn prompt_cancellation_preserves_history_attachments_mentions_and_new_draf
         chat.on_ide_context_completed(id, Ok(context("stale.rs")));
         assert_eq!(chat.bottom_pane.composer_draft_snapshot(), restored);
         assert_no_turn(&mut op_rx);
+    }
+}
+
+#[tokio::test]
+async fn prompt_cancellation_and_failure_preserve_held_keystroke() {
+    for cancel in [false, true] {
+        let (mut chat, _rx, op_rx) = make_chatwidget_manual(None).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.ide_context.enable();
+        chat.submit_user_message("original".into());
+        let id = pending_id(&chat);
+        chat.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        assert!(chat.bottom_pane.is_in_paste_burst());
+        drop(op_rx);
+        if cancel {
+            chat.handle_ide_command_args("off");
+        } else {
+            chat.on_ide_context_completed(id, Ok(context("fresh.rs")));
+        }
+        assert_eq!(chat.bottom_pane.composer_text(), "original\na");
+        assert!(!chat.ide_context.prompt_pending());
+        assert!(!chat.bottom_pane.is_in_paste_burst());
     }
 }
 

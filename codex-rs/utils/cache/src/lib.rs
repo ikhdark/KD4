@@ -134,15 +134,6 @@ mod tests {
     use super::BlockingLruCache;
     use std::num::NonZeroUsize;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stores_and_retrieves_values() {
-        let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
-
-        assert!(cache.get(&"first").is_none());
-        cache.insert("first", /*value*/ 1);
-        assert_eq!(cache.get(&"first"), Some(1));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn current_thread_runtime_stores_and_retrieves_values() {
         let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
@@ -179,7 +170,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn evicts_least_recently_used() {
         let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
+        assert_eq!(cache.get(&"a"), None);
         cache.insert("a", /*value*/ 1);
+        assert_eq!(cache.get(&"a"), Some(1));
         cache.insert("b", /*value*/ 2);
         assert_eq!(cache.get(&"a"), Some(1));
 

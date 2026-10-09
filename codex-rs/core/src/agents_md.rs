@@ -83,6 +83,7 @@ fn stable_context_identity_from_structure(
 pub(crate) struct ProjectInstructionsLoad {
     pub(crate) loaded: Option<LoadedAgentsMd>,
     pub(crate) complete: bool,
+    pub(crate) retained_sources: Vec<RetainedProjectDoc>,
 }
 
 /// Freshness of the AGENTS.md observation attached to one sampling request.
@@ -113,6 +114,7 @@ impl AgentsMdFreshness {
 
 struct EnvironmentProjectInstructions {
     loaded: Option<LoadedAgentsMd>,
+    retained_sources: Vec<RetainedProjectDoc>,
     retained_source_bytes: usize,
     rendered_bytes: usize,
     omitted_documents: Vec<ProjectDocOmission>,
@@ -178,8 +180,6 @@ struct ProjectDocCandidate {
 
 pub(crate) struct ProjectInstructionsDiscovery {
     environments: Vec<EnvironmentProjectInstructionsDiscovery>,
-    #[cfg(test)]
-    config_identity: usize,
 }
 
 struct EnvironmentProjectInstructionsDiscovery {
@@ -189,17 +189,20 @@ struct EnvironmentProjectInstructionsDiscovery {
     result: io::Result<Vec<ProjectDocCandidate>>,
 }
 
-impl ProjectInstructionsDiscovery {
-    #[cfg(test)]
-    pub(crate) fn config_identity(&self) -> usize {
-        self.config_identity
-    }
-}
-
+#[derive(Clone)]
 struct ProjectDocRead {
     retained_data: Vec<u8>,
     original_bytes: u64,
     utf8_boundary_truncation: Option<usize>,
+}
+
+/// Last accepted source bytes, separate from generated truncation/encoding notices.
+#[derive(Clone)]
+pub(crate) struct RetainedProjectDoc {
+    environment_id: String,
+    cwd: PathUri,
+    candidate: ProjectDocCandidate,
+    read: ProjectDocRead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,13 +251,9 @@ pub(crate) async fn discover_project_instructions_with_markers(
     environments: &TurnEnvironmentSnapshot,
     project_root_markers: &[String],
 ) -> ProjectInstructionsDiscovery {
-    #[cfg(test)]
-    let config_identity = Arc::as_ptr(&config) as usize;
     if config.project_doc_max_bytes == 0 {
         return ProjectInstructionsDiscovery {
             environments: Vec::new(),
-            #[cfg(test)]
-            config_identity,
         };
     }
 
@@ -294,8 +293,6 @@ pub(crate) async fn discover_project_instructions_with_markers(
 
     ProjectInstructionsDiscovery {
         environments,
-        #[cfg(test)]
-        config_identity,
     }
 }
 
@@ -313,7 +310,7 @@ pub(crate) async fn load_project_instructions_with_fallback(
     user_instructions: Option<UserInstructions>,
     discovery: ProjectInstructionsDiscovery,
     omission_recovery: Option<&ProjectDocOmissionRecovery>,
-    previous: Option<&LoadedAgentsMd>,
+    previous: Option<(&LoadedAgentsMd, &[RetainedProjectDoc])>,
 ) -> ProjectInstructionsLoad {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
     let mut remaining_source_bytes = config.project_doc_max_bytes;
@@ -322,11 +319,13 @@ pub(crate) async fn load_project_instructions_with_fallback(
         remaining_rendered_bytes.min(PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
     remaining_rendered_bytes = remaining_rendered_bytes.saturating_sub(aggregate_reserve);
     let mut omitted_documents = Vec::new();
+    let mut retained_sources = Vec::new();
     let mut complete = true;
     if remaining_source_bytes == 0 {
         return ProjectInstructionsLoad {
             loaded: (!loaded.is_empty()).then_some(loaded),
             complete,
+            retained_sources,
         };
     }
 
@@ -381,7 +380,7 @@ pub(crate) async fn load_project_instructions_with_fallback(
                     candidates,
                     remaining_source_bytes,
                     /*prefetch_utf8_boundary_slack*/ false,
-                    previous.map(|loaded| (loaded, environment_id.as_str(), &cwd)),
+                    previous.map(|(_, sources)| (sources, environment_id.as_str(), &cwd)),
                 )
                 .await;
                 complete &= failed_sources.is_empty();
@@ -396,6 +395,7 @@ pub(crate) async fn load_project_instructions_with_fallback(
                 remaining_rendered_bytes =
                     remaining_rendered_bytes.saturating_sub(environment_load.rendered_bytes);
                 omitted_documents.extend(environment_load.omitted_documents);
+                retained_sources.extend(environment_load.retained_sources);
                 let environment_start = loaded.entries.len();
                 if let Some(docs) = environment_load.loaded {
                     loaded.entries.extend(docs.entries);
@@ -411,6 +411,12 @@ pub(crate) async fn load_project_instructions_with_fallback(
             Err(err) => {
                 complete = false;
                 retain_failed_environment(&mut loaded, previous, &environment_id, &cwd, &mut remaining_source_bytes, &mut remaining_rendered_bytes, None);
+                if let Some((_, sources)) = previous {
+                    retained_sources.extend(sources.iter().filter(|source| {
+                        source.environment_id == environment_id && source.cwd == cwd
+                            && loaded.sources().any(|path| path == source.candidate.path)
+                    }).cloned());
+                }
                 error!(
                     environment_id,
                     "error trying to find AGENTS.md docs: {err:#}"
@@ -434,12 +440,13 @@ pub(crate) async fn load_project_instructions_with_fallback(
     ProjectInstructionsLoad {
         loaded: (!loaded.is_empty()).then_some(loaded),
         complete,
+        retained_sources,
     }
 }
 
 fn retain_failed_environment(
     loaded: &mut LoadedAgentsMd,
-    previous: Option<&LoadedAgentsMd>,
+    previous: Option<(&LoadedAgentsMd, &[RetainedProjectDoc])>,
     environment_id: &str,
     cwd: &PathUri,
     source_budget: &mut usize,
@@ -448,7 +455,8 @@ fn retain_failed_environment(
 ) {
     // Freshness is reported by the existing world-state transition. Putting a
     // notice in the body would spuriously replace unchanged instructions.
-    for entry in previous.into_iter().flat_map(|previous| &previous.entries) {
+    let Some((previous, sources)) = previous else { return; };
+    for entry in &previous.entries {
         if let Some(paths) = failed_sources
             && !matches!(&entry.provenance, InstructionProvenance::Project { source_path, .. } if paths.contains(source_path))
         { continue; }
@@ -457,10 +465,14 @@ fn retain_failed_environment(
             continue;
         }
         let bytes = entry.contents.len();
-        if bytes <= *rendered_budget && bytes <= *source_budget {
+        let source_bytes = sources.iter().find(|source| {
+            source.environment_id == environment_id && &source.cwd == cwd
+                && entry.provenance.path().as_ref() == Some(&source.candidate.path)
+        }).map_or(bytes, |source| source.read.retained_data.len());
+        if bytes <= *rendered_budget && source_bytes <= *source_budget {
             loaded.entries.push(entry.clone());
             *rendered_budget -= bytes;
-            *source_budget -= bytes;
+            *source_budget -= source_bytes;
         }
     }
 }
@@ -533,7 +545,7 @@ async fn read_discovered_project_docs(
     paths: Vec<ProjectDocCandidate>,
     max_total: usize,
     prefetch_utf8_boundary_slack: bool,
-    fallback: Option<(&LoadedAgentsMd, &str, &PathUri)>,
+    fallback: Option<(&[RetainedProjectDoc], &str, &PathUri)>,
 ) -> (Vec<LoadedProjectDoc>, Vec<PathUri>) {
     if paths.is_empty() {
         return (Vec::new(), Vec::new());
@@ -563,18 +575,13 @@ async fn read_discovered_project_docs(
                 error!(path = %candidate.path, "error reading instruction source: {err:#}");
                 failed_sources.push(candidate.path.clone());
                 let cached = fallback.and_then(|(previous, environment_id, cwd)| {
-                    previous.entries.iter().find(|entry| matches!(&entry.provenance,
-                        InstructionProvenance::Project { source_path, environment_id: id, cwd: old_cwd }
-                            if source_path == &candidate.path && id == environment_id && old_cwd == cwd))
+                    previous.iter().find(|source| source.candidate.path == candidate.path
+                        && source.environment_id == environment_id && &source.cwd == cwd)
                 });
                 let Some(cached) = cached else { continue; };
                 // Admit the last accepted body at its normal nearest-first priority,
                 // before fresh ancestors consume the shared budget. No extra I/O.
-                ProjectDocRead {
-                    retained_data: cached.contents.as_bytes().to_vec(),
-                    original_bytes: cached.contents.len() as u64,
-                    utf8_boundary_truncation: None,
-                }
+                cached.read.clone()
             }
         };
 
@@ -602,6 +609,7 @@ fn render_project_docs(
     let mut remaining = max_rendered_bytes;
     let mut loaded = LoadedAgentsMd::default();
     let mut entries = Vec::new();
+    let mut retained_sources = Vec::new();
     let mut retained_source_bytes = 0usize;
     let mut omitted_documents = Vec::new();
 
@@ -651,6 +659,12 @@ fn render_project_docs(
         }
 
         let rendered_bytes = text.len();
+        retained_sources.push(RetainedProjectDoc {
+            environment_id: environment_id.to_string(),
+            cwd: cwd.clone(),
+            candidate: candidate.clone(),
+            read,
+        });
         entries.push(InstructionEntry {
             contents: text,
             provenance: InstructionProvenance::Project {
@@ -668,6 +682,7 @@ fn render_project_docs(
 
     EnvironmentProjectInstructions {
         loaded: (!loaded.is_empty()).then_some(loaded),
+        retained_sources,
         retained_source_bytes,
         rendered_bytes: max_rendered_bytes.saturating_sub(remaining),
         omitted_documents,

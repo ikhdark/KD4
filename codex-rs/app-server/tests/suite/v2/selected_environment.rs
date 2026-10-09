@@ -149,7 +149,7 @@ async fn thread_start_reports_selected_environment_metadata() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_start_reports_selected_environment_instruction_source() -> Result<()> {
+async fn selected_environment_instructions_and_context_are_model_visible() -> Result<()> {
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_once(
         &server,
@@ -176,7 +176,7 @@ async fn thread_start_reports_selected_environment_instruction_source() -> Resul
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, app_server.initialize()).await??;
 
-    let (agents_source, environment_cwd) = {
+    let (agents_source, environment_cwd, environment_shell) = {
         let auto_env = app_server.auto_env()?;
         let environment_cwd = auto_env.selection().cwd.clone();
         let agents_source = environment_cwd.join("AGENTS.md")?;
@@ -189,7 +189,11 @@ async fn thread_start_reports_selected_environment_instruction_source() -> Resul
                 /*sandbox*/ None,
             )
             .await?;
-        (agents_source, environment_cwd)
+        (
+            agents_source,
+            environment_cwd,
+            auto_env.environment().info().await?.shell.name,
+        )
     };
 
     let request_id = app_server
@@ -206,6 +210,7 @@ async fn thread_start_reports_selected_environment_instruction_source() -> Resul
         response.instruction_sources,
         vec![agents_source.clone().into()]
     );
+    let runtime_workspace_roots = response.runtime_workspace_roots;
     timeout(
         DEFAULT_READ_TIMEOUT,
         app_server.start_turn_and_wait_for_completion(text_turn_params(
@@ -227,67 +232,6 @@ async fn thread_start_reports_selected_environment_instruction_source() -> Resul
     );
     assert_eq!(instructions, &expected_instructions);
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn turn_model_context_uses_selected_environment() -> Result<()> {
-    let server = responses::start_mock_server().await;
-    let response_mock = responses::mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_response_created("resp-1"),
-            responses::ev_assistant_message("msg-1", "done"),
-            responses::ev_completed("resp-1"),
-        ]),
-    )
-    .await;
-    let codex_home = TempDir::new()?;
-    write_mock_responses_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        &BTreeMap::new(),
-        /*auto_compact_limit*/ 100_000,
-        /*requires_openai_auth*/ None,
-        "mock_provider",
-        "compact",
-    )?;
-    let mut app_server = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, app_server.initialize()).await??;
-    let (environment_cwd, environment_shell) = {
-        let auto_env = app_server.auto_env()?;
-        (
-            auto_env.selection().cwd.clone(),
-            auto_env.environment().info().await?.shell.name,
-        )
-    };
-
-    let request_id = app_server
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ThreadStartResponse {
-        thread,
-        runtime_workspace_roots,
-        ..
-    } = to_response(response)?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        app_server.start_turn_and_wait_for_completion(text_turn_params(
-            thread.id,
-            "inspect the selected environment",
-        )),
-    )
-    .await??;
-
-    let user_context = response_mock.single_request().message_input_texts("user");
     let environment_context = user_context
         .iter()
         .find(|text| text.starts_with("<environment_context>"))

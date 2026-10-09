@@ -88,15 +88,16 @@ fn unmatched_safe_powershell_words_are_allowed() {
 }
 
 #[test]
-fn read_only_windows_sandbox_runs_unmatched_commands_under_sandbox() {
+fn read_only_windows_policy_requires_an_enforcing_sandbox_backend() {
     let command = vec!["cmd.exe".to_string(), "/c".to_string(), "dir".to_string()];
 
-    for windows_sandbox_level in [
-        WindowsSandboxLevel::RestrictedToken,
-        WindowsSandboxLevel::Elevated,
+    for (windows_sandbox_level, expected) in [
+        (WindowsSandboxLevel::RestrictedToken, Decision::Allow),
+        (WindowsSandboxLevel::Elevated, Decision::Allow),
+        (WindowsSandboxLevel::Disabled, Decision::Forbidden),
     ] {
         assert_eq!(
-            Decision::Allow,
+            expected,
             render_decision_for_unmatched_command(
                 &command,
                 UnmatchedCommandContext {
@@ -110,27 +111,6 @@ fn read_only_windows_sandbox_runs_unmatched_commands_under_sandbox() {
             )
         );
     }
-}
-
-#[test]
-fn read_only_windows_policy_without_sandbox_backend_still_requires_approval() {
-    let command = vec!["cmd.exe".to_string(), "/c".to_string(), "dir".to_string()];
-
-    assert_eq!(
-        Decision::Forbidden,
-        render_decision_for_unmatched_command(
-            &command,
-            UnmatchedCommandContext {
-                approval_policy: AskForApproval::Never,
-                permission_profile: &PermissionProfile::read_only(),
-                windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                sandbox_permissions: SandboxPermissions::UseDefault,
-                used_complex_parsing: false,
-                command_origin: ExecPolicyCommandOrigin::Generic,
-            },
-        ),
-        "command is forbidden because approval policy is never and there is no Windows sandbox to rely on"
-    );
 }
 
 #[test]

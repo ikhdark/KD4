@@ -68,7 +68,7 @@ async fn unchanged_generation_reuses_one_mcp_process_for_100_calls() -> anyhow::
     let original_pid = wait_for_pid_file(&pid_file).await?;
     fs::remove_file(&pid_file)?;
     for call in 0..100 {
-        fixture
+        let result = fixture
             .codex
             .call_mcp_tool(
                 "stable_generation",
@@ -77,6 +77,12 @@ async fn unchanged_generation_reuses_one_mcp_process_for_100_calls() -> anyhow::
                 /*meta*/ None,
             )
             .await?;
+        assert_ne!(result.is_error, Some(true), "echo call {call} failed");
+        assert_eq!(
+            result.structured_content.as_ref().and_then(|value| value.get("echo")),
+            Some(&serde_json::json!(format!("ECHOING: call-{call}"))),
+            "each call must reach the retained server with its own arguments"
+        );
     }
 
     assert!(process_is_alive(&original_pid).await?);

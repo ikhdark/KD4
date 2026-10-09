@@ -8,6 +8,11 @@ use opentelemetry_sdk::metrics::data::Metric;
 use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+// Every successful OtelProvider construction writes process-global tracestate,
+// including providers that export logs only.
+pub(crate) static TRACE_CONTEXT_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn build_metrics_with_defaults(
     default_tags: &[(&str, &str)],

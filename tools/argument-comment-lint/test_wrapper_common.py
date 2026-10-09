@@ -202,6 +202,36 @@ class WrapperCommonTest(unittest.TestCase):
             },
         )
 
+    def test_only_explicit_levels_for_the_exact_lint_override_defaults(self) -> None:
+        # README: both lints default to errors, except an explicit level for
+        # that lint. Merely mentioning its name must not disable enforcement.
+        for flags in (
+            "--cfg=argument_comment_mismatch",
+            "--cfg='-D argument-comment-mismatch'",
+            '--cfg="unterminated',
+            "-A argument_comment_mismatch_extra",
+            "-A uncommented_anonymous_literal_argument_extra",
+        ):
+            with self.subTest(flags=flags):
+                env = {"DYLINT_RUSTFLAGS": flags}
+                wrapper_common.set_default_lint_env(env)
+                self.assertEqual(
+                    env["DYLINT_RUSTFLAGS"],
+                    flags + " -D argument-comment-mismatch"
+                    " -D uncommented-anonymous-literal-argument -A unknown_lints",
+                )
+
+    def test_explicit_level_spellings_and_lists_are_preserved(self) -> None:
+        for flags in (
+            "-Aargument_comment_mismatch -Wuncommented_anonymous_literal_argument",
+            "--allow=argument_comment_mismatch --forbid uncommented_anonymous_literal_argument",
+            "--force-warn=argument_comment_mismatch,uncommented_anonymous_literal_argument",
+        ):
+            with self.subTest(flags=flags):
+                env = {"DYLINT_RUSTFLAGS": flags}
+                wrapper_common.set_default_lint_env(env)
+                self.assertEqual(env["DYLINT_RUSTFLAGS"], flags + " -A unknown_lints")
+
 
 if __name__ == "__main__":
     unittest.main()

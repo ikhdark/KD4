@@ -265,7 +265,6 @@ pub(crate) fn build_settings_update_items(
 mod tests {
     use super::build_collaboration_mode_update_item;
     use super::build_personality_update_item;
-    use super::generic_personality_message;
     use crate::session::tests::make_session_and_context;
     use codex_execpolicy::Policy;
     use codex_protocol::config_types::Personality;
@@ -340,57 +339,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generic_personality_fallback_covers_template_less_models() {
-        assert!(
-            generic_personality_message(Personality::Friendly)
-                .is_some_and(|message| message.contains("warm, collaborative"))
-        );
-        assert!(
-            generic_personality_message(Personality::Pragmatic)
-                .is_some_and(|message| message.contains("engineering-focused"))
-        );
-        assert_eq!(generic_personality_message(Personality::None), None);
-    }
+
 
     #[tokio::test]
-    async fn model_switch_reinjects_an_unchanged_personality() {
+    async fn model_switch_reinjects_template_less_personality_and_honors_feature_gate() {
         let (_session, mut next) = make_session_and_context().await;
-        next.personality = Some(Personality::Friendly);
         next.model_info.model_messages = None;
+        for (personality, expected) in [
+            (Personality::Friendly, "warm, collaborative"),
+            (Personality::Pragmatic, "engineering-focused"),
+        ] {
+            next.personality = Some(personality);
+            let mut previous = next.to_turn_context_item();
+            assert_eq!(build_personality_update_item(Some(&previous), &next, true), None);
+            previous.model = "previous-model".into();
+            assert_eq!(build_personality_update_item(Some(&previous), &next, false), None);
+            let update = build_personality_update_item(Some(&previous), &next, true).unwrap();
+            assert!(update.starts_with("<personality_spec>"));
+            assert!(update.contains(expected));
+        }
+        next.personality = Some(Personality::None);
         let mut previous = next.to_turn_context_item();
-        previous.personality = Some(Personality::Friendly);
-        previous.model = "previous-model".to_string();
-
-        let update = build_personality_update_item(Some(&previous), &next, true)
-            .expect("model switch should refresh model-visible personality wording");
-
-        assert!(update.contains("<personality_spec>"));
-        assert!(update.contains("warm, collaborative"));
+        previous.model = "previous-model".into();
+        assert_eq!(super::personality_message_for(&next.model_info, Personality::None), None);
+        assert_eq!(build_personality_update_item(Some(&previous), &next, true), None);
     }
 
-    #[tokio::test]
-    async fn collaboration_metadata_change_without_prompt_change_emits_no_delta() {
-        let (_session, next) = make_session_and_context().await;
-        let mut previous = next.to_turn_context_item();
-        let previous_mode = previous
-            .collaboration_mode
-            .as_mut()
-            .expect("test turn should persist collaboration mode");
-        previous_mode.settings.model = "previous-model".to_string();
 
-        assert_eq!(
-            build_collaboration_mode_update_item(Some(&previous), &next),
-            None
-        );
-    }
 
     #[tokio::test]
     async fn blank_collaboration_instructions_emit_reset_and_preserve_nonblank_formatting() {
         let (_session, mut next) = make_session_and_context().await;
         next.collaboration_mode.settings.developer_instructions =
             Some("active instructions".to_string());
-        let previous = next.to_turn_context_item();
+        let mut previous = next.to_turn_context_item();
+        previous.collaboration_mode.as_mut().unwrap().settings.model = "previous-model".into();
+        assert_eq!(build_collaboration_mode_update_item(Some(&previous), &next), None);
         for instructions in [None, Some(""), Some("\n\t \u{2003}")] {
             next.collaboration_mode.settings.developer_instructions =
                 instructions.map(str::to_string);

@@ -751,20 +751,23 @@ mod tests {
     use std::sync::Mutex;
 
     #[tokio::test]
-    async fn successful_rev_parse_false_is_not_a_worktree() {
+    async fn rev_parse_rejects_non_worktrees() {
+        for (exit_code, output) in [(0, "false\n"), (128, "")] {
         let runner = FakeRunner::new(vec![response(
             git_command(
                 FsmonitorOverride::Disabled,
                 &["rev-parse", "--is-inside-work-tree"],
             ),
-            0,
-            "false\n",
+            exit_code,
+            output,
         )]);
         assert_eq!(
             get_git_diff(&runner, Path::new("/bare")).await,
             Ok((false, String::new()))
         );
         assert_eq!(runner.commands().len(), 1);
+        assert_command_metadata(&runner.commands(), Path::new("/bare"));
+        }
     }
 
     #[tokio::test]
@@ -854,24 +857,6 @@ mod tests {
                 .expect_err("read failure must surface")
                 .contains("could not access missing-file")
         );
-    }
-
-    #[tokio::test]
-    async fn get_git_diff_returns_not_git_for_non_git_cwd() {
-        let cwd = PathBuf::from("/workspace");
-        let runner = FakeRunner::new(vec![response(
-            git_command(
-                FsmonitorOverride::Disabled,
-                &["rev-parse", "--is-inside-work-tree"],
-            ),
-            /*exit_code*/ 128,
-            "",
-        )]);
-
-        let result = get_git_diff(&runner, &cwd).await;
-
-        assert_eq!(result, Ok((false, String::new())));
-        assert_command_metadata(&runner.commands(), &cwd);
     }
 
     #[tokio::test]
@@ -982,13 +967,14 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_remote_diff_discards_output_that_reaches_the_sentinel() {
+        for output in ["12345678", "123456789"] {
         let cwd = PathBuf::from("/workspace");
         let args = ["diff", "--no-index"];
         let complete_output_budget = 8;
         let runner = FakeRunner::new(vec![response(
             git_command(FsmonitorOverride::Disabled, &args),
             /*exit_code*/ 1,
-            "123456789",
+            output,
         )]);
 
         let capture = run_git_capture_diff_bounded(
@@ -1002,10 +988,11 @@ mod tests {
         .await
         .expect("bounded diff response");
 
-        assert!(capture.output.is_none());
-        assert_eq!(capture.captured_bytes, complete_output_budget + 1);
+        assert_eq!(capture.output.as_deref(), (output.len() <= complete_output_budget).then_some(output));
+        assert_eq!(capture.captured_bytes, output.len());
         let commands = runner.commands();
         assert_eq!(commands[0].output_bytes_cap, complete_output_budget + 1);
+        }
     }
 
     #[tokio::test]
@@ -1224,78 +1211,7 @@ mod tests {
         assert_command_metadata(&runner.commands(), &cwd);
     }
 
-    #[tokio::test]
-    async fn get_git_diff_rejects_tracked_diff_exit_code_one() {
-        let cwd = PathBuf::from("/workspace");
-        let runner = FakeRunner::new(vec![
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &["rev-parse", "--is-inside-work-tree"],
-                ),
-                /*exit_code*/ 0,
-                "true\n",
-            ),
-            response(
-                git_probe_command(&["config", "--null", "--get", "core.fsmonitor"]),
-                /*exit_code*/ 1,
-                "",
-            ),
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &[
-                        "config",
-                        "--null",
-                        "--name-only",
-                        "--get-regexp",
-                        EXECUTABLE_FILTER_CONFIG_PATTERN,
-                    ],
-                ),
-                /*exit_code*/ 1,
-                "",
-            ),
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &[
-                        "diff",
-                        "--no-textconv",
-                        "--no-ext-diff",
-                        "--submodule=short",
-                        "--ignore-submodules=dirty",
-                        "--color",
-                        "--relative",
-                    ],
-                ),
-                /*exit_code*/ 1,
-                "tracked\n",
-            ),
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &[
-                        "-c",
-                        "core.quotePath=true",
-                        "ls-files",
-                        "--others",
-                        "--exclude-standard",
-                    ],
-                ),
-                /*exit_code*/ 0,
-                "",
-            ),
-        ]);
 
-        let result = get_git_diff(&runner, &cwd).await;
-
-        assert!(
-            result
-                .expect_err("tracked diff errors must surface")
-                .contains("failed with status 1")
-        );
-        assert_command_metadata(&runner.commands(), &cwd);
-    }
 
     #[tokio::test]
     async fn get_git_diff_caps_untracked_file_diffs_and_lists_omitted_paths() {
@@ -1407,7 +1323,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_git_diff_rejects_unexpected_git_diff_status() {
+    async fn get_git_diff_rejects_tracked_diff_error_statuses() {
+        for (status, output) in [(1, "tracked\n"), (2, "")] {
         let cwd = PathBuf::from("/workspace");
         let runner = FakeRunner::new(vec![
             response(
@@ -1450,8 +1367,8 @@ mod tests {
                         "--relative",
                     ],
                 ),
-                /*exit_code*/ 2,
-                "",
+                status,
+                output,
             ),
             response(
                 git_command(
@@ -1475,9 +1392,10 @@ mod tests {
 
         assert_eq!(
             error,
-            "git [\"diff\", \"--no-textconv\", \"--no-ext-diff\", \"--submodule=short\", \"--ignore-submodules=dirty\", \"--color\", \"--relative\"] failed with status 2: "
+            format!("git [\"diff\", \"--no-textconv\", \"--no-ext-diff\", \"--submodule=short\", \"--ignore-submodules=dirty\", \"--color\", \"--relative\"] failed with status {status}: ")
         );
         assert_command_metadata(&runner.commands(), &cwd);
+        }
     }
 
     #[test]
@@ -1680,6 +1598,10 @@ mod tests {
         assert!(result.0);
         assert_eq!(runner.commands().len(), 5);
         assert_eq!(result.1.matches("diff --git").count(), 32);
+        for file in &files {
+            assert_eq!(result.1.matches(&format!("diff --git a/{file} b/{file}")).count(), 1);
+            assert_eq!(result.1.matches(&format!("\x1b[32m+\x1b[m\x1b[32m{file}\x1b[m\n")).count(), 1);
+        }
         #[cfg(unix)]
         {
             assert_eq!(result.1.matches("new file mode 100755").count(), 1);

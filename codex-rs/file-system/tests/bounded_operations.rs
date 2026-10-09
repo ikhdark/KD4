@@ -86,13 +86,19 @@ fn filters_do_not_hide_budget_cutoffs_or_exclude_the_selected_root() {
 
 #[test]
 fn filters_are_bounded_and_invalid_scope_fails_before_enumeration() {
-    for include in [vec!["".into()], vec!["src/*.rs".into()], vec!["a\\b".into()],
-        vec!["x".repeat(257)], vec!["x".into(); 65]] {
-        let fs = TestFileSystem::default();
-        let mut opts = options(20);
-        opts.filters.include = include;
-        assert_eq!(block_on(fs.walk(&root(), opts, None)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
-        assert!(fs.limits.lock().unwrap().is_empty());
+    for field in ["include", "exclude", "exclude_directories"] {
+        for patterns in [vec!["".into()], vec!["src/*.rs".into()], vec!["a\\b".into()],
+            vec!["a\0b".into()], vec!["x".repeat(257)], vec!["x".into(); 65]] {
+            let fs = TestFileSystem::default();
+            let mut opts = options(20);
+            match field {
+                "include" => opts.filters.include = patterns,
+                "exclude" => opts.filters.exclude = patterns,
+                _ => opts.filters.exclude_directories = patterns,
+            }
+            assert_eq!(block_on(fs.walk(&root(), opts, None)).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{field}");
+            assert!(fs.limits.lock().unwrap().is_empty(), "{field}");
+        }
     }
 }
 

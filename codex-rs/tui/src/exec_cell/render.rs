@@ -915,11 +915,12 @@ mod tests {
         );
         let rendered: Vec<String> = truncated.iter().map(render_line_text).collect();
 
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains("… output truncated (ctrl + t to view transcript)")),
-            "expected a generic viewport hint, got: {rendered:?}"
+        assert_eq!(
+            rendered,
+            vec![
+                "    … output truncated (ctrl + t to view transcript)",
+                "    tail",
+            ]
         );
     }
 
@@ -928,7 +929,7 @@ mod tests {
         let output =
             CommandOutput::new(0, (1..=7).map(|n| n.to_string()).join("\n"), String::new());
 
-        let rendered: Vec<String> = output_lines(
+        let result = output_lines(
             Some(&output),
             OutputLinesParams {
                 line_limit: 2,
@@ -936,17 +937,16 @@ mod tests {
                 include_angle_pipe: false,
                 include_prefix: false,
             },
-        )
-        .lines
+        );
+        assert_eq!(result.omitted, Some(3));
+        let rendered: Vec<String> = result.lines
         .iter()
         .map(render_line_text)
         .collect();
 
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains("… +3 lines (ctrl + t to view transcript)")),
-            "expected logical truncation to include transcript hint, got: {rendered:?}"
+        assert_eq!(
+            rendered,
+            vec!["1", "2", "… +3 lines (ctrl + t to view transcript)", "6", "7"]
         );
     }
 
@@ -1059,20 +1059,14 @@ mod tests {
             duration: None,
         };
 
-        let cell = ExecCell::new(call, /*animations_enabled*/ false);
-        let first: Vec<String> = cell
-            .command_display_lines(/*width*/ 80)
-            .iter()
-            .map(render_line_text)
-            .collect();
-        let second: Vec<String> = cell
-            .command_display_lines(/*width*/ 80)
-            .iter()
-            .map(render_line_text)
-            .collect();
+        let mut cell = ExecCell::new(call, /*animations_enabled*/ false);
+        let first = cell.command_display_lines(/*width*/ 80);
+        cell.calls[0].start_time = Some(Instant::now() - std::time::Duration::from_secs(1));
+        let second = cell.command_display_lines(/*width*/ 80);
 
         assert_eq!(first, second);
-        assert_eq!(first, vec!["• Running echo done".to_string()]);
+        assert_eq!(first[0].spans[0], "•".dim());
+        assert_eq!(first.iter().map(render_line_text).collect_vec(), vec!["• Running echo done"]);
     }
 
     #[test]

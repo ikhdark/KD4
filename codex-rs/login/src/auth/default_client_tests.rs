@@ -254,13 +254,10 @@ fn default_client_constructors_reject_invalid_custom_ca() {
 }
 
 #[tokio::test]
-async fn raw_auth_client_does_not_log_sensitive_request_or_response_data() {
-    assert_auth_client_does_not_log_secrets(false).await;
-}
-
-#[tokio::test]
-async fn default_auth_client_does_not_log_sensitive_request_or_response_data() {
-    assert_auth_client_does_not_log_secrets(true).await;
+async fn auth_clients_do_not_log_sensitive_request_or_response_data() {
+    for default_client in [false, true] {
+        assert_auth_client_does_not_log_secrets(default_client).await;
+    }
 }
 
 async fn assert_auth_client_does_not_log_secrets(default_client: bool) {
@@ -371,21 +368,10 @@ async fn assert_auth_client_does_not_log_secrets(default_client: bool) {
 #[test]
 fn test_invalid_suffix_is_sanitized() {
     let prefix = "codex_cli_rs/0.0.0";
-    let suffix = "bad\rsuffix";
-
-    assert_eq!(
-        sanitize_user_agent(format!("{prefix} ({suffix})"), prefix),
-        "codex_cli_rs/0.0.0 (bad_suffix)"
-    );
-}
-
-#[test]
-fn test_invalid_suffix_is_sanitized2() {
-    let prefix = "codex_cli_rs/0.0.0";
-    let suffix = "bad\0suffix";
-
-    assert_eq!(
-        sanitize_user_agent(format!("{prefix} ({suffix})"), prefix),
-        "codex_cli_rs/0.0.0 (bad_suffix)"
-    );
+    for suffix in ["bad\rsuffix", "bad\0suffix", "bad\nsuffix"] {
+        assert_eq!(
+            sanitize_user_agent(format!("{prefix} ({suffix})"), prefix),
+            "codex_cli_rs/0.0.0 (bad_suffix)"
+        );
+    }
 }

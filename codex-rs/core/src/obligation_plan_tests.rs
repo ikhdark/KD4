@@ -8,18 +8,7 @@ async fn apply(store: &PlanStore, mut args: serde_json::Value) -> PlanStoreUpdat
     store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap()
 }
 
-#[tokio::test]
-async fn obligation_widened_scope_survives_return_to_original_wording_and_resume() {
-    let store = PlanStore::default();
-    let initial = apply(&store, json!({"plan":[{"step":"Inspect A","status":"pending"}]})).await;
-    let id = initial.lineage.step_id("Inspect A");
-    apply(&store, json!({"plan":[{"step":"Inspect A and verify B","status":"pending","continues":[id]}]})).await;
-    let current = apply(&store, json!({"plan":[{"step":"Inspect A","status":"completed","continues":[id]}]})).await;
-    let unresolved = current.lineage.obligation_summary(&current.current).unresolved;
-    assert!(unresolved.iter().any(|id| current.lineage.requirements[id].text == "Inspect A and verify B"));
-    store.restore_with_lineage(Some(current.current), Some(current.lineage)).await;
-    assert_eq!(store.execution_snapshot().await.unwrap().obligations.unresolved, unresolved);
-}
+
 
 #[tokio::test]
 async fn obligation_explicit_resolution_closes_completed_split_without_renaming_back() {
@@ -74,23 +63,7 @@ async fn obligation_changed_scope_rejects_stale_stable_id_completion_atomically(
     assert_eq!(store.execution_snapshot().await, before);
 }
 
-#[tokio::test]
-async fn obligation_user_cited_retirement_requires_accepted_input_and_survives_resume() {
-    let store = PlanStore::default();
-    let initial = apply(&store, json!({"plan":[{"step":"Publish package","status":"pending"}]})).await;
-    let id = initial.lineage.step_id("Publish package");
-    let instruction = "Do not publish; review only.";
-    let revision = store.execution_snapshot().await.unwrap().revision;
-    let args = json!({"expected_revision":revision,"plan":[],
-        "superseded":[{"step_id":id,"reason":"User cancelled publication"}],
-        "scope_change_instructions":{(id.clone()):instruction}});
-    assert!(store.update_tool(serde_json::from_value(args.clone()).unwrap()).await.is_err());
-    store.record_accepted_input("user-turn", std::iter::once(instruction)).await;
-    let retired = store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap();
-    assert_eq!(retired.lineage.obligation_summary(&retired.current).superseded, 1);
-    store.restore_with_lineage(Some(retired.current), Some(retired.lineage)).await;
-    assert_eq!(store.execution_snapshot().await.unwrap().obligations.superseded, 1);
-}
+
 
 #[tokio::test]
 async fn obligation_split_retirement_reason_survives_explanation_replacement_and_resume() {

@@ -905,6 +905,11 @@ mod tests {
 
         let two_col = wrap_two_column_row(&row, /*desc_col*/ 0, /*width*/ 1);
         assert_eq!(two_col.len(), 0);
+
+        let wrapped = wrap_row_lines(&row, /*desc_col*/ 0, /*width*/ 1);
+        assert!(wrapped.len() > 1);
+        assert!(wrapped.iter().all(|line| line.width() <= 1));
+        assert_eq!(wrapped[0].to_string(), "…");
     }
 
     #[test]

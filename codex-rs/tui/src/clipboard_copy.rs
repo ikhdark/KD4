@@ -99,8 +99,10 @@ mod tests {
         let text = "# Hello\n\n```rust\nfn main() {}\n```\n";
         let sequence = osc52_sequence(text).expect("OSC 52 sequence");
         let encoded = sequence
-            .trim_start_matches("\u{1b}]52;c;")
-            .trim_end_matches('\u{7}');
+            .strip_prefix("\u{1b}]52;c;")
+            .expect("OSC 52 clipboard selector")
+            .strip_suffix('\u{7}')
+            .expect("OSC terminator");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .unwrap();

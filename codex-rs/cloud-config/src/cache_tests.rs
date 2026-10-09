@@ -162,19 +162,32 @@ async fn load_rejects_cache_for_incomplete_or_different_identity() {
     let cache_file = signed_cache_file(valid_signed_payload());
     write_cache_file(&cache, &cache_file);
 
-    assert_eq!(
-        cache.load(Some("user-99999"), Some("account-12345")).await,
-        Err(CacheLoadStatus::CacheIdentityMismatch)
-    );
+    for (user, account) in [
+        ("user-99999", "account-12345"),
+        ("user-12345", "account-99999"),
+    ] {
+        assert_eq!(
+            cache.load(Some(user), Some(account)).await,
+            Err(CacheLoadStatus::CacheIdentityMismatch),
+            "user: {user}, account: {account}"
+        );
+    }
 
-    let mut signed_payload = valid_signed_payload();
-    signed_payload.chatgpt_user_id = None;
-    write_cache_file(&cache, &signed_cache_file(signed_payload));
+    for missing_user in [true, false] {
+        let mut signed_payload = valid_signed_payload();
+        if missing_user {
+            signed_payload.chatgpt_user_id = None;
+        } else {
+            signed_payload.account_id = None;
+        }
+        write_cache_file(&cache, &signed_cache_file(signed_payload));
 
-    assert_eq!(
-        cache.load(Some("user-12345"), Some("account-12345")).await,
-        Err(CacheLoadStatus::CacheIdentityIncomplete)
-    );
+        assert_eq!(
+            cache.load(Some("user-12345"), Some("account-12345")).await,
+            Err(CacheLoadStatus::CacheIdentityIncomplete),
+            "missing user: {missing_user}"
+        );
+    }
 }
 
 #[tokio::test]

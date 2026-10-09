@@ -100,10 +100,7 @@ def lint_utf8_ascii_check(filename: Path) -> bool:
     decoder = codecs.getincrementaldecoder("utf-8")()
     line = 1
     col = 1
-    byte_line = 1
-    byte_col = 1
     byte_offset = 0
-    previous_cr = False
     text_previous_cr = False
 
     try:
@@ -125,10 +122,10 @@ def lint_utf8_ascii_check(filename: Path) -> bool:
                         print_decode_error(
                             error,
                             byte_offset - len(pending),
-                            byte_line,
-                            max(1, byte_col - len(pending)),
+                            line,
+                            col,
                             filename=filename,
-                            previous_cr=previous_cr,
+                            previous_cr=text_previous_cr,
                         )
                         reporter.flush()
                         return True
@@ -141,13 +138,6 @@ def lint_utf8_ascii_check(filename: Path) -> bool:
                         line, col = scan_text(scan_chunk, line, col, reporter)
                         text_previous_cr = text.endswith("\r")
 
-                position_chunk = (
-                    chunk[1:] if previous_cr and chunk.startswith(b"\n") else chunk
-                )
-                byte_line, byte_col = advance_position_bytes(
-                    position_chunk, byte_line, byte_col
-                )
-                previous_cr = chunk.endswith(b"\r")
                 byte_offset += len(chunk)
     except OSError as error:
         print_file_error(filename, "read", error)
@@ -160,10 +150,10 @@ def lint_utf8_ascii_check(filename: Path) -> bool:
         print_decode_error(
             error,
             byte_offset - len(pending),
-            byte_line,
-            max(1, byte_col - len(pending)),
+            line,
+            col,
             filename=filename,
-            previous_cr=previous_cr,
+            previous_cr=text_previous_cr,
         )
         reporter.flush()
         return True
@@ -337,7 +327,9 @@ def print_decode_error(
     partial = error.object[: error.start]
     if previous_cr and partial.startswith(b"\n"):
         partial = partial[1:]
-    line, col = advance_position_bytes(partial, line, col)
+    # The decoder guarantees the prefix before error.start is valid UTF-8.
+    # Keep columns in characters, matching ordinary invalid-character reports.
+    line, col = advance_position_text(partial.decode("utf-8"), line, col)
     prefix = f"{filename}: " if filename is not None else ""
     sys.stdout.write(
         f"{prefix}UTF-8 decoding error:\n"

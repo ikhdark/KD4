@@ -764,12 +764,28 @@ fn request_cancellation_tombstones_are_bounded() {
         .expect("start duplicate probe");
     assert!(requests.start(duplicate, RequestKind::OpenSession).is_err());
     requests.finish(duplicate);
+    assert!(requests.start(duplicate, RequestKind::OpenSession).is_err());
+    for (index, kind, cancellable) in [
+        (1, RequestKind::OpenSession, false),
+        (2, RequestKind::Execute, true),
+        (3, RequestKind::Wait, true),
+        (4, RequestKind::Terminate, false),
+        (5, RequestKind::ShutdownSession, false),
+    ] {
+        let id = request_id(-index - 1);
+        let token = requests.start(id, kind).expect("start cancellation probe");
+        assert!(!token.is_cancelled());
+        requests.cancel(id);
+        assert_eq!(token.is_cancelled(), cancellable);
+        requests.finish(id);
+    }
     for value in 1..=MAX_RECENT_REQUEST_IDS as i64 + 100 {
         let id = request_id(value);
-        requests
+        let token = requests
             .start(id, RequestKind::Wait)
             .expect("start request");
         requests.cancel(id);
+        assert!(token.is_cancelled());
         requests.finish(id);
     }
     for value in 10_000..20_000 {
@@ -779,6 +795,13 @@ fn request_cancellation_tombstones_are_bounded() {
     assert!(requests.active.is_empty());
     assert_eq!(requests.recent.len(), MAX_RECENT_REQUEST_IDS);
     assert_eq!(requests.recent_order.len(), MAX_RECENT_REQUEST_IDS);
+    assert!(!requests.recent.contains(&duplicate));
+    assert!(!requests.recent.contains(&request_id(100)));
+    assert!(requests.start(request_id(101), RequestKind::Wait).is_err());
+    assert!(requests.start(duplicate, RequestKind::OpenSession).is_ok());
+    requests.cancel_all();
+    assert!(requests.active[&duplicate].cancellation.is_cancelled());
+    requests.finish(duplicate);
 }
 
 #[tokio::test]

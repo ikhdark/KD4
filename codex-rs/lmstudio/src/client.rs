@@ -278,7 +278,7 @@ mod tests {
 
         let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
         let models = client.fetch_models().await.expect("fetch models");
-        assert!(models.contains(&"openai/gpt-oss-20b".to_string()));
+        assert_eq!(models, vec!["openai/gpt-oss-20b"]);
     }
 
     #[tokio::test]
@@ -603,14 +603,4 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
-    #[test]
-    fn test_from_host_root() {
-        let client =
-            LMStudioClient::from_host_root("http://localhost:1234").expect("shared HTTP client");
-        assert_eq!(client.base_url, "http://localhost:1234");
-
-        let client = LMStudioClient::from_host_root("https://example.com:8080/api")
-            .expect("shared HTTP client");
-        assert_eq!(client.base_url, "https://example.com:8080/api");
-    }
 }

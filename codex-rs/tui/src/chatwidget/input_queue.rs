@@ -113,35 +113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preview_keeps_queue_categories_separate() {
-        let mut state = InputQueueState::default();
-        state
-            .queued_user_messages
-            .push_back(UserMessage::from("queued").into());
-        state
-            .rejected_steers_queue
-            .push_back(UserMessage::from("rejected"));
-        state.pending_steers.push_back(PendingSteer {
-            user_message: UserMessage::from("pending"),
-            history_record: UserMessageHistoryRecord::UserMessageText,
-            compare_key: crate::chatwidget::user_messages::PendingSteerCompareKey {
-                message: "pending".to_string(),
-                image_count: 0,
-            },
-        });
-
-        assert_eq!(
-            state.preview(),
-            PendingInputPreview {
-                queued_messages: vec!["queued".to_string()],
-                pending_steers: vec!["pending".to_string()],
-                rejected_steers: vec!["rejected".to_string()],
-            }
-        );
-    }
-
-    #[test]
-    fn clear_resets_all_input_queues() {
+    fn preview_keeps_categories_separate_and_clear_resets_all_queues() {
         let mut state = InputQueueState::default();
         state
             .queued_user_messages
@@ -151,6 +123,20 @@ mod tests {
             .push_back(UserMessage::from("rejected"));
         state.user_turn_pending_start = true;
         state.submit_pending_steers_after_interrupt = true;
+        state
+            .queued_user_message_history_records
+            .push_back(UserMessageHistoryRecord::UserMessageText);
+        state
+            .rejected_steer_history_records
+            .push_back(UserMessageHistoryRecord::UserMessageText);
+        state.pending_steers.push_back(PendingSteer {
+            user_message: UserMessage::from("pending"),
+            history_record: UserMessageHistoryRecord::UserMessageText,
+            compare_key: crate::chatwidget::user_messages::PendingSteerCompareKey {
+                message: "pending".to_string(),
+                image_count: 0,
+            },
+        });
         state.promoted_steers.push_back(PendingSteer {
             user_message: UserMessage::from("promoted"),
             history_record: UserMessageHistoryRecord::UserMessageText,
@@ -160,7 +146,22 @@ mod tests {
             },
         });
 
+        assert!(state.has_queued_follow_up_messages());
+        assert!(state.has_uncommitted_steers());
+        assert_eq!(
+            state.preview(),
+            PendingInputPreview {
+                queued_messages: vec!["queued".to_string()],
+                pending_steers: vec!["pending".to_string(), "promoted".to_string()],
+                rejected_steers: vec!["rejected".to_string()],
+            }
+        );
+
         state.clear();
+
+        assert_eq!(state.preview(), PendingInputPreview::default());
+        assert!(!state.has_queued_follow_up_messages());
+        assert!(!state.has_uncommitted_steers());
 
         assert!(state.queued_user_messages.is_empty());
         assert!(state.queued_user_message_history_records.is_empty());

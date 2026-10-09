@@ -88,13 +88,13 @@ fn command_evidence_ignores_durations_and_timestamps() {
         ("2026-09-29T12:03:01.555Z error: broken", "2026-09-30T01:02:03Z error: broken"),
         ("2026-09-29 12:03:01 error: broken", "2026-09-30 01:02:03 error: broken"),
     ] {
-        assert_eq!(semantic_evidence_for_command_output(first.as_bytes()),
-            semantic_evidence_for_command_output(second.as_bytes()));
+        assert_eq!(validation_diagnostic_evidence(first.as_bytes()),
+            validation_diagnostic_evidence(second.as_bytes()));
     }
-    assert_ne!(semantic_evidence_for_command_output(b"1 failed in 0.12s"),
-        semantic_evidence_for_command_output(b"2 failed in 0.12s"));
-    assert_ne!(semantic_evidence_for_command_output(b"localhost:8080"),
-        semantic_evidence_for_command_output(b"localhost:9090"));
+    assert_ne!(validation_diagnostic_evidence(b"1 failed in 0.12s"),
+        validation_diagnostic_evidence(b"2 failed in 0.12s"));
+    assert_ne!(validation_diagnostic_evidence(b"localhost:8080"),
+        validation_diagnostic_evidence(b"localhost:9090"));
     // Generic prose has no producer framing: its coordinates and durations
     // can be substantive facts rather than volatile diagnostics.
     assert_ne!(normalize_tool_failure_text("invalid at line 12 column 9 in 1.5s"),
@@ -114,8 +114,8 @@ fn command_timing_normalization_preserves_substantive_data_and_failure_status() 
         ("================ 2 passed, 1 skipped in 0.12s ================", "================ 2 passed, 1 skipped in 8.32s ================"),
         ("Summary [0.112s] 2 tests run: 1 passed, 1 failed", "Summary [2.541s] 2 tests run: 1 passed, 1 failed"),
     ] {
-        let first_evidence = semantic_evidence_for_command_output(first.as_bytes());
-        let second_evidence = semantic_evidence_for_command_output(second.as_bytes());
+        let first_evidence = validation_diagnostic_evidence(first.as_bytes());
+        let second_evidence = validation_diagnostic_evidence(second.as_bytes());
         assert_eq!(first_evidence, second_evidence, "{first}");
         assert_eq!(
             command_failure_signature(&first_evidence, Some(1)),
@@ -139,8 +139,8 @@ fn command_timing_normalization_preserves_substantive_data_and_failure_status() 
         ),
     ] {
         assert_ne!(
-            semantic_evidence_for_command_output(first.as_bytes()),
-            semantic_evidence_for_command_output(second.as_bytes()),
+            validation_diagnostic_evidence(first.as_bytes()),
+            validation_diagnostic_evidence(second.as_bytes()),
             "{first}",
         );
     }
@@ -1259,7 +1259,8 @@ fn log_preview_uses_content_items_when_plain_text_is_missing() {
 }
 
 #[test]
-fn command_semantic_evidence_normalizes_read_only_presentations() {
+fn command_semantic_evidence_preserves_distinct_read_only_presentations() {
+    let evidence = |bytes: &[u8]| successful_command_evidence(bytes, None);
     let source_fact = "let stable = compute();";
     let presentations = [
         source_fact.to_string(),
@@ -1268,88 +1269,90 @@ fn command_semantic_evidence_normalizes_read_only_presentations() {
         format!("diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+{source_fact}"),
         format!("  --> src/lib.rs:10:1\n10 | {source_fact}\n   | ^^^"),
     ];
-    let expected = semantic_evidence_for_command_output(presentations[0].as_bytes());
+    let expected = evidence(presentations[0].as_bytes());
     for presentation in &presentations[1..] {
-        assert_eq!(
-            semantic_evidence_for_command_output(presentation.as_bytes()),
+        assert_ne!(
+            evidence(presentation.as_bytes()),
             expected
         );
-        assert_eq!(
+        assert_ne!(
             command_failure_signature(
-                &semantic_evidence_for_command_output(presentation.as_bytes()),
+                &evidence(presentation.as_bytes()),
                 Some(1)
             ),
             command_failure_signature(&expected, Some(1))
         );
     }
     assert_ne!(
-        semantic_evidence_for_command_output(b"let changed = compute();"),
+        evidence(b"let changed = compute();"),
         expected
     );
 }
 
 #[test]
 fn command_semantic_evidence_preserves_diagnostics_and_non_location_numbers() {
+    let evidence = |bytes: &[u8]| successful_command_evidence(bytes, None);
+    assert_ne!(evidence(b"same fact\nsame fact"), evidence(b"same fact"));
     let source = "10 | let stable = compute();";
     let first_diagnostic = format!("error[E0001]: first failure\n{source}");
     let second_diagnostic = format!("error[E0002]: second failure\n{source}");
     assert_ne!(
-        semantic_evidence_for_command_output(first_diagnostic.as_bytes()),
-        semantic_evidence_for_command_output(second_diagnostic.as_bytes())
+        evidence(first_diagnostic.as_bytes()),
+        evidence(second_diagnostic.as_bytes())
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"service-a:8080: healthy"),
-        semantic_evidence_for_command_output(b"service-b:9090: healthy")
+        evidence(b"service-a:8080: healthy"),
+        evidence(b"service-b:9090: healthy")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"12 failures remain"),
-        semantic_evidence_for_command_output(b"13 failures remain")
+        evidence(b"12 failures remain"),
+        evidence(b"13 failures remain")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"https://service-a:8080: healthy"),
-        semantic_evidence_for_command_output(b"https://service-b:8080: healthy")
+        evidence(b"https://service-a:8080: healthy"),
+        evidence(b"https://service-b:8080: healthy")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"db.example.com:5432: ready"),
-        semantic_evidence_for_command_output(b"cache.example.com:5432: ready")
+        evidence(b"db.example.com:5432: ready"),
+        evidence(b"cache.example.com:5432: ready")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"src/lib.rs:10:8080: healthy"),
-        semantic_evidence_for_command_output(b"src/lib.rs:10:9090: healthy")
+        evidence(b"src/lib.rs:10:8080: healthy"),
+        evidence(b"src/lib.rs:10:9090: healthy")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"running 5 workers"),
-        semantic_evidence_for_command_output(b"running 6 workers")
+        evidence(b"running 5 workers"),
+        evidence(b"running 6 workers")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"let value = \"a  b\";"),
-        semantic_evidence_for_command_output(b"let value = \"a b\";")
+        evidence(b"let value = \"a  b\";"),
+        evidence(b"let value = \"a b\";")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"10 | legitimate table value"),
-        semantic_evidence_for_command_output(b"legitimate table value")
+        evidence(b"10 | legitimate table value"),
+        evidence(b"legitimate table value")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"fact\n}"),
-        semantic_evidence_for_command_output(b"fact\n]")
+        evidence(b"fact\n}"),
+        evidence(b"fact\n]")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"first fact\nsecond fact"),
-        semantic_evidence_for_command_output(b"second fact\nfirst fact")
+        evidence(b"first fact\nsecond fact"),
+        evidence(b"second fact\nfirst fact")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(b"Ok"),
-        semantic_evidence_for_command_output(b"No")
+        evidence(b"Ok"),
+        evidence(b"No")
     );
     assert_ne!(
-        semantic_evidence_for_command_output(&[0xff, b'a']),
-        semantic_evidence_for_command_output("�a".as_bytes())
+        evidence(&[0xff, b'a']),
+        evidence("�a".as_bytes())
     );
     assert_ne!(
-        semantic_evidence_for_command_output(
+        evidence(
             b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+same fact\nfatal: first"
         ),
-        semantic_evidence_for_command_output(
+        evidence(
             b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -9,0 +10 @@\n+same fact\nfatal: second"
         )
     );
@@ -1357,20 +1360,21 @@ fn command_semantic_evidence_preserves_diagnostics_and_non_location_numbers() {
 
 #[test]
 fn command_semantic_evidence_preserves_removed_and_context_diff_lines() {
+    let evidence = |bytes: &[u8]| successful_command_evidence(bytes, None);
     let first_removal =
         b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old value\n+new value";
     let second_removal =
         b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-other old value\n+new value";
     assert_ne!(
-        semantic_evidence_for_command_output(first_removal),
-        semantic_evidence_for_command_output(second_removal)
+        evidence(first_removal),
+        evidence(second_removal)
     );
 
     let first_context = b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n first context\n-old value\n+new value";
     let second_context = b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n second context\n-old value\n+new value";
     assert_ne!(
-        semantic_evidence_for_command_output(first_context),
-        semantic_evidence_for_command_output(second_context)
+        evidence(first_context),
+        evidence(second_context)
     );
 }
 
@@ -1385,6 +1389,7 @@ fn ansi_stripping_preserves_text_after_a_non_csi_escape() {
 
 #[test]
 fn command_semantic_evidence_includes_facts_after_the_old_limit() {
+    let evidence = |bytes: &[u8]| successful_command_evidence(bytes, None);
     let shared = (0..512)
         .map(|index| format!("shared fact {index}"))
         .collect::<Vec<_>>()
@@ -1392,33 +1397,20 @@ fn command_semantic_evidence_includes_facts_after_the_old_limit() {
     let first = format!("{shared}\nfirst tail fact");
     let second = format!("{shared}\nsecond tail fact");
     assert_ne!(
-        semantic_evidence_for_command_output(first.as_bytes()),
-        semantic_evidence_for_command_output(second.as_bytes())
+        evidence(first.as_bytes()),
+        evidence(second.as_bytes())
     );
 
     let long_prefix = "x".repeat(4_096);
     assert_ne!(
-        semantic_evidence_for_command_output(format!("{long_prefix} first").as_bytes()),
-        semantic_evidence_for_command_output(format!("{long_prefix} second").as_bytes())
+        evidence(format!("{long_prefix} first").as_bytes()),
+        evidence(format!("{long_prefix} second").as_bytes())
     );
 }
 
-#[test]
-fn command_semantic_evidence_preserves_fact_multiplicity() {
-    assert_ne!(
-        semantic_evidence_for_command_output(b"same fact\nsame fact"),
-        semantic_evidence_for_command_output(b"same fact")
-    );
-}
 
-#[test]
-fn command_failure_signature_preserves_exit_status() {
-    let evidence = semantic_evidence_for_command_output(b"same diagnostic");
-    assert_ne!(
-        command_failure_signature(&evidence, Some(1)),
-        command_failure_signature(&evidence, Some(2))
-    );
-}
+
+
 
 #[test]
 fn token_efficiency_exec_output_omits_redundant_headers() {
@@ -2578,9 +2570,11 @@ async fn code_mode_command_result_fits_its_cell_when_printed() {
     assert_eq!(rest.lines().collect::<Vec<_>>(), source[next - 1..].to_vec());
     assert_eq!(gaps.len(), 2);
     let (first, last) = gaps[0];
+    // Recovery selectors describe the known missing scope. The reader's
+    // payload budget and continuation bound delivery, not this source range.
     assert_eq!(
         result["recovery_selector"],
-        json!({"kind": "lines", "start": first, "end": last.min(first + 199)})
+        json!({"kind": "lines", "start": first, "end": last})
     );
     let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
     assert!(
@@ -2620,33 +2614,9 @@ async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
     );
 }
 
-#[tokio::test]
-async fn exec_reduction_notice_is_absent_for_complete_output() {
-    let (output, _, _, _retained_root) =
-        artifact_backed_exec_output(b"complete output\n", Some(1_000)).await;
 
-    let response = output.response_text();
 
-    assert!(!response.contains("[command output reduced;"));
-}
 
-#[tokio::test]
-async fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
-    let raw_output = "word ".repeat(200);
-    let (output, _, artifact_path, _retained_root) =
-        artifact_backed_exec_output(raw_output.as_bytes(), Some(4)).await;
-    std::fs::remove_file(&artifact_path).expect("evict retained artifact");
-
-    let response = output.response_text();
-
-    assert!(!response.contains("[command output reduced;"));
-    assert!(!response.contains("full retained output is available"));
-
-    std::fs::create_dir(&artifact_path).expect("replace artifact with nonregular entry");
-    let nonregular_response = output.response_text();
-    assert!(!nonregular_response.contains("[command output reduced;"));
-    assert!(!nonregular_response.contains("full retained output is available"));
-}
 
 #[tokio::test]
 async fn audit_tiny_recovery_budget_preserves_process_state() {

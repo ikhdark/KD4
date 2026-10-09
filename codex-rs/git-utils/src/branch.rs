@@ -170,9 +170,12 @@ mod tests {
         let repo = temp.path();
         init_test_repo(repo);
 
+        assert_eq!(merge_base_with_head(repo, "main")?, None);
         std::fs::write(repo.join("base.txt"), "base\n")?;
         run_git_in(repo, &["add", "base.txt"]);
         commit(repo, "base commit");
+        let expected = run_git_stdout(repo, &["rev-parse", "HEAD"]);
+        assert_eq!(merge_base_with_head(repo, "missing-branch")?, None);
 
         run_git_in(repo, &["checkout", "-b", "feature"]);
         std::fs::write(repo.join("feature.txt"), "feature change\n")?;
@@ -186,7 +189,6 @@ mod tests {
 
         run_git_in(repo, &["checkout", "feature"]);
 
-        let expected = run_git_stdout(repo, &["merge-base", "HEAD", "main"]);
         let merge_base = merge_base_with_head(repo, "main")?;
         assert_eq!(merge_base, Some(expected));
 
@@ -208,6 +210,7 @@ mod tests {
         std::fs::write(repo.join("base.txt"), "base\n")?;
         run_git_in(&repo, &["add", "base.txt"]);
         commit(&repo, "base commit");
+        let expected = run_git_stdout(&repo, &["rev-parse", "HEAD"]);
 
         run_git_in(
             &repo,
@@ -231,26 +234,10 @@ mod tests {
         run_git_in(&repo, &["checkout", "feature"]);
         run_git_in(&repo, &["fetch", "origin"]);
 
-        let expected = run_git_stdout(&repo, &["merge-base", "HEAD", "origin/main"]);
         let merge_base = merge_base_with_head(&repo, "main")?;
         assert_eq!(merge_base, Some(expected));
 
         Ok(())
     }
 
-    #[test]
-    fn merge_base_returns_none_when_branch_missing() -> Result<(), GitToolingError> {
-        let temp = tempdir()?;
-        let repo = temp.path();
-        init_test_repo(repo);
-
-        std::fs::write(repo.join("tracked.txt"), "tracked\n")?;
-        run_git_in(repo, &["add", "tracked.txt"]);
-        commit(repo, "initial");
-
-        let merge_base = merge_base_with_head(repo, "missing-branch")?;
-        assert_eq!(merge_base, None);
-
-        Ok(())
-    }
 }

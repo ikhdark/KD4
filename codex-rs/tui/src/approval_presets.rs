@@ -70,13 +70,50 @@ mod tests {
 
     #[test]
     fn presets_resolve_to_their_declared_profiles() {
-        for preset in builtin_approval_presets() {
+        let presets = builtin_approval_presets();
+        assert_eq!(presets.len(), 3);
+        for (preset, (id, profile_id, approval, profile)) in presets.into_iter().zip([
+            (
+                "read-only",
+                BUILT_IN_PERMISSION_PROFILE_READ_ONLY,
+                AskForApproval::OnRequest,
+                PermissionProfile::read_only(),
+            ),
+            (
+                "auto",
+                BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+                AskForApproval::OnRequest,
+                PermissionProfile::workspace_write(),
+            ),
+            (
+                "full-access",
+                BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
+                AskForApproval::Never,
+                PermissionProfile::Disabled,
+            ),
+        ]) {
+            assert_eq!(preset.id, id);
+            assert_eq!(preset.active_permission_profile.id, profile_id);
+            assert_eq!(preset.approval, approval);
+            assert_eq!(preset.permission_profile, profile);
             assert_eq!(
                 builtin_permission_profile_for_active_permission_profile(
                     &preset.active_permission_profile
                 ),
-                Some(preset.permission_profile)
+                Some(profile)
+            );
+            let mut inherited = preset.active_permission_profile;
+            inherited.extends = Some("custom-parent".to_string());
+            assert_eq!(
+                builtin_permission_profile_for_active_permission_profile(&inherited),
+                None
             );
         }
+        assert_eq!(
+            builtin_permission_profile_for_active_permission_profile(
+                &ActivePermissionProfile::new("custom-profile")
+            ),
+            None
+        );
     }
 }

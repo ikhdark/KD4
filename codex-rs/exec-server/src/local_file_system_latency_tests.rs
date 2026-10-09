@@ -43,48 +43,31 @@ async fn bounded_reads_preserve_limits_and_confined_results() -> anyhow::Result<
 }
 
 #[test]
-fn bounded_read_keeps_two_passes_and_final_open() -> io::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("file");
-    std::fs::write(&path, b"original")?;
-    let mut opens = 0;
-    let bytes = read_bounded_file_sync(
-        || {
-            opens += 1;
-            regular_file::open_sync(&path)
-        },
-        8,
-        &CancellationToken::new(),
-    )?;
-    assert_eq!(bytes, Some(b"original".to_vec()));
-    assert_eq!(opens, 3);
-    Ok(())
-}
-
-#[test]
-fn bounded_read_detects_changed_bytes_with_restored_metadata() -> io::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("file");
-    std::fs::write(&path, b"original")?;
-    let modified = std::fs::metadata(&path)?.modified()?;
-    let mut opens = 0;
-    let bytes = read_bounded_file_sync(
-        || {
-            opens += 1;
-            if opens == 2 {
-                std::fs::write(&path, b"modified")?;
-                std::fs::File::options()
-                    .write(true)
-                    .open(&path)?
-                    .set_modified(modified)?;
-            }
-            regular_file::open_sync(&path)
-        },
-        8,
-        &CancellationToken::new(),
-    )?;
-    assert_eq!(bytes, None);
-    assert_eq!(opens, 3);
+fn bounded_read_verifies_content_across_two_passes_and_final_open() -> io::Result<()> {
+    for changed in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("file");
+        std::fs::write(&path, b"original")?;
+        let modified = std::fs::metadata(&path)?.modified()?;
+        let mut opens = 0;
+        let bytes = read_bounded_file_sync(
+            || {
+                opens += 1;
+                if changed && opens == 2 {
+                    std::fs::write(&path, b"modified")?;
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&path)?
+                        .set_modified(modified)?;
+                }
+                regular_file::open_sync(&path)
+            },
+            8,
+            &CancellationToken::new(),
+        )?;
+        assert_eq!(bytes, (!changed).then(|| b"original".to_vec()));
+        assert_eq!(opens, 3);
+    }
     Ok(())
 }
 
@@ -218,6 +201,7 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
             .expect("native enumeration should supply metadata");
         assert_eq!(metadata.is_symlink, entry.file_name.ends_with("-link"));
         assert_eq!(metadata.is_directory, entry.file_name == "directory-link");
+        assert_eq!(metadata.is_file, entry.file_name != "directory-link");
     }
     let options = WalkOptions {
         max_depth: 4,

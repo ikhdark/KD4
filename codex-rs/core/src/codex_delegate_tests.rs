@@ -103,6 +103,13 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
     assert_eq!(received.id, "full");
     let received = rx_out.recv().await.expect("visible event missing");
     assert_eq!(received.id, "visible-1");
+    timeout(Duration::from_secs(1), async {
+        while tx_out.len() != 1 || !codex.rx_event.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("forwarder must be blocked sending the final visible event");
     cancel.cancel();
     timeout(std::time::Duration::from_millis(1000), forward)
         .await
@@ -143,23 +150,30 @@ async fn forward_ops_preserves_mailbox_admission_acknowledgement() {
         CancellationToken::new(),
     ));
     let (admission_tx, admission_rx) = oneshot::channel();
+    let submission = Submission {
+        id: "mailbox-overflow".to_string(),
+        op: Op::InterAgentCommunication {
+            communication: codex_protocol::protocol::InterAgentCommunication::new(
+                codex_protocol::AgentPath::root(),
+                codex_protocol::AgentPath::try_from("/root/worker").expect("worker path"),
+                Vec::new(),
+                "message".to_string(),
+                false,
+            ),
+        },
+        client_user_message_id: None,
+        trace: Some(codex_protocol::protocol::W3cTraceContext {
+            traceparent: Some(
+                "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01".to_string(),
+            ),
+            tracestate: Some("vendor=state".to_string()),
+        }),
+    };
     tx_ops
         .send(crate::session::QueuedSubmission {
-            submission: Submission {
-                id: "mailbox-overflow".to_string(),
-                op: Op::InterAgentCommunication {
-                    communication: codex_protocol::protocol::InterAgentCommunication::new(
-                        codex_protocol::AgentPath::root(),
-                        codex_protocol::AgentPath::try_from("/root/worker").expect("worker path"),
-                        Vec::new(),
-                        "message".to_string(),
-                        false,
-                    ),
-                },
-                client_user_message_id: None,
-                trace: None,
-            },
+            submission: submission.clone(),
             mailbox_admission: Some(admission_tx),
+            preparation_permit: Some(Arc::clone(&codex.session.submission_preparation_slots).acquire_owned().await.unwrap()),
         })
         .await
         .expect("submit to proxy");
@@ -167,7 +181,11 @@ async fn forward_ops_preserves_mailbox_admission_acknowledgement() {
         .await
         .expect("forwarding timed out")
         .expect("forwarded submission");
-    assert_eq!(forwarded.submission.id, "mailbox-overflow");
+    assert_eq!(forwarded.submission.id, submission.id);
+    assert_eq!(forwarded.submission.op, submission.op);
+    assert_eq!(forwarded.submission.trace, submission.trace);
+    let preparation_permit = forwarded.preparation_permit.expect("original admission permit");
+    assert_eq!(codex.session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY - 1);
     forwarded
         .mailbox_admission
         .expect("original acknowledgement")
@@ -183,6 +201,8 @@ async fn forward_ops_preserves_mailbox_admission_acknowledgement() {
     assert!(
         matches!(error, CodexErr::InvalidRequest(message) if message == "session mailbox is full")
     );
+    drop(preparation_permit);
+    assert_eq!(codex.session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY);
     drop(tx_ops);
     timeout(Duration::from_secs(5), forward)
         .await
@@ -245,6 +265,7 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
             trace: None,
         },
         mailbox_admission: None,
+        preparation_permit: None,
     };
     tx_sub.send(queued("fills-child-mailbox")).await.unwrap();
     let (_tx_events, rx_event) = bounded(1);
@@ -260,6 +281,7 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
     let (admission_tx, admission_rx) = oneshot::channel();
     let mut blocked = queued("blocked-forward");
     blocked.mailbox_admission = Some(admission_tx);
+    blocked.preparation_permit = Some(Arc::clone(&session.submission_preparation_slots).acquire_owned().await.unwrap());
     tx_ops.send(blocked).await.unwrap();
     let cancel = CancellationToken::new();
     let forward = tokio::spawn(forward_ops(
@@ -274,6 +296,10 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
     })
     .await
     .expect("forwarder takes queued submission");
+    let mut buffered = queued("buffered-proxy");
+    buffered.preparation_permit = Some(Arc::clone(&session.submission_preparation_slots).acquire_owned().await.unwrap());
+    tx_ops.send(buffered).await.unwrap();
+    assert_eq!(session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY - 2);
     cancel.cancel();
     timeout(Duration::from_secs(1), forward)
         .await
@@ -283,6 +309,9 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
         admission_rx.await.is_err(),
         "a canceled forwarding operation cannot acknowledge admission"
     );
+    assert!(rx_ops.is_closed());
+    assert!(rx_ops.is_empty());
+    assert_eq!(session.submission_preparation_slots.available_permits(), SUBMISSION_CHANNEL_CAPACITY);
     let start_gate = session.task_start_gate.acquire().await.unwrap();
     timeout(Duration::from_secs(1), shutdown_delegate(&codex))
         .await
@@ -297,57 +326,6 @@ async fn full_delegate_mailbox_cancels_forwarding_and_the_running_child() {
     timeout(Duration::from_secs(5), stopped.notified())
         .await
         .expect("owned teardown must cancel the actual child after the drain deadline");
-}
-
-#[tokio::test]
-async fn forward_ops_preserves_submission_trace_context() {
-    let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let (_tx_events, rx_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
-    let (session, _ctx, _rx_evt) = crate::session::tests::make_session_and_context_with_rx().await;
-    let codex = Arc::new(Codex {
-        tx_sub,
-        rx_event: rx_events,
-        agent_status,
-        session,
-        session_loop_termination: completed_session_loop_termination(),
-    });
-    let (tx_ops, rx_ops) = bounded(1);
-    let cancel = CancellationToken::new();
-    let forward = tokio::spawn(forward_ops(Arc::clone(&codex), rx_ops, cancel));
-
-    let submission = Submission {
-        id: "sub-1".to_string(),
-        op: Op::Interrupt,
-        client_user_message_id: None,
-        trace: Some(codex_protocol::protocol::W3cTraceContext {
-            traceparent: Some(
-                "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01".to_string(),
-            ),
-            tracestate: Some("vendor=state".to_string()),
-        }),
-    };
-    tx_ops
-        .send(crate::session::QueuedSubmission {
-            submission: submission.clone(),
-            mailbox_admission: None,
-        })
-        .await
-        .unwrap();
-    drop(tx_ops);
-
-    let forwarded = timeout(Duration::from_secs(1), rx_sub.recv())
-        .await
-        .expect("forward_ops hung")
-        .expect("forwarded submission missing");
-    assert_eq!(submission.id, forwarded.submission.id);
-    assert_eq!(submission.op, forwarded.submission.op);
-    assert_eq!(submission.trace, forwarded.submission.trace);
-
-    timeout(Duration::from_secs(1), forward)
-        .await
-        .expect("forward_ops did not exit")
-        .expect("forward_ops join error");
 }
 
 #[tokio::test]
@@ -683,7 +661,8 @@ async fn delegated_user_input_preserves_answers_and_reports_interruption() {
 
         let expected = RequestUserInputResponse {
             disposition: matches!(outcome, "cancelled" | "closed").then_some(
-                codex_protocol::request_user_input::RequestUserInputDisposition::Interrupted),
+                codex_protocol::request_user_input::RequestUserInputDisposition::Interrupted,
+            ),
             answers: if outcome == "answered" {
                 HashMap::from([(
                     "next".to_string(),

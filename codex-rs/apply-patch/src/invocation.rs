@@ -866,6 +866,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_environment_header_cannot_redirect_selected_shell_environment() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        for header in ["", "*** Environment ID: selected\n", "*** Environment ID: other\n"] {
+            let patch = wrap_patch(&format!("{header}*** Add File: result.txt\n+selected environment"));
+            let result = maybe_parse_apply_patch_verified_for_environment(
+                &strs_to_strings(&["apply_patch", &patch]),
+                &cwd,
+                LOCAL_FS.as_ref(),
+                None,
+                "selected",
+            )
+            .await;
+            if header.contains("other") {
+                assert_eq!(
+                    result,
+                    MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::EnvironmentIdMismatch {
+                        patch_environment_id: "other".to_string(),
+                        selected_environment_id: "selected".to_string(),
+                    })
+                );
+            } else {
+                let MaybeApplyPatchVerified::Body(action) = result else {
+                    panic!("expected verified patch, got {result:?}");
+                };
+                assert_eq!(action.cwd, cwd);
+                assert_eq!(action.changes(), &HashMap::from([(
+                    cwd.join("result.txt").unwrap(),
+                    ApplyPatchFileChange::Add { content: "selected environment\n".to_string() },
+                )]));
+            }
+            assert!(!dir.path().join("result.txt").exists(), "verification must not write");
+        }
+    }
+
+    #[tokio::test]
     async fn test_implicit_patch_single_arg_is_error() {
         let patch = "*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch".to_string();
         let args = vec![patch];
@@ -899,102 +935,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_literal() {
-        let args = strs_to_strings(&[
-            "apply_patch",
-            r#"*** Begin Patch
-*** Add File: foo
-+hi
-*** End Patch
-"#,
-        ]);
-
-        match maybe_parse_apply_patch(
-            &args,
-            &PathUri::parse("file:///workspace").expect("valid POSIX test cwd"),
-        ) {
-            MaybeApplyPatch::Body(ApplyPatchArgs { hunks, .. }) => {
-                assert_eq!(
-                    hunks,
-                    vec![Hunk::AddFile {
-                        path: PathBuf::from("foo"),
-                        contents: "hi\n".to_string()
-                    }]
-                );
-            }
-            result => panic!("expected MaybeApplyPatch::Body got {result:?}"),
+    #[test]
+    fn test_literal_aliases() {
+        let patch = wrap_patch("*** Add File: foo\n+hi");
+        for command in ["apply_patch", "applypatch"] {
+            assert_match_args(strs_to_strings(&[command, &patch]), None);
         }
     }
 
-    #[tokio::test]
-    async fn test_literal_applypatch() {
-        let args = strs_to_strings(&[
-            "applypatch",
-            r#"*** Begin Patch
-*** Add File: foo
-+hi
-*** End Patch
-"#,
-        ]);
-
-        match maybe_parse_apply_patch(
-            &args,
-            &PathUri::parse("file:///workspace").expect("valid POSIX test cwd"),
-        ) {
-            MaybeApplyPatch::Body(ApplyPatchArgs { hunks, .. }) => {
-                assert_eq!(
-                    hunks,
-                    vec![Hunk::AddFile {
-                        path: PathBuf::from("foo"),
-                        contents: "hi\n".to_string()
-                    }]
-                );
+    #[test]
+    fn test_heredoc_shell_and_command_variants() {
+        for command in ["apply_patch", "applypatch"] {
+            for flag in ["-c", "-lc"] {
+                let script = heredoc_script("").replace("apply_patch", command);
+                assert_match_args(strs_to_strings(&["bash", flag, &script]), None);
             }
-            result => panic!("expected MaybeApplyPatch::Body got {result:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_heredoc() {
-        assert_match(&heredoc_script(""), /*expected_workdir*/ None);
-    }
-
-    #[tokio::test]
-    async fn test_heredoc_non_login_shell() {
-        let script = heredoc_script("");
-        let args = strs_to_strings(&["bash", "-c", &script]);
-        assert_match_args(args, /*expected_workdir*/ None);
-    }
-
-    #[tokio::test]
-    async fn test_heredoc_applypatch() {
-        let args = strs_to_strings(&[
-            "bash",
-            "-lc",
-            r#"applypatch <<'PATCH'
-*** Begin Patch
-*** Add File: foo
-+hi
-*** End Patch
-PATCH"#,
-        ]);
-
-        match maybe_parse_apply_patch(
-            &args,
-            &PathUri::parse("file:///workspace").expect("valid POSIX test cwd"),
-        ) {
-            MaybeApplyPatch::Body(ApplyPatchArgs { hunks, workdir, .. }) => {
-                assert_eq!(workdir, None);
-                assert_eq!(
-                    hunks,
-                    vec![Hunk::AddFile {
-                        path: PathBuf::from("foo"),
-                        contents: "hi\n".to_string()
-                    }]
-                );
-            }
-            result => panic!("expected MaybeApplyPatch::Body got {result:?}"),
         }
     }
 
@@ -1006,28 +961,19 @@ PATCH"#,
             args_powershell(&script),
             args_powershell_no_profile(&script),
             args_pwsh(&script),
-        ] {
-            assert_match_args_with_cwd(args, &cwd, /*expected_workdir*/ None);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_apply_patch_interception_uses_cwd_convention_for_windows_pwsh_path() {
-        let script = heredoc_script("");
-        assert_match_args_with_cwd(
             strs_to_strings(&[
                 r"C:\Program Files\PowerShell\7\pwsh.exe",
                 "-NoProfile",
                 "-Command",
                 &script,
             ]),
-            &PathUri::parse("file:///C:/windows").expect("valid Windows test cwd"),
-            /*expected_workdir*/ None,
-        );
+        ] {
+            assert_match_args_with_cwd(args, &cwd, /*expected_workdir*/ None);
+        }
     }
 
-    #[tokio::test]
-    async fn test_cmd_heredoc_with_cd() {
+    #[test]
+    fn test_cmd_heredoc_with_cd() {
         let script = heredoc_script("cd foo && ");
         assert_match_args_with_cwd(
             args_cmd(&script),
@@ -1036,67 +982,34 @@ PATCH"#,
         );
     }
 
-    #[tokio::test]
-    async fn test_heredoc_with_leading_cd() {
-        assert_match(&heredoc_script("cd foo && "), Some("foo"));
+    #[test]
+    fn test_heredoc_with_leading_cd() {
+        for (prefix, workdir) in [
+            ("cd foo && ", "foo"),
+            ("cd 'foo bar' && ", "foo bar"),
+            ("cd \"foo bar\" && ", "foo bar"),
+        ] {
+            assert_match(&heredoc_script(prefix), Some(workdir));
+        }
     }
 
-    #[tokio::test]
-    async fn test_cd_with_semicolon_is_ignored() {
-        assert_not_match(&heredoc_script("cd foo; "));
-    }
-
-    #[tokio::test]
-    async fn test_cd_or_apply_patch_is_ignored() {
-        assert_not_match(&heredoc_script("cd bar || "));
-    }
-
-    #[tokio::test]
-    async fn test_cd_pipe_apply_patch_is_ignored() {
-        assert_not_match(&heredoc_script("cd bar | "));
-    }
-
-    #[tokio::test]
-    async fn test_cd_single_quoted_path_with_spaces() {
-        assert_match(&heredoc_script("cd 'foo bar' && "), Some("foo bar"));
-    }
-
-    #[tokio::test]
-    async fn test_cd_double_quoted_path_with_spaces() {
-        assert_match(&heredoc_script("cd \"foo bar\" && "), Some("foo bar"));
-    }
-
-    #[tokio::test]
-    async fn test_echo_and_apply_patch_is_ignored() {
-        assert_not_match(&heredoc_script("echo foo && "));
-    }
-
-    #[tokio::test]
-    async fn test_apply_patch_with_arg_is_ignored() {
-        let script = "apply_patch foo <<'PATCH'\n*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch\nPATCH";
-        assert_not_match(script);
-    }
-
-    #[tokio::test]
-    async fn test_double_cd_then_apply_patch_is_ignored() {
-        assert_not_match(&heredoc_script("cd foo && cd bar && "));
-    }
-
-    #[tokio::test]
-    async fn test_cd_two_args_is_ignored() {
-        assert_not_match(&heredoc_script("cd foo bar && "));
-    }
-
-    #[tokio::test]
-    async fn test_cd_then_apply_patch_then_extra_is_ignored() {
-        let script = heredoc_script_ps("cd bar && ", " && echo done");
-        assert_not_match(&script);
-    }
-
-    #[tokio::test]
-    async fn test_echo_then_cd_and_apply_patch_is_ignored() {
-        // Ensure preceding commands before the `cd && apply_patch <<...` sequence do not match.
-        assert_not_match(&heredoc_script("echo foo; cd bar && "));
+    #[test]
+    fn test_heredoc_rejects_extra_commands_and_arguments() {
+        for prefix in [
+            "cd foo; ",
+            "cd bar || ",
+            "cd bar | ",
+            "echo foo && ",
+            "cd foo && cd bar && ",
+            "cd foo bar && ",
+            "echo foo; cd bar && ",
+        ] {
+            assert_not_match(&heredoc_script(prefix));
+        }
+        assert_not_match(
+            "apply_patch foo <<'PATCH'\n*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch\nPATCH",
+        );
+        assert_not_match(&heredoc_script_ps("cd bar && ", " && echo done"));
     }
 
     #[tokio::test]
@@ -1390,7 +1303,24 @@ PATCH"#,
             "*** Begin Patch\n*** Update File: source.txt\n*** Move to: binary.dat\n@@\n-before\n+after\n*** End Patch".to_string(),
         ];
 
-        for argv in [add_argv, move_argv] {
+        for (argv, source, expected) in [
+            (
+                add_argv,
+                "binary.dat",
+                ApplyPatchFileChange::Add {
+                    content: "text\n".to_string(),
+                },
+            ),
+            (
+                move_argv,
+                "source.txt",
+                ApplyPatchFileChange::Update {
+                    unified_diff: "@@ -1 +1 @@\n-before\n+after\n".to_string(),
+                    move_path: Some(cwd.join("binary.dat").unwrap()),
+                    new_content: "after\n".to_string(),
+                },
+            ),
+        ] {
             let result = maybe_parse_apply_patch_verified(
                 &argv,
                 &cwd,
@@ -1399,7 +1329,22 @@ PATCH"#,
             )
             .await;
 
-            assert!(matches!(result, MaybeApplyPatchVerified::Body(_)));
+            let MaybeApplyPatchVerified::Body(action) = result else {
+                panic!("expected verified action, got {result:?}");
+            };
+            assert_eq!(action.cwd, cwd);
+            assert_eq!(
+                action.changes(),
+                &HashMap::from([(cwd.join(source).unwrap(), expected)])
+            );
+            assert_eq!(
+                fs::read(session_dir.path().join("binary.dat")).unwrap(),
+                [0xff, 0xfe, 0xfd]
+            );
+            assert_eq!(
+                fs::read_to_string(session_dir.path().join("source.txt")).unwrap(),
+                "before\n"
+            );
         }
     }
 }

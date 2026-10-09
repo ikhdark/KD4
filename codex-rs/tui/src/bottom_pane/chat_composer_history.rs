@@ -1568,9 +1568,16 @@ mod tests {
 
     #[test]
     fn should_handle_navigation_when_cursor_is_at_line_boundaries() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
         let mut history = ChatComposerHistory::new();
+        assert!(!history.should_handle_navigation("", /*cursor*/ 0));
         history.record_local_submission(HistoryEntry::new("hello".to_string()));
-        history.last_history_text = Some("hello".to_string());
+        assert!(!history.should_handle_navigation("hello", /*cursor*/ 0));
+        assert_eq!(
+            history.navigate_up(&tx),
+            Some(HistoryEntry::new("hello".to_string()))
+        );
 
         assert!(history.should_handle_navigation("hello", /*cursor*/ 0));
         assert!(history.should_handle_navigation("hello", "hello".len()));

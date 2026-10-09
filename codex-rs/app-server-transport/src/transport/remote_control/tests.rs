@@ -1341,9 +1341,13 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
         },
     )
     .await;
-    timeout(Duration::from_secs(1), first_websocket.next())
+    let closed = timeout(Duration::from_secs(1), first_websocket.next())
         .await
         .expect("disabling remote control should close the websocket");
+    assert!(
+        matches!(closed, None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))),
+        "disable must terminate the connection, not merely produce a frame: {closed:?}"
+    );
     timeout(Duration::from_millis(100), listener.accept())
         .await
         .expect_err("disabled remote control should not reconnect");

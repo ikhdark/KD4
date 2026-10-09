@@ -226,23 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn plugin_mention_name_uses_display_segments_when_they_match_plugin_name() {
-        assert_eq!(
-            plugin_mention_name("mcp-search", "MCP Search"),
-            "MCP-Search"
-        );
-        assert_eq!(
-            plugin_mention_name("google_calendar", "Google Calendar"),
-            "Google_Calendar"
-        );
-    }
-
-    #[test]
-    fn plugin_mention_name_falls_back_to_title_cased_plugin_name() {
-        assert_eq!(plugin_mention_name("sample", "Sample Plugin"), "Sample");
-        assert_eq!(
-            plugin_mention_name("browser-use", "Browser Use"),
-            "Browser-Use"
-        );
+    fn plugin_mention_name_uses_matching_display_segments_or_title_case_fallback() {
+        for (name, display, expected) in [
+            ("mcp-search", "MCP Search", "MCP-Search"),
+            ("google_calendar", "Google Calendar", "Google_Calendar"),
+            ("sample", "Sample Plugin", "Sample"),
+            ("browser-use", "Browser Use", "Browser-Use"),
+            ("browser-use", "Browser Automation", "Browser-Use"),
+        ] {
+            assert_eq!(plugin_mention_name(name, display), expected, "{name}: {display}");
+        }
     }
 }

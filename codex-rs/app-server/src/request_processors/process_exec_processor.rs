@@ -952,11 +952,16 @@ mod tests {
 
         let metadata = process_spawn_log_metadata(&params);
 
-        assert_eq!(metadata.argv_count, 3);
-        assert_eq!(metadata.env_key_count, 1);
-        assert!(metadata.tty);
-        assert!(metadata.output_cap_present);
-        assert!(metadata.timeout_present);
+        assert_eq!(metadata, ProcessSpawnLogMetadata {
+            argv_count: 3,
+            env_key_count: 1,
+            tty: true,
+            stream_stdin: true,
+            stream_stdout_stderr: true,
+            output_cap_present: true,
+            timeout_present: true,
+            size_present: false,
+        });
         let rendered = format!("{metadata:?}");
         assert!(!rendered.contains("command secret"));
         assert!(!rendered.contains("secret value"));
@@ -1065,17 +1070,23 @@ mod tests {
             .expect("process exit notification timed out")
             .expect("outgoing channel closed");
         let OutgoingEnvelope::ToConnection {
+            connection_id,
             message,
             write_complete_tx,
-            ..
         } = envelope
         else {
             panic!("process exit should use a targeted notification");
         };
-        assert!(matches!(
-            message,
-            OutgoingMessage::AppServerNotification(ServerNotification::ProcessExited(_))
-        ));
+        assert_eq!(connection_id, ConnectionId(22));
+        let OutgoingMessage::AppServerNotification(ServerNotification::ProcessExited(exited)) = message else {
+            panic!("expected process exit notification");
+        };
+        assert_eq!(exited.process_handle, "backpressured");
+        assert_eq!(exited.exit_code, 1);
+        assert_eq!(exited.stdout, "");
+        assert_eq!(exited.stderr, "");
+        assert!(!exited.stdout_cap_reached);
+        assert!(!exited.stderr_cap_reached);
         assert!(write_complete_tx.is_none());
         timeout(Duration::from_secs(1), run_handle)
             .await

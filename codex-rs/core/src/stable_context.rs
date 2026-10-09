@@ -605,10 +605,12 @@ fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSection<'_
     let mut content_index = 0;
     while let Some(content_item) = content.get(content_index) {
         let ContentItem::InputText { text } = content_item else {
-            content_index += 1;
-            continue;
+            return None;
         };
         let Some(classification) = classify_stable_text(role, text) else {
+            if known_open_marker_kind(text).is_some() {
+                return None;
+            }
             content_index += 1;
             continue;
         };
@@ -1742,39 +1744,7 @@ mod tests_optimization {
         assert!(retained.is_empty());
     }
 
-    #[test]
-    fn wrapped_root_orchestration_is_classified_and_reused() {
-        let old = text_message(
-            "developer",
-            "<root_orchestration_instructions>old orchestration</root_orchestration_instructions>",
-        );
-        let current = text_message(
-            "developer",
-            "<root_orchestration_instructions>current orchestration</root_orchestration_instructions>",
-        );
 
-        let projected =
-            project_stable_context(vec![old, current].into(), StableContextTarget::Sampling);
-        let root_items = projected
-            .manifest
-            .components
-            .iter()
-            .filter(|component| component.kind == StableContextKind::RootCoordinator)
-            .count();
-
-        assert_eq!(root_items, 1);
-        assert_eq!(projected.items.len(), 1);
-        let ResponseItem::Message { role, content, .. } = &projected.items[0] else {
-            panic!("expected the current root orchestration message");
-        };
-        assert_eq!(role, "developer");
-        assert_eq!(
-            content,
-            &[ContentItem::InputText {
-                text: "<root_orchestration_instructions>current orchestration</root_orchestration_instructions>".to_string(),
-            }]
-        );
-    }
 
     #[test]
     fn changed_and_volatile_injections_remain_turn_scoped() {

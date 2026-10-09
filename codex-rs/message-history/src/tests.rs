@@ -71,42 +71,6 @@ async fn retention_publishes_history_without_the_temporary_file_attribute() {
 }
 
 #[tokio::test]
-async fn lookup_reads_history_entries() {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    let history_path = temp_dir.path().join(HISTORY_FILENAME);
-
-    let entries = vec![
-        HistoryEntry {
-            session_id: "first-session".to_string(),
-            ts: 1,
-            text: "first".to_string(),
-        },
-        HistoryEntry {
-            session_id: "second-session".to_string(),
-            ts: 2,
-            text: "second".to_string(),
-        },
-    ];
-
-    let mut file = File::create(&history_path).expect("create history file");
-    for entry in &entries {
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(entry).expect("serialize history entry")
-        )
-        .expect("write history entry");
-    }
-
-    let (log_id, count) = history_metadata_for_file(&history_path).await;
-    assert_eq!(count, entries.len());
-
-    let second_entry = lookup_history_entry(&history_path, log_id, /*offset*/ 1)
-        .expect("fetch second history entry");
-    assert_eq!(second_entry, entries[1]);
-}
-
-#[tokio::test]
 async fn history_metadata_counts_newlines_across_read_boundaries() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let history_path = temp_dir.path().join(HISTORY_FILENAME);
@@ -154,6 +118,8 @@ async fn lookup_uses_stable_log_id_after_appends() {
 
     let (log_id, count) = history_metadata_for_file(&history_path).await;
     assert_eq!(count, 1);
+    assert_ne!(log_id, 0, "zero bypasses identity checking in lookup");
+    assert_eq!(lookup_history_entry(&history_path, log_id, 0), Some(initial));
 
     let mut append = std::fs::OpenOptions::new()
         .append(true)
@@ -166,6 +132,7 @@ async fn lookup_uses_stable_log_id_after_appends() {
     )
     .expect("append history entry");
 
+    assert_eq!(history_metadata_for_file(&history_path).await, (log_id, 2));
     let fetched = lookup_history_entry(&history_path, log_id, /*offset*/ 1)
         .expect("lookup appended history entry");
     assert_eq!(fetched, appended);

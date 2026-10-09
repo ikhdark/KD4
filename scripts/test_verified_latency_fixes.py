@@ -44,9 +44,11 @@ class LaneLatencyTests(unittest.TestCase):
                                 "--timing-json", str(timing), "--", sys.executable, "-c", "pass"]
                         self.assertEqual(rust_build_status.main(argv), 75)
                         child.assert_not_called()
-                        self.assertLessEqual(now[0], wait)
+                        self.assertAlmostEqual(now[0], wait)
                         if wait == 0:
                             slept.assert_not_called()
+                        else:
+                            self.assertGreater(slept.call_count, 0)
                         status = next(json.loads(line) for line in stderr.getvalue().splitlines() if line.startswith("{"))
                         self.assertEqual(status["status"], "busy")
                         self.assertEqual(status["validation_status"], "pending")

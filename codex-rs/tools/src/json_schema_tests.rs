@@ -294,65 +294,10 @@ fn parse_tool_input_schema_infers_object_shape_from_boolean_additional_propertie
 }
 
 #[test]
-fn parse_tool_input_schema_preserves_untyped_numeric_keywords() {
-    // Example schema shape:
-    // {
-    //   "minimum": 1
-    // }
-    //
-    // Expected normalization behavior:
-    // - Numeric constraint keywords do not exclude nonnumeric instances.
-    let schema = parse_tool_input_schema(&serde_json::json!({
-        "minimum": 1
-    }))
-    .expect("parse schema");
-
-    assert_eq!(
-        schema,
-        JsonSchema {
-            minimum: Some(1.into()),
-            ..Default::default()
-        }
-    );
-}
-
-#[test]
-fn parse_tool_input_schema_preserves_untyped_multiple_of() {
-    // Example schema shape:
-    // {
-    //   "multipleOf": 5
-    // }
-    //
-    // Expected normalization behavior:
-    // - `multipleOf` constrains numbers without excluding other instance types.
-    let schema = parse_tool_input_schema(&serde_json::json!({
-        "multipleOf": 5
-    }))
-    .expect("parse schema");
-
-    assert_eq!(
-        schema,
-        JsonSchema {
-            multiple_of: Some(5.into()),
-            ..Default::default()
-        }
-    );
-}
-
-#[test]
 fn parse_tool_input_schema_preserves_all_numeric_constraints() {
-    let schema = parse_tool_input_schema(&serde_json::json!({
-        "type": "number",
-        "minimum": -2,
-        "maximum": 9.5,
-        "exclusiveMinimum": -3,
-        "exclusiveMaximum": 10,
-        "multipleOf": 0.5
-    }))
-    .expect("parse numeric schema");
-
-    assert_eq!(
-        serde_json::to_value(schema).expect("serialize numeric schema"),
+    for input in [
+        serde_json::json!({"minimum": 1}),
+        serde_json::json!({"multipleOf": 5}),
         serde_json::json!({
             "type": "number",
             "minimum": -2,
@@ -360,8 +305,12 @@ fn parse_tool_input_schema_preserves_all_numeric_constraints() {
             "exclusiveMinimum": -3,
             "exclusiveMaximum": 10,
             "multipleOf": 0.5
-        })
-    );
+        }),
+    ] {
+        // Untyped constraints must not exclude nonnumeric instances.
+        let schema = parse_tool_input_schema(&input).expect("parse numeric schema");
+        assert_eq!(serde_json::to_value(schema).unwrap(), input);
+    }
 }
 
 #[test]
@@ -1250,7 +1199,7 @@ fn parse_large_tool_input_schema_preserves_oversized_field_descriptions() {
 
 #[test]
 fn parse_large_tool_input_schema_preserves_compositions_over_budget() {
-    for composition_key in super::COMPOSITION_SCHEMA_KEYS {
+    for composition_key in ["anyOf", "oneOf", "allOf"] {
         let variants = vec![
             serde_json::json!({
                 "type": "string",

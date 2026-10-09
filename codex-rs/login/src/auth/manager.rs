@@ -1488,6 +1488,7 @@ async fn load_auth(
 // Persist refreshed tokens into auth storage and update last_refresh.
 fn persist_tokens(
     storage: &Arc<dyn AuthStorageBackend>,
+    expected_tokens: &TokenData,
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
@@ -1496,6 +1497,13 @@ fn persist_tokens(
         .load()?
         .ok_or(std::io::Error::other("Token data is not available."))?;
 
+    // A login, logout, or another refresh may complete while the HTTP request is in flight.
+    // Its credentials must not be replaced by the response for the previous token snapshot.
+    if auth_dot_json.resolved_mode() != AuthMode::Chatgpt
+        || auth_dot_json.tokens.as_ref() != Some(expected_tokens)
+    {
+        return Err(std::io::Error::other("authentication changed during token refresh"));
+    }
     let tokens = auth_dot_json.tokens.get_or_insert_with(TokenData::default);
     if let Some(id_token) = id_token {
         tokens.id_token = parse_chatgpt_jwt_claims(&id_token).map_err(std::io::Error::other)?;
@@ -2799,7 +2807,7 @@ impl AuthManager {
                             "Token data is not available.",
                         ))
                     })?;
-                    self.refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data.refresh_token)
+                    self.refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data)
                         .await
                 }
                 CodexAuth::ApiKey(_)
@@ -2981,12 +2989,14 @@ impl AuthManager {
     async fn refresh_and_persist_chatgpt_token(
         &self,
         auth: &ChatgptAuth,
-        refresh_token: String,
+        expected_tokens: TokenData,
     ) -> Result<(), RefreshTokenError> {
-        let refresh_response = request_chatgpt_token_refresh(refresh_token, auth.client()).await?;
+        let refresh_response =
+            request_chatgpt_token_refresh(expected_tokens.refresh_token.clone(), auth.client()).await?;
 
         persist_tokens(
             auth.storage(),
+            &expected_tokens,
             refresh_response.id_token,
             refresh_response.access_token,
             refresh_response.refresh_token,

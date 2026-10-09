@@ -128,7 +128,8 @@ impl ChatWidget {
             } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 && c.eq_ignore_ascii_case(&'v') =>
             {
-                return true;
+                // Do not start clipboard/storage work while setup or shutdown has disabled input.
+                return self.bottom_pane.composer_input_enabled();
             }
             _ => {}
         }

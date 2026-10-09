@@ -955,39 +955,28 @@ mod tests {
     }
 
     #[test]
-    fn implicit_sticky_grants_bypass_inline_permission_validation() {
+    fn only_default_requests_use_implicit_sticky_grants() {
         let cwd = tempdir().expect("tempdir");
         let granted_permissions = file_system_permissions(cwd.path());
-        let implicit_permissions = implicit_granted_permissions(
-            SandboxPermissions::UseDefault,
-            /*additional_permissions*/ None,
-            &EffectiveAdditionalPermissions {
-                sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
-                additional_permissions: Some(granted_permissions.clone()),
-                additional_permissions_uri: None,
-                permissions_preapproved: false,
-            },
-        );
-
-        assert_eq!(implicit_permissions, Some(granted_permissions));
-    }
-
-    #[test]
-    fn explicit_inline_permissions_do_not_use_implicit_sticky_grant_path() {
-        let cwd = tempdir().expect("tempdir");
-        let requested_permissions = file_system_permissions(cwd.path());
-        let implicit_permissions = implicit_granted_permissions(
-            SandboxPermissions::WithAdditionalPermissions,
-            Some(&requested_permissions),
-            &EffectiveAdditionalPermissions {
-                sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
-                additional_permissions: Some(requested_permissions.clone()),
-                additional_permissions_uri: None,
-                permissions_preapproved: false,
-            },
-        );
-
-        assert_eq!(implicit_permissions, None);
+        for (mode, explicit, expected) in [
+            (SandboxPermissions::UseDefault, false, true),
+            (SandboxPermissions::UseDefault, true, false),
+            (SandboxPermissions::WithAdditionalPermissions, false, false),
+            (SandboxPermissions::WithAdditionalPermissions, true, false),
+            (SandboxPermissions::RequireEscalated, false, false),
+        ] {
+            let implicit = implicit_granted_permissions(
+                mode,
+                explicit.then_some(&granted_permissions),
+                &EffectiveAdditionalPermissions {
+                    sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
+                    additional_permissions: Some(granted_permissions.clone()),
+                    additional_permissions_uri: None,
+                    permissions_preapproved: false,
+                },
+            );
+            assert_eq!(implicit, expected.then(|| granted_permissions.clone()), "{mode:?}, explicit={explicit}");
+        }
     }
 
     #[test]

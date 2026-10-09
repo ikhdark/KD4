@@ -263,19 +263,15 @@ mod tests {
     }
 
     #[test]
-    fn stop_command_is_canonical_name() {
-        assert_eq!(SlashCommand::Stop.command(), "stop");
-    }
-
-    #[test]
-    fn clean_alias_parses_to_stop_command() {
-        assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
-    }
-
-    #[test]
-    fn pet_alias_parses_to_pets_command() {
-        assert_eq!(SlashCommand::Pets.command(), "pets");
-        assert_eq!(SlashCommand::from_str("pet"), Ok(SlashCommand::Pets));
+    fn aliases_parse_without_replacing_canonical_names() {
+        for (command, canonical, alias) in [
+            (SlashCommand::Stop, "stop", "clean"),
+            (SlashCommand::Pets, "pets", "pet"),
+        ] {
+            assert_eq!(command.command(), canonical);
+            assert_eq!(SlashCommand::from_str(canonical), Ok(command));
+            assert_eq!(SlashCommand::from_str(alias), Ok(command));
+        }
     }
 
     #[test]

@@ -295,6 +295,35 @@ function Get-DefaultInstallDir {
     )
 }
 
+function ConvertTo-BundleIdentityJsonString {
+    param([string]$Value)
+
+    # Match the package producer's json.dumps(..., ensure_ascii=True), not
+    # PowerShell's version-dependent Unicode/HTML escaping. UTF-16 surrogate
+    # pairs deliberately become two \u escapes, as Python serializes them.
+    $encoded = [Text.StringBuilder]::new()
+    [void]$encoded.Append('"')
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int]$character
+        $escaped = switch ($code) {
+            8 { '\b' }
+            9 { '\t' }
+            10 { '\n' }
+            12 { '\f' }
+            13 { '\r' }
+            34 { '\"' }
+            92 { '\\' }
+            default {
+                if ($code -lt 32 -or $code -gt 126) { '\u' + $code.ToString('x4') }
+                else { [string]$character }
+            }
+        }
+        [void]$encoded.Append($escaped)
+    }
+    [void]$encoded.Append('"')
+    return $encoded.ToString()
+}
+
 function Resolve-SourceBundleManifest {
     param([string]$ManifestPath)
 
@@ -350,14 +379,12 @@ function Resolve-SourceBundleManifest {
             $rolePaths[$role] = $path
             $roleDigests[$role] = [string]$file.sha256
         }
-        $canonicalInventory += [ordered]@{
-            path = $relative
-            role = $role
-            sha256 = [string]$file.sha256
-            size = [long]$file.size
-        }
+        $canonicalInventory += '{"path":' + (ConvertTo-BundleIdentityJsonString $relative) +
+            ',"role":' + (ConvertTo-BundleIdentityJsonString $role) +
+            ',"sha256":' + (ConvertTo-BundleIdentityJsonString ([string]$file.sha256)) +
+            ',"size":' + ([long]$file.size).ToString([Globalization.CultureInfo]::InvariantCulture) + '}'
     }
-    $canonicalJson = ConvertTo-Json -InputObject @($canonicalInventory) -Compress -Depth 4
+    $canonicalJson = '[' + ($canonicalInventory -join ',') + ']'
     $sha256 = [Security.Cryptography.SHA256]::Create()
     try {
         $bundleBytes = [Text.Encoding]::UTF8.GetBytes($canonicalJson)
@@ -3055,84 +3082,90 @@ function Invoke-CodexBuild {
     if ($releaseUsesUpstreamProfile) {
         Write-ProofLine "releaseProfile" "upstream-compatible: thin LTO, line-table debug, strip=symbols, codegen-units=4"
     }
-    if ($effectiveNoSccache) {
-        if ($DryRun) {
-            $cargoConfigArgs = @("--config", "<temporary publish cargo config>")
-        }
-        else {
-            $noSccacheCargoConfigPath = [System.IO.Path]::GetTempFileName()
-            $cargoConfigLines = [System.Collections.Generic.List[string]]::new()
-            $cargoConfigLines.Add("[build]")
-            $cargoConfigLines.Add("rustc-wrapper = `"`"")
-            $cargoConfigLines.Add("rustc-workspace-wrapper = `"`"")
-            [System.IO.File]::WriteAllText($noSccacheCargoConfigPath, ([string]::Join("`n", $cargoConfigLines) + "`n"))
-            $cargoConfigArgs = @("--config", $noSccacheCargoConfigPath)
-        }
-    }
-    $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")
-    $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $cargoProfile)
-
-    $codexRs = Join-Path $RepoRoot "codex-rs"
-    $publishTargetDir = Join-Path $codexRs "target\publish-$Profile"
-    $buildCommandArgs = @(Add-CargoTargetDirArgument -CommandArgs (@("cargo") + $buildArgs) -TargetDir $publishTargetDir)
-    $buildCommand = Format-CargoCommandForProof -CommandArgs $buildCommandArgs
-    Assert-RustyV8ArchiveReadyForPublish `
-        -RepoRoot $RepoRoot `
-        -Profile $Profile `
-        -DryRun:$DryRun `
-        -AllowDownload:$AllowRustyV8Download `
-        -ArchivePath $RustyV8Archive
-    if ($DryRun) {
-        Write-ProofLine "buildCommand" "$buildCommand (not run)"
-        return
-    }
-
-    # Cargo re-links up-to-date outputs from deps even when nothing recompiles,
-    # so clearing them lets the build stamp bind only files this run produced at
-    # the paths publish reads.
-    foreach ($builtArtifact in @(
-            (Get-BuiltCodexPath -RepoRoot $RepoRoot -Profile $Profile),
-            (Get-BuiltCodeModeHostPath -RepoRoot $RepoRoot -Profile $Profile),
-            (Get-BuiltWindowsSandboxSetupPath -RepoRoot $RepoRoot -Profile $Profile),
-            (Get-BuiltCommandRunnerPath -RepoRoot $RepoRoot -Profile $Profile)
-        )) {
-        if (Test-Path -LiteralPath $builtArtifact -PathType Leaf) {
-            Remove-Item -LiteralPath $builtArtifact -Force
-        }
-    }
-
-    $previousSccacheEnv = @{
-        SCCACHE_BASEDIRS = $env:SCCACHE_BASEDIRS
-        SCCACHE_CACHE_SIZE = $env:SCCACHE_CACHE_SIZE
-        RUSTC_WRAPPER = $env:RUSTC_WRAPPER
-        CARGO_BUILD_RUSTC_WRAPPER = $env:CARGO_BUILD_RUSTC_WRAPPER
-        RUSTC_WORKSPACE_WRAPPER = $env:RUSTC_WORKSPACE_WRAPPER
-        CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER = $env:CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
-    }
-    $previousTargetDir = $env:CARGO_TARGET_DIR
-    $previousLinkerEnv = @{
-        CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
-        CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER
-    }
-    Set-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $null
-    $previousBuildMetadataEnv = @{}
-    Write-ProofLine "staticMsvcCrt" "enabled for all windows-msvc profiles via codex-rs/.cargo/config.toml"
-    Enable-BuildMetadataForPublish -RepoRoot $RepoRoot -Profile $Profile -Previous $previousBuildMetadataEnv
-    Enable-SccacheForPublish -RepoRoot $RepoRoot -DisableSccache $effectiveNoSccache
-    Set-CodexRustMsvcLinkerEnvironment
-    Write-ProofLine "cargoTargetDir" $publishTargetDir
-    Push-Location $codexRs
     try {
-        Invoke-CargoForPublish -CommandArgs $buildCommandArgs -FailureDescription "cargo build"
+        if ($effectiveNoSccache) {
+            if ($DryRun) {
+                $cargoConfigArgs = @("--config", "<temporary publish cargo config>")
+            }
+            else {
+                $noSccacheCargoConfigPath = [System.IO.Path]::GetTempFileName()
+                $cargoConfigLines = [System.Collections.Generic.List[string]]::new()
+                $cargoConfigLines.Add("[build]")
+                $cargoConfigLines.Add("rustc-wrapper = `"`"")
+                $cargoConfigLines.Add("rustc-workspace-wrapper = `"`"")
+                [System.IO.File]::WriteAllText($noSccacheCargoConfigPath, ([string]::Join("`n", $cargoConfigLines) + "`n"))
+                $cargoConfigArgs = @("--config", $noSccacheCargoConfigPath)
+            }
+        }
+        $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")
+        $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $cargoProfile)
+
+        $codexRs = Join-Path $RepoRoot "codex-rs"
+        $publishTargetDir = Join-Path $codexRs "target\publish-$Profile"
+        $buildCommandArgs = @(Add-CargoTargetDirArgument -CommandArgs (@("cargo") + $buildArgs) -TargetDir $publishTargetDir)
+        $buildCommand = Format-CargoCommandForProof -CommandArgs $buildCommandArgs
+        Assert-RustyV8ArchiveReadyForPublish `
+            -RepoRoot $RepoRoot `
+            -Profile $Profile `
+            -DryRun:$DryRun `
+            -AllowDownload:$AllowRustyV8Download `
+            -ArchivePath $RustyV8Archive
+        if ($DryRun) {
+            Write-ProofLine "buildCommand" "$buildCommand (not run)"
+            return
+        }
+
+        # Cargo re-links up-to-date outputs from deps even when nothing recompiles,
+        # so clearing them lets the build stamp bind only files this run produced at
+        # the paths publish reads.
+        foreach ($builtArtifact in @(
+                (Get-BuiltCodexPath -RepoRoot $RepoRoot -Profile $Profile),
+                (Get-BuiltCodeModeHostPath -RepoRoot $RepoRoot -Profile $Profile),
+                (Get-BuiltWindowsSandboxSetupPath -RepoRoot $RepoRoot -Profile $Profile),
+                (Get-BuiltCommandRunnerPath -RepoRoot $RepoRoot -Profile $Profile)
+            )) {
+            if (Test-Path -LiteralPath $builtArtifact -PathType Leaf) {
+                Remove-Item -LiteralPath $builtArtifact -Force
+            }
+        }
+
+        $previousSccacheEnv = @{
+            SCCACHE_BASEDIRS = $env:SCCACHE_BASEDIRS
+            SCCACHE_CACHE_SIZE = $env:SCCACHE_CACHE_SIZE
+            RUSTC_WRAPPER = $env:RUSTC_WRAPPER
+            CARGO_BUILD_RUSTC_WRAPPER = $env:CARGO_BUILD_RUSTC_WRAPPER
+            RUSTC_WORKSPACE_WRAPPER = $env:RUSTC_WORKSPACE_WRAPPER
+            CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER = $env:CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+        }
+        $previousTargetDir = $env:CARGO_TARGET_DIR
+        $previousLinkerEnv = @{
+            CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+            CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER
+        }
+        $previousBuildMetadataEnv = @{}
+        $locationPushed = $false
+        try {
+            Set-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $null
+            Write-ProofLine "staticMsvcCrt" "enabled for all windows-msvc profiles via codex-rs/.cargo/config.toml"
+            Enable-BuildMetadataForPublish -RepoRoot $RepoRoot -Profile $Profile -Previous $previousBuildMetadataEnv
+            Enable-SccacheForPublish -RepoRoot $RepoRoot -DisableSccache $effectiveNoSccache
+            Set-CodexRustMsvcLinkerEnvironment
+            Write-ProofLine "cargoTargetDir" $publishTargetDir
+            Push-Location -LiteralPath $codexRs
+            $locationPushed = $true
+            Invoke-CargoForPublish -CommandArgs $buildCommandArgs -FailureDescription "cargo build"
+        }
+        finally {
+            if ($locationPushed) { Pop-Location }
+            Set-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $previousTargetDir
+            Restore-SccachePublishEnv -Previous $previousSccacheEnv
+            Restore-BuildMetadataForPublish -Previous $previousBuildMetadataEnv
+            foreach ($name in $previousLinkerEnv.Keys) {
+                Set-ProcessEnvironmentVariable -Name $name -Value $previousLinkerEnv[$name]
+            }
+        }
     }
     finally {
-        Pop-Location
-        Set-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $previousTargetDir
-        Restore-SccachePublishEnv -Previous $previousSccacheEnv
-        Restore-BuildMetadataForPublish -Previous $previousBuildMetadataEnv
-        foreach ($name in $previousLinkerEnv.Keys) {
-            Set-ProcessEnvironmentVariable -Name $name -Value $previousLinkerEnv[$name]
-        }
         if ($null -ne $noSccacheCargoConfigPath) {
             Remove-Item -LiteralPath $noSccacheCargoConfigPath -ErrorAction SilentlyContinue
         }
@@ -3322,15 +3355,38 @@ function Recover-CodexRuntimeBundleTransaction {
         throw "Cannot recover pending runtime bundle transaction; journal schema is invalid: $JournalPath"
     }
     $transaction.JournalPath = $JournalPath
+    # The journal is persisted input, not authority over arbitrary siblings.
+    # Validate every destructive target before even rewriting the journal,
+    # including the committed-cleanup path.
+    $journalFullPath = [IO.Path]::GetFullPath($JournalPath)
+    $journalName = [IO.Path]::GetFileName($journalFullPath)
+    $journalMatch = [regex]::Match($journalName, '^\.(.+)\.codex-local-publish\.transaction\.json$')
+    if (-not $journalMatch.Success -or
+        [string]$transaction.TransactionId -cnotmatch '\A[A-Za-z0-9_-]+\z') {
+        throw "Cannot recover runtime bundle transaction with an invalid journal identity: $JournalPath"
+    }
+    $installLeaf = $journalMatch.Groups[1].Value
+    $installParent = [IO.Path]::GetDirectoryName($journalFullPath)
+    $expectedPaths = @{
+        InstallDir = [IO.Path]::Combine($installParent, $installLeaf)
+        StageRoot = [IO.Path]::Combine($installParent, ".$installLeaf.bundle.$($transaction.TransactionId)")
+        RollbackRoot = [IO.Path]::Combine($installParent, ".$installLeaf.rollback.$($transaction.TransactionId)")
+    }
+    foreach ($name in $expectedPaths.Keys) {
+        $candidate = [IO.Path]::GetFullPath([string]$transaction.$name)
+        if (-not [string]::Equals($candidate, $expectedPaths[$name], [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Cannot recover runtime bundle transaction with an unowned ${name}: $candidate"
+        }
+        if (Test-Path -LiteralPath $candidate) {
+            $item = Get-Item -LiteralPath $candidate -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Cannot recover runtime bundle transaction through a reparse point: $candidate"
+            }
+        }
+    }
     if ($transaction.Phase -ne "Committed") {
         $transaction.Phase = "Recovering"
         Write-CodexPublishTransactionJournal -Transaction $transaction
-        $installParent = [IO.Path]::GetFullPath((Split-Path -Parent $transaction.InstallDir))
-        foreach ($candidate in @($transaction.InstallDir, $transaction.StageRoot, $transaction.RollbackRoot)) {
-            if (-not [string]::Equals([IO.Path]::GetFullPath((Split-Path -Parent $candidate)), $installParent, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Cannot recover runtime bundle transaction with a path outside its install parent: $candidate"
-            }
-        }
         if (Test-Path -LiteralPath $transaction.RollbackRoot -PathType Container) {
             if (Test-Path -LiteralPath $transaction.InstallDir -PathType Container) {
                 $failedRoot = "$($transaction.StageRoot).failed"

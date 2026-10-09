@@ -739,6 +739,7 @@ mod api {
             "completed" => AttemptStatus::Completed,
             "in_progress" => AttemptStatus::InProgress,
             "pending" => AttemptStatus::Pending,
+            "cancelled" => AttemptStatus::Cancelled,
             _ => AttemptStatus::Pending,
         }
     }

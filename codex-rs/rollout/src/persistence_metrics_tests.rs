@@ -81,27 +81,18 @@ fn update_for_batch(
 
 #[test]
 fn thread_sampling_is_stable_and_selects_whole_threads() {
-    let mut sampled = None;
-    let mut unsampled = None;
-    for value in 0..10_000_u128 {
-        let thread_id = ThreadId::from_string(&format!("00000000-0000-0000-0000-{value:012x}"))
-            .expect("valid thread id");
-        if is_thread_sampled(thread_id) {
-            sampled.get_or_insert(thread_id);
-        } else {
-            unsampled.get_or_insert(thread_id);
-        }
-        if sampled.is_some() && unsampled.is_some() {
-            break;
+    // Fixed FNV-1a fixtures pin cohort membership; searching with the production
+    // predicate would silently accept a changed hash or sample denominator.
+    for (id, expected) in [
+        ("00000000-0000-0000-0000-000000000000", false),
+        ("00000000-0000-0000-0000-000000000007", true),
+        ("00000000-0000-0000-0000-000000000010", true),
+    ] {
+        let thread_id = ThreadId::from_string(id).expect("valid thread id");
+        for _ in 0..2 {
+            assert_eq!(is_thread_sampled(thread_id), expected, "{id}");
         }
     }
-
-    let sampled = sampled.expect("at least one sampled thread");
-    let unsampled = unsampled.expect("at least one unsampled thread");
-    assert!(is_thread_sampled(sampled));
-    assert!(is_thread_sampled(sampled));
-    assert!(!is_thread_sampled(unsampled));
-    assert!(!is_thread_sampled(unsampled));
 }
 
 #[test]
@@ -130,6 +121,9 @@ fn mixed_batch_reports_exact_policy_counts_and_bytes() {
     );
     assert_eq!(measurement.post_filter.items, 1);
     assert_eq!(measurement.post_filter.payload_bytes, kept_bytes);
+    assert_eq!(measurement.items.len(), 2);
+    assert_eq!(measurement.items[0].decision, super::PersistenceDecision::Kept);
+    assert_eq!(measurement.items[1].decision, super::PersistenceDecision::Dropped);
     assert_eq!(measurement.items[0].payload_bytes, Some(kept_bytes));
     assert_eq!(measurement.items[1].payload_bytes, Some(dropped_bytes));
     assert_eq!(measurement.items[0].rollout_item_type, "response.message");

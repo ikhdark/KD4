@@ -61,7 +61,7 @@ mod animation_tests {
         let first = cell.transcript_animation_tick().expect("live search tick");
         cell.start_time -= Duration::from_millis(100);
         assert!(cell.transcript_animation_tick().unwrap() >= first + 2);
-        cell.completed = true;
+        cell.complete();
         assert_eq!(cell.transcript_animation_tick(), None);
         cell.completed = false;
         cell.animations_enabled = false;

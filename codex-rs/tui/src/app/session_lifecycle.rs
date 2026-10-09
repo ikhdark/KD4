@@ -902,39 +902,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_thread_read_error_detection_matches_not_loaded_errors() {
-        let err = thread_error_report(ThreadErrorReason::NotLoaded, "localized message");
-
-        assert!(App::is_terminal_thread_read_error(&err));
-    }
-
-    #[test]
-    fn terminal_thread_read_error_detection_ignores_transient_failures() {
-        let err = color_eyre::eyre::eyre!(
-            "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
-        );
-
-        assert!(!App::is_terminal_thread_read_error(&err));
-    }
-
-    #[test]
-    fn closed_state_for_thread_read_error_preserves_live_state_without_cache_on_transient_error() {
-        let err = color_eyre::eyre::eyre!(
-            "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
-        );
-
-        assert!(!App::closed_state_for_thread_read_error(
-            &err, /*existing_is_closed*/ None
-        ));
-    }
-
-    #[test]
-    fn closed_state_for_thread_read_error_marks_terminal_uncached_threads_closed() {
-        let err = thread_error_report(ThreadErrorReason::NotLoaded, "localized message");
-
-        assert!(App::closed_state_for_thread_read_error(
-            &err, /*existing_is_closed*/ None
-        ));
+    fn thread_read_errors_preserve_cached_closure_and_classify_terminal_failures() {
+        for (err, terminal) in [
+            (thread_error_report(ThreadErrorReason::NotLoaded, "localized message"), true),
+            (thread_error_report(ThreadErrorReason::NotFound, "localized message"), true),
+            (color_eyre::eyre::eyre!(
+                "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
+            ), false),
+        ] {
+            assert_eq!(App::is_terminal_thread_read_error(&err), terminal);
+            for cached in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    App::closed_state_for_thread_read_error(&err, cached),
+                    terminal || cached == Some(true),
+                    "error: {err}; cached closure: {cached:?}"
+                );
+            }
+        }
     }
 
     #[test]

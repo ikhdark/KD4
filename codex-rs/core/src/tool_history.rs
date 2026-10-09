@@ -4101,11 +4101,11 @@ pub(crate) fn source_dependency_overlaps(dependency: &SourceDependencyV1, change
         || dependency.recursive
             && changed
                 .strip_prefix(&dependency.path)
-                .is_some_and(|suffix| suffix.starts_with('/'))
+                .is_some_and(|suffix| dependency.path.ends_with('/') || suffix.starts_with('/'))
         || dependency
             .path
             .strip_prefix(changed)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+            .is_some_and(|suffix| changed.ends_with('/') || suffix.starts_with('/'))
 }
 
 fn affected_paths_overlap_dependency(
@@ -4116,7 +4116,7 @@ fn affected_paths_overlap_dependency(
         return true;
     }
     if dependency.recursive {
-        let descendant_prefix = format!("{}/", dependency.path);
+        let descendant_prefix = format!("{}/", dependency.path.trim_end_matches('/'));
         if affected_paths
             .range(descendant_prefix.clone()..)
             .next()
@@ -4132,7 +4132,7 @@ fn affected_paths_overlap_dependency(
             return true;
         }
         if parent.is_empty() {
-            return false;
+            return affected_paths.contains("/");
         }
         ancestor = parent;
     }

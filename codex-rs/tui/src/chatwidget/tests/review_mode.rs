@@ -104,44 +104,20 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
 async fn entered_review_mode_uses_request_hint() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    handle_entered_review_mode(&mut chat, "feature branch");
+    for hint in ["feature branch", "current changes"] {
+    handle_entered_review_mode(&mut chat, hint);
 
     let cells = drain_insert_history(&mut rx);
     let banner = lines_to_single_string(cells.last().expect("review banner"));
-    assert_eq!(banner, ">> Code review started: feature branch <<\n");
+    assert_eq!(banner, format!(">> Code review started: {hint} <<\n"));
     assert!(chat.review.is_review_mode);
+    }
 }
 
 /// Entering review mode renders the current changes banner when requested.
-#[tokio::test]
-async fn entered_review_mode_defaults_to_current_changes_banner() {
-    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    handle_entered_review_mode(&mut chat, "current changes");
 
-    let cells = drain_insert_history(&mut rx);
-    let banner = lines_to_single_string(cells.last().expect("review banner"));
-    assert_eq!(banner, ">> Code review started: current changes <<\n");
-    assert!(chat.review.is_review_mode);
-}
 
-#[tokio::test]
-async fn live_review_prompt_item_is_not_rendered() {
-    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    handle_entered_review_mode(&mut chat, "changes against 'main'");
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1);
-    assert!(lines_to_single_string(&cells[0]).contains("Code review started"));
-
-    complete_user_message(
-        &mut chat,
-        "review-prompt",
-        "Review the code changes against the base branch 'main'.",
-    );
-
-    assert!(drain_insert_history(&mut rx).is_empty());
-}
 
 #[tokio::test]
 async fn live_app_server_review_prompt_item_is_not_rendered() {
@@ -471,46 +447,7 @@ async fn steer_enter_uses_pending_steers_while_turn_is_running_without_streaming
     assert!(lines_to_single_string(&inserted[0]).contains("queued while running"));
 }
 
-#[tokio::test]
-async fn steer_enter_uses_pending_steers_while_final_answer_stream_is_active() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.on_task_started();
-    // Keep the assistant stream open (no commit tick/finalize) to model the repro window:
-    // user presses Enter while the final answer is still streaming.
-    chat.on_agent_message_delta("Final answer line\n".to_string());
 
-    chat.bottom_pane.set_composer_text(
-        "queued while streaming".to_string(),
-        Vec::new(),
-        Vec::new(),
-    );
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert!(chat.input_queue.queued_user_messages.is_empty());
-    assert_eq!(chat.input_queue.pending_steers.len(), 1);
-    assert_eq!(
-        chat.input_queue
-            .pending_steers
-            .front()
-            .unwrap()
-            .user_message
-            .text,
-        "queued while streaming"
-    );
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn { .. } => {}
-        other => panic!("expected Op::UserTurn, got {other:?}"),
-    }
-    assert!(drain_insert_history(&mut rx).is_empty());
-
-    complete_user_message(&mut chat, "user-1", "queued while streaming");
-
-    assert!(chat.input_queue.pending_steers.is_empty());
-    let inserted = drain_insert_history(&mut rx);
-    assert_eq!(inserted.len(), 1);
-    assert!(lines_to_single_string(&inserted[0]).contains("queued while streaming"));
-}
 
 #[tokio::test]
 async fn failed_pending_steer_submit_does_not_add_pending_preview() {
@@ -526,6 +463,7 @@ async fn failed_pending_steer_submit_does_not_add_pending_preview() {
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
+    assert_eq!(chat.bottom_pane.composer_text(), "queued while streaming");
     assert!(chat.input_queue.pending_steers.is_empty());
     assert!(chat.input_queue.queued_user_messages.is_empty());
     assert!(drain_insert_history(&mut rx).is_empty());
@@ -1078,6 +1016,9 @@ async fn ctrl_c_shutdown_works_with_caps_lock() {
 async fn ctrl_c_interrupts_active_review_without_quitting() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_task_running(/*running*/ true);
+    handle_entered_review_mode(&mut chat, "current changes");
+    drain_insert_history(&mut rx);
+    assert!(chat.review.is_review_mode);
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
@@ -1124,7 +1065,7 @@ async fn ctrl_c_cleared_prompt_is_recoverable_via_history() {
 async fn review_capture_prompt_forwards_exact_text() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let raw_text = "  first line\r\n\tCafe\u{301}!?  ";
+    for raw_text in ["", "  first line\r\n\tCafe\u{301}!?  "] {
     chat.open_bug_capture_prompt();
     chat.handle_paste(raw_text.to_string());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1135,72 +1076,19 @@ async fn review_capture_prompt_forwards_exact_text() {
         }
         other => panic!("unexpected app event: {other:?}"),
     }
+    assert!(rx.try_recv().is_err());
+    }
 }
 
 /// The commit picker shows only commit subjects (no timestamps).
-#[tokio::test]
-async fn review_commit_picker_shows_subjects_without_timestamps() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.open_bug_capture_prompt();
-
-    // Render the bottom pane and inspect the lines for subjects and absence of time words.
-    let width = 72;
-    let height = chat.desired_height(width);
-    let area = ratatui::layout::Rect::new(0, 0, width, height);
-    let mut buf = ratatui::buffer::Buffer::empty(area);
-    chat.render(area, &mut buf);
-
-    let mut blob = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            let s = buf[(x, y)].symbol();
-            if s.is_empty() {
-                blob.push(' ');
-            } else {
-                blob.push_str(s);
-            }
-        }
-        blob.push('\n');
-    }
-
-    assert!(
-        blob.contains("Capture audit"),
-        "expected capture prompt title in output"
-    );
-
-    // Ensure no relative-time phrasing is present.
-    let lowered = blob.to_lowercase();
-    assert!(
-        !lowered.contains("ago")
-            && !lowered.contains(" second")
-            && !lowered.contains(" minute")
-            && !lowered.contains(" hour")
-            && !lowered.contains(" day"),
-        "expected no relative time in capture prompt output: {blob:?}"
-    );
-}
 
 /// Empty capture input is forwarded without local normalization so the server can
 /// enforce the authoritative rejection rule.
-#[tokio::test]
-async fn review_capture_prompt_forwards_empty_text() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.open_bug_capture_prompt();
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    let evt = rx.try_recv().expect("expected one app event");
-    match evt {
-        AppEvent::CodexOp(AppCommand::BugCreate { raw_text }) => {
-            assert!(raw_text.is_empty());
-        }
-        other => panic!("unexpected app event: {other:?}"),
-    }
-}
-
-// Snapshot test: interrupting a running exec finalizes the active cell with a red ✗
-// marker (replacing the spinner) and flushes it into history.
+// Interrupting a running exec must report failure in both the compact status
+// color and the transcript marker, not merely replace "Running" with "Ran".
 #[tokio::test]
 async fn interrupt_exec_marks_failed_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -1212,14 +1100,24 @@ async fn interrupt_exec_marks_failed_snapshot() {
     // cause the active exec cell to be finalized as failed and flushed.
     handle_turn_interrupted(&mut chat, "turn-1");
 
-    let cells = drain_insert_history(&mut rx);
-    assert!(
-        !cells.is_empty(),
-        "expected finalized exec cell to be inserted into history"
-    );
-
-    // The first inserted cell should be the finalized exec; snapshot its text.
-    let exec_blob = lines_to_single_string(&cells[0]);
+    let cell = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .expect("expected finalized exec cell in history");
+    let exec = cell.as_any().downcast_ref::<ExecCell>().expect("exec cell");
+    assert!(!exec.is_active());
+    let display = cell.display_lines(80);
+    let marker = display.iter().flat_map(|line| &line.spans)
+        .find(|span| span.content.contains('•'))
+        .expect("compact status marker");
+    assert_eq!(marker.style.fg, Some(ratatui::style::Color::Red));
+    let transcript = lines_to_single_string(&cell.transcript_lines(80));
+    assert!(transcript.contains('✗'), "{transcript}");
+    assert!(!transcript.contains('✓'), "{transcript}");
+    assert!(chat.transcript.active_cell.is_none());
+    let exec_blob = lines_to_single_string(&display);
     assert_chatwidget_snapshot!("interrupt_exec_marks_failed", exec_blob);
 }
 

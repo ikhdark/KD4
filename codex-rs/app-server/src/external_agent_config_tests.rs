@@ -1988,6 +1988,8 @@ async fn detect_repo_skips_plugins_that_are_already_configured_in_codex() {
         r#"{
           "enabledPlugins": {
             "formatter@acme-tools": true,
+            "disabled@acme-tools": true,
+            "implicit@acme-tools": true,
             "deployer@acme-tools": true
           },
           "extraKnownMarketplaces": {
@@ -2003,6 +2005,11 @@ async fn detect_repo_skips_plugins_that_are_already_configured_in_codex() {
         r#"
 [plugins."formatter@acme-tools"]
 enabled = true
+
+[plugins."disabled@acme-tools"]
+enabled = false
+
+[plugins."implicit@acme-tools"]
 "#,
     )
     .expect("write codex config");
@@ -2036,91 +2043,6 @@ enabled = true
             }),
         }]
     );
-}
-
-#[tokio::test]
-async fn detect_repo_skips_plugins_that_are_disabled_in_codex() {
-    let root = TempDir::new().expect("create tempdir");
-    let external_agent_home = root.path().join(EXTERNAL_AGENT_DIR);
-    let codex_home = root.path().join(".codex");
-    let repo_root = root.path().join("repo");
-    fs::create_dir_all(repo_root.join(".git")).expect("create git dir");
-    fs::create_dir_all(repo_root.join(EXTERNAL_AGENT_DIR)).expect("create repo external agent dir");
-    fs::create_dir_all(&codex_home).expect("create codex home");
-    fs::write(
-        repo_root.join(EXTERNAL_AGENT_DIR).join("settings.json"),
-        r#"{
-          "enabledPlugins": {
-            "formatter@acme-tools": true
-          },
-          "extraKnownMarketplaces": {
-            "acme-tools": {
-              "source": "acme-corp/external-agent-plugins"
-            }
-          }
-        }"#,
-    )
-    .expect("write repo settings");
-    fs::write(
-        codex_home.join("config.toml"),
-        r#"
-[plugins."formatter@acme-tools"]
-enabled = false
-"#,
-    )
-    .expect("write codex config");
-
-    let items = service_for_paths(external_agent_home, codex_home)
-        .detect(ExternalAgentConfigDetectOptions {
-            include_home: false,
-            cwds: Some(vec![repo_root]),
-        })
-        .await
-        .expect("detect");
-
-    assert_eq!(items, Vec::<ExternalAgentConfigMigrationItem>::new());
-}
-
-#[tokio::test]
-async fn detect_repo_skips_plugins_without_explicit_enabled_in_codex() {
-    let root = TempDir::new().expect("create tempdir");
-    let external_agent_home = root.path().join(EXTERNAL_AGENT_DIR);
-    let codex_home = root.path().join(".codex");
-    let repo_root = root.path().join("repo");
-    fs::create_dir_all(repo_root.join(".git")).expect("create git dir");
-    fs::create_dir_all(repo_root.join(EXTERNAL_AGENT_DIR)).expect("create repo external agent dir");
-    fs::create_dir_all(&codex_home).expect("create codex home");
-    fs::write(
-        repo_root.join(EXTERNAL_AGENT_DIR).join("settings.json"),
-        r#"{
-          "enabledPlugins": {
-            "formatter@acme-tools": true
-          },
-          "extraKnownMarketplaces": {
-            "acme-tools": {
-              "source": "acme-corp/external-agent-plugins"
-            }
-          }
-        }"#,
-    )
-    .expect("write repo settings");
-    fs::write(
-        codex_home.join("config.toml"),
-        r#"
-[plugins."formatter@acme-tools"]
-"#,
-    )
-    .expect("write codex config");
-
-    let items = service_for_paths(external_agent_home, codex_home)
-        .detect(ExternalAgentConfigDetectOptions {
-            include_home: false,
-            cwds: Some(vec![repo_root]),
-        })
-        .await
-        .expect("detect");
-
-    assert_eq!(items, Vec::<ExternalAgentConfigMigrationItem>::new());
 }
 
 #[tokio::test]
@@ -2526,7 +2448,7 @@ async fn import_plugins_supports_external_agent_plugin_marketplace_layout() {
             Some(MigrationDetails {
                 plugins: vec![PluginsMigration {
                     marketplace_name: "my-plugins".to_string(),
-                    plugin_names: vec!["cloudflare".to_string()],
+                    plugin_names: vec!["missing".to_string(), "cloudflare".to_string()],
                 }],
                 ..Default::default()
             }),
@@ -2534,19 +2456,34 @@ async fn import_plugins_supports_external_agent_plugin_marketplace_layout() {
         .await
         .expect("import plugins");
 
+    assert_single_plugin_raw_error(
+        &outcome.raw_errors,
+        "plugin_import",
+        "missing@my-plugins",
+        Some("plugin_not_found"),
+    );
     assert_eq!(
-        outcome,
+        PluginImportOutcome {
+            raw_errors: Vec::new(),
+            ..outcome
+        },
         PluginImportOutcome {
             succeeded_marketplaces: vec!["my-plugins".to_string()],
             succeeded_plugin_ids: vec!["cloudflare@my-plugins".to_string()],
             failed_marketplaces: Vec::new(),
-            failed_plugin_ids: Vec::new(),
+            failed_plugin_ids: vec!["missing@my-plugins".to_string()],
             raw_errors: Vec::new(),
         }
     );
-    let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
-    assert!(config.contains(r#"[plugins."cloudflare@my-plugins"]"#));
-    assert!(config.contains("enabled = true"));
+    let config: TomlValue = toml::from_str(
+        &fs::read_to_string(codex_home.join("config.toml")).expect("read config"),
+    )
+    .expect("parse config");
+    assert_eq!(
+        config["plugins"]["cloudflare@my-plugins"]["enabled"].as_bool(),
+        Some(true)
+    );
+    assert!(config["plugins"].get("missing@my-plugins").is_none());
 }
 
 #[tokio::test]
@@ -2641,7 +2578,21 @@ async fn detect_home_infers_external_official_marketplace_when_missing_from_sett
     )
     .expect("write settings");
 
-    let items = service_for_paths(external_agent_home.clone(), codex_home)
+    let service = service_for_paths(external_agent_home.clone(), codex_home);
+    let settings = effective_external_settings(&external_agent_home.join("settings.json"))
+        .expect("read settings")
+        .expect("settings");
+    assert_eq!(
+        service.marketplace_import_sources(&settings, &external_agent_home),
+        BTreeMap::from([(
+            EXTERNAL_OFFICIAL_MARKETPLACE_NAME.to_string(),
+            MarketplaceImportSource {
+                source: EXTERNAL_OFFICIAL_MARKETPLACE_SOURCE.to_string(),
+                ref_name: None,
+            },
+        )])
+    );
+    let items = service
         .detect(ExternalAgentConfigDetectOptions {
             include_home: true,
             cwds: None,
@@ -2744,55 +2695,6 @@ async fn import_plugins_supports_relative_external_agent_plugin_marketplace_path
     assert!(config.contains("enabled = true"));
 }
 
-#[tokio::test]
-async fn import_plugins_infers_external_official_marketplace_when_missing_from_settings() {
-    let (_root, external_agent_home, codex_home) = fixture_paths();
-    fs::create_dir_all(&external_agent_home).expect("create external agent home");
-    fs::create_dir_all(&codex_home).expect("create codex home");
-
-    fs::write(
-        external_agent_home.join("settings.json"),
-        format!(
-            r#"{{
-          "enabledPlugins": {{
-            "sample@{EXTERNAL_OFFICIAL_MARKETPLACE_NAME}": true
-          }}
-        }}"#
-        ),
-    )
-    .expect("write settings");
-
-    let outcome = service_for_paths(external_agent_home, codex_home)
-        .import_plugins(
-            /*cwd*/ None,
-            Some(MigrationDetails {
-                plugins: vec![PluginsMigration {
-                    marketplace_name: EXTERNAL_OFFICIAL_MARKETPLACE_NAME.to_string(),
-                    plugin_names: vec!["sample".to_string()],
-                }],
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect("import plugins");
-
-    assert_eq!(
-        outcome.succeeded_marketplaces,
-        vec![EXTERNAL_OFFICIAL_MARKETPLACE_NAME.to_string()]
-    );
-    assert_eq!(outcome.succeeded_plugin_ids, Vec::<String>::new());
-    assert_eq!(outcome.failed_marketplaces, Vec::<String>::new());
-    assert_eq!(
-        outcome.failed_plugin_ids,
-        vec![format!("sample@{EXTERNAL_OFFICIAL_MARKETPLACE_NAME}")]
-    );
-    assert_single_plugin_raw_error(
-        &outcome.raw_errors,
-        "plugin_import",
-        &format!("sample@{EXTERNAL_OFFICIAL_MARKETPLACE_NAME}"),
-        Some("plugin_not_found"),
-    );
-}
 
 #[tokio::test]
 async fn detect_repo_supports_project_relative_external_agent_plugin_marketplace_path() {

@@ -802,6 +802,11 @@ mod tests {
             compiled[0].actions.inject_request_headers[0].value,
             HeaderValue::from_static("Bearer ghp-file-secret")
         );
+        assert_eq!(
+            compiled[0].actions.inject_request_headers[0].source,
+            SecretSource::File(AbsolutePathBuf::try_from(secret_file.path()).unwrap())
+        );
+        assert!(compiled[0].actions.inject_request_headers[0].value.is_sensitive());
     }
 
     #[test]
@@ -857,19 +862,28 @@ mod tests {
             |_| Err(anyhow!("unexpected file lookup")),
         )
         .unwrap();
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/repos/openai/codex/issues?state=open&per_page=10")
-            .header("x-github-api-version", "2022-11-28")
-            .body(Body::empty())
-            .unwrap();
-
-        assert_eq!(
-            evaluate_mitm_hooks(&hooks, "api.github.com", &req),
-            HookEvaluation::Matched {
-                actions: hooks.get("api.github.com").unwrap()[0].actions.clone(),
-            }
-        );
+        for (query, version, allowed) in [
+            ("state=open&per_page=10", "2022-11-28", true),
+            ("state=triage", "2022-11-28", true),
+            ("state=closed", "2022-11-28", false),
+            ("", "2022-11-28", false),
+            ("state=open", "wrong-version", false),
+        ] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/repos/openai/codex/issues?{query}"))
+                .header("x-github-api-version", version)
+                .body(Body::empty())
+                .unwrap();
+            let expected = if allowed {
+                HookEvaluation::Matched {
+                    actions: hooks.get("api.github.com").unwrap()[0].actions.clone(),
+                }
+            } else {
+                HookEvaluation::HookedHostNoMatch
+            };
+            assert_eq!(evaluate_mitm_hooks(&hooks, "api.github.com", &req), expected);
+        }
     }
 
     #[test]

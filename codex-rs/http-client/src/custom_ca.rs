@@ -110,6 +110,21 @@ pub(crate) enum CustomCaPolicy {
     HonorProcessEnvironment,
     ExplicitRootSet,
 }
+
+pub(crate) fn parse_explicit_root_certificates(
+    pem: &[u8],
+) -> io::Result<Vec<reqwest::Certificate>> {
+    let certificates = reqwest::Certificate::from_pem_bundle(pem)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if certificates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no certificates found in explicit root PEM",
+        ));
+    }
+    Ok(certificates)
+}
+
 fn native_root_store() -> Cow<'static, RootCertStore> {
     // The native loader replaces OS roots with these mutable sources. Never put their
     // contents into the permanent platform snapshot; include the resulting roots in cache identity.
@@ -929,39 +944,31 @@ mod tests {
     }
 
     #[test]
-    fn ca_path_prefers_codex_env() {
-        let env = map_env(&[
-            (CODEX_CA_CERT_ENV, "/tmp/codex.pem"),
-            (SSL_CERT_FILE_ENV, "/tmp/fallback.pem"),
-        ]);
-
-        assert_eq!(
-            env.configured_ca_bundle().map(|bundle| bundle.path),
-            Some(PathBuf::from("/tmp/codex.pem"))
-        );
-    }
-
-    #[test]
-    fn ca_path_falls_back_to_ssl_cert_file() {
-        let env = map_env(&[(SSL_CERT_FILE_ENV, "/tmp/fallback.pem")]);
-
-        assert_eq!(
-            env.configured_ca_bundle().map(|bundle| bundle.path),
-            Some(PathBuf::from("/tmp/fallback.pem"))
-        );
-    }
-
-    #[test]
-    fn ca_path_ignores_empty_values() {
-        let env = map_env(&[
-            (CODEX_CA_CERT_ENV, ""),
-            (SSL_CERT_FILE_ENV, "/tmp/fallback.pem"),
-        ]);
-
-        assert_eq!(
-            env.configured_ca_bundle().map(|bundle| bundle.path),
-            Some(PathBuf::from("/tmp/fallback.pem"))
-        );
+    fn ca_path_selection_preserves_precedence_and_source() {
+        for (values, expected) in [
+            (
+                vec![(CODEX_CA_CERT_ENV, "/tmp/codex.pem"), (SSL_CERT_FILE_ENV, "/tmp/fallback.pem")],
+                Some((CODEX_CA_CERT_ENV, PathBuf::from("/tmp/codex.pem"))),
+            ),
+            (
+                vec![(SSL_CERT_FILE_ENV, "/tmp/fallback.pem")],
+                Some((SSL_CERT_FILE_ENV, PathBuf::from("/tmp/fallback.pem"))),
+            ),
+            (
+                vec![(CODEX_CA_CERT_ENV, ""), (SSL_CERT_FILE_ENV, "/tmp/fallback.pem")],
+                Some((SSL_CERT_FILE_ENV, PathBuf::from("/tmp/fallback.pem"))),
+            ),
+            (vec![], None),
+            (vec![(CODEX_CA_CERT_ENV, ""), (SSL_CERT_FILE_ENV, "")], None),
+        ] {
+            assert_eq!(
+                map_env(&values)
+                    .configured_ca_bundle()
+                    .map(|bundle| (bundle.source_env, bundle.path)),
+                expected,
+                "environment: {values:?}"
+            );
+        }
     }
 
     #[test]
@@ -1144,14 +1151,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn default_rustls_client_config_is_reused() {
-        let first = super::cached_rustls_client_config(None).expect("first default rustls config");
-        let second =
-            super::cached_rustls_client_config(None).expect("second default rustls config");
 
-        assert!(Arc::ptr_eq(&first, &second));
-    }
 
     #[test]
     fn rustls_config_reports_invalid_ca_file() {

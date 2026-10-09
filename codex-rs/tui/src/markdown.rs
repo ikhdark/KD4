@@ -353,53 +353,20 @@ mod tests {
     }
 
     #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_table_rendering() {
-        let src = "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert!(rendered.iter().any(|line| line.contains('━')));
-        assert!(rendered.iter().any(|line| line.contains(" 1      2")));
-    }
-
-    #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_no_outer_table_rendering() {
-        let src = "```md\nCol A | Col B | Col C\n--- | --- | ---\nx | y | z\n10 | 20 | 30\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert!(rendered.iter().any(|line| line.contains('━')));
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains(" Col A    Col B    Col C"))
-        );
-        assert!(
-            !rendered
-                .iter()
-                .any(|line| line.trim() == "Col A | Col B | Col C")
-        );
-    }
-
-    #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_two_column_no_outer_table() {
-        let src = "```md\nA | B\n--- | ---\nleft | right\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert!(rendered.iter().any(|line| line.contains('━')));
-        assert!(rendered.iter().any(|line| line.contains(" left    right")));
-        assert!(!rendered.iter().any(|line| line.trim() == "A | B"));
-    }
-
-    #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_single_column_table() {
-        let src = "```md\n| Only |\n|---|\n| value |\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert!(rendered.iter().any(|line| line.contains('━')));
-        assert!(!rendered.iter().any(|line| line.trim() == "| Only |"));
+    fn append_markdown_agent_unwraps_table_fences_with_optional_outer_pipes() {
+        for (src, required, forbidden) in [
+            ("\x60\x60\x60markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n\x60\x60\x60\n", " 1      2", "| A | B |"),
+            ("\x60\x60\x60md\nCol A | Col B | Col C\n--- | --- | ---\nx | y | z\n10 | 20 | 30\n\x60\x60\x60\n", " Col A    Col B    Col C", "Col A | Col B | Col C"),
+            ("\x60\x60\x60md\nA | B\n--- | ---\nleft | right\n\x60\x60\x60\n", " left    right", "A | B"),
+            ("\x60\x60\x60md\n| Only |\n|---|\n| value |\n\x60\x60\x60\n", "value", "| Only |"),
+        ] {
+            let mut out = Vec::new();
+            append_markdown_agent(src, /*width*/ None, &mut out);
+            let rendered = lines_to_strings(&out);
+            assert!(rendered.iter().any(|line| line.contains('━')), "{src}");
+            assert!(rendered.iter().any(|line| line.contains(required)), "{src}");
+            assert!(!rendered.iter().any(|line| line.trim() == forbidden), "{src}");
+        }
     }
 
     #[test]
@@ -422,10 +389,7 @@ mod tests {
     fn append_markdown_agent_unwraps_blockquoted_markdown_fence_table() {
         let src = "> ```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n> ```\n";
         let rendered = unwrap_markdown_fences(src);
-        assert!(
-            !rendered.contains("```"),
-            "expected markdown fence markers to be removed: {rendered:?}"
-        );
+        assert_eq!(rendered, "> | A | B |\n> |---|---|\n> | 1 | 2 |\n");
     }
 
     #[test]

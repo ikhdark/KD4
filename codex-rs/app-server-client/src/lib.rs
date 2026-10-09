@@ -1160,8 +1160,11 @@ mod tests {
         let mut config = build_test_config().await;
         config.bypass_hook_trust = true;
         config.service_tier = Some("priority".to_string());
+        config.model = Some("configured-model".to_string());
+        config.base_instructions = Some("base instructions".to_string());
+        config.ephemeral = true;
         let overrides = ThreadLifecycleOverrides {
-            model_provider: Some(config.model_provider_id.clone()),
+            model_provider: Some("provider-override".to_string()),
             cwd: Some(config.cwd.to_string_lossy().to_string()),
             permissions: None,
             developer_instructions: Some("developer override".to_string()),
@@ -1173,6 +1176,21 @@ mod tests {
             thread_resume_params_from_config(&config, "thread-id".to_string(), overrides.clone());
         let fork = thread_fork_params_from_config(&config, "thread-id".to_string(), overrides);
 
+        for (model, provider, cwd, instructions) in [
+            (&start.model, &start.model_provider, &start.cwd, &start.developer_instructions),
+            (&resume.model, &resume.model_provider, &resume.cwd, &resume.developer_instructions),
+            (&fork.model, &fork.model_provider, &fork.cwd, &fork.developer_instructions),
+        ] {
+            assert_eq!(model.as_deref(), Some("configured-model"));
+            assert_eq!(provider.as_deref(), Some("provider-override"));
+            assert_eq!(cwd.as_deref(), Some(config.cwd.to_string_lossy().as_ref()));
+            assert_eq!(instructions.as_deref(), Some("developer override"));
+        }
+        assert_eq!(resume.thread_id, "thread-id");
+        assert_eq!(fork.thread_id, "thread-id");
+        assert_eq!(fork.base_instructions.as_deref(), Some("base instructions"));
+        assert_eq!(start.ephemeral, Some(true));
+        assert!(fork.ephemeral);
         assert_eq!(start.config, resume.config);
         assert_eq!(resume.config, fork.config);
         assert_eq!(
@@ -1203,11 +1221,19 @@ mod tests {
             ..Default::default()
         };
 
-        let start = thread_start_params_from_config(&config, overrides, None);
+        let start = thread_start_params_from_config(&config, overrides.clone(), None);
+        let resume = thread_resume_params_from_config(&config, "thread".into(), overrides.clone());
+        let fork = thread_fork_params_from_config(&config, "thread".into(), overrides);
 
-        assert_eq!(start.permissions.as_deref(), Some("configured-profile"));
-        assert_eq!(start.permission_profile, None);
-        assert_eq!(start.sandbox, None);
+        for (permissions, profile, sandbox) in [
+            (start.permissions, start.permission_profile, start.sandbox),
+            (resume.permissions, resume.permission_profile, resume.sandbox),
+            (fork.permissions, fork.permission_profile, fork.sandbox),
+        ] {
+            assert_eq!(permissions.as_deref(), Some("configured-profile"));
+            assert_eq!(profile, None);
+            assert_eq!(sandbox, None);
+        }
     }
 
     #[tokio::test]
@@ -1597,7 +1623,7 @@ mod tests {
 
     #[test]
     fn runtime_warning_formatter_consumes_code_message_and_action() {
-        let warning = ServerRuntimeWarning {
+        let mut warning = ServerRuntimeWarning {
             code: "localBinaryMismatch".to_string(),
             message: "Desktop is using a stale local binary.".to_string(),
             action: Some("restartCodexDesktop".to_string()),
@@ -1610,20 +1636,27 @@ mod tests {
                 "Suggested action: restartCodexDesktop"
             )
         );
+        warning.action = None;
+        assert_eq!(
+            format_runtime_warning(&warning),
+            "App-server warning [localBinaryMismatch]: Desktop is using a stale local binary."
+        );
     }
 
     #[tokio::test]
     async fn typed_request_roundtrip_works() {
-        let client = start_test_client(SessionSource::Exec).await;
-        let response: ConfigRequirementsReadResponse = client
-            .request_typed(ClientRequest::ConfigRequirementsRead {
-                request_id: RequestId::Integer(1),
-                params: None,
-            })
-            .await
-            .expect("typed request should succeed");
-        assert_eq!(response.requirements, None);
-        client.shutdown().await.expect("shutdown should complete");
+        for capacity in [0, 1, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY] {
+            let client = start_test_client_with_capacity(SessionSource::Exec, capacity).await;
+            let response: ConfigRequirementsReadResponse = client
+                .request_typed(ClientRequest::ConfigRequirementsRead {
+                    request_id: RequestId::Integer(1),
+                    params: None,
+                })
+                .await
+                .expect("typed request should succeed");
+            assert_eq!(response.requirements, None);
+            client.shutdown().await.expect("shutdown should complete");
+        }
     }
 
     #[tokio::test]
@@ -1639,6 +1672,12 @@ mod tests {
             })
             .await
             .expect_err("missing thread should return a JSON-RPC error");
+        let TypedRequestError::Server { method, source } = &err else {
+            panic!("expected a server error, got {err:?}");
+        };
+        assert_eq!(method, "thread/read");
+        assert!(!source.message.is_empty());
+        assert_eq!(err.server_error(), Some(source));
         assert!(
             err.to_string().starts_with("thread/read failed:"),
             "expected method-qualified JSON-RPC failure message"
@@ -1699,20 +1738,7 @@ mod tests {
         client.shutdown().await.expect("shutdown should complete");
     }
 
-    #[tokio::test]
-    async fn tiny_channel_capacity_still_supports_request_roundtrip() {
-        let client =
-            start_test_client_with_capacity(SessionSource::Exec, /*channel_capacity*/ 1).await;
-        let response: ConfigRequirementsReadResponse = client
-            .request_typed(ClientRequest::ConfigRequirementsRead {
-                request_id: RequestId::Integer(1),
-                params: None,
-            })
-            .await
-            .expect("typed request should succeed");
-        assert_eq!(response.requirements, None);
-        client.shutdown().await.expect("shutdown should complete");
-    }
+
 
     #[tokio::test]
     async fn in_process_requests_progress_while_required_delivery_is_full() {
@@ -1907,13 +1933,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn performance_probe_lossless_forwarding_uses_available_capacity() {
+    async fn lossless_forwarding_reuses_available_capacity() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let mut pending_delivery = std::collections::VecDeque::new();
         let mut skipped_events = 0;
-        let mut deferred = 0;
-        let started = std::time::Instant::now();
-        for _ in 0..10_000 {
+        for _ in 0..4 {
             assert_eq!(
                 forward_in_process_event(
                     &event_tx,
@@ -1926,11 +1950,10 @@ mod tests {
                 ),
                 ForwardEventResult::Continue
             );
-            // Count the worker delivery passes needed after forwarding.
-            while let Some(event) = pending_delivery.pop_front() {
-                deferred += 1;
-                event_tx.send(event).await.expect("deliver retained event");
-            }
+            assert!(
+                pending_delivery.is_empty(),
+                "available capacity must not require another worker pass"
+            );
             assert!(matches!(
                 event_rx.try_recv().expect("lossless event"),
                 InProcessServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
@@ -1938,15 +1961,7 @@ mod tests {
                 )) if notification.delta == "hello"
             ));
         }
-        eprintln!(
-            "in-process: 10000 events, {deferred} deferred deliveries, {:?}",
-            started.elapsed()
-        );
         assert_eq!(skipped_events, 0);
-        assert_eq!(
-            deferred, 0,
-            "available capacity must not require another worker pass"
-        );
     }
 
     #[tokio::test]
@@ -2884,6 +2899,10 @@ mod tests {
                 panic!("expected server request response");
             };
             assert_eq!(response.id, request_id);
+            assert_eq!(
+                response.result,
+                serde_json::json!({"answers": {"question-1": {"answers": ["chosen"]}}})
+            );
         })
         .await;
         let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -2898,7 +2917,10 @@ mod tests {
             panic!("expected server request event");
         };
         client
-            .resolve_server_request(request.id().clone(), serde_json::json!({}))
+            .resolve_server_request(
+                request.id().clone(),
+                serde_json::json!({"answers": {"question-1": {"answers": ["chosen"]}}}),
+            )
             .await
             .expect("server request should resolve");
 

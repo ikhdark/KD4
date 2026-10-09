@@ -127,43 +127,6 @@ async fn base_instructions_override_disables_personality_template() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Result<()> {
-    require_network!();
-
-    let server = start_mock_server().await;
-    let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
-        config
-            .features
-            .enable(Feature::Personality)
-            .expect("test config should allow feature update");
-        config.personality = Some(Personality::None);
-    });
-    let test = builder.build(&server).await?;
-
-    test.codex
-        .submit(read_only_text_turn(
-            &test,
-            "hello",
-            test.session_configured.model.clone(),
-            test.config.permissions.approval_policy.value(),
-        ))
-        .await?;
-
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let developer_texts = request.message_input_texts("developer");
-    assert!(
-        !developer_texts
-            .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "did not expect a personality update message when personality is None"
-    );
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Result<()> {
@@ -335,81 +298,6 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> {
-    require_network!();
-
-    let server = start_mock_server().await;
-    let resp_mock = mount_sse_sequence(
-        &server,
-        vec![sse_completed("resp-1"), sse_completed("resp-2")],
-    )
-    .await;
-    let mut builder = test_codex()
-        .with_model("exp-codex-personality")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::Personality)
-                .expect("test config should allow feature update");
-        });
-    let test = builder.build(&server).await?;
-
-    test.codex
-        .submit(read_only_text_turn(
-            &test,
-            "hello",
-            test.session_configured.model.clone(),
-            test.config.permissions.approval_policy.value(),
-        ))
-        .await?;
-
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    core_test_support::submit_thread_settings(
-        &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
-            personality: Some(Personality::Friendly),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    test.codex
-        .submit(read_only_text_turn(
-            &test,
-            "hello",
-            test.session_configured.model.clone(),
-            test.config.permissions.approval_policy.value(),
-        ))
-        .await?;
-
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let requests = resp_mock.requests();
-    assert_eq!(requests.len(), 2, "expected two requests");
-    let request = requests
-        .last()
-        .expect("expected personality update request");
-
-    let developer_texts = request.message_input_texts("developer");
-    let personality_text = developer_texts
-        .iter()
-        .rev()
-        .find(|text| text.contains("<personality_spec>"))
-        .expect("expected personality update message in developer input");
-
-    assert!(
-        personality_text.contains("Use the following communication style for future messages:"),
-        "expected personality update preamble, got {personality_text:?}"
-    );
-    assert!(
-        personality_text.contains(LOCAL_FRIENDLY_TEMPLATE),
-        "expected personality update to include the local pragmatic template, got: {personality_text:?}"
-    );
-
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow::Result<()> {
@@ -483,6 +371,14 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
 
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 3, "expected three requests");
+    let prior_developer_texts = requests[1].message_input_texts("developer");
+    let prior_personality = prior_developer_texts
+        .iter()
+        .rev()
+        .find(|text| text.contains("<personality_spec>"))
+        .expect("friendly personality was active before reset");
+    assert!(prior_personality.contains(LOCAL_FRIENDLY_TEMPLATE));
+    assert!(prior_personality.contains("Use the following communication style for future messages:"));
     let developer_texts = requests
         .last()
         .expect("expected personality reset request")

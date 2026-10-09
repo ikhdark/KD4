@@ -1482,6 +1482,50 @@ mod tests {
                 }],
             }
         );
+
+        for (backend_type, api_type) in [
+            (BackendWorkspaceMessageType::Announcement, WorkspaceMessageType::Announcement),
+            (BackendWorkspaceMessageType::Unknown, WorkspaceMessageType::Unknown),
+        ] {
+            let response = AccountRequestProcessor::workspace_messages_response(
+                BackendWorkspaceMessagesResponse {
+                    messages: vec![BackendWorkspaceMessage {
+                        message_id: "other-id".to_string(),
+                        message_type: backend_type,
+                        message_body: "Other body".to_string(),
+                        created_at: None,
+                        archived_at: None,
+                    }],
+                },
+                false,
+            ).expect("absent timestamps are valid");
+            assert_eq!(response, GetWorkspaceMessagesResponse {
+                feature_enabled: false,
+                messages: vec![WorkspaceMessage {
+                    message_id: "other-id".to_string(),
+                    message_type: api_type,
+                    message_body: "Other body".to_string(),
+                    created_at: None,
+                    archived_at: None,
+                }],
+            });
+        }
+        for (created_at, archived_at) in [(Some("invalid"), None), (None, Some("invalid"))] {
+            let error = AccountRequestProcessor::workspace_messages_response(
+                BackendWorkspaceMessagesResponse {
+                    messages: vec![BackendWorkspaceMessage {
+                        message_id: "invalid-id".to_string(),
+                        message_type: BackendWorkspaceMessageType::Headline,
+                        message_body: String::new(),
+                        created_at: created_at.map(str::to_string),
+                        archived_at: archived_at.map(str::to_string),
+                    }],
+                },
+                true,
+            ).expect_err("invalid timestamps must not be silently dropped");
+            assert_eq!(error.code, -32603);
+            assert!(error.message.starts_with("failed to parse workspace message timestamp `invalid`:"));
+        }
     }
 
     #[test]

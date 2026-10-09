@@ -14,8 +14,10 @@ use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_core::find_thread_path_by_id_str;
 use codex_protocol::ThreadId;
@@ -359,11 +361,17 @@ async fn send_turn_and_wait(mcp: &mut TestAppServer, thread_id: &str, text: &str
         mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
-    let _: TurnStartResponse = to_response(response)?;
-    timeout(
+    let started: TurnStartResponse = to_response(response)?;
+    let completed = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    let completed: TurnCompletedNotification =
+        serde_json::from_value(completed.params.expect("turn/completed params"))?;
+    assert_eq!(completed.thread_id, thread_id);
+    assert_eq!(completed.turn.id, started.turn.id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+    assert_eq!(completed.turn.error, None);
     Ok(())
 }

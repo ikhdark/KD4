@@ -3,7 +3,6 @@
 from pathlib import Path
 import sys
 import tempfile
-import tomllib
 import unittest
 from unittest import mock
 
@@ -27,7 +26,7 @@ class VersionDiscoveryTest(unittest.TestCase):
                         "",
                         "[workspace.package]",
                         'name = "codex"',
-                        'version = "1.2.3-alpha.4"',
+                        'version = "1.2.3-alpha.4" # package version',
                         "",
                         "[workspace.dependencies]",
                         'serde = "1"',
@@ -40,24 +39,6 @@ class VersionDiscoveryTest(unittest.TestCase):
                 version.read_workspace_version(cargo_toml),
                 "1.2.3-alpha.4",
             )
-
-    def test_uses_required_stdlib_tomllib(self) -> None:
-        self.assertIs(version.tomllib, tomllib)
-
-    def test_reads_workspace_package_version_with_toml_comments(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cargo_toml = Path(temp_dir) / "Cargo.toml"
-            cargo_toml.write_text(
-                "\n".join(
-                    [
-                        "[workspace.package]",
-                        'version = "1.2.3" # package version',
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            self.assertEqual(version.read_workspace_version(cargo_toml), "1.2.3")
 
     def test_raises_when_workspace_package_version_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -77,23 +58,6 @@ class VersionDiscoveryTest(unittest.TestCase):
                 manifest.write_text(f'[workspace.package]\nversion = "{value}"\n')
                 with self.assertRaisesRegex(RuntimeError, "workspace.package"):
                     version.read_workspace_version(manifest)
-
-    def test_caches_manifest_reads_by_path(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cargo_toml = Path(temp_dir) / "Cargo.toml"
-            cargo_toml.write_text(
-                '[workspace.package]\nversion = "1.0.0"\n',
-                encoding="utf-8",
-            )
-
-            first = version.read_workspace_version(cargo_toml)
-            cargo_toml.write_text(
-                '[workspace.package]\nversion = "2.0.0"\n',
-                encoding="utf-8",
-            )
-            second = version.read_workspace_version(cargo_toml)
-
-            self.assertEqual((first, second), ("1.0.0", "1.0.0"))
 
     def test_cache_keeps_multiple_manifest_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -129,7 +93,7 @@ class VersionDiscoveryTest(unittest.TestCase):
                 return_value="3.4.5",
             ) as read_uncached,
         ):
-            version.read_workspace_version()
+            self.assertEqual(version.read_workspace_version(), "3.4.5")
 
         read_uncached.assert_called_once_with(expected)
 

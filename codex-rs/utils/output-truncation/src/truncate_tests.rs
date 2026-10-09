@@ -174,6 +174,7 @@ fn zero_projection_budget_preserves_omission_metadata_without_text() {
         assert_eq!(marked.output, expected);
         assert!(marked.omitted_lines.is_empty());
         assert_eq!(crate::truncate_text_with_line_markers(source, 0), "");
+        assert_eq!(truncate_text_to_token_ceiling(source, 0), "");
     }
 }
 
@@ -731,6 +732,8 @@ fn fork_validation_routes_receive_the_diagnostic_budget() {
         "just -q -f codex-rs/justfile -- app-server-schema-check",
         "just --justfile=codex-rs/justfile fmt-check",
         "python scripts/rust_test_runner.py run-target core_lib -E test(parser)",
+        "python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib -E test(parser)",
+        "just --set rust_validation_wait_seconds 5 core-gate tool-output-recovery",
         "uv run pytest -q",
         "node --test",
         "npx tsc --noEmit",
@@ -740,6 +743,7 @@ fn fork_validation_routes_receive_the_diagnostic_budget() {
         "npm run lint",
         "pnpm typecheck",
     ] {
+        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::HighSignal, "{command}");
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000);
         assert_eq!(
@@ -766,7 +770,12 @@ fn just_non_validation_commands_keep_the_success_budget() {
         "just --justfile test",
         "echo just --justfile codex-rs/justfile test",
         "just run test",
+        "just --set rust_validation_wait_seconds",
+        "just --set rust_validation_wait_seconds 5 run test",
+        "python -I -B -c 'print(1)' scripts/rust_test_runner.py",
+        "python -I -B other.py scripts/rust_test_runner.py",
     ] {
+        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::Normal, "{command}");
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000)
                 .applied_limit,
@@ -924,11 +933,6 @@ fn token_ceiling_retains_head_middle_and_tail_evidence() {
 }
 
 #[test]
-fn exact_token_ceiling_zero_returns_no_text() {
-    assert_eq!(truncate_text_to_token_ceiling("content", 0), "");
-}
-
-#[test]
 fn just_over_budget_retains_most_of_the_source() {
     let source = "x".repeat(4004);
     let result = truncate_text_to_token_ceiling(&source, 1000);
@@ -983,6 +987,7 @@ fn diagnostic_output_receives_budget_without_command_metadata() {
         "Segmentation fault (core dumped)",
         "project.csproj: error MSB1009: Project file does not exist.",
     ] {
+        assert_eq!(crate::classify_diagnostic(None, diagnostic), OutputDiagnosticClass::HighSignal, "{diagnostic}");
         let limits = resolve_output_limits(None, OutputOutcome::Success, None, diagnostic, 20_000);
         assert_eq!(limits.applied_limit, 10_000, "{diagnostic}");
     }
@@ -1002,6 +1007,7 @@ fn validation_help_and_version_requests_use_the_ordinary_output_budget() {
         "cargo test --help",
         "just core-test-fast --help",
     ] {
+        assert!(!crate::looks_like_validation_command(command), "{command}");
         let limits = resolve_output_limits(
             None,
             OutputOutcome::Success,
@@ -1016,6 +1022,7 @@ fn validation_help_and_version_requests_use_the_ordinary_output_budget() {
     }
     // Verbosity and operands after the option terminator still run validation.
     for command in ["pytest -v", "eslint -- --help"] {
+        assert!(crate::looks_like_validation_command(command), "{command}");
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000);
         assert_eq!(
@@ -1028,16 +1035,19 @@ fn validation_help_and_version_requests_use_the_ordinary_output_budget() {
 #[test]
 fn validation_launcher_chains_do_not_require_recursive_stack_space() {
     let launchers = "& npx uv run ".repeat(16_384);
-    for (command, expected) in [
+    for (command, validation, expected) in [
         (
             format!("{launchers}pytest -q"),
+            true,
             DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
         ),
         (
             format!("{launchers}echo pytest"),
+            false,
             DEFAULT_SUCCESS_OUTPUT_TOKENS,
         ),
     ] {
+        assert_eq!(crate::looks_like_validation_command(&command), validation);
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(&command), "ok", 20_000);
         assert_eq!(limits.applied_limit, expected);
@@ -1085,18 +1095,6 @@ fn validation_launchers_preserve_diagnostic_budgets_without_promoting_arguments(
             "{command}"
         );
     }
-}
-
-#[test]
-fn reading_typescript_configuration_is_not_validation() {
-    let limits = resolve_output_limits(
-        None,
-        OutputOutcome::Success,
-        Some("Get-Content tsconfig.json"),
-        "{}",
-        20_000,
-    );
-    assert_eq!(limits.applied_limit, 10_000);
 }
 
 #[test]
@@ -1165,6 +1163,7 @@ fn formatted_content_items_enforce_dense_token_budget_and_preserve_nontext() {
 #[test]
 fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
     for command in [
+        "Get-Content tsconfig.json",
         "echo \"cargo test\"",
         "echo pytest",
         "cat /tmp/pytest-results.txt",
@@ -1288,6 +1287,35 @@ fn projection_line_markers_cover_exact_crlf_gaps() {
             assert!(!output.contains(&format!("source line {line:04}")));
         }
     }
+}
+
+#[test]
+fn marked_recovery_preserves_the_entire_known_gap() {
+    let source = (1..=3000)
+        .map(|line| format!("source 雪 line {line:04}\r\n"))
+        .collect::<String>();
+    let marked = crate::formatted_truncate_text_with_line_markers(
+        &source,
+        OutputLimitResolution {
+            requested_limit: None,
+            default_limit: 1000,
+            hard_limit: 1000,
+            applied_limit: 1000,
+        },
+    );
+    // The displayed marker is the recovery consumer's promise. Read its
+    // independently visible endpoints rather than the producer's range vector.
+    let (first, last) = marked.output.text.lines()
+        .find_map(|line| line.strip_prefix("[omitted lines "))
+        .and_then(|marker| marker.split_once(" of "))
+        .and_then(|(span, _)| span.split_once('-'))
+        .map(|(start, end)| (start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()))
+        .expect("numbered omission marker");
+    assert!(last - first + 1 > 200, "fixture must exceed a preview page");
+    assert_eq!(marked.first_omitted_line_range(), Some((first, last)));
+    let gap = source.lines().skip(first - 1).take(last - first + 1).collect::<Vec<_>>();
+    assert_eq!(gap.first().copied(), Some(format!("source 雪 line {first:04}").as_str()));
+    assert_eq!(gap.last().copied(), Some(format!("source 雪 line {last:04}").as_str()));
 }
 
 /// Recovery receipts must name the whole first gap. Source code repeats braces

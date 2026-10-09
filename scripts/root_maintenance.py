@@ -309,6 +309,10 @@ VALIDATION_REGRESSIONS = (
     "scripts.test_report_script_regressions.Report26ValidationRegressions"
 )
 SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
+    ".codex/test-runners.json": (
+        "scripts.test_root_maintenance.RootMaintenanceTest.test_script_test_entrypoints_have_explicit_validation_declarations",
+        "scripts.test_rust_test_runner.RunTargetTest.test_trusted_declaration_covers_parser_global_options",
+    ),
     "justfile": (
         "scripts.test_root_maintenance",
         "scripts.test_build_tooling",
@@ -360,7 +364,6 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         f"{REPORT_REGRESSIONS}.test_tool_contents_invalidate_identity_preserving_size_and_mtime",
     ),
     "scripts/codex_package/cli.py": (
-        f"{REPORT_REGRESSIONS}.test_publication_rolls_back_package_archive_and_sidecar",
         f"{REPORT_REGRESSIONS}.test_activation_rollback_retains_old_outputs_without_copying",
         f"{REPORT_REGRESSIONS}.test_cross_target_prebuilt_cannot_label_distributable_version",
         f"{REPORT_REGRESSIONS}.test_missing_license_fails_before_build",
@@ -417,12 +420,16 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/rust_build_status.py": (
         "scripts.test_build_tooling_storage",
         f"{REPORT_REGRESSIONS}.test_recent_overflow_survives_expired_base",
+        "scripts.test_rust_test_admission",
     ),
     "scripts/rust_build_status_support.py": ("scripts.test_build_tooling_storage",),
     "scripts/run-python.js": ("scripts.test_build_tooling_policy",),
     "scripts/rust_packages.py": ("scripts.test_build_tooling_policy",),
     "scripts/rust_test_runner.py": (
         f"{REPORT_REGRESSIONS}.test_nextest_progress_counter_and_binary_identity",
+        "scripts.test_rust_test_admission",
+        "scripts.test_rust_test_runner_failure_diagnostics",
+        "scripts.test_validation_metrics",
         "scripts.test_validation_scheduling",
     ),
     "scripts/rust_tool_env.py": ("scripts.test_process_owner",),

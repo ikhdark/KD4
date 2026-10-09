@@ -241,11 +241,15 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .unwrap()
         .len();
     let server = MockServer::start().await;
-    let config = test_config(&server);
+    let config = RemotePluginServiceConfig::new(
+        format!("{}/backend-api/?tenant=share-test", server.uri()),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
     let auth = test_auth();
 
     Mock::given(method("POST"))
         .and(path("/backend-api/public/plugins/workspace/upload-url"))
+        .and(query_param("tenant", "share-test"))
         .and(header("authorization", "Bearer Access Token"))
         .and(header("chatgpt-account-id", "account_id"))
         .and(body_json(json!({
@@ -271,6 +275,7 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .await;
     Mock::given(method("POST"))
         .and(path("/backend-api/public/plugins/workspace"))
+        .and(query_param("tenant", "share-test"))
         .and(header("authorization", "Bearer Access Token"))
         .and(header("chatgpt-account-id", "account_id"))
         .and(body_json(json!({
@@ -335,6 +340,16 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .find(|request| request.method == "PUT" && request.url.path() == "/upload/file_123")
         .unwrap();
     let archive_files = archive_file_entries(&upload_request.body);
+    assert_eq!(upload_request.body.len(), archive_size);
+    assert!(!upload_request.headers.contains_key("authorization"));
+    assert!(!upload_request.headers.contains_key("chatgpt-account-id"));
+    assert_eq!(
+        archive_files.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            ".codex-plugin/plugin.json".to_string(),
+            "skills/example/SKILL.md".to_string(),
+        ]
+    );
     assert_eq!(
         archive_files
             .get(".codex-plugin/plugin.json")
@@ -365,35 +380,6 @@ fn archive_plugin_for_upload_rejects_archives_over_limit() {
         err,
         RemotePluginCatalogError::ArchiveTooLarge { .. }
     ));
-}
-
-#[test]
-fn archive_plugin_for_upload_places_manifest_at_archive_root() {
-    let temp_dir = TempDir::new().unwrap();
-    let plugin_path = write_test_plugin(temp_dir.path(), "demo-plugin");
-
-    let archive_bytes = archive_plugin_for_upload(&plugin_path).unwrap();
-    let archive_files = archive_file_entries(&archive_bytes);
-
-    assert_eq!(
-        archive_files.keys().cloned().collect::<Vec<_>>(),
-        vec![
-            ".codex-plugin/plugin.json".to_string(),
-            "skills/example/SKILL.md".to_string()
-        ]
-    );
-    assert_eq!(
-        archive_files
-            .get(".codex-plugin/plugin.json")
-            .map(Vec::as_slice),
-        Some(br#"{"name":"demo-plugin"}"#.as_slice())
-    );
-    assert_eq!(
-        archive_files
-            .get("skills/example/SKILL.md")
-            .map(Vec::as_slice),
-        Some(b"# Example\n\nA test skill.\n".as_slice())
-    );
 }
 
 #[test]
@@ -659,11 +645,15 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
         AbsolutePathBuf::try_from(codex_home.path().join("local-plugin")).unwrap();
     write_plugin_share_local_path_mapping(codex_home.path(), "plugins_123", &local_plugin_path);
     let server = MockServer::start().await;
-    let config = test_config(&server);
+    let config = RemotePluginServiceConfig::new(
+        format!("{}/backend-api/?tenant=share-test", server.uri()),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
     let auth = test_auth();
 
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/workspace/created"))
+        .and(query_param("tenant", "share-test"))
         .and(header("authorization", "Bearer Access Token"))
         .and(header("chatgpt-account-id", "account_id"))
         .and(query_param(
@@ -706,6 +696,7 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
             REMOTE_PLUGIN_LIST_PAGE_LIMIT.to_string(),
         ))
         .and(query_param("pageToken", "page-2"))
+        .and(query_param("tenant", "share-test"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "plugins": [remote_plugin_json_with_share_url_and_principals(
                 "plugins_456",
@@ -795,7 +786,8 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
                     id: "demo-plugin@workspace-shared-with-me".to_string(),
                     remote_plugin_id: "plugins_456".to_string(),
                     version: Some("0.1.0".to_string()),
-                    local_version: Some("0.1.0".to_string()),
+                    // The backend marks this installed, but no local package exists.
+                    local_version: None,
                     name: "demo-plugin".to_string(),
                     share_context: Some(RemotePluginShareContext {
                         remote_plugin_id: "plugins_456".to_string(),

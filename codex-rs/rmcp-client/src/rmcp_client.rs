@@ -1719,7 +1719,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn active_time_timeout_pauses_while_elicitation_is_pending() {
         let pause_state = ElicitationPauseState::new();
         let pause = pause_state.enter();
