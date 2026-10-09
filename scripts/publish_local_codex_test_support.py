@@ -705,6 +705,9 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         return subprocess.run(
             [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", *invocation],
             text=True,
+            # Windows PowerShell writes redirected text in the OEM code page;
+            # Python's UTF-8 mode must not decide how that pipe is decoded.
+            encoding="oem" if Path(self.shell).stem.lower() == "powershell" else "utf-8",
             capture_output=True,
             check=False,
             env=effective_env,

@@ -689,12 +689,14 @@ class ScriptReportRegressions(unittest.TestCase):
 
     def test_staged_bytes_must_match_inputs_observed_before_copy(self):
         from scripts.codex_package import layout
+        from scripts.codex_package.test_layout import use_package_notice_fixture
         from scripts.codex_package.targets import (
             PackageInputs,
             PACKAGE_VARIANTS,
             TARGET_SPECS,
         )
 
+        use_package_notice_fixture(self, layout)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = [root / name for name in ("codex", "host", "rg", "runner", "setup")]

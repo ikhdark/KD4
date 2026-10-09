@@ -20,6 +20,7 @@ from unittest import mock
 import scripts.stage_npm_archives as archives
 import scripts.stage_npm_packages as stage
 from scripts.codex_package import layout
+from scripts.codex_package.test_layout import use_package_notice_fixture
 from scripts.codex_package.targets import PACKAGE_VARIANTS
 from scripts.codex_package.targets import PackageInputs
 from scripts.codex_package.targets import TARGET_SPECS
@@ -459,6 +460,7 @@ class StageNpmPackagesTests(unittest.TestCase):
             stage.list_workflow_artifacts.cache_clear()
         if hasattr(stage.load_build_module, "cache_clear"):
             stage.load_build_module.cache_clear()
+        use_package_notice_fixture(self, layout, stage.load_build_module())
 
     def tearDown(self) -> None:
         if hasattr(stage.list_workflow_artifacts, "cache_clear"):

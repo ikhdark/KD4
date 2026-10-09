@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from codex_package import cargo as cargo_module
 from codex_package import cli
 from codex_package.cargo import SourceBuildOutputs
+from codex_package.test_layout import use_package_notice_fixture
 from codex_package.test_layout import write_pe
 
 
@@ -48,6 +49,7 @@ class CliEntrypointTest(unittest.TestCase):
 
 class CliPerformanceFlagsTest(unittest.TestCase):
     def setUp(self) -> None:
+        use_package_notice_fixture(self, cli)
         fingerprint = mock.patch.object(
             cli, "source_tree_fingerprint", return_value={"status": "test"}
         )
@@ -376,6 +378,9 @@ class CliPerformanceFlagsTest(unittest.TestCase):
 
 
 class CliPreflightTest(unittest.TestCase):
+    def setUp(self) -> None:
+        use_package_notice_fixture(self, cli)
+
     def test_ripgrep_role_alias_fails_before_build_lease_or_inputs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

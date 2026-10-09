@@ -90,7 +90,7 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
         )?;
         let mut tool = "exec_command";
         let mut args = json!({
-            "cmd": "cargo test --offline -p validation-route-fixture --lib --target-dir target -- --nocapture",
+            "cmd": "cargo test --offline -p validation-route-fixture --lib --target-dir target validates_current_source -- --nocapture",
             "workdir": fixture,
             "yield_time_ms": 1000,
             "max_output_tokens": 2000,

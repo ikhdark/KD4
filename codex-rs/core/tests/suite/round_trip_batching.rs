@@ -581,7 +581,7 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
     for rule in [
         "Use supplied sessions for the requested analysis, comparison, review, or implementation; a session alone does not authorize code changes.",
         "Focused diagnostic or baseline checks may run before and during implementation.",
-        "Run final verification after the last relevant edit.",
+        "Run final verification after the last relevant edit, subject to the full-suite budget and failure-only retry rule above.",
         "Sequence dependencies and shared-resource conflicts, including Cargo commands sharing a target directory.",
         "Resume live operations rather than restarting them.",
         "Reuse current reads, schemas, exact values, inventories, and passing checks",

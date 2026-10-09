@@ -839,6 +839,16 @@ impl ThreadState {
         // Keep the live turn, including its pending approvals, when rejoining it.
         if self.current_turn_history.in_progress_turn_id().is_none() {
             self.seed_current_turn_history(items);
+            // A lagging resume snapshot must not resurrect a turn whose terminal
+            // event this listener has already consumed and indexed.
+            if self
+                .current_turn_history
+                .in_progress_turn_id()
+                .and_then(|turn_id| self.turn_index.turns.get(turn_id))
+                .is_some_and(|turn| turn.status != TurnStatus::InProgress)
+            {
+                self.current_turn_history.reset();
+            }
         }
         self.resume_history_seeded_generation = Some(listener_generation);
         true

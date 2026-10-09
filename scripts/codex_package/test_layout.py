@@ -20,6 +20,7 @@ from codex_package.targets import TARGET_SPECS
 
 class CopyFileForStagingTest(unittest.TestCase):
     def setUp(self) -> None:
+        use_package_notice_fixture(self, layout)
         # These fixtures exercise PE parsing; only launching a real Windows process is mocked.
         launch = mock.patch.object(
             layout.subprocess, "run", return_value=mock.Mock(stdout="codex 1.2.3")
@@ -429,6 +430,19 @@ class CopyFileForStagingTest(unittest.TestCase):
             nested.write_text("tampered")
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 layout.validate_package_dir(package, variant, spec)
+
+
+def use_package_notice_fixture(test: unittest.TestCase, *modules) -> None:
+    """Keep packaging tests independent of optional checkout notice files."""
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    root = Path(directory.name)
+    for name in ("LICENSE", "NOTICE"):
+        (root / name).write_text(f"Fixture {name}\n", encoding="utf-8")
+    for module in modules:
+        patch = mock.patch.object(module, "REPO_ROOT", root)
+        patch.start()
+        test.addCleanup(patch.stop)
 
 
 def write_pe(path: Path, *, machine: int = 0x8664) -> None:

@@ -3916,7 +3916,7 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
             let ready = scratch.path().join("ready");
             let release = scratch.path().join("release");
             let command = serde_json::json!({
-                "program":"cargo", "args":["test","--offline","-p","freshness_fixture","--target-dir",scratch.path().join("target")],
+                "program":"cargo", "args":["test","--offline","-p","freshness_fixture","--target-dir",scratch.path().join("target"),"validates_current_source"],
                 "yield_time_ms":300000, "max_output_tokens":2000,
             })
             .to_string();

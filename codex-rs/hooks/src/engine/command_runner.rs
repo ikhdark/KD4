@@ -785,7 +785,7 @@ mod tests {
             let child_script = temp_dir.path().join("child.ps1");
             std::fs::write(
                 &child_script,
-                format!("Start-Sleep -Seconds 3; Set-Content -LiteralPath '{marker}' -Value done"),
+                format!("Start-Sleep -Seconds 30; Set-Content -LiteralPath '{marker}' -Value done"),
             )
             .expect("write child script");
             let child_script = child_script.to_string_lossy().replace('\'', "''");
@@ -799,16 +799,22 @@ mod tests {
             format!("(sleep 3; printf done > '{marker}') & printf '%s' $! > child.pid; sleep 60")
         };
 
-        let handler = test_handler(command, 1, &cwd);
+        // Starting two PowerShell processes can exceed one second under suite load.
+        // Keep the descendant's delayed write beyond the hook's timeout.
+        let timeout_sec = if cfg!(windows) { 5 } else { 1 };
+        let handler = test_handler(command, timeout_sec, &cwd);
 
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(15),
             run_command(&explicit_test_shell(), &handler, 0, "{}", cwd.as_path()),
         )
         .await
         .expect("run_command should enforce its timeout");
 
-        assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
+        assert_eq!(
+            result.error,
+            Some(format!("hook timed out after {timeout_sec}s"))
+        );
         let pid = std::fs::read_to_string(temp_dir.path().join("child.pid"))
             .expect("descendant was spawned")
             .trim()
