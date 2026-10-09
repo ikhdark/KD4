@@ -41,6 +41,15 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                 panic!("nested function dispatch must preserve its payload kind");
             };
             let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+            if args["serial_retention"] == true
+                && let crate::tools::router::ToolCallSource::CodeMode { cell_id, .. } = &invocation.source
+            {
+                invocation.session.services.code_mode_service
+                    .flush_packet_retention(&CellId::new(cell_id.clone())).await;
+            }
+            if let Some(delay) = args["delay_ms"].as_u64() {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             if args["partial_selection"] == true {
                 return Ok(crate::tools::context::boxed_tool_output(
                     codex_tools::JsonToolOutput::with_success(serde_json::json!({
@@ -119,7 +128,15 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
             {
                 return Err(crate::FunctionCallError::RespondToModel(error.to_string()));
             }
-            let output = FunctionToolOutput::from_text("READ_RESULT_42".to_string(), Some(true));
+            let text = if args["benchmark_output"] == true {
+                "src/first.rs:12:needle\nC:\\repo\\second.rs:3:needle\n".repeat(2_000)
+                    + "FAILURE_TAIL\n"
+            } else if args["retention_output"] == true {
+                "EXACT_LARGE_RECOVERY\n".repeat(400)
+            } else {
+                "READ_RESULT_42".to_string()
+            };
+            let output = FunctionToolOutput::from_text(text, Some(true));
             let output = match args["outcome"].as_str() {
                 Some("blocked") => output.with_skip_disposition(
                     codex_tools::ToolOutputSkipDisposition::BlockingRequiredOperation,
@@ -315,6 +332,207 @@ fn packet_output_text(output: &dyn ToolOutput) -> String {
         panic!("exec projection must produce a custom tool output");
     };
     output.body.to_text().unwrap()
+}
+
+/// No provider calls: measures the real JS/broker/router/projection round trip
+/// with a deterministic nested producer. Process startup is measured separately.
+#[tokio::test]
+#[ignore = "wall-clock benchmark; run explicitly without competing benchmarks"]
+async fn benchmark_tool_execution_projection() {
+    let runtime = PacketRuntime::new().await;
+    for limit in [100, 10_000] {
+        let source = format!(
+            "// @exec: {{\"max_output_tokens\":{limit}}}\ntext(await tools.read_tool_output({{benchmark_output:true}}));"
+        );
+        let mut elapsed_us = Vec::new();
+        for sample in 0..8 {
+            let start = Instant::now();
+            let output = runtime.exec(&source).await;
+            let visible = packet_output_text(output.as_ref());
+            let elapsed = start.elapsed().as_micros();
+            assert!(visible.contains("FAILURE_TAIL"), "{visible}");
+            assert!(visible.contains("omitted lines"), "{visible}");
+            if sample > 0 {
+                elapsed_us.push(elapsed);
+            }
+        }
+        let mut sorted = elapsed_us.clone();
+        sorted.sort_unstable();
+        println!("{}", serde_json::json!({
+            "benchmark":"code_mode_nested_dispatch_to_model_packet",
+            "limit":limit, "samples_us":elapsed_us, "median_us":sorted[3],
+            "model_calls":0, "subprocesses":0,
+        }));
+    }
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn packet_retention_flush_preserves_order_after_cancelled_wait_and_yield() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let service = &session.services.code_mode_service;
+    let cell = CellId::new("retention-order".into());
+    service.record_cell_parent_call_id(&cell, "outer");
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first = Arc::clone(&completed);
+    assert!(service.queue_packet_retention(&session, &cell, async move {
+        blocked.await.unwrap();
+        first.lock().unwrap().push(1);
+    }).is_none());
+    {
+        let flush = service.flush_packet_retention(&cell);
+        tokio::pin!(flush);
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        // Dropping this observer must not discard the chain's predecessor.
+    }
+    service.finish_packet(cell.as_str(), true);
+    let second = Arc::clone(&completed);
+    {
+        let previous = service.queue_packet_retention(&session, &cell, async move {
+            second.lock().unwrap().push(2);
+        }).expect("the predecessor applies backpressure");
+        tokio::pin!(previous);
+        assert!(futures::poll!(previous.as_mut()).is_pending());
+        // Cancelling the producer's wait must preserve both accepted writes.
+    }
+    let flush = service.flush_packet_retention(&cell);
+    tokio::pin!(flush);
+    assert!(futures::poll!(flush.as_mut()).is_pending());
+    assert!(completed.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap();
+    assert_eq!(*completed.lock().unwrap(), vec![1, 2]);
+    service.finish_cell_dispatch(&cell);
+}
+
+#[tokio::test]
+async fn packet_retention_backpressure_preserves_overlap_and_cell_independence() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let service = &session.services.code_mode_service;
+    let cell = CellId::new("slow-retention".into());
+    let other = CellId::new("independent-retention".into());
+    service.record_cell_parent_call_id(&cell, "outer");
+    service.record_cell_parent_call_id(&other, "other-outer");
+    let (release_first, first) = tokio::sync::oneshot::channel();
+    let (release_second, second) = tokio::sync::oneshot::channel();
+    assert!(service.queue_packet_retention(&session, &cell, async move {
+        first.await.unwrap();
+    }).is_none());
+    let previous = service.queue_packet_retention(&session, &cell, async move {
+        second.await.unwrap();
+    }).expect("a producer cannot run arbitrarily far ahead of storage");
+    tokio::pin!(previous);
+    assert!(futures::poll!(previous.as_mut()).is_pending());
+
+    // Storage backpressure is per cell, never a new cross-session execution lock.
+    assert!(service.queue_packet_retention(&session, &other, async {}).is_none());
+    tokio::time::timeout(Duration::from_secs(5), service.flush_packet_retention(&other))
+        .await.unwrap();
+    release_first.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), previous).await.unwrap();
+    // Returning the second result waits only for the first write. The second
+    // remains owned and can overlap the next tool until the response flush.
+    let flush = service.flush_packet_retention(&cell);
+    tokio::pin!(flush);
+    assert!(futures::poll!(flush.as_mut()).is_pending());
+    release_second.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap();
+    service.finish_cell_dispatch(&cell);
+    service.finish_cell_dispatch(&other);
+}
+
+#[tokio::test]
+async fn packet_retention_survives_cell_close_without_reopening_packet() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let service = &session.services.code_mode_service;
+    let cell = CellId::new("closed-retention".into());
+    service.record_cell_parent_call_id(&cell, "outer");
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let task_session = Arc::clone(&session);
+    let task_cell = cell.clone();
+    assert!(service.queue_packet_retention(&session, &cell, async move {
+        blocked.await.unwrap();
+        task_session.services.code_mode_service.record_packet_recovery(
+            &task_cell, 0, serde_json::json!({"result":"late"}),
+        );
+        done.send(()).unwrap();
+    }).is_none());
+    service.finish_cell_dispatch(&cell);
+    session.terminal_tasks.close();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await.unwrap();
+    finished.await.unwrap();
+    assert!(!service.packet_admission.lock().unwrap().cells.contains_key(cell.as_str()));
+}
+
+#[tokio::test]
+async fn packet_retention_large_results_are_recoverable_at_exec_and_wait_boundaries() {
+    for use_wait in [false, true] {
+        let runtime = PacketRuntime::with_nested_tool("exec_command").await;
+        let source = format!(
+            "{} for (let i = 0; i < 3; i++) await tools.exec_command({{cmd:'Get-Content source.txt', retention_output:true}});",
+            if use_wait { "await yield_control();" } else { "" },
+        );
+        let mut output = runtime.exec(&source).await;
+        if use_wait {
+            let cell = runtime.live_cell();
+            output = runtime.call(ToolPayload::Function {
+                arguments: serde_json::json!({"cell_id":cell.as_str(),"max_tokens":10_000}).to_string(),
+            }, Default::default()).await.unwrap();
+        }
+        let visible = packet_output_text(output.as_ref());
+        let directory = visible.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|row| row["nested_result_recovery_directory"].as_array().cloned())
+            .expect("all three large results have recovery entries");
+        assert_eq!(directory.len(), 3, "{visible}");
+        let history = runtime.session.lock_history_state_for_test().await.tool_history_state();
+        for entry in directory {
+            let artifact_id = entry["outcome"]["artifact_id"].as_str().expect("retention drained");
+            assert!(history.artifact_references().contains_key(artifact_id));
+            let exact = crate::tools::command_output_artifact::read_complete_canonical_snapshot(
+                &runtime.step.turn.config.codex_home, &runtime.session.thread_id.to_string(),
+                artifact_id, 100_000,
+            ).await.unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&exact).unwrap(),
+                serde_json::json!("EXACT_LARGE_RECOVERY\n".repeat(400)));
+        }
+        runtime.finish().await;
+    }
+}
+
+/// Matched in-process barrier baseline, not an end-to-end model benchmark.
+/// The serial fixture waits for the previous result before doing its own work.
+#[tokio::test]
+#[ignore = "wall-clock benchmark; run explicitly without competing benchmarks"]
+async fn benchmark_packet_retention_overlap() {
+    let runtime = PacketRuntime::with_nested_tool("exec_command").await;
+    for large in [false, true] {
+        for serial in [true, false] {
+            let source = format!(
+                "for (let i=0; i<8; i++) await tools.exec_command({{cmd:'Get-Content source.txt',retention_output:{large},serial_retention:{serial},delay_ms:5}}); text('settled');"
+            );
+            let mut samples_us = Vec::new();
+            for sample in 0..8 {
+                let started = Instant::now();
+                let output = runtime.exec(&source).await;
+                assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+                assert!(packet_output_text(output.as_ref()).contains("settled"));
+                if sample > 0 { samples_us.push(started.elapsed().as_micros()); }
+            }
+            let mut sorted = samples_us.clone();
+            sorted.sort_unstable();
+            println!("{}", serde_json::json!({
+                "benchmark":"packet_retention_overlap", "large":large,
+                "serial_barrier":serial, "samples_us":samples_us, "median_us":sorted[3],
+                "nested_calls_per_cell":8, "model_calls":0,
+            }));
+        }
+    }
+    runtime.finish().await;
 }
 
 #[tokio::test]

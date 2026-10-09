@@ -576,16 +576,30 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
     // roots and workers alike.
     let instructions = requests[0].instructions_text();
     for rule in [
-        "Finish edits before checks.",
+        "Use supplied sessions for the requested analysis, comparison, review, or implementation; a session alone does not authorize code changes.",
+        "Focused diagnostic or baseline checks may run before and during implementation.",
+        "Run final verification after the last relevant edit.",
         "Sequence dependencies and shared-resource conflicts, including Cargo commands sharing a target directory.",
         "Resume live operations rather than restarting them.",
         "Reuse current reads, schemas, exact values, inventories, and passing checks",
-        "Choose the smallest checks that prove the requested behavior",
+        "Choose the smallest checks that cover the requested behavior and credible regressions introduced by the change",
+        "Retain complete data in the producing environment before crossing the tool boundary",
+        "Recover missing output and follow-up ranges from retained artifacts before rerunning producers or reacquiring unchanged evidence",
     ] {
         assert_eq!(
             instructions.matches(rule).count(),
             1,
             "base instructions must state this rule exactly once: {rule}"
+        );
+    }
+
+    for obsolete in [
+        "When the user provides a session, run the audit, fix the actual problems, and validate the fixes.",
+        "Finish edits before checks.",
+    ] {
+        assert!(
+            !instructions.contains(obsolete),
+            "base instructions must not restore overbroad workflow rules: {obsolete}"
         );
     }
 

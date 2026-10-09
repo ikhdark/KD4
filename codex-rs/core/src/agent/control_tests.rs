@@ -2089,8 +2089,6 @@ fn registered_cancelled_spawn_retains_usage_until_child_termination() {
             let (parent_id, parent) = harness.start_thread().await;
             let control = parent.codex.session.services.agent_control.clone();
             let turn = parent.codex.session.new_default_turn().await;
-            turn.multi_agent_spawn_authorized
-                .store(true, std::sync::atomic::Ordering::Release);
             let step = StepContext::for_test(turn);
             let tool_name = codex_tools::ToolName::namespaced("agents", "spawn_agent");
             let router = Arc::new(ToolRouter::from_context(

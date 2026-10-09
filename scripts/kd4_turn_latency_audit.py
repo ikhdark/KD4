@@ -24,12 +24,14 @@ try:
     from scripts import kd4_session_diagnostics
     from scripts.kd4_timing_analysis import (
         _MAX_SLOW_TOOL_CALLS,
+        _REQUEST_SETUP_MEASUREMENT_NOTE,
         _SLOW_TOOL_CALL_NS,
         _diagnostic_token_report,
         _is_rg_no_match,
         analyze_runner_evidence,
         _population_report,
         _request_metric,
+        _request_setup_phases,
         _selected_requests,
         _token_intervals,
         _tool_model_visible_at_ms,
@@ -50,12 +52,14 @@ except ImportError:
     import kd4_session_diagnostics
     from kd4_timing_analysis import (
         _MAX_SLOW_TOOL_CALLS,
+        _REQUEST_SETUP_MEASUREMENT_NOTE,
         _SLOW_TOOL_CALL_NS,
         _diagnostic_token_report,
         _is_rg_no_match,
         analyze_runner_evidence,
         _population_report,
         _request_metric,
+        _request_setup_phases,
         _selected_requests,
         _token_intervals,
         _tool_model_visible_at_ms,
@@ -1239,6 +1243,7 @@ def _latency_breakdown(
             "shareOfAgentActive": orchestration_ns / machine_ns if machine_ns else None,
             "localActivityUnionsNs": population["localActivityUnionsNs"],
             "preFirstModelOutput": population["preFirstModelOutput"],
+            "requestSetup": population["requestSetup"],
             "toolRelayOverheadNs": tool_relay_overhead_ns,
             "toolRelayTimingCalls": tool_relay["calls"],
             "toolRelayTimingOverflowCalls": tool_relay["timingOverflowCalls"],
@@ -1254,7 +1259,7 @@ def _latency_breakdown(
                 ],
             },
             "measurementNote": (
-                "Local activity, pre-first-output, tool-relay, and command-gap "
+                "Local activity, pre-first-output, request setup, tool-relay, and command-gap "
                 "values are overlapping diagnostics; they do not form an additive "
                 "partition of exclusiveTotalNs."
             ),
@@ -1421,6 +1426,7 @@ def _turn_report(
         "tokens": tokens,
         "tokenScope": "turn_model_requests_not_session_cumulative",
         "requestRetention": analysis["requestRetention"],
+        "requestSetup": analysis["requestSetup"],
         "continuationAccounting": {
             "reportedSuppressedContinuations": counters.get(
                 "suppressedDeterministicContinuationCount"
@@ -2340,6 +2346,7 @@ def _request_ledger(records, calls, tool_calls, include_tokens):
                     "dispatchMs", "completedMs", "modelStreamWaitNs", "decisionLatencyNs",
                 )},
                 "inputTokens": usage.get("inputTokens") if include_tokens else None,
+                "setupPhaseNs": _request_setup_phases(request),
                 "outputTokens": request.get("outputTokens") if include_tokens else None,
             })
     rows = []
@@ -2392,10 +2399,19 @@ def _render_request_ledger(report):
             if kind == "requests":
                 wait = row.get("modelStreamWaitNs")
                 seconds = f"{wait / 1e9:.3f}s" if isinstance(wait, (int, float)) else "?"
+                phases = row.get("setupPhaseNs")
+                setup = (
+                    _ledger_text(
+                        ", ".join(f"{name}={value / 1e6:.3f}ms" for name, value in phases.items()),
+                        512,
+                    )
+                    if phases else "unavailable"
+                )
                 lines.append(f"  request {row['requestIndex']} {identity} "
                              f"{_ledger_text(row.get('attemptKind'), 20)} "
                              f"{_ledger_text(row.get('generationPurpose'), 40)} wait={seconds} "
-                             f"tokens in/out={row.get('inputTokens')}/{row.get('outputTokens')}")
+                             f"tokens in/out={row.get('inputTokens')}/{row.get('outputTokens')} "
+                             f"setup (overlapping)=[{setup}]")
             else:
                 duration = row.get("roundTripNs")
                 seconds = f"{duration / 1e9:.3f}s" if isinstance(duration, (int, float)) else "?"
@@ -2648,6 +2664,23 @@ def render_report(report: dict[str, Any]) -> str:
         f"{command_round_trip['gapUpperBoundNs'] / 1e9:.1f}s/"
         f"{command_round_trip['coveredCalls']} calls"
     )
+    setup = orchestration_breakdown.get("requestSetup")
+    if setup is not None:
+        lines.append(
+            "request setup (overlapping diagnostics; non-additive): "
+            f"measured={setup['measuredRequests']}/{setup['requestRows']} retained rows; "
+            f"missing={setup['missingRequests']}; retention={setup['retentionComplete']}"
+        )
+        if not setup["available"]:
+            lines.append("  setup durations unavailable: no measured request rows")
+        for name, summary in setup["phaseSummariesNs"].items():
+            lines.append(
+                f"  {_ledger_text(name, 80)}: n={summary['count']} "
+                f"observed-sum={summary['observedTotalNs'] / 1e6:.3f}ms "
+                f"mean={summary['observedTotalNs'] / summary['count'] / 1e6:.3f}ms "
+                f"min={summary['minNs'] / 1e6:.3f}ms max={summary['maxNs'] / 1e6:.3f}ms"
+            )
+        lines.append(_REQUEST_SETUP_MEASUREMENT_NOTE)
     model_breakdown = latency_breakdown["modelInference"]
     model_share = model_breakdown["shareOfAgentActive"]
     model_share_text = (
@@ -3248,6 +3281,16 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         + " "
         + _COMPACTION_MEASUREMENT_NOTE
     )
+    # Retain setup coverage and the overlap warning once, outside token compaction.
+    # Historical saved reports may not contain this additive diagnostic.
+    # When nothing was measured, leave the unavailable section to full JSON/text
+    # rather than displacing existing turn or comparison evidence in old reports.
+    setup = orchestration_breakdown.get("requestSetup")
+    if setup is not None and setup["available"]:
+        result["latencyBreakdown"]["orchestration"]["requestSetup"] = {
+            **setup,
+            "measurementNote": _REQUEST_SETUP_MEASUREMENT_NOTE,
+        }
     subscription = report.get("sessionDiagnostics", {}).get("subscriptionUsage")
     # With no token-count events, leave the unavailable section to full JSON/text
     # rather than displacing existing turn evidence in legacy compact reports.

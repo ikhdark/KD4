@@ -221,6 +221,11 @@
         }
         session = current.session_id;
         incarnation = current.session_capabilities.incarnation;
+        // Silence is a decision boundary, not proof of failure. Keep the live
+        // owner and all completed output; do not hide the notice in another poll.
+        if (!exited && current.session_capabilities.observation?.reason === "no_output_observed") {
+          fail("command reported no output; inspect and resume the retained handle", evidence);
+        }
         if (observations.length >= max_observations) fail("command observation limit reached", evidence);
         try {
           if (on_progress && await on_progress(current) !== true) fail("command progress needs review", evidence);

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -902,7 +903,28 @@ pub(crate) struct SamplingToolCallRegistration {
     pub(crate) replayed_success: Option<SuccessfulReplayGuard>,
 }
 
+/// Shared only while consuming one settled request, never across tool execution.
+pub(crate) struct SamplingRequestAnalysis<'a> {
+    collector: &'a SamplingRequestSignalCollector,
+    cycle: OnceLock<Option<DeterministicCycle>>,
+}
+
+impl SamplingRequestAnalysis<'_> {
+    fn deterministic_cycle(&self) -> Option<&DeterministicCycle> {
+        self.cycle
+            .get_or_init(|| self.collector.deterministic_cycle())
+            .as_ref()
+    }
+}
+
 impl SamplingRequestSignalCollector {
+    pub(crate) fn analyze_settled_request(&self) -> SamplingRequestAnalysis<'_> {
+        SamplingRequestAnalysis {
+            collector: self,
+            cycle: OnceLock::new(),
+        }
+    }
+
     pub(crate) fn register_runtime_semantics(
         &self,
         tool_name: &ToolName,
@@ -1829,6 +1851,7 @@ impl SamplingRequestSignalCollector {
         self.deterministic_cycle().map(|cycle| cycle.key)
     }
 
+    #[cfg(test)]
     fn failure_fingerprint(&self) -> Option<String> {
         self.deterministic_cycle()
             .and_then(|cycle| cycle.failure_fingerprint)
@@ -3085,6 +3108,7 @@ pub(crate) struct TurnExecutionControl {
     turn_efficiency_child_runtime_ms: u64,
     budget_progress_evidence: BTreeSet<String>,
     delivered_coverage: BTreeMap<String, DeliveredSourceCoverage>,
+    evidence_fingerprint: OnceLock<String>,
     artifact_source_coverage: BTreeMap<String, BTreeSet<String>>,
     /// Mutation revision proven by this turn's last passing validation.
     validated_mutation_revision: Option<u64>,
@@ -3262,6 +3286,7 @@ impl TurnExecutionControl {
             turn_efficiency_child_runtime_ms: 0,
             budget_progress_evidence: BTreeSet::new(),
             delivered_coverage: BTreeMap::new(),
+            evidence_fingerprint: OnceLock::new(),
             artifact_source_coverage: BTreeMap::new(),
             validated_mutation_revision: None,
             validated_check: None,
@@ -3532,6 +3557,7 @@ impl TurnExecutionControl {
                     format!("content:{evidence}")
                 };
                 if self.budget_progress_evidence.insert(evidence) {
+                    self.evidence_fingerprint.take();
                     if state.validation_ordinals.contains(&outcome.ordinal) {
                         progress.push(TurnTimingProgressKind::ValidationResult);
                     }
@@ -3606,6 +3632,8 @@ impl TurnExecutionControl {
             query_proofs: values.iter().filter_map(value_evidence_identity).collect(),
         };
         let sources = self.artifact_source_coverage.get(&key).cloned().unwrap_or_default();
+        // Alias propagation can change the digest even without novel source bytes.
+        self.evidence_fingerprint.take();
         // Other reads may have filled holes since this artifact was created.
         // Import their coverage before deciding whether recovery adds evidence.
         if source == "artifact" {
@@ -3659,16 +3687,18 @@ impl TurnExecutionControl {
             plan_revision: self.plan_revision,
             input_revision: self.input_revision,
             tool_exposure_revision,
-            evidence_fingerprint: format!(
-                "{:x}",
-                Sha256::digest(
-                    serde_json::to_vec(&(
-                        &self.budget_progress_evidence,
-                        &self.delivered_coverage,
-                    ))
-                    .expect("ordered evidence contains only JSON-serializable values"),
-                ),
-            ),
+            evidence_fingerprint: self.evidence_fingerprint.get_or_init(|| {
+                format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&(
+                            &self.budget_progress_evidence,
+                            &self.delivered_coverage,
+                        ))
+                        .expect("ordered evidence contains only JSON-serializable values"),
+                    ),
+                )
+            }).clone(),
         }
     }
 
@@ -3699,6 +3729,7 @@ impl TurnExecutionControl {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn continuation_generation_request(
         &self,
         baselines: &SamplingRequestBaselines,
@@ -3706,6 +3737,22 @@ impl TurnExecutionControl {
         settled: &SamplingRequestSettledState,
         has_pending_input: bool,
     ) -> GenerationRequestDisposition {
+        self.continuation_generation_request_with_analysis(
+            baselines,
+            &collector.analyze_settled_request(),
+            settled,
+            has_pending_input,
+        )
+    }
+
+    pub(crate) fn continuation_generation_request_with_analysis(
+        &self,
+        baselines: &SamplingRequestBaselines,
+        analysis: &SamplingRequestAnalysis<'_>,
+        settled: &SamplingRequestSettledState,
+        has_pending_input: bool,
+    ) -> GenerationRequestDisposition {
+        let collector = analysis.collector;
         let relevant_state_fingerprint = self
             .baselines_with_tool_exposure_revision(
                 settled.mutation_revision,
@@ -3719,7 +3766,8 @@ impl TurnExecutionControl {
             purpose: collector.generation_purpose(baselines, settled, has_pending_input, false),
             sampling: SamplingGenerationDisposition::DecisionBearing,
             relevant_state_fingerprint,
-            failure_fingerprint: collector.failure_fingerprint(),
+            failure_fingerprint: analysis.deterministic_cycle()
+                .and_then(|cycle| cycle.failure_fingerprint.clone()),
             terminal_completion_only: false,
         }
     }
@@ -3834,12 +3882,27 @@ impl TurnExecutionControl {
         self.issued_directives.insert(directive.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn evaluate_convergence(
         &mut self,
         baselines: &SamplingRequestBaselines,
         collector: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
     ) -> SamplingConvergenceDecision {
+        self.evaluate_convergence_with_analysis(
+            baselines,
+            &collector.analyze_settled_request(),
+            settled,
+        )
+    }
+
+    pub(crate) fn evaluate_convergence_with_analysis(
+        &mut self,
+        baselines: &SamplingRequestBaselines,
+        analysis: &SamplingRequestAnalysis<'_>,
+        settled: &SamplingRequestSettledState,
+    ) -> SamplingConvergenceDecision {
+        let collector = analysis.collector;
         // Required validation remains turn-owned across request collectors.
         // Background services without validation ownership do not gate delivery.
         if self.pending_validation_coverage.values().any(|pending| !pending.inherited) {
@@ -3894,7 +3957,7 @@ impl TurnExecutionControl {
             && runtime_samples == request_tool_calls
             && request_child_runtime_ms <= request_runtime_limit_ms;
         let request_cycle = efficiency_sample_eligible
-            .then(|| collector.deterministic_cycle())
+            .then(|| analysis.deterministic_cycle())
             .flatten();
         let request_deterministic_cycle = request_cycle.as_ref().map(|cycle| cycle.key.clone());
         let repeated_cycle = request_cycle.as_ref().is_some_and(|cycle| {

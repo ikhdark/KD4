@@ -2029,8 +2029,8 @@ function Get-Command($Name) {
                     self.assertEqual(
                         # PowerShell consumes the literal -- when calling the
                         # recording function instead of a native executable.
-                        command[1:6],
-                        ["run-lane", "--lane", "auto", "cargo", "clippy"],
+                        command[1:8],
+                        ["run-lane", "--lane", "auto", "--warm-wait-seconds", "0", "cargo", "clippy"],
                     )
                     self.assertEqual(command[-len(args) :], list(args))
                     self.assertEqual("--fix" in command, recipe == "fix")
@@ -2152,6 +2152,8 @@ function Get-Command($Name) {
                 "run-lane",
                 "--lane",
                 "core-tests",
+                "--warm-wait-seconds",
+                "0",
                 "just",
                 "_core-gate-reserved",
                 "app-server-command-exec",
@@ -2431,6 +2433,8 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             "run-lane --lane release -- cargo build --release",
             "run-lane --lane app-server-test-client -- just _app-server-test-client-reserved",
         ):
+            if snippet.startswith("run-lane"):
+                snippet = snippet.replace(" -- ", ' --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- ', 1)
             self.assertIn(snippet, justfile)
         self.assertNotIn("target/lanes/", justfile)
         self.assertEqual(justfile.count("scripts\\cargo-lane.ps1"), 1)
@@ -2441,7 +2445,7 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         for recipe in ("test", "test-fast", "test-compile"):
             body = justfile.split(f"\n{recipe} *args:\n", 1)[1].split("\n\n", 1)[0]
             self.assertIn(
-                'rust_build_status.py" run-lane --lane auto -- cargo nextest run',
+                'rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run',
                 body,
             )
             self.assertIn("@forwarded_args", body)

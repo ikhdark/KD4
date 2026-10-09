@@ -106,7 +106,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     }.into()))
                 }),
                 ("resolve".to_string(), JsonSchema::array(JsonSchema::string(None), Some(
-                    "Original requirement IDs whose acceptance scope is now fully satisfied. Use in the same update as completing renamed/split/merged descendants; every mapped descendant must be completed. This is explicit checklist accounting, never test evidence. Newly introduced step text remains an independent obligation.".into()
+                    "Original requirement IDs whose acceptance scope is now fully satisfied. Use in the same update as completing renamed/split/merged descendants; at least one mapped descendant must exist and every mapped descendant must be completed. Reattach orphaned scope with continues before resolving it; authorized retirement uses superseded instead. This is explicit checklist accounting, never test evidence. Newly introduced step text remains an independent obligation.".into()
                 ))),
                 ("scope_change_instructions".to_string(), JsonSchema {
                     description: Some("Superseded step/orphan ID to the exact complete text of a currently accepted user input authorizing that scope change. The host verifies user-input provenance, not your interpretation; a reason or tool/context quote alone cannot retire scope. Omit for unverified proposals.".into()),

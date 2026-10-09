@@ -1549,24 +1549,15 @@ async fn host_context_gates_agent_job_tools() {
         TypedToolClass::OwnTask
     );
 
-    for authorized in [false, true] {
-        let v2_agent_job = probe(|turn| {
-            set_features(turn, &[Feature::SpawnCsv, Feature::MultiAgentV2]);
-            Arc::make_mut(&mut turn.config)
-                .multi_agent_v2
-                .multi_agent_mode_hint_text = None;
-            turn.multi_agent_spawn_authorized
-                .store(authorized, std::sync::atomic::Ordering::Release);
-        })
-        .await;
-        if authorized {
-            v2_agent_job.assert_visible_contains(&["spawn_agents_on_csv"]);
-            v2_agent_job.assert_registered_contains(&["spawn_agents_on_csv"]);
-        } else {
-            v2_agent_job.assert_visible_lacks(&["spawn_agents_on_csv"]);
-            v2_agent_job.assert_registered_lacks(&["spawn_agents_on_csv"]);
-        }
-    }
+    let v2_agent_job = probe(|turn| {
+        set_features(turn, &[Feature::SpawnCsv, Feature::MultiAgentV2]);
+        Arc::make_mut(&mut turn.config)
+            .multi_agent_v2
+            .multi_agent_mode_hint_text = None;
+    })
+    .await;
+    v2_agent_job.assert_visible_contains(&["spawn_agents_on_csv"]);
+    v2_agent_job.assert_registered_contains(&["spawn_agents_on_csv"]);
     let v2_worker = probe(|turn| {
         set_features(turn, &[Feature::SpawnCsv, Feature::MultiAgentV2]);
         turn.session_source =
@@ -1574,7 +1565,7 @@ async fn host_context_gates_agent_job_tools() {
     })
     .await;
     v2_worker.assert_visible_contains(&["report_agent_job_result"]);
-    v2_worker.assert_registered_lacks(&["spawn_agents_on_csv"]);
+    v2_worker.assert_registered_contains(&["spawn_agents_on_csv"]);
 
     let remote_agent_job = probe(|turn| {
         set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);

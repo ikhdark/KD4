@@ -28,6 +28,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -70,12 +71,14 @@ struct StagedWsMessage {
 struct WsIngressSender {
     tx: mpsc::Sender<StagedWsMessage>,
     queued_bytes: Arc<AtomicUsize>,
+    capacity_released: Arc<Notify>,
     max_queued_bytes: usize,
 }
 
 struct WsIngressReceiver {
     rx: mpsc::Receiver<StagedWsMessage>,
     queued_bytes: Arc<AtomicUsize>,
+    capacity_released: Arc<Notify>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,17 +99,45 @@ fn ws_ingress_channel(
 ) -> (WsIngressSender, WsIngressReceiver) {
     let (tx, rx) = mpsc::channel(capacity);
     let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let capacity_released = Arc::new(Notify::new());
     (
         WsIngressSender {
             tx,
             queued_bytes: Arc::clone(&queued_bytes),
+            capacity_released: Arc::clone(&capacity_released),
             max_queued_bytes,
         },
-        WsIngressReceiver { rx, queued_bytes },
+        WsIngressReceiver { rx, queued_bytes, capacity_released },
     )
 }
 
 impl WsIngressSender {
+    async fn send(&self, message: &Message) -> Result<(), WsIngressSendError> {
+        let payload_bytes = message.len();
+        if payload_bytes > self.max_queued_bytes {
+            return Err(WsIngressSendError::Full);
+        }
+        let permit = self.tx.reserve().await.map_err(|_| WsIngressSendError::Closed)?;
+        loop {
+            // Register before checking the budget to avoid a lost wakeup.
+            let released = self.capacity_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if self.queued_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued.checked_add(payload_bytes).filter(|next| *next <= self.max_queued_bytes)
+            }).is_ok() {
+                // No await after charging the budget: cancellation cannot leak it.
+                permit.send(StagedWsMessage { message: message.clone(), payload_bytes });
+                return Ok(());
+            }
+            tokio::select! {
+                _ = self.tx.closed() => return Err(WsIngressSendError::Closed),
+                _ = released => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn try_send(&self, message: Message) -> Result<(), WsIngressSendError> {
         let payload_bytes = message.len();
         if self
@@ -146,6 +177,7 @@ impl WsIngressReceiver {
         let staged = self.rx.recv().await?;
         self.queued_bytes
             .fetch_sub(staged.payload_bytes, Ordering::AcqRel);
+        self.capacity_released.notify_waiters();
         Some(staged.message)
     }
 
@@ -153,6 +185,7 @@ impl WsIngressReceiver {
         let staged = self.rx.try_recv().ok()?;
         self.queued_bytes
             .fetch_sub(staged.payload_bytes, Ordering::AcqRel);
+        self.capacity_released.notify_waiters();
         Some(staged.message)
     }
 }
@@ -176,6 +209,7 @@ impl WsStream {
         let pump_task = tokio::spawn(async move {
             let mut inner = inner;
             let mut tx_failure = Some(tx_failure);
+            let mut pending_message = None;
             loop {
                 tokio::select! {
                     command = rx_command.recv() => {
@@ -193,7 +227,29 @@ impl WsStream {
                             }
                         }
                     }
-                    message = inner.next() => {
+                    // Pause reads at the ingress bounds, but keep dispatch commands
+                    // runnable: a reused connection sends before draining ingress.
+                    result = async { tx_message.send(pending_message.as_ref().unwrap()).await }, if pending_message.is_some() => {
+                        match result {
+                            Ok(()) => {
+                                if matches!(pending_message.take(), Some(Message::Close(_))) {
+                                    break;
+                                }
+                            }
+                            Err(WsIngressSendError::Full) => {
+                                if let Some(tx_failure) = tx_failure.take() {
+                                    let _ = tx_failure.send(WsIngressFailure::Overflow(
+                                        WsError::Io(std::io::Error::other(
+                                            WEBSOCKET_INGRESS_OVERFLOW_MESSAGE,
+                                        )),
+                                    ));
+                                }
+                                break;
+                            }
+                            Err(WsIngressSendError::Closed) => break,
+                        }
+                    }
+                    message = inner.next(), if pending_message.is_none() => {
                         let Some(message) = message else {
                             break;
                         };
@@ -211,24 +267,7 @@ impl WsStream {
                             | Message::Binary(_)
                             | Message::Close(_)
                             | Message::Frame(_))) => {
-                                let is_close = matches!(message, Message::Close(_));
-                                match tx_message.try_send(message) {
-                                    Ok(()) => {}
-                                    Err(WsIngressSendError::Full) => {
-                                        if let Some(tx_failure) = tx_failure.take() {
-                                            let _ = tx_failure.send(WsIngressFailure::Overflow(
-                                                WsError::Io(std::io::Error::other(
-                                                    WEBSOCKET_INGRESS_OVERFLOW_MESSAGE,
-                                                )),
-                                            ));
-                                        }
-                                        break;
-                                    }
-                                    Err(WsIngressSendError::Closed) => break,
-                                }
-                                if is_close {
-                                    break;
-                                }
+                                pending_message = Some(message);
                             }
                             Err(err) => {
                                 if let Some(tx_failure) = tx_failure.take() {
@@ -1404,6 +1443,107 @@ mod tests {
         byte_tx
             .try_send(Message::Text("cd".into()))
             .expect("byte budget should be released after receive");
+    }
+
+    #[tokio::test]
+    async fn websocket_ingress_backpressure_releases_capacity_and_cancels() {
+        // Exercise item exhaustion and byte exhaustion independently.
+        for (capacity, bytes) in [(1, 1024), (2, 3)] {
+            let (tx, mut rx) = ws_ingress_channel(capacity, bytes);
+            let first = Message::Text("ab".into());
+            let second = Message::Text("cd".into());
+            tx.send(&first).await.unwrap();
+            {
+                let send = tx.send(&second);
+                tokio::pin!(send);
+                assert!(futures::poll!(&mut send).is_pending());
+                assert_eq!(tx.queued_bytes.load(Ordering::Acquire), 2);
+                assert_eq!(rx.recv().await, Some(first.clone()));
+                send.await.unwrap();
+            }
+            assert_eq!(rx.try_recv(), Some(second.clone()));
+            assert_eq!(tx.queued_bytes.load(Ordering::Acquire), 0);
+            tx.send(&first).await.unwrap();
+            {
+                let send = tx.send(&second);
+                tokio::pin!(send);
+                assert!(futures::poll!(&mut send).is_pending());
+                // Dropping a blocked send must release its item reservation.
+            }
+            assert_eq!(rx.recv().await, Some(first.clone()));
+            tx.send(&second).await.unwrap();
+            let send = tx.send(&first);
+            tokio::pin!(send);
+            assert!(futures::poll!(&mut send).is_pending());
+            drop(rx);
+            assert_eq!(send.await, Err(WsIngressSendError::Closed));
+        }
+        let (tx, _rx) = ws_ingress_channel(1, 1);
+        assert_eq!(tx.send(&Message::Text("oversized".into())).await, Err(WsIngressSendError::Full));
+    }
+
+    #[tokio::test]
+    async fn websocket_burst_backpressures_without_blocking_dispatch_or_reuse() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (tx_done, rx_done) = oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let websocket = tokio_tungstenite::accept_async_with_config(socket, Some(websocket_config())).await.unwrap();
+                let (mut sink, mut source) = websocket.split();
+                let burst = async {
+                    for index in 0..5000 {
+                        sink.feed(Message::Text(json!({"type":"response.output_text.delta", "delta": index.to_string()}).to_string().into())).await.unwrap();
+                    }
+                    sink.send(Message::Text(json!({"type":"response.completed", "response":{"id":"burst"}}).to_string().into())).await.unwrap();
+                };
+                let request = async { assert!(matches!(source.next().await, Some(Ok(Message::Text(_))))); };
+                tokio::join!(burst, request);
+                assert!(matches!(source.next().await, Some(Ok(Message::Text(_)))));
+                sink.send(Message::Text(json!({"type":"response.completed", "response":{"id":"reused"}}).to_string().into())).await.unwrap();
+                let _ = rx_done.await;
+            });
+            let factory = HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+            let connected = connect_websocket(Url::parse(&format!("ws://{address}/responses")).unwrap(), HeaderMap::new(), &factory, None).await.unwrap();
+            // Stop consuming until the real socket pump fills its bounded queue.
+            while connected.stream.rx_message.rx.len() < WEBSOCKET_INGRESS_CAPACITY {
+                assert!(!connected.stream.is_closed(), "burst must not retire the socket");
+                tokio::task::yield_now().await;
+            }
+            tokio::task::yield_now().await;
+            let connection = ResponsesWebsocketConnection::new(connected.stream, Duration::from_secs(5), connected.metadata, None);
+            let mut response = connection.stream_request(test_response_request("test"), false, None).await.unwrap();
+            let mut deltas = 0;
+            let mut completed = false;
+            while let Some(event) = response.next().await {
+                match event.unwrap() {
+                    ResponseEvent::OutputTextDelta(delta) => {
+                        assert_eq!(delta, deltas.to_string());
+                        deltas += 1;
+                    }
+                    ResponseEvent::Completed { response_id, .. } => {
+                        assert_eq!(response_id, "burst");
+                        completed = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(deltas, 5000);
+            assert!(completed);
+            assert!(!connection.is_closed().await);
+            let mut response = connection.stream_request(test_response_request("test"), true, None).await.unwrap();
+            let mut completed = false;
+            while let Some(event) = response.next().await {
+                if let ResponseEvent::Completed { response_id, .. } = event.unwrap() {
+                    assert_eq!(response_id, "reused");
+                    completed = true;
+                }
+            }
+            assert!(completed);
+            tx_done.send(()).unwrap();
+            server.await.unwrap();
+        }).await.expect("burst and reused response should finish without a queue deadlock");
     }
 
     #[tokio::test]

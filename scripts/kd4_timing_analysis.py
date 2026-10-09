@@ -43,6 +43,15 @@ _MAX_SLOW_TOOL_CALLS = 8
 
 _MAX_EXCLUSIVE_GATE_CONVOYS = 8
 
+_REQUEST_SETUP_MEASUREMENT_NOTE = (
+    "Setup phases are per-request unions frozen at dispatch, not cumulative turn "
+    "timers. They overlap: do not sum phases or add them to wall-clock, model-wait, "
+    "or orchestration totals. Summaries count each retained request row once, not "
+    "once per physicalAttemptId; same-phase sums across rows are not wall-clock "
+    "unions. Missing/empty maps (older records or undispatched attempts) are "
+    "unavailable, not zero; missing phase names are not imputed."
+)
+
 _TOOL_PHASE_OWNERS = {
     "itemToFirstPollMs": "ToolDispatchQueue",
     "parallelGateWaitMs": "ExclusiveGate",
@@ -64,6 +73,52 @@ def _selected_requests(timing: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(rows, list)
         else []
     )
+
+
+def _request_setup_phases(request: dict[str, Any]) -> dict[str, int] | None:
+    """Preserve recorded phase names and zeros; never reconstruct missing setup."""
+    phases = request.get("setupPhaseNs")
+    if phases is None or phases == {}:
+        return None
+    if not isinstance(phases, dict) or any(
+        not isinstance(name, str)
+        or type(value) is not int
+        or not 0 <= value < 2**64
+        for name, value in phases.items()
+    ):
+        raise ValueError("setupPhaseNs must map phase names to unsigned nanoseconds")
+    return dict(sorted(phases.items()))
+
+
+def _request_setup_report(
+    requests: Iterable[dict[str, Any]], *, retention_complete: bool | None
+) -> dict[str, Any]:
+    request_rows = 0
+    measured_requests = 0
+    summaries: dict[str, dict[str, int]] = {}
+    for request in requests:
+        request_rows += 1
+        phases = _request_setup_phases(request)
+        if phases is None:
+            continue
+        measured_requests += 1
+        for name, value in phases.items():
+            summary = summaries.setdefault(
+                name, {"count": 0, "observedTotalNs": 0, "minNs": value, "maxNs": value}
+            )
+            summary["count"] += 1
+            summary["observedTotalNs"] += value
+            summary["minNs"] = min(summary["minNs"], value)
+            summary["maxNs"] = max(summary["maxNs"], value)
+    return {
+        "available": measured_requests > 0,
+        "requestRows": request_rows,
+        "measuredRequests": measured_requests,
+        "missingRequests": request_rows - measured_requests,
+        "retentionComplete": retention_complete,
+        "phaseSummariesNs": dict(sorted(summaries.items())),
+        "measurementNote": _REQUEST_SETUP_MEASUREMENT_NOTE,
+    }
 
 
 def timing_profile_valid(timing: Any) -> bool:
@@ -1438,6 +1493,9 @@ def _population_report(
             },
         },
         "generationPurposeLatency": _generation_purpose_latency_report(all_requests),
+        "requestSetup": _request_setup_report(
+            all_requests, retention_complete=retention["complete"]
+        ),
         "requestRetention": retention,
         "tokens": tokens,
         "observationalNonprogressTokens": _diagnostic_token_report(
@@ -2034,7 +2092,8 @@ def analyze_runner_evidence(
                 del profiles[key]
     # Preserve legacy labels for unique turn IDs; qualify all labels when threads
     # reuse an ID so compatibility fields cannot silently overwrite a thread.
-    turn_keys = set(profiles) | set(terminal)
+    unfinished_turns = started_turns - set(terminal)
+    turn_keys = set(profiles) | set(terminal) | started_turns
     qualify_turns = len({turn_id for _, turn_id in turn_keys}) != len(turn_keys)
 
     def turn_label(key: tuple[str | None, str]) -> str:
@@ -2095,6 +2154,7 @@ def analyze_runner_evidence(
                 "attemptKind": request.get("attemptKind"),
                 "classification": classification,
                 "modelStreamWaitNs": request.get("modelStreamWaitNs"),
+                "setupPhaseNs": _request_setup_phases(request),
                 "dispatchMs": request.get("dispatchMs"),
                 "completedMs": request.get("completedMs"),
                 "physicalAttemptIds": request.get("physicalAttemptIds", []),
@@ -2195,7 +2255,7 @@ def analyze_runner_evidence(
             "terminalTurns": len(terminal),
             "missingTerminalTurnIds": missing_usage_turns,
             "unfinishedProfileTurnIds": sorted(
-                turn_label(key) for key in (set(profiles) | set(response_only)) - set(terminal)
+                turn_label(key) for key in (set(profiles) | set(response_only) | started_turns) - set(terminal)
             ),
             "timingValidityRequired": False,
         }
@@ -2241,6 +2301,7 @@ def analyze_runner_evidence(
         ),
         available=bool(profiles)
         and set(profiles) == set(terminal)
+        and not unfinished_turns
         and all(
             isinstance(record["timing"].get("toolCalls"), list)
             for record in profiles.values()
@@ -2395,7 +2456,7 @@ def analyze_runner_evidence(
                     for status in terminal.values()
                     if status not in ("completed", "complete")
                 ),
-                "completed" if terminal else "unfinished",
+                "completed" if terminal and not unfinished_turns else "unfinished",
             ),
         ),
         "elapsedMs": evidence.get("elapsedMs"),
@@ -2410,6 +2471,8 @@ def analyze_runner_evidence(
             "validCompleteTimingProfiles": len(valid_profiles),
             "terminalTurns": len(terminal),
             "tokenAnalysisEnabled": include_tokens,
+            "startedTurns": len(started_turns),
+            "unfinishedTurns": len(unfinished_turns),
         },
         "logicalGenerations": runtime.get("logicalGenerations")
         if runtime

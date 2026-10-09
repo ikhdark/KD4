@@ -302,9 +302,18 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         }
     }
 
-    let _ = transport_event_tx
-        .send(TransportEvent::ConnectionClosed { connection_id })
-        .await;
+    // Normal disconnects must reach the processor for per-connection cleanup.
+    // During listener shutdown it may no longer drain ingress: retain an
+    // immediately publishable close, but never hold shutdown behind a full queue.
+    if let Err(mpsc::error::TrySendError::Full(event)) = transport_event_tx
+        .try_send(TransportEvent::ConnectionClosed { connection_id })
+    {
+        tokio::select! {
+            biased;
+            _ = shutdown_token.cancelled() => {}
+            _ = transport_event_tx.send(event) => {}
+        }
+    }
 }
 
 pub(crate) enum IncomingWebSocketMessage<'a> {
@@ -1282,6 +1291,58 @@ mod tests {
         })
         .await
         .expect("close flush must be bounded without listener cancellation");
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_retires_multiple_connections_with_full_ingress() {
+        timeout(Duration::from_secs(3), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (events_tx, mut events_rx) = mpsc::channel(1);
+            let shutdown = CancellationToken::new();
+            let acceptor = start_websocket_acceptor_with_listener(
+                listener,
+                events_tx.clone(),
+                shutdown.clone(),
+                WebsocketAuthPolicy::default(),
+            )
+            .unwrap();
+            let mut clients = Vec::new();
+            let mut writers = Vec::new();
+            for _ in 0..3 {
+                let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/rpc"))
+                    .await
+                    .unwrap();
+                clients.push(client);
+                match events_rx.recv().await.unwrap() {
+                    TransportEvent::ConnectionOpened { writer, .. } => writers.push(writer),
+                    event => panic!("expected registration: {event:?}"),
+                }
+            }
+            events_tx
+                .try_send(TransportEvent::ConnectionClosed {
+                    connection_id: ConnectionId(u64::MAX),
+                })
+                .unwrap();
+            shutdown.cancel();
+            // Keep the receiver alive and full until the listener and every
+            // registered worker have exited. Draining first masks the deadlock.
+            acceptor.await.unwrap();
+            assert!(writers.iter().all(mpsc::Sender::is_closed));
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(TransportEvent::ConnectionClosed {
+                    connection_id: ConnectionId(u64::MAX)
+                })
+            ));
+            drop(events_tx);
+            assert!(events_rx.recv().await.is_none());
+            for mut client in clients {
+                assert!(matches!(client.next().await, None | Some(Err(_))));
+            }
+        })
+        .await
+        .expect("listener shutdown must not wait for an abandoned ingress queue");
     }
 
     #[tokio::test]

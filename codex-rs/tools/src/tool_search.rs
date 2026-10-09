@@ -284,7 +284,13 @@ fn append_activation_description(description: &str, parts: &mut String) {
                 };
                 let pair = word.eq_ignore_ascii_case("not")
                     && (previous.0.eq_ignore_ascii_case("do") || previous.0.eq_ignore_ascii_case("does"));
-                if cutoff == clause.len() && (negative || pair) {
+                // "Does not only read ..." and "doesn't only read ..." affirm
+                // the capability; they do not prohibit it.
+                let not_only = (pair || word.eq_ignore_ascii_case("doesn't")
+                    || word.eq_ignore_ascii_case("don't"))
+                    && clause[offset + piece.len()..].split_whitespace().next()
+                        .is_some_and(|next| next.eq_ignore_ascii_case("only"));
+                if cutoff == clause.len() && (negative || pair) && !not_only {
                     cutoff = if pair { previous.1 } else { offset };
                 }
                 if (first.eq_ignore_ascii_case("to") || first.eq_ignore_ascii_case("use"))

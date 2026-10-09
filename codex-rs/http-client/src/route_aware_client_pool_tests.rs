@@ -198,6 +198,85 @@ async fn forwards_exact_urls_and_caches_clients_by_resolved_route() {
 }
 
 #[tokio::test]
+async fn shared_pool_isolates_concurrent_request_headers_and_cancellation() {
+    let response = |body: &str| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (first_address, first_server) =
+        spawn_response_server(vec![response("first"), response("after-cancel")]);
+    let (second_address, second_server) = spawn_response_server(vec![response("second")]);
+    let pool = manual_redirect_pool();
+    let sibling = pool.clone();
+    let cancelled_pool = pool.clone();
+    let mut cancelled = Box::pin(cancelled_pool.client_for_url_with_resolver(
+        "https://pending.test/responses",
+        |_| std::future::pending::<io::Result<OutboundProxyRoute>>(),
+    ));
+    assert!(futures::poll!(&mut cancelled).is_pending());
+
+    let request = |address, session: &'static str| {
+        let mut request = reqwest::Request::new(
+            Method::POST,
+            format!("http://{address}/responses").parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {session}")).unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("session_id", HeaderValue::from_static(session));
+        *request.body_mut() = Some(session.into());
+        request
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (first, second) = tokio::join!(
+            pool.send_with_resolver(request(first_address, "first"), |_| async {
+                Ok(OutboundProxyRoute::Direct)
+            }),
+            sibling.send_with_resolver(request(second_address, "second"), |_| async {
+                Ok(OutboundProxyRoute::Direct)
+            }),
+        );
+        assert_eq!(first.unwrap().text().await.unwrap(), "first");
+        assert_eq!(second.unwrap().text().await.unwrap(), "second");
+    })
+    .await
+    .expect("one stalled route lookup must not block another session");
+    drop(cancelled);
+    drop(cancelled_pool);
+    assert_eq!(pool.cached_route_count(), 1);
+    assert_eq!(
+        sibling
+            .send_with_resolver(request(first_address, "after-cancel"), |_| async {
+                Ok(OutboundProxyRoute::Direct)
+            })
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "after-cancel"
+    );
+
+    let first_requests = first_server.join().unwrap();
+    let second_requests = second_server.join().unwrap();
+    for (wire, session, other) in [
+        (&first_requests[0], "first", "second"),
+        (&second_requests[0], "second", "first"),
+        (&first_requests[1], "after-cancel", "first"),
+    ] {
+        assert!(wire.contains(&format!("authorization: Bearer {session}\r\n")));
+        assert!(wire.contains(&format!("session_id: {session}\r\n")));
+        assert!(wire.ends_with(&format!("\r\n\r\n{session}")));
+        assert!(!wire.contains(&format!("Bearer {other}\r\n")));
+    }
+}
+
+#[tokio::test]
 async fn reqwest_default_route_preserves_transport_redirects() {
     let (address, server) = spawn_response_server(vec![
         "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

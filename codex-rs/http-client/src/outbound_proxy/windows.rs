@@ -164,22 +164,25 @@ fn resolve_with_winhttp_options(
         lpszProxyBypass: ptr::null_mut(),
     };
     let result = with_shared_winhttp_session(|session| {
-        // SAFETY: the session stays owned for this call, request_url is a live
-        // NUL-terminated UTF-16 buffer, and both output structures are writable.
-        // Any PAC URL referenced by options stays alive in the synchronous caller.
-        let ok = unsafe {
-            WinHttpGetProxyForUrl(
-                session.raw_handle(),
-                request_url.as_ptr(),
-                &mut options,
-                &mut proxy_info,
-            )
-        };
-        if ok == FALSE {
-            Err(last_error())
-        } else {
-            Ok(())
-        }
+        resolve_with_auto_logon_fallback(options.fAutoLogonIfChallenged != FALSE, |auto_logon| {
+            options.fAutoLogonIfChallenged = if auto_logon { TRUE } else { FALSE };
+            // SAFETY: the session stays owned for this call, request_url is a live
+            // NUL-terminated UTF-16 buffer, and both output structures are writable.
+            // Any PAC URL referenced by options stays alive in the synchronous caller.
+            let ok = unsafe {
+                WinHttpGetProxyForUrl(
+                    session.raw_handle(),
+                    request_url.as_ptr(),
+                    &mut options,
+                    &mut proxy_info,
+                )
+            };
+            if ok == FALSE {
+                Err(last_error())
+            } else {
+                Ok(())
+            }
+        })
     });
     if let Err(error) = result {
         return SystemProxyDecision::Unavailable {
@@ -189,6 +192,19 @@ fn resolve_with_winhttp_options(
 
     let proxy_info = ProxyInfo::from_raw(proxy_info);
     proxy_info_decision(&proxy_info, origin)
+}
+
+fn resolve_with_auto_logon_fallback<T>(
+    allow_auto_logon: bool,
+    mut resolve: impl FnMut(bool) -> Result<T, u32>,
+) -> Result<T, u32> {
+    // WinHTTP's out-of-process PAC cache is disabled when auto-logon is enabled.
+    // Try anonymously first, then preserve the caller's authentication policy
+    // only when the PAC server challenges. In particular, WPAD remains anonymous.
+    match resolve(false) {
+        Err(ERROR_WINHTTP_LOGIN_FAILURE) if allow_auto_logon => resolve(true),
+        result => result,
+    }
 }
 
 fn proxy_info_decision(proxy_info: &ProxyInfo, origin: &RequestOrigin) -> SystemProxyDecision {

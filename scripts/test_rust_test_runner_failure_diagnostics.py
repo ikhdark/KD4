@@ -11,6 +11,25 @@ from scripts.test_rust_test_runner import RunnerTestCase
 
 
 class FailureDiagnosticTest(RunnerTestCase):
+    def test_final_output_replay_is_not_execution_evidence(self):
+        execution = "\n".join([
+            "PASS [0.01s] codex-core once",
+            "LEAK [0.01s] codex-core leaked",
+            "FAIL [0.01s] codex-core failed",
+            "PASS [0.01s] codex-core duplicate",
+            "PASS [0.01s] codex-core duplicate",
+        ]) + "\n"
+        text = execution + "Summary [0.1s] 5 tests run: 4 passed, 1 failed\n" + execution
+        expected = [(status, "codex-core", name) for status, name in [
+            ("PASS", "once"), ("LEAK", "leaked"), ("FAIL", "failed"),
+            ("PASS", "duplicate"), ("PASS", "duplicate"),
+        ]]
+        for stream in ("stdout", "stderr"):
+            result, path = self.retained_result(text, stream=stream)
+            before = path.read_bytes()
+            self.assertEqual(list(runner_module._nextest_results(result)), expected)
+            self.assertEqual(path.read_bytes(), before)
+
     def retained_result(self, text, *, stream="stderr"):
         path = self.temp_dir / f"{stream}.log"
         path.write_text(text, encoding="utf-8", newline="")

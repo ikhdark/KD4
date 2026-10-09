@@ -201,6 +201,105 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
     }
 
 
+class RequestSetupReportingTest(unittest.TestCase):
+    def test_setup_survives_full_bounded_text_and_saved_report_paths(self):
+        timing = _timing()
+        timing["schemaVersion"] = 30
+        timing["modelRequests"] = [
+            {"generationIndex": index // 2,
+             "attemptKind": "retry" if index % 2 else "primary",
+             "setupPhaseNs": {"preparation": (index + 1) * 1_000_000,
+                              "history_snapshot": (index + 1) * 1_000_000,
+                              "serialization": 0}}
+            for index in range(25)
+        ]
+        timing["counters"].update(modelRequestCount=25, logicalGenerationCount=13)
+        historical = _timing()
+        historical["schemaVersion"] = 29
+        historical["counters"]["modelRequestCount"] = 2
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            terminal = _event({"type": "task_complete", "turn_id": "modern", "timing": timing})
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "modern"}),
+                terminal, terminal,
+                _event({"type": "task_started", "turn_id": "historical"}),
+                _event({"type": "task_complete", "turn_id": "historical", "timing": historical}),
+            ]), encoding="utf-8")
+            for include_tokens in (True, False):
+                with self.subTest(include_tokens=include_tokens):
+                    report = kd4_turn_latency_audit.analyze_session_path(
+                        path, Path(temp), include_tokens=include_tokens
+                    )
+                    ledger = report["requestLedger"]["requests"]
+                    modern = [row for row in ledger if row["turnId"] == "modern"]
+                    self.assertEqual([row["requestIndex"] for row in modern], list(range(25)))
+                    self.assertEqual([row["setupPhaseNs"] for row in modern],
+                                     [row["setupPhaseNs"] for row in timing["modelRequests"]])
+                    self.assertEqual(modern[1]["attemptKind"], "retry")
+                    self.assertTrue(all(row["setupPhaseNs"] is None for row in ledger
+                                        if row["turnId"] == "historical"))
+                    setup = report["latencyBreakdown"]["orchestration"]["requestSetup"]
+                    self.assertEqual((setup["requestRows"], setup["measuredRequests"], setup["missingRequests"]),
+                                     (27, 25, 2))
+                    self.assertEqual(setup["phaseSummariesNs"]["preparation"],
+                                     {"count": 25, "observedTotalNs": 325_000_000,
+                                      "minNs": 1_000_000, "maxNs": 25_000_000})
+                    self.assertEqual(report["populations"]["all"]["requestSetup"], setup)
+                    self.assertEqual(report["runnerDiagnostics"]["runtime"]["requestSetup"], setup)
+                    by_turn = {turn["turnId"]: turn for turn in report["perTurn"]}
+                    self.assertEqual(by_turn["modern"]["requestSetup"]["measuredRequests"], 25)
+                    self.assertFalse(by_turn["historical"]["requestSetup"]["available"])
+                    self.assertEqual(report["latencyBreakdown"]["orchestration"]["exclusiveTotalNs"], 200_000_000)
+                    self.assertEqual(report["latencyBreakdown"]["modelInference"]["exclusiveTotalNs"], 1_200_000_000)
+                    before = json.dumps(report, sort_keys=True)
+                    for limit in (kd4_turn_latency_audit._MAX_SUMMARY_BYTES, 1):
+                        with mock.patch.object(kd4_turn_latency_audit, "_MAX_SUMMARY_BYTES", limit):
+                            bounded = kd4_turn_latency_audit.bounded_summary(report)
+                        self.assertEqual(bounded["latencyBreakdown"]["orchestration"]["requestSetup"], setup)
+                    self.assertEqual(json.dumps(report, sort_keys=True), before)
+                    rendered = kd4_turn_latency_audit.render_report(report)
+                    for expected in ("setup (overlapping)", "serialization=0.000ms",
+                                     "observed-sum=325.000ms", "do not sum phases", "requests omitted"):
+                        self.assertIn(expected, rendered)
+                    saved = Path(temp) / "report.json"
+                    saved.write_text(before, encoding="utf-8")
+                    for output_flag in ("--json", "--summary-json"):
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                            status = kd4_turn_latency_audit.main(["--from-report", str(saved), output_flag])
+                        self.assertEqual(status, 0)
+                        replay = json.loads(output.getvalue())
+                        self.assertEqual(replay["latencyBreakdown"]["orchestration"]["requestSetup"], setup)
+
+    def test_older_rollouts_and_saved_reports_do_not_require_setup_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "legacy"}),
+                _event({"type": "task_complete", "turn_id": "legacy", "timing": _timing()}),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        self.assertIn("setup durations unavailable", kd4_turn_latency_audit.render_report(report))
+        self.assertEqual(report["latencyBreakdown"]["orchestration"]["requestSetup"]["missingRequests"], 2)
+        bounded = kd4_turn_latency_audit.bounded_summary(report)
+        self.assertNotIn("requestSetup", bounded["latencyBreakdown"]["orchestration"])
+        self.assertEqual(len(bounded["perTurn"]), 1)
+        # Simulate saved JSON from before setup reporting existed, with the same schema.
+        report["latencyBreakdown"]["orchestration"].pop("requestSetup")
+        for row in report["requestLedger"]["requests"]:
+            row.pop("setupPhaseNs")
+        for turn in report["perTurn"]:
+            turn.pop("requestSetup")
+        for population in report["populations"].values():
+            population.pop("requestSetup")
+        self.assertIn("setup (overlapping)=[unavailable]", kd4_turn_latency_audit.render_report(report))
+        bounded = kd4_turn_latency_audit.bounded_summary(report)
+        self.assertNotIn("requestSetup", bounded["latencyBreakdown"]["orchestration"])
+
+
 class CompactionLatencyTest(unittest.TestCase):
     def test_summary_requests_are_separate_in_full_bounded_and_text_reports(self):
         timing = _timing()

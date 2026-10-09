@@ -1349,7 +1349,7 @@ async fn regular_turn_bounds_unfinished_startup_prewarm_handoff() {
     let (mut startup_prewarm_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        Ok(Some(test_model_client_session()))
     });
 
     sess.set_session_startup_prewarm(
@@ -1409,7 +1409,7 @@ async fn unfinished_startup_prewarm_falls_back_immediately() {
         release_rx
             .recv()
             .expect("startup prewarm test should release blocked task");
-        let result = Ok(test_model_client_session());
+        let result = Ok(Some(test_model_client_session()));
         let _ = completed_tx.send(());
         result
     });
@@ -1451,7 +1451,7 @@ async fn unfinished_startup_prewarm_falls_back_immediately() {
 #[tokio::test]
 async fn completed_startup_prewarm_is_reused() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-    let handle = tokio::spawn(async { Ok(test_model_client_session()) });
+    let handle = tokio::spawn(async { Ok(Some(test_model_client_session())) });
     while !handle.is_finished() {
         tokio::task::yield_now().await;
     }
@@ -1514,7 +1514,7 @@ async fn startup_prewarm_completing_after_handoff_is_not_awaited() {
     // Held open past the handoff, so readiness cannot depend on scheduler timing.
     let handle = tokio::spawn(async {
         std::future::pending::<()>().await;
-        Ok(test_model_client_session())
+        Ok(Some(test_model_client_session()))
     });
     sess.set_session_startup_prewarm(
         crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
@@ -1580,7 +1580,7 @@ async fn interrupting_regular_turn_after_startup_prewarm_fallback_emits_turn_abo
     let (mut startup_prewarm_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        Ok(Some(test_model_client_session()))
     });
 
     sess.set_session_startup_prewarm(
@@ -11825,9 +11825,6 @@ async fn make_multi_agent_v2_usage_hint_test_session(
         },
     )
     .await;
-    turn_context
-        .multi_agent_spawn_authorized
-        .store(true, std::sync::atomic::Ordering::Release);
     (session, turn_context)
 }
 
@@ -13462,11 +13459,11 @@ async fn desktop_and_skill_prefixes_stay_stable_across_task_changes() {
 }
 
 #[tokio::test]
-async fn build_initial_context_omits_multi_agent_usage_hint_when_prohibited() {
-    let (session, turn_context) = make_multi_agent_v2_usage_hint_test_session(true).await;
-    turn_context
-        .multi_agent_spawn_authorized
-        .store(false, std::sync::atomic::Ordering::Release);
+async fn build_initial_context_omits_multi_agent_usage_hint_when_disabled() {
+    let (session, mut turn_context) = make_multi_agent_v2_usage_hint_test_session(true).await;
+    Arc::get_mut(&mut turn_context)
+        .expect("unique turn context")
+        .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::Disabled;
     let initial = build_initial_context(&session, &turn_context).await;
     assert!(multi_agent_usage_hint_payloads(&initial).is_empty());
     // A fresh context never sent the hint, so it must not carry a retraction.
@@ -17512,87 +17509,7 @@ async fn steer_input_rejects_non_regular_turns() {
     }
 }
 
-#[tokio::test]
-async fn steer_input_revokes_spawn_authorization_with_contracted_denial() {
-    let (sess, mut tc, _rx) = make_session_and_context_with_rx().await;
-    Arc::get_mut(&mut tc)
-        .expect("unique turn context")
-        .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: true,
-        },
-    )
-    .await;
 
-    for (text, expected_authorized) in [
-        ("'Use subagents'", false),
-        ("Use subagents to inspect the user's code", true),
-        ("Don't use subagents", false),
-    ] {
-        sess.steer_input(
-            vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-            Some(&tc.sub_id),
-            None,
-            None,
-        )
-        .await
-        .expect("steering should be accepted");
-        if text.starts_with("Use subagents") {
-            assert!(!super::multi_agents::spawn_is_authorized(&tc), "queue admission is not prompt-hook acceptance");
-            tc.update_multi_agent_spawn_authorization(&[UserInput::Text { text: text.to_string(), text_elements: Vec::new() }]);
-        }
-        assert_eq!(
-            super::multi_agents::spawn_is_authorized(&tc),
-            expected_authorized,
-            "{text:?}"
-        );
-    }
-
-    let error = crate::tools::handlers::multi_agents_v2::SpawnAgentHandler::default()
-        .handle(ToolInvocation {
-            session: Arc::clone(&sess),
-            step_context: StepContext::for_test(Arc::clone(&tc)),
-            cancellation_token: CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
-            call_id: "revoked-spawn".to_string(),
-            tool_name: codex_tools::ToolName::plain("spawn_agent"),
-            source: ToolCallSource::Direct,
-            payload: ToolPayload::Function {
-                arguments: json!({
-                    "message": "inspect this repo",
-                    "task_name": "revoked"
-                })
-                .to_string(),
-            },
-        })
-        .await
-        .err()
-        .expect("spawn must be rejected after the user's denial");
-    assert_eq!(
-        error,
-        FunctionCallError::RespondToModel(
-            "spawn_agent: spawning is not authorized for this turn. Explicit-request-only permission is checked per turn; an earlier turn's authorization is not carried forward."
-                .to_string(),
-        )
-    );
-    assert!(!sess.services.agent_control.has_live_agents());
-    assert!(
-        !sess
-            .services
-            .agent_control
-            .task_coordinator()
-            .has_bindings()
-    );
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-}
 
 #[tokio::test]
 #[expect(
@@ -17644,11 +17561,6 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
         )
         .await
         .expect("baseline steering should be accepted");
-        assert!(!super::multi_agents::spawn_is_authorized(&tc));
-        tc.update_multi_agent_spawn_authorization(&[UserInput::Text {
-            text: "Use subagents to inspect the user's code".to_string(), text_elements: Vec::new(),
-        }]);
-        assert!(super::multi_agents::spawn_is_authorized(&tc));
         let baseline_input = sess.input_queue.get_pending_input(&sess.active_turn).await;
         assert_eq!(baseline_input.len(), 2, "baseline context and user input");
         let context_before = sess.state.lock().await.additional_context.clone();
@@ -17744,7 +17656,6 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
                 }
             ));
         }
-        assert!(super::multi_agents::spawn_is_authorized(&tc));
         assert_eq!(sess.state.lock().await.additional_context, context_before);
         assert_eq!(metadata(), baseline_metadata);
         assert!(
@@ -17779,7 +17690,6 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
             .await
             .expect("small steering should commit after either failed attempt");
         assert_eq!(turn_id, tc.sub_id);
-        assert!(!super::multi_agents::spawn_is_authorized(&tc));
         assert_eq!(metadata(), candidate_metadata);
         assert!(activity.has_changed().unwrap());
         assert_eq!(*activity.borrow_and_update(), InputQueueActivity::Steer);

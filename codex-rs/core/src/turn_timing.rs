@@ -64,7 +64,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-pub(crate) const TIMING_SCHEMA_VERSION: u16 = 30;
+pub(crate) const TIMING_SCHEMA_VERSION: u16 = 31;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -1433,6 +1433,21 @@ impl ActiveSet {
         self.model > 0 || self.tool > 0 || self.retry > 0 || self.standalone > 0
     }
 
+    /// A request wait opens before the client prepares its physical attempt.
+    /// Transport readiness closes at dispatch-ready, so a request wait it
+    /// overlaps is client-side setup the provider has not received yet.
+    fn provider_request_wait(self) -> bool {
+        self.model_request_wait > 0 && self.transport_readiness == 0
+    }
+
+    /// Model time the provider can be serving. Validation still counts
+    /// pre-dispatch request setup as explicit machine activity.
+    fn provider_model_active(self) -> bool {
+        self.provider_request_wait()
+            || self.model_stream_wait > 0
+            || self.model_stream_processing > 0
+    }
+
     fn is_supported(self) -> bool {
         if self.finalizing {
             return !self.has_explicit_machine_activity() && self.interactive == 0;
@@ -1464,10 +1479,11 @@ impl ActiveSet {
         if self.finalizing {
             return ExclusivePhase::Finalization;
         }
-        if self.model > 0 && self.tool > 0 {
+        let model = self.provider_model_active();
+        if model && self.tool > 0 {
             return ExclusivePhase::ModelToolOverlap;
         }
-        if self.model > 0 {
+        if model {
             return ExclusivePhase::ModelOnly;
         }
         if self.tool > 0 {
@@ -1760,6 +1776,24 @@ impl TurnTimingState {
     ) {
         self.finish_checkout_snapshot();
         let hash = format!("{:x}", Sha256::digest(bytes));
+        let mut state = self.state();
+        if let Some(request) = state.model_requests.iter_mut().find(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && request.physical_attempt_ids.iter().any(|id| id == physical_attempt_id)
+        }) {
+            request.request_sha256_by_attempt.insert(physical_attempt_id.to_owned(), hash);
+        }
+    }
+
+    /// Optional canonical section hashes belong to the existing blocking
+    /// diagnostics worker, not the dispatch callback. Keep the wire-byte hash
+    /// above available even when that worker is cancelled or fails.
+    pub(crate) fn record_model_request_sections(
+        &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
+        bytes: &[u8],
+    ) {
         let sections = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(bytes)
             .ok()
             .map(|fields| fields.into_iter().map(|(key, value)| {
@@ -1770,11 +1804,11 @@ impl TurnTimingState {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
                 && request.physical_attempt_ids.iter().any(|id| id == physical_attempt_id)
         }) {
-            request.request_sha256_by_attempt.insert(physical_attempt_id.to_owned(), hash);
             if let Some(sections) = sections {
                 request.request_section_sha256_by_attempt.insert(physical_attempt_id.to_owned(), sections);
             }
         }
+        state.refresh_completed_request_diagnostics();
     }
 
     pub(crate) fn record_model_response_id(&self, attempt_id: &str, response_id: &str) {
@@ -3387,8 +3421,15 @@ impl TurnTimingState {
         self.begin_guard(GuardKind::ModelStreamWait)
     }
 
-    pub(crate) fn begin_model_stream_processing(self: &Arc<Self>) -> TurnTimingGuard {
-        self.begin_guard(GuardKind::ModelStreamProcessing)
+    pub(crate) fn begin_model_stream_processing(
+        self: &Arc<Self>,
+        event: &ResponseEvent,
+    ) -> Option<TurnTimingGuard> {
+        // Once Completed arrives, token accounting, history updates, and output
+        // flushing are client bookkeeping, not work overlapping the provider.
+        // Keep concurrent tools in their own bucket rather than finalizing.
+        (!matches!(event, ResponseEvent::Completed { .. }))
+            .then(|| self.begin_guard(GuardKind::ModelStreamProcessing))
     }
 
     pub(crate) fn begin_tool_execution(self: &Arc<Self>) -> TurnTimingGuard {
@@ -4016,14 +4057,14 @@ impl TurnTimingStateInner {
     }
 
     fn add_unions(&mut self, elapsed_ns: u128) {
-        if self.activity.model > 0 {
+        if self.activity.provider_model_active() {
             add_saturating(
                 &mut self.unions.model_active_ns,
                 elapsed_ns,
                 &mut self.counters.saturation_count,
             );
         }
-        if self.activity.model_request_wait > 0 {
+        if self.activity.provider_request_wait() {
             add_saturating(
                 &mut self.unions.model_request_wait_ns,
                 elapsed_ns,
@@ -4232,6 +4273,8 @@ impl TurnTimingStateInner {
                     current.sampling_request_id == request.sampling_request_id
                         && current.physical_attempt_ids == request.physical_attempt_ids
                 }) {
+                    request.request_section_sha256_by_attempt =
+                        current.request_section_sha256_by_attempt.clone();
                     request.request_token_categories = current.request_token_categories.clone();
                     request.request_diagnostics_status = current.request_diagnostics_status;
                     request.fixed_prefix_reuse_eligible = current.fixed_prefix_reuse_eligible;

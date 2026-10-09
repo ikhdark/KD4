@@ -468,6 +468,12 @@ impl RequestSerializationQueues {
             let retained_bytes = queues.ordered_bytes();
             cancelled_bytes =
                 cancelled_bytes.saturating_add(previous_bytes.saturating_sub(retained_bytes));
+            if previous_control_len != queues.control_len() || previous_len != queues.ordered_len() {
+                // Removing a queued writer can admit readers while an earlier
+                // read is still running. Wake the existing drain rather than
+                // waiting for that unrelated read or another enqueue to finish.
+                queues.changed.notify_one();
+            }
         }
         state.total_queued -= cancelled;
         state.total_control -= cancelled_control;
@@ -520,6 +526,10 @@ impl RequestSerializationQueues {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "idle_scheduling_tests.rs"]
+mod idle_scheduling_tests;
 
 #[cfg(test)]
 mod tests {

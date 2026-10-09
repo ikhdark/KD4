@@ -974,6 +974,14 @@ impl UnifiedExecProcess {
             }
         });
 
+        // Only sandboxed launches need an early denial check before returning
+        // to the orchestrator. Ordinary commands are observed by the manager's
+        // output/deadline wait; spending another grace period here delays Begin
+        // and starts that deadline late for every long-running local command.
+        if sandbox_type == SandboxType::None {
+            return Ok(managed);
+        }
+
         match tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, async {
             state_rx
                 .wait_for(|state| state.has_exited)

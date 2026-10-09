@@ -6,6 +6,53 @@ use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_CONNECTION_ERROR;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_NAME_NOT_RESOLVED;
 
 #[test]
+fn pac_resolution_prefers_cacheable_anonymous_lookup() {
+    for allow_auto_logon in [false, true] {
+        let mut attempts = Vec::new();
+        let result = resolve_with_auto_logon_fallback(allow_auto_logon, |auto_logon| {
+            attempts.push(auto_logon);
+            Ok("proxy.example:8080")
+        });
+        assert_eq!(result, Ok("proxy.example:8080"));
+        assert_eq!(attempts, [false]);
+    }
+}
+
+#[test]
+fn pac_resolution_retries_only_an_allowed_authentication_challenge() {
+    for first_error in [
+        ERROR_WINHTTP_LOGIN_FAILURE,
+        ERROR_WINHTTP_TIMEOUT,
+        ERROR_WINHTTP_SECURE_FAILURE,
+    ] {
+        for allow_auto_logon in [false, true] {
+            for retry_result in [
+                Ok(()),
+                Err(ERROR_WINHTTP_LOGIN_FAILURE),
+                Err(ERROR_WINHTTP_TIMEOUT),
+            ] {
+                let mut attempts = Vec::new();
+                let result = resolve_with_auto_logon_fallback(allow_auto_logon, |auto_logon| {
+                    attempts.push(auto_logon);
+                    if auto_logon {
+                        retry_result
+                    } else {
+                        Err(first_error)
+                    }
+                });
+                if allow_auto_logon && first_error == ERROR_WINHTTP_LOGIN_FAILURE {
+                    assert_eq!(attempts, [false, true]);
+                    assert_eq!(result, retry_result);
+                } else {
+                    assert_eq!(attempts, [false]);
+                    assert_eq!(result, Err(first_error));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn winhttp_session_is_reused() {
     let first = with_shared_winhttp_session(|session| Ok(session.0))
         .expect("open the shared WinHTTP session");

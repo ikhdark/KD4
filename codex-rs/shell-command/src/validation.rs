@@ -126,6 +126,15 @@ pub fn standalone_argv(script: &str) -> Option<Vec<String>> {
     shlex::split(commands[0])
 }
 
+/// Preserve PowerShell literal arguments instead of applying POSIX escaping.
+/// Reuse the syntax owner's single-command proof: pipelines, redirections,
+/// expressions and compound scripts cannot authenticate a runner receipt.
+pub fn standalone_powershell_argv(script: &str) -> Option<Vec<String>> {
+    crate::command_safety::try_parse_powershell_ast_analysis("pwsh", script)?
+        .direct_argv
+        .map(|candidate| candidate.argv)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationClassification {
     NonValidation,
@@ -1247,6 +1256,52 @@ mod tests {
         ).unwrap();
         let runners: Vec<RepositoryRunner> = serde_json::from_value(config["runners"].clone()).unwrap();
         classify_argv_with_runners(program, &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>(), &runners)
+    }
+
+    #[test]
+    fn repository_bytecode_flag_preserves_trusted_validation() {
+        let config: serde_json::Value = serde_json::from_str(include_str!("../../../.codex/test-runners.json")).unwrap();
+        let runners: Vec<RepositoryRunner> = serde_json::from_value(config["runners"].clone()).unwrap();
+        for subcommand in ["run-target", "run-gate"] {
+            let baseline = repository_argv("python", &["scripts/rust_test_runner.py", subcommand, "example"]);
+            for flags in [vec!["-B"], vec!["-I", "-B", "-u"]] {
+                let mut args = flags;
+                args.extend(["scripts/rust_test_runner.py", subcommand, "example"]);
+                assert_eq!(repository_argv("python", &args), baseline);
+                assert!(runners.iter().any(|runner| runner.receipt_runner.as_deref() == Some("rust_test_runner")
+                    && runner.matches("python", &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>())));
+            }
+        }
+        assert!(is_validation(&repository_argv("python", &[
+            "-B", "scripts/rust_build_status.py", "run-lane", "--", "cargo", "test",
+        ])));
+        assert!(!is_validation(&repository_argv("python", &[
+            "-B", "scripts/rust_test_runner.py", "run-target", "--help",
+        ])));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_receipt_argv_preserves_paths_and_rejects_output_substitution() {
+        for (script, path) in [
+            (r"python -B scripts\rust_test_runner.py run-target core_lib", r"scripts\rust_test_runner.py"),
+            (r"python -B 'C:\work tree\runner''s.py' run-target core_lib", r"C:\work tree\runner's.py"),
+        ] {
+            assert_eq!(standalone_powershell_argv(script), Some(
+                ["python", "-B", path, "run-target", "core_lib"].map(str::to_string).to_vec()
+            ));
+        }
+        for script in [
+            "python scripts/runner.py; Write-Output receipt",
+            "python scripts/runner.py | Write-Output receipt",
+            "python scripts/runner.py > receipt.json",
+            "python scripts/runner.py 2>&1",
+            "python $runner run-target core_lib",
+            "python $(Write-Output scripts/runner.py)",
+            "& $runner run-target core_lib",
+        ] {
+            assert!(standalone_powershell_argv(script).is_none(), "{script}");
+        }
     }
 
     #[test]

@@ -1858,6 +1858,7 @@ impl Session {
                 )
                 .await
                 .with_workspace_cache(Arc::clone(&git_workspace));
+            let shared_model_http_clients = agent_control.model_http_clients();
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via
@@ -1934,7 +1935,8 @@ impl Session {
                         .enabled(Feature::ConcurrentReasoningSummaries),
                     attestation_provider,
                     config.http_client_factory(),
-                ),
+                )
+                .with_shared_http_clients(shared_model_http_clients.as_deref()),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::clone(
                     &code_mode_session_provider,
                 )).with_recovery_path(config.codex_home.join("code-mode-state").join(format!("{thread_id}.json"))),

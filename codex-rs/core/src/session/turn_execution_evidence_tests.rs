@@ -613,7 +613,7 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
         json!({"path":path.with_file_name("other.txt"),"offset":2,"limit":1}),
         json!({"path":path,"selectors":[{"kind":"search","query":"second"}]}),
     ] {
-        if default_read && (args.get("offset") == Some(&json!(1)) || args.get("selectors").is_some()) {
+        if raw["file_complete"] == true && (args.get("offset") == Some(&json!(1)) || args.get("selectors").is_some()) {
             // A full source can prove EOF-clamped lines and complete searches.
             assert!(collector.register_deterministic_tool_call(
                 &ToolName::plain("read_file"),

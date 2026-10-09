@@ -15,6 +15,7 @@ use super::REQUEST_SCHEMA_CACHE_CAPACITY;
 use super::RequestSchemaCacheKey;
 use super::RequestSchemaCacheValue;
 use super::RequestSchemaSerializationCache;
+use super::SharedModelHttpClients;
 use super::StreamThroughputCollapse;
 use super::UnauthorizedRecoveryExecution;
 use super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION;
@@ -93,6 +94,8 @@ use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
 use codex_utils_output_truncation::approx_token_count;
 use futures::StreamExt;
+use http::HeaderMap;
+use http::HeaderValue;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -427,6 +430,97 @@ async fn model_http_transport_pool_reuses_client_across_api_endpoints() {
         .await
         .expect("different endpoint on the same route should reuse the client");
 
+    assert_eq!(client.state.http_clients.cached_route_count(), 1);
+}
+
+#[tokio::test]
+async fn model_http_clients_share_transports_without_sharing_conversations() {
+    let shared = SharedModelHttpClients::default();
+    let first = test_model_client(SessionSource::Cli).with_shared_http_clients(Some(&shared));
+    let second = test_model_client(SessionSource::Cli).with_shared_http_clients(Some(&shared));
+    assert!(
+        first
+            .state
+            .http_clients
+            .shares_cache_with(&second.state.http_clients)
+    );
+    assert!(!Arc::ptr_eq(&first.state, &second.state));
+    assert_ne!(first.prompt_cache_key(), second.prompt_cache_key());
+    let pool = first.state.http_clients.clone();
+    drop(first);
+    drop(second);
+    let next = test_model_client(SessionSource::Cli).with_shared_http_clients(Some(&shared));
+    assert!(pool.shares_cache_with(&next.state.http_clients));
+    let independent = test_model_client(SessionSource::Cli)
+        .with_shared_http_clients(Some(&SharedModelHttpClients::default()));
+    assert!(!pool.shares_cache_with(&independent.state.http_clients));
+}
+
+#[test]
+fn shared_model_http_clients_isolate_transport_defaults_and_bound_retention() {
+    let shared = SharedModelHttpClients::default();
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+    let headers = HeaderMap::new();
+    let first = shared.pool(&factory, headers.clone());
+    assert!(first.shares_cache_with(&shared.pool(&factory, headers.clone())));
+    let system_proxy = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
+    assert!(!first.shares_cache_with(&shared.pool(&system_proxy, headers.clone())));
+    let cookies = factory
+        .clone()
+        .with_chatgpt_cookies([HeaderValue::from_static("key=value")]);
+    assert!(!first.shares_cache_with(&shared.pool(&cookies, headers.clone())));
+    for index in 0..8 {
+        let mut changed_headers = headers.clone();
+        changed_headers.insert(
+            "originator",
+            HeaderValue::from_str(&format!("client-{index}")).unwrap(),
+        );
+        assert!(!first.shares_cache_with(&shared.pool(&factory, changed_headers)));
+    }
+    assert_eq!(shared.pools.lock().unwrap().len(), 8);
+    assert!(!first.shares_cache_with(&shared.pool(&factory, headers)));
+}
+
+#[tokio::test]
+async fn model_http_transport_preserves_system_proxy_redirect_handoff() {
+    use codex_http_client::HttpTransport;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/routed-responses"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/routed-responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("data: completed\n\n"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut client = test_model_client(SessionSource::Cli);
+    client.http_client_factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
+    Arc::get_mut(&mut client.state).unwrap().http_clients =
+        codex_login::default_client::create_client_pool(
+            client.http_client_factory.clone(),
+            codex_http_client::ClientRouteClass::Api,
+        );
+    let mut setup = client.current_client_setup().await.unwrap();
+    setup.api_provider.base_url = server.uri();
+    for _ in 0..2 {
+        let transport = client.build_api_transport(&setup.api_provider, "responses").await.unwrap();
+        let request = codex_http_client::Request::new(
+            http::Method::POST,
+            setup.api_provider.url_for_path("responses"),
+        );
+        let mut response = transport.stream(request).await.expect("follow the redirect");
+        assert_eq!(response.status, http::StatusCode::OK);
+        let mut body = Vec::new();
+        while let Some(chunk) = response.bytes.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"data: completed\n\n");
+    }
     assert_eq!(client.state.http_clients.cached_route_count(), 1);
 }
 
@@ -1502,6 +1596,8 @@ fn model_request_measurements_agree_on_current_turn_contributions() {
 
 #[tokio::test]
 async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
+    use sha2::Digest;
+
     for use_encoded_bytes in [false, true] {
         let mut memory = history_test_item("remember this", None);
         if let ResponseItem::Message { role, .. } = &mut memory {
@@ -1522,6 +1618,14 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
         let expected_history = serde_json::to_vec(&request.input[1]).unwrap().len() as u64;
         let expected_current = serde_json::to_vec(&request.input[2]).unwrap().len() as u64;
         let encoded = serde_json::to_vec(&request).unwrap();
+        let timing = Arc::new(crate::turn_timing::TurnTimingState::default());
+        timing.mark_turn_started();
+        drop(timing.begin_model_request_wait());
+        timing.record_model_attempt_identity("sections", "attempt");
+        let expected_sections = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&encoded)
+            .unwrap().into_iter().map(|(key, value)| {
+                (key, format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())))
+            }).collect::<BTreeMap<_, _>>();
         let prompt = Prompt {
             input: original.into(),
             prompt_provenance: provenance,
@@ -1540,6 +1644,10 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
             tokio_util::sync::CancellationToken::new(),
             Some(encoded.len() as u64),
             use_encoded_bytes.then(|| encoded.into()),
+            Some((Arc::clone(&timing), super::ResponseAttemptIdentity {
+                sampling_request_id: "sections".into(),
+                physical_attempt_id: "attempt".into(),
+            })),
         )
         .await
         .unwrap();
@@ -1558,6 +1666,13 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
             expected_history
         );
         assert_eq!(result.measurements.current_input_bytes, expected_current);
+        let snapshot = timing.complete_snapshot().protocol_timing();
+        let sections = &snapshot.model_requests[0].request_section_sha256_by_attempt;
+        if use_encoded_bytes {
+            assert_eq!(sections.get("attempt"), Some(&expected_sections));
+        } else {
+            assert!(sections.is_empty(), "never fingerprint an undispatched logical body");
+        }
     }
 }
 
@@ -1585,6 +1700,7 @@ mod request_setting_tests {
             tokio_util::sync::CancellationToken::new(),
             /*logical_request_bytes*/ None,
             encoded,
+            None,
         )
         .await
         .unwrap()
@@ -2364,6 +2480,82 @@ fn websocket_prefix_hash_ignores_internal_metadata_only() {
 
     assert_eq!(first, second);
     assert_ne!(first, visible_change);
+}
+
+fn reference_websocket_prefix_hash(items: &[ResponseItem]) -> CanonicalPrefixHash {
+    use sha2::Digest;
+    let mut prefix = CanonicalPrefixHash::empty();
+    for item in items {
+        let bytes = serde_json::to_vec(&super::normalized_websocket_history_item(item)).unwrap();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(super::WEBSOCKET_HISTORY_HASH_DOMAIN);
+        hasher.update(prefix.digest);
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+        prefix.digest = hasher.finalize().into();
+        prefix.item_count = prefix.item_count.saturating_add(1);
+    }
+    prefix
+}
+
+#[test]
+fn websocket_prefix_hash_scratch_preserves_exact_chain_and_chunk_boundaries() {
+    let items = vec![
+        history_test_item(&"large λ😀\\\"\n".repeat(4096), Some("turn-a")),
+        history_test_item("", None),
+        history_test_tool_output("call", "short after a large buffer"),
+        ResponseItem::AdditionalTools {
+            id: None,
+            role: "developer".into(),
+            tools: vec![serde_json::from_str(r#"{"z":1,"a":{"second":2,"first":1}}"#).unwrap()],
+        },
+    ];
+    let reference = reference_websocket_prefix_hash(&items);
+    assert_eq!(CanonicalPrefixHash::from_items(&items).unwrap(), reference);
+    for boundary in 0..=items.len() {
+        let mut prefix = CanonicalPrefixHash::from_items(&items[..boundary]).unwrap();
+        prefix.extend_items(&items[boundary..]).unwrap();
+        assert_eq!(prefix, reference);
+    }
+    assert_eq!(CanonicalPrefixHash::from_items(&[]).unwrap(), CanonicalPrefixHash::empty());
+}
+
+/// Byte-identical local hashing only, not provider TTFT or turn latency.
+#[test]
+#[ignore = "manual payload preparation benchmark"]
+fn websocket_prefix_hash_serialization_benchmark() {
+    use std::hint::black_box;
+    for (count, bytes) in [(128, 256), (128, 8192), (64, 32768)] {
+        let text = "x".repeat(bytes);
+        let items = (0..count).map(|_| history_test_item(&text, None)).collect::<Vec<_>>();
+        let reference = reference_websocket_prefix_hash(&items);
+        let mut samples = [Vec::new(), Vec::new()];
+        for trial in 0..12 {
+            for variant in [trial % 2, 1 - trial % 2] {
+                let started = std::time::Instant::now();
+                for _ in 0..16 {
+                    let actual = if variant == 0 {
+                        reference_websocket_prefix_hash(black_box(&items))
+                    } else {
+                        CanonicalPrefixHash::from_items(black_box(&items)).unwrap()
+                    };
+                    assert_eq!(black_box(actual), reference);
+                }
+                if trial != 0 {
+                    samples[variant].push(started.elapsed().as_secs_f64() * 1000.0 / 16.0);
+                }
+            }
+        }
+        let medians = samples.clone().map(|mut values| {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        });
+        eprintln!("PAYLOAD_HASH_BENCH {}", json!({
+            "items": count, "text_bytes": count * bytes,
+            "baseline_median_ms": medians[0], "candidate_median_ms": medians[1],
+            "samples_ms": samples, "digest_equivalence": true,
+        }));
+    }
 }
 
 /// A named property and the mutation that changes it on a request under test.
@@ -4739,6 +4931,7 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
                     tool_history_fallback,
                 },
                 cancellation,
+                None,
                 None,
                 None,
             )

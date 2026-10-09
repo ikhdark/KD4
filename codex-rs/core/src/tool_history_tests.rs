@@ -4035,6 +4035,54 @@ fn final_budget_reserves_recovery_before_admitting_untracked_raw_output() {
 }
 
 #[test]
+fn continuation_projection_reuses_unmodified_prepared_storage() {
+    let workspace = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let mut state = ToolHistoryState::default();
+    let mut items: Arc<[ResponseItem]> = Arc::from([]);
+    let mut anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&items),
+        projection: ToolHistoryProjection {
+            items: Arc::clone(&items),
+            unreplaced_items: Arc::clone(&items),
+            ..Default::default()
+        },
+    };
+    for index in 0..3 {
+        let call_id = format!("shared-{index}");
+        state.register_non_workspace_code_mode_call(call_id.clone());
+        let mut extended = items.to_vec();
+        extended.extend([function_call(&call_id), text_output(&call_id, "result".into())]);
+        items = extended.into();
+        let projection = state.project_continuation_with_workspace_cache(
+            &anchor, Arc::clone(&items), None, &workspace,
+        ).unwrap();
+        assert!(Arc::ptr_eq(&projection.items, &items));
+        assert!(Arc::ptr_eq(&projection.unreplaced_items, &items));
+        anchor = SamplingProjectionAnchor { prepared_items: Arc::clone(&items), projection };
+    }
+    let retry = state.project_continuation_with_workspace_cache(
+        &anchor, Arc::clone(&items), None, &workspace,
+    ).unwrap();
+    assert!(Arc::ptr_eq(&retry.items, &items));
+
+    // A distinct primary projection must still be extended, while its unchanged
+    // unreplaced representation can independently reuse the prepared input.
+    let mut projected = items.to_vec();
+    projected[1] = text_output("shared-0", "projected result".into());
+    anchor.projection.items = projected.into();
+    state.register_non_workspace_code_mode_call("last".into());
+    let mut extended = items.to_vec();
+    extended.extend([function_call("last"), text_output("last", "last result".into())]);
+    let extended: Arc<[ResponseItem]> = extended.into();
+    let continued = state.project_continuation_with_workspace_cache(
+        &anchor, Arc::clone(&extended), None, &workspace,
+    ).unwrap();
+    assert!(continued.items.starts_with(&anchor.projection.items));
+    assert!(!Arc::ptr_eq(&continued.items, &extended));
+    assert!(Arc::ptr_eq(&continued.unreplaced_items, &extended));
+}
+
+#[test]
 fn continuation_projection_keeps_the_previous_request_as_a_prefix() {
     let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let workspace = crate::git_workspace::GitWorkspaceCache::new();

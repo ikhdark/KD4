@@ -400,6 +400,42 @@ try {
       }
     } finally { Date.now = savedNow; }
   }
+  // An owner-observed stall stops draining immediately, without killing the
+  // process or losing earlier output. Ordinary quiet packets are not stalls.
+  {
+    const stalled = {...live(""), session_capabilities:{...live().session_capabilities,
+      observation:{reason:"no_output_observed", silent_for_ms:60_000,
+        process_exited:false, termination_requested:false}}};
+    for (const initialStall of [true, false]) {
+      let polls = 0, progressCalls = 0;
+      tools.write_stdin = async args => {
+        check(args.terminate === undefined && args.chars === undefined, "stall changed process lifetime");
+        ++polls;
+        return polls === 1 ? stalled : done;
+      };
+      const stopped = await rejected(() => await_command(initialStall ? stalled : live("completed work"), {
+        on_progress:() => { ++progressCalls; return true; },
+      }));
+      check(stopped.message.includes("reported no output") && polls === (initialStall ? 0 : 1) &&
+        progressCalls === (initialStall ? 0 : 1) && stopped.evidence.terminal === stalled &&
+        stopped.evidence.observations.length === (initialStall ? 1 : 2),
+        "stall notice was ignored or lost its resumable receipt");
+      if (!initialStall) check(stopped.evidence.observations[0].output === "completed work", "lost partial work");
+      // After an explicit decision the caller polls the retained handle, then
+      // passes that fresh observation back. No process creation is involved.
+      tools.write_stdin = async args => {
+        check(args.session_id === stalled.session_id && args.incarnation === "creation-a", "resume changed owner");
+        return done;
+      };
+      const resumed = await tools.write_stdin({session_id:stalled.session_id, incarnation:"creation-a"});
+      check((await await_command(resumed)).terminal === done, "stalled owner could not be resumed");
+    }
+    let polls = 0;
+    tools.write_stdin = async () => { ++polls; return done; };
+    check((await await_command(live(""))).terminal === done && polls === 1, "ordinary silence stopped draining");
+    const exitedTail = {...stalled, execution_state:"exited", process_exited:true, exit_code:0};
+    check((await await_command(exitedTail)).terminal === done && polls === 2, "old stall prevented final output drain");
+  }
   check(await rejected(() => await_command(live(), { max_observations: 0 })) instanceof TypeError,
     "bad command bound accepted");
 } finally {

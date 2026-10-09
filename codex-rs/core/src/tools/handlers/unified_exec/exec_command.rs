@@ -469,8 +469,9 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
-        let validation_analysis = crate::validation::resolve_command_validation(
+        let validation_analysis = crate::validation::resolve_command_validation_with_shell(
             &command_invocation,
+            resolved_command.preflight_shell_type,
             if environment_is_remote { None } else { native_cwd.as_ref().map(|cwd| cwd.as_path()) },
             args.validation.clone(),
         );

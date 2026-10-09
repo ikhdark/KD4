@@ -28,6 +28,29 @@ fn affordance_projection_preserves_contract_and_positive_clauses() {
 }
 
 #[test]
+fn affordance_not_only_keeps_positive_capabilities() {
+    for prefix in ["Does not only", "Do not only", "Doesn't only", "DOES NOT   ONLY"] {
+        let tool = ResponsesApiTool {
+            name: "lookup".into(),
+            description: format!("{prefix} read documents but also search records; do not delete files."),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::default(),
+            output_schema: None,
+        };
+        let info = ToolSearchInfo::from_tool_spec(&ToolSpec::Function(tool.clone()), None).unwrap();
+        for activation in [
+            info.entry.callable_search_text(),
+            ToolSearchEntry::callable_function_search_text(&tool),
+        ] {
+            assert!(activation.contains("read documents"), "{prefix}: {activation}");
+            assert!(activation.contains("search records"), "{prefix}: {activation}");
+            assert!(!activation.contains("delete files"), "{prefix}: {activation}");
+        }
+    }
+}
+
+#[test]
 fn affordance_output_hints_are_bounded_shared_and_retrieval_only() {
     let schema = serde_json::json!({"type":"object", "properties":{
         "continuationToken":{"type":"string", "description":"Never index output prose"}

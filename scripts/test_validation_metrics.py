@@ -223,7 +223,7 @@ class PersistenceTest(unittest.TestCase):
 
 
 class RunnerMetricsTest(RunnerTestCase):
-    def invoke(self, *, outcome="passed", admission_error=None):
+    def invoke(self, *, outcome="passed", admission_error=None, wait_seconds=0):
         instance, _ = self.runner()
         manifest = self.temp_dir / "manifest.toml"
         manifest.write_text("fixture")
@@ -252,7 +252,8 @@ class RunnerMetricsTest(RunnerTestCase):
                 stack.enter_context(mock.patch.object(rust_build_status, "reserve_rust_test_target", side_effect=admission_error))
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
-            code = runner.main(["--manifest", str(manifest), "run-target", "core_all", "-E", "test(one)"])
+            code = runner.main(["--manifest", str(manifest), "--admission-timeout-seconds", str(wait_seconds),
+                                "run-target", "core_all", "-E", "test(one)"])
         reference = next(json.loads(line) for line in stderr.getvalue().splitlines()
                          if line.startswith('{"bytes":') and metrics.REF_KIND in line)
         value = json.loads(Path(reference["path"]).read_text())
@@ -289,10 +290,35 @@ class RunnerMetricsTest(RunnerTestCase):
                 self.assertEqual(value["commands"][0]["outcome"], outcome)
                 self.assertEqual(stdout, "")
         code, value, _ = self.invoke(admission_error=TimeoutError("fixture"))
-        self.assertEqual(code, 2)
-        self.assertEqual(value["outcome"], "timed_out")
+        self.assertEqual(code, 75)
+        self.assertEqual(value["outcome"], "busy")
+        self.assertEqual(value["proof"]["status"], "pending")
         self.assertEqual(value["commands"], [])
         self.assertIsNotNone(value["phases"]["admission"])
+
+    def test_busy_and_expired_wait_preserve_pending_selection_without_execution(self):
+        with rust_build_status.reserve_rust_test_target(self.target_dir):
+            for wait in (0, .02):
+                with self.subTest(wait=wait):
+                    code, value, stdout = self.invoke(wait_seconds=wait)
+                    self.assertEqual(code, 75)
+                    self.assertEqual(stdout, "")  # No successful execution receipt.
+                    self.assertEqual(value["commands"], [])
+                    self.assertEqual(value["outcome"], "busy")
+                    self.assertEqual(value["proof"]["status"], "pending")
+                    self.assertEqual(value["proof"]["obligations"], ["core_all"])
+                    self.assertEqual(value["proof"]["completed_tests"], {})
+                    status = value["admission"]
+                    self.assertEqual(status["selected_targets"], ["core_all"])
+                    self.assertEqual(status["invocation"][-4:], ["run-target", "core_all", "-E", "test(one)"])
+                    for flag in ("executed", "queued", "automatic_retry", "automatic_resume"):
+                        self.assertIs(status[flag], False)
+                    self.assertEqual(metrics.summarize([value])["launches_producing_current_proof"], 0)
+            self.assertTrue(rust_build_status.cargo_lock_is_busy(self.target_dir))
+        # A later explicit invocation executes once; nothing ran in the background.
+        code, value, _ = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(value["commands"]), 1)
 
     def test_default_executor_reports_wait_and_cleanup_on_success_and_timeout(self):
         for timeout in (False, True):

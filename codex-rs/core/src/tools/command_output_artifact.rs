@@ -2760,6 +2760,28 @@ pub(super) async fn create_canonical_output_artifact_with_id(
     canonical: &CanonicalToolResult,
     id: ToolOutputArtifactId,
 ) -> CanonicalOutputArtifact {
+    create_canonical_output_artifact_inner(codex_home, thread_id, canonical, id, false).await
+}
+
+/// New history artifacts are protected in their creation transaction. Existing
+/// artifacts still require independent on-disk verification before protection.
+pub(crate) async fn create_tool_history_output_artifact(
+    codex_home: &Path,
+    thread_id: &str,
+    canonical: &CanonicalToolResult,
+) -> CanonicalOutputArtifact {
+    create_canonical_output_artifact_inner(
+        codex_home, thread_id, canonical, ToolOutputArtifactId::new(), true,
+    ).await
+}
+
+async fn create_canonical_output_artifact_inner(
+    codex_home: &Path,
+    thread_id: &str,
+    canonical: &CanonicalToolResult,
+    id: ToolOutputArtifactId,
+    protect_history: bool,
+) -> CanonicalOutputArtifact {
     let codex_home = codex_home.to_path_buf();
     let thread_id = thread_id.to_string();
     let exact_bytes = canonical.exact_bytes;
@@ -2795,7 +2817,7 @@ pub(super) async fn create_canonical_output_artifact_with_id(
             }
         };
         tokio::task::spawn_blocking(move || {
-            commit_create_canonical_output_artifact(staged, process_permit)
+            commit_create_canonical_output_artifact(staged, process_permit, protect_history)
         })
         .await
     })
@@ -2861,6 +2883,7 @@ fn stage_create_canonical_output_artifact(
 fn commit_create_canonical_output_artifact(
     staged: StagedCanonicalOutput,
     process_permit: OwnedSemaphorePermit,
+    protect_history: bool,
 ) -> CanonicalOutputArtifact {
     let StagedCanonicalOutput {
         directory,
@@ -2980,6 +3003,29 @@ fn commit_create_canonical_output_artifact(
             error: Some(format!("failed to write artifact metadata: {err}")),
         };
     }
+    // The installed segments are the bytes this worker just wrote and synced.
+    // Do not reacquire the global lock and read/hash them again for protection.
+    // Publish the marker only for a complete, internally consistent receipt.
+    if protect_history {
+        let protection = if complete && unavailable_ranges.is_empty()
+            && metadata.retained_sha256.as_deref() == Some(canonical.sha256.as_str())
+        {
+            create_new_protection_marker(
+                &active_tool_history_protection_path(&path),
+                ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+            )
+        } else {
+            Err(std::io::Error::other("history artifact is incomplete or has an invalid digest"))
+        };
+        if let Err(err) = protection {
+            rollback_logical_artifact_creation(&retention_token, &path);
+            return CanonicalOutputArtifact {
+                id: Some(id), retained_bytes: 0, complete: false,
+                unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
+                error: Some(format!("failed to protect new history artifact: {err}")),
+            };
+        }
+    }
     if let Err(err) = finish_logical_artifact_transaction(&path) {
         reject_stale_delta(&retention_token);
         return CanonicalOutputArtifact {
@@ -2990,7 +3036,10 @@ fn commit_create_canonical_output_artifact(
             error: Some(format!("failed to commit artifact transaction: {err}")),
         };
     }
-    match artifact_retention_record_blocking(&path) {
+    // Segment and sidecar sizes are known from this transaction; a directory
+    // scan would only rediscover them while holding the machine-wide lock.
+    let disk_bytes = retained_bytes.saturating_add(metadata_bytes.len() as u64);
+    match artifact_retention_record_with_bytes_blocking(&path, disk_bytes) {
         Ok(Some(record)) => {
             publish_known_record(&retention_token, record, LogicalRetentionMutation::Create)
         }

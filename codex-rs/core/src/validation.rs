@@ -307,22 +307,46 @@ fn classify_with_runners(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn resolve_command_validation(
     invocation: &CommandInvocation,
     cwd: Option<&std::path::Path>,
     declared: Option<codex_protocol::validation::ValidationCommandContext>,
 ) -> Option<CommandValidation> {
-    let invocation = invocation.clone();
+    resolve_command_validation_with_shell(invocation, None, cwd, declared).await
+}
+
+pub(crate) async fn resolve_command_validation_with_shell(
+    invocation: &CommandInvocation,
+    shell_type: Option<crate::shell::ShellType>,
+    cwd: Option<&std::path::Path>,
+    declared: Option<codex_protocol::validation::ValidationCommandContext>,
+) -> Option<CommandValidation> {
+    let invocation = match invocation {
+        CommandInvocation::Script(script) if shell_type == Some(crate::shell::ShellType::PowerShell) =>
+            CommandInvocation::PowerShellScript(script.clone()),
+        _ => invocation.clone(),
+    };
     let cwd = cwd.map(std::path::Path::to_path_buf);
     crate::tools::run_blocking_command_analysis(move || {
         let runners = cwd.as_deref().map(repository_runners).unwrap_or_default();
-        let classification = classify_with_runners(&invocation, &runners);
         let argv = match &invocation {
             CommandInvocation::Argv { program, args } => Some(
                 std::iter::once(program.clone()).chain(args.iter().cloned()).collect::<Vec<_>>()
             ),
-            CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) =>
+            CommandInvocation::Script(script) =>
                 codex_shell_command::validation::standalone_argv(script),
+            CommandInvocation::PowerShellScript(script) =>
+                codex_shell_command::validation::standalone_powershell_argv(script),
+        };
+        // Classification and receipt matching must describe the same literal
+        // PowerShell argv; POSIX shlex removes unquoted Windows backslashes.
+        let classification = if matches!(invocation, CommandInvocation::PowerShellScript(_))
+            && let Some((program, args)) = argv.as_ref().and_then(|argv| argv.split_first())
+        {
+            codex_shell_command::validation::classify_argv_with_runners(program, args, &runners)
+        } else {
+            classify_with_runners(&invocation, &runners)
         };
         let receipt_runner = argv.as_ref().and_then(|argv| argv.split_first())
             .and_then(|(program, args)| runners.iter().find(|runner| runner.matches(program, args)))
@@ -563,6 +587,40 @@ mod tests {
             git(&["add", ".codex/test-runners.json"]);
             git(&["commit", "-m", "second"]);
             assert_eq!(repository_runners(root)[0].operations, vec![ValidationOperation::Lint]);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn powershell_runner_receipts_use_the_selected_shell_and_committed_manifest() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git").arg("-C").arg(root)
+                    .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+                    .args(args).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            };
+            git(&["init"]);
+            std::fs::create_dir(root.join(".codex")).unwrap();
+            std::fs::write(root.join(".codex/test-runners.json"),
+                include_str!("../../../.codex/test-runners.json")).unwrap();
+            git(&["add", ".codex/test-runners.json"]);
+            git(&["commit", "-m", "runner fixture"]);
+            let script = r"python -B scripts\rust_test_runner.py run-target core_lib";
+            for invocation in [CommandInvocation::Script(script.into()), CommandInvocation::PowerShellScript(script.into())] {
+                let validation = resolve_command_validation_with_shell(&invocation,
+                    Some(crate::shell::ShellType::PowerShell), Some(root), None).await.unwrap();
+                assert!(validation.is_test());
+                assert_eq!(validation.receipt_runner.as_deref(), Some("rust_test_runner"));
+            }
+            let posix = resolve_command_validation_with_shell(&CommandInvocation::Script(script.into()),
+                Some(crate::shell::ShellType::Bash), Some(root), None).await;
+            assert!(posix.is_none_or(|validation| validation.receipt_runner.is_none()));
+            for suffix in ["; Write-Output receipt", " | Write-Output receipt", " > receipt.json"] {
+                let validation = resolve_command_validation_with_shell(&CommandInvocation::Script(format!("{script}{suffix}")),
+                    Some(crate::shell::ShellType::PowerShell), Some(root), None).await;
+                assert!(validation.is_none_or(|validation| validation.receipt_runner.is_none()));
+            }
         }
 
         fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {

@@ -254,22 +254,6 @@ fn validated_rebased_compaction_summary(
     if rebased.iter().any(|&index| !populated[index]) {
         return Err(CodexErr::Fatal("compaction omitted a requested refreshed section".into()));
     }
-    if rebased.contains(&3) {
-        // Structural validity alone says nothing about obligation conservation.
-        // Require exact anchors in the existing rebase response, without a
-        // critic call or interpreting model prose as proof of resolution.
-        let mut unresolved = false;
-        for (line, section) in checkpoint_lines(previous) {
-            if let Some(index) = section {
-                unresolved = index == 3;
-            } else if unresolved && !line.trim().is_empty() && !suffix.contains(line.trim()) {
-                return Err(CodexErr::Fatal(format!(
-                    "rebase omitted a prior unresolved anchor; preserve it or quote it with explicit resolution/supersession accounting: {}",
-                    line.trim()
-                )));
-            }
-        }
-    }
     // Text quoted in Next action is not conservation of a Goal/Unresolved
     // anchor. Retain missing anchors without dropping the new state or making
     // a second generation. Next-action-only updates do not need this scan.
@@ -2547,13 +2531,23 @@ fn append_bounded_user_messages(
             anchors -= budget;
             remaining -= budget;
         }
+        // The latest text input must not disappear when it crosses the short
+        // part threshold. Reserve its bounded anchor before older short parts
+        // spend the remaining allowance; trailing image-only inputs do not
+        // displace it. This stays within the existing anchor and total budgets.
+        if let Some(index) = costs.iter().rposition(|(cost, _)| *cost > 0).filter(|index| *index != 0) {
+            let budget = costs[index].0.min(512).min(anchors);
+            budgets[index] = budget;
+            anchors -= budget;
+            remaining -= budget;
+        }
         // Short exact requests/corrections take priority over excerpts of bulk
         // payloads. Keep allocation deterministic and independent of prose.
         let anchor_order = costs.iter().enumerate().skip(1).filter(|(_, (cost, _))| *cost <= 512)
             .chain(costs.iter().enumerate().skip(1).filter(|(_, (cost, _))| *cost > 512));
         for (index, (cost, _)) in anchor_order {
-            let budget = (*cost).min(512).min(anchors);
-            budgets[index] = budget;
+            let budget = (*cost).min(512).saturating_sub(budgets[index]).min(anchors);
+            budgets[index] += budget;
             anchors -= budget;
             remaining -= budget;
         }
@@ -2740,24 +2734,24 @@ async fn drain_to_completed(
                 None,
             ));
         };
+        let event = event?;
         let _model_stream_processing_timing_guard = turn_context
             .turn_timing_state
-            .begin_model_stream_processing();
+            .begin_model_stream_processing(&event);
         match event {
-            Ok(ResponseEvent::OutputItemDone(item)) => {
+            ResponseEvent::OutputItemDone(item) => {
                 accumulator.record_output(item);
             }
-            Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
+            ResponseEvent::ServerReasoningIncluded(included) => {
                 sess.set_server_reasoning_included(included).await;
             }
-            Ok(ResponseEvent::RateLimits(snapshot)) => {
+            ResponseEvent::RateLimits(snapshot) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
-            Ok(ResponseEvent::Completed { token_usage, .. }) => {
+            ResponseEvent::Completed { token_usage, .. } => {
                 return Ok(accumulator.complete(token_usage));
             }
-            Ok(_) => continue,
-            Err(e) => return Err(e),
+            _ => continue,
         }
     }
 }

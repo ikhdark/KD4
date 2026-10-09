@@ -163,10 +163,6 @@ fn ensure_unique_headers_rejects_generated_output_column_collisions() {
 #[tokio::test]
 async fn spawn_rejects_invalid_and_non_object_output_schemas_before_reading_csv() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
-    crate::session::multi_agents::update_spawn_authorization_from_text(
-        &turn,
-        "Use subagents to process the CSV.",
-    );
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
@@ -1141,13 +1137,6 @@ async fn csv_job_sql_fault_fixture(
     // The default unavailable AgentControl is the real failed-spawn prerequisite used by
     // runner_settles_non_limit_spawn_failure_without_retrying; no successful worker is faked.
     turn.multi_agent_version = mode;
-    crate::session::multi_agents::update_spawn_authorization_from_text(
-        &turn,
-        "Use subagents to process the CSV.",
-    );
-    if mode == MultiAgentVersion::V2 {
-        assert!(crate::session::multi_agents::spawn_is_authorized(&turn));
-    }
     let arguments = json!({
         "csv_path": input_path.to_str().expect("temporary input path must be UTF-8"),
         "output_csv_path": output_path.to_str().expect("temporary output path must be UTF-8"),

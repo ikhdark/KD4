@@ -33,7 +33,10 @@ use super::execute_handler::CellDispatchLease;
 use super::handle_runtime_response;
 use super::wait_spec::create_wait_tool;
 
-const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+// The runtime may spend two seconds draining already-issued notifications.
+// Give it time to commit the terminal response and retained output afterward;
+// matching that inner deadline races cleanup and discards recoverable evidence.
+const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 /// Compatibility default for bounded polls. Passive wait_for_output owns
 /// continuation internally; cell waits wake on decisions, input, or the actor's idle bound.
 pub(crate) const NESTED_DEFAULT_POLL: Duration = Duration::from_secs(285);
@@ -268,6 +271,7 @@ impl CodeModeWaitHandler {
                         .await;
                 }
                 let response = wait_response.into();
+                exec.session.services.code_mode_service.flush_packet_retention(&cell_id).await;
                 let delivery = exec.session.services.code_mode_service.delivery_for_response(
                     &cell_id, &exec.turn, &response,
                 );

@@ -1398,7 +1398,7 @@ impl WorkspaceGateGuard {
             },
             // Resource-scoped writers hold a shared global guard. Downgrading
             // an unknown-resource exclusive guard would admit those writers,
-            // so retain that barrier until the observation is published.
+            // so retain that barrier until the workspace identity is captured.
             other => other,
         }
     }
@@ -1790,9 +1790,14 @@ impl ToolCallRuntime {
                 return true;
             }
         }
-        let gate_guard = Some(WorkspaceGateGuard::Shared {
-            _guard: Arc::clone(&self.parallel_execution).read_owned().await,
-        });
+        // Only a fresh workspace capture needs synchronization with tool effects.
+        let gate_guard = if baseline.is_none() || mutation_advanced {
+            Some(WorkspaceGateGuard::Shared {
+                _guard: Arc::clone(&self.parallel_execution).read_owned().await,
+            })
+        } else {
+            None
+        };
         Self::register_workspace_evidence_after_call(
             self.session.as_ref(),
             self.step_context.turn.as_ref(),
@@ -1873,6 +1878,9 @@ impl ToolCallRuntime {
                 (revision, true)
             }
         };
+        // Identity capture is complete. History projection and persistence do not
+        // need the workspace lease, even when they wait for session state.
+        drop(workspace_gate_guard);
         Self::register_workspace_evidence_observation(
             session,
             turn,
@@ -1882,7 +1890,7 @@ impl ToolCallRuntime {
                 captured_current,
                 source_dependencies,
                 source_path_observations,
-                workspace_gate_guard,
+                workspace_gate_guard: None,
             },
         )
         .await;
@@ -5742,7 +5750,7 @@ mod tests {
             fn permits_shared_workspace_observation(&self, _: &ToolPayload) -> bool { true }
         }
         for nested in [false, true] {
-            for change in ["unchanged", "unrelated", "relevant", "permission"] {
+            for change in ["unchanged", "unrelated", "relevant", "permission", "selection"] {
                 let workspace = tempfile::tempdir().unwrap();
                 assert!(std::process::Command::new("git").args(["init", "--quiet"])
                     .current_dir(workspace.path()).status().unwrap().success());
@@ -5797,7 +5805,11 @@ mod tests {
                         StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(Arc::clone(&router)),
                         Arc::clone(&tracker)).with_sampling_request_signals(collector.clone());
                     let tool_name = codex_tools::ToolName::plain("read_file");
-                    let payload = ToolPayload::Function { arguments: serde_json::json!({"path":path}).to_string() };
+                    let arguments = if change == "selection" {
+                        if index == 0 { serde_json::json!({"path":path,"selectors":[{"kind":"lines","start":1,"end":1}]}) }
+                        else { serde_json::json!({"path":path,"selectors":[{"kind":"search","query":"original source"}]}) }
+                    } else { serde_json::json!({"path":path}) };
+                    let payload = ToolPayload::Function { arguments: arguments.to_string() };
                     let call_id = format!("read-{index}");
                     let call = ToolCall { tool_name: tool_name.clone(), call_id: call_id.clone(), payload: payload.clone() };
                     let output = if nested {
@@ -6411,6 +6423,455 @@ mod tests {
         );
 
         drop(held_gate);
+    }
+
+    fn admitted_test_baseline() -> WorkspaceEvidenceBaseline {
+        WorkspaceEvidenceBaseline {
+            revision: None,
+            cache_hit: false,
+            timed_out_git_dependencies: Vec::new(),
+            source_dependencies: Default::default(),
+            source_path_observations: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_baseline_evidence_does_not_wait_for_unknown_resource_writer() {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
+            StepContext::for_test(Arc::clone(&turn_context)),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        // An unknown-resource writer owns the global gate for its whole handler.
+        let writer = Arc::clone(&runtime.parallel_execution)
+            .try_write_owned()
+            .expect("workspace gate should initially be available");
+        let response = ResponseInputItem::FunctionCallOutput {
+            call_id: "admitted-baseline-read".to_string(),
+            output: FunctionCallOutputPayload::from_text("ok".to_string()),
+        };
+        let classification = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: true,
+            workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
+            source_dependencies: Default::default(),
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.register_workspace_evidence_for_response(
+                &response,
+                Some(admitted_test_baseline()),
+                false,
+                None,
+                &classification,
+                None,
+            ),
+        )
+        .await
+        .expect("publishing an admitted baseline must not queue behind an unrelated writer");
+        assert_eq!(
+            session
+                .clone_history()
+                .await
+                .tool_history_state()
+                .workspace_evidence_revision_for_test("admitted-baseline-read"),
+            Some(None)
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn workspace_lease_covers_identity_capture_but_not_history_projection() {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let repo = tempfile::tempdir().expect("repository");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let global = Arc::new(RwLock::new(()));
+        let resource = Arc::new(crate::scoped_workspace_gate::ScopedWorkspaceGate::default());
+        for capture_after_call in [false, true] {
+            let call_id = format!("lease-scope-{capture_after_call}");
+            // A concurrent history operation (relay, prompt preparation) owns
+            // session state while the completed call registers its evidence.
+            let (state_held_tx, state_held_rx) = oneshot::channel();
+            let release_state = Arc::new(Notify::new());
+            let state_holder = tokio::spawn({
+                let session = Arc::clone(&session);
+                let release_state = Arc::clone(&release_state);
+                async move {
+                    let _state = session.lock_history_state_for_test().await;
+                    let _ = state_held_tx.send(());
+                    release_state.notified().await;
+                }
+            });
+            state_held_rx.await.expect("session state should be held");
+            let pause = capture_after_call
+                .then(|| session.services.git_workspace.pause_next_workspace_evidence_capture());
+            let guard = WorkspaceGateGuard::ResourceScoped {
+                _resource: WorkspaceResourceGateGuard::Exclusive {
+                    _guard: Arc::clone(&resource).write_owned().await,
+                },
+                _global: Arc::clone(&global).read_owned().await,
+            };
+            let registration = tokio::spawn({
+                let session = Arc::clone(&session);
+                let turn_context = Arc::clone(&turn_context);
+                let call_id = call_id.clone();
+                let workspace_cwd = repo.path().to_path_buf();
+                async move {
+                    let response = ResponseInputItem::FunctionCallOutput {
+                        call_id,
+                        output: FunctionCallOutputPayload::from_text("observed".to_string()),
+                    };
+                    let classification = crate::tool_history::WorkspaceCallClassification {
+                        observes_workspace: true,
+                        workspace_cwd,
+                        source_dependencies: Default::default(),
+                    };
+                    ToolCallRuntime::register_workspace_evidence_after_call(
+                        session.as_ref(),
+                        turn_context.as_ref(),
+                        WorkspaceEvidenceAfterCall {
+                            response: &response,
+                            baseline: (!capture_after_call).then(admitted_test_baseline),
+                            mutation_advanced: false,
+                            source_dependencies_override: None,
+                            classification: &classification,
+                            workspace_gate_guard: Some(guard),
+                        },
+                        None,
+                        None,
+                    )
+                    .await
+                }
+            });
+            if let Some(pause) = pause.as_ref() {
+                tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
+                    .await
+                    .expect("post-call identity capture should start");
+                assert!(
+                    Arc::clone(&resource).try_write_owned().is_err(),
+                    "a post-call identity capture must still exclude same-resource writers"
+                );
+                assert!(Arc::clone(&global).try_write_owned().is_err());
+                pause.release();
+            }
+            // Projection and publication wait for session state, not effects.
+            let writer = tokio::time::timeout(
+                Duration::from_secs(5),
+                Arc::clone(&resource).write_owned(),
+            )
+            .await
+            .expect("history projection must not retain the workspace lease");
+            let global_writer =
+                tokio::time::timeout(Duration::from_secs(5), Arc::clone(&global).write_owned())
+                    .await
+                    .expect("history projection must not retain the global barrier");
+            assert!(
+                !registration.is_finished(),
+                "registration should still be waiting for session state"
+            );
+            drop((writer, global_writer));
+            release_state.notify_one();
+            state_holder.await.expect("state holder should join");
+            let deferred = tokio::time::timeout(Duration::from_secs(5), registration)
+                .await
+                .expect("registration should complete once state is released")
+                .expect("registration task should join");
+            assert!(!deferred);
+            assert!(
+                session
+                    .clone_history()
+                    .await
+                    .tool_history_state()
+                    .workspace_evidence_revision_for_test(&call_id)
+                    .is_some(),
+                "{call_id} evidence should be published"
+            );
+        }
+    }
+
+    /// Wall-clock benchmark for how long completed calls keep workspace gates
+    /// during evidence registration. Prints p50/p90 for before/after builds;
+    /// it asserts completion only, never a timing threshold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "wall-clock benchmark; run explicitly with --ignored"]
+    async fn kd4_latency_bench_evidence_registration_gate_scope() {
+        use crate::session::turn_context::TurnEnvironment;
+        use crate::tools::handlers::ReadFileHandler;
+        use codex_protocol::models::PermissionProfile;
+        use codex_utils_absolute_path::AbsolutePathBuf;
+        use codex_utils_path_uri::PathUri;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        const READS: usize = 16;
+        const ITERATIONS: usize = 15;
+
+        // Holds each read inside its handler until released, so a writer can
+        // queue behind in-flight readers before they complete together.
+        struct GatedRead {
+            entered: Arc<AtomicUsize>,
+            release: Arc<tokio::sync::Semaphore>,
+        }
+        impl ToolExecutor<ToolInvocation> for GatedRead {
+            fn tool_name(&self) -> codex_tools::ToolName { ReadFileHandler.tool_name() }
+            fn spec(&self) -> codex_tools::ToolSpec { ReadFileHandler.spec() }
+            fn supports_parallel_tool_calls(&self) -> bool { true }
+            fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+                Box::pin(async move {
+                    self.entered.fetch_add(1, Ordering::SeqCst);
+                    self.release.acquire().await.expect("release semaphore").forget();
+                    ReadFileHandler.handle(invocation).await
+                })
+            }
+        }
+        impl CoreToolRuntime for GatedRead {
+            fn permits_shared_workspace_observation(&self, _: &ToolPayload) -> bool { true }
+        }
+        // A serial tool, such as a mutating MCP call, takes the global gate.
+        struct SerialWriter {
+            name: &'static str,
+            work: Duration,
+            entered: Arc<Mutex<Option<Instant>>>,
+        }
+        impl ToolExecutor<ToolInvocation> for SerialWriter {
+            fn tool_name(&self) -> codex_tools::ToolName { codex_tools::ToolName::plain(self.name) }
+            fn spec(&self) -> codex_tools::ToolSpec {
+                ImmediateHandler { tool_name: self.tool_name() }.spec()
+            }
+            fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+                Box::pin(async move {
+                    *self.entered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Instant::now());
+                    tokio::time::sleep(self.work).await;
+                    Ok(Box::new(FunctionToolOutput::from_text("written".to_string(), Some(true)))
+                        as Box<dyn crate::tools::context::ToolOutput>)
+                })
+            }
+        }
+        impl CoreToolRuntime for SerialWriter {}
+
+        async fn wait_until(mut ready: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !ready() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("benchmark precondition should be reached");
+        }
+        fn percentiles(mut samples: Vec<Duration>) -> String {
+            samples.sort();
+            let at = |quantile: usize| samples[(samples.len() * quantile / 100).min(samples.len() - 1)];
+            format!("p50={} p90={}", at(50).as_micros(), at(90).as_micros())
+        }
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let body = "evidence line for the gate-scope benchmark\n".repeat(1_500);
+        for index in 0..READS {
+            std::fs::write(workspace.path().join(format!("f{index}.txt")), &body)
+                .expect("write fixture");
+        }
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        Arc::make_mut(&mut turn.config).cwd =
+            AbsolutePathBuf::from_absolute_path(workspace.path()).expect("workspace path");
+        turn.permission_profile = PermissionProfile::Disabled;
+        turn.environments.turn_environments = vec![TurnEnvironment::new(
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            PathUri::from_host_native_path(workspace.path()).expect("workspace URI"),
+            None,
+        )];
+        let timing_state = Arc::clone(&turn.turn_timing_state);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let writer_entered = Arc::new(Mutex::new(None));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([
+                Arc::new(GatedRead { entered: Arc::clone(&entered), release: Arc::clone(&release) })
+                    as Arc<dyn CoreToolRuntime>,
+                Arc::new(SerialWriter {
+                    name: "serial_writer",
+                    work: Duration::ZERO,
+                    entered: Arc::clone(&writer_entered),
+                }) as Arc<dyn CoreToolRuntime>,
+                Arc::new(SerialWriter {
+                    name: "slow_serial_writer",
+                    work: Duration::from_millis(100),
+                    entered: Arc::clone(&writer_entered),
+                }) as Arc<dyn CoreToolRuntime>,
+            ]),
+            Vec::new(),
+        ));
+        let session = Arc::new(session);
+        let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
+            step,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let nested = |call_id: String, tool: &str, arguments: serde_json::Value| {
+            runtime.clone().handle_tool_call_with_source(
+                ToolCall {
+                    tool_name: codex_tools::ToolName::plain(tool),
+                    call_id: call_id.clone(),
+                    payload: ToolPayload::Function { arguments: arguments.to_string() },
+                },
+                ToolCallSource::CodeMode {
+                    cell_id: "gate-scope-bench".into(),
+                    parent_call_id: Some("gate-scope-exec".into()),
+                    runtime_tool_call_id: call_id,
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                },
+                CancellationToken::new(),
+            )
+        };
+
+        // Nested readers complete together while a serial writer is queued.
+        // `state_contention` models a concurrent history operation (relay or
+        // prompt preparation) holding session state for 5 ms at completion.
+        for (writer, state_contention) in [(false, false), (true, false), (true, true)] {
+            let mut writer_entry = Vec::new();
+            let mut batch_wall = Vec::new();
+            for iteration in 0..ITERATIONS {
+                entered.store(0, Ordering::SeqCst);
+                *writer_entered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                let reads = (0..READS)
+                    .map(|index| {
+                        tokio::spawn(nested(
+                            format!("read-{writer}-{state_contention}-{iteration}-{index}"),
+                            "read_file",
+                            serde_json::json!({"path": format!("f{index}.txt")}),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                wait_until(|| entered.load(Ordering::SeqCst) == READS).await;
+                let writer_task = writer.then(|| {
+                    tokio::spawn(nested(
+                        format!("write-{state_contention}-{iteration}"),
+                        "serial_writer",
+                        serde_json::json!({}),
+                    ))
+                });
+                if writer {
+                    wait_until(|| timing_state.lifecycle_context().parallel_gate_waiter_count > 0)
+                        .await;
+                }
+                let state_holder = if state_contention {
+                    let (held_tx, held_rx) = oneshot::channel();
+                    let session = Arc::clone(&session);
+                    let holder = tokio::spawn(async move {
+                        let _state = session.lock_history_state_for_test().await;
+                        let _ = held_tx.send(());
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    });
+                    held_rx.await.expect("session state should be held");
+                    Some(holder)
+                } else {
+                    None
+                };
+                let released = Instant::now();
+                release.add_permits(READS);
+                if let Some(writer_task) = writer_task {
+                    writer_task.await.expect("writer joins").expect("writer succeeds");
+                    let entry = writer_entered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .expect("writer handler entered");
+                    writer_entry.push(entry.saturating_duration_since(released));
+                }
+                for read in reads {
+                    read.await.expect("read joins").expect("read succeeds");
+                }
+                batch_wall.push(released.elapsed());
+                if let Some(holder) = state_holder {
+                    holder.await.expect("state holder joins");
+                }
+            }
+            let scenario = if writer { "nested_reads_then_serial_writer" } else { "nested_reads_only" };
+            let writer_entry = if writer_entry.is_empty() {
+                "n/a".to_string()
+            } else {
+                percentiles(writer_entry)
+            };
+            eprintln!(
+                "kd4-bench evidence-gate scenario={scenario} state_contention={state_contention} reads={READS} iterations={ITERATIONS} writer_entry_after_release_us {writer_entry} batch_wall_us {}",
+                percentiles(batch_wall)
+            );
+        }
+
+        // A completed direct read while a serial writer that queued behind it
+        // runs for 100 ms. The read result itself is final at release.
+        let mut read_completion = Vec::new();
+        let mut batch_wall = Vec::new();
+        for iteration in 0..10 {
+            entered.store(0, Ordering::SeqCst);
+            let call = ToolCall {
+                tool_name: codex_tools::ToolName::plain("read_file"),
+                call_id: format!("direct-read-{iteration}"),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({"path": "f0.txt"}).to_string(),
+                },
+            };
+            let admission = crate::tool_history::classify_workspace_tool_call_at_admission(
+                call.tool_name.name.to_string(),
+                call.payload.clone(),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("admission proof");
+            let read = runtime.clone().handle_model_tool_call_with_admission(
+                call,
+                CancellationToken::new(),
+                runtime.create_tool_dispatch_timing(TokioInstant::now(), false),
+                Some(admission),
+            );
+            let read = tokio::spawn(async move { (read.await, Instant::now()) });
+            wait_until(|| entered.load(Ordering::SeqCst) == 1).await;
+            let writer = runtime.clone().handle_tool_call(
+                ToolCall {
+                    tool_name: codex_tools::ToolName::plain("slow_serial_writer"),
+                    call_id: format!("direct-write-{iteration}"),
+                    payload: ToolPayload::Function { arguments: "{}".to_string() },
+                },
+                CancellationToken::new(),
+            );
+            let writer = tokio::spawn(async move { (writer.await, Instant::now()) });
+            wait_until(|| timing_state.lifecycle_context().parallel_gate_waiter_count > 0).await;
+            let released = Instant::now();
+            release.add_permits(1);
+            let (read_result, read_done) = read.await.expect("read joins");
+            read_result.expect("read succeeds");
+            let (writer_result, writer_done) = writer.await.expect("writer joins");
+            writer_result.expect("writer succeeds");
+            read_completion.push(read_done.saturating_duration_since(released));
+            batch_wall.push(read_done.max(writer_done).saturating_duration_since(released));
+        }
+        eprintln!(
+            "kd4-bench evidence-gate scenario=direct_read_then_queued_serial_writer writer_work_ms=100 iterations=10 read_completion_after_release_us {} batch_wall_us {}",
+            percentiles(read_completion),
+            percentiles(batch_wall)
+        );
     }
 
     #[tokio::test]

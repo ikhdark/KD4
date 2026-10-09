@@ -25,6 +25,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS;
+use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES;
 use crate::tools::handlers::read_tool_output_spec::file_selector_schema;
 use crate::tools::handlers::read_tool_output_spec::read_tool_output_output_schema;
 use crate::tools::handlers::wait_for_tool_environment;
@@ -201,13 +202,17 @@ pub(crate) fn reselect_read_file_output(
         return None;
     }
     let retained = output["results"].as_array()?;
-    let selected = if previous["selectors"].is_null()
-        && output["file_complete"] == true
-        && selectors.iter().any(|selector| matches!(selector["kind"].as_str(), Some("lines" | "search" | "json_pointer")))
-    {
-        // Default reads use a byte selector. Reuse that whole authenticated
-        // source through the owning selector engine instead of requiring another
-        // filesystem read for lines/search/JSON. Search hydration stays self-contained.
+    // Preserve the cheap exact-range path before rebuilding a full snapshot.
+    // Search hydration is not self-contained and must use the selector engine.
+    let ranges = selectors.iter().map(|selector| {
+        if !matches!(selector["kind"].as_str(), Some("bytes" | "lines")) { return None; }
+        retained.iter().find_map(|result| retained_read_selection(result, selector))
+    }).collect::<Option<Vec<_>>>();
+    let selected = if let Some(ranges) = ranges {
+        json!(ranges)
+    } else if output["file_complete"] == true {
+        // Complete explicit reads carry the same authenticated source as default
+        // reads. Reuse either form without reopening unchanged workspace files.
         let source = retained.first()?;
         let text = source["text"].as_str()?;
         if retained.len() != 1 || source["status"] != "ok" || source["complete"] != true
@@ -231,16 +236,7 @@ pub(crate) fn reselect_read_file_output(
         if !selection.complete || continuation.is_some() { return None; }
         serde_json::to_value(selection.results).ok()?
     } else {
-        // Partial search results can reference other hydration owners. Do not
-        // reuse them after removing those owners or infer undelivered source.
-        if selectors.iter().any(|selector| !matches!(selector["kind"].as_str(), Some("bytes" | "lines"))) {
-            return None;
-        }
-        let mut selected = Vec::new();
-        for selector in selectors {
-            selected.push(retained.iter().find_map(|result| retained_read_selection(result, selector))?);
-        }
-        json!(selected)
+        return None;
     };
     // Ledger candidates may belong to another file or fail to satisfy this
     // selection. Borrow their retained bytes until a reusable selection exists;
@@ -357,7 +353,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     "type": "object",
                     "properties": {
                         "artifact_id": {"type": "string"},
-                        "selectors": {"type": "array", "items": file_selector_schema(), "minItems": 1, "maxItems": 64}
+                        "selectors": {"type": "array", "items": file_selector_schema(), "minItems": 1, "maxItems": 64},
+                        "max_bytes": {"type":"integer", "minimum":1, "maximum":READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES,
+                            "description":"Code-mode recipes retain the script payload budget; direct recipes keep the default display-sized cap."}
                     },
                     "required": ["artifact_id", "selectors"],
                     "additionalProperties": false
@@ -673,7 +671,14 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 output["snapshot_error"] = json!(error);
             }
             if let Some(artifact_id) = &artifact_id {
-                if let Some(recovery) = file_recovery_recipe(&output, artifact_id) {
+                if let Some(mut recovery) = file_recovery_recipe(&output, artifact_id) {
+                    // Preserve the consumer's existing byte budget across this
+                    // mechanical continuation. Otherwise a script-sized read
+                    // silently falls back to 16 KiB recovery pages. The recovery
+                    // owner still enforces its serialized cap and exact scope.
+                    if script_consumer {
+                        recovery["arguments"]["max_bytes"] = json!(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES);
+                    }
                     output["recovery"] = recovery;
                 }
             }
@@ -1037,6 +1042,8 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
+
+    include!("read_file_navigation_tests.rs");
 
     #[tokio::test]
     async fn read_identity_and_json_pointer_survive_plain_attachment() {
@@ -2165,6 +2172,59 @@ mod tests {
         let end = selector["end"].as_u64().unwrap() as usize;
         assert_eq!(recovered["results"][0]["text"], &original[start..end]);
         assert!(codex_utils_string::approx_token_count(&recovered.to_string()) <= 4_000);
+
+        // The ready-to-pass recipe preserves the script-sized budget. The
+        // serialized envelope may still require multiple exact recovery pages.
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+        jsonschema::validator_for(&spec.output_schema.unwrap().to_value())
+            .unwrap().validate(&retained).unwrap();
+        let mut recipe = retained["recovery"]["arguments"].clone();
+        assert_eq!(recipe["max_bytes"], READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES);
+        let start = retained["continuation"]["start"].as_u64().unwrap() as usize;
+        let mut offset = start;
+        let mut tail = String::new();
+        let mut page_recipe = recipe.clone();
+        for page_index in 0..64 {
+            call.payload = ToolPayload::Function { arguments: page_recipe.to_string() };
+            let page = ReadToolOutputHandler.handle(call.clone()).await.unwrap()
+                .code_mode_result(&call.payload);
+            assert_eq!(page["canonical_sha256"], retained["source_sha256"]);
+            assert!(page.to_string().len() <= READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES);
+            let before = offset;
+            for part in page["results"].as_array().unwrap() {
+                if let Some(text) = part["text"].as_str() {
+                    assert_eq!(part["status"], "ok");
+                    assert_eq!(part["canonical_range"]["start"], offset);
+                    offset += text.len();
+                    assert_eq!(part["canonical_range"]["end"], offset);
+                    tail.push_str(text);
+                }
+            }
+            assert!(offset > before, "recovery must make progress");
+            if page_index == 0 {
+                assert!(offset - before > 16_384, "recipe must retain the script-sized budget");
+            }
+            if page["complete"] == true {
+                assert_eq!(offset, original.len());
+                break;
+            }
+            let stop = &page["continuation_stop"];
+            assert_eq!(stop["reason"], "budget");
+            assert_eq!(stop["resumable"], true);
+            assert_eq!(stop["selector"], json!({"kind":"bytes", "start":offset, "end":original.len()}));
+            page_recipe["selectors"] = json!([stop["selector"].clone()]);
+        }
+        assert_eq!(offset, original.len());
+        assert_eq!(tail, original[start..]);
+
+        // Same requested suffix, old recipe: another recovery is necessary.
+        recipe.as_object_mut().unwrap().remove("max_bytes");
+        call.payload = ToolPayload::Function { arguments: recipe.to_string() };
+        let paged = ReadToolOutputHandler.handle(call.clone()).await.unwrap()
+            .code_mode_result(&call.payload);
+        assert_eq!(paged["complete"], false);
+        assert_eq!(paged["continuation_stop"]["reason"], "budget");
+        assert_eq!(paged["continuation_stop"]["resumable"], true);
     }
 
     #[test]
@@ -2967,6 +3027,7 @@ mod tests {
         let duplicate = output["results"][0].clone();
         output["results"].as_array_mut().unwrap().push(duplicate);
         let recipe = file_recovery_recipe(&output, "snapshot").unwrap();
+        assert!(recipe["arguments"].get("max_bytes").is_none(), "direct recipe cap changed");
         assert_eq!(recipe["arguments"]["selectors"].as_array().unwrap().len(), 64);
         assert_eq!(recipe["omitted_selectors"], 16);
         let recipe = file_recovery_recipe(&json!({"results":[

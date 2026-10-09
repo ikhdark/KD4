@@ -5,16 +5,14 @@ import copy
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from scripts import _rollout_analyze2 as analyzer
-from scripts import _rollout_dump as full_dump
-from scripts import _rollout_narrative as narrative
+from scripts import rollout_reports as reports
 from scripts import rollout_snapshot
 
 
@@ -75,7 +73,7 @@ class RolloutReportsTest(unittest.TestCase):
     def analyze(self, rows):
         self.path.write_bytes(encode(rows))
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            analyzer.analyze(self.path)
+            reports.analyze(self.path)
         return output.getvalue()
 
     def test_native_timing_and_compaction_usage_replace_event_estimates(self):
@@ -188,7 +186,7 @@ class RolloutReportsTest(unittest.TestCase):
             ) as reader,
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
-            analyzer.analyze(self.path)
+            reports.analyze(self.path)
         reader.assert_called_once_with(self.path)
         self.assertEqual(self.path.read_bytes(), initial + appended)
         self.assertTrue(captured[0].stream.closed)
@@ -220,7 +218,7 @@ class RolloutReportsTest(unittest.TestCase):
                 ]
             )
         )
-        full_dump.dump(self.path, self.output)
+        reports.dump(self.path, self.output)
         output = self.output.read_text(encoding="utf-8")
         self.assertEqual(output.count("original-contract"), 1)
         self.assertEqual(output.count("changed-contract"), 1)
@@ -245,7 +243,7 @@ class RolloutReportsTest(unittest.TestCase):
                 ]
             )
         )
-        full_dump.dump(self.path, self.output)
+        reports.dump(self.path, self.output)
         output = self.output.read_text(encoding="utf-8")
         self.assertEqual(output.count("a" * 64), 1)
         self.assertEqual(output.count("b" * 64), 1)
@@ -256,9 +254,9 @@ class RolloutReportsTest(unittest.TestCase):
     def test_narrative_keeps_long_inputs_and_compacted_inputs_but_bounds_outputs(self):
         arguments = "a" * 7000 + "important-input" + "z" * 7000
         tool_output = (
-            "o" * (narrative.OUT_LIMIT + 4000)
+            "o" * (reports.OUT_LIMIT + 4000)
             + "omitted-output-middle"
-            + "o" * (narrative.OUT_LIMIT + 4000)
+            + "o" * (reports.OUT_LIMIT + 4000)
         )
         call = {"type": "function_call", "name": "exec", "arguments": arguments}
         self.path.write_bytes(
@@ -273,7 +271,7 @@ class RolloutReportsTest(unittest.TestCase):
                 ]
             )
         )
-        narrative.dump(self.path, self.output)
+        reports.dump_narrative(self.path, self.output)
         output = self.output.read_text(encoding="utf-8")
         self.assertEqual(output.count(arguments), 2)
         self.assertNotIn("omitted-output-middle", output)
@@ -292,8 +290,8 @@ class RolloutReportsTest(unittest.TestCase):
         for arguments, status in cases:
             with self.subTest(arguments=arguments):
                 result = subprocess.run(
-                    [sys.executable, '-B', str(Path(narrative.__file__)), *arguments],
-                    cwd=self.root, capture_output=True, encoding='utf-8', timeout=30,
+                    [sys.executable, '-B', str(Path(reports.__file__)), 'narrative', *arguments],
+                    cwd=self.root, capture_output=True, encoding='utf-8', timeout=30, check=False,
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                 )
                 self.assertEqual(result.returncode, status, result.stderr)
@@ -312,9 +310,9 @@ class RolloutReportsTest(unittest.TestCase):
                                      'content': [{'text': 'second record'}]}, 1),
         ]))
         result = subprocess.run(
-            [sys.executable, '-B', str(Path(narrative.__file__)), 'reports',
+            [sys.executable, '-B', str(Path(reports.__file__)), 'narrative', 'reports',
              str(self.path), f'{self.path}@1'],
-            cwd=self.root, capture_output=True, encoding='utf-8', timeout=30,
+            cwd=self.root, capture_output=True, encoding='utf-8', timeout=30, check=False,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -329,7 +327,7 @@ class RolloutReportsTest(unittest.TestCase):
     def test_reader_rejects_interior_corruption_and_nonobjects_before_output(self):
         prefix = encode([record("session_meta", {})])
         for bad in (b"broken\n", b"[]\n", b"[]", b"\xff\n"):
-            for dump in (full_dump.dump, narrative.dump):
+            for dump in (reports.dump, reports.dump_narrative):
                 with self.subTest(bad=bad, dump=dump):
                     self.path.write_bytes(prefix + bad)
                     self.output.write_text("existing report", encoding="utf-8")
@@ -367,22 +365,22 @@ class RolloutReportsTest(unittest.TestCase):
             )
             + b'{"type":'
         )
-        scripts = Path(__file__).parent
         for name in (
-            "_rollout_analyze",
-            "_rollout_analyze2",
-            "_rollout_dump",
-            "_rollout_narrative",
+            "summary",
+            "diagnostics",
+            "dump",
+            "narrative",
         ):
             with self.subTest(name=name):
-                arguments = [sys.executable, "-B", str(scripts / f"{name}.py")]
-                if name in ("_rollout_dump", "_rollout_narrative"):
+                arguments = [sys.executable, "-B", reports.__file__, name]
+                if name in ("dump", "narrative"):
                     arguments.append(str(self.root / name))
-                elif name == "_rollout_analyze":
+                elif name == "summary":
                     arguments.append("-v")
                 arguments.append(str(self.path))
                 result = subprocess.run(
                     arguments,
+                    check=False,
                     capture_output=True,
                     encoding="utf-8",
                     timeout=30,
@@ -391,13 +389,76 @@ class RolloutReportsTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("complete prefix only", result.stderr)
-                if name in ("_rollout_dump", "_rollout_narrative"):
+                if name in ("dump", "narrative"):
                     files = list((self.root / name).glob("*.txt"))
                     self.assertEqual(len(files), 1)
                     output = files[0].read_text(encoding="utf-8")
                 else:
                     output = result.stdout
                 self.assertIn("task_complete", output)
+
+    def test_summary_and_diagnostics_cli_keep_multiple_inputs_and_verbose_mode(self):
+        self.path.write_bytes(encode([record("session_meta", {"id": "test"})]))
+        for command, options, marker in (
+            ("summary", [], "samplings:"),
+            ("summary", ["-v"], "--- timeline ---"),
+            ("diagnostics", [], "bytes by type:"),
+        ):
+            with self.subTest(command=command, options=options):
+                result = subprocess.run(
+                    [sys.executable, "-B", reports.__file__, command, *options,
+                     str(self.path), str(self.path)],
+                    cwd=self.root, capture_output=True, encoding="utf-8", timeout=30, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.count(marker), 2)
+                if command == "summary" and not options:
+                    self.assertNotIn("--- timeline ---", result.stdout)
+                self.assertEqual(set(self.root.iterdir()), {self.path})
+
+    def test_command_help_and_missing_arguments_do_not_write(self):
+        for command in ([], ["summary"], ["diagnostics"], ["dump"], ["narrative"]):
+            for options, status in ((["--help"], 0), ([], 2)):
+                with self.subTest(command=command, options=options):
+                    with (
+                        contextlib.redirect_stdout(io.StringIO()),
+                        contextlib.redirect_stderr(io.StringIO()),
+                        self.assertRaises(SystemExit) as error,
+                    ):
+                        reports.main([*command, *options])
+                    self.assertEqual(error.exception.code, status)
+                    self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_narrative_output_limit_is_scoped_to_narrative(self):
+        text = "a" * 12 + "omitted-middle" + "z" * 4
+        self.path.write_bytes(encode([
+            record("response_item", {"type": "function_call_output", "output": text})
+        ]))
+        with mock.patch.dict(os.environ, {"NARR_OUT_LIMIT": "16"}):
+            reports.dump_narrative(self.path, self.output)
+        rendered = self.output.read_text(encoding="utf-8")
+        self.assertIn(f"{len(text) - 16} chars omitted", rendered)
+        self.assertNotIn("omitted-middle", rendered)
+        with mock.patch.dict(os.environ, {"NARR_OUT_LIMIT": "not-a-number"}):
+            reports.dump(self.path, self.output)
+        self.assertIn(text, self.output.read_text(encoding="utf-8"))
+
+    def test_shared_timestamps_preserve_strict_diagnostics_and_tolerant_views(self):
+        self.assertIsNone(reports.ts({"timestamp": "invalid"}))
+        with self.assertRaises(ValueError):
+            reports.ts({"timestamp": "invalid"}, strict=True)
+        self.assertIsNone(reports.ts({}, strict=True))
+
+    def test_changed_report_owner_selects_both_regression_modules(self):
+        from scripts import root_maintenance
+
+        with mock.patch.object(root_maintenance, "script_inventory",
+                               side_effect=AssertionError("broad discovery")):
+            self.assertEqual(
+                root_maintenance.python_test_targets([], ["scripts/rollout_reports.py"]),
+                ["scripts.test_rollout_complete", "scripts.test_rollout_reports"],
+            )
 
 
 if __name__ == "__main__":

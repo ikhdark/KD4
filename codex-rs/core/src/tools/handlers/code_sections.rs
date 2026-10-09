@@ -28,6 +28,9 @@ pub(crate) struct CodeItem {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linked_path_candidates: Vec<String>,
     pub syntax_error: bool,
+    /// Diagnostic-only spelling for trait methods; never an executable alias.
+    #[serde(skip)]
+    pub trait_method_alias: Option<String>,
     #[serde(skip)]
     pub start: usize,
     #[serde(skip)]
@@ -94,6 +97,7 @@ pub(crate) fn parse(
                 .unwrap_or_else(|| kind.to_owned());
             let mut start = node.start_byte();
             let mut qualifiers = Vec::new();
+            let mut trait_alias = None;
             let mut in_test_context = false;
             let mut ancestor = node.parent();
             while let Some(parent) = ancestor {
@@ -110,6 +114,15 @@ pub(crate) fn parse(
                         {
                             qualifiers.push(format!("<{} as {}>",
                                 &source[owner.byte_range()], &source[trait_name.byte_range()]));
+                            if kind == "fn" && trait_alias.is_none() {
+                                // Both the type and trait can contain generics;
+                                // recover the type from grammar nodes, not text.
+                                while owner.kind() == "generic_type" {
+                                    let Some(base) = owner.child_by_field_name("type") else { break; };
+                                    owner = base;
+                                }
+                                trait_alias = Some((qualifiers.len() - 1, source[owner.byte_range()].to_owned()));
+                            }
                             ancestor = parent.parent();
                             continue;
                         }
@@ -124,7 +137,21 @@ pub(crate) fn parse(
                 ancestor = parent.parent();
             }
             qualifiers.reverse();
-            qualifiers.push(name.clone());
+            let trait_method_alias = trait_alias.map(|(index, owner)| {
+                let mut alias = qualifiers.clone();
+                let index = alias.len() - index - 1;
+                alias[index] = owner;
+                alias.push(name.clone());
+                alias.join("::")
+            });
+            // Keep outline names compatible while giving impl blocks a
+            // selectable identity distinct from the type definition.
+            qualifiers.push(if kind == "impl" {
+                match node.child_by_field_name("trait") {
+                    Some(trait_name) => format!("impl {} for {name}", &source[trait_name.byte_range()]),
+                    None => format!("impl {name}"),
+                }
+            } else { name.clone() });
             let qualified_name = qualifiers.join(if rust { "::" } else { "." });
             let mut start_line = node.start_position().row + 1;
             let mut is_test = (!rust
@@ -249,6 +276,7 @@ pub(crate) fn parse(
                 linked_path,
                 linked_path_candidates,
                 syntax_error: node.has_error(),
+                trait_method_alias,
                 start,
                 end: node.end_byte(),
             });

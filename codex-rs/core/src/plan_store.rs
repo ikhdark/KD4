@@ -801,9 +801,12 @@ impl PlanStore {
             if !lineage.requirements.contains_key(&id) {
                 return Err(format!("resolve names unknown requirement {id}; no changes were made"));
             }
-            if next.plan.iter().any(|step| step.status != StepStatus::Completed
-                && lineage.step_requirements.get(&lineage.step_id(&step.step)).is_some_and(|ids| ids.contains(&id)))
-            {
+            let mut descendants = next.plan.iter().filter(|step|
+                lineage.step_requirements.get(&lineage.step_id(&step.step)).is_some_and(|ids| ids.contains(&id)));
+            let Some(first) = descendants.next() else {
+                return Err(format!("reattach {id} to a descendant checklist before resolving it; orphaned scope is not completed. No changes were made"));
+            };
+            if first.status != StepStatus::Completed || descendants.any(|step| step.status != StepStatus::Completed) {
                 return Err(format!("complete the descendant checklist before resolving {id}; no changes were made"));
             }
             lineage.resolved_requirements.insert(id.clone());

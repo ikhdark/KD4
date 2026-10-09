@@ -88,8 +88,6 @@ async fn make_session_and_context() -> (crate::session::Session, TurnContext) {
         turn.config.codex_home.to_path_buf(),
         Some(codex_models_manager::test_support::test_models_response().expect("test model catalog")),
     );
-    turn.multi_agent_spawn_authorized
-        .store(true, std::sync::atomic::Ordering::Release);
     (session, turn)
 }
 
@@ -107,8 +105,6 @@ async fn make_session_and_context_with_rx() -> (
         turn.config.codex_home.to_path_buf(),
         Some(codex_models_manager::test_support::test_models_response().expect("test model catalog")),
     );
-    turn.multi_agent_spawn_authorized
-        .store(true, std::sync::atomic::Ordering::Release);
     (session, turn, events)
 }
 
@@ -716,40 +712,7 @@ async fn spawn_agent_fork_context_rejects_child_model_overrides() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_requires_explicit_turn_authorization() {
-    let (session, mut turn) = make_session_and_context().await;
-    turn.multi_agent_version = MultiAgentVersion::V2;
-    turn.multi_agent_spawn_authorized
-        .store(false, std::sync::atomic::Ordering::Release);
-
-    let error = SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "task_name": "unauthorized"
-            })),
-        ))
-        .await
-        .err()
-        .expect("spawn must be rejected without a direct user grant");
-
-    assert_eq!(
-        error,
-        FunctionCallError::RespondToModel(
-            "spawn_agent: spawning is not authorized for this turn. Explicit-request-only permission is checked per turn; an earlier turn's authorization is not carried forward."
-                .to_string(),
-        )
-    );
-}
-
-#[test_case::test_case("implement subagents again"; "restart")]
-#[test_case::test_case("Use subagents"; "plain")]
-#[test_case::test_case("**Use subagents**"; "emphasized")]
-#[tokio::test]
-async fn multi_agent_v2_spawn_accepts_explicit_user_request(request: &str) {
+async fn multi_agent_v2_spawn_does_not_require_wording_authorization() {
     let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config.multi_agent_v2.multi_agent_mode_hint_text = None;
@@ -766,13 +729,7 @@ async fn multi_agent_v2_spawn_accepts_explicit_user_request(request: &str) {
     session.thread_id = root.thread_id;
     set_turn_config(&mut turn, config);
     turn.multi_agent_version = MultiAgentVersion::V2;
-    // Do not inherit the test helper's grant: exercise the real user-input path.
-    turn.multi_agent_spawn_authorized
-        .store(false, std::sync::atomic::Ordering::Release);
-    turn.update_multi_agent_spawn_authorization(&[UserInput::Text {
-        text: request.to_string(),
-        text_elements: Vec::new(),
-    }]);
+    // No user-text grant or synthetic authorization state is installed.
 
     let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -781,22 +738,22 @@ async fn multi_agent_v2_spawn_accepts_explicit_user_request(request: &str) {
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "authorized_again"
+                "task_name": "wording_independent"
             })),
         ))
         .await
-        .expect("the explicit request must pass authorization and durable admission");
+        .expect("spawn must pass durable admission without a parsed user-text grant");
     let (content, _) = expect_text_output(output);
     let result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn result should be json");
-    assert_eq!(result["task_name"], "/root/authorized_again");
+    assert_eq!(result["task_name"], "/root/wording_independent");
     assert!(result["assignment_id"].is_string());
     assert!(
         manager
             .captured_ops()
             .iter()
             .any(|(thread_id, _)| *thread_id != root.thread_id),
-        "the authorized child must actually receive its task"
+        "the child must actually receive its task"
     );
     manager
         .shutdown_all_threads_bounded(Duration::from_secs(5))

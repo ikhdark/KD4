@@ -1,6 +1,8 @@
 use super::ConnectionSessionState;
 #[path = "message_processor_thread_queue_tests.rs"]
 mod thread_queue_tests;
+#[path = "message_processor_dispatch_latency_tests.rs"]
+mod dispatch_latency_tests;
 use super::MessageProcessor;
 use super::MessageProcessorArgs;
 use super::notification_log_metadata;

@@ -209,6 +209,12 @@ impl AgentControl {
         }
     }
 
+    pub(crate) fn model_http_clients(&self) -> Option<Arc<crate::client::SharedModelHttpClients>> {
+        self.manager
+            .upgrade()
+            .map(|manager| Arc::clone(&manager.model_http_clients))
+    }
+
     pub(crate) fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self {
         self.session_id = session_id;
         self.agent_execution_limiter.initialize(max_threads);

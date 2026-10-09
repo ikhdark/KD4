@@ -6689,9 +6689,6 @@ impl Session {
                 active_turn.turn_state.as_ref(),
                 &pending_input,
                 || {
-                    multi_agents::revoke_spawn_authorization_from_input(
-                        &active_turn_context, &input_for_telemetry,
-                    );
                     state.additional_context = staged_additional_context;
                     if let Some(metadata) = responsesapi_client_metadata {
                         active_turn_context

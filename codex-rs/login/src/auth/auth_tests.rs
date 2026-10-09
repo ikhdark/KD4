@@ -1416,6 +1416,107 @@ impl ExternalAuth for StaticExternalAuth {
     }
 }
 
+struct RotatingExternalAuth {
+    refresh_count: AtomicUsize,
+}
+
+impl ExternalAuth for RotatingExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async {
+            Ok(CodexAuth::from_api_key(&format!(
+                "token-{}",
+                self.refresh_count.load(Ordering::SeqCst)
+            )))
+        })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async {
+            self.refresh_count.fetch_add(1, Ordering::SeqCst);
+            self.resolve().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn authority_refresh_coalesces_concurrent_sessions_but_not_later_refreshes() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+    let source = Arc::new(RotatingExternalAuth {
+        refresh_count: AtomicUsize::new(0),
+    });
+    manager.set_external_auth(source.clone()).await.unwrap();
+    let permit = manager.refresh_lock.acquire().await.unwrap();
+    let mut waiters = (0..8)
+        .map(|_| Box::pin(manager.refresh_token_from_authority()))
+        .collect::<Vec<_>>();
+    std::future::poll_fn(|cx| {
+        for waiter in &mut waiters {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(permit);
+    for waiter in waiters {
+        waiter.await.unwrap();
+    }
+    assert_eq!(source.refresh_count.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.auth_cached().unwrap().api_key(), Some("token-1"));
+
+    manager.refresh_token_from_authority().await.unwrap();
+    assert_eq!(source.refresh_count.load(Ordering::SeqCst), 2);
+    assert_eq!(manager.auth_cached().unwrap().api_key(), Some("token-2"));
+}
+
+#[tokio::test]
+async fn authority_refresh_waiter_preserves_replaced_or_cleared_credentials() {
+    for replacement in [Some(CodexAuth::from_api_key("replacement")), None] {
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+        let source = Arc::new(RotatingExternalAuth {
+            refresh_count: AtomicUsize::new(0),
+        });
+        manager.set_external_auth(source.clone()).await.unwrap();
+        let permit = manager.refresh_lock.acquire().await.unwrap();
+        let mut waiter = Box::pin(manager.refresh_token_from_authority());
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        manager.set_cached_auth(replacement.clone());
+        drop(permit);
+        waiter.await.unwrap();
+        assert_eq!(source.refresh_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager.auth_cached().as_ref().and_then(CodexAuth::api_key),
+            replacement.as_ref().and_then(CodexAuth::api_key)
+        );
+    }
+}
+
+#[tokio::test]
+async fn authority_refresh_cancelled_waiter_releases_admission() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+    let source = Arc::new(RotatingExternalAuth {
+        refresh_count: AtomicUsize::new(0),
+    });
+    manager.set_external_auth(source.clone()).await.unwrap();
+    let permit = manager.refresh_lock.acquire().await.unwrap();
+    let mut waiter = Box::pin(manager.refresh_token_from_authority());
+    std::future::poll_fn(|cx| {
+        assert!(waiter.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(waiter);
+    drop(permit);
+    tokio::time::timeout(Duration::from_secs(1), manager.refresh_token_from_authority())
+        .await
+        .expect("cancelled waiter must not retain refresh admission")
+        .unwrap();
+    assert_eq!(source.refresh_count.load(Ordering::SeqCst), 1);
+}
+
 struct FailingExternalAuth {
     auth: CodexAuth,
     resolve_count: AtomicUsize,

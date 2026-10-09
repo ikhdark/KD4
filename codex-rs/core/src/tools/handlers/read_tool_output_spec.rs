@@ -34,7 +34,7 @@ pub(crate) fn file_selector_schema() -> JsonSchema {
         variants.push(selector_variant(
             "symbol",
             BTreeMap::from([("name".to_string(), JsonSchema::string(Some(
-                "Unique Rust/Python item name, optionally qualified (Type::method, <Type as Trait>::method, module::Type::method, or Class.method in Python). No macro expansion; incomplete neighboring syntax is tolerated.".to_string(),
+                "Unique Rust/Python item name, optionally qualified (Type::method, <Type as Trait>::method, module::Type::method, or Class.method). Exact qualified names precede suffix matches. Rust impl blocks use impl Type or impl Trait for Type, optionally module-qualified; duplicate blocks remain ambiguous. Batch known symbols and enclosing searches to avoid search-then-read calls. No type resolution or macro expansion; text hits are not semantic references.".to_string(),
             )))]),
             vec!["name"],
         ));

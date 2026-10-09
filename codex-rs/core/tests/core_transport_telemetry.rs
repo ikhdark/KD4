@@ -24,6 +24,8 @@ mod suite {
     mod responses_api_proxy_headers;
     #[path = "responses_headers.rs"]
     mod responses_headers;
+    #[path = "request_lifecycle_latency.rs"]
+    mod request_lifecycle_latency;
     #[path = "websocket_fallback.rs"]
     mod websocket_fallback;
 }

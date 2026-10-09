@@ -511,6 +511,7 @@ impl CodeModeExecuteHandler {
             _ = exec.session.services.elicitations.wait_until_clear() => {}
         }
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
+        exec.session.services.code_mode_service.flush_packet_retention(&cell_id).await;
         let delivery = exec.session.services.code_mode_service.delivery_for_response(
             &cell_id, &exec.turn, &response,
         );

@@ -2760,12 +2760,19 @@ impl AuthManager {
     /// it and update the shared cache. If the token refresh fails, returns the
     /// error to the caller.
     pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
+        // Several sessions can reject the same credentials at once. Serialize
+        // refreshes, but do not rotate credentials that a preceding waiter has
+        // already replaced. A later, non-overlapping explicit refresh still runs.
+        let auth_revision = *self.auth_change_tx.borrow();
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
+        if *self.auth_change_tx.borrow() != auth_revision {
+            return Ok(());
+        }
         self.refresh_token_from_authority_impl().await
     }
 

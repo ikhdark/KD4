@@ -202,7 +202,6 @@ pub struct TurnContext {
     pub(crate) developer_instructions: Option<String>,
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) multi_agent_version: MultiAgentVersion,
-    pub(crate) multi_agent_spawn_authorized: super::multi_agents::SpawnAuthorization,
     pub(crate) personality: Option<Personality>,
     pub(crate) approval_policy: Constrained<AskForApproval>,
     pub(crate) permission_profile: PermissionProfile,
@@ -372,16 +371,6 @@ impl TurnContext {
             .unwrap_or_else(|| PathUri::from_abs_path(self.cwd()))
     }
 
-    pub(crate) fn update_multi_agent_spawn_authorization(
-        &self,
-        input: &[codex_protocol::user_input::UserInput],
-    ) {
-        for item in input {
-            if let codex_protocol::user_input::UserInput::Text { text, .. } = item {
-                crate::session::multi_agents::update_spawn_authorization_from_text(self, text);
-            }
-        }
-    }
     pub(crate) fn activate_deferred_tools(
         &self,
         tools: impl IntoIterator<Item = codex_tools::ToolName>,
@@ -634,7 +623,6 @@ impl TurnContext {
             developer_instructions: self.developer_instructions.clone(),
             collaboration_mode,
             multi_agent_version: self.multi_agent_version,
-            multi_agent_spawn_authorized: self.multi_agent_spawn_authorized.clone(),
             personality: self.personality,
             approval_policy: self.approval_policy.clone(),
             permission_profile: self.permission_profile.clone(),
@@ -996,7 +984,6 @@ impl Session {
             developer_instructions: session_configuration.developer_instructions.clone(),
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             multi_agent_version,
-            multi_agent_spawn_authorized: Default::default(),
             personality: session_configuration.personality,
             approval_policy: session_configuration.approval_policy.clone(),
             permission_profile: session_configuration.permission_profile(),

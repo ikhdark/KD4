@@ -3003,7 +3003,7 @@ fn projection_budget_drops_are_ordered_to_match_the_prompt_representations() {
         unreplaced_items_budget_drops: drops(4),
     };
 
-    let projected = apply_tool_history_projection(prepared, projection, fallback_projection);
+    let projected = apply_tool_history_projection(prepared, projection, fallback_projection, None);
 
     assert_eq!(
         projected.tool_output_budget_drops(),
@@ -3032,7 +3032,7 @@ fn unchanged_tool_projection_preserves_prepared_sidecars() {
         ..ToolHistoryProjection::default()
     };
 
-    let projected = apply_tool_history_projection(prepared, projection, fallback_projection);
+    let projected = apply_tool_history_projection(prepared, projection, fallback_projection, None);
 
     for (projected, original) in projected
         .shared_prompt_projections()
@@ -3061,8 +3061,153 @@ fn prompt_projections_reuse_shared_storage_without_copies() {
     }
 }
 
+fn assert_projected_metadata_matches_rebuild(prepared: &PreparedPromptInput, hashed_items: usize) {
+    let fingerprint = prepared.fingerprint.as_ref().expect("prepared fingerprint");
+    assert_eq!(fingerprint.last_update_item_count, hashed_items);
+    assert_eq!(
+        fingerprint.digest,
+        prepared_history_fingerprint(
+            prepared.items(),
+            prepared.stable_context_manifest(),
+            prepared.policy,
+        )
+        .unwrap(),
+    );
+    let rebuilt = PromptProvenanceSidecar::from_assembled_items(
+        prepared.items(),
+        prepared.stable_context_manifest(),
+    );
+    let measure = |provenance: &PromptProvenanceSidecar| {
+        let breakdown = crate::context::PromptContextBreakdown::from_response_items(
+            prepared.items(),
+            provenance,
+        )
+        .unwrap();
+        (breakdown.fixed_prefix_item_count, breakdown.measurements())
+    };
+    assert_eq!(measure(prepared.prompt_provenance()), measure(&rebuilt));
+}
+
 #[test]
-fn sampling_preparation_preserves_stable_context_in_original_positions() {
+fn continuation_projection_metadata_extends_freshness_notices_and_retries() {
+    let workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let mut history = create_history_with_items(vec![user_input_text_msg("inspect source")]);
+    let prepare = |history: &ContextManager| {
+        history.clone().prepare_for_sampling_prompt_with_workspace_freshness(
+            &default_input_modalities(),
+            StableContextTarget::Sampling,
+            None,
+            &workspace,
+        )
+    };
+    let mut previous = prepare(&history);
+    for index in 0..3 {
+        let call_id = format!("metadata-{index}");
+        let appended = [
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "functions.exec".into(),
+                namespace: None,
+                arguments: "{}".into(),
+                call_id: call_id.clone(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id,
+                output: FunctionCallOutputPayload::from_text("source evidence".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        history.record_items(appended.iter(), TruncationPolicy::Tokens(10_000));
+        let continued = prepare(&history);
+        assert!(continued.items().starts_with(previous.items()));
+        let tail_len = continued.items().len() - previous.items().len();
+        assert!(tail_len > appended.len(), "missing evidence appends a freshness notice");
+        assert_projected_metadata_matches_rebuild(&continued, tail_len);
+        let retried = prepare(&history);
+        assert_eq!(retried.items(), continued.items());
+        assert_projected_metadata_matches_rebuild(&retried, 0);
+        assert!(retried.prompt_provenance.shares_contributions_with(&continued.prompt_provenance));
+        previous = continued;
+    }
+    history.record_items([&user_input_text_msg("next task")], TruncationPolicy::Tokens(10_000));
+    let next_turn = prepare(&history);
+    assert_projected_metadata_matches_rebuild(&next_turn, next_turn.items().len());
+}
+
+#[test]
+fn continuation_projection_metadata_checks_policy_and_all_manifest_components() {
+    use crate::stable_context::StableContextKind;
+
+    let mut context = user_input_text_msg("shared context");
+    if let ResponseItem::Message { role, .. } = &mut context {
+        *role = "developer".into();
+    }
+    let mut input = user_input_text_msg("task");
+    if let ResponseItem::Message { internal_chat_message_metadata_passthrough, .. } = &mut input {
+        *internal_chat_message_metadata_passthrough = Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some("metadata-turn".into()),
+        });
+    }
+    let mut prepared = create_history_with_items(vec![context, input])
+        .prepare_for_prompt(&default_input_modalities());
+    prepared.stable_context_manifest = StableContextManifest::default()
+        .add_component_bytes(StableContextKind::Repository, "repository", b"shared context");
+    let base_items: Arc<[ResponseItem]> = prepared.items().to_vec().into();
+    let projection = ToolHistoryProjection {
+        items: Arc::clone(&base_items),
+        unreplaced_items: base_items,
+        ..Default::default()
+    };
+    let first = apply_tool_history_projection(
+        prepared.clone(), projection.clone(), projection.clone(), None,
+    );
+    let entry = SamplingProjectionCacheEntry::new(
+        SamplingProjectionAnchor { prepared_items: prepared.shared_items(), projection },
+        &first,
+    );
+    for change in ["none", "local_reused", "policy", "manifest", "dynamic_history", "user_turn", "missing_hash"] {
+        let mut prepared = prepared.clone();
+        let mut entry = entry.clone();
+        let mut suffix = assistant_msg("continuing");
+        if let ResponseItem::Message { internal_chat_message_metadata_passthrough, .. } = &mut suffix {
+            *internal_chat_message_metadata_passthrough = Some(InternalChatMessageMetadataPassthrough {
+                turn_id: Some("metadata-turn".into()),
+            });
+        }
+        match change {
+            "local_reused" => prepared.stable_context_manifest = prepared.stable_context_manifest.with_local_reused(true),
+            "policy" => prepared.policy.supports_images = !prepared.policy.supports_images,
+            "manifest" => prepared.stable_context_manifest = StableContextManifest::default(),
+            "dynamic_history" => {
+                prepared.stable_context_manifest = prepared.stable_context_manifest
+                    .add_dynamic_history(b"shared context", 14, 4);
+                assert_eq!(prepared.stable_context_manifest.fingerprint(), entry.stable_context_manifest.fingerprint());
+                assert_ne!(prepared.stable_context_manifest.components(), entry.stable_context_manifest.components());
+            }
+            "user_turn" => suffix = user_input_text_msg("next task"),
+            "missing_hash" => entry.fingerprint = None,
+            _ => {}
+        }
+        let mut items = first.items().to_vec();
+        items.push(suffix);
+        let items: Arc<[ResponseItem]> = items.into();
+        let projection = ToolHistoryProjection {
+            items: Arc::clone(&items),
+            unreplaced_items: items,
+            ..Default::default()
+        };
+        let continued = apply_tool_history_projection(
+            prepared, projection.clone(), projection, Some(&entry),
+        );
+        let hashed_items = if matches!(change, "none" | "local_reused") { 1 } else { continued.items().len() };
+        assert_projected_metadata_matches_rebuild(&continued, hashed_items);
+    }
+}
+
+#[test]
+fn sampling_preparation_preserves_surviving_stable_context_in_original_positions() {
     let old_repository =
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
     let current_repository =
@@ -3076,6 +3221,8 @@ fn sampling_preparation_preserves_stable_context_in_original_positions() {
         crate::stable_context::mark_trusted_stable_context_item(&mut current);
         let dynamic = user_input_text_msg("dynamic request or compaction checkpoint");
         let untrusted = user_input_text_msg(current_repository);
+        // Changed stable context in the active tail must not rewrite the
+        // already sampled prefix until the next real user boundary.
         let expected = vec![old.clone(), dynamic.clone(), current.clone(), untrusted.clone()];
         let items = vec![old.clone(), old, dynamic.clone(), current.clone(), current, untrusted];
         let mut history = ContextManager::new();
@@ -3092,9 +3239,8 @@ fn sampling_preparation_preserves_stable_context_in_original_positions() {
         assert!(generic.stable_context_manifest().fail_open());
 
         for completed_tool_projection in [false, true] {
-            let sampled = if completed_tool_projection {
+            let prepare = |history: ContextManager| if completed_tool_projection {
                 history
-                    .clone()
                     .prepare_for_sampling_prompt_with_completed_tool_projection(
                         &default_input_modalities(),
                         StableContextTarget::Sampling,
@@ -3103,7 +3249,6 @@ fn sampling_preparation_preserves_stable_context_in_original_positions() {
                     )
             } else {
                 history
-                    .clone()
                     .prepare_for_sampling_prompt_with_workspace_freshness(
                         &default_input_modalities(),
                         StableContextTarget::Sampling,
@@ -3111,12 +3256,79 @@ fn sampling_preparation_preserves_stable_context_in_original_positions() {
                         &workspace,
                     )
             };
+            let sampled = prepare(history.clone());
             assert_eq!(
                 sampled.items(),
                 expected.as_slice(),
                 "replace_history={replace_history}, completed_tool_projection={completed_tool_projection}"
             );
             assert!(sampled.stable_context_manifest().fail_open());
+
+            let next_request = user_input_text_msg("next user request");
+            let mut next_history = history.clone();
+            next_history.record_items([&next_request], TruncationPolicy::Tokens(10_000));
+            let next_sampled = prepare(next_history);
+            let mut retired = expected[1..].to_vec();
+            retired.push(next_request);
+            assert_eq!(next_sampled.items(), retired.as_slice());
+            assert!(next_sampled.stable_context_manifest().fail_open());
+        }
+    }
+}
+
+#[test]
+fn unchanged_context_reinjection_preserves_sampling_prefix_across_turns() {
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    for (role, text) in [
+        ("user", "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nsame\n</INSTRUCTIONS>"),
+        ("developer", "<permissions instructions>same</permissions instructions>"),
+        ("developer", "<collaboration_mode>same</collaboration_mode>"),
+    ] {
+        let context = |turn: &str| {
+            let mut item = user_input_text_msg(text);
+            if let ResponseItem::Message { role: item_role, .. } = &mut item {
+                *item_role = role.to_string();
+            }
+            crate::stable_context::mark_trusted_stable_context_item(&mut item);
+            item.set_turn_id_if_missing(turn);
+            item
+        };
+        for resumed in [false, true] {
+            for completed_tool_projection in [false, true] {
+                let original = context("first");
+                let first = user_input_text_msg("first task");
+                let mut canonical = vec![original.clone(), first];
+                let mut history = create_history_with_items(canonical.clone());
+                let prepare = |history: &ContextManager| {
+                    if completed_tool_projection {
+                        history.clone().prepare_for_sampling_prompt_with_completed_tool_projection(
+                            &default_input_modalities(), StableContextTarget::Sampling, None, &workspace,
+                        )
+                    } else {
+                        history.clone().prepare_for_sampling_prompt_with_workspace_freshness(
+                            &default_input_modalities(), StableContextTarget::Sampling, None, &workspace,
+                        )
+                    }
+                };
+                let before = prepare(&history);
+                let duplicate = context("second");
+                let untrusted = user_input_text_msg(text);
+                let second = user_input_text_msg("second task");
+                let append = [duplicate.clone(), untrusted.clone(), second];
+                canonical.extend(append.iter().cloned());
+                if resumed {
+                    history.replace(canonical.clone());
+                } else {
+                    history.record_items(append.iter(), TruncationPolicy::Tokens(10_000));
+                }
+                let after = prepare(&history);
+                assert!(after.items().starts_with(before.items()), "{role}: resumed={resumed}");
+                assert!(after.items().contains(&original));
+                assert!(!after.items().contains(&duplicate));
+                assert!(after.items().contains(&untrusted));
+                assert_eq!(history.raw_items(), canonical.as_slice());
+                assert_eq!(history.clone().prepare_for_prompt(&default_input_modalities()).items(), canonical.as_slice());
+            }
         }
     }
 }
@@ -5131,4 +5343,198 @@ fn tokenizer_bounded_cell_output_is_not_truncated_again_by_history() {
     let prepared = history
         .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling);
     assert_eq!(prepared.items()[1], output);
+}
+
+// TEMPORARY wall-clock benchmark for the history-preparation audit. Not a
+// regression test; removed after measurement.
+#[test]
+#[ignore = "manual wall-clock benchmark"]
+fn zz_bench_sampling_preparation_wall_clock() {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    // Shapes follow local rollouts: code-mode `exec` calls (~1.7 KB input,
+    // ~20 KB JSON-ish output), ~3 KB encrypted reasoning, periodic commentary.
+    fn exec_call(round: usize) -> ResponseItem {
+        let mut input = String::with_capacity(1_800);
+        while input.len() < 1_700 {
+            input.push_str(&format!(
+                "const r{round} = await tools.exec_command({{ cmd: \"rg -n \\\"symbol_{round}\\\" src\" }});\n"
+            ));
+        }
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            call_id: format!("call-{round:04}"),
+            name: "exec".to_string(),
+            namespace: None,
+            input,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+    fn exec_output(round: usize) -> ResponseItem {
+        let mut text = String::with_capacity(20_200);
+        let mut line = 0;
+        while text.len() < 20_000 {
+            text.push_str(&format!(
+                "{{\"path\":\"src/module_{round}/file_{line}.rs\",\"line\":{line},\"text\":\"    let value = compute(\\\"{round}-{line}\\\");\\tnext();\"}}\n"
+            ));
+            line += 1;
+        }
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: format!("call-{round:04}"),
+            name: None,
+            output: FunctionCallOutputPayload::from_text(text),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+    fn record_round(history: &mut ContextManager, round: usize) {
+        let policy = TruncationPolicy::Tokens(10_000);
+        // Calls and outputs are recorded at separate lifecycle boundaries.
+        history.record_items(
+            [reasoning_with_encrypted_content(3_000), exec_call(round)].iter(),
+            policy,
+        );
+        history.record_items([exec_output(round)].iter(), policy);
+        if round % 4 == 3 {
+            history.record_items(
+                [assistant_msg(
+                    &"Inspecting the module structure before editing. ".repeat(45),
+                )]
+                .iter(),
+                policy,
+            );
+        }
+    }
+    fn stats(samples: &mut [Duration]) -> (u128, u128, u128) {
+        samples.sort();
+        let median = samples[samples.len() / 2].as_micros();
+        let p90 = samples[(samples.len() * 9 / 10).min(samples.len() - 1)].as_micros();
+        let mean = samples.iter().map(Duration::as_micros).sum::<u128>() / samples.len() as u128;
+        (median, mean, p90)
+    }
+    fn time_median(mut operation: impl FnMut()) -> u128 {
+        let mut samples = (0..25)
+            .map(|_| {
+                let started = Instant::now();
+                operation();
+                started.elapsed()
+            })
+            .collect::<Vec<_>>();
+        stats(&mut samples).0
+    }
+
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    let modalities = default_input_modalities();
+    let prepare = |history: &ContextManager| {
+        let prepared = history
+            .clone()
+            .prepare_for_sampling_prompt_with_completed_tool_projection(
+                &modalities,
+                StableContextTarget::Sampling,
+                None,
+                &workspace,
+            );
+        // The reads `build_projected_prompt_from_scaffold` performs.
+        std::hint::black_box((
+            prepared.shared_prompt_projections(),
+            prepared.fingerprint(),
+            prepared.prompt_provenance().clone(),
+        ));
+        prepared
+    };
+    const CONTINUATIONS: usize = 12;
+    const ITERATIONS: usize = 6;
+    for (label, rounds) in [("short", 10), ("long", 60), ("xlong", 85)] {
+        let mut miss = Vec::new();
+        let mut continuation = Vec::new();
+        let mut record = Vec::new();
+        let mut sizes = (0, 0, 0, 0);
+        for iteration in 0..ITERATIONS {
+            let mut history = ContextManager::new();
+            history.record_items(
+                [
+                    developer_msg(&"<permissions instructions>sandboxed workspace</permissions instructions>\n".repeat(50)),
+                    user_input_text_msg("Audit the module and fix the failing tests."),
+                ]
+                .iter(),
+                TruncationPolicy::Tokens(10_000),
+            );
+            for round in 0..rounds {
+                record_round(&mut history, round);
+            }
+            let start_items = history.raw_items().len();
+            let start_bytes = serde_json::to_vec(history.raw_items()).unwrap().len();
+            let started = Instant::now();
+            let first = prepare(&history);
+            let miss_elapsed = started.elapsed();
+            assert!(history.sampling_projection_anchor_len().is_some());
+            let mut previous = first;
+            for step in 0..CONTINUATIONS {
+                let started = Instant::now();
+                record_round(&mut history, rounds + step);
+                let record_elapsed = started.elapsed();
+                let started = Instant::now();
+                let prepared = prepare(&history);
+                let continuation_elapsed = started.elapsed();
+                assert!(prepared.items().starts_with(previous.items()));
+                if iteration > 0 {
+                    record.push(record_elapsed);
+                    continuation.push(continuation_elapsed);
+                }
+                previous = prepared;
+            }
+            if iteration > 0 {
+                miss.push(miss_elapsed);
+            }
+            sizes = (
+                start_items,
+                start_bytes,
+                history.raw_items().len(),
+                serde_json::to_vec(history.raw_items()).unwrap().len(),
+            );
+        }
+        let (miss_median, miss_mean, _) = stats(&mut miss);
+        let (cont_median, cont_mean, cont_p90) = stats(&mut continuation);
+        let (record_median, record_mean, _) = stats(&mut record);
+        println!(
+            "BENCH size={label} items={}..{} bytes={}..{} turn_start_median_us={miss_median} turn_start_mean_us={miss_mean} continuation_median_us={cont_median} continuation_mean_us={cont_mean} continuation_p90_us={cont_p90} record_median_us={record_median} record_mean_us={record_mean}",
+            sizes.0, sizes.2, sizes.1, sizes.3,
+        );
+    }
+
+    // Attribute one continuation's whole-history passes on the long shape.
+    let mut history = ContextManager::new();
+    history.record_items(
+        [user_input_text_msg("Audit the module and fix the failing tests.")].iter(),
+        TruncationPolicy::Tokens(10_000),
+    );
+    for round in 0..60 {
+        record_round(&mut history, round);
+    }
+    let prepared = prepare(&history);
+    let items = prepared.shared_items();
+    let manifest = prepared.stable_context_manifest().clone();
+    let policy = prepared.policy;
+    let fingerprint_us = time_median(|| {
+        std::hint::black_box(PreparedHistoryFingerprint::new(&items, &manifest, policy).ok());
+    });
+    let provenance_us = time_median(|| {
+        std::hint::black_box(PromptProvenanceSidecar::from_assembled_items(&items, &manifest));
+    });
+    let copy: Arc<[ResponseItem]> = items.iter().cloned().collect();
+    let deep_clone_us = time_median(|| {
+        std::hint::black_box(items.iter().cloned().collect::<Arc<[ResponseItem]>>());
+    });
+    let deep_eq_us = time_median(|| {
+        std::hint::black_box(items[..] == copy[..]);
+    });
+    let serialize_us = time_median(|| {
+        std::hint::black_box(serde_json::to_vec(items.as_ref()).unwrap());
+    });
+    println!(
+        "BENCH_PARTS size=long items={} fingerprint_us={fingerprint_us} provenance_us={provenance_us} deep_clone_us={deep_clone_us} deep_eq_us={deep_eq_us} serialize_request_items_us={serialize_us}",
+        items.len()
+    );
 }

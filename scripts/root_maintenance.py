@@ -5,17 +5,26 @@ from __future__ import annotations
 
 import argparse
 import ast
+import codecs
+from contextlib import ExitStack, closing
 from functools import cache
 import hashlib
+from itertools import groupby
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from shutil import which
 from typing import Callable, Sequence
+
+try:
+    from scripts.process_owner import OwnedThreadPoolExecutor, run_owned
+except ModuleNotFoundError:
+    from process_owner import OwnedThreadPoolExecutor, run_owned
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -400,6 +409,7 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.test_publish_local_codex_freshness",
     ),
     "scripts/process_owner.py": ("scripts.test_report_script_regressions",),
+    "scripts/rollout_reports.py": ("scripts.test_rollout_complete",),
     "scripts/root_maintenance.py": (
         f"{REPORT_REGRESSIONS}.test_changed_tests_and_adjacent_production_across_owned_roots",
         f"{REPORT_REGRESSIONS}.test_report_regressions_follow_their_changed_owners_once",
@@ -982,6 +992,62 @@ def git_context_label() -> str:
     return f"{branch}; {max(0, len(lines) - 1)} changed path(s)"
 
 
+def _is_syntax_check(item: tuple[str, tuple[str, ...]]) -> bool:
+    # Only parser commands constructed by script_audit_commands are independent.
+    # uv may synchronize its environment/cache, and tests may mutate shared state.
+    label, _command = item
+    return label in {
+        "PowerShell syntax", "justfile PowerShell syntax", "justfile Python syntax"
+    } or label.startswith("JavaScript syntax:")
+
+
+def _run_syntax_check(command: Sequence[str], output) -> int:
+    executable = which(command[0]) or command[0]
+    try:
+        return run_owned(
+            [executable, *command[1:]], cwd=REPO_ROOT,
+            stdout=output, stderr=subprocess.STDOUT,
+        ).returncode
+    except OSError as error:
+        output.write(f"Could not run {command[0]}: {error}\n".encode("utf-8"))
+        return 127
+
+
+def _audit_command_results(commands):
+    for independent, group in groupby(commands, key=_is_syntax_check):
+        batch = list(group)
+        if not independent:
+            for label, command in batch:
+                print(f"[RUN] {label}", flush=True)
+                try:
+                    returncode = run(command)
+                except OSError as error:
+                    print(f"[FAIL] {label}: {error}", flush=True)
+                    returncode = 127
+                yield label, returncode
+            continue
+        # Bounded parser-only fanout, with the slow PowerShell groups admitted
+        # first by the owning command list. Never overlap a serial command.
+        # File-backed output avoids interleaved diagnostics or an unbounded
+        # memory buffer. Keep every child and log alive through ordered delivery.
+        with ExitStack() as stack:
+            logs = [stack.enter_context(tempfile.TemporaryFile()) for _ in batch]
+            with OwnedThreadPoolExecutor(max_workers=min(4, len(batch))) as executor:
+                futures = []
+                for (label, command), output in zip(batch, logs):
+                    print(f"[RUN] {label}", flush=True)
+                    futures.append(executor.submit(_run_syntax_check, command, output))
+                for (label, _command), future, output in zip(batch, futures, logs):
+                    returncode = future.result()
+                    output.seek(0)
+                    # Decode across chunk boundaries, including split UTF-8.
+                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                    while chunk := output.read(64 * 1024):
+                        print(decoder.decode(chunk), end="", flush=True)
+                    print(decoder.decode(b"", final=True), end="", flush=True)
+                    yield label, returncode
+
+
 def run_script_audit(*, include_tests: bool, strict: bool) -> int:
     audit_targets = script_source_targets()
     kind_by_target = script_kind_map()
@@ -1016,20 +1082,14 @@ def run_script_audit(*, include_tests: bool, strict: bool) -> int:
         print(f"[ADVISORY] {advisory}", flush=True)
     failed_commands: list[str] = []
     passed_commands = 0
-    for label, command in commands:
-        print(f"[RUN] {label}", flush=True)
-        try:
-            returncode = run(command)
-        except OSError as exc:
-            print(f"[FAIL] {label}: {exc}", flush=True)
-            failed_commands.append(label)
-            continue
-        if returncode == 0:
-            print(f"[PASS] {label}", flush=True)
-            passed_commands += 1
-        else:
-            print(f"[FAIL] {label}: exit {returncode}", flush=True)
-            failed_commands.append(label)
+    with closing(_audit_command_results(commands)) as results:
+        for label, returncode in results:
+            if returncode == 0:
+                print(f"[PASS] {label}", flush=True)
+                passed_commands += 1
+            else:
+                print(f"[FAIL] {label}: exit {returncode}", flush=True)
+                failed_commands.append(label)
 
     strict_failure = strict and bool(advisories)
     if strict_failure:

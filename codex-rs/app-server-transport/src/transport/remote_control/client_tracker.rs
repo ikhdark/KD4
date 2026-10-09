@@ -48,6 +48,8 @@ pub(crate) struct ClientTracker {
     join_set: JoinSet<(ClientId, StreamId, ConnectionId)>,
     server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
+    // Unlike the child below, this is not cancelled by tracker-only shutdown.
+    transport_shutdown_token: CancellationToken,
     shutdown_token: CancellationToken,
 }
 
@@ -63,6 +65,7 @@ impl ClientTracker {
             join_set: JoinSet::new(),
             server_event_tx,
             transport_event_tx,
+            transport_shutdown_token: shutdown_token.clone(),
             shutdown_token: shutdown_token.child_token(),
         }
     }
@@ -426,17 +429,31 @@ impl ClientTracker {
             "forwarding remote control connection closed transport event"
         );
         let transport_event_tx = self.transport_event_tx.clone();
+        let transport_shutdown_token = self.transport_shutdown_token.clone();
         tokio::spawn(async move {
-            transport_event_tx
-                .send(TransportEvent::ConnectionClosed { connection_id })
-                .await
-                .map_err(|_| {
-                    warn!(
-                        transport_event = "connection_closed",
-                        "remote control transport event receiver dropped"
-                    );
-                    Stopped
-                })
+            let event = TransportEvent::ConnectionClosed { connection_id };
+            let result = match transport_event_tx.try_send(event) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    // Preserve cleanup across caller cancellation and reconnects, but
+                    // do not retain a sender after the transport itself shuts down.
+                    tokio::select! {
+                        biased;
+                        _ = transport_shutdown_token.cancelled() => return Ok(()),
+                        result = transport_event_tx.send(event) => result,
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(event)) => {
+                    Err(mpsc::error::SendError(event))
+                }
+            };
+            result.map_err(|_| {
+                warn!(
+                    transport_event = "connection_closed",
+                    "remote control transport event receiver dropped"
+                );
+                Stopped
+            })
         })
     }
 }
@@ -673,6 +690,101 @@ mod tests {
         timeout(Duration::from_secs(1), client_tracker.shutdown())
             .await
             .expect("shutdown should not hang on blocked server forwarding");
+    }
+
+    #[tokio::test]
+    async fn transport_shutdown_retires_clients_and_detached_cleanup_with_full_ingress() {
+        let (server_event_tx, _server_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (transport_event_tx, mut transport_event_rx) = mpsc::channel(2);
+        let shutdown = CancellationToken::new();
+        let mut tracker = ClientTracker::new(server_event_tx, transport_event_tx, &shutdown);
+        let mut writers = Vec::new();
+        for stream in ["stream-1", "stream-2", "stream-3"] {
+            tracker
+                .handle_message(initialize_envelope_with_stream_id("client", Some(stream)))
+                .await
+                .expect("initialize client stream");
+            match transport_event_rx.recv().await.expect("open event") {
+                TransportEvent::ConnectionOpened { writer, .. } => writers.push(writer),
+                other => panic!("expected open event, got {other:?}"),
+            }
+            assert!(matches!(
+                transport_event_rx.recv().await,
+                Some(TransportEvent::IncomingMessage { .. })
+            ));
+        }
+        for _ in 0..2 {
+            tracker
+                .transport_event_tx
+                .try_send(TransportEvent::ConnectionClosed {
+                    connection_id: next_connection_id(),
+                })
+                .expect("prefill ingress");
+        }
+        let mut cleanup = tracker.spawn_connection_closed(next_connection_id());
+        assert!(timeout(Duration::from_millis(20), &mut cleanup).await.is_err());
+
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), tracker.shutdown())
+            .await
+            .expect("transport shutdown must not wait for ingress to drain");
+        timeout(Duration::from_secs(1), cleanup)
+            .await
+            .expect("detached cleanup must also stop")
+            .expect("cleanup task")
+            .expect("cleanup succeeds");
+        assert!(tracker.clients.is_empty());
+        assert!(tracker.join_set.is_empty());
+        assert!(writers.iter().all(mpsc::Sender::is_closed));
+        drop(tracker);
+        assert!(transport_event_rx.is_closed(), "no cleanup senders remain");
+        for _ in 0..2 {
+            assert!(transport_event_rx.try_recv().is_ok());
+        }
+        assert!(transport_event_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tracker_only_shutdown_preserves_cleanup_with_full_ingress() {
+        let (server_event_tx, _server_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (transport_event_tx, mut transport_event_rx) = mpsc::channel(2);
+        let shutdown = CancellationToken::new();
+        let mut tracker = ClientTracker::new(server_event_tx, transport_event_tx, &shutdown);
+        tracker
+            .handle_message(initialize_envelope("client"))
+            .await
+            .expect("initialize client");
+        let connection_id = match transport_event_rx.recv().await.expect("open event") {
+            TransportEvent::ConnectionOpened { connection_id, .. } => connection_id,
+            other => panic!("expected open event, got {other:?}"),
+        };
+        let _ = transport_event_rx.recv().await.expect("initialize event");
+        for _ in 0..2 {
+            tracker
+                .transport_event_tx
+                .try_send(TransportEvent::IncomingMessage {
+                    connection_id,
+                    message: initialized_notification(),
+                })
+                .expect("prefill ingress");
+        }
+        let close = tracker.shutdown();
+        tokio::pin!(close);
+        assert!(timeout(Duration::from_millis(20), &mut close).await.is_err());
+        assert!(!shutdown.is_cancelled());
+        for _ in 0..2 {
+            assert!(matches!(
+                transport_event_rx.recv().await,
+                Some(TransportEvent::IncomingMessage { .. })
+            ));
+        }
+        timeout(Duration::from_secs(1), close)
+            .await
+            .expect("tracker shutdown completes after ingress drains");
+        match transport_event_rx.recv().await.expect("close event") {
+            TransportEvent::ConnectionClosed { connection_id: id } => assert_eq!(id, connection_id),
+            other => panic!("expected close event, got {other:?}"),
+        }
     }
 
     #[tokio::test]

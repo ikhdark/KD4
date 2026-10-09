@@ -308,13 +308,11 @@ async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
         }
     }
     assert!(stopped, "the real hook must have blocked the prompt");
-    assert!(!crate::session::multi_agents::spawn_is_authorized(&turn));
     let continuing = run_hooks_and_record_inputs_detailed(&session, &turn, &[
         TurnInput::ResponseItem(crate::compact::compaction_context_message("Accepted ongoing context".to_string())),
         TurnInput::UserInput { content: vec![UserInput::Text { text: "Use subagents".to_string(), text_elements: Vec::new() }], client_id: None },
     ]).await.unwrap();
     assert!(!continuing.should_stop);
-    assert!(!crate::session::multi_agents::spawn_is_authorized(&turn));
 }
 
 #[tokio::test]
@@ -3302,8 +3300,8 @@ fn goal_surface_state_has_disabled_inactive_and_active_transitions() {
     );
 }
 
-#[test]
-fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
+#[tokio::test]
+async fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
     assert_eq!(
         agent_surface_stage_from_snapshot(false, false, false),
         AgentSurfaceStage::Prohibited
@@ -3334,6 +3332,29 @@ fn agent_surface_stage_depends_only_on_coarse_graph_and_binding_state() {
     );
     // Running/waiting status, gates, targets, and capacity are deliberately absent from the
     // snapshot signature, so those fine-grained transitions cannot change the schema identity.
+
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    for policy in [
+        None,
+        Some(""),
+        Some("Do not use subagents"),
+        Some("Use subagents"),
+    ] {
+        Arc::make_mut(&mut turn.config)
+            .multi_agent_v2
+            .multi_agent_mode_hint_text = policy.map(str::to_string);
+        assert_eq!(
+            agent_surface_stage(&session, &turn),
+            AgentSurfaceStage::SpawnOnly,
+            "tool availability must not depend on parsing instruction text"
+        );
+    }
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::Disabled;
+    assert_eq!(
+        agent_surface_stage(&session, &turn),
+        AgentSurfaceStage::Prohibited
+    );
 }
 
 fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {
@@ -3844,6 +3865,78 @@ fn first_turn_dispatch_aborts_never_completing_prewarm() -> Result<()> {
     )
 }
 
+
+#[test]
+fn first_turn_dispatch_reports_disabled_startup_prewarm() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "first_turn_dispatch_reports_disabled_startup_prewarm",
+        || async {
+            let server = responses::start_mock_server().await;
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![responses::sse(vec![
+                    responses::ev_assistant_message("answer", "ordinary dispatch"),
+                    responses::ev_completed("done"),
+                ])],
+            )
+            .await;
+            let home = tempfile::tempdir()?;
+            let provider = non_openai_model_provider(&server);
+            let (session, turn, _events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    CodexAuth::from_api_key("test key"),
+                    Vec::new(),
+                    home.path(),
+                    move |config| {
+                        config.model_provider = provider;
+                        config.features.disable(Feature::CodeModeHost).unwrap();
+                    },
+                )
+                .await;
+            // Tool preparation completed without a speculative model request.
+            let task = tokio::spawn(async { Ok(None) });
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            session
+                .set_session_startup_prewarm(
+                    crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+                        task,
+                        std::time::Instant::now(),
+                    ),
+                )
+                .await;
+            let mut budget = LogicalGenerationBudget::default();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                run_turn(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    Arc::new(ExtensionData::new(turn.sub_id.clone())),
+                    vec![TurnInput::UserInput {
+                        content: vec![UserInput::Text {
+                            text: "dispatch now".into(),
+                            text_elements: Vec::new(),
+                        }],
+                        client_id: None,
+                    }],
+                    None,
+                    &mut budget,
+                    CancellationToken::new(),
+                ),
+            )
+            .await??;
+            assert_eq!(requests.requests().len(), 1);
+            assert!(requests.requests()[0].body_contains_text("dispatch now"));
+            let snapshot = session.startup_timing.complete_snapshot();
+            assert_eq!(snapshot.prewarm_status.as_deref(), Some("disabled"));
+            assert_eq!(snapshot.phases.transport_preconnect_ns, 0);
+            assert_eq!(snapshot.phases.prewarm_request_ns, 0);
+            assert!(session.take_session_startup_prewarm().await.is_none());
+            Ok(())
+        },
+    )
+}
 
 #[test]
 fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()> {
@@ -7674,6 +7767,10 @@ async fn completed_measurements_calibrate_next_prompt_pressure_with_safe_fallbac
             "measurement", "physical",
             serde_json::json!({"model": turn.model_info.slug}).to_string().as_bytes(),
         );
+        timing.record_model_request_sections(
+            "measurement", "physical",
+            serde_json::json!({"model": turn.model_info.slug}).to_string().as_bytes(),
+        );
         timing.record_model_request_token_categories(
             "measurement", "physical",
             codex_protocol::protocol::TurnTimingRequestTokenCategories {
@@ -8919,3 +9016,7 @@ async fn failed_response_recording_is_reported_at_the_relay_boundary() {
         "failed response recording must be reported before publishing tool outputs"
     );
 }
+
+#[path = "completion_latency_tests.rs"]
+mod completion_latency;
+

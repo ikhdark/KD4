@@ -224,17 +224,18 @@ fn new_with_disabled_bundled_skills_removes_stale_cached_system_skills() {
 }
 
 #[tokio::test]
-async fn bundled_harness_tools_are_discovered_in_an_unrelated_repository() {
+async fn bundled_system_skills_are_discovered_without_harness_tools() {
     let codex_home = tempfile::tempdir().expect("home");
     let cwd = tempfile::tempdir().expect("unrelated repository");
     let config_layer_stack = config_stack(&codex_home, "");
     let service = SkillsService::new(codex_home.path().abs(), true);
     let outcome = skills_for_config_with_stack(&service, &cwd, &config_layer_stack, &[]).await;
+    assert!(outcome.skills.iter().all(|skill| skill.name != "harness-tools"));
     let skill = outcome
         .skills
         .iter()
-        .find(|skill| skill.name == "harness-tools")
-        .expect("bundled harness capability is discoverable without repository scripts");
+        .find(|skill| skill.name == "skill-creator")
+        .expect("other bundled skills remain discoverable without repository scripts");
     assert_eq!(skill.scope, SkillScope::System);
     assert!(outcome.is_skill_enabled(skill));
     let root = skill
@@ -242,9 +243,7 @@ async fn bundled_harness_tools_are_discovered_in_an_unrelated_repository() {
         .as_path()
         .parent()
         .expect("skill root");
-    assert!(root.join("scripts/harness_tools.py").is_file());
-    assert!(root.join("scripts/lib/source_inventory.py").is_file());
-    assert!(root.join("scripts/lib/kd4_turn_latency_audit.py").is_file());
+    assert!(root.join("scripts/init_skill.py").is_file());
     assert!(!cwd.path().join("scripts").exists());
 
     let disabled = config_stack(&codex_home, "[skills.bundled]\nenabled = false\n");
@@ -253,7 +252,7 @@ async fn bundled_harness_tools_are_discovered_in_an_unrelated_repository() {
         outcome
             .skills
             .iter()
-            .all(|skill| skill.name != "harness-tools")
+            .all(|skill| skill.scope != SkillScope::System)
     );
 }
 

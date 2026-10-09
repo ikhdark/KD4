@@ -25,6 +25,7 @@ const BEHAVIORAL_VALIDATOR: &str = "import sys,time; from pathlib import Path; f
 #[test_case::test_case("graph")]
 #[test_case::test_case("recovery")]
 #[test_case::test_case("large-recovery")]
+#[test_case::test_case("recipe-recovery")]
 #[test_case::test_case("poll")]
 #[test_case::test_case("retained")]
 #[test_case::test_case("validation_overlap")]
@@ -57,7 +58,9 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             serde_json::json!({"path":"second.txt","selected":true}),
         ]);
         fs::write(test.cwd.path().join("inventory.json"), serde_json::to_vec(&inventory)?)?;
-        let bulk = serde_json::json!({"answer":answer,"padding":"filler ".repeat(if scenario == "large-recovery" { 10_000 } else { 900 })}).to_string();
+        let bulk = serde_json::json!({"answer":answer,"padding":"filler ".repeat(match scenario {
+            "recipe-recovery" => 160_000, "large-recovery" => 10_000, _ => 900,
+        })}).to_string();
         fs::write(test.cwd.path().join("bulk.json"), &bulk)?;
         // Larger than a model display page, but comfortably within the exact
         // script payload limit. A short computed answer must not force paging.
@@ -184,6 +187,36 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                     const value = JSON.parse(parts.join('')); if (value.padding !== 'filler '.repeat(10000)) throw Error('corrupt payload'); text(value.answer);"#,
                     bulk.len(), if candidate { 1024 * 1024 } else { 16_384 }, bulk.len(), candidate),
             ),
+            "recipe-recovery" => (
+                Some("{ const head = await tools.read_file({path:'bulk.json'}); if (!head.complete || head.file_complete || !head.recovery) throw Error('expected retained suffix'); store('recipeHead',head); }".to_string()),
+                format!(r#"const head = load('recipeHead'); let args = {{...head.recovery.arguments}};
+                    if (!{}) delete args.max_bytes;
+                    let offset = head.continuation.start, parts = [head.results[0].text], calls = 0;
+                    while (offset < head.canonical_bytes && calls < 64) {{
+                        const r = await tools.read_tool_output(args); ++calls;
+                        if (r.artifact_id !== head.artifact_id || r.canonical_sha256 !== head.source_sha256 ||
+                            r.canonical_bytes !== head.canonical_bytes) throw Error('snapshot changed');
+                        const before = offset;
+                        for (const part of r.results) {{
+                            if (part.status === 'selector_too_large' && !part.complete && part.text === undefined &&
+                                (Array.isArray(part.child_selectors) || part.continuation?.kind === 'bytes')) continue;
+                            if (part.status !== 'ok' || !part.complete || typeof part.text !== 'string' ||
+                                part.canonical_range.start !== offset || part.canonical_range.end <= offset ||
+                                part.canonical_range.end > head.canonical_bytes) throw Error('incomplete source: '+JSON.stringify({{status:part.status,complete:part.complete,range:part.canonical_range,continuation:part.continuation,offset,calls,stop:r.continuation_stop}}));
+                            offset = part.canonical_range.end; parts.push(part.text);
+                        }}
+                        if (offset <= before) throw Error('no recovery progress');
+                        if (r.complete) break;
+                        const stop = r.continuation_stop;
+                        if (stop?.reason !== 'budget' || !stop.resumable || stop.selector?.kind !== 'bytes' ||
+                            stop.selector.start !== offset || stop.selector.end !== head.canonical_bytes) throw Error('recovery needs review');
+                        args = {{...args,selectors:[stop.selector]}};
+                    }}
+                    if (offset !== head.canonical_bytes || ({} && calls !== 1)) throw Error('incomplete/redundant recovery');
+                    const value = JSON.parse(parts.join(''));
+                    if (value.padding !== 'filler '.repeat(160000)) throw Error('changed evidence');
+                    text(value.answer);"#, candidate, candidate),
+            ),
             "retained" => (
                 Some("const r = await tools.read_file({path:'answer.txt'}); if (!r.file_complete) throw Error('incomplete source'); store('evidence', r);".to_string()),
                 if candidate {
@@ -266,7 +299,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         };
         // Discovery and independent reads already have same-cell APIs. Recovery
         // and polling also need their owners not to manufacture a model boundary.
-        let inline_prepare = if candidate && matches!(scenario, "recovery" | "large-recovery" | "poll" | "retained" | "retained-batch" | "bounded-inventory") {
+        let inline_prepare = if candidate && matches!(scenario, "recovery" | "large-recovery" | "recipe-recovery" | "poll" | "retained" | "retained-batch" | "bounded-inventory") {
             prepare.as_deref().unwrap_or_default()
         } else {
             ""
@@ -426,7 +459,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             let commands = calls.iter().filter(|call| call["toolName"] == "exec_command").count();
             assert_eq!(commands, if candidate { 1 } else { 2 }, "no discovery-only command or retry");
         }
-        if scenario == "large-recovery" {
+        if matches!(scenario, "large-recovery" | "recipe-recovery") {
             let recoveries = calls.iter().filter(|call| call["toolName"] == "read_tool_output").count();
             if candidate { assert_eq!(recoveries, 1); } else { assert!(recoveries > 1); }
         }
@@ -440,6 +473,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             "scenario":scenario, "candidate":candidate,
             "wall_ms":started_at.elapsed().as_millis(),
             "model_requests":model_requests, "native_reads":reads,
+            "native_recoveries":calls.iter().filter(|call| call["toolName"] == "read_tool_output").count(),
             "outer_tool_calls":outer_calls,
             "projected_tool_output_bytes":timing_json["counters"]["toolOutputModelByteCount"],
             "exact_answer_and_persistence_verified":true,

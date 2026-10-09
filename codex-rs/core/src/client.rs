@@ -67,6 +67,7 @@ use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
 use codex_client::TransportPhaseObservation;
 use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
@@ -1199,6 +1200,7 @@ fn measure_responses_request_after_dispatch(
     cancellation: CancellationToken,
     logical_request_bytes: Option<u64>,
     encoded_request: Option<Bytes>,
+    payload_timing: Option<(Arc<TurnTimingState>, ResponseAttemptIdentity)>,
 ) -> tokio::task::JoinHandle<PostDispatchRequestMeasurements> {
     let selected_budget_drops = prompt.selected_tool_output_budget_drops(
         selected_representation.stable_context_fallback,
@@ -1209,6 +1211,20 @@ fn measure_responses_request_after_dispatch(
         let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
         let blocking_cancellation = cancellation.clone();
         let result = tokio::task::spawn_blocking(move || {
+            // Reuse the dispatched bytes and this worker. Canonical JSON
+            // parsing/hashing must not hold up either HTTP or WS transmission.
+            // Publish before token categories so calibration never sees those
+            // categories without their matching model fingerprint.
+            if !blocking_cancellation.is_cancelled()
+                && let Some((timing, identity)) = payload_timing
+                && let Some(encoded) = encoded_request.as_deref()
+            {
+                timing.record_model_request_sections(
+                    &identity.sampling_request_id,
+                    &identity.physical_attempt_id,
+                    encoded,
+                );
+            }
             let provenance = if input_reprojected {
                 prompt
                     .prompt_provenance
@@ -1922,6 +1938,45 @@ fn session_telemetry_for_request(
     )
 }
 
+/// Thread-manager-owned HTTP transports. Conversation and WebSocket state are never shared.
+/// Like individual route pools, these retain process TLS settings until their owner is replaced.
+#[derive(Default)]
+pub(crate) struct SharedModelHttpClients {
+    pools: StdMutex<VecDeque<(HttpClientFactory, ApiHeaderMap, RouteAwareClientPool)>>,
+}
+
+impl SharedModelHttpClients {
+    fn pool(&self, factory: &HttpClientFactory, headers: ApiHeaderMap) -> RouteAwareClientPool {
+        const MAX_POOLS: usize = 8;
+        let mut pools = self
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = pools.iter().position(|(cached_factory, cached_headers, _)| {
+            cached_factory == factory && cached_headers == &headers
+        }) {
+            let entry = pools.remove(index).expect("matched pool exists");
+            let pool = entry.2.clone();
+            pools.push_back(entry);
+            return pool;
+        }
+        // Snapshot the defaults once so the cache key and the actual headers cannot diverge.
+        // No network or TLS construction occurs while holding this lock; route pools are lazy.
+        let pool = RouteAwareClientPool::with_builder(
+            factory.clone(),
+            ClientRouteClass::Api,
+            HttpClientBuilder::new()
+                .default_headers(headers.clone())
+                .with_chatgpt_cloudflare_cookie_store(),
+        );
+        if pools.len() == MAX_POOLS {
+            pools.pop_front();
+        }
+        pools.push_back((factory.clone(), headers, pool.clone()));
+        pool
+    }
+}
+
 /// Session-scoped state shared by all [`ModelClient`] clones.
 ///
 /// This is intentionally kept minimal so `ModelClient` does not need to hold a full `Config`. Most
@@ -2211,14 +2266,18 @@ impl CanonicalPrefixHash {
     }
 
     fn extend_iter<'a>(&mut self, items: impl IntoIterator<Item = &'a ResponseItem>) -> serde_json::Result<()> {
+        // Reuse scratch storage within this pass, not across requests. Large
+        // histories otherwise allocate and grow a fresh JSON buffer per item.
+        let mut serialized = Vec::new();
         for item in items {
             let normalized = normalized_websocket_history_item(item);
-            let serialized = serde_json::to_vec(&normalized)?;
+            serialized.clear();
+            serde_json::to_writer(&mut serialized, &normalized)?;
             let mut hasher = Sha256::new();
             hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
             hasher.update(self.digest);
             hasher.update((serialized.len() as u64).to_be_bytes());
-            hasher.update(serialized);
+            hasher.update(&serialized);
             self.digest = hasher.finalize().into();
             self.item_count = self.item_count.saturating_add(1);
         }
@@ -2622,6 +2681,22 @@ impl ModelClient {
             agent_identity_policy,
             http_client_factory,
         }
+    }
+
+    /// Attach shared transports immediately after construction, before cloning the client.
+    pub(crate) fn with_shared_http_clients(
+        mut self,
+        shared: Option<&SharedModelHttpClients>,
+    ) -> Self {
+        if let Some(shared) = shared {
+            let state = Arc::get_mut(&mut self.state)
+                .expect("shared HTTP transports must be attached before cloning the model client");
+            state.http_clients = shared.pool(
+                &self.http_client_factory,
+                codex_login::default_client::default_headers(),
+            );
+        }
+        self
     }
 
     fn prompt_cache_key(&self) -> String {
@@ -3119,7 +3194,16 @@ impl ModelClient {
             .client_for_url(&request_url)
             .await
             .map_err(std::io::Error::other)?;
-        Ok(ReqwestTransport::from_http_client(client))
+        // Keep the eager setup/error boundary, but let the pool select the route
+        // for every dispatched URL and redirect hop. Its system-proxy clients
+        // deliberately disable reqwest's automatic redirect handling.
+        if self.http_client_factory.outbound_proxy_policy()
+            == codex_http_client::OutboundProxyPolicy::RespectSystemProxy
+        {
+            Ok(ReqwestTransport::from_client_pool(self.state.http_clients.clone()))
+        } else {
+            Ok(ReqwestTransport::from_http_client(client))
+        }
     }
 
     pub(crate) async fn prewarm_auth(&self) -> Result<()> {
@@ -4264,6 +4348,7 @@ impl ModelClientSession {
                     measurement_cancellation.clone(),
                     logical_request_bytes,
                     dispatched_request,
+                    self.turn_timing.clone().map(|timing| (timing, attempt_identity.clone())),
                 ));
             let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
             let prompt_digests = prompt.digests;
@@ -4871,6 +4956,7 @@ impl ModelClientSession {
                             measurement_cancellation.clone(),
                             /*logical_request_bytes*/ None,
                             dispatched_request,
+                            self.turn_timing.clone().map(|timing| (timing, attempt_identity.clone())),
                         ));
                     let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
                     let prompt_digests = prompt.digests;

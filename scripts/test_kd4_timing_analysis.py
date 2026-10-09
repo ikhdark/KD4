@@ -67,6 +67,89 @@ def timing_profile() -> dict:
     }
 
 
+class RequestSetupAnalysisTest(unittest.TestCase):
+    def test_requests_and_retries_keep_independent_setup_without_changing_wall_time(self):
+        timing = timing_profile()
+        timing["schemaVersion"] = 30
+        timing["modelRequests"] = [
+            {"generationIndex": 0, "attemptKind": "primary", "dispatchMs": 5,
+             "setupPhaseNs": {"preparation": 2_000_000, "history_snapshot": 2_000_000}},
+            {"generationIndex": 1, "attemptKind": "primary", "dispatchMs": 15,
+             "physicalAttemptIds": ["attempt-a", "attempt-b"],
+             "setupPhaseNs": {"preparation": 4_000_000, "history_snapshot": 4_000_000}},
+            {"generationIndex": 2, "attemptKind": "primary", "dispatchMs": None,
+             "setupPhaseNs": {}},
+            {"generationIndex": 2, "attemptKind": "retry", "dispatchMs": 25,
+             "setupPhaseNs": {"serialization": 2_000_000}},
+        ]
+        timing["counters"]["modelRequestCount"] = 4
+        original = copy.deepcopy(timing)
+        without_setup = copy.deepcopy(timing)
+        for request in without_setup["modelRequests"]:
+            request.pop("setupPhaseNs")
+        baseline = analysis.analyze_timing(without_setup, include_tokens=False)
+        report = analysis.analyze_timing(timing, include_tokens=False)
+        setup = report["requestSetup"]
+        self.assertEqual({key: value for key, value in report.items() if key != "requestSetup"},
+                         {key: value for key, value in baseline.items() if key != "requestSetup"})
+        self.assertEqual((setup["requestRows"], setup["measuredRequests"], setup["missingRequests"]),
+                         (4, 3, 1))
+        self.assertTrue(setup["retentionComplete"])
+        self.assertEqual(setup["phaseSummariesNs"]["preparation"],
+                         {"count": 2, "observedTotalNs": 6_000_000,
+                          "minNs": 2_000_000, "maxNs": 4_000_000})
+        self.assertEqual(setup["phaseSummariesNs"]["serialization"]["observedTotalNs"], 2_000_000)
+        self.assertNotIn("totalNs", setup)
+        event = {"method": "turn/completed", "params": {"turn": {
+            "id": "turn", "status": "completed", "timing": timing,
+        }}}
+        runner = analysis.analyze_runner_evidence(
+            {"schemaVersion": 1, "events": [event, copy.deepcopy(event)]}, include_tokens=False
+        )
+        self.assertEqual(runner["runtime"]["requestSetup"], setup)
+        self.assertEqual([row["setupPhaseNs"] for row in runner["generations"]],
+                         [request["setupPhaseNs"] or None for request in timing["modelRequests"]])
+        self.assertEqual(runner["retryEvidence"][0]["setupPhaseNs"], {"serialization": 2_000_000})
+        self.assertEqual(timing, original)
+
+    def test_historical_empty_and_missing_maps_are_unavailable_not_zero(self):
+        for version in (14, 29, 30):
+            with self.subTest(version=version):
+                timing = timing_profile()
+                timing["schemaVersion"] = version
+                timing["modelRequests"][1]["setupPhaseNs"] = {}
+                report = analysis.analyze_timing(timing)
+                setup = report["requestSetup"]
+                self.assertFalse(setup["available"])
+                self.assertEqual(setup["phaseSummariesNs"], {})
+                self.assertEqual(setup["measuredRequests"], 0)
+                self.assertEqual(setup["missingRequests"], 2)
+                self.assertIsNone(setup["retentionComplete"])
+                self.assertIsNone(analysis.timing_profile_error(timing))
+
+    def test_partial_phase_coverage_and_recorded_zero_survive_incomplete_retention(self):
+        timing = timing_profile()
+        timing["modelRequests"][0]["setupPhaseNs"] = {"preparation": 0, "future_phase": 7}
+        timing["modelRequests"][1]["setupPhaseNs"] = {"history_snapshot": 3}
+        timing["counters"]["modelRequestCount"] = 3
+        setup = analysis.analyze_timing(timing)["requestSetup"]
+        self.assertTrue(setup["available"])
+        self.assertFalse(setup["retentionComplete"])
+        self.assertEqual(setup["requestRows"], 2)
+        self.assertEqual(setup["phaseSummariesNs"]["preparation"],
+                         {"count": 1, "observedTotalNs": 0, "minNs": 0, "maxNs": 0})
+        self.assertEqual(setup["phaseSummariesNs"]["future_phase"]["observedTotalNs"], 7)
+        self.assertEqual(setup["phaseSummariesNs"]["history_snapshot"]["count"], 1)
+
+    def test_malformed_setup_uses_existing_profile_validation(self):
+        for phases in ([], 0, {"serialization": -1}, {"serialization": True},
+                       {"serialization": 1.5}, {"serialization": "2"}, {"serialization": 2**64}):
+            with self.subTest(phases=phases):
+                timing = timing_profile()
+                timing["modelRequests"][0]["setupPhaseNs"] = phases
+                self.assertEqual(analysis.timing_profile_error(timing), "malformed_timing_fields")
+
+
 class TimingEvidenceRegressionsTest(unittest.TestCase):
     def test_audit_conflicts_compare_full_profiles_not_only_milestones(self):
         first = timing_profile()
@@ -1442,6 +1525,47 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         self.assertEqual(report["directToolCount"], 1)
         self.assertEqual(report["failures"][0]["kind"], "tool_execution_failure")
         self.assertEqual(report["symptoms"][-1]["source"], "tool_output")
+
+    def test_open_followup_does_not_inherit_completion_or_complete_metrics(self):
+        evidence = self.evidence()
+        evidence.pop("status")
+        evidence["events"].append({"message": {
+            "method": "turn/started", "params": {"turn": {"id": "followup"}},
+        }})
+        for include_tokens in (True, False):
+            report = analysis.analyze_runner_evidence(evidence, include_tokens=include_tokens)
+            self.assertEqual(report["status"], "unfinished")
+            self.assertEqual(report["coverage"]["unfinishedTurns"], 1)
+            self.assertEqual(report["coverage"]["terminalTurns"], 1)
+            self.assertFalse(report["toolDispatch"]["available"])
+            if include_tokens:
+                self.assertFalse(report["tokens"]["complete"])
+                self.assertEqual(report["tokenCoverage"]["unfinishedProfileTurnIds"], ["followup"])
+        # An explicit attempt outcome remains authoritative, but cannot turn
+        # incomplete native coverage into complete usage/dispatch telemetry.
+        evidence["status"] = "timeout"
+        self.assertEqual(analysis.analyze_runner_evidence(evidence)["status"], "timeout")
+        evidence.pop("status")
+        evidence["events"].append({"message": {
+            "method": "turn/completed", "params": {"turn": {"id": "followup", "status": "completed"}},
+        }})
+        report = analysis.analyze_runner_evidence(evidence)
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["coverage"]["unfinishedTurns"], 0)
+
+    def test_open_turn_ids_remain_thread_qualified(self):
+        events = [
+            {"message": {"method": "turn/completed", "params": {
+                "threadId": "first", "turn": {"id": "shared", "status": "completed"},
+            }}},
+            {"message": {"method": "turn/started", "params": {
+                "threadId": "second", "turn": {"id": "shared"},
+            }}},
+        ]
+        report = analysis.analyze_runner_evidence({"schemaVersion": 1, "events": events})
+        self.assertEqual(report["status"], "unfinished")
+        self.assertEqual(report["tokenCoverage"]["unfinishedProfileTurnIds"], ['["second","shared"]'])
+        self.assertEqual(report["terminalTurns"], {'["first","shared"]': "completed"})
 
     def test_terminal_error_without_status_is_reported_as_failed(self):
         error = {"message": "provider rejected request"}

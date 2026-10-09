@@ -1,6 +1,54 @@
 use super::*;
 
 #[tokio::test]
+async fn repetition_rebase_round_trip_benchmark() {
+    use core_test_support::responses::{ev_assistant_message, ev_completed, mount_response_sequence, sse, sse_response, start_mock_server};
+    let anchor = format!("Verification is UNRUN; do not deploy. {}", "Preserve compatibility. ".repeat(80));
+    let previous = format!("{SUMMARY_PREFIX}\n## Goal\nReview only.\n## Current state\nInvestigating.\n## Completed work\nRead source.\n## Unresolved work\n{anchor}\n## Evidence\nHistorical source; freshness unknown.\n## Next action\nInspect.");
+    let suffix = "## Unresolved work\nCheck cancellation.\n## Next action\nVerify both obligations.";
+    assert!(compaction_rebase_sections(&previous).contains(&3));
+    for sample in 0..5 {
+        let server = start_mock_server().await;
+        let request = mount_response_sequence(&server, [suffix].into_iter().map(|summary|
+            sse_response(sse(vec![ev_assistant_message("summary", summary), ev_completed("compacted")]))
+                .set_delay(std::time::Duration::from_millis(25))).collect()).await;
+        let home = tempfile::tempdir().unwrap();
+        let (mut session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(), |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                    config.compact_prompt = None;
+                }).await;
+        crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+        let mut observation = user_message("New source observed; cancellation is still untested.");
+        if let ResponseItem::Message { role, .. } = &mut observation { *role = "assistant".into(); }
+        session.record_conversation_items(&turn, &[
+            compaction_summary_item_with_artifact_pins(previous.clone(), None),
+            user_message("Continue reviewing; do not repeat completed inspection."), observation,
+        ]).await.unwrap();
+        let start = std::time::Instant::now();
+        let summary = run_compact_task_inner_impl(Arc::clone(&session), Arc::clone(&turn), None, Some(&None),
+            Vec::new(), InitialContextInjection::DoNotInject,
+            CompactionTurnMetadata::new(CompactionTrigger::Manual, CompactionReason::UserRequested,
+                CompactionImplementation::Responses, CompactionPhase::StandaloneTurn),
+            &mut CompactionAnalyticsDetails::default(), false, &CancellationToken::new()).await.unwrap();
+        session.live_thread().unwrap().flush().await.unwrap();
+        let wall_us = start.elapsed().as_micros();
+        let requests = request.requests().len();
+        assert_eq!(requests, 1, "missing anchors are restored without a corrective generation");
+        assert!(summary.contains(&anchor));
+        assert!(summary.contains("Check cancellation."));
+        assert!(summary.contains("freshness unknown"));
+        assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+        let persisted = session.live_thread().unwrap().load_history(false).await.unwrap();
+        assert!(persisted.items.iter().any(|item| matches!(item,
+            codex_protocol::protocol::RolloutItem::Compacted(compacted) if compacted.message == summary)));
+        eprintln!("repetition-rebase sample={sample} requests={requests} wall_us={wall_us} scripted_response_delay_ms=25");
+    }
+}
+
+#[tokio::test]
 async fn uncertainty_first_compaction_retains_unplanned_source_with_one_request() {
     use core_test_support::responses::{ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server};
     use crate::tools::command_output_artifact::read_exact_tool_output_artifact;
@@ -1088,8 +1136,12 @@ fn original_request_and_corrections_survive_later_bulk_input() {
 fn rebase_cannot_silently_erase_unresolved_prohibition() {
     let anchor = "Diagnosis only; do not edit. Verification remains unfinished.";
     let previous = format!("{SUMMARY_PREFIX}\n## Goal\nDiagnose.\n## Current state\nInvestigating.\n## Completed work\nRead source.\n## Unresolved work\n{anchor}\n## Evidence\nSource.\n## Next action\nVerify.");
-    let error = validated_rebased_compaction_summary(&previous, "## Unresolved work\nNone", &[3]).unwrap_err();
-    assert!(error.to_string().contains("omitted a prior unresolved anchor"));
+    let summary = validated_rebased_compaction_summary(&previous, "## Unresolved work\nNone", &[3]).unwrap();
+    let mut section = None;
+    assert!(checkpoint_lines(&summary).any(|(line, heading)| {
+        if heading.is_some() { section = heading; }
+        section == Some(3) && line == anchor
+    }), "repair must retain the prohibition as unresolved, not just quote it elsewhere");
     let accounted = format!("## Unresolved work\nNone\n## Completed work\nResolved: {anchor} Evidence: diagnosis delivered without edits.");
     let summary = validated_rebased_compaction_summary(&previous, &accounted, &[3]).unwrap();
     assert!(summary.contains(anchor), "accounting remains a visible model claim, not proof");

@@ -2319,7 +2319,12 @@ impl ToolHistoryState {
             return None;
         }
         let extend = |base: &Arc<[ResponseItem]>| -> Arc<[ResponseItem]> {
-            let items = if tail.is_empty() {
+            let items = if Arc::ptr_eq(base, &anchor.prepared_items) {
+                // No earlier projection changed the prefix (including by
+                // appending freshness notices). The transport-ready input is
+                // already base + tail; do not deep-copy it a second time.
+                Arc::clone(&prepared_items)
+            } else if tail.is_empty() {
                 Arc::clone(base)
             } else {
                 let mut items = Vec::with_capacity(base.len().saturating_add(tail.len()));

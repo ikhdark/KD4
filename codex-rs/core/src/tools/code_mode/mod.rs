@@ -23,6 +23,7 @@ use codex_protocol::items::DynamicToolCallItem;
 use codex_protocol::items::DynamicToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use futures::FutureExt;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
@@ -117,6 +118,7 @@ struct CodeModePacketAdmission {
 
 #[derive(Default)]
 struct CodeModePacketMetrics {
+    retention_tail: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
     turn_id: Option<String>,
     output_budget: Option<usize>,
     delivery_intent: Option<CodeModeDeliveryIntent>,
@@ -130,6 +132,7 @@ struct CodeModePacketMetrics {
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
     nested_recovery: std::collections::BTreeMap<usize, JsonValue>,
+    inline_recovery_bytes: usize,
     omitted_nested_result_count: usize,
     first_required_terminal: Option<CodeModeNestedTerminal>,
 }
@@ -289,6 +292,9 @@ fn bounded_serialized_json(value: &JsonValue) -> (String, bool, usize) {
 
 const MAX_RETAINED_NESTED_RESULTS: usize = 2;
 const MAX_RETAINED_NESTED_RESULT_BYTES: usize = 1_024;
+// Diagnostic previews are not a storage threshold. Retain ordinary native
+// results in the packet; spill only when its aggregate recovery budget is full.
+const MAX_INLINE_PACKET_RECOVERY_BYTES: usize = 1024 * 1024;
 const MAX_FAILED_CELL_ERROR_BYTES: usize = 4_096;
 const FAILED_CELL_ERROR_TRUNCATION_MARKER: &str = "\n… [truncated]";
 const APPLY_PATCH_ENVELOPE_MARKER: &str = "*** Begin Patch";
@@ -650,6 +656,68 @@ impl CodeModeService {
         Some(ordinal)
     }
 
+    fn try_record_inline_packet_recovery(
+        &self,
+        cell_id: &CellId,
+        ordinal: usize,
+        result_bytes: usize,
+        recovery: impl FnOnce() -> JsonValue,
+    ) -> bool {
+        let mut admission = self.packet_admission.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else {
+            return false;
+        };
+        if result_bytes > MAX_INLINE_PACKET_RECOVERY_BYTES.saturating_sub(metrics.inline_recovery_bytes) {
+            return false;
+        }
+        metrics.inline_recovery_bytes += result_bytes;
+        metrics.nested_recovery.insert(ordinal, recovery());
+        true
+    }
+
+    fn queue_packet_retention(
+        &self,
+        session: &Session,
+        cell_id: &CellId,
+        retention: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>> {
+        let (done, receiver) = tokio::sync::oneshot::channel();
+        let tail = async move { let _ = receiver.await; }.boxed().shared();
+        let previous = self.packet_admission.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells.get_mut(cell_id.as_str())
+            .and_then(|metrics| metrics.retention_tail.replace(tail));
+        // Session shutdown owns accepted writes, even if a caller is cancelled.
+        // A closed packet is never recreated by late persistence completion.
+        let backpressure = previous.clone();
+        session.terminal_tasks.spawn(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            retention.await;
+            let _ = done.send(());
+        });
+        // Do not let a sequential producer accumulate full results behind slow
+        // storage. Wait for its predecessor, not this write: the next tool can
+        // still overlap persistence. Concurrent producers remain bounded by the
+        // runtime's outstanding-callback limit. Enqueue before exposing the wait
+        // so cancelling the observer never discards an accepted result.
+        backpressure
+    }
+
+    async fn flush_packet_retention(&self, cell_id: &CellId) {
+        // Snapshot without removing the tail: cancellation of a wait must not
+        // break ordering, and a live cell may enqueue more work during a yield.
+        let tail = self.packet_admission.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells.get(cell_id.as_str())
+            .and_then(|metrics| metrics.retention_tail.clone());
+        if let Some(tail) = tail {
+            tail.await;
+        }
+    }
+
     fn record_packet_recovery(&self, cell_id: &CellId, ordinal: usize, recovery: JsonValue) {
         if let Some(metrics) = self.packet_admission.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).cells.get_mut(cell_id.as_str())
@@ -769,6 +837,7 @@ impl CodeModeService {
             .map(|metrics| {
                 let next_nested_ordinal = metrics.next_nested_ordinal;
                 let mut packet = std::mem::take(metrics);
+                metrics.retention_tail = packet.retention_tail.take();
                 // Live output and steering can cross outstanding child calls.
                 // Drain response data, but keep registration order for the cell.
                 metrics.next_nested_ordinal = next_nested_ordinal;
@@ -914,7 +983,9 @@ pub(super) fn handle_runtime_response(
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
     let needs_retained_results = response_needs_retained_nested_results(&response);
     let nested_results = if needs_retained_results {
-        if packet.omitted_nested_result_count > 0 {
+        if packet.omitted_nested_result_count > 0
+            || packet.nested_results.iter().any(|result| result.output_truncated)
+        {
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: serde_json::json!({
                     "nested_result_recovery_directory": packet.nested_recovery.into_values().collect::<Vec<_>>(),
@@ -1902,63 +1973,102 @@ async fn call_nested_tool(
             .record_nested_tool_output_reduction();
     }
     let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
-    // Reuse dispatcher retention. Only results without a canonical receipt need
-    // new storage, and only when their complete inline outcome does not fit.
+    // Source evidence may outlive the packet; retain its independent pin when
+    // it cannot use a compact native read receipt or a small inline observation.
+    let compact_source_read = tool_name == ToolName::plain("read_file")
+        && result_value["source_sha256"].is_string();
+    let needs_source_pin = parent_tool_call_id.is_some()
+        && source_dependencies.as_ref().is_some_and(|dependencies| !dependencies.is_empty())
+        && result_bytes > 4_096 && !compact_source_read;
     let mut recovery_artifact = retained_artifact;
-    if recovery_artifact.is_none() && output_truncated {
-        let canonical = codex_tools::CanonicalToolResult::json(result_value.clone());
-        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-            &exec.turn.config.codex_home, &exec.session.thread_id.to_string(), &canonical,
-        ).await;
-        if artifact.complete && let Some(id) = artifact.artifact_id() {
-            exec.session.register_tool_artifact_origin(id.clone(), nested_call_id.clone(),
-                canonical.exact_bytes, canonical.sha256.clone()).await;
-            recovery_artifact = Some((id, canonical.sha256, canonical.exact_bytes));
+    let inline_recovery = recovery_artifact.is_none() && !needs_source_pin
+        && exec.session.services.code_mode_service.try_record_inline_packet_recovery(
+            &cell_id, packet_ordinal, result_bytes, || serde_json::json!({
+                "call_id":nested_call_id, "tool_name":tool_name.to_string(),
+                "failed":!matches!(outcome_context.outcome, ToolOutputOutcome::Success | ToolOutputOutcome::Yielded),
+                "outcome":{"result":result_value},
+            }),
+        );
+    let defer_retention = recovery_artifact.is_none() && !inline_recovery;
+    let retention = {
+        let exec = exec.clone();
+        let cell_id = cell_id.clone();
+        let nested_call_id = nested_call_id.clone();
+        let parent_tool_call_id = parent_tool_call_id.clone();
+        let tool_name = tool_name.clone();
+        let result_value = result_value.clone();
+        let retained_output = retained_output.clone();
+        let has_source_dependencies = source_dependencies.as_ref()
+            .is_some_and(|dependencies| !dependencies.is_empty());
+        let failed = !matches!(outcome_context.outcome, ToolOutputOutcome::Success | ToolOutputOutcome::Yielded);
+        async move {
+            if defer_retention {
+                let canonical = codex_tools::CanonicalToolResult::json(result_value.clone());
+                let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+                    &exec.turn.config.codex_home, &exec.session.thread_id.to_string(), &canonical,
+                ).await;
+                if artifact.complete && let Some(id) = artifact.artifact_id() {
+                    exec.session.register_tool_artifact_origin(id.clone(), nested_call_id.clone(),
+                        canonical.exact_bytes, canonical.sha256.clone()).await;
+                    recovery_artifact = Some((id, canonical.sha256, canonical.exact_bytes));
+                }
+            }
+            if !inline_recovery {
+                let recovery = if let Some((id, sha256, bytes)) = &recovery_artifact {
+                    serde_json::json!({
+                        "artifact_id": id, "canonical_sha256": sha256, "canonical_bytes": bytes,
+                        "recovery": {"tool":"read_tool_output", "arguments": {
+                            "artifact_id":id, "selectors":[{"kind":"bytes","start":0,"end":bytes}]
+                        }},
+                    })
+                } else {
+                    serde_json::json!({"output": retained_output, "output_truncated":output_truncated,
+                        "recovery_available":!output_truncated,
+                        "notice":"Canonical retention failed; do not replay effects."})
+                };
+                exec.session.services.code_mode_service.record_packet_recovery(&cell_id, packet_ordinal,
+                    serde_json::json!({"call_id":nested_call_id,"tool_name":tool_name.to_string(),
+                        "failed":failed,
+                        "outcome":recovery}));
+            }
+            if let Some(parent_call_id) = parent_tool_call_id.as_ref()
+                && has_source_dependencies
+            {
+                let evidence_output = if result_bytes <= 4_096 {
+                    Some(result_value.to_string())
+                } else if compact_source_read {
+                    Some(crate::tool_history::compact_read_evidence(&result_value).to_string())
+                } else {
+                    recovery_artifact.as_ref().map(|(id, _, bytes)| serde_json::json!({
+                        "artifact_id":id, "historical_source":true, "recovery_tool":"read_tool_output",
+                        "selectors":[{"kind":"bytes","start":0,"end":bytes}],
+                    }).to_string())
+                };
+                if let Some(output) = evidence_output {
+                    exec.session
+                        .register_code_mode_nested_evidence(
+                            parent_call_id.clone(),
+                            nested_call_id.clone(),
+                            output,
+                        )
+                        .await;
+                }
+            }
         }
-    }
-    let recovery = if let Some((id, sha256, bytes)) = &recovery_artifact {
-        serde_json::json!({
-            "artifact_id": id, "canonical_sha256": sha256, "canonical_bytes": bytes,
-            "recovery": {"tool":"read_tool_output", "arguments": {
-                "artifact_id":id, "selectors":[{"kind":"bytes","start":0,"end":bytes}]
-            }},
-        })
-    } else if !output_truncated {
-        serde_json::json!({"result": result_value})
-    } else {
-        serde_json::json!({"output": retained_output, "output_truncated":true,
-            "recovery_available":false, "notice":"Canonical retention failed; do not replay effects."})
     };
-    exec.session.services.code_mode_service.record_packet_recovery(&cell_id, packet_ordinal,
-        serde_json::json!({"call_id":nested_call_id,"tool_name":tool_name.to_string(),
-            "failed":!matches!(outcome_context.outcome, ToolOutputOutcome::Success | ToolOutputOutcome::Yielded),
-            "outcome":recovery}));
-    if let Some(parent_call_id) = parent_tool_call_id.as_ref()
-        && source_dependencies
-            .as_ref()
-            .is_some_and(|dependencies| !dependencies.is_empty())
-    {
-        let evidence_output = if !output_truncated && retained_output.len() <= 4_096 {
-            Some(retained_output.clone())
-        } else if tool_name == ToolName::plain("read_file")
-            && result_value["source_sha256"].is_string()
-        {
-            Some(crate::tool_history::compact_read_evidence(&result_value).to_string())
-        } else {
-            recovery_artifact.as_ref().map(|(id, _, bytes)| serde_json::json!({
-                "artifact_id":id, "historical_source":true, "recovery_tool":"read_tool_output",
-                "selectors":[{"kind":"bytes","start":0,"end":bytes}],
-            }).to_string())
-        };
-        if let Some(output) = evidence_output {
-            exec.session
-                .register_code_mode_nested_evidence(
-                    parent_call_id.clone(),
-                    nested_call_id.clone(),
-                    output,
-                )
-                .await;
+    if defer_retention {
+        let previous = exec.session.services.code_mode_service.queue_packet_retention(
+            &exec.session, &cell_id, retention,
+        );
+        if let Some(previous) = previous {
+            tokio::select! {
+                biased;
+                _ = previous => {}
+                _ = cancellation.token().cancelled() => {}
+            }
         }
+    } else {
+        retention.await;
     }
     let script_result = script_visible_nested_result(
         &tool_name, result_value.clone(), &nested_call_id, packet_ordinal,
@@ -3204,6 +3314,7 @@ mod tests {
         .await
         .unwrap();
         assert!(output.to_string().len() > 4_096);
+        session.services.code_mode_service.flush_packet_retention(&cell_id).await;
         let history = session
             .lock_history_state_for_test()
             .await
@@ -3292,6 +3403,68 @@ mod tests {
         let batched = service.finish_packet("cell", false);
         assert_eq!(batched.nested_call_count, 6);
         assert_eq!(batched.result_bytes, 768);
+    }
+
+    #[test]
+    fn inline_packet_recovery_is_aggregate_bounded_and_drained() {
+        let service = test_service();
+        let cell = CellId::new("inline-recovery".into());
+        service.record_cell_parent_call_id(&cell, "outer");
+        let limit = super::MAX_INLINE_PACKET_RECOVERY_BYTES;
+        assert!(service.try_record_inline_packet_recovery(&cell, 0, limit - 1, || json!("first")));
+        assert!(!service.try_record_inline_packet_recovery(&cell, 1, 2, || panic!("over budget")));
+        assert!(service.try_record_inline_packet_recovery(&cell, 1, 1, || json!("second")));
+        let packet = service.finish_packet(cell.as_str(), true);
+        assert_eq!(packet.nested_recovery.len(), 2);
+        assert!(service.try_record_inline_packet_recovery(&cell, 2, limit, || json!("after yield")));
+        service.finish_cell_dispatch(&cell);
+        assert!(!service.try_record_inline_packet_recovery(&cell, 3, 1, || panic!("closed cell")));
+    }
+
+    #[tokio::test]
+    async fn medium_nested_result_uses_inline_recovery_instead_of_diagnostic_spill() {
+        let handler: Arc<dyn crate::tools::registry::CoreToolRuntime> =
+            Arc::new(crate::tools::handlers::ExecCommandHandler::default());
+        let (session, turn, runtime) = nested_call_fixture(vec![handler]).await;
+        let cell = CellId::new("medium-inline".into());
+        let service = &session.services.code_mode_service;
+        service.record_cell_parent_call_id(&cell, "outer");
+        let body = "retained-evidence-".repeat(100);
+        let output = super::call_nested_tool(
+            super::ExecContext { session: Arc::clone(&session), turn: Arc::clone(&turn) },
+            runtime,
+            codex_code_mode::CodeModeNestedToolCall {
+                cell_id: cell.clone(), parent_tool_call_id: Some("outer".into()),
+                runtime_tool_call_id: "medium".into(), tool_name: ToolName::plain("exec_command"),
+                tool_kind: CodeModeToolKind::Function,
+                input: Some(json!({"cmd":format!("echo {body}"), "yield_time_ms":30000})),
+                nested_deadline: None, buffered_output_bytes: 0,
+            },
+            codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
+        ).await.unwrap();
+        assert_eq!(output["exit_code"], 0, "{output}");
+        assert!(output.to_string().len() > super::MAX_RETAINED_NESTED_RESULT_BYTES);
+        let packet = service.finish_packet(cell.as_str(), false);
+        assert!(packet.nested_results[0].output_truncated);
+        let recovered = &packet.nested_recovery[&0]["outcome"]["result"];
+        assert_eq!(recovered["stdout"], output["stdout"]);
+        assert_eq!(recovered["stdout"].as_str().unwrap().trim(), body);
+        assert!(packet.nested_recovery[&0]["outcome"].get("artifact_id").is_none());
+        // A single truncated diagnostic also needs the directory on failure;
+        // the omitted-result count alone is zero in this case.
+        service.record_packet_recovery(&cell, 0, packet.nested_recovery[&0].clone());
+        service.complete_packet_call(&cell, 0, false, 0, Vec::new(),
+            Some(packet.nested_results[0].clone()), None);
+        let failed = super::handle_runtime_response(
+            &super::ExecContext { session: Arc::clone(&session), turn: Arc::clone(&turn) },
+            RuntimeResponse::Result { cell_id: cell.clone(), content_items: Vec::new(),
+                error_text: Some("script failed after the command".into()), output_loss: None },
+            Some(100), std::time::Instant::now(),
+        ).unwrap();
+        let canonical = super::code_mode_text_content(failed.canonical_body.as_ref().unwrap());
+        assert!(canonical.contains("nested_result_recovery_directory"));
+        assert!(canonical.contains(&body), "exact settled output survives outer truncation");
+        service.finish_cell_dispatch(&cell);
     }
 
     #[test]

@@ -922,11 +922,12 @@ pub(crate) async fn run_turn(
                     )
                     .await;
                 }
+                let request_analysis = request_signals.analyze_settled_request();
                 let mut convergence_decision =
                     if kd4_runtime && needs_follow_up && !has_pending_input {
-                        Some(turn_execution.evaluate_convergence(
+                        Some(turn_execution.evaluate_convergence_with_analysis(
                             &request_baselines,
-                            &request_signals,
+                            &request_analysis,
                             &settled_state,
                         ))
                     } else {
@@ -961,13 +962,14 @@ pub(crate) async fn run_turn(
                     needs_follow_up = false;
                 }
                 let mut next_generation_request = needs_follow_up.then(|| {
-                    turn_execution.continuation_generation_request(
+                    turn_execution.continuation_generation_request_with_analysis(
                         &request_baselines,
-                        &request_signals,
+                        &request_analysis,
                         &settled_state,
                         has_pending_input,
                     )
                 });
+                drop(request_analysis);
                 if terminal_completion_required {
                     next_generation_request = next_generation_request
                         .map(GenerationRequestDisposition::require_terminal_completion);
@@ -1048,7 +1050,11 @@ pub(crate) async fn run_turn(
                         turn_execution.plan_completed()
                             || pending_generation_request
                                 .as_ref()
-                                .is_some_and(|request| request.terminal_completion_only),
+                                .is_some_and(|request| request.terminal_completion_only)
+                            // Admission will force the next request to report the
+                            // budget boundary, even without a completed checklist.
+                            || (!has_pending_input
+                                && !logical_generation_budget.has_regular_generation_capacity()),
                         token_status.active_context_tokens,
                         turn_context.model_context_window(),
                     );
@@ -1095,7 +1101,12 @@ pub(crate) async fn run_turn(
                     }
                     can_drain_pending_input = true;
                     pending_continuation_cause = Some(ContinuationCause::Compaction);
-                    continue;
+                    // A requested reset still commits, but it cannot revoke an
+                    // already accepted answer or manufacture another generation.
+                    // Completion hooks and pending-input admission remain below.
+                    if needs_follow_up {
+                        continue;
+                    }
                 }
 
                 if !needs_follow_up {
@@ -2071,10 +2082,6 @@ async fn inspect_inputs(
             )
             .await;
         } else {
-            if let TurnInput::UserInput { content, .. } = input_item {
-                // Commit authority only after this input passes UserPromptSubmit.
-                turn_context.update_multi_agent_spawn_authorization(content);
-            }
             if resets_turn_execution(input_item) {
                 accepted_context_input = true;
             }
@@ -2298,7 +2305,6 @@ async fn build_pure_pending_turn_plan(
         ))
     );
     let extension_injection_items = extension_injection_items?;
-    super::multi_agents::refresh_instruction_authority(turn_context, step_context.loaded_agents_md.as_deref());
     // DAG edge P -> plugin mentions. Connector inventory C waits for P because
     // plugin mentions can make inventory necessary even when apps are disabled.
     let mentioned_plugins =
@@ -4727,7 +4733,7 @@ pub(super) fn agent_surface_stage(sess: &Session, turn_context: &TurnContext) ->
             crate::agent::next_thread_spawn_depth(&turn_context.session_source),
             turn_context.config.agent_max_depth,
         ),
-        MultiAgentVersion::V2 => crate::session::multi_agents::spawn_is_authorized(turn_context),
+        MultiAgentVersion::V2 => true,
     };
     let control = &sess.services.agent_control;
     agent_surface_stage_from_snapshot(
@@ -5866,6 +5872,9 @@ async fn try_run_sampling_request(
                     StartupPrewarmClaim::Rejected => ("stale_incompatible", "stale_incompatible"),
                 }
             }
+            SessionStartupPrewarmResolution::Unavailable { status: "disabled", .. } => {
+                ("disabled", "disabled")
+            }
             SessionStartupPrewarmResolution::Unavailable { .. } => {
                 ("ordinary_dispatch_winner", "ordinary_dispatch_winner")
             }
@@ -6145,7 +6154,7 @@ async fn try_run_sampling_request(
 
         let _model_stream_processing_timing_guard = turn_context
             .turn_timing_state
-            .begin_model_stream_processing();
+            .begin_model_stream_processing(&event);
         sess.services
             .session_telemetry
             .record_responses(&handle_responses, &event);

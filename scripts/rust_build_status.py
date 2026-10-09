@@ -147,6 +147,30 @@ RUST_PROCESS_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 RUST_MIN_STACK_BYTES = "8388608"
+RUST_ADMISSION_BUSY_EXIT_CODE = 75
+
+
+class RustAdmissionBusy(RuntimeError):
+    """Admission did not execute the requested work; obligations remain pending."""
+
+    def __init__(self, message: str, *, resource: Path, wait_option: str):
+        super().__init__(message)
+        self.status = {
+            "kind": "codex_rust_admission_v1", "status": "busy",
+            "exit_code": RUST_ADMISSION_BUSY_EXIT_CODE,
+            "resource": str(resource.resolve()), "validation_status": "pending",
+            "executed": False, "queued": False, "automatic_retry": False,
+            "working_directory": str(Path.cwd().resolve()),
+            "automatic_resume": False,
+            "wait_option": wait_option,
+            "next_action": (
+                "Keep required validation pending. Do not poll by relaunching, switch lanes, "
+                "or start duplicate checks. Resume any already-live validation operation; "
+                "Otherwise leave validation pending for a later explicit invocation; "
+                "a short bounded wait is opt-in, not required. "
+                "If that wait expires, report blocked validation rather than retrying or completing."
+            ),
+        }
 
 
 class CargoLanesRootValidationError(ValueError):
@@ -754,7 +778,7 @@ def _binary_file_lock_is_busy(path: Path) -> bool:
 
 @contextmanager
 def reserve_rust_test_target(
-    target_dir: Path, *, timeout_seconds: float = 1800.0,
+    target_dir: Path, *, timeout_seconds: float = 0.0,
     cargo_profile: str | None = None,
 ) -> Iterator[dict[str, object]]:
     """Coordinate whole runner invocations, not cached results.
@@ -766,10 +790,11 @@ def reserve_rust_test_target(
     CODEX_CARGO_LANE_TARGET_DIR is the wrappers' inherited reservation contract,
     not an authorization boundary; it exempts only that exact parent lane, never
     another runner or Cargo process using the selected build profile. An unknown
-    profile keeps the conservative whole-target Cargo probe.
+    profile keeps the conservative whole-target Cargo probe. Busy targets fail
+    promptly by default; a positive timeout explicitly opts into waiting.
     """
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise ValueError("admission timeout must be a finite positive number")
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+        raise ValueError("admission timeout must be a finite nonnegative number")
     if cargo_profile is not None and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None:
         raise ValueError("Cargo profile must be a profile name, not a filesystem path")
     profile_dir = {"dev": "debug", "test": "debug", "bench": "release"}.get(
@@ -787,12 +812,12 @@ def reserve_rust_test_target(
     try:
         while handle is None:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if timeout_seconds > 0 and remaining <= 0:
                 raise TimeoutError(f"timed out waiting for Rust test target {target_dir}")
             managed = (target_dir.parent / CARGO_LANES_ROOT_MARKER).is_file()
             coordination = (
                 cargo_lane_coordination_lock(
-                    target_dir.parent, timeout_seconds=min(30.0, remaining)
+                    target_dir.parent, timeout_seconds=max(0.0, min(30.0, remaining))
                 ) if managed and os.name == "nt" else nullcontext()
             )
             with coordination:
@@ -818,6 +843,12 @@ def reserve_rust_test_target(
                                 finally:
                                     candidate.close()
             if handle is None:
+                if timeout_seconds == 0:
+                    raise RustAdmissionBusy(
+                        f"Rust test target is busy: {target_dir}. No validation was run. "
+                        "Required validation remains pending.",
+                        resource=target_dir, wait_option="--admission-timeout-seconds",
+                    )
                 if not announced:
                     print(f"Rust admission: waiting for target {target_dir}", file=sys.stderr)
                     announced = True
@@ -1048,6 +1079,13 @@ def _lane_reservation_candidates(
     return candidates
 
 
+def _nonnegative_wait_seconds(value: str | float) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("wait must be a finite nonnegative number")
+    return seconds
+
+
 @contextmanager
 def reserve_cargo_lane(
     *,
@@ -1056,10 +1094,11 @@ def reserve_cargo_lane(
     command: Sequence[str],
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
-    warm_wait_seconds: float = 600.0,
+    warm_wait_seconds: float = 0.0,
     allow_cold_overflow: bool = False,
     build_context: Mapping[str, object] | None = None,
 ) -> Iterator[tuple[str, Path]]:
+    warm_wait_seconds = _nonnegative_wait_seconds(warm_wait_seconds)
     explicit = requested_lane != "auto"
     base_lane = _safe_lane_name(
         requested_lane if explicit else _auto_lane_base(command)
@@ -1076,7 +1115,11 @@ def reserve_cargo_lane(
     while active_handle is None:
         busy_reusable = False
         deferred_cold = False
-        with cargo_lane_coordination_lock(root, timeout_seconds=lock_timeout_seconds):
+        # The short creation/prune lock shares admission's budget; otherwise
+        # even fail-fast calls can quietly wait 30 seconds here.
+        with cargo_lane_coordination_lock(
+            root, timeout_seconds=max(0.0, min(lock_timeout_seconds, deadline - time.monotonic()))
+        ):
             candidates = _lane_reservation_candidates(root, base_lane, prefer_warm=True)
             # Profile names are configurable. Inspect only immediate, direct
             # profile directories; their names alone do not prove reusable work.
@@ -1127,10 +1170,10 @@ def reserve_cargo_lane(
                         deferred_cold = True
                         break
                     if not allow_cold_overflow:
-                        raise RuntimeError(
+                        raise RustAdmissionBusy(
                             f"Cargo lane {base_lane!r} is busy; no cold overflow was started. "
-                            "Wait for its owner, increase --warm-wait-seconds, or explicitly "
-                            "use --allow-cold-overflow."
+                            "Required validation remains pending.",
+                            resource=root / base_lane, wait_option="--warm-wait-seconds",
                         )
                 candidate_dir.mkdir(exist_ok=True)
                 if cargo_lock_is_busy(candidate_dir):
@@ -1156,7 +1199,10 @@ def reserve_cargo_lane(
         # other work can reserve unrelated lanes.
         time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
     if active_handle is None or target_dir is None or resolved_lane is None:
-        raise RuntimeError(f"unable to reserve an idle Cargo lane for {base_lane!r}")
+        raise RustAdmissionBusy(
+            f"unable to reserve an idle Cargo lane for {base_lane!r}; validation remains pending",
+            resource=root / base_lane, wait_option="--warm-wait-seconds",
+        )
     stamp = target_dir / LANE_LAST_USED_STAMP
     try:
         stamp.write_text(f"{time.time()}\n", encoding="utf-8")
@@ -2033,7 +2079,7 @@ def run_in_cargo_lane(
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
     timing_path: Path | None = None,
-    warm_wait_seconds: float = 600.0,
+    warm_wait_seconds: float = 0.0,
     allow_cold_overflow: bool = False,
 ) -> int:
     if not command:
@@ -2165,7 +2211,10 @@ def run_in_cargo_lane(
                     raise
                 record.update(
                     exitCode=exit_code,
-                    status="completed" if exit_code == 0 else "failed",
+                    status="completed" if exit_code == 0 else (
+                        "busy" if exit_code == RUST_ADMISSION_BUSY_EXIT_CODE
+                        and _is_named_runner_command(child_command) else "failed"
+                    ),
                 )
                 if exit_code == 0:
                     # Hold the lane lock until its successful context is recorded.
@@ -2182,6 +2231,15 @@ def run_in_cargo_lane(
             finally:
                 next_phase("release")
     except BaseException as error:
+        if isinstance(error, TimeoutError) and phase == "reservation":
+            error = RustAdmissionBusy(
+                str(error), resource=lane_root if lane_root is not None else cargo_lanes_root(repo_root),
+                wait_option="--warm-wait-seconds",
+            )
+        if isinstance(error, RustAdmissionBusy):
+            record.update(status="busy", exitCode=RUST_ADMISSION_BUSY_EXIT_CODE,
+                          admission=error.status)
+            raise error
         record.update(
             status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
             errorType=type(error).__name__,
@@ -2858,9 +2916,9 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument("--lanes-root", type=Path)
     run_lane_parser.add_argument(
         "--warm-wait-seconds",
-        type=positive_float,
-        default=600.0,
-        help="Wait for reusable work before failing or explicitly overflowing (default: 600).",
+        type=_nonnegative_wait_seconds,
+        default=0.0,
+        help="Opt into waiting for reusable work (default: 0, report busy immediately).",
     )
     run_lane_parser.add_argument(
         "--allow-cold-overflow",
@@ -2953,6 +3011,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             parser.error(f"unknown command {args.command}")
+    except RustAdmissionBusy as exc:
+        print(f"Rust admission busy: {exc}", file=sys.stderr)
+        print(json.dumps({**exc.status, "pending_command": command_args,
+                          "invocation": [sys.executable, str(Path(__file__).resolve()),
+                                         *(sys.argv[1:] if argv is None else argv)]},
+                         sort_keys=True), file=sys.stderr)
+        return RUST_ADMISSION_BUSY_EXIT_CODE
     except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

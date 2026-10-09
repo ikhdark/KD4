@@ -2703,6 +2703,19 @@ text('one-cell-complete');
     }
 
     #[test]
+    fn affordance_not_only_activates_both_positive_capabilities() {
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "Does not only read documents but also search records; do not delete files.",
+            None, "documents", "lookup",
+        )]);
+        for query in ["read documents", "search records"] {
+            assert_eq!(handler.search(query, 1).unwrap().activation_tools,
+                vec![ToolName::namespaced("mcp__documents", "lookup")], "{query}");
+        }
+        assert!(handler.search("delete files", 1).unwrap().activation_tools.is_empty());
+    }
+
+    #[test]
     fn affordance_source_verbosity_does_not_demote_unchanged_callable() {
         let target = search_info("search invoice amount", None, "a", "lookup");
         let mut infos = vec![target, search_info("search invoice", None, "b", "lookup")];

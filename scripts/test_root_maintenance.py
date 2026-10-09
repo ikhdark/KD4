@@ -4,7 +4,9 @@ import contextlib
 import io
 import os
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -574,6 +576,127 @@ class RootMaintenanceTest(unittest.TestCase):
                 ),
             ],
         )
+
+
+class SyntaxSchedulingTest(unittest.TestCase):
+    def setUp(self):
+        self.owner = load_root_maintenance_module()
+        self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+
+    def commands(self, count):
+        return [(f"JavaScript syntax: {i}", (str(i),)) for i in range(count)]
+
+    def test_bounded_overlap_preserves_output_order_and_serial_barriers(self):
+        rendezvous = threading.Barrier(4, timeout=5)
+        lock = threading.Lock()
+        active = peak = 0
+        completed = []
+        serial = []
+
+        def parser(command, **kwargs):
+            nonlocal active, peak
+            i = int(command[0])
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                if i < 4:
+                    rendezvous.wait()
+                kwargs["stdout"].write(f"diagnostic-{i}\n".encode())
+                return subprocess.CompletedProcess(command, i == 2)
+            finally:
+                with lock:
+                    active -= 1
+                    completed.append(i)
+
+        def exclusive(command):
+            self.assertEqual(active, 0)
+            serial.append(command[0])
+            if command[0] == "after":
+                self.assertEqual(sorted(completed), list(range(7)))
+            return 0
+
+        commands = [("Python lint", ("before",)), *self.commands(7),
+                    ("script unit tests", ("after",))]
+        with (mock.patch.object(self.owner, "run_owned", side_effect=parser),
+              mock.patch.object(self.owner, "run", side_effect=exclusive)):
+            results = list(self.owner._audit_command_results(commands))
+        self.assertEqual(peak, 4)
+        self.assertEqual(active, 0)
+        self.assertEqual(serial, ["before", "after"])
+        self.assertEqual([label for label, _ in results], [label for label, _ in commands])
+        self.assertEqual([code for _, code in results], [0, 0, 0, 1, 0, 0, 0, 0, 0])
+        diagnostics = [line for line in self.output.getvalue().splitlines()
+                       if line.startswith("diagnostic-")]
+        self.assertEqual(diagnostics, [f"diagnostic-{i}" for i in range(7)])
+
+    def test_interrupt_cancels_and_joins_started_sibling(self):
+        from scripts import process_owner
+
+        started = threading.Event()
+        stopped = threading.Event()
+
+        def parser(command, **kwargs):
+            if command[0] == "0":
+                self.assertTrue(started.wait(5))
+                raise KeyboardInterrupt()
+            with process_owner.operation() as operation:
+                started.set()
+                try:
+                    self.assertTrue(operation.cancelled.wait(5))
+                    process_owner.check_operation()
+                finally:
+                    stopped.set()
+
+        with (mock.patch.object(self.owner, "run_owned", side_effect=parser),
+              self.assertRaises(KeyboardInterrupt)):
+            list(self.owner._audit_command_results(self.commands(2)))
+        self.assertTrue(stopped.is_set())
+
+    def test_missing_parser_preserves_sibling_and_unicode_diagnostics(self):
+        body = "x" * 65535 + "λ😀\n"
+
+        def parser(command, **kwargs):
+            if command[0] == "0":
+                raise FileNotFoundError("missing parser")
+            kwargs["stdout"].write(body.encode())
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch.object(self.owner, "run_owned", side_effect=parser):
+            results = list(self.owner._audit_command_results(self.commands(2)))
+        self.assertEqual([code for _, code in results], [127, 0])
+        self.assertIn("missing parser", self.output.getvalue())
+        self.assertIn(body, self.output.getvalue())
+
+    def test_unknown_commands_and_uv_checks_remain_serial(self):
+        commands = [(label, (label,)) for label in
+                    ("Python format", "Python lint", "unknown", "script unit tests")]
+        with (mock.patch.object(self.owner, "run", side_effect=[0, OSError("no tool"), 0, 0]) as run,
+              mock.patch.object(self.owner, "run_owned") as parallel):
+            results = list(self.owner._audit_command_results(commands))
+        self.assertEqual(run.call_count, 4)
+        parallel.assert_not_called()
+        self.assertEqual([code for _, code in results], [0, 127, 0, 0])
+
+    def test_real_parser_exit_codes_and_audit_cli_failure_summary(self):
+        commands = [(f"JavaScript syntax: {i}",
+                     (sys.executable, "-c", f"print('child-{i}'); raise SystemExit({i})"))
+                    for i in (0, 1)]
+        with (
+            mock.patch.object(self.owner, "script_source_targets", return_value=["fixture.js"]),
+            mock.patch.object(self.owner, "script_kind_map", return_value={"fixture.js": "javascript"}),
+            mock.patch.object(self.owner, "script_audit_context_issues", return_value=[]),
+            mock.patch.object(self.owner, "script_audit_findings", return_value=([], [])),
+            mock.patch.object(self.owner, "script_audit_commands", return_value=(commands, [])),
+            mock.patch.object(self.owner, "git_context_label", return_value="fixture"),
+        ):
+            self.assertEqual(self.owner.main(["audit-scripts", "--quick"]), 1)
+        output = self.output.getvalue()
+        self.assertIn("child-0", output)
+        self.assertIn("child-1", output)
+        self.assertIn("[PASS] JavaScript syntax: 0", output)
+        self.assertIn("[FAIL] JavaScript syntax: 1: exit 1", output)
+        self.assertIn("1 command failure(s)", output)
 
 
 if __name__ == "__main__":

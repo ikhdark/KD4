@@ -67,7 +67,7 @@ class WarmLaneReservationTest(unittest.TestCase):
                 mock.patch.object(
                     rust_build_status.time, "sleep", side_effect=release_owner
                 ) as sleep,
-                self.reserve() as (name, target),
+                self.reserve(warm_wait_seconds=1) as (name, target),
             ):
                 self.assertEqual((name, target), ("core-tests", lane))
                 self.assertTrue(rust_build_status.lane_active_lock_is_held(target))
@@ -185,10 +185,11 @@ class WarmLaneReservationTest(unittest.TestCase):
 
     def test_default_deadline_does_not_create_cold_sibling_or_release_owner(self):
         lane = self.warm("core-tests")
-        with self.reserve():
+        with self.reserve(), mock.patch.object(rust_build_status.time, "sleep") as sleep:
             with self.assertRaisesRegex(RuntimeError, "no cold overflow"):
-                with self.reserve(warm_wait_seconds=0):
+                with self.reserve():
                     self.fail("must not start cold work")
+            sleep.assert_not_called()
             self.assertTrue(rust_build_status.lane_active_lock_is_held(lane))
             self.assertFalse((self.root / "core-tests-2").exists())
 

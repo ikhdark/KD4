@@ -916,7 +916,7 @@ async fn emit_exec_end(
     let current_workspace_identity = if !defer_workspace_identity
         && workspace_identity_capture_required(
             workspace_identity_required,
-            observed_workspace_identity.as_ref(),
+            captured_workspace_identity,
         ) {
         captured_workspace_identity = true;
         ctx.session
@@ -1109,9 +1109,11 @@ fn observed_workspace_identity_changed(
 
 fn workspace_identity_capture_required(
     required: bool,
-    observed: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+    already_captured: bool,
 ) -> bool {
-    required && observed.is_none()
+    // None is a completed observation too (for example outside a repository).
+    // Retrying it here adds another scan without strengthening the evidence.
+    required && !already_captured
 }
 
 async fn emit_patch_end(
@@ -1490,6 +1492,16 @@ mod tests {
     fn unavailable_workspace_snapshots_do_not_prove_read_only_execution() {
         assert_eq!(observed_workspace_identity_changed(Some(&None), None), None);
         assert_eq!(observed_workspace_identity_changed(None, None), None);
+    }
+
+    #[test]
+    fn command_end_does_not_recapture_an_unavailable_workspace_observation() {
+        assert!(workspace_identity_capture_required(true, false));
+        assert!(!workspace_identity_capture_required(true, true));
+        assert!(!workspace_identity_capture_required(false, false));
+        assert!(!workspace_identity_capture_required(false, true));
+        // Avoiding a second scan must not upgrade unavailable evidence.
+        assert_eq!(observed_workspace_identity_changed(Some(&None), None), None);
     }
 
     #[tokio::test]

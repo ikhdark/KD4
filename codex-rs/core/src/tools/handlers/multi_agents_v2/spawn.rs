@@ -168,14 +168,6 @@ async fn handle_spawn_agent(
     } else {
         None
     };
-    if !crate::session::multi_agents::spawn_is_authorized(turn.as_ref())
-        && legacy_parent_assignment_id.is_none()
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: spawning is not authorized for this turn. Explicit-request-only permission is checked per turn; an earlier turn's authorization is not carried forward."
-                .to_string(),
-        ));
-    }
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config = build_agent_spawn_config(turn.as_ref())?;

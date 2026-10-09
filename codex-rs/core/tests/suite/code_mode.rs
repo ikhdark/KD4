@@ -9,6 +9,9 @@ mod owned_continuation;
 #[path = "code_mode_token_cache_e2e.rs"]
 mod token_cache_e2e;
 
+#[path = "code_mode_idle_benchmark.rs"]
+mod idle_benchmark;
+
 fn workspace_invalidation(request: &ResponsesRequest, call_id: &str) -> Option<Value> {
     request.body_json()["input"]
         .as_array()?
@@ -1752,9 +1755,11 @@ store('large', result);"#),
     let retained = retained_items
         .iter()
         .filter_map(|item| item["text"].as_str())
+        // The script envelope can join the result and its recovery directory.
+        .flat_map(str::lines)
         .filter_map(|text| serde_json::from_str::<Value>(text).ok())
         .find_map(|value| value["result"].as_str().filter(|text| text.starts_with("exit_code: 0\n")).map(str::to_string))
-        .expect("a silent cell must expose its retained nested evidence");
+        .unwrap_or_else(|| panic!("a silent cell must expose its retained nested evidence: {retained_items:?}"));
     assert!(retained.len() <= 4_096);
     assert!(retained.contains('🙂'));
     assert!(retained.contains("END_OF_REQUIRED_EVIDENCE"));

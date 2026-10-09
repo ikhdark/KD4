@@ -28,12 +28,17 @@ from typing import Any
 
 import tomllib
 
+# Isolated Python omits the script directory from sys.path. Resolve siblings
+# from this file, never the caller's cwd or PYTHONPATH.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 try:
-    from .process_owner import owned_process, CleanupFailed
+    from .process_owner import owned_process, CleanupFailed, OwnedThreadPoolExecutor, run_owned
     from .rust_tool_env import cargo_package_specs, local_rust_env
     from .validation_metrics import ValidationMetrics
 except ImportError:
-    from process_owner import owned_process, CleanupFailed
+    from process_owner import owned_process, CleanupFailed, OwnedThreadPoolExecutor, run_owned
     from rust_tool_env import cargo_package_specs, local_rust_env
     from validation_metrics import ValidationMetrics
 
@@ -83,12 +88,14 @@ class RunnerError(RuntimeError):
         outcome: str = "failed",
         result: subprocess.CompletedProcess[str] | None = None,
         completed_gates: dict[str, list[str]] | None = None,
+        admission_status: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.outcome = outcome
         self.result = result
         self.completed_gates = completed_gates if completed_gates is not None else {}
         self.completed_tests: dict[str, list[str]] = {}
+        self.admission_status = admission_status
 
 
 @dataclass(frozen=True)
@@ -807,6 +814,12 @@ def _nextest_results(
 ) -> Iterable[tuple[str, str, str]]:
     for stream in ("stdout", "stderr"):
         for line in _output_lines(result, stream):
+            # Nextest's final/immediate-final output repeats status headers
+            # after its summary. Those are presentation copies, not another
+            # execution. Keep every pre-summary result, including real
+            # duplicate executions and failures, for exactly-once validation.
+            if re.match(r"\s*Summary\s+\[[^]\r\n]+\]\s+\d+ tests? run:", line):
+                break
             match = re.fullmatch(
                 r"\s*(PASS|LEAK|FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL)\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
                 line,
@@ -2674,6 +2687,36 @@ def crate_validation_commands(
     return commands
 
 
+def run_crate_validation(mode: str, package: str, raw_args: Sequence[str]) -> int:
+    """Await every read-only check; only the test command owns a Cargo lane."""
+    commands = crate_validation_commands(mode, package, raw_args)
+    env = dict(os.environ)
+    env.update(local_rust_env(env, repo_root=REPO_ROOT))
+
+    def run(command: list[str]) -> subprocess.CompletedProcess:
+        # Start a shared cache outside the outer owned job, not inside a nested
+        # lane whose ancestor cleanup would otherwise kill that cache server.
+        return run_owned(
+            command, cwd=CODEX_RS_ROOT, env=env,
+            # CREATE_NO_WINDOW needs explicit handles to preserve diagnostics.
+            stdout=sys.stdout, stderr=sys.stderr,
+            prepare_sccache=command[1] == "test-fast",
+        )
+
+    if len(commands) == 1:
+        return run(commands[0]).returncode
+    # A check failure is a result, not cancellation of its independent sibling.
+    # Exceptions/cancellation still stop and reap descendants through the shared
+    # process owner. Preserve deterministic recipe-order failure precedence.
+    with OwnedThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = [
+            executor.submit(run, command)
+            for command in commands
+        ]
+        codes = [future.result().returncode for future in futures]
+    return next((code for code in codes if code), 0)
+
+
 def load_metadata(
     executor: Executor = _default_executor,
     *,
@@ -2745,8 +2788,8 @@ def build_parser() -> argparse.ArgumentParser:
     target_dir_help = "Cargo target directory; relative paths use the caller's working directory."
     parser.add_argument("--target-dir", help=target_dir_help)
     parser.add_argument(
-        "--admission-timeout-seconds", type=float, default=1800.0,
-        help="Maximum wait for another runner using the exact target directory (default 1800s). Place before the subcommand.",
+        "--admission-timeout-seconds", type=float, default=0.0,
+        help="Opt into waiting for the exact target directory (default 0: report busy immediately). Place before the subcommand.",
     )
     parser.add_argument(
         "--cargo-profile",
@@ -2891,8 +2934,8 @@ def _split_runner_owned_options(
 
 def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) -> int:
     try:
-        if not math.isfinite(args.admission_timeout_seconds) or args.admission_timeout_seconds <= 0:
-            raise RunnerError("admission timeout must be a finite positive number")
+        if not math.isfinite(args.admission_timeout_seconds) or args.admission_timeout_seconds < 0:
+            raise RunnerError("admission timeout must be a finite nonnegative number")
         if args.command in {"_guard-generic", "guard-args"}:
             # This runs on every generic recipe invocation: never read the
             # manifest or shell out to Cargo here.
@@ -2993,7 +3036,7 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
         if metrics is not None:
             metrics.record["outcome"] = (
                 exc.outcome if metrics.record["commands"]
-                or exc.outcome in {"cancelled", "timed_out", "cleanup_failed"} else "blocked"
+                or exc.outcome in {"busy", "cancelled", "timed_out", "cleanup_failed"} else "blocked"
             )
             partial = exc.completed_tests if isinstance(exc.completed_tests, ExecutionReceipts) else exc.completed_gates
             metrics.record["proof"]["completed_tests"] = (
@@ -3004,6 +3047,14 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
                     partial.identities(partial.required) if partial.required is not None else None)
                 metrics.record["proof"]["satisfied_gates"] = partial.gates
         print(f"rust_test_runner: {exc}", file=sys.stderr)
+        if exc.admission_status is not None:
+            if metrics is not None:
+                exc.admission_status["invocation"] = [
+                    sys.executable, str(Path(__file__).resolve()), *metrics.record["argv"]
+                ]
+                metrics.record["admission"] = exc.admission_status
+            print(json.dumps(exc.admission_status, sort_keys=True), file=sys.stderr)
+            return int(exc.admission_status["exit_code"])
         return 2
 
 
@@ -3058,9 +3109,9 @@ def _dispatch_with_admission(
         if args.command in {"run-target", "run-gate", "check-gates"}:
             try:
                 if __package__:
-                    from .rust_build_status import reserve_rust_test_target
+                    from .rust_build_status import RustAdmissionBusy, reserve_rust_test_target
                 else:
-                    from rust_build_status import reserve_rust_test_target
+                    from rust_build_status import RustAdmissionBusy, reserve_rust_test_target
 
                 with runner.metrics.phase("admission") if runner.metrics else nullcontext():
                     admission = cleanup.enter_context(reserve_rust_test_target(
@@ -3069,8 +3120,14 @@ def _dispatch_with_admission(
                     ))
             except KeyboardInterrupt as exc:
                 raise RunnerError("Rust admission cancelled before dispatch", outcome="cancelled") from exc
-            except TimeoutError as exc:
-                raise RunnerError(str(exc), outcome="timed_out") from exc
+            except (RustAdmissionBusy, TimeoutError) as exc:
+                busy = exc if isinstance(exc, RustAdmissionBusy) else RustAdmissionBusy(
+                    str(exc), resource=runner.target_dir, wait_option="--admission-timeout-seconds",
+                )
+                status = {**busy.status, "selected_targets": (
+                    [args.name] if args.command == "run-target" else list(args.names)
+                )}
+                raise RunnerError(str(busy), outcome="busy", admission_status=status) from exc
             except (OSError, RuntimeError, ValueError) as exc:
                 raise RunnerError(f"Rust admission failed: {exc}") from exc
             print(f"Rust admission: wait={admission['wait_seconds']:.3f}s; target={runner.target_dir}", file=sys.stderr)

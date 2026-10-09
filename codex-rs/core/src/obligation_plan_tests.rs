@@ -36,6 +36,34 @@ async fn obligation_explicit_resolution_closes_completed_split_without_renaming_
 }
 
 #[tokio::test]
+async fn obligation_orphan_resolution_requires_completed_descendants_atomically() {
+    let store = PlanStore::default();
+    let initial = apply(&store, json!({"plan":[{"step":"Verify compatibility","status":"pending"}]})).await;
+    let id = initial.lineage.step_id("Verify compatibility");
+    let dropped = json!({"plan":[],"superseded":[{"step_id":id,"reason":"Deferred, not completed"}]});
+    let mut bypass = dropped.clone();
+    bypass["resolve"] = json!([id]);
+    bypass["expected_revision"] = json!(store.execution_snapshot().await.unwrap().revision);
+    let before = store.snapshot_with_lineage().await;
+    assert!(store.update_tool(serde_json::from_value(bypass).unwrap()).await.unwrap_err().contains("descendant"));
+    assert_eq!(store.snapshot_with_lineage().await, before);
+
+    let orphaned = apply(&store, dropped).await;
+    store.restore_with_lineage(Some(orphaned.current), Some(orphaned.lineage)).await;
+    for plan in [json!([]), json!([{"step":"Unrelated work","status":"completed"}])] {
+        let before = store.snapshot_with_lineage().await;
+        let args = json!({"plan":plan,"resolve":[id],
+            "expected_revision":store.execution_snapshot().await.unwrap().revision});
+        assert!(store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap_err().contains("descendant"));
+        assert_eq!(store.snapshot_with_lineage().await, before);
+        assert_eq!(store.execution_snapshot().await.unwrap().obligations.unresolved, vec![id.clone()]);
+    }
+    let recovered = apply(&store, json!({"plan":[
+        {"step":"Compatibility verified","status":"completed","continues":[id]}],"resolve":[id]})).await;
+    assert!(recovered.lineage.obligation_summary(&recovered.current).unresolved.is_empty());
+}
+
+#[tokio::test]
 async fn obligation_changed_scope_rejects_stale_stable_id_completion_atomically() {
     let store = PlanStore::default();
     let initial = apply(&store, json!({"plan":[{"step":"Run unit tests","status":"pending"}]})).await;

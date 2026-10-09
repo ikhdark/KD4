@@ -111,7 +111,6 @@ impl StepContext {
         agents_md_stable_context: Option<RepositoryStableContextBundle>,
         agents_md_freshness: AgentsMdFreshness,
     ) -> Self {
-        super::multi_agents::refresh_instruction_authority(&turn, loaded_agents_md.as_deref());
         let mcp = Arc::clone(turn.mcp_runtime.get_or_init(|| mcp));
         let mcp_tool_snapshot = Arc::clone(&turn.mcp_tool_snapshot);
         Self {

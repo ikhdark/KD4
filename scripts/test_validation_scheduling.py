@@ -4,6 +4,11 @@ import contextlib
 import copy
 import io
 import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts import rust_build_status, rust_test_runner as runner_module
@@ -189,3 +194,103 @@ class ValidationSchedulingTest(RunnerTestCase):
         ):
             runner.run_target("core_lib", ["-E", "all()"])
         count.assert_called_once()
+
+
+class CrateValidationExecutionTest(unittest.TestCase):
+    def test_isolated_script_entrypoints_do_not_import_from_caller(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "process_owner.py").write_text("raise RuntimeError('caller import')")
+            for arguments, expected in (
+                (["--help"], "run-target"),
+                (["list-targets"], "core_lib"),
+                (["_guard-generic", "--", "-p", "codex-utils-stream-parser"], ""),
+            ):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-B", str(Path(runner_module.__file__).resolve()), *arguments],
+                        cwd=directory, capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(expected, result.stdout)
+
+    def test_invalid_selection_launches_no_checks(self):
+        with mock.patch.object(runner_module, "run_owned") as run:
+            with self.assertRaises(runner_module.RunnerError):
+                runner_module.run_crate_validation("local", "codex-core", ["--lib"])
+        run.assert_not_called()
+
+    def test_independent_checks_overlap_and_all_results_are_required(self):
+        for mode in ("local", "full"):
+            for codes in ((0, 0), (1, 0), (0, 100), (1, 100)):
+                with self.subTest(mode=mode, codes=codes):
+                    commands = runner_module.crate_validation_commands(mode, "codex-config", ["--lib"])
+                    started = threading.Barrier(2)
+                    completed = []
+
+                    def execute(command, *, cwd, env, stdout, stderr, prepare_sccache):
+                        self.assertEqual(cwd, runner_module.CODEX_RS_ROOT)
+                        self.assertIsInstance(env, dict)
+                        self.assertIs(stdout, sys.stdout)
+                        self.assertIs(stderr, sys.stderr)
+                        self.assertEqual(prepare_sccache, command[1] == "test-fast")
+                        index = commands.index(command)
+                        started.wait(timeout=5)
+                        completed.append(index)
+                        return subprocess.CompletedProcess(command, codes[index])
+
+                    with mock.patch.object(runner_module, "run_owned", side_effect=execute):
+                        result = runner_module.run_crate_validation(mode, "codex-config", ["--lib"])
+                    self.assertCountEqual(completed, [0, 1])
+                    self.assertEqual(result, next((code for code in codes if code), 0))
+
+    def test_focused_mode_runs_only_the_selected_test_command(self):
+        args = ["--lib", "-E", "test(=fixture)"]
+        command, = runner_module.crate_validation_commands("focused", "codex-config", args)
+        with mock.patch.object(runner_module, "run_owned", return_value=subprocess.CompletedProcess(command, 100)) as run:
+            self.assertEqual(runner_module.run_crate_validation("focused", "codex-config", args), 100)
+        run.assert_called_once_with(
+            command, cwd=runner_module.CODEX_RS_ROOT, env=mock.ANY,
+            stdout=sys.stdout, stderr=sys.stderr, prepare_sccache=True,
+        )
+
+    def test_real_children_preserve_diagnostics_and_failure_status(self):
+        script = f"""
+import sys
+from unittest import mock
+sys.path.insert(0, {str(runner_module.REPO_ROOT)!r})
+from scripts import rust_test_runner as runner
+commands = [
+    [sys.executable, "-c", "import sys;print('formatter-out');print('formatter-err',file=sys.stderr);sys.exit(17)"],
+    [sys.executable, "-c", "import sys;print('tests-out');print('tests-err',file=sys.stderr)"],
+]
+with mock.patch.object(runner, "crate_validation_commands", return_value=commands):
+    raise SystemExit(runner.run_crate_validation("local", "fixture", ["--lib"]))
+"""
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertCountEqual(result.stdout.splitlines(), ["formatter-out", "tests-out"])
+        self.assertCountEqual(result.stderr.splitlines(), ["formatter-err", "tests-err"])
+
+    def test_launch_exception_cancels_and_joins_the_other_check(self):
+        from scripts.process_owner import check_operation
+
+        started = threading.Barrier(2)
+        sibling_finished = threading.Event()
+
+        def execute(command, **kwargs):
+            started.wait(timeout=5)
+            if command[1] != "test-fast":
+                raise OSError("formatter could not start")
+            try:
+                while not sibling_finished.wait(0.01):
+                    check_operation()
+            finally:
+                sibling_finished.set()
+
+        with mock.patch.object(runner_module, "run_owned", side_effect=execute):
+            with self.assertRaisesRegex(OSError, "formatter could not start"):
+                runner_module.run_crate_validation("local", "codex-config", ["--lib"])
+        self.assertTrue(sibling_finished.is_set())

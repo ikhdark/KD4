@@ -34,12 +34,31 @@ def rollout_payload_root(path: Path) -> Path:
     return path.parent / "rollout-payloads"
 
 
+def _codex_home_payload_roots() -> list[Path]:
+    homes = [os.environ.get("CODEX_HOME"), os.path.expanduser("~/.codex")]
+    return [Path(home) / "rollout-payloads" for home in homes if home]
+
+
 def load_rollout_payload(path: Path, sha256: str, expected_bytes: int | None = None) -> bytes:
     """Load immutable undo/timing data, rejecting missing or substituted blobs."""
     if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
         raise ValueError("invalid rollout payload hash")
-    artifact = rollout_payload_root(path) / f"{sha256}.json"
-    metadata = artifact.lstat()
+    # A rollout copied out of its sessions tree leaves its blobs behind. They
+    # are content-addressed and checksum-verified below, so the Codex home's
+    # store may stand in for a missing colocated blob, but never a corrupt one.
+    roots = list(dict.fromkeys([rollout_payload_root(path), *_codex_home_payload_roots()]))
+    for root in roots:
+        artifact = root / f"{sha256}.json"
+        try:
+            metadata = artifact.lstat()
+            break
+        except FileNotFoundError:
+            continue
+    else:
+        raise FileNotFoundError(
+            f"rollout payload {sha256}.json not found in: "
+            + ", ".join(str(root) for root in roots)
+        )
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_PAYLOAD_BYTES:
         raise ValueError(f"invalid rollout payload file: {artifact}")
     if expected_bytes is not None and metadata.st_size != expected_bytes:

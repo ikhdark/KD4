@@ -42,6 +42,29 @@ fn obligation_recent_short_correction_survives_saturated_old_notes_and_bulk() {
 }
 
 #[test]
+fn obligation_latest_correction_survives_the_short_part_threshold() {
+    let original = "Review the implementation without changing the public API.";
+    let prefix = "LATEST-CORRECTION: diagnosis only; do not edit. ";
+    for tokens in [512, 513, 600] {
+        let correction = format!("{prefix}{}", "x".repeat(tokens * 4 - prefix.len()));
+        std::assert_eq!(approx_token_count(&correction), tokens);
+        for trailing_empty in [false, true] {
+            let mut messages = vec![compacted_user_message(original)];
+            messages.extend((0..50).map(|_| compacted_user_message(&"x".repeat(2048))));
+            messages.push(compacted_user_message(&correction));
+            if trailing_empty { messages.push(compacted_user_message("")); }
+            let (history, _, _, indices) = append_bounded_user_messages(Vec::new(), &messages, COMPACT_USER_MESSAGE_MAX_TOKENS, 0, 0);
+            let retained = collect_user_messages(&history);
+            assert!(indices.contains(&51), "latest correction lost at {tokens} tokens");
+            assert!(retained.iter().any(|message| message == &compacted_user_message(original)));
+            assert!(retained.iter().flat_map(|message| &message.content).any(|part|
+                matches!(part, UserInput::Text { text, .. } if text.starts_with(prefix))));
+            assert!(retained.iter().map(compacted_user_message_text_tokens).sum::<usize>() <= COMPACT_USER_MESSAGE_MAX_TOKENS);
+        }
+    }
+}
+
+#[test]
 fn obligation_short_text_parts_are_not_starved_by_bulk_in_the_same_message() {
     let correction = "MULTIPART-CORRECTION: do not write files.";
     let bulk = "large attachment ".repeat(10_000);

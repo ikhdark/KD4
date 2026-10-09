@@ -4,6 +4,85 @@ use std::time::Duration;
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn protected_canonical_creation_indexes_exact_bytes_without_a_second_protection_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    for canonical in [
+        CanonicalToolResult::text(""),
+        CanonicalToolResult::json(serde_json::json!({"body":"λ😀\n".repeat(2048)})),
+        CanonicalToolResult::text("x".repeat(MAX_RAW_OUTPUT_ARTIFACT_BYTES + 17)),
+    ] {
+        let artifact = create_tool_history_output_artifact(home.path(), "thread", &canonical).await;
+        assert!(artifact.complete, "{:?}", artifact.error);
+        let id = artifact.artifact_id().unwrap();
+        let directory = home.path().join("tool-output/thread");
+        let path = directory.join(format!("{id}.log"));
+        assert!(protection_marker_status(&active_tool_history_protection_path(&path),
+            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES).unwrap());
+        assert!(!logical_transaction_path(&path).exists());
+        let actual = artifact_retention_record_blocking(&path).unwrap().unwrap();
+        assert!(actual.protected);
+        let metadata_bytes = std::fs::metadata(logical_metadata_path(&path)).unwrap().len();
+        assert_eq!(actual.bytes, canonical.exact_bytes + metadata_bytes);
+        assert_eq!(read_complete_canonical_snapshot(home.path(), "thread", &id,
+            canonical.exact_bytes as usize + 1).await.unwrap(), canonical.bytes);
+        verify_tool_history_artifact(home.path(), "thread", &id,
+            canonical.exact_bytes, &canonical.sha256).await.unwrap();
+    }
+    let diagnostics = retention_diagnostics_for_test(&home.path().join("tool-output"));
+    assert_eq!(diagnostics.creates, 3);
+    assert_eq!(diagnostics.protection_changes, 0);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn protected_canonical_creation_rejects_bad_receipts_and_marker_failures() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join("tool-output/thread");
+    std::fs::create_dir_all(&directory).unwrap();
+    for invalid_digest in [false, true] {
+        let mut canonical = CanonicalToolResult::text("must not publish an invalid history receipt");
+        if invalid_digest {
+            canonical.sha256 = "0".repeat(64);
+        } else {
+            canonical.complete = false;
+        }
+        let artifact = create_tool_history_output_artifact(home.path(), "thread", &canonical).await;
+        assert!(!artifact.complete);
+        assert_eq!(artifact.retained_bytes, 0);
+        let path = directory.join(format!("{}.log", artifact.artifact_id().unwrap()));
+        assert!(!path.exists());
+        assert!(!active_tool_history_protection_path(&path).exists());
+        assert!(!logical_transaction_path(&path).exists());
+    }
+    let id = ToolOutputArtifactId::new();
+    let path = directory.join(format!("{id}.log"));
+    let marker = active_tool_history_protection_path(&path);
+    std::fs::create_dir(&marker).unwrap();
+    let artifact = create_canonical_output_artifact_inner(home.path(), "thread",
+        &CanonicalToolResult::text("protection fails"), id, true).await;
+    assert!(!artifact.complete);
+    assert!(artifact.error.unwrap().contains("failed to protect"));
+    assert!(!path.exists());
+    assert!(!logical_metadata_path(&path).exists());
+    assert!(marker.is_dir(), "do not remove a preexisting conflicting marker");
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn protected_canonical_creation_finishes_with_one_blocking_thread() {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all()
+        .max_blocking_threads(1).build().unwrap();
+    runtime.block_on(async {
+        let home = tempfile::tempdir().unwrap();
+        let canonical = CanonicalToolResult::text("single-worker protected creation");
+        let artifact = tokio::time::timeout(Duration::from_secs(5),
+            create_tool_history_output_artifact(home.path(), "thread", &canonical)).await.unwrap();
+        assert!(artifact.complete, "{:?}", artifact.error);
+    });
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn verified10_text_json_indexes_once_per_recovery_transaction() {
     let home = tempfile::tempdir().unwrap();
     let canonical = CanonicalToolResult::text(format!("{{\"name\":\"{}\",\"small\":7}}", "evidence ".repeat(20_000)));

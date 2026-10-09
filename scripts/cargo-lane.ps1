@@ -55,7 +55,7 @@ function Parse-CargoLaneArguments {
     $parsedIsolateCargoHome = $false
     $parsedFetch = $false
     $allowColdOverflow = $false
-    $warmWaitSeconds = 600.0
+    $warmWaitSeconds = 0.0
     $maintenanceOnly = $false
     $commandStart = $RawArgs.Count
 
@@ -749,12 +749,13 @@ function Try-AcquireCargoLaneReservation {
         [string]$BaseLane,
         [switch]$PreferWarm,
         [switch]$AllowColdOverflow,
-        [string[]]$ActiveNames = @()
+        [string[]]$ActiveNames = @(),
+        [double]$CoordinationWaitSeconds = 0
     )
 
     $coordinationPath = Join-Path $LaneRoot ".lane-coordination.lock"
     $coordinationStream = $null
-    $coordinationDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    $coordinationDeadline = [DateTime]::UtcNow.AddSeconds($CoordinationWaitSeconds)
     while ($null -eq $coordinationStream) {
         try {
             $coordinationStream = [IO.File]::Open(
@@ -769,9 +770,9 @@ function Try-AcquireCargoLaneReservation {
                 throw
             }
             if ([DateTime]::UtcNow -ge $coordinationDeadline) {
-                throw "Timed out waiting for Cargo lane coordination lock."
+                return $null
             }
-            Start-Sleep -Milliseconds 50
+            Start-Sleep -Milliseconds ([Math]::Max(1, [Math]::Min(50, ($coordinationDeadline - [DateTime]::UtcNow).TotalMilliseconds)))
         }
     }
 
@@ -848,7 +849,7 @@ function Try-AcquireCargoLaneReservation {
             }
         }
 
-        throw "Unable to reserve an idle Cargo lane for '$BaseLane'."
+        return $null
     }
     finally {
         if ($null -ne $coordinationStream) {
@@ -864,16 +865,17 @@ function Acquire-CargoLaneReservation {
         [switch]$PreferWarm,
         [string[]]$ActiveNames = @(),
         [switch]$AllowColdOverflow,
-        [double]$WarmWaitSeconds = 600
+        [double]$WarmWaitSeconds = 0
     )
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $announced = $false
     while ($true) {
         $expired = $watch.Elapsed.TotalSeconds -ge $WarmWaitSeconds
-        $reservation = Try-AcquireCargoLaneReservation -LaneRoot $LaneRoot -BaseLane $BaseLane -PreferWarm:$PreferWarm -ActiveNames $ActiveNames -AllowColdOverflow:($AllowColdOverflow -and $expired)
+        $remaining = [Math]::Max(0, $WarmWaitSeconds - $watch.Elapsed.TotalSeconds)
+        $reservation = Try-AcquireCargoLaneReservation -LaneRoot $LaneRoot -BaseLane $BaseLane -PreferWarm:$PreferWarm -ActiveNames $ActiveNames -AllowColdOverflow:($AllowColdOverflow -and $expired) -CoordinationWaitSeconds $remaining
         if ($null -ne $reservation) { return $reservation }
-        if ($expired) {
-            throw "Cargo lane '$BaseLane' is busy; no cold overflow was started. Wait for its owner, increase -WarmWaitSeconds, or explicitly use -AllowColdOverflow."
+        if ($watch.Elapsed.TotalSeconds -ge $WarmWaitSeconds) {
+            return $null
         }
         if (-not $announced) {
             [Console]::Error.WriteLine("waiting up to ${WarmWaitSeconds}s for a reusable Cargo lane for '$BaseLane'")
@@ -1070,6 +1072,20 @@ $didPushLocation = $false
 # OS observations may become idle while waiting for coordination. Reservation
 # rechecks their locks; only explicit administrative exclusions stay excluded.
 $reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $excludedLaneNames -PreferWarm:($requestedLane -ceq "auto") -AllowColdOverflow:$parsedArgs.AllowColdOverflow -WarmWaitSeconds $parsedArgs.WarmWaitSeconds
+if ($null -eq $reservation) {
+    [Console]::Error.WriteLine("Cargo lane '$candidateLane' is busy; no cold overflow was started. Required validation remains pending.")
+    $status = @{
+        kind = "codex_rust_admission_v1"; status = "busy"; exit_code = 75
+        resource = (Join-Path $cargoLanesRoot $candidateLane); validation_status = "pending"
+        executed = $false; queued = $false; automatic_retry = $false
+        automatic_resume = $false; working_directory = (Get-Location).Path
+        invocation = @((Get-Process -Id $PID).Path, "-NoProfile", "-File", $PSCommandPath) + @($args)
+        wait_option = "-WarmWaitSeconds"; pending_command = @($commandArgs)
+        next_action = "Keep required validation pending. Do not poll by relaunching, switch lanes, or start duplicate checks. Resume any already-live validation operation. Otherwise leave validation pending for a later explicit invocation; a short bounded wait is opt-in, not required. If that wait expires, report blocked validation rather than retrying or completing."
+    }
+    [Console]::Error.WriteLine(($status | ConvertTo-Json -Compress -Depth 4))
+    exit 75
+}
 try {
     $resolvedLane = $reservation.Lane
     $targetDir = $reservation.TargetDir

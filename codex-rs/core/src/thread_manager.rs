@@ -301,6 +301,7 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    pub(crate) model_http_clients: Arc<crate::client::SharedModelHttpClients>,
     thread_registry_leases: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<AsyncMutex<()>>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_created_instances: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<CodexThread>>>,
@@ -637,6 +638,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                model_http_clients: Default::default(),
                 thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),
@@ -783,6 +785,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                model_http_clients: Default::default(),
                 thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),

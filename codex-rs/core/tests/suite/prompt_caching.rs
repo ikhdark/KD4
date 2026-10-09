@@ -241,6 +241,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
     let expected_tools_names = vec![
         "exec",
         "wait",
+        "tool_search",
         "exec_command",
         "write_stdin",
         "read_tool_output",

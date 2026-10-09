@@ -2474,13 +2474,20 @@ class RunTargetTest(RunnerTestCase):
 
     def test_requested_success_output_is_streamed_without_changing_receipts(self) -> None:
         receipts = {}
-        for value in ("never", "immediate"):
+        for value in rust_test_runner.SUCCESS_OUTPUT_VALUES:
             executor = self.build_executor(default_listing={"tests::alpha": False})
             runner = RustTestRunner(
                 self.manifest(), self.metadata(), target_dir=self.target_dir,
                 platform="windows", executor=executor, success_output=value,
             )
-            receipts[value] = runner.run_target("core_all", ["-E", "test(=tests::alpha)"])
+            original_stdout = executor._stdout
+            def displayed_output(args):
+                output = original_stdout(args)
+                if args[:3] == ["cargo", "nextest", "run"] and value in ("final", "immediate-final"):
+                    output += "\nSummary [ 0.01s] 1 test run: 1 passed\n" + output + "\n  stdout ---\nbenchmark output\n"
+                return output
+            with mock.patch.object(executor, "_stdout", side_effect=displayed_output):
+                receipts[value] = runner.run_target("core_all", ["-E", "test(=tests::alpha)"])
             (run,) = executor.commands(["cargo", "nextest", "run"])
             self.assertEqual(run[run.index("--success-output") + 1], value)
             (capture,) = [
@@ -2490,7 +2497,8 @@ class RunTargetTest(RunnerTestCase):
             # Status lines stay retained for receipts; requested output streams.
             self.assertEqual(capture, rust_test_runner.CAPTURE_BOTH
                              if value == "never" else rust_test_runner.CAPTURE_STDOUT)
-        self.assertEqual(receipts["immediate"], receipts["never"])
+        for value in rust_test_runner.SUCCESS_OUTPUT_VALUES:
+            self.assertEqual(receipts[value], receipts["never"])
         with self.assertRaisesRegex(RunnerError, "--success-output must be one of"):
             RustTestRunner(self.manifest(), self.metadata(), success_output="always")
 

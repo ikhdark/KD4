@@ -54,20 +54,19 @@ fn enclosing(items: &[CodeItem], line: usize) -> Result<&CodeItem, ReadToolOutpu
 }
 
 fn symbol_matches(item: &CodeItem, name: &str) -> bool {
-    item.kind != "impl" && (item.name == name || item.qualified_name == name
+    if item.kind == "impl" && !name.starts_with("impl ") && !name.contains("::impl ") {
+        return false;
+    }
+    (item.kind != "impl" && item.name == name) || item.qualified_name == name
         || item.qualified_name.ends_with(&format!("::{name}"))
-        || item.qualified_name.ends_with(&format!(".{name}")))
+        || item.qualified_name.ends_with(&format!(".{name}"))
 }
 
 // Diagnostic-only repair for Type::method when the parsed owner is a trait
 // implementation. Never make this looser spelling an executable selector.
 fn trait_method_candidate(item: &CodeItem, name: &str) -> bool {
-    let Some((owner, method)) = name.rsplit_once("::") else { return false; };
-    if item.name != method { return false; }
-    let Some(qualified_owner) = item.qualified_name.strip_suffix(&format!("::{method}")) else { return false; };
-    let Some((prefix, implementation)) = qualified_owner.rsplit_once('<') else { return false; };
-    let Some((ty, trait_name)) = implementation.split_once(" as ") else { return false; };
-    trait_name.ends_with('>') && (owner == ty || owner == format!("{prefix}{ty}"))
+    name.contains("::") && item.trait_method_alias.as_ref().is_some_and(|alias|
+        alias == name || alias.ends_with(&format!("::{name}")))
 }
 
 pub(super) fn resolve_batch(
@@ -160,7 +159,12 @@ fn resolve_items(
         };
         let item = match structure {
             StructureSelector::Symbol { name } => {
-                let mut matches = items.iter().filter(|item| symbol_matches(item, &name));
+                // A nested suffix must not obscure an exact qualified name.
+                // Bare names still require uniqueness across the whole file.
+                let exact = (name.contains("::") || name.contains('.') || name.starts_with("impl "))
+                    && items.iter().any(|item| item.qualified_name == name && symbol_matches(item, &name));
+                let mut matches = items.iter().filter(|item| symbol_matches(item, &name)
+                    && (!exact || item.qualified_name == name));
                 let item = matches.next().ok_or_else(|| error(format!("symbol {name:?} not found (macros are not expanded)")))?;
                 if matches.next().is_some() {
                     return Err(error(format!("symbol {name:?} is ambiguous; use a qualified name such as Type::method or <Type as Trait>::method (Python: Class.method), or enclosing with a known line")));

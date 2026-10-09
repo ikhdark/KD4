@@ -504,9 +504,9 @@ async fn collect_compaction_output(
         let Some(event) = next_event else {
             break;
         };
-        let _model_stream_processing_timing_guard =
-            timing_state.map(super::turn_timing::TurnTimingState::begin_model_stream_processing);
         let event = event?;
+        let _model_stream_processing_timing_guard =
+            timing_state.and_then(|timing| timing.begin_model_stream_processing(&event));
         if let Some(timing) = timing_state {
             // Ignored compactor messages are not user-visible or actionable.
             if matches!(

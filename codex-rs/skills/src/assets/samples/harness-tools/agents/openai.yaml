@@ -1,4 +1,0 @@
-interface:
-  display_name: "Harness Tools"
-  short_description: "Inventory sources and audit sessions in any repo"
-  default_prompt: "Use $harness-tools to audit this session, fix verified problems, and validate the fixes."

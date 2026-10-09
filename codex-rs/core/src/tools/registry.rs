@@ -13,6 +13,7 @@ use crate::session::turn_execution::PendingOwnerDrainedContinuation;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::attach_canonical_output_artifact;
+#[cfg(test)]
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
 use crate::tools::context::FunctionToolOutput;
@@ -3178,14 +3179,16 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical)
                     .await
             } else {
-                create_canonical_output_artifact(&codex_home, &thread_id, &canonical).await
+                crate::tools::command_output_artifact::create_tool_history_output_artifact(
+                    &codex_home, &thread_id, &canonical,
+                ).await
             };
             let artifact_id = artifact.artifact_id();
             if let Some(artifact_id) = artifact_id
                 && artifact.complete
                 && artifact.retained_bytes == canonical.exact_bytes
                 && artifact.unavailable_ranges.is_empty()
-                && crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+                && (artifact_created || crate::tools::command_output_artifact::protect_active_tool_history_artifact(
                     &codex_home,
                     &thread_id,
                     &artifact_id,
@@ -3193,7 +3196,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                     &canonical.sha256,
                 )
                 .await
-                .is_ok()
+                .is_ok())
             {
                 Some((artifact, artifact_id, artifact_created))
             } else {

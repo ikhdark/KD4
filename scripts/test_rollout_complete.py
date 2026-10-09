@@ -3,14 +3,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from scripts import _rollout_dump as dump
+from scripts import rollout_reports as dump
 
 
 def encode(rows):
@@ -115,9 +115,9 @@ class CompleteRolloutTest(unittest.TestCase):
     def test_complete_cli_uses_the_complete_renderer(self):
         self.source.write_bytes(encode([{"unknown": "tail" * 2000}]))
         result = subprocess.run(
-            [sys.executable, "-B", str(Path(dump.__file__)), "--complete",
+            [sys.executable, "-B", str(Path(dump.__file__)), "dump", "--complete",
              str(self.root / "reports"), str(self.source)],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(

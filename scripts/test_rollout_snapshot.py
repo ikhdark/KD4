@@ -46,6 +46,34 @@ class RolloutSnapshotTest(unittest.TestCase):
                                 rollout_snapshot.load_rollout_payload(source, digest, len(data))
                     opened().read.assert_called_once_with(len(data) + 1)
 
+    def test_relocated_rollout_reads_codex_home_store_but_not_over_corrupt_blob(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            data = b'{"type":"event_msg","payload":{"type":"example"}}'
+            digest = hashlib.sha256(data).hexdigest()
+            (home / "rollout-payloads").mkdir(parents=True)
+            (home / "rollout-payloads" / f"{digest}.json").write_bytes(data)
+            source = Path(temp) / "runs" / "copied.jsonl"
+            source.parent.mkdir()
+            source.write_text(json.dumps({"type": "rollout_payload_artifact", "payload": {
+                "sha256": digest, "bytes": len(data), "item_type": "event_msg"}}) + "\n",
+                encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+                [(record, _)] = rollout_snapshot.read_rollout_records(source)
+                self.assertEqual(record["payload"], {"type": "example"})
+                output = Path(temp) / "export" / "snapshot.jsonl"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rollout_snapshot.main([str(source), "--output", str(output)])
+                self.assertEqual(
+                    (rollout_snapshot.rollout_payload_root(output) / f"{digest}.json").read_bytes(), data)
+                colocated = rollout_snapshot.rollout_payload_root(source)
+                colocated.mkdir()
+                (colocated / f"{digest}.json").write_bytes(b"corrupt")
+                with self.assertRaisesRegex(ValueError, "size mismatch"):
+                    rollout_snapshot.load_rollout_payload(source, digest, len(data))
+                with self.assertRaisesRegex(FileNotFoundError, f"{'0' * 64}.json not found in: .*home"):
+                    rollout_snapshot.load_rollout_payload(source, "0" * 64)
+
     def test_record_iterator_is_lazy_and_closes_its_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "rollout.jsonl"

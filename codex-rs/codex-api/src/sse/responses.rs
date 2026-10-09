@@ -33,27 +33,27 @@ const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
 const MAX_SSE_EVENT_BYTES: usize = 32 * 1024 * 1024;
 
-// Bound parser accumulation before UTF-8/JSON decoding. Count raw bytes since
-// the last empty SSE line, recognizing LF, CRLF and CR even across chunks.
-// This is deliberately not a response-lifetime limit.
+// Bound parser accumulation before UTF-8/JSON decoding. Scan raw bytes once,
+// recognizing LF, CRLF and CR even across chunks. Only pass complete events to
+// eventsource-stream: partial payloads make it repeatedly scan the same line.
 fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
     struct Framing {
         stream: ByteStream,
         pending: bytes::Bytes,
+        event: bytes::BytesMut,
         bytes: usize,
         line_has_data: bool,
         after_cr: bool,
-        error_pending: bool,
         finished: bool,
         since_yield: usize,
     }
     let state = Framing {
         stream,
         pending: bytes::Bytes::new(),
+        event: bytes::BytesMut::new(),
         bytes: 0,
         line_has_data: false,
         after_cr: false,
-        error_pending: false,
         finished: false,
         since_yield: 0,
     };
@@ -61,89 +61,105 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
         if state.finished {
             return None;
         }
-        let framing_error = || codex_client::TransportError::Build(format!(
-            "SSE event exceeds the {limit}-byte framing limit"
-        ));
-        if state.error_pending {
-            state.finished = true;
-            return Some((Err(framing_error()), state));
-        }
-        // The SSE parser can consume comments without returning an event. Keep
-        // cancellation/deadlines runnable even with an always-ready byte source.
-        tokio::task::consume_budget().await;
-        const SCAN_CHUNK_BYTES: usize = 64 * 1024;
-        if state.since_yield >= SCAN_CHUNK_BYTES {
-            tokio::task::yield_now().await;
-            state.since_yield = 0;
-        }
-        if state.pending.is_empty() {
-            match state.stream.next().await? {
-                Ok(chunk) => state.pending = chunk,
-                Err(error) => {
-                    state.finished = true;
-                    return Some((Err(error), state));
+        loop {
+            // Bound work even for an always-ready source of comments, empty
+            // chunks, or one large unfinished event.
+            tokio::task::consume_budget().await;
+            const SCAN_CHUNK_BYTES: usize = 64 * 1024;
+            if state.since_yield >= SCAN_CHUNK_BYTES {
+                tokio::task::yield_now().await;
+                state.since_yield = 0;
+            }
+            if state.pending.is_empty() {
+                match state.stream.next().await {
+                    Some(Ok(chunk)) => state.pending = chunk,
+                    Some(Err(error)) => {
+                        state.finished = true;
+                        return Some((Err(error), state));
+                    }
+                    None => {
+                        state.finished = true;
+                        // Preserve EOF/UTF-8 classification for truncated input.
+                        return if state.event.is_empty() {
+                            None
+                        } else {
+                            Some((Ok(state.event.split().freeze()), state))
+                        };
+                    }
                 }
             }
-        }
-        // Zero-copy slices avoid scanning/copying an entire coalesced response
-        // before the parser can deliver its first event.
-        let len = state.pending.len().min(SCAN_CHUNK_BYTES);
-        let chunk = state.pending.split_to(len);
-        state.since_yield += len;
-        let mut index = 0;
-        let overflow = loop {
-            if index == chunk.len() {
-                break None;
-            }
-            if state.after_cr && chunk[index] == b'\n' {
+            if state.after_cr && state.bytes == 0 && state.pending.first() == Some(&b'\n') {
+                // The previous empty CR line was already terminated below.
+                let _ = state.pending.split_to(1);
                 state.after_cr = false;
-                if state.bytes != 0 {
+            }
+            let len = state.pending.len().min(SCAN_CHUNK_BYTES);
+            let chunk = &state.pending[..len];
+            let mut index = 0;
+            let mut complete = false;
+            let mut overflow = false;
+            while index < chunk.len() {
+                if state.after_cr && chunk[index] == b'\n' {
+                    state.after_cr = false;
                     if state.bytes == limit {
-                        break Some(index);
+                        overflow = true;
+                        break;
                     }
                     state.bytes += 1;
+                    index += 1;
+                    continue;
                 }
+                state.after_cr = false;
+                let run = chunk[index..].iter()
+                    .position(|byte| matches!(byte, b'\r' | b'\n'))
+                    .unwrap_or(chunk.len() - index);
+                if run > limit - state.bytes {
+                    overflow = true;
+                    break;
+                }
+                state.bytes += run;
+                state.line_has_data |= run != 0;
+                index += run;
+                if index == chunk.len() {
+                    break;
+                }
+                if state.bytes == limit {
+                    overflow = true;
+                    break;
+                }
+                state.bytes += 1;
+                state.after_cr = chunk[index] == b'\r';
+                complete = !state.line_has_data;
+                state.line_has_data = false;
                 index += 1;
-                continue;
+                if complete {
+                    state.bytes = 0;
+                    break;
+                }
             }
-            state.after_cr = false;
-            // Account for ordinary bytes in runs, instead of updating framing
-            // state and checking the size limit on every payload byte.
-            let run = chunk[index..].iter()
-                .position(|byte| matches!(byte, b'\r' | b'\n'))
-                .unwrap_or(chunk.len() - index);
-            if run > limit - state.bytes {
-                break Some(index + limit - state.bytes);
-            }
-            state.bytes += run;
-            state.line_has_data |= run != 0;
-            index += run;
-            if index == chunk.len() {
-                break None;
-            }
-            if state.bytes == limit {
-                break Some(index);
-            }
-            state.bytes += 1;
-            state.after_cr = chunk[index] == b'\r';
-            if !state.line_has_data {
-                state.bytes = 0;
-            }
-            state.line_has_data = false;
-            index += 1;
-        };
-        if let Some(index) = overflow {
-            // A later invalid frame must not erase earlier complete events
-            // in the same network chunk, especially response.completed.
-            state.pending = bytes::Bytes::new();
-            if index == 0 {
+            if overflow {
                 state.finished = true;
-                return Some((Err(framing_error()), state));
+                return Some((Err(codex_client::TransportError::Build(format!(
+                    "SSE event exceeds the {limit}-byte framing limit"
+                ))), state));
             }
-            state.error_pending = true;
-            return Some((Ok(chunk.slice(..index)), state));
+            state.since_yield += index;
+            let chunk = state.pending.split_to(index);
+            if complete && state.event.is_empty() && !state.after_cr {
+                // Common case: an event in one network chunk needs no copy.
+                return Some((Ok(chunk), state));
+            }
+            state.event.extend_from_slice(&chunk);
+            if complete {
+                if state.after_cr {
+                    // nom's streaming CRLF parser needs lookahead after CR.
+                    // Finish an empty CR line without waiting for another event;
+                    // swallow its optional wire LF on the next iteration.
+                    state.event.extend_from_slice(b"\n");
+                }
+                return Some((Ok(state.event.split().freeze()), state));
+            }
         }
-        Some((Ok(chunk), state))
     }).boxed()
 }
 
@@ -416,7 +432,10 @@ mod tests {
             for width in [1, 3, 64, valid.len()] {
                 let chunks = valid.as_bytes().chunks(width).map(|chunk| Ok(bytes::Bytes::copy_from_slice(chunk))).collect::<Vec<_>>();
                 let received = bound_sse_events(futures::stream::iter(chunks).boxed(), 32).try_collect::<Vec<_>>().await.unwrap();
-                assert_eq!(received.iter().map(|chunk| chunk.len()).sum::<usize>(), valid.len());
+                // Empty CR lines are completed with LF for the streaming parser.
+                let expected = format!("data: x{}", if separator == "\r\r" { "\r\r\n" } else { separator });
+                assert_eq!(received.len(), 1000);
+                assert!(received.iter().all(|chunk| chunk.as_ref() == expected.as_bytes()));
             }
         }
         for payload in ["data: ".to_string() + &"x".repeat(33), "data:x\n".repeat(10)] {
@@ -609,7 +628,41 @@ mod tests {
             Box::pin(stream::iter([Ok(Bytes::from(vec![b'x'; 1024 * 1024]))])),
             MAX_SSE_EVENT_BYTES,
         );
-        assert_eq!(source.next().await.unwrap().unwrap().len(), 64 * 1024);
+        // Scanning remains cooperative even though no partial event is emitted.
+        assert!(futures::poll!(source.next()).is_pending());
+        assert_eq!(source.next().await.unwrap().unwrap().len(), 1024 * 1024);
+        assert!(source.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sse_framing_delivers_fragmented_large_events_once() {
+        let payload = "x".repeat(1024 * 1024);
+        let frame = format!("event: delta\ndata: {payload}\n\n");
+        let wire = format!("{frame}data: tail\n\n");
+        let chunks = wire.as_bytes().chunks(16384)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk))).collect::<Vec<_>>();
+        let framed = bound_sse_events(stream::iter(chunks).boxed(), MAX_SSE_EVENT_BYTES)
+            .try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(framed, vec![Bytes::from(frame), Bytes::from_static(b"data: tail\n\n")]);
+        let events = stream::iter(framed.into_iter().map(Ok::<_, TransportError>))
+            .eventsource().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, payload);
+        assert_eq!(events[1].data, "tail");
+    }
+
+    #[tokio::test]
+    async fn sse_framing_preserves_split_utf8_multiline_and_cr_completion() {
+        for ending in ["\n", "\r", "\r\n"] {
+            let wire = format!("event: delta{ending}data: hé🙂{ending}data: world{ending}{ending}");
+            let chunks = wire.bytes().map(|byte| Ok(Bytes::from(vec![byte]))).collect::<Vec<_>>();
+            // A complete event must not wait for EOF or the next network event.
+            let source = stream::iter(chunks).chain(stream::pending());
+            let mut events = bound_sse_events(source.boxed(), wire.len()).eventsource();
+            let event = timeout(idle_timeout(), events.next()).await.unwrap().unwrap().unwrap();
+            assert_eq!(event.event, "delta");
+            assert_eq!(event.data, "hé🙂\nworld");
+        }
     }
 
     #[tokio::test]

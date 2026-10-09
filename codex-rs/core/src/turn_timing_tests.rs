@@ -1873,7 +1873,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 30);
+    assert_eq!(timing.schema_version, 31);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -1967,6 +1967,15 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
     state.record_model_request_payload("new", "new-attempt", br#"{"instructions":"two","input":[]}"#);
     state.record_model_request_payload("old", "old-attempt", br#"{"instructions":"one","input":[]}"#);
     state.record_model_response_id("old-attempt", "response-one");
+    let before_diagnostics = state.complete_snapshot().protocol_timing();
+    for request in &before_diagnostics.model_requests {
+        assert_eq!(request.request_sha256_by_attempt.len(), 1);
+        assert!(request.request_section_sha256_by_attempt.is_empty());
+    }
+    // Late diagnostics must refresh the completed snapshot without rebinding
+    // old attempt data to the newer generation.
+    state.record_model_request_sections("new", "new-attempt", br#"{"instructions":"two","input":[]}"#);
+    state.record_model_request_sections("old", "old-attempt", br#"{"instructions":"one","input":[]}"#);
     state.record_model_request_token_categories(
         "old",
         "old-attempt",
@@ -2004,6 +2013,8 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
     let old_sections = &old.request_section_sha256_by_attempt["old-attempt"];
     let new_sections = &new.request_section_sha256_by_attempt["new-attempt"];
     assert_eq!(old_sections["input"], new_sections["input"]);
+    assert_eq!(old_sections["input"], format!("{:x}", sha2::Sha256::digest(b"[]")));
+    assert_eq!(old_sections["instructions"], format!("{:x}", sha2::Sha256::digest(br#""one""#)));
     assert_ne!(old_sections["instructions"], new_sections["instructions"]);
     assert!(new.request_token_categories.is_none());
     assert!(new.fixed_prefix_reuse_eligible.is_none());
@@ -2685,7 +2696,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 30);
+    assert_eq!(profile.schema_version, 31);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -2704,6 +2715,119 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     assert_eq!(profile.unions.model_active_ns, 90 * NS_PER_MS);
     assert_eq!(profile.unions.tool_active_ns, 60 * NS_PER_MS);
     assert_eq!(profile.unions.interactive_wait_ns, 25 * NS_PER_MS);
+}
+
+#[test]
+fn request_setup_before_dispatch_is_not_model_time() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+
+    // Sampling opens the request wait before the client prepares the physical
+    // attempt; transport readiness spans that setup until dispatch-ready.
+    clock.set_ms(10);
+    let request = state.begin_model_request_wait();
+    clock.set_ms(12);
+    let transport = state.begin_local_phase(TurnLocalPhase::TransportReadiness);
+    clock.set_ms(20);
+    let persistence = state.begin_local_phase(TurnLocalPhase::Persistence);
+    clock.set_ms(26);
+    let background_tool = state.begin_tool_execution();
+    clock.set_ms(30);
+    drop(persistence);
+    let serialization = state.begin_local_phase(TurnLocalPhase::Serialization);
+    clock.set_ms(32);
+    drop(serialization);
+    drop(transport);
+    state.mark_model_request_dispatched();
+    clock.set_ms(35);
+    drop(background_tool);
+    clock.set_ms(40);
+    drop(request);
+    let stream = state.begin_model_stream_wait();
+    clock.set_ms(90);
+    drop(stream);
+    state.begin_finalization();
+    clock.set_ms(100);
+
+    let snapshot = state.complete_snapshot();
+    let profile = &snapshot.profile;
+    assert!(profile.profile_valid);
+    assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
+    // Setup [12, 26) is orchestration, and a tool running during setup
+    // [26, 32) does not overlap the model.
+    assert_eq!(profile.exclusive.orchestration_ns, 24 * NS_PER_MS);
+    assert_eq!(profile.exclusive.tool_only_ns, 6 * NS_PER_MS);
+    assert_eq!(profile.exclusive.model_tool_overlap_ns, 3 * NS_PER_MS);
+    // A request wait outside transport readiness [10, 12) stays model time.
+    assert_eq!(profile.exclusive.model_only_ns, 57 * NS_PER_MS);
+    assert_eq!(profile.exclusive.finalization_ns, 10 * NS_PER_MS);
+    assert_eq!(profile.unions.model_request_wait_ns, 10 * NS_PER_MS);
+    assert_eq!(profile.unions.model_active_ns, 60 * NS_PER_MS);
+    // The reclassified interval is exactly the request's recorded setup.
+    assert_eq!(
+        snapshot.protocol_timing().model_requests[0].setup_phase_ns["transport_readiness"],
+        20 * NS_PER_MS as u64
+    );
+}
+
+#[test]
+fn completed_response_bookkeeping_is_not_model_time() {
+    for end_turn in [Some(true), Some(false), None] {
+        let (clock, state) = timing();
+        state.mark_turn_started();
+        let request = state.begin_model_request_wait();
+        state.mark_model_request_dispatched();
+        clock.set_ms(10);
+        drop(request);
+        let stream = state.begin_model_stream_wait();
+        clock.set_ms(20);
+        drop(stream);
+        let processing =
+            state.begin_model_stream_processing(&ResponseEvent::OutputTextDelta("text".to_string()));
+        assert!(processing.is_some());
+        clock.set_ms(25);
+        drop(processing);
+        let stream = state.begin_model_stream_wait();
+        clock.set_ms(30);
+        let tool = state.begin_tool_execution();
+        clock.set_ms(40);
+        drop(stream);
+
+        let completed = ResponseEvent::Completed {
+            response_id: "response".to_string(),
+            token_usage: None,
+            end_turn,
+        };
+        let processing = state.begin_model_stream_processing(&completed);
+        assert!(processing.is_none());
+        state.record_response_event_milestones(&completed);
+        // Completion bookkeeping may overlap a tool before returning to the
+        // orchestration loop, including when the server requests a continuation.
+        clock.set_ms(50);
+        drop(tool);
+        clock.set_ms(60);
+        drop(processing);
+
+        let snapshot = state.complete_snapshot();
+        let profile = &snapshot.profile;
+        assert!(profile.profile_valid);
+        assert!(profile.classification_complete);
+        assert_eq!(profile.exclusive.total_ns(), 60 * NS_PER_MS);
+        assert_eq!(profile.inclusive_duration_ns, 60 * NS_PER_MS);
+        assert_eq!(profile.exclusive.model_only_ns, 30 * NS_PER_MS);
+        assert_eq!(profile.exclusive.model_tool_overlap_ns, 10 * NS_PER_MS);
+        assert_eq!(profile.exclusive.tool_only_ns, 10 * NS_PER_MS);
+        assert_eq!(profile.exclusive.orchestration_ns, 10 * NS_PER_MS);
+        assert_eq!(profile.exclusive.finalization_ns, 0);
+        assert_eq!(profile.unions.model_request_wait_ns, 10 * NS_PER_MS);
+        assert_eq!(profile.unions.model_stream_wait_ns, 25 * NS_PER_MS);
+        assert_eq!(profile.unions.model_stream_processing_ns, 5 * NS_PER_MS);
+        assert_eq!(profile.unions.model_active_ns, 40 * NS_PER_MS);
+        assert_eq!(
+            snapshot.protocol_timing().model_requests[0].completed_ms,
+            Some(40)
+        );
+    }
 }
 
 #[test]

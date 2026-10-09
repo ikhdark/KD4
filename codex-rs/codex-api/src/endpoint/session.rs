@@ -16,6 +16,8 @@ use http::HeaderMap;
 use http::Method;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tracing::instrument;
 
 async fn prepare_request(request: Request) -> Result<Request, TransportError> {
@@ -219,36 +221,44 @@ impl<T: HttpTransport> EndpointSession<T> {
         let request = prepare_request(request).await?;
         let make_request = || request.clone();
         let header_timeout = self.provider.stream_idle_timeout;
+        let header_deadline_elapsed = AtomicBool::new(false);
 
         // The new header deadline must not replay an ambiguously dispatched
         // model request. Concrete transport errors retain their existing policy.
         // Scope the deadline to obtaining headers, not the response body's lifetime.
-        let stream = tokio::time::timeout(
-            header_timeout,
-            run_with_request_telemetry_non_idempotent(
-                self.provider.retry.to_policy(),
-                self.request_telemetry.clone(),
-                make_request,
-                |req| {
-                    let auth = self.auth.clone();
-                    let transport = &self.transport;
-                    async move {
-                        let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
-                        transport.stream(req).await
-                    }
-                },
-            ),
+        let stream = run_with_request_telemetry_non_idempotent(
+            self.provider.retry.to_policy(),
+            self.request_telemetry.clone(),
+            make_request,
+            |req| {
+                let auth = self.auth.clone();
+                let transport = &self.transport;
+                let header_deadline_elapsed = &header_deadline_elapsed;
+                async move {
+                    let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
+                    // Authentication and safe pre-dispatch retry backoff are
+                    // not response silence. Give each dispatch its own budget.
+                    tokio::time::timeout(header_timeout, transport.stream(req))
+                        .await
+                        .unwrap_or_else(|_| {
+                            header_deadline_elapsed.store(true, Ordering::Relaxed);
+                            Err(TransportError::Timeout)
+                        })
+                }
+            },
         )
-        .await
-        .map_err(|_| ApiError::ProviderFailure {
-            code: Some("response_header_timeout".to_string()),
-            message: format!(
-                "deadline waiting for model response headers after {}ms",
-                header_timeout.as_millis()
-            ),
-        })??;
+        .await;
+        if header_deadline_elapsed.load(Ordering::Relaxed) {
+            return Err(ApiError::ProviderFailure {
+                code: Some("response_header_timeout".to_string()),
+                message: format!(
+                    "deadline waiting for model response headers after {}ms",
+                    header_timeout.as_millis()
+                ),
+            });
+        }
 
-        Ok(stream)
+        Ok(stream?)
     }
 }
 
@@ -323,6 +333,59 @@ mod tests {
             std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
                 .write_all(result.as_bytes()).unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_deadline_excludes_authentication_and_safe_retry_backoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct DelayedAuth(AtomicUsize);
+        impl crate::auth::AuthProvider for DelayedAuth {
+            fn add_auth_headers(&self, _: &mut HeaderMap) {}
+
+            fn apply_auth(&self, request: Request) -> crate::auth::AuthProviderFuture<'_> {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(crate::auth::AuthError::Transient("credentials unavailable".into()));
+                    }
+                    Ok(request)
+                })
+            }
+        }
+        struct ImmediateHeaders(Arc<AtomicUsize>);
+        impl HttpTransport for ImmediateHeaders {
+            async fn execute(&self, _: Request) -> Result<Response, TransportError> {
+                unreachable!("stream only")
+            }
+
+            async fn stream(&self, _: Request) -> Result<StreamResponse, TransportError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(StreamResponse {
+                    status: http::StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    bytes: Box::pin(futures::stream::empty()),
+                })
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let auth = Arc::new(DelayedAuth(AtomicUsize::new(0)));
+        let session = EndpointSession::new(ImmediateHeaders(calls.clone()), Provider {
+            name: "auth retry probe".into(), base_url: "http://127.0.0.1".into(),
+            query_params: None, headers: HeaderMap::new(),
+            retry: crate::provider::RetryConfig {
+                max_retries: 1, base_delay: Duration::from_millis(100),
+                retry_429: false, retry_5xx: false, retry_transport: true,
+            },
+            stream_idle_timeout: Duration::from_millis(50),
+        }, auth.clone());
+        let result = session.stream_encoded_json_with(
+            Method::POST, "responses", HeaderMap::new(), None, |_| {},
+        ).await;
+        assert!(result.is_ok(), "authentication/backoff are not response silence");
+        assert_eq!(auth.0.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]

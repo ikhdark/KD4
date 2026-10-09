@@ -8,8 +8,6 @@ use std::hash::Hasher;
 use thiserror::Error;
 
 const SYSTEM_SKILLS_DIR: Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/assets/samples");
-const HARNESS_TOOL_SCRIPTS: &[(&str, &[u8])] =
-    include!(concat!(env!("OUT_DIR"), "/harness_tool_scripts.rs"));
 
 const SYSTEM_SKILLS_DIR_NAME: &str = ".system";
 const SKILLS_DIR_NAME: &str = "skills";
@@ -33,20 +31,7 @@ pub fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
 /// with a fingerprint of the embedded directory. When the marker matches, the
 /// install is skipped.
 pub fn install_system_skills(codex_home: &AbsolutePathBuf) -> Result<(), SystemSkillsError> {
-    install_system_skills_with(codex_home, |dest| {
-        write_embedded_dir(&SYSTEM_SKILLS_DIR, dest)?;
-        for (relative_path, contents) in HARNESS_TOOL_SCRIPTS {
-            let path = dest.join(relative_path);
-            if let Some(parent) = path.as_path().parent() {
-                fs::create_dir_all(parent).map_err(|source| {
-                    SystemSkillsError::io("create harness tool directory", source)
-                })?;
-            }
-            fs::write(path.as_path(), contents)
-                .map_err(|source| SystemSkillsError::io("write harness tool", source))?;
-        }
-        Ok(())
-    })
+    install_system_skills_with(codex_home, |dest| write_embedded_dir(&SYSTEM_SKILLS_DIR, dest))
 }
 
 fn install_system_skills_with(
@@ -173,11 +158,6 @@ fn read_marker(path: &AbsolutePathBuf) -> Result<String, SystemSkillsError> {
 fn embedded_system_skills_fingerprint() -> String {
     let mut items = Vec::new();
     collect_fingerprint_items(&SYSTEM_SKILLS_DIR, &mut items);
-    for (path, contents) in HARNESS_TOOL_SCRIPTS {
-        let mut hasher = DefaultHasher::new();
-        contents.hash(&mut hasher);
-        items.push(((*path).to_owned(), Some(hasher.finish())));
-    }
     items.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
     let mut hasher = DefaultHasher::new();
@@ -281,33 +261,31 @@ mod tests {
     }
 
     #[test]
-    fn installed_harness_tools_work_outside_the_source_checkout() {
+    fn installation_removes_retired_harness_tools() {
         use super::*;
         let home = tempfile::tempdir().expect("home");
         let home = AbsolutePathBuf::from_absolute_path(home.path()).expect("absolute home");
-        install_system_skills(&home).expect("install harness tools");
         let installed = system_cache_root_dir(&home);
-        for (path, contents) in HARNESS_TOOL_SCRIPTS {
-            assert_eq!(fs::read(installed.join(path).as_path()).unwrap(), *contents);
-        }
-        let python = std::env::var_os("CODEX_TEST_PYTHON")
-            .unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into());
-        let output = std::process::Command::new(python)
-            .args(["-I", "-B"])
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/test_harness_tools.py"
-            ))
-            .arg(installed.join("harness-tools").as_path())
-            .current_dir(home.as_path())
-            .output()
-            .expect("Python is required to exercise the bundled harness tools");
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let retired = installed.join("harness-tools");
+        fs::create_dir_all(retired.join("scripts/lib").as_path()).expect("old payload directory");
+        fs::write(retired.join("SKILL.md").as_path(), "old skill").expect("old skill");
+        fs::write(
+            retired.join("scripts/lib/source_inventory.py").as_path(),
+            "old payload",
+        )
+        .expect("old payload");
+        fs::write(
+            installed.join(SYSTEM_SKILLS_MARKER_FILENAME).as_path(),
+            "old-bundle",
+        )
+        .expect("old marker");
+
+        install_system_skills(&home).expect("replace old bundle");
+
+        assert!(SYSTEM_SKILLS_DIR.get_dir("harness-tools").is_none());
+        assert!(!retired.as_path().exists());
+        assert!(installed.join("skill-creator/SKILL.md").as_path().is_file());
+        assert!(installed.join("skill-installer/SKILL.md").as_path().is_file());
     }
 
     #[test]

@@ -119,7 +119,7 @@ class ValidationMetrics:
         self.record["lifecycle_seconds"] = self.clock() - self.started
         self.record["finished_at"] = datetime.now(timezone.utc).isoformat()
         if outcome != "passed":
-            self.record["proof"]["status"] = outcome
+            self.record["proof"]["status"] = "pending" if outcome == "busy" else outcome
         self.checkpoint()
         try:
             raw = self.path.read_bytes() if self.path is not None else None

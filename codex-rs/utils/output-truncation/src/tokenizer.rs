@@ -83,7 +83,8 @@ pub fn truncate_model_text_at_lines_with_recovery(
             marker,
             std::str::from_utf8(&tail_bytes[tail_start..]).unwrap_or_default()
         );
-        if model_token_count(&result) <= limit {
+        let result_tokens = model_token_count(&result);
+        if result_tokens <= limit {
             let (first, last, _) = crate::omitted_line_span(
                 text, head_end, text.len() - (tail_bytes.len() - tail_start),
             );
@@ -92,7 +93,15 @@ pub fn truncate_model_text_at_lines_with_recovery(
         if retained == 0 {
             return (String::new(), all_lines);
         }
-        retained = retained.saturating_sub(1.max(retained / 100));
+        // The complete packet already tells us how far it exceeds the budget.
+        // A fixed 1% decrement needlessly re-tokenizes the packet and rescans
+        // all omitted source lines, especially for small display budgets.
+        // Recheck after each cut: boundary merges and the marker can change.
+        // Close to a tiny packet, the partial-line marker can itself shrink.
+        // Keep fine-grained fitting for the last 16 tokens on each side rather
+        // than jumping over a fitting diagnostic tail to an empty packet.
+        let excess = (result_tokens - limit).min(retained.saturating_sub(32));
+        retained = retained.saturating_sub(excess.max(1).max(retained / 100));
     }
 }
 
@@ -202,5 +211,36 @@ mod tests {
         assert!(omitted_file_counts("src/日本語.rs\n", 0, "src/日本語.rs\n".len()).contains("src/日本語.rs: 1"));
         let many = (0..30).map(|i| format!("src/file_{i}.rs\n")).collect::<String>();
         assert!(omitted_file_counts(&many, 0, many.len()).contains("22 additional files"));
+    }
+
+    #[test]
+    fn small_artifact_packets_keep_exact_source_boundaries_after_large_budget_cuts() {
+        for line in ["  source evidence λ\r\n", "🙂漢字 repeated evidence\n"] {
+            let source = line.repeat(2_000) + "FAILURE_TAIL\n";
+            for limit in [64, 100, 200] {
+                let (output, gap) = truncate_model_text_at_lines_with_recovery(
+                    &source, limit, 50, 2_100, Some("fixture-artifact"),
+                );
+                assert!(model_token_count(&output) <= limit);
+                assert!(output.ends_with("FAILURE_TAIL\n"));
+                let (head, rest) = output.split_once("\n[omitted lines ").unwrap();
+                let (_, tail) = rest.split_once("]\n").unwrap();
+                assert!(source.starts_with(head));
+                assert!(source.ends_with(tail));
+                let (first, last) = gap.unwrap();
+                assert_eq!(first, 51 + head.bytes().filter(|&b| b == b'\n').count());
+                assert_eq!(last, 50 + source[..source.len() - tail.len()].lines().count());
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_packet_keeps_failure_tail_when_its_line_marker_shrinks() {
+        let source = "src/file.rs:12:needle\n".repeat(64) + "FAILURE_TAIL\n";
+        let (output, _) = truncate_model_text_at_lines_with_recovery(
+            &source, 33, 0, source.lines().count(), Some("fixture-artifact"),
+        );
+        assert!(model_token_count(&output) <= 33);
+        assert!(output.ends_with("FAILURE_TAIL\n"));
     }
 }

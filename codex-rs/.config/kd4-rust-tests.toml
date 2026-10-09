@@ -11,6 +11,39 @@
 
 version = 1
 
+[gates.multi-session-transport]
+description = "Concurrent auth refresh, shared HTTP request isolation, and WebSocket disconnect/shutdown under saturated ingress."
+
+[[gates.multi-session-transport.steps]]
+target = "login_lib"
+tests = [
+  "auth::manager::tests::authority_refresh_coalesces_concurrent_sessions_but_not_later_refreshes",
+  "auth::manager::tests::authority_refresh_waiter_preserves_replaced_or_cleared_credentials",
+  "auth::manager::tests::authority_refresh_cancelled_waiter_releases_admission",
+  "auth::manager::tests::runtime_external_auth_errors_remain_transient",
+]
+
+[[gates.multi-session-transport.steps]]
+target = "http_client_lib"
+tests = [
+  "route_aware_client_pool::tests::shared_pool_isolates_concurrent_request_headers_and_cancellation",
+  "route_aware_client_pool::tests::cold_callers_wait_for_construction_and_recheck_published_client",
+]
+
+[[gates.multi-session-transport.steps]]
+target = "app_server_transport_lib"
+tests = [
+  "transport::websocket::tests::listener_shutdown_retires_multiple_connections_with_full_ingress",
+  "transport::websocket::tests::disconnect_releases_stalled_websocket_io_before_ingress_drains",
+  "transport::websocket::tests::tcp_listener_shutdown_awaits_established_connection",
+  "transport::websocket::tests::listener_shutdown_cancels_registration_behind_full_ingress",
+  "transport::remote_control::client_tracker::tests::transport_shutdown_retires_clients_and_detached_cleanup_with_full_ingress",
+  "transport::remote_control::client_tracker::tests::tracker_only_shutdown_preserves_cleanup_with_full_ingress",
+  "transport::remote_control::client_tracker::tests::close_client_waits_for_transport_event_queue_capacity",
+  "transport::remote_control::client_tracker::tests::close_client_keeps_forwarding_after_caller_is_aborted",
+  "transport::remote_control::client_tracker::tests::initialize_timeout_closes_open_connection",
+]
+
 [gates.harness-fork91-recovery]
 description = "Fork91-specific recovery regressions. Pair with harness-recovery-audit, harness-prevention-context and capability-command-preflight for shared coverage."
 
@@ -33,7 +66,7 @@ tests = [
 ]
 
 [gates.harness-recovery-audit]
-description = "Command receipts preserve recovery, diagnostics and drain handles without false silent-read recovery."
+description = "Command receipts preserve recovery, diagnostics and drain handles; artifact retention stays ordered and backpressured without losing cancellation recovery."
 
 [[gates.harness-recovery-audit.steps]]
 target = "core_lib"
@@ -46,6 +79,10 @@ tests = [
   "tools::code_mode::response_tests::recovery_audit_bare_locator_does_not_hide_exact_selector",
   "tools::code_mode::response_tests::live_session_receipt_is_added_only_when_its_handle_is_not_visible",
   "tools::code_mode::response_tests::command_receipts_share_the_script_budget_and_keep_latest_canonical_states",
+  "tools::code_mode::response_tests::packet_retention_backpressure_preserves_overlap_and_cell_independence",
+  "tools::code_mode::response_tests::packet_retention_flush_preserves_order_after_cancelled_wait_and_yield",
+  "tools::code_mode::response_tests::packet_retention_survives_cell_close_without_reopening_packet",
+  "tools::code_mode::response_tests::packet_retention_large_results_are_recoverable_at_exec_and_wait_boundaries",
 ]
 
 [gates.harness-prevention-context]
@@ -373,6 +410,16 @@ package = "codex-http-client"
 lib = true
 helpers = []
 
+[targets.login_lib]
+package = "codex-login"
+lib = true
+helpers = []
+
+[targets.app_server_transport_lib]
+package = "codex-app-server-transport"
+lib = true
+helpers = []
+
 [targets.model_provider_lib]
 package = "codex-model-provider"
 lib = true
@@ -580,6 +627,8 @@ tests = [
   "responses_retry::tests::connection_recovery_reaches_https_fallback_without_exhausting_network_waits",
   "responses_retry::tests::batch_and_subagent_sources_do_not_opt_into_unlimited_recovery",
   "responses_retry::tests::audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_transport",
+  "responses_retry::tests::provider_retry_timing_microbenchmark",
+  "responses_retry::tests::cancelled_retry_does_not_switch_transport_or_announce_an_attempt",
   "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
 ]
 

@@ -377,8 +377,9 @@ impl ShellCommandHandler {
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let invocation_changed = command_invocation != original_invocation;
-        let validation = crate::validation::resolve_command_validation(
+        let validation = crate::validation::resolve_command_validation_with_shell(
             &command_invocation,
+            original_shell_type,
             (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
             params.validation.clone(),
         ).await;

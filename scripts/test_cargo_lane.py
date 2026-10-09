@@ -56,7 +56,8 @@ class CargoLaneTest(unittest.TestCase):
                 errors.open("w", encoding="utf-8") as stderr,
                 owned_process(
                     [self.shell, "-NoProfile", "-File", str(SCRIPT),
-                     "-LanesRoot", str(self.lanes_root), "-Lane", "handoff"],
+                     "-LanesRoot", str(self.lanes_root), "-Lane", "handoff",
+                     "-WarmWaitSeconds", "10"],
                     env=env, stdout=subprocess.PIPE, stderr=stderr, text=True,
                     creationflags=CREATE_NO_WINDOW,
                 ) as process,
@@ -66,7 +67,7 @@ class CargoLaneTest(unittest.TestCase):
                     if "waiting up to" in errors.read_text(encoding="utf-8"):
                         break
                     time.sleep(0.025)
-                self.assertIn("waiting up to 600s", errors.read_text(encoding="utf-8"))
+                self.assertIn("waiting up to 10s", errors.read_text(encoding="utf-8"))
                 with rust_build_status.cargo_lane_coordination_lock(
                     self.lanes_root, timeout_seconds=1
                 ):
@@ -82,10 +83,30 @@ class CargoLaneTest(unittest.TestCase):
             repo_root=self.temp_root, lane_root=self.lanes_root,
             requested_lane="busy", command=["cargo", "check"]
         ):
-            result = self.run_script("-Lane", "busy", "-WarmWaitSeconds", "0")
-        self.assertNotEqual(result.returncode, 0)
+            result = self.run_script("-Lane", "busy")
+        self.assertEqual(result.returncode, 75)
         self.assertIn("no cold overflow was started", result.stderr)
+        self.assertNotIn("waiting up to", result.stderr)
+        status = next(json.loads(line) for line in result.stderr.splitlines() if line.startswith("{"))
+        self.assertEqual(status["status"], "busy")
+        self.assertEqual(status["validation_status"], "pending")
+        self.assertFalse(status["executed"])
+        self.assertFalse(status["queued"])
+        self.assertFalse(status["automatic_retry"])
+        self.assertFalse(status["automatic_resume"])
         self.assertFalse((self.lanes_root / "busy-2").exists())
+
+    def test_coordination_contention_respects_zero_and_short_waits(self):
+        rust_build_status.initialize_cargo_lanes_root(self.temp_root, self.lanes_root)
+        with rust_build_status.cargo_lane_coordination_lock(self.lanes_root):
+            for wait in ("0", ".05"):
+                result = self.run_script("-Lane", "coordination", "-WarmWaitSeconds", wait)
+                self.assertEqual(result.returncode, 75, result.stderr)
+                self.assertNotIn("LANE=", result.stdout)
+                status = next(json.loads(line) for line in result.stderr.splitlines() if line.startswith("{"))
+                self.assertEqual(status["validation_status"], "pending")
+                self.assertFalse(status["queued"])
+        self.assertFalse((self.lanes_root / "coordination").exists())
 
     def test_busy_lane_uses_an_idle_warm_sibling_without_overflow_opt_in(self):
         with rust_build_status.reserve_cargo_lane(

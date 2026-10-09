@@ -389,6 +389,49 @@ struct PreparedHistoryCacheEntry {
     pending_append: Vec<ResponseItem>,
 }
 
+/// Keep measurement state with the exact projection it describes. A verified
+/// continuation can extend it without hashing or classifying the sent prefix.
+#[derive(Clone, Debug)]
+struct SamplingProjectionCacheEntry {
+    anchor: SamplingProjectionAnchor,
+    fingerprint: Option<PreparedHistoryFingerprint>,
+    prompt_provenance: PromptProvenanceSidecar,
+    stable_context_manifest: StableContextManifest,
+    policy: PreparedHistoryPolicy,
+}
+
+impl SamplingProjectionCacheEntry {
+    fn new(anchor: SamplingProjectionAnchor, prepared: &PreparedPromptInput) -> Self {
+        Self {
+            anchor,
+            fingerprint: prepared.fingerprint.clone(),
+            prompt_provenance: prepared.prompt_provenance.clone(),
+            stable_context_manifest: prepared.stable_context_manifest.clone(),
+            policy: prepared.policy,
+        }
+    }
+
+    fn metadata_matches(&self, prepared: &PreparedPromptInput) -> bool {
+        let previous = &self.stable_context_manifest;
+        let current = &prepared.stable_context_manifest;
+        self.policy == prepared.policy
+            && previous.fingerprint() == current.fingerprint()
+            && previous.projection_enabled() == current.projection_enabled()
+            && previous.fail_open() == current.fail_open()
+            // The fingerprint excludes DynamicHistory, but provenance reads
+            // every component. Ignore only the measurement-only reuse marker.
+            && previous.components().len() == current.components().len()
+            && previous.components().iter().zip(current.components()).all(
+                |(previous, current)| {
+                    previous.kind == current.kind
+                        && previous.identity == current.identity
+                        && previous.active == current.active
+                        && previous.disposition == current.disposition
+                },
+            )
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PreparedAppendSource {
     Prepared,
@@ -429,7 +472,7 @@ pub(crate) struct ContextManager {
     /// previous request as an exact prefix; compaction,
     /// rollback, or replaced tool-history state starts over. Shared like the
     /// prepared cache so a prompt prepared from a snapshot publishes it back.
-    sampling_projection_anchor: Arc<StdMutex<Option<SamplingProjectionAnchor>>>,
+    sampling_projection_anchor: Arc<StdMutex<Option<SamplingProjectionCacheEntry>>>,
     item_token_estimates:
         Arc<StdMutex<HashMap<ItemTokenEstimateCacheNamespace, HashMap<usize, i64>>>>,
     token_info: Option<TokenUsageInfo>,
@@ -742,6 +785,13 @@ impl ContextManager {
         let mut normalized_items = Arc::unwrap_or_clone(self.items);
         retire_expired_turn_advice(&mut normalized_items);
         if stable_context_target == StableContextTarget::Sampling {
+            // Remove identical reinjections before latest-wins retirement. If
+            // retirement runs first, it deletes the original prefix item even
+            // when the new value is unchanged. Retain the first item (including
+            // its identity and turn metadata); changed values still retire below.
+            normalized_items = crate::stable_context::filter_unchanged_stable_context_items(
+                &[], normalized_items,
+            );
             // Retire superseded trusted slots only through the latest real
             // request. Never hoist surviving fragments or rewrite active-tail
             // injections on each continuation.
@@ -757,12 +807,6 @@ impl ContextManager {
                 );
                 normalized_items.extend(tail);
             }
-            // Ingestion already filters new injections. Apply the same trusted,
-            // nonvolatile equality rule to resumed/replaced history as well.
-            // Do not hoist newer instructions or infer trust from their text.
-            normalized_items = crate::stable_context::filter_unchanged_stable_context_items(
-                &[], normalized_items,
-            );
         }
         let normalized_items: Arc<[ResponseItem]> = normalized_items.into();
         // Keep context updates at their original positions. Hoisting the latest
@@ -911,7 +955,7 @@ impl ContextManager {
                 .clone();
             if let Some(projection) = anchor.as_ref().and_then(|anchor| {
                 tool_history.project_continuation_with_workspace_cache(
-                    anchor,
+                    &anchor.anchor,
                     Arc::clone(&items),
                     workspace_identity,
                     git_workspace,
@@ -922,14 +966,23 @@ impl ContextManager {
                     aggregate_tool_result_budget_applied = false,
                     "selected provider-bound tool history projection"
                 );
+                let prepared = apply_tool_history_projection(
+                    prepared,
+                    projection.clone(),
+                    projection.clone(),
+                    anchor.as_ref(),
+                );
                 *anchor_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(SamplingProjectionAnchor {
-                        prepared_items: items,
-                        projection: projection.clone(),
-                    });
-                return apply_tool_history_projection(prepared, projection.clone(), projection);
+                    Some(SamplingProjectionCacheEntry::new(
+                        SamplingProjectionAnchor {
+                            prepared_items: items,
+                            projection,
+                        },
+                        &prepared,
+                    ));
+                return prepared;
             }
         }
         let project = |items: Arc<[ResponseItem]>| match git_workspace {
@@ -981,18 +1034,27 @@ impl ContextManager {
         } else {
             project(fallback_items)
         };
+        let prepared = apply_tool_history_projection(
+            prepared,
+            projection.clone(),
+            fallback_projection,
+            None,
+        );
         if let Some(anchor_slot) = anchor_slot
             && shares_input
         {
             *anchor_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(SamplingProjectionAnchor {
-                    prepared_items: items,
-                    projection: projection.clone(),
-                });
+                Some(SamplingProjectionCacheEntry::new(
+                    SamplingProjectionAnchor {
+                        prepared_items: items,
+                        projection,
+                    },
+                    &prepared,
+                ));
         }
-        apply_tool_history_projection(prepared, projection, fallback_projection)
+        prepared
     }
 
     fn clear_sampling_projection_anchor(&mut self) {
@@ -1008,7 +1070,7 @@ impl ContextManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|anchor| anchor.prepared_items.len())
+            .map(|entry| entry.anchor.prepared_items.len())
     }
 
     pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
@@ -1144,6 +1206,7 @@ impl ContextManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(anchor) = anchor
             .as_ref()
+            .map(|entry| &entry.anchor)
             .filter(|anchor| items.starts_with(&anchor.prepared_items))
         else {
             return items;
@@ -2038,6 +2101,9 @@ fn apply_tool_history_projection(
     mut prepared: PreparedPromptInput,
     projection: ToolHistoryProjection,
     fallback_projection: ToolHistoryProjection,
+    // Only supplied after project_continuation_with_workspace_cache has proven
+    // that this projection extends the anchor. Do not compare that prefix again.
+    continuation: Option<&SamplingProjectionCacheEntry>,
 ) -> PreparedPromptInput {
     let prepared_items = prepared.items.shared();
     let prepared_unreplaced_items = if prepared
@@ -2120,16 +2186,44 @@ fn apply_tool_history_projection(
         projection.unreplaced_items_budget_drops,
         fallback_projection.unreplaced_items_budget_drops,
     ];
-    prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
-        prepared.items(),
-        &prepared.stable_context_manifest,
-    );
-    prepared.fingerprint = PreparedHistoryFingerprint::new(
-        prepared.items(),
-        &prepared.stable_context_manifest,
-        prepared.policy,
-    )
-    .ok();
+    let metadata = continuation
+        .filter(|entry| entry.metadata_matches(&prepared))
+        .and_then(|entry| {
+            let tail = prepared.items().get(entry.anchor.projection.items.len()..)?;
+            // A new user turn reclassifies current-input attribution in the
+            // prefix, even when its serialized bytes happen to be unchanged.
+            if tail.iter().any(|item| {
+                matches!(item, ResponseItem::Message { role, .. } if role == "user")
+                    && is_user_turn_boundary(item)
+            }) {
+                return None;
+            }
+            let fingerprint = entry.fingerprint.as_ref()?.append(tail).ok()?;
+            let provenance = if tail.is_empty() {
+                entry.prompt_provenance.clone()
+            } else {
+                entry.prompt_provenance.with_appended_items(
+                    tail,
+                    &prepared.stable_context_manifest,
+                )
+            };
+            Some((provenance, fingerprint))
+        });
+    if let Some((provenance, fingerprint)) = metadata {
+        prepared.prompt_provenance = provenance;
+        prepared.fingerprint = Some(fingerprint);
+    } else {
+        prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
+            prepared.items(),
+            &prepared.stable_context_manifest,
+        );
+        prepared.fingerprint = PreparedHistoryFingerprint::new(
+            prepared.items(),
+            &prepared.stable_context_manifest,
+            prepared.policy,
+        )
+        .ok();
+    }
     prepared
 }
 

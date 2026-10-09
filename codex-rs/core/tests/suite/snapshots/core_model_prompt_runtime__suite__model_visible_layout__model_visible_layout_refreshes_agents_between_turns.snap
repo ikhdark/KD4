@@ -9,38 +9,50 @@ Scenario: Normal turns refresh AGENTS.md after a cwd change and after a same-cwd
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
     [03] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/user[2]:
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-03:message/user:first turn in agents_one
-04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+04:message/user:first turn in agents_one
+05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools [source:agents] (named source meta...
 
 ## Second Request (agents_two cwd)
 00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
     [03] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/user:first turn in agents_one
-03:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-04:message/assistant:turn one complete
-05:message/user[2]:
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user:first turn in agents_one
+04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+05:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools [source:agents] (named source meta...
+06:message/assistant:turn one complete
+07:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-06:message/user:second turn in agents_two
+08:message/user:second turn in agents_two
 
 ## Third Request (agents_two edited)
 00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
     [03] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/user:first turn in agents_one
-03:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-04:message/assistant:turn one complete
-05:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-06:message/user:second turn in agents_two
-07:message/assistant:turn two complete
-08:message/user:<AGENTS_MD>
-09:message/user:third turn after same-cwd AGENTS edit
+01:message/developer[2]:
+    [01] <multi_agent_usage_hint state="present" />
+    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/user:first turn in agents_one
+04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+05:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools [source:agents] (named source meta...
+06:message/assistant:turn one complete
+07:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+08:message/user:second turn in agents_two
+09:message/assistant:turn two complete
+10:message/user:<AGENTS_MD>
+11:message/user:third turn after same-cwd AGENTS edit

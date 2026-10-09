@@ -329,7 +329,7 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                     self.fail("timed out waiter dispatched")
             with mock.patch.object(lanes.time, "sleep", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
-                    with lanes.reserve_rust_test_target(self.target):
+                    with lanes.reserve_rust_test_target(self.target, timeout_seconds=1):
                         self.fail("cancelled waiter dispatched")
             self.assertTrue(lanes.cargo_lock_is_busy(self.target))
         with lanes.reserve_rust_test_target(self.target):
@@ -349,11 +349,22 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                 self.fail("quarantined target admitted")
 
     def test_invalid_deadlines_reject_before_creating_target(self):
-        for value in [0, -1, float("inf"), float("nan")]:
+        for value in [-1, float("inf"), float("nan")]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 with lanes.reserve_rust_test_target(self.target, timeout_seconds=value):
                     self.fail("invalid deadline admitted")
         self.assertFalse(self.target.exists())
+
+    def test_busy_default_does_not_wait_dispatch_or_release_owner(self):
+        with lanes.reserve_rust_test_target(self.target):
+            with mock.patch.object(lanes.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "busy.*No validation was run"):
+                    with lanes.reserve_rust_test_target(self.target):
+                        self.fail("busy target dispatched")
+                sleep.assert_not_called()
+            self.assertTrue(lanes.cargo_lock_is_busy(self.target))
+        with lanes.reserve_rust_test_target(self.target, timeout_seconds=0):
+            pass
 
     @unittest.skipUnless(os.name == "nt", "Windows lane owner")
     def test_managed_lane_reservation_and_pruner_recognize_runner_lease(self):
@@ -454,7 +465,8 @@ class AdmissionDispatchTest(RunnerTestCase):
                         self.assertEqual(json.loads(text)["admission"]["cargo_profile_directory"], "debug")
                     with self.assertRaises(runner.RunnerError) as error:
                         self.dispatch(command, cargo_profile="release")
-                    self.assertEqual(error.exception.outcome, "timed_out")
+                    self.assertEqual(error.exception.outcome, "busy")
+                    self.assertEqual(error.exception.admission_status["validation_status"], "pending")
         finally:
             lanes._release_binary_file_lock(handle)
             handle.close()
@@ -521,7 +533,8 @@ class AdmissionDispatchTest(RunnerTestCase):
         with lanes.reserve_rust_test_target(self.target_dir):
             with self.assertRaises(runner.RunnerError) as timed:
                 self.dispatch()
-            self.assertEqual(timed.exception.outcome, "timed_out")
+            self.assertEqual(timed.exception.outcome, "busy")
+            self.assertFalse(timed.exception.admission_status["automatic_retry"])
             with mock.patch.object(lanes.time, "sleep", side_effect=KeyboardInterrupt):
                 with self.assertRaises(runner.RunnerError) as cancelled:
                     self.dispatch()
@@ -530,7 +543,7 @@ class AdmissionDispatchTest(RunnerTestCase):
 
     def test_cli_rejects_bad_timeout_without_metadata_or_execution(self):
         with mock.patch.object(runner, "load_metadata") as metadata:
-            for value in ["0", "-1", "nan", "inf"]:
+            for value in ["-1", "nan", "inf"]:
                 with contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(runner.main(["--admission-timeout-seconds", value, "check-manifest"]), 2)
             metadata.assert_not_called()

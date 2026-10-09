@@ -258,27 +258,13 @@ impl Connection {
 
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_FRAME_CAPACITY);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_FRAME_CAPACITY);
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let failure = Arc::new(std::sync::Mutex::new(None));
 
         let writer_cancellation = cancellation.clone();
-        let writer_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = writer_cancellation.cancelled() => return Ok(()),
-                    frame = outgoing_rx.recv() => {
-                        let Some(frame) = frame else {
-                            return Err("code-mode host outgoing stream closed".to_string());
-                        };
-                        if let Err(err) = writer.write_frame(&frame).await {
-                            return Err(format!("failed to write code-mode host message: {err}"));
-                        }
-                    }
-                }
-            }
-        });
+        let writer_task = tokio::spawn(drive_writer(writer, outgoing_rx, writer_cancellation));
 
         let reader_events = event_tx.clone();
         let reader_cancellation = cancellation.clone();
@@ -524,6 +510,29 @@ impl ConnectionSupervisor {
     }
 }
 
+async fn drive_writer<W: tokio::io::AsyncWrite + Unpin>(
+    mut writer: FramedWriter<W>,
+    mut frames: mpsc::Receiver<EncodedFrame>,
+    cancellation: CancellationToken,
+) -> Result<(), String> {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            frame = frames.recv() => frame.ok_or_else(|| "code-mode host outgoing stream closed".to_string())?,
+        };
+        tokio::select! {
+            biased;
+            // A partial frame cannot be resumed on this stream. Cancellation
+            // retires the entire connection; drop the writer, never replay it.
+            _ = cancellation.cancelled() => return Ok(()),
+            result = writer.write_frame(&frame) => {
+                result.map_err(|err| format!("failed to write code-mode host message: {err}"))?;
+            }
+        }
+    }
+}
+
 fn task_failure(
     task_name: &str,
     result: Result<Result<(), String>, tokio::task::JoinError>,
@@ -567,6 +576,57 @@ async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn writer_cancellation_releases_backpressured_pipe_without_replay() {
+        use tokio::io::AsyncReadExt;
+
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let (pipe, mut host) = tokio::io::duplex(1);
+            let (frames, rx) = mpsc::channel(2);
+            frames.send(EncodedFrame::encode(&"first frame").unwrap()).await.unwrap();
+            frames.send(EncodedFrame::encode(&"must not be replayed").unwrap()).await.unwrap();
+            let cancellation = CancellationToken::new();
+            let pump = drive_writer(FramedWriter::new(pipe), rx, cancellation.clone());
+            tokio::pin!(pump);
+            assert!(futures::poll!(&mut pump).is_pending(), "one-byte pipe must backpressure");
+            let started = std::time::Instant::now();
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_millis(100), &mut pump)
+                .await.expect("cancel must not wait for a host read").unwrap();
+            samples.push(started.elapsed().as_micros());
+            let mut partial = Vec::new();
+            host.read_to_end(&mut partial).await.unwrap();
+            assert_eq!(partial.len(), 1, "never restart a partial frame or dispatch its successor");
+            assert!(frames.is_closed());
+        }
+        samples.sort_unstable();
+        eprintln!("writer_cancel_backpressure_us={samples:?} median={}", samples[3]);
+    }
+
+    #[tokio::test]
+    async fn writer_preserves_order_and_reports_closed_transport() {
+        let (pipe, host) = tokio::io::duplex(1024);
+        let (frames, rx) = mpsc::channel(2);
+        for message in ["first", "second"] {
+            frames.send(EncodedFrame::encode(&message).unwrap()).await.unwrap();
+        }
+        drop(frames);
+        let result = drive_writer(FramedWriter::new(pipe), rx, CancellationToken::new()).await;
+        assert!(result.unwrap_err().contains("outgoing stream closed"));
+        let mut reader = FramedReader::new(host);
+        assert_eq!(reader.read::<String>().await.unwrap(), Some("first".into()));
+        assert_eq!(reader.read::<String>().await.unwrap(), Some("second".into()));
+        assert_eq!(reader.read::<String>().await.unwrap(), None);
+
+        let (pipe, host) = tokio::io::duplex(1);
+        drop(host);
+        let (frames, rx) = mpsc::channel(1);
+        frames.send(EncodedFrame::encode(&"failure").unwrap()).await.unwrap();
+        let error = drive_writer(FramedWriter::new(pipe), rx, CancellationToken::new()).await.unwrap_err();
+        assert!(error.contains("failed to write code-mode host message"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_ack_deadline_fails_live_unresponsive_connection() {

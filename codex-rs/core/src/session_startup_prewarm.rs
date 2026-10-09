@@ -32,7 +32,7 @@ use codex_protocol::models::BaseInstructions;
 const CODE_MODE_PREWARM_PHASE: &str = "code_mode_prewarm";
 
 pub(crate) struct SessionStartupPrewarmHandle {
-    task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
+    task: AbortOnDropHandle<CodexResult<Option<ModelClientSession>>>,
     started_at: Instant,
 }
 
@@ -101,7 +101,7 @@ pub(crate) enum SessionStartupPrewarmResolution {
 
 impl SessionStartupPrewarmHandle {
     pub(crate) fn new(
-        task: JoinHandle<CodexResult<ModelClientSession>>,
+        task: JoinHandle<CodexResult<Option<ModelClientSession>>>,
         started_at: Instant,
     ) -> Self {
         Self {
@@ -203,13 +203,17 @@ impl SessionStartupPrewarmHandle {
     }
 
     fn resolution_from_join_result(
-        result: std::result::Result<CodexResult<ModelClientSession>, tokio::task::JoinError>,
+        result: std::result::Result<CodexResult<Option<ModelClientSession>>, tokio::task::JoinError>,
         started_at: Instant,
     ) -> SessionStartupPrewarmResolution {
         match result {
-            Ok(Ok(prewarmed_session)) => {
+            Ok(Ok(Some(prewarmed_session))) => {
                 SessionStartupPrewarmResolution::Ready(Box::new(prewarmed_session))
             }
+            Ok(Ok(None)) => SessionStartupPrewarmResolution::Unavailable {
+                status: "disabled",
+                prewarm_duration: None,
+            },
             Ok(Err(err)) => {
                 warn!("startup websocket prewarm setup failed: {err:#}");
                 SessionStartupPrewarmResolution::Unavailable {
@@ -347,7 +351,11 @@ impl Session {
                 startup_transport,
             )
             .await;
-            let status = if result.is_ok() { "ready" } else { "failed" };
+            let status = match &result {
+                Ok(Some(_)) => "ready",
+                Ok(None) => "disabled",
+                Err(_) => "failed",
+            };
             session_telemetry.record_startup_phase(
                 "startup_prewarm_total",
                 started_at.elapsed(),
@@ -453,11 +461,20 @@ mod tests {
             .take_session_startup_prewarm()
             .await
             .expect("HTTP sessions must also schedule tool preparation");
-        tokio::time::timeout(Duration::from_secs(5), prewarm.task)
+        let prepared_session = tokio::time::timeout(Duration::from_secs(5), prewarm.task)
             .await
             .expect("tool preparation completes without waiting for a provider")
             .expect("prewarm task must finish")
             .expect("no network request is needed");
+        assert!(prepared_session.is_none(), "disabled prewarm must not claim an empty session");
+        let resolution = SessionStartupPrewarmHandle::resolution_from_join_result(
+            Ok(Ok(prepared_session)),
+            Instant::now(),
+        );
+        assert!(matches!(
+            resolution,
+            SessionStartupPrewarmResolution::Unavailable { status: "disabled", .. }
+        ));
         let prepared = session
             .startup_prepared_router
             .take_for_first_turn()
@@ -621,7 +638,7 @@ async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
     base_instructions: String,
     startup_transport: Option<SessionStartupTransportHandle>,
-) -> CodexResult<ModelClientSession> {
+) -> CodexResult<Option<ModelClientSession>> {
     let _preparation = session
         .startup_timing
         .begin_phase(StartupPhase::PrewarmPreparation);
@@ -668,7 +685,7 @@ async fn schedule_startup_prewarm_inner(
     // Tool preparation is useful for every transport. Only the speculative
     // model request depends on websocket support.
     if !session.services.model_client.startup_websocket_enabled() {
-        return Ok(session.services.model_client.new_speculative_session());
+        return Ok(None);
     }
     let build_prompt_started_at = Instant::now();
     let startup_prompt = build_prompt(
@@ -722,5 +739,5 @@ async fn schedule_startup_prewarm_inner(
         websocket_warmup_started_at.elapsed(),
         /*status*/ None,
     );
-    Ok(client_session)
+    Ok(Some(client_session))
 }

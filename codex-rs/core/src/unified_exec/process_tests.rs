@@ -1191,7 +1191,43 @@ async fn tool_result_correctness_closed_local_exit_channel_is_a_failure() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn local_process_constructor_observes_an_exit_during_the_grace_period() {
+async fn unsandboxed_local_process_constructor_does_not_wait_for_early_exit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let args = [
+        "/D".to_string(),
+        "/S".to_string(),
+        "/C".to_string(),
+        "ping -n 30 127.0.0.1 >nul".to_string(),
+    ];
+    let spawned =
+        spawn_pipe_process_no_stdin("cmd.exe", &args, temp.path(), &HashMap::new(), &None)
+            .await
+            .expect("local fixture process should spawn");
+    let pending_spawns = PendingSpawnRegistration::default();
+    let mut constructor = Box::pin(UnifiedExecProcess::from_spawned(
+        spawned,
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        None,
+        &pending_spawns,
+    ));
+    // Poll once, rather than asserting a wall-clock threshold under CI load.
+    let ready = futures::poll!(&mut constructor).is_ready();
+    drop(constructor);
+    let retained = pending_spawns.snapshot();
+    assert_eq!(retained.len(), 1);
+    assert!(!retained[0].has_exited());
+    retained[0]
+        .terminate_confirmed()
+        .await
+        .expect("immediately registered process remains owned and cancellable");
+    pending_spawns.clear().await;
+    assert!(ready, "unsandboxed registration must not wait for the grace period");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn sandboxed_local_process_constructor_observes_an_exit_during_the_grace_period() {
     let temp = tempfile::tempdir().expect("tempdir");
     let args = [
         "/D".to_string(),
@@ -1224,7 +1260,7 @@ async fn local_process_constructor_observes_an_exit_during_the_grace_period() {
             stderr_rx,
             exit_rx,
         },
-        SandboxType::None,
+        SandboxType::WindowsRestrictedToken,
         Box::new(NoopSpawnLifecycle),
         None,
         &PendingSpawnRegistration::default(),
@@ -1480,7 +1516,7 @@ async fn spawned_process_is_retained_when_constructor_future_is_cancelled() {
     let pending_spawns = PendingSpawnRegistration::default();
     let mut constructor = Box::pin(UnifiedExecProcess::from_spawned(
         spawned,
-        SandboxType::None,
+        SandboxType::WindowsRestrictedToken,
         Box::new(NoopSpawnLifecycle),
         None,
         &pending_spawns,

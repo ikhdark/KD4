@@ -348,15 +348,19 @@ async fn report_agent_job_result_rejects_wrong_thread() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn csv_spawning_requires_explicit_authorization_in_v2_turns() -> Result<()> {
+async fn csv_spawning_requires_enabled_feature_in_v2_turns() -> Result<()> {
     use sqlx::Connection;
 
-    for authorized in [false, true] {
+    for enabled in [false, true] {
         let server = start_mock_server().await;
         let test = test_codex()
             .with_model("gpt-5.6-sol")
-            .with_config(|config| {
-                config.features.enable(Feature::SpawnCsv).unwrap();
+            .with_config(move |config| {
+                if enabled {
+                    config.features.enable(Feature::SpawnCsv).unwrap();
+                } else {
+                    config.features.disable(Feature::SpawnCsv).unwrap();
+                }
                 config.features.enable(Feature::MultiAgentV2).unwrap();
                 config.multi_agent_v2.multi_agent_mode_hint_text = None;
             })
@@ -377,12 +381,8 @@ async fn csv_spawning_requires_explicit_authorization_in_v2_turns() -> Result<()
             .await;
 
         let created_before = test.thread_manager.list_thread_created_ids().await;
-        test.submit_turn(if authorized {
-            "Use subagents to process the CSV."
-        } else {
-            "Read the CSV. Do not spawn agents."
-        })
-        .await?;
+        // Admission follows the configured capability, not parsed user wording.
+        test.submit_turn("Use subagents to process the CSV.").await?;
 
         let request_bodies = server
             .received_requests()
@@ -407,7 +407,7 @@ async fn csv_spawning_requires_explicit_authorization_in_v2_turns() -> Result<()
             .await?;
         connection.close().await?;
 
-        if authorized {
+        if enabled {
             assert_eq!((jobs, items, worker_requests), (1, 1, 1));
             let output = fs::read_to_string(&output_path)?;
             let records = parse_csv_records(&output).map_err(anyhow::Error::msg)?;

@@ -4,7 +4,7 @@
     {
       "programs": ["python", "python3", "py"],
       "prefixes": [["scripts/rust_build_status.py", "run-lane"]],
-      "options": {"-I": 0, "-u": 0},
+      "options": {"-I": 0, "-B": 0, "-u": 0},
       "allow_extra_args": true,
       "passthrough_after": "--"
     },
@@ -15,7 +15,7 @@
         ["scripts/rust_test_runner.py", "run-gate"],
         ["scripts/rust_test_runner.py", "parity"]
       ],
-      "options": {"-I": 0, "-u": 0, "--manifest": 1, "--target-dir": 1, "--profile": 1, "--cargo-profile": 1, "--admission-timeout-seconds": 1},
+      "options": {"-I": 0, "-B": 0, "-u": 0, "--manifest": 1, "--target-dir": 1, "--profile": 1, "--cargo-profile": 1, "--admission-timeout-seconds": 1},
       "allow_extra_args": true,
       "operations": ["test"],
       "receipt_runner": "rust_test_runner"
