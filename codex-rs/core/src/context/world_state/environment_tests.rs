@@ -42,6 +42,56 @@ fn session_visualization_roots_do_not_change_the_prompt_or_runtime_permissions()
 }
 
 #[test]
+fn visualization_projection_hides_managed_grants_but_preserves_denials() -> Result<()> {
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+
+    let home = tempfile::tempdir()?;
+    let project = AbsolutePathBuf::try_from(home.path().join("project"))?;
+    let allowed = AbsolutePathBuf::try_from(home.path().join(
+        "visualizations/2026/09/30/01a0f3c5-18aa-79e2-86f0-10bf6108b5f7",
+    ))?;
+    let denied = AbsolutePathBuf::try_from(home.path().join(
+        "visualizations/2026/09/30/01a0f3c5-18aa-79e2-86f0-10bf6108b5f8",
+    ))?;
+    let profile = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: allowed.clone() },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: denied.clone() },
+                access: FileSystemAccessMode::Deny,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: project.clone() },
+                access: FileSystemAccessMode::Write,
+            },
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let original = FileSystemContext::from_permission_profile(
+        &profile, &[project.clone(), allowed.clone(), denied.clone()],
+    );
+    let before = original.render();
+    let allowed = allowed.as_path().display();
+    let denied = denied.as_path().display();
+    let project = project.as_path().display();
+    assert!(before.contains(&format!("<entry access=\"write\"><path>{allowed}</path></entry>")));
+    let visible = original.clone().without_session_visualizations(home.path()).render();
+    assert_eq!(
+        visible,
+        format!("<filesystem><workspace_roots><root>{project}</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"deny\" escalatable=\"false\"><path>{denied}</path></entry><entry access=\"write\"><path>{project}</path></entry></file_system></permission_profile></filesystem>")
+    );
+    assert_eq!(original.render(), before, "prompt projection must not mutate runtime context");
+    Ok(())
+}
+
+#[test]
 fn renders_full_environment_state() -> Result<()> {
     let context = EnvironmentsState {
         environments: [
@@ -234,8 +284,10 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
 }
 
 #[test]
-fn subagent_only_changes_render_a_diff() {
-    let no_subagents = EnvironmentsState {
+fn legacy_subagent_snapshot_is_cleared_with_none() {
+    // Subagents now have their own section, so the current state never lists
+    // them here. Only a snapshot persisted by an older build still can.
+    let current = EnvironmentsState {
         filesystem: Some(FileSystemContext::from_permission_profile(
             &PermissionProfile::Disabled,
             &[],
@@ -247,48 +299,11 @@ fn subagent_only_changes_render_a_diff() {
         )),
         ..Default::default()
     };
-    let previous = WorldStateSection::snapshot(&no_subagents);
-    let atlas = no_subagents
-        .clone()
-        .with_subagents("- agent-1: atlas".to_string());
+    let legacy = WorldStateSection::snapshot(&EnvironmentsState {
+        subagents: Some("- agent-2: nova".to_string()),
+        ..current.clone()
+    });
 
-    assert_eq!(
-        Some(replacement_message(
-            r#"<environment_context>
-  <network enabled="true"><allowed>example.com</allowed></network>
-  <filesystem><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
-  <subagents>
-    - agent-1: atlas
-  </subagents>
-</environment_context>"#,
-        )),
-        render_fragment(WorldStateSection::render_diff(
-            &atlas,
-            PreviousSectionState::Known(&previous),
-        )),
-    );
-
-    let previous = WorldStateSection::snapshot(&atlas);
-    let nova = no_subagents
-        .clone()
-        .with_subagents("- agent-2: nova".to_string());
-    assert_eq!(
-        Some(replacement_message(
-            r#"<environment_context>
-  <network enabled="true"><allowed>example.com</allowed></network>
-  <filesystem><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
-  <subagents>
-    - agent-2: nova
-  </subagents>
-</environment_context>"#,
-        )),
-        render_fragment(WorldStateSection::render_diff(
-            &nova,
-            PreviousSectionState::Known(&previous),
-        )),
-    );
-
-    let previous = WorldStateSection::snapshot(&nova);
     assert_eq!(
         Some(replacement_message(
             r#"<environment_context>
@@ -300,8 +315,8 @@ fn subagent_only_changes_render_a_diff() {
 </environment_context>"#,
         )),
         render_fragment(WorldStateSection::render_diff(
-            &no_subagents,
-            PreviousSectionState::Known(&previous),
+            &current,
+            PreviousSectionState::Known(&legacy),
         )),
     );
 }

@@ -1042,7 +1042,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn noise_connect_provider_requests_and_validates_a_full_bundle() {
+    async fn connect_rejects_unusable_connection_data() {
+        let server = MockServer::start().await;
+        let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
+            .expect("client");
+        let public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
+        let incomplete = "environment registry returned incomplete Noise connection data";
+        // Each case replaces one field of an otherwise valid response.
+        for (field, value, expected) in [
+            (
+                "environment_id",
+                "other-environment",
+                "environment registry returned a different environment id",
+            ),
+            (
+                "security_profile",
+                "plaintext_v0",
+                "environment registry returned unsupported security profile `plaintext_v0`",
+            ),
+            ("url", "", incomplete),
+            ("executor_registration_id", " ", incomplete),
+            ("harness_key_authorization", "", incomplete),
+            (
+                "url",
+                "https://rendezvous.test/ws",
+                "environment registry returned an invalid rendezvous URL",
+            ),
+        ] {
+            let mut body = serde_json::json!({
+                "environment_id": "environment-requested",
+                "url": "wss://rendezvous.test/ws",
+                "security_profile": NOISE_RELAY_SECURITY_PROFILE,
+                "executor_registration_id": "registration-1",
+                "executor_public_key": public_key.clone(),
+                "harness_key_authorization": "authorization-1",
+            });
+            body[field] = value.into();
+            Mock::given(method("POST"))
+                .and(path("/cloud/environment/environment-requested/connect"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = client
+                .connect_environment("environment-requested", public_key.clone())
+                .await;
+            assert!(
+                matches!(result, Err(ExecServerError::Protocol(message)) if message == expected),
+                "{field}={value:?}"
+            );
+            server.verify().await;
+            server.reset().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_connect_provider_requests_a_full_bundle() {
         let server = MockServer::start().await;
         let harness_public_key = NoiseChannelIdentity::generate()
             .expect("identity")

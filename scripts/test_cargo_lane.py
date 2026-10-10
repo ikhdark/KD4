@@ -1628,6 +1628,28 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         )
         self.assertTrue(trash.exists())
 
+    def test_cleanup_rejects_junction_ancestor_before_deleting_external_trash(self):
+        external = self.temp_root / "external-parent"
+        root = external / "lanes"
+        self.mark_lanes_root(root)
+        trash = root / "old.trash-20260728123456789"
+        trash.mkdir()
+        sentinel = trash / "keep.txt"
+        sentinel.write_bytes(b"external payload")
+        junction = self.temp_root / "linked-parent"
+        self.make_junction(junction, external)
+        result = subprocess.run(
+            [self.shell, "-NoProfile", "-File", str(CLEANUP_SCRIPT),
+             "-LanesRoot", str(junction / "lanes"), "-MaxPasses", "1"],
+            text=True, capture_output=True, check=False, timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(sentinel.is_file(), "cleanup followed a junction ancestor")
+        self.assertEqual(sentinel.read_bytes(), b"external payload")
+        self.assertEqual(sorted(path.name for path in root.iterdir()),
+                         [LANES_ROOT_MARKER, trash.name])
+
     def test_cleanup_preserves_trash_named_junction_and_external_target(self) -> None:
         self.mark_lanes_root()
         external = self.temp_root / "external-sentinel"

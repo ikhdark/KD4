@@ -88,11 +88,8 @@ async fn mount_shell_responses(
 }
 
 async fn mount_terminal_shell_response(harness: &TestCodexHarness, responses: Vec<String>) {
-    let response = responses
-        .into_iter()
-        .next()
-        .expect("terminal shell fixture should include a tool-call response");
-    mount_sse_sequence(harness.server(), vec![response]).await;
+    // A timed-out command is relayed to the model; it does not fail the turn.
+    mount_sse_sequence(harness.server(), responses).await;
 }
 
 async fn mount_shell_responses_with_timeout(
@@ -185,7 +182,11 @@ async fn submit_shell_and_capture_output_and_begin(
                     output = Some(text.to_string());
                 }
             }
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
+                assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
+                break;
+            }
             _ => {}
         }
     }

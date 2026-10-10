@@ -90,6 +90,8 @@ async fn run_codex_times_out() {
         &mut command(false), Duration::from_secs(30), false,
     ).await.expect("exiting child should finish");
     assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "the exact child test must run; a zero-test invocation is not proof");
     let started = Instant::now();
     let error = core_test_support::process::capture_contained_command(
         &mut command(true), Duration::from_millis(100), false,

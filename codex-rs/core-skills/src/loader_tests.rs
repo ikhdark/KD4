@@ -1831,6 +1831,28 @@ async fn deduplicates_by_path_preferring_first_root() {
             plugin_id: None,
         }]
     );
+
+    // Reversed roots: root order, not scope priority, selects the surviving entry.
+    let reversed = load_skills_from_roots(
+        [SkillScope::User, SkillScope::Repo].map(|scope| SkillRoot {
+            path: root.path().abs(),
+            scope,
+            file_system: Arc::clone(&LOCAL_FS),
+            plugin_id: None,
+            plugin_namespace: None,
+            plugin_root: None,
+        }),
+        /*plugin_skill_snapshots*/ None,
+    )
+    .await;
+    assert_eq!(
+        reversed
+            .skills
+            .iter()
+            .map(|skill| (skill.scope, skill.path_to_skills_md.clone()))
+            .collect::<Vec<_>>(),
+        vec![(SkillScope::User, normalized(&skill_path))]
+    );
 }
 
 #[tokio::test]
@@ -1977,6 +1999,14 @@ async fn repo_skills_search_does_not_escape_repo_root() {
         "outer-skill",
         "from outer",
     );
+    // `.codex` layers come from this file's `project_layers_for_cwd`; the loader itself
+    // only walks `.agents/skills`, so the boundary needs a skill there as well.
+    write_skill_at(
+        &outer_dir.path().join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
+        "outer-agents",
+        "outer-agents-skill",
+        "from outer agents",
+    );
     mark_as_git_repo(&repo_dir);
 
     let cfg = make_config_for_cwd(&codex_home, repo_dir).await;
@@ -2005,6 +2035,14 @@ async fn loads_skills_when_cwd_is_file_in_repo() {
         "repo-skill",
         "from repo",
     );
+    // The `.codex` layer for a file cwd is resolved by this file's `project_layers_for_cwd`;
+    // `.agents/skills` is the root the loader has to find from the file path itself.
+    let agents_skill_path = write_skill_at(
+        &repo_dir.path().join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
+        "agents",
+        "agents-skill",
+        "from agents",
+    );
     let file_path = repo_dir.path().join("some-file.txt");
     fs::write(&file_path, "contents").unwrap();
 
@@ -2018,17 +2056,30 @@ async fn loads_skills_when_cwd_is_file_in_repo() {
     );
     assert_eq!(
         outcome.skills,
-        vec![SkillMetadata {
-            name: "repo-skill".to_string(),
-            description: "from repo".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&skill_path),
-            scope: SkillScope::Repo,
-            plugin_id: None,
-        }]
+        vec![
+            SkillMetadata {
+                name: "agents-skill".to_string(),
+                description: "from agents".to_string(),
+                short_description: None,
+                interface: None,
+                dependencies: None,
+                policy: None,
+                path_to_skills_md: normalized(&agents_skill_path),
+                scope: SkillScope::Repo,
+                plugin_id: None,
+            },
+            SkillMetadata {
+                name: "repo-skill".to_string(),
+                description: "from repo".to_string(),
+                short_description: None,
+                interface: None,
+                dependencies: None,
+                policy: None,
+                path_to_skills_md: normalized(&skill_path),
+                scope: SkillScope::Repo,
+                plugin_id: None,
+            },
+        ]
     );
 }
 
@@ -2047,6 +2098,14 @@ async fn non_git_repo_skills_search_does_not_walk_parents() {
         "outer",
         "outer-skill",
         "from outer",
+    );
+    // `.codex` layers come from this file's `project_layers_for_cwd`; the loader itself
+    // only walks `.agents/skills`, so the boundary needs a skill there as well.
+    write_skill_at(
+        &outer_dir.path().join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
+        "outer-agents",
+        "outer-agents-skill",
+        "from outer agents",
     );
 
     let cfg = make_config_for_cwd(&codex_home, nested_dir).await;

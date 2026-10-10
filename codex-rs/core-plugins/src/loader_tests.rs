@@ -237,8 +237,10 @@ enabled = true
     for plugins in [&full, &hooks_only] {
         for (config_name, expected_error) in [
             ("disabled@test", None),
+            ("invalid", Some("invalid plugin key `invalid`; expected <plugin>@<marketplace>")),
             ("malformed@test", Some("missing or invalid plugin.json")),
             ("missing@test", Some("plugin is not installed")),
+            ("warning@test", None),
         ] {
             let plugin = plugins
                 .iter()
@@ -247,6 +249,16 @@ enabled = true
             assert_eq!(plugin.error.as_deref(), expected_error);
             assert!(plugin.hook_sources.is_empty());
         }
+        let warning = plugins
+            .iter()
+            .find(|plugin| plugin.config_name == "warning@test")
+            .expect("configured plugin should be returned");
+        assert_eq!(warning.hook_load_warnings.len(), 1);
+        assert!(
+            warning.hook_load_warnings[0].starts_with("failed to parse plugin hooks config "),
+            "{:?}",
+            warning.hook_load_warnings
+        );
     }
 
     let hooks_only_valid = hooks_only

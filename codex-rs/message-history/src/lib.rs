@@ -143,6 +143,16 @@ pub async fn append_entry(
 // Check identity only after locking, then reopen stale handles. Readers use the
 // same protocol so their identity and contents describe one coherent snapshot.
 fn open_locked_history(path: &Path, exclusive: bool) -> Result<File> {
+    open_locked_history_with(path, exclusive, |options| options.open(path))
+}
+
+// The opener seam lets tests supply a handle opened before a retention rename,
+// without relying on scheduler timing to hit that race.
+fn open_locked_history_with(
+    path: &Path,
+    exclusive: bool,
+    mut open: impl FnMut(&OpenOptions) -> Result<File>,
+) -> Result<File> {
     for _ in 0..MAX_RETRIES {
         let mut options = OpenOptions::new();
         options
@@ -156,7 +166,7 @@ fn open_locked_history(path: &Path, exclusive: bool) -> Result<File> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(path)?;
+        let file = open(&options)?;
         let lock = if exclusive {
             file.try_lock()
         } else {

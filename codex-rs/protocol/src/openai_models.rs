@@ -786,6 +786,17 @@ mod tests {
                 on_request: Some(String::new()),
             })
         );
+
+        let missing: ModelMessages = from_str(
+            r#"{
+                "instructions_template": null,
+                "instructions_variables": null,
+                "approvals": {}
+            }"#,
+        )
+        .expect("approval messages without on_request should deserialize");
+
+        assert_eq!(missing.approvals, Some(ApprovalMessages { on_request: None }));
     }
 
     #[test]
@@ -821,6 +832,20 @@ mod tests {
                 "future".to_string(),
             )
         );
+
+        for (wire, effort) in [
+            ("none", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::XHigh),
+            ("max", ReasoningEffort::Max),
+            ("ultra", ReasoningEffort::Ultra),
+        ] {
+            assert_eq!(effort.as_str(), wire);
+            assert_eq!(wire.parse::<ReasoningEffort>(), Ok(effort));
+        }
     }
 
     #[test]
@@ -1032,15 +1057,14 @@ mod tests {
                 "limit": 10000
             },
             "supports_parallel_tool_calls": false,
-            "supports_image_detail_original": false,
             "context_window": null,
             "auto_compact_token_limit": null,
-            "effective_context_window_percent": 95,
-            "experimental_supported_tools": [],
-            "input_modalities": ["text", "image"]
+            "experimental_supported_tools": []
         }))
         .expect("deserialize model info");
 
+        assert_eq!(model.effective_context_window_percent, 95);
+        assert_eq!(model.input_modalities, vec![InputModality::Text, InputModality::Image]);
         assert_eq!(model.availability_nux, None);
         assert!(!model.include_skills_usage_instructions);
         assert!(!model.supports_image_detail_original);
@@ -1102,6 +1126,19 @@ mod tests {
         let model = serde_json::from_value::<ModelInfo>(value).expect("deserialize model info");
 
         assert_eq!(model.multi_agent_version, None);
+
+        let mut known =
+            serde_json::to_value(test_model(/*spec*/ None)).expect("serialize test model");
+        known
+            .as_object_mut()
+            .expect("model info should be an object")
+            .insert(
+                "multi_agent_version".to_string(),
+                serde_json::Value::String("v2".to_string()),
+            );
+        let known = serde_json::from_value::<ModelInfo>(known).expect("deserialize model info");
+
+        assert_eq!(known.multi_agent_version, Some(MultiAgentVersion::V2));
     }
 
     #[test]
@@ -1173,16 +1210,88 @@ mod tests {
 
     #[test]
     fn borrowed_model_preset_matches_owned_conversion() {
+        // Every mapped field is non-default so a field dropped by one conversion is visible.
         let model = ModelInfo {
+            description: Some("Test description".to_string()),
+            default_reasoning_level: Some(ReasoningEffort::High),
+            supported_reasoning_levels: vec![ReasoningEffortPreset {
+                effort: ReasoningEffort::High,
+                description: "Deep reasoning".to_string(),
+            }],
+            visibility: ModelVisibility::Hide,
+            supported_in_api: false,
             availability_nux: Some(ModelAvailabilityNux {
                 message: "Try Spark.".to_string(),
             }),
             additional_speed_tiers: vec![SPEED_TIER_FAST.to_string()],
+            service_tiers: vec![ModelServiceTier {
+                id: ServiceTier::Fast.request_value().to_string(),
+                name: "Fast".to_string(),
+                description: "Priority processing.".to_string(),
+            }],
             default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
-            ..test_model(/*spec*/ None)
+            upgrade: Some(ModelInfoUpgrade {
+                model: "next-model".to_string(),
+                migration_markdown: "Upgrade notes".to_string(),
+            }),
+            input_modalities: vec![InputModality::Text],
+            ..test_model(Some(ModelMessages {
+                token_budget: None,
+                instructions_template: Some("Hello {{ personality }}".to_string()),
+                instructions_variables: Some(personality_variables()),
+                approvals: None,
+            }))
+        };
+        let expected = ModelPreset {
+            id: "test-model".to_string(),
+            model: "test-model".to_string(),
+            display_name: "Test Model".to_string(),
+            description: "Test description".to_string(),
+            default_reasoning_effort: ReasoningEffort::High,
+            supported_reasoning_efforts: vec![ReasoningEffortPreset {
+                effort: ReasoningEffort::High,
+                description: "Deep reasoning".to_string(),
+            }],
+            supports_personality: true,
+            additional_speed_tiers: vec![SPEED_TIER_FAST.to_string()],
+            service_tiers: vec![ModelServiceTier {
+                id: ServiceTier::Fast.request_value().to_string(),
+                name: "Fast".to_string(),
+                description: "Priority processing.".to_string(),
+            }],
+            default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
+            is_default: false,
+            upgrade: Some(ModelUpgrade {
+                id: "next-model".to_string(),
+                migration_config_key: "test-model".to_string(),
+                model_link: None,
+                upgrade_copy: None,
+                migration_markdown: Some("Upgrade notes".to_string()),
+            }),
+            show_in_picker: false,
+            availability_nux: Some(ModelAvailabilityNux {
+                message: "Try Spark.".to_string(),
+            }),
+            supported_in_api: false,
+            input_modalities: vec![InputModality::Text],
         };
 
-        assert_eq!(ModelPreset::from(&model), ModelPreset::from(model));
+        assert_eq!(ModelPreset::from(&model), expected);
+        assert_eq!(ModelPreset::from(&model), ModelPreset::from(model.clone()));
+
+        let listed = ModelInfo {
+            visibility: ModelVisibility::List,
+            supported_in_api: true,
+            ..model
+        };
+        let expected_listed = ModelPreset {
+            show_in_picker: true,
+            supported_in_api: true,
+            ..expected
+        };
+
+        assert_eq!(ModelPreset::from(&listed), expected_listed);
+        assert_eq!(ModelPreset::from(&listed), ModelPreset::from(listed));
     }
 
     #[test]
@@ -1197,17 +1306,36 @@ mod tests {
         });
 
         assert!(preset.supports_fast_mode());
+
+        let flex_only = ModelPreset::from(ModelInfo {
+            service_tiers: vec![ModelServiceTier {
+                id: ServiceTier::Flex.request_value().to_string(),
+                name: "Flex".to_string(),
+                description: "Flexible processing.".to_string(),
+            }],
+            ..test_model(/*spec*/ None)
+        });
+
+        assert!(!flex_only.supports_fast_mode());
     }
 
     #[test]
     fn service_tier_for_request_filters_unsupported_tiers() {
         let model = ModelInfo {
             default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
-            service_tiers: vec![ModelServiceTier {
-                id: ServiceTier::Fast.request_value().to_string(),
-                name: "Fast".to_string(),
-                description: "Priority processing.".to_string(),
-            }],
+            // The sentinel is advertised here so only the explicit sentinel check can drop it.
+            service_tiers: vec![
+                ModelServiceTier {
+                    id: ServiceTier::Fast.request_value().to_string(),
+                    name: "Fast".to_string(),
+                    description: "Priority processing.".to_string(),
+                },
+                ModelServiceTier {
+                    id: SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string(),
+                    name: "Default".to_string(),
+                    description: "Standard processing.".to_string(),
+                },
+            ],
             ..test_model(/*spec*/ None)
         };
 

@@ -163,7 +163,7 @@ impl FenceTracker {
 
     /// Process one raw source line and update fence state.
     ///
-    /// Lines with >3 leading spaces are ignored (indented code blocks, not
+    /// Lines with four-column indentation are ignored (indented code blocks, not
     /// fences).  Blockquote prefixes (`>`) are stripped before scanning.
     pub(crate) fn advance(&mut self, raw_line: &str) {
         let leading_spaces = raw_line
@@ -171,7 +171,7 @@ impl FenceTracker {
             .iter()
             .take_while(|byte| **byte == b' ')
             .count();
-        if leading_spaces > 3 {
+        if leading_spaces > 3 || raw_line.as_bytes().get(leading_spaces) == Some(&b'\t') {
             return;
         }
 
@@ -388,6 +388,9 @@ mod tests {
         let mut tracker = FenceTracker::new();
         tracker.advance("    ```sh");
         assert_eq!(tracker.kind(), FenceKind::Outside);
+        // Three spaces is still a fence; only four or more make it indented code.
+        tracker.advance("   ```sh");
+        assert_eq!(tracker.kind(), FenceKind::Other);
     }
 
     #[test]

@@ -1111,7 +1111,8 @@ mod tests {
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let uuid = Uuid::from_u128(213);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let rollout_path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
         codex_rollout::append_thread_name(home.path(), thread_id, "Legacy title")
             .await
             .expect("append legacy thread name");
@@ -1124,6 +1125,33 @@ mod tests {
             })
             .await
             .expect("read thread");
+
+        assert_eq!(thread.name, Some("Legacy title".to_string()));
+
+        // A SQLite row whose title is empty resolves the name through the same legacy index.
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let indexed_store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        let builder =
+            ThreadMetadataBuilder::new(thread_id, rollout_path, Utc::now(), SessionSource::Cli);
+        runtime
+            .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should succeed");
+
+        let thread = indexed_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read indexed thread");
 
         assert_eq!(thread.name, Some("Legacy title".to_string()));
     }
@@ -1366,7 +1394,9 @@ mod tests {
         assert_eq!(thread.model_provider, "rollout-provider");
         assert_eq!(
             thread.created_at,
-            parse_rfc3339_non_optional("2025-01-03T12:00:00Z").unwrap()
+            DateTime::parse_from_rfc3339("2025-01-03T12:00:00Z")
+                .expect("valid created time")
+                .with_timezone(&Utc)
         );
         assert_eq!(thread.updated_at, expected_updated_at);
         assert_eq!(thread.recency_at, expected_updated_at);

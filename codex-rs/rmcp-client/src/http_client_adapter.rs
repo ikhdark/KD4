@@ -801,8 +801,17 @@ mod tests {
                         },
                     )),
                 ) => {
+                    // A JSON-RPC error body is collected up to the larger limit.
+                    let limit = if case == "rpc-error" {
+                        MAX_JSON_RPC_ERROR_BODY_BYTES
+                    } else {
+                        NON_JSON_RESPONSE_BODY_PREVIEW_BYTES
+                    };
                     assert!(body_preview.len() < NON_JSON_RESPONSE_BODY_PREVIEW_BYTES + 200);
-                    assert!(body_preview.contains("collection limit"));
+                    assert!(
+                        body_preview.contains(&format!("exceeds {limit}-byte collection limit")),
+                        "{case}: {body_preview}"
+                    );
                 }
                 ("invalid-type", Err(StreamableHttpError::UnexpectedContentType(_))) => {}
                 ("rpc", Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(error), _))) => {

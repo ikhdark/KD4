@@ -103,7 +103,17 @@ async fn apply_explorer_role_preserves_model_and_adds_read_only_session_flags() 
 
 #[tokio::test]
 async fn apply_explorer_role_sets_read_only_permissions() {
-    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    // Start from a writable parent: the default profile is already read-only,
+    // which would hide a role that left the parent's permissions in place.
+    let (_home, mut config) = test_config_with_cli_overrides(vec![(
+        "sandbox_mode".to_string(),
+        TomlValue::String("danger-full-access".to_string()),
+    )])
+    .await;
+    assert_ne!(
+        config.permissions.permission_profile(),
+        &PermissionProfile::read_only()
+    );
     let before_layers = session_flags_layer_count(&config);
 
     let locks = apply_role_to_config(&mut config, Some("explorer"))

@@ -1080,9 +1080,10 @@ mod tests {
 
     /// Re-deriving from state is what makes the previous guarantee hold for a
     /// waiter that is already parked: the watch carries only its latest value,
-    /// so the completion's wake would otherwise overwrite the steer signal.
+    /// so a later trigger-turn mail's wake would otherwise overwrite the steer
+    /// signal.
     #[tokio::test]
-    async fn a_parked_waiter_re_derives_steering_after_a_completion_wake() {
+    async fn a_parked_waiter_re_derives_steering_after_a_mailbox_wake() {
         let input_queue = InputQueue::new();
         let turn_state = Mutex::new(TurnState::default());
         let (mut activity_rx, pending) = input_queue
@@ -1104,18 +1105,26 @@ mod tests {
             )
             .await
             .expect("steer input should fit");
-        // The completion publishes last, so the watch's latest value is the
-        // low-priority one.
-        input_queue.publish_internal_completion();
-        activity_rx.changed().await.expect("completion wakes the parked subscriber");
+        // The mail publishes last, so the watch's latest value is the
+        // lower-priority one.
+        input_queue
+            .enqueue_mailbox_communication(make_mail(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                "needs a turn",
+                /*trigger_turn*/ true,
+            ))
+            .await
+            .expect("mailbox admission");
+        activity_rx.changed().await.expect("mail wakes the parked subscriber");
         assert_eq!(
             *activity_rx.borrow_and_update(),
-            InputQueueActivity::InternalCompletion
+            InputQueueActivity::Mailbox
         );
 
         assert_eq!(
             input_queue
-                .pending_activity(Some(&turn_state), /*has_internal_completion*/ true)
+                .pending_activity(Some(&turn_state), /*has_internal_completion*/ false)
                 .await,
             Some(InputQueueActivity::Steer),
             "priority comes from queue state, not from the last value published"
@@ -1543,10 +1552,14 @@ mod tests {
         assert!(!queue.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
         assert!(queue.enqueue_mailbox_communication(make(Some("attempt-2"))).await.unwrap());
 
+        // Resume seeds from the startup reducer, so its extraction is what must keep the id.
         let restored = InputQueue::new();
-        restored.seed_seen_mailbox_communication_ids(&[
+        let history = codex_protocol::protocol::InitialHistory::Forked(vec![
             RolloutItem::ResponseItem(first.to_model_input_item()),
-        ]).await;
+        ]);
+        restored.seed_seen_mailbox_communication_ids_from_ids(
+            crate::session::StartupRolloutFacts::reduce(&history).mailbox_communication_ids,
+        ).await;
         assert!(!restored.enqueue_mailbox_communication(make(Some("attempt-1"))).await.unwrap());
         assert!(restored.get_pending_input(&Mutex::new(None)).await.is_empty());
     }

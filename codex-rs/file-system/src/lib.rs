@@ -853,6 +853,7 @@ pub use atomic_write::SymlinkWritePaths;
 pub use atomic_write::acquire_atomic_write_lock;
 pub use atomic_write::atomic_write_lock_path;
 pub use atomic_write::resolve_symlink_write_paths;
+pub use atomic_write::try_acquire_atomic_write_lock;
 pub use atomic_write::write_atomically;
 pub use atomic_write::write_bytes_atomically;
 pub use atomic_write::write_bytes_atomically_without_sync;

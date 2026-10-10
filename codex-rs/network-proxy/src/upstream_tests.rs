@@ -27,6 +27,20 @@ use tokio::time::timeout;
 
 #[test]
 fn proxy_env_uses_first_present_casing_even_when_unusable() {
+    // Control: the fallback casing is usable on its own, so every `None` below comes from
+    // the first present key rather than from an unparseable fixture.
+    assert_eq!(
+        read_proxy_env_with(&["HTTPS_PROXY", "https_proxy"], |key| {
+            if key == "https_proxy" {
+                Ok("http://lower.example:8080".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        })
+        .map(|proxy| proxy.to_string()),
+        Some("http://lower.example:8080".to_string())
+    );
+
     let values = HashMap::from([
         ("HTTPS_PROXY", ""),
         ("https_proxy", "http://lower.example:8080"),

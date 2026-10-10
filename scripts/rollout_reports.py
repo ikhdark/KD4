@@ -1023,17 +1023,26 @@ def main(argv=None):
                 analyze(path)
         return 0
 
-    args.outdir.mkdir(parents=True, exist_ok=True)
+    outputs = set()
+    jobs = []
     for value in args.rollouts:
         if args.command == "narrative":
             path, start = value
             name = os.path.basename(path).replace(".jsonl", f".narr{start or ''}.txt")
-            output = args.outdir / name
+        else:
+            path, start = value, 0
+            name = os.path.basename(value).replace(".jsonl", ".txt")
+        output = args.outdir / name
+        if output in outputs:
+            parser.error(f"multiple rollouts map to the same report output: {output}")
+        outputs.add(output)
+        jobs.append((path, output, start))
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    for path, output, start in jobs:
+        if args.command == "narrative":
             dump_narrative(path, output, start)
         else:
-            name = os.path.basename(value).replace(".jsonl", ".txt")
-            output = args.outdir / name
-            (dump_complete if args.complete else dump)(value, output)
+            (dump_complete if args.complete else dump)(path, output)
         print("wrote", output, output.stat().st_size)
     return 0
 

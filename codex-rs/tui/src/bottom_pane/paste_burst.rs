@@ -553,6 +553,24 @@ mod tests {
         assert_eq!(grab.start_byte, 1);
         assert_eq!(grab.grabbed, " b");
         assert!(burst.is_active());
+
+        // "Long enough" counts characters, not bytes: 15 CJK characters are 45 bytes.
+        let mut burst = PasteBurst::default();
+        let fifteen = "界".repeat(15);
+        assert!(
+            burst
+                .decide_begin_buffer(now, &fifteen, /*retro_chars*/ 15)
+                .is_none()
+        );
+        assert!(!burst.is_active());
+
+        let sixteen = "界".repeat(16);
+        let grab = burst
+            .decide_begin_buffer(now, &sixteen, /*retro_chars*/ 16)
+            .expect("16 characters should be considered paste-like");
+        assert_eq!(grab.start_byte, 0);
+        assert_eq!(grab.grabbed, sixteen);
+        assert!(burst.is_active());
     }
 
     /// Behavior: after a paste-like burst, we keep an "enter suppression window" alive briefly so

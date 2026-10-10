@@ -53,11 +53,6 @@ impl ValidationTerminalStatus {
     pub fn is_success(self) -> bool {
         self == Self::Succeeded
     }
-
-    /// Whether the validation command itself completed successfully.
-    pub fn is_command_success(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Unverified)
-    }
 }
 
 /// The settled result of one validation command execution.
@@ -208,7 +203,7 @@ mod tests {
         );
         assert!(ValidationTerminalStatus::Succeeded.is_success());
         assert!(!ValidationTerminalStatus::Unverified.is_success());
-        assert!(ValidationTerminalStatus::Unverified.is_command_success());
+        assert!(!ValidationTerminalStatus::Failed.is_success());
         assert!(serde_json::from_value::<ValidationTerminalStatus>(json!("superseded")).is_err());
         assert!(serde_json::from_value::<ValidationTerminalStatus>(json!("timed_out")).is_err());
     }
@@ -243,6 +238,10 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<ValidationCommandContext>(legacy).is_err());
         }
+
+        let mut legacy_result = result_value;
+        legacy_result["uncertainty"] = json!("legacy");
+        assert!(serde_json::from_value::<ValidationResult>(legacy_result).is_err());
     }
 
     #[test]
@@ -259,7 +258,15 @@ mod tests {
                 "status": "failed", "durationMs": 1
             }),
             json!({
+                "argv": [], "coveredPaths": ["src"], "callId": "call-1",
+                "status": "failed", "durationMs": 1
+            }),
+            json!({
                 "argv": ["cargo"], "coveredPaths": [], "callId": "call-1",
+                "status": "failed", "durationMs": 1
+            }),
+            json!({
+                "argv": ["cargo"], "coveredPaths": ["src"], "callId": " ",
                 "status": "failed", "durationMs": 1
             }),
         ] {
@@ -287,6 +294,10 @@ mod tests {
             json!(["C:/src"]),
             json!(["src//lib"]),
             json!(["src/./lib"]),
+            json!(["src\\lib"]),
+            json!(["src/"]),
+            json!(["~/src"]),
+            json!([" src"]),
             json!(["src", "src"]),
             json!(["src", "SRC"]),
         ] {

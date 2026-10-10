@@ -6,34 +6,27 @@ use std::io::Write;
 use tempfile::TempDir;
 
 #[tokio::test]
-#[cfg(unix)]
-async fn append_entry_creates_private_history_and_keeps_it_private_after_retention() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let codex_home = TempDir::new().expect("create temp dir");
-    let mut config = HistoryConfig::new(codex_home.path(), &History::default());
-    let history_path = codex_home.path().join(HISTORY_FILENAME);
-    append_entry("first prompt", "session", &config)
+async fn disabled_persistence_does_not_create_or_modify_history() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let codex_home = temp_dir.path().join("missing").join("home");
+    let config = HistoryConfig {
+        codex_home: codex_home.clone(),
+        persistence: HistoryPersistence::None,
+        max_bytes: Some(1),
+    };
+    append_entry("do not persist", "session", &config)
         .await
-        .expect("create history");
-    let metadata = std::fs::metadata(&history_path).expect("history metadata");
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        .expect("disabled history succeeds without storage");
+    assert!(!codex_home.exists(), "disabled history must not create directories");
 
-    config.max_bytes = Some(metadata.len() as usize + 1);
-    append_entry("second prompt", "session", &config)
+    std::fs::create_dir_all(&codex_home).expect("create fixture directory");
+    let path = history_filepath(&config);
+    let original = b"existing incomplete history must remain untouched";
+    std::fs::write(&path, original).expect("write existing history");
+    append_entry("still private", "session", &config)
         .await
-        .expect("replace history during retention");
-    assert_eq!(
-        std::fs::metadata(&history_path)
-            .expect("retained history metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    let entries = std::fs::read_to_string(history_path).expect("read retained history");
-    assert!(!entries.contains("first prompt"));
-    assert!(entries.contains("second prompt"));
+        .expect("disabled history leaves existing storage alone");
+    assert_eq!(std::fs::read(&path).expect("read existing history"), original);
 }
 
 #[tokio::test]
@@ -313,6 +306,46 @@ async fn waiting_writer_reopens_after_compaction() {
     assert_eq!(count, 2);
     assert_eq!(lookup(id, 0, &config).unwrap().text, "retained");
     assert_eq!(lookup(id, 1, &config).unwrap().text, "waiting");
+}
+
+#[tokio::test]
+async fn stale_open_handles_reopen_current_generation_after_compaction() {
+    let home = TempDir::new().expect("temp dir");
+    let config = HistoryConfig::new(home.path(), &History::default());
+    append_entry("old", "session", &config).await.unwrap();
+    append_entry("retained", "session", &config).await.unwrap();
+    let path = history_filepath(&config);
+    let original = std::fs::read_to_string(&path).unwrap();
+    let retained = format!("{}\n", original.lines().last().unwrap());
+    let mut locked = open_locked_history(&path, true).unwrap();
+    let old_id = log_identity(&locked).unwrap();
+    // Both handles genuinely refer to the old generation before publication.
+    let stale_handles = [false, true].map(|exclusive| {
+        let file = OpenOptions::new().read(true).write(exclusive).open(&path).unwrap();
+        assert_eq!(log_identity(&file).unwrap(), old_id);
+        (exclusive, file)
+    });
+    enforce_history_limit(&mut locked, &path, Some(1), retained.len() as u64).unwrap();
+    drop(locked);
+    let (new_id, count) = history_metadata(&config).await;
+    assert_ne!(new_id, old_id);
+    assert_eq!(count, 1);
+
+    for (exclusive, stale_handle) in stale_handles {
+        let mut stale_handle = Some(stale_handle);
+        let mut current = open_locked_history_with(&path, exclusive, |options| {
+            match stale_handle.take() {
+                Some(file) => Ok(file),
+                None => options.open(&path),
+            }
+        })
+        .expect("stale reader or writer must reopen the published generation");
+        assert!(stale_handle.is_none(), "the old handle must actually be exercised");
+        assert_eq!(log_identity(&current).unwrap(), new_id);
+        let mut contents = String::new();
+        current.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, retained);
+    }
 }
 
 #[tokio::test]

@@ -832,6 +832,11 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
             messages.push((role.to_string(), text.to_string()));
         }
     }
+    let system_message_count = messages
+        .iter()
+        .filter(|(role, text)| role == "system" || text == "resumed system instruction")
+        .count();
+    assert_eq!(system_message_count, 0, "system history must not be replayed");
     let pos_prior_user = messages
         .iter()
         .position(|(role, text)| role == "user" && text == "resumed user message")
@@ -1986,7 +1991,7 @@ async fn skills_append_to_developer_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
+async fn skill_catalog_reports_omissions_under_budget_pressure() {
     require_network!();
     let server = MockServer::start().await;
 
@@ -2003,7 +2008,8 @@ async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
     std::fs::create_dir_all(&long_home_parent).expect("create long home parent");
     let codex_home = Arc::new(TempDir::new_in(long_home_parent).unwrap());
     let skill_root = codex_home.path().join("skills");
-    for index in 0..12 {
+    const SKILL_COUNT: usize = 256;
+    for index in 0..SKILL_COUNT {
         let skill_dir = skill_root.join(format!("s{index:02}"));
         std::fs::create_dir_all(&skill_dir).expect("create skill dir");
         std::fs::write(
@@ -2026,7 +2032,8 @@ async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
                     toml! { skills = { bundled = { enabled = false } } }.into(),
                 )
                 .into();
-            config.model_context_window = Some(12_000);
+            // Saturate the capped skills budget without forcing unrelated prompt compaction.
+            config.model_context_window = Some(100_000);
         });
     let codex = builder
         .build(&server)
@@ -2048,15 +2055,34 @@ async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let completed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    if let EventMsg::TurnComplete(completed) = completed {
+        assert_eq!(completed.error, None);
+    }
 
     let request = resp_mock.single_request();
     let developer_messages = request.message_input_texts("developer");
     let developer_text = developer_messages.join("\n\n");
     assert!(
-        !developer_text.contains("<skills_instructions>") && !developer_text.contains("s00"),
-        "expected the skill catalog to be omitted when none fits the context budget: {developer_messages:?}"
+        developer_text.contains("<skills_instructions>"),
+        "budgeted catalogs must retain omission/discovery guidance: {developer_messages:?}"
     );
+    let included = (0..SKILL_COUNT)
+        .filter(|index| {
+            developer_text
+                .lines()
+                .any(|line| line.starts_with(&format!("- s{index:02} — ")))
+        })
+        .count();
+    assert!(included > 0 && included < SKILL_COUNT, "exercise partial omission");
+    assert!(
+        developer_text.contains(&format!(
+            "Catalog incomplete: {} additional skills omitted",
+            SKILL_COUNT - included
+        )),
+        "omission notice must account for all authored skills: {developer_messages:?}"
+    );
+    assert!(developer_text.contains("read_file(path=\"skill:catalog\")"));
     let _codex_home_guard = codex_home;
     let _codex_home_parent_guard = codex_home_parent;
 }
@@ -3222,6 +3248,11 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
+    let completed = wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!();
+    };
+    assert_eq!(completed.error, Some(error_event));
 
     Ok(())
 }
@@ -3329,7 +3360,11 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
         "expected context window error; got {error_event:?}"
     );
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let completed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let (EventMsg::Error(error), EventMsg::TurnComplete(completed)) = (error_event, completed) else {
+        unreachable!();
+    };
+    assert_eq!(completed.error, Some(error));
 
     assert_eq!(requests.requests().len(), 4, "recover from overflow only once");
     Ok(())
@@ -3416,7 +3451,11 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
         "expected incomplete content filter error; got {error_event:?}"
     );
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let completed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let (EventMsg::Error(error), EventMsg::TurnComplete(completed)) = (error_event, completed) else {
+        unreachable!();
+    };
+    assert_eq!(completed.error, Some(error));
     assert_eq!(responses_mock.requests().len(), 1);
     Ok(())
 }
@@ -3649,16 +3688,17 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
         .expect("r3 missing input array")
         .iter()
         .filter(|item| {
-            item.get("content")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|content| {
-                    content.iter().any(|part| {
-                        matches!(
-                            part.get("text").and_then(serde_json::Value::as_str),
-                            Some("U1" | "U2" | "U3" | "Hey there!\n")
-                        )
+            item["role"] == "assistant"
+                || item.get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|part| {
+                            matches!(
+                                part.get("text").and_then(serde_json::Value::as_str),
+                                Some("U1" | "U2" | "U3" | "Hey there!\n")
+                            )
+                        })
                     })
-                })
         })
         .cloned()
         .collect::<Vec<_>>();

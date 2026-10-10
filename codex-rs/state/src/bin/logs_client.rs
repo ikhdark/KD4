@@ -442,8 +442,11 @@ mod tests {
         let pool = logs_fixture(&selected).await;
         let decoy = logs_fixture(&codex_state::logs_db_path(home.path())).await;
         insert_fixture_logs(&decoy, 2).await;
+        // Point --codex-home at the decoy so ignoring --db would read its two rows.
         let args = Args::try_parse_from([
             "codex-state-logs",
+            "--codex-home",
+            home.path().to_str().expect("home path"),
             "--db",
             selected.to_str().expect("path"),
             "--backfill",

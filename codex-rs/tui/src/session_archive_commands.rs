@@ -271,31 +271,7 @@ async fn start_app_server_for_archive_command(
         .await
         .wrap_err("failed to find Codex home")?;
 
-    let mut launch_loader_overrides = loader_overrides.clone();
-    if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
-        launch_loader_overrides.user_config_path = Some(resolve_profile_v2_config_path(
-            codex_home.as_path(),
-            profile_v2,
-        ));
-        launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
-    }
-
-    let reuse_implicit_local_daemon = super::can_reuse_implicit_local_daemon(
-        &cli_kv_overrides,
-        &launch_loader_overrides,
-        strict_config,
-        cli.bypass_hook_trust,
-    );
-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
-        super::maybe_probe_default_daemon_socket(codex_home.as_path()).await
-    } else {
-        None
-    };
-    let app_server_target = super::app_server_target_for_launch(
-        explicit_remote_endpoint,
-        default_daemon,
-        reuse_implicit_local_daemon,
-    );
+    let app_server_target = super::app_server_target_for_launch(explicit_remote_endpoint);
     let remote_cwd_override = cli
         .cwd
         .clone()
@@ -546,9 +522,14 @@ mod tests {
                 if cyclic {
                     assert!(error.contains("repeated a pagination cursor"), "{error}");
                 } else {
-                    assert!(
-                        error.contains("No ") && error.contains("session found matching"),
-                        "{error}"
+                    let scope = match action {
+                        SessionArchiveAction::Archive => "active",
+                        SessionArchiveAction::Delete(_) => "active or archived",
+                        SessionArchiveAction::Unarchive => "archived",
+                    };
+                    assert_eq!(
+                        error,
+                        format!("No {scope} session found matching 'missing-session'.")
                     );
                 }
                 assert!(error.contains("missing-session"));

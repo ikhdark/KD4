@@ -707,6 +707,21 @@ async fn view_image_tool_call_preserves_foreign_path() {
     assert_eq!(cells.len(), 1, "expected a single history cell");
     let combined = lines_to_single_string(&cells[0]);
     assert_chatwidget_snapshot!("foreign_image_attachment_history_snapshot", combined);
+
+    // The native path convention here is Windows, so the drive path above is native. A POSIX
+    // spelling is the foreign one and must be shown exactly as received.
+    let posix_image_path: LegacyAppPathString =
+        serde_json::from_value(json!("/workspace/assets/example.png"))
+            .expect("valid legacy app path string");
+
+    handle_view_image_tool_call(&mut chat, "call-image-posix", posix_image_path);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected a single history cell");
+    assert_eq!(
+        lines_to_single_string(&cells[0]),
+        "• Viewed Image\n  └ /workspace/assets/example.png\n"
+    );
 }
 
 #[tokio::test]
@@ -1161,15 +1176,17 @@ async fn turn_termination_preserves_unified_exec_processes() {
 }
 
 #[tokio::test]
-async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
+async fn interrupt_discards_unified_exec_wait_streak() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     handle_turn_started(&mut chat, "turn-1");
 
     let begin = begin_unified_exec_startup(&mut chat, "call-1", "process-1", "just fix");
     terminal_interaction(&mut chat, "call-1a", "process-1", "");
+    assert!(chat.unified_exec_wait_streak.is_some());
 
     handle_turn_interrupted(&mut chat, "turn-1");
+    assert!(chat.unified_exec_wait_streak.is_none());
 
     end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
     let cells = drain_insert_history(&mut rx);
@@ -1178,8 +1195,12 @@ async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
         .map(|lines| lines_to_single_string(lines))
         .collect::<Vec<_>>()
         .join("\n");
-    let snapshot = format!("cells={}\n{combined}", cells.len());
-    assert_chatwidget_snapshot!("interrupt_preserves_unified_exec_wait_streak", snapshot);
+    // Only the interruption notice reaches history: no "Waited for background terminal" row.
+    assert_eq!(cells.len(), 1, "{combined}");
+    assert_eq!(
+        combined.trim_end(),
+        "■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue."
+    );
 }
 
 
@@ -1245,6 +1266,29 @@ async fn apply_patch_events_emit_history_cells() {
     assert!(
         cells.is_empty(),
         "no success cell should be emitted anymore"
+    );
+
+    // 4) Control: a failed apply reaches the same completion path and does add a cell.
+    let mut failed_changes = HashMap::new();
+    failed_changes.insert(
+        PathBuf::from("foo.txt"),
+        FileChange::Add {
+            content: "hello\n".to_string(),
+        },
+    );
+    handle_patch_apply_end(
+        &mut chat,
+        "c1",
+        "turn-c1",
+        failed_changes,
+        AppServerPatchApplyStatus::Failed,
+    );
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one failure cell");
+    let blob = lines_to_single_string(&cells[0]);
+    assert!(
+        blob.contains("Failed to apply patch"),
+        "expected patch failure notice: {blob:?}"
     );
 }
 
@@ -1456,6 +1500,10 @@ async fn apply_patch_request_omits_diff_summary_from_modal() -> anyhow::Result<(
         }
         contents.push('\n');
     }
+    assert!(
+        contents.contains("Would you like to make the following edits?"),
+        "expected the patch approval modal to be rendered: {contents:?}"
+    );
     assert!(!contents.contains("README.md (+2 -0)"));
     assert!(!contents.contains("+line one"));
     assert!(!contents.contains("+line two"));

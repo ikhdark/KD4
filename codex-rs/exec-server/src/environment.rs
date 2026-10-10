@@ -1483,6 +1483,9 @@ mod tests {
         .expect("environment manager");
         let environment = manager.get_environment("stdio").expect("stdio environment");
 
+        // A spawned startup cannot have run yet on this runtime, so the task slot
+        // is the signal that none was created.
+        assert!(environment.startup_task.lock().unwrap().is_none());
         assert!(!environment.startup_finished());
         assert!(environment.wait_until_ready().await.is_err());
         assert!(environment.startup_finished());
@@ -1527,6 +1530,7 @@ mod tests {
             manager.inspect_selected_capability_roots(std::slice::from_ref(&selected_root));
         assert!(status.ready_roots.is_empty());
         assert_eq!(status.warnings, Vec::<String>::new());
+        assert!(environment.startup_task.lock().unwrap().is_none());
         assert!(!environment.startup_finished());
 
         let missing_root = SelectedCapabilityRoot {

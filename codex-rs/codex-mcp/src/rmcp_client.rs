@@ -1792,6 +1792,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mcp_initialize_sends_client_elicitation_capability_in_2025_06_18_shape() {
+        for (capability, expected_wire) in [
+            (ElicitationCapability::default(), serde_json::json!({})),
+            (
+                ElicitationCapability {
+                    form: Some(rmcp::model::FormElicitationCapability::default()),
+                    url: Some(rmcp::model::UrlElicitationCapability::default()),
+                },
+                serde_json::json!({ "form": {}, "url": {} }),
+            ),
+        ] {
+            let params = mcp_initialize_request_params(
+                capability.clone(),
+                /*supports_openai_form_elicitation*/ false,
+            );
+            assert_eq!(params.capabilities.elicitation, Some(capability));
+            let wire = serde_json::to_value(&params.capabilities)
+                .expect("serialize client capabilities");
+            assert_eq!(wire["elicitation"], expected_wire);
+        }
+    }
+
     fn tool_with_connector_meta() -> RmcpTool {
         RmcpTool::new(
             "capture_file_upload",
@@ -1818,11 +1841,23 @@ mod tests {
 
     #[test]
     fn custom_mcp_connector_metadata_is_stripped() {
-        let mut tool = tool_with_connector_meta();
+        // Convert through the listing path so an unwired strip is caught as well.
+        let tool_info = tool_info_from_listed_tool(
+            "custom-server",
+            /*is_codex_apps_mcp_server*/ false,
+            /*server_instructions*/ None,
+            ToolWithConnectorId {
+                tool: tool_with_connector_meta(),
+                connector_id: Some("connector_gmail".to_string()),
+                connector_name: Some("Gmail".to_string()),
+                connector_description: Some("Mail connector".to_string()),
+            },
+        );
 
-        strip_untrusted_connector_meta(&mut tool);
-
-        let meta = tool.meta.as_ref().expect("meta");
+        assert_eq!(tool_info.connector_id, None);
+        assert_eq!(tool_info.connector_name, None);
+        assert_eq!(tool_info.namespace_description, None);
+        let meta = tool_info.tool.meta.as_ref().expect("meta");
         for key in [
             "connector_id",
             "connector_name",

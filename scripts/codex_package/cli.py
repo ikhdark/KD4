@@ -325,6 +325,7 @@ class Publication:
     def __init__(self, paths):
         self.paths = set(paths)
         self.backups = {}
+        self.source_identities = {}
 
     def activate(self, source, destination, *, force):
         destination = destination.resolve()
@@ -340,6 +341,7 @@ class Publication:
                 f".{destination.name}.backup-{uuid.uuid4().hex}"
             )
         # Register before mutation, including an interrupt between rename and activation.
+        self.source_identities[destination] = source.stat()
         self.backups[destination] = backup
         if backup is not None:
             destination.replace(backup)
@@ -351,7 +353,12 @@ class Publication:
     def rollback(self):
         for destination, backup in reversed(list(self.backups.items())):
             if backup is None:
-                _remove_output(destination)
+                # A failed no-clobber activation may have lost to another writer.
+                # Only the staged inode became ours, even across an interruption.
+                if destination.exists() and os.path.samestat(
+                    destination.stat(), self.source_identities[destination]
+                ):
+                    _remove_output(destination)
             elif backup.exists():
                 _remove_output(destination)
                 backup.replace(destination)

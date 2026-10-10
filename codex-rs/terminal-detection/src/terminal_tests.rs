@@ -42,6 +42,38 @@ fn terminal_info(
 }
 
 #[test]
+fn user_agent_tokens_sanitize_environment_values() {
+    // The public metadata may contain arbitrary environment text, but the
+    // User-Agent token must replace unsafe characters without changing safe
+    // punctuation. Exercise each environment-backed token construction path.
+    for (env, expected) in [
+        (
+            FakeEnvironment::new()
+                .with_var("TERM_PROGRAM", "Term\r\n:é")
+                .with_var("TERM_PROGRAM_VERSION", "1.0\tbeta"),
+            "Term____/1.0_beta",
+        ),
+        (
+            FakeEnvironment::new().with_var("TERM", "xterm\r\nÉ"),
+            "xterm___",
+        ),
+        (
+            FakeEnvironment::new().with_var("WEZTERM_VERSION", "2024\nbad"),
+            "WezTerm/2024_bad",
+        ),
+        (
+            FakeEnvironment::new().with_var("TERM_PROGRAM", "Term-._/9"),
+            "Term-._/9",
+        ),
+    ] {
+        assert_eq!(
+            detect_terminal_info_from_env(&env).user_agent_token(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn detects_term_program() {
     let env = FakeEnvironment::new()
         .with_var("TERM_PROGRAM", "iTerm.app")
@@ -106,27 +138,6 @@ fn detects_term_program() {
         "iTerm.app",
         "term_program_overrides_wezterm_user_agent"
     );
-}
-
-#[test]
-fn terminal_info_reports_is_zellij() {
-    let zellij = terminal_info(
-        TerminalName::Unknown,
-        /*term_program*/ None,
-        /*version*/ None,
-        /*term*/ None,
-        Some(Multiplexer::Zellij { version: None }),
-    );
-    assert!(zellij.is_zellij());
-
-    let non_zellij = terminal_info(
-        TerminalName::Unknown,
-        /*term_program*/ None,
-        /*version*/ None,
-        /*term*/ None,
-        Some(Multiplexer::Tmux { version: None }),
-    );
-    assert!(!non_zellij.is_zellij());
 }
 
 #[test]
@@ -330,7 +341,6 @@ fn detects_zellij_multiplexer() {
             ),
             "{variable}"
         );
-        assert!(terminal.is_zellij(), "{variable}");
 
         let empty = FakeEnvironment::new().with_var(variable, " \t");
         assert_eq!(detect_terminal_info_from_env(&empty).multiplexer, None);

@@ -293,10 +293,13 @@ async fn plain_start_resolves_persisted_preference_when_auth_changes() {
     .expect("auth should save");
     auth_manager.reload().await;
 
+    // This window can overlap the first 180ms retry, so it only bounds the
+    // end-to-end latency. The wake itself is pinned without wall-clock timing by
+    // preference_resolution_retry_wakes_on_auth_change_and_resets_backoff.
     assert!(
         timeout(Duration::from_millis(100), &mut resolve)
             .await
-            .expect("auth change should wake preference resolution before its retry delay")
+            .expect("preference resolution should finish once auth is published")
     );
     assert_eq!(
         *desired_state_tx.borrow(),
@@ -1149,6 +1152,32 @@ async fn remote_control_start_allows_remote_control_invalid_url_when_disabled() 
         .await
         .expect("remote control task should stop")
         .expect("remote control task should join");
+
+    // Control: the same URL is rejected when startup would connect to it.
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let (enabled_transport_event_tx, _enabled_transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let Err(err) = start_remote_control(
+        RemoteControlStartConfig {
+            remote_control_url: "https://internal.example.com/backend-api/".to_string(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+        },
+        Some(remote_control_state_runtime(&codex_home).await),
+        remote_control_auth_manager(),
+        enabled_transport_event_tx,
+        CancellationToken::new(),
+        /*app_server_client_name_rx*/ None,
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await
+    else {
+        panic!("enabled remote control should validate the URL at startup");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[tokio::test]
@@ -2246,6 +2275,15 @@ async fn persisted_enable_account_change(close_socket: bool, logout_first: bool)
             .expect("backend websocket should close");
     }
     auth_manager.reload().await;
+    if !close_socket && !logout_first {
+        let closed = timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("account change should stop the live socket");
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))
+        ));
+    }
 
     let mut desired_state_rx = remote_handle.desired_state_tx.subscribe();
     timeout(

@@ -906,6 +906,8 @@ mod tests {
         for (err, terminal) in [
             (thread_error_report(ThreadErrorReason::NotLoaded, "localized message"), true),
             (thread_error_report(ThreadErrorReason::NotFound, "localized message"), true),
+            // A classified but recoverable reason must not close the thread.
+            (thread_error_report(ThreadErrorReason::NotMaterialized, "localized message"), false),
             (color_eyre::eyre::eyre!(
                 "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
             ), false),
@@ -932,6 +934,11 @@ mod tests {
 
         assert!(App::can_fallback_from_include_turns_error(&unmaterialized));
         assert!(App::can_fallback_from_include_turns_error(&ephemeral));
+
+        let not_found = thread_error_report(ThreadErrorReason::NotFound, "localized message");
+        let transport = color_eyre::eyre::eyre!("thread/read transport error: broken pipe");
+        assert!(!App::can_fallback_from_include_turns_error(&not_found));
+        assert!(!App::can_fallback_from_include_turns_error(&transport));
     }
 
     fn thread_error_report(reason: ThreadErrorReason, message: &str) -> color_eyre::Report {

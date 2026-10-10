@@ -726,7 +726,7 @@ impl ToolOutput for FunctionToolOutput {
         })
     }
 
-    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
         let canonical_body = self.canonical_body.as_ref().unwrap_or(&self.body);
         match canonical_body.as_slice() {
             items
@@ -750,23 +750,9 @@ impl ToolOutput for FunctionToolOutput {
                         .join("\n"),
                 ))
             }
-            _ => {
-                let canonical_output = Self {
-                    essential_inline: self.essential_inline.clone(),
-                    body: canonical_body.clone(),
-                    canonical_body: None,
-                    success: self.success,
-                    outcome: self.outcome,
-                    post_tool_use_response: None,
-                    sampling_request_signal: None,
-                    deterministic_continuation_receipts: Vec::new(),
-                    deterministic_continuation_owner_key: None,
-                    skip_disposition: self.skip_disposition,
-                };
-                Some(CanonicalToolResult::json(
-                    canonical_output.code_mode_result(payload),
-                ))
-            }
+            // Display conversion intentionally flattens modalities. Recovery
+            // must retain item boundaries, image detail and opaque content.
+            _ => Some(CanonicalToolResult::json(serde_json::json!(canonical_body))),
         }
     }
 

@@ -97,5 +97,13 @@ mod tests {
             ),
             16
         );
+        // An odd whole second is the second half of the two-second sweep.
+        assert_eq!(
+            sweep_position(
+                Duration::from_secs((1 << 24) + 1) + Duration::from_millis(32),
+                1000
+            ),
+            516
+        );
     }
 }

@@ -135,6 +135,12 @@ mod tests {
         );
 
         assert!(is_auto_backup_recoverable(&startup_error));
+        // Control: the same detail under a real directory must not move the database aside.
+        let ordinary_error = LocalStateDbStartupError::new(
+            codex_state::state_db_path(temp_dir.path()),
+            "File exists".to_string(),
+        );
+        assert!(!is_auto_backup_recoverable(&ordinary_error));
         let backups = backup_files_for_fresh_start(&startup_error).await?;
 
         assert_eq!(backups.len(), 1);

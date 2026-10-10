@@ -284,5 +284,13 @@ mod tests {
         assert!(SlashCommand::Raw.available_in_side_conversation());
         assert!(SlashCommand::Raw.supports_inline_args());
         assert!(SlashCommand::App.available_during_task());
+        for command in [
+            SlashCommand::New,
+            SlashCommand::Compact,
+            SlashCommand::Delete,
+            SlashCommand::Logout,
+        ] {
+            assert!(!command.available_during_task(), "{command:?}");
+        }
     }
 }

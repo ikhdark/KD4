@@ -323,6 +323,22 @@ mod tests {
                 message: "repo deny".to_string(),
             })
         );
+
+        // A later allow must not overrule the deny either; the order above
+        // also passes for a fold where the last decision wins.
+        let decisions = [
+            PermissionRequestDecision::Deny {
+                message: "repo deny".to_string(),
+            },
+            PermissionRequestDecision::Allow,
+        ];
+
+        assert_eq!(
+            resolve_permission_request_decision(decisions.iter()),
+            Some(PermissionRequestDecision::Deny {
+                message: "repo deny".to_string(),
+            })
+        );
     }
 
     #[test]

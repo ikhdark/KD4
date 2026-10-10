@@ -408,9 +408,7 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
 }
 
 #[tokio::test]
-async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
-    let _budget =
-        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
+async fn code_mode_registry_output_is_admitted_raw_with_a_recoverable_candidate() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let call_id = "registry-discovery";
     let registry_input = "text(ALL_TOOLS.find(tool => tool.name === 'exec_command').description);";
@@ -479,101 +477,14 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
     let mut history = crate::tool_history::ToolHistoryState::default();
     history.register(candidate);
 
-    let first_exposure = history.project(Arc::clone(&canonical));
-    assert!(first_exposure.substitutions.is_empty());
-    assert!(history.mark_consumed(
-        &first_exposure.items,
-        crate::tool_history::ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let consumed_exposure = history.project(Arc::clone(&canonical));
-    assert!(consumed_exposure.substitutions.is_empty());
-    assert_eq!(consumed_exposure.items, canonical);
-
-    let fresh_call_id = "fresh-code-mode-output";
-    let fresh_input = "text('abc '.repeat(6000));";
-    let fresh_output = "abc ".repeat(6_000);
-    let raw_tokens = approx_token_count(&raw_registry_output);
-    let fresh_tokens = approx_token_count(&fresh_output);
-    assert_eq!(fresh_tokens, 6_000);
-    // Each result fits the shared 10,000-token budget; together they require a receipt.
-    assert!(raw_tokens <= 10_000);
-    assert!(fresh_tokens <= 10_000);
-    assert!(raw_tokens + fresh_tokens > 10_000);
-    let fresh_invocation = ToolInvocation {
-        call_id: fresh_call_id.to_string(),
-        payload: ToolPayload::Custom {
-            input: fresh_input.to_string(),
-        },
-        ..invocation.clone()
-    };
-    let mut fresh_result = AnyToolResult {
-        call_id: fresh_call_id.to_string(),
-        payload: fresh_invocation.payload.clone(),
-        result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
-            fresh_output.clone(),
-            Some(true),
-        )),
-        model_projection: None,
-        source_dependencies: None,
-        code_mode_feedback: Vec::new(),
-    };
-    let fresh_projection_input = prepare_model_projection(
-        &fresh_invocation,
-        &mut fresh_result,
-        /*parsed_function_arguments*/ None,
-        /*source_dependencies_override*/ None,
-        /*force_inline_carrier*/ false,
-        /*track_for_admission*/ true,
+    // The raw output stays in history; the registered candidate is what keeps it recoverable.
+    let pins: serde_json::Value = serde_json::from_str(
+        &history
+            .artifact_pin_payload_for_items(&canonical)
+            .expect("the admitted output has a recovery handle"),
     )
-    .await
-    .expect("fresh code-mode output should be admitted");
-    let fresh_projection = project_model_output(fresh_projection_input)
-        .await
-        .expect("fresh code-mode admission projection");
-    let fresh_response = fresh_projection.response();
-    assert_eq!(
-        history_output_text(&fresh_response).as_deref(),
-        Some(fresh_output.as_str())
-    );
-    history.register(
-        fresh_projection
-            .candidate
-            .expect("fresh completed-tool history candidate"),
-    );
-    let fresh_response = ResponseItem::from(fresh_response);
-    let mut pressured_canonical = canonical.to_vec();
-    pressured_canonical.extend([
-        ResponseItem::CustomToolCall {
-            id: None,
-            status: Some("completed".to_string()),
-            call_id: fresh_call_id.to_string(),
-            name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-            namespace: None,
-            input: fresh_input.to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        fresh_response.clone(),
-    ]);
-
-    let later_exposure = history.project(Arc::from(pressured_canonical));
-    assert_eq!(later_exposure.substitutions.len(), 1);
-    assert_eq!(later_exposure.substitutions[0].call_id, call_id);
-    assert!(later_exposure.items.contains(&fresh_response));
-    assert!(
-        later_exposure
-            .items
-            .iter()
-            .any(crate::tool_history::response_item_has_valid_tool_history_receipt)
-    );
-    assert!(
-        !serde_json::to_string(&later_exposure.items)
-            .expect("serialize later prompt exposure")
-            .contains(&raw_registry_output)
-    );
+    .expect("pin payload JSON");
+    assert_eq!(pins["artifacts"][0]["call_id"], call_id);
 }
 
 #[tokio::test]
@@ -1799,13 +1710,17 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|value| value["type"] == "deterministic_tool_output_recovery")
         .expect("inline deterministic recovery");
-    for expected in [
-        "line-001", "line-002", "line-150", "line-151", "line-299", "line-300",
-    ] {
-        assert!(
-            recovery.to_string().contains(expected),
-            "missing {expected}"
-        );
+    let results = recovery["results"].as_array().expect("recovery results");
+    assert_eq!(results.len(), 3);
+    for (result, (start, end, expected)) in results.iter().zip([
+        (1, 2, "line-001\nline-002\n"),
+        (150, 151, "line-150\nline-151\n"),
+        (299, 300, "line-299\nline-300"),
+    ]) {
+        assert_eq!(result["selector"], serde_json::json!({"kind": "lines", "start": start, "end": end}));
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["text"], expected);
     }
     let receipt = projection
         .deterministic_continuation_receipt

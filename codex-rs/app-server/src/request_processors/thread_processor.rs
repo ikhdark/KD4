@@ -238,12 +238,12 @@ fn raw_override_contains(
     key: &str,
 ) -> bool {
     overrides.is_some_and(|overrides| {
-        overrides.contains_key(key)
-            || overrides.keys().any(|candidate| {
-                candidate
-                    .strip_prefix(key)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-            })
+        let key = key.split('.').collect::<Vec<_>>();
+        overrides.keys().any(|candidate| {
+            codex_config::parse_override_key(candidate)
+                .is_ok_and(|candidate| candidate.iter().map(String::as_str).zip(&key)
+                    .all(|(candidate, key)| candidate == *key) && candidate.len() >= key.len())
+        })
     })
 }
 

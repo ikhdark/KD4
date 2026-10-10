@@ -272,37 +272,6 @@ mod catalog_id_tests {
         assert!(!restricted.matches_product_restriction(None));
     }
 
-    #[test]
-    fn skill_metadata_deserializes_shared_fields_and_tool_type() {
-        let interface: codex_protocol::protocol::SkillInterface =
-            noyalib::compat::serde_yaml::from_str("display_name: Example\n")
-                .expect("interface metadata should deserialize");
-        assert_eq!(interface.display_name.as_deref(), Some("Example"));
-        assert_eq!(interface.short_description, None);
-        assert_eq!(interface.default_prompt, None);
-
-        let dependencies: codex_protocol::protocol::SkillDependencies =
-            noyalib::compat::serde_yaml::from_str("tools:\n  - type: mcp\n    value: example\n")
-                .expect("tool dependency metadata should deserialize");
-        assert_eq!(
-            dependencies.tools,
-            vec![SkillToolDependency {
-                r#type: "mcp".to_string(),
-                value: "example".to_string(),
-                description: None,
-                transport: None,
-                command: None,
-                url: None,
-            }]
-        );
-        assert!(
-            noyalib::compat::serde_yaml::from_str::<SkillDependencies>(
-                "tools:\n  - value: missing-type\n"
-            )
-            .is_err()
-        );
-    }
-
     fn skill(name: &str, path: &str, scope: SkillScope, plugin_id: Option<&str>) -> SkillMetadata {
         SkillMetadata {
             name: name.to_string(),

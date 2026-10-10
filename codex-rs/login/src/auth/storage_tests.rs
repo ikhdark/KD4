@@ -759,6 +759,35 @@ fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()>
 }
 
 #[test]
+fn auto_auth_storage_save_does_not_fall_back_on_secrets_contention() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let mock_keyring = MockKeyringStore::default();
+    let storage = AutoAuthStorage::new(
+        codex_home.path().to_path_buf(),
+        Arc::new(mock_keyring.clone()),
+        AuthKeyringBackendKind::Secrets,
+    );
+    let original = auth_with_prefix("original");
+    seed_secrets_backend_with_auth(&mock_keyring, codex_home.path(), &original)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(codex_home.path().join("secrets/.lock"))?;
+    lock.try_lock()?;
+
+    let updated = auth_with_prefix("updated");
+    let result = storage.save(&updated);
+    drop(lock);
+    let error = result.expect_err("contention must not report a hidden fallback write as success");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(!get_auth_file(codex_home.path()).exists());
+    assert_eq!(storage.load()?, Some(original));
+    storage.save(&updated)?;
+    assert_eq!(storage.load()?, Some(updated));
+    Ok(())
+}
+
+#[test]
 fn auto_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();

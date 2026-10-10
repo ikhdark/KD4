@@ -24,7 +24,7 @@ impl ClockFormat {
 
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn time_locale(
     mut get: impl FnMut(&str) -> Option<std::ffi::OsString>,
 ) -> Option<std::ffi::OsString> {
@@ -39,7 +39,7 @@ fn detect() -> Option<ClockFormat> {
     detect_time_locale(locale.to_str()?)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn detect_time_locale(locale: &str) -> Option<ClockFormat> {
     if matches!(locale, "C" | "POSIX" | "C.UTF-8" | "C.utf8") {
         return Some(ClockFormat::TwentyFourHour);
@@ -70,7 +70,7 @@ fn detect_time_locale(locale: &str) -> Option<ClockFormat> {
     None
 }
 
-#[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn parse_strftime(pattern: &[u8]) -> Option<ClockFormat> {
     let mut chars = pattern.iter().copied().peekable();
     let mut twelve = false;

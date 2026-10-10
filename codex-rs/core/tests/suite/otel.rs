@@ -473,13 +473,21 @@ async fn process_sse_failed_event_logs_parse_error() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let completed =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!();
+    };
+    assert!(completed.error.is_some(), "response.failed must fail the turn");
 
     logs_assert(|lines: &[&str]| {
         lines
             .iter()
             .find(|line| {
-                line.contains("codex.sse_event") && line.contains("event.kind=response.failed")
+                line.contains("codex.sse_event")
+                    && line.contains("event.kind=response.failed")
+                    && extract_log_field(line, "error.message")
+                        .is_some_and(|message| !message.is_empty())
             })
             .map(|_| Ok(()))
             .unwrap_or(Err("missing codex.sse_event".to_string()))
@@ -516,13 +524,21 @@ async fn process_sse_failed_event_logs_missing_error() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let completed =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!();
+    };
+    assert!(completed.error.is_some(), "response.failed must fail the turn");
 
     logs_assert(|lines: &[&str]| {
         lines
             .iter()
             .find(|line| {
-                line.contains("codex.sse_event") && line.contains("event.kind=response.failed")
+                line.contains("codex.sse_event")
+                    && line.contains("event.kind=response.failed")
+                    && extract_log_field(line, "error.message")
+                        .is_some_and(|message| !message.is_empty())
             })
             .map(|_| Ok(()))
             .unwrap_or(Err("missing codex.sse_event".to_string()))
@@ -652,7 +668,7 @@ async fn process_sse_emits_completed_telemetry() {
                         .is_some_and(|tool_tokens| tool_tokens > 0)
                     && extract_log_field(line, "ttft_ms")
                         .and_then(|ttft_ms| ttft_ms.parse::<i64>().ok())
-                        .is_some()
+                        .is_some_and(|ttft_ms| ttft_ms >= 0)
             })
             .map(|_| Ok(()))
             .unwrap_or(Err("missing response.completed telemetry".to_string()))
@@ -717,7 +733,20 @@ async fn turn_and_completed_response_spans_record_token_usage() {
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    // Turn completion is published before deferred token-usage telemetry.
+    let logs = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+            if logs.lines().any(|line| {
+                extract_log_field(line, "codex.turn.token_usage.total_tokens").is_some()
+            }) {
+                break logs;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("post-terminal token usage telemetry");
 
     assert!(
         logs.lines().any(|line| {
@@ -1137,23 +1166,36 @@ fn tool_decision_assertion<'a>(
         let line = lines
             .iter()
             .find(|line| {
-                line.contains("codex.tool_decision") && line.contains(&format!("call_id={call_id}"))
+                line.contains("codex.tool_decision")
+                    && extract_log_field(line, "call_id").as_deref() == Some(call_id.as_str())
             })
             .ok_or_else(|| format!("missing codex.tool_decision event for {call_id}"))?;
 
         let lower = line.to_lowercase();
-        if !lower.contains("tool_name=shell_command") {
+        if extract_log_field(&lower, "tool_name").as_deref() != Some("shell_command") {
             return Err("missing tool_name for shell_command".to_string());
         }
-        if !lower.contains(&format!("decision={expected_decision}")) {
+        if extract_log_field(&lower, "decision").as_deref() != Some(expected_decision.as_str()) {
             return Err(format!("unexpected decision for {call_id}"));
         }
-        if !lower.contains(&format!("source={expected_source}")) {
+        if extract_log_field(&lower, "source").as_deref() != Some(expected_source.as_str()) {
             return Err(format!("unexpected source for {expected_source}"));
         }
 
         Ok(())
     }
+}
+
+#[test]
+fn tool_decision_assertion_distinguishes_approval_scope() {
+    let approved = "event.name=codex.tool_decision call_id=call tool_name=shell_command decision=approved source=user";
+    let session_approved = "event.name=codex.tool_decision call_id=call tool_name=shell_command decision=approvedforsession source=user";
+    let assertion = tool_decision_assertion("call", "approved", "user");
+    assert!(assertion(&[approved]).is_ok());
+    assert!(assertion(&[session_approved]).is_err());
+    assert!(tool_decision_assertion("call", "approvedforsession", "user")(&[session_approved]).is_ok());
+    assert!(tool_decision_assertion("call", "approved", "config")(&[approved]).is_err());
+    assert!(tool_decision_assertion("cal", "approved", "user")(&[approved]).is_err());
 }
 
 fn sandbox_outcome_assertion<'a>(

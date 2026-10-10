@@ -200,7 +200,7 @@ fn conversation_message_role(record: &JsonValue) -> Option<MessageRole> {
                 Some("text") => {
                     if let Some(text) = block.get("text").and_then(JsonValue::as_str) {
                         has_content |= !text.trim().is_empty();
-                        only_tool_result &= text.is_empty();
+                        only_tool_result &= text.trim().is_empty();
                     }
                 }
                 Some("thinking") | None => {}
@@ -482,6 +482,30 @@ mod tests {
     }
 
     #[test]
+    fn summary_fallback_title_skips_control_only_user_messages() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("session.jsonl");
+        let user = |text: &str| {
+            serde_json::json!({
+                "type": "user", "cwd": root.path(), "timestamp": "2026-06-03T12:00:00Z",
+                "message": {"content": text}
+            })
+        };
+        let selection = user("<ide_selection>src/auth.rs:1-5</ide_selection>");
+        let stderr = user("<local-command-stderr>tests failed</local-command-stderr>");
+        let request = user("Fix auth flow");
+
+        std::fs::write(&path, format!("{selection}\n{request}")).unwrap();
+        let summary = summarize_session(&path).unwrap().unwrap();
+        assert_eq!(summary.migration.title.as_deref(), Some("Fix auth flow"));
+
+        // Discovery offers the same safe title the import path falls back to.
+        std::fs::write(&path, format!("{selection}\n{stderr}")).unwrap();
+        let summary = summarize_session(&path).unwrap().unwrap();
+        assert_eq!(summary.migration.title.as_deref(), Some("Imported session"));
+    }
+
+    #[test]
     fn converts_tool_use_blocks_to_bounded_external_agent_tags() {
         let block = serde_json::json!({
             "type": "tool_use",
@@ -595,6 +619,63 @@ mod tests {
                 "[external_agent_tool_result: error]\nprefix\n{}...\n[/external_agent_tool_result]",
                 "界".repeat(3_990)
             )
+        );
+    }
+
+    #[test]
+    fn whitespace_beside_tool_results_does_not_create_a_user_turn() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("session.jsonl");
+        let result = serde_json::json!({
+            "type": "user", "cwd": root.path(), "timestamp": "2026-06-03T12:00:00Z",
+            "message": {"content": [
+                {"type": "text", "text": " \n\t"},
+                {"type": "tool_result", "content": "tool output"}
+            ]}
+        });
+        std::fs::write(&path, result.to_string()).unwrap();
+        assert!(summarize_session(&path).unwrap().is_none());
+        let migration = ExternalAgentSessionMigration {
+            path: path.clone(),
+            cwd: root.path().to_path_buf(),
+            title: None,
+        };
+        assert!(
+            crate::prepare_validated_session_import(root.path(), migration.clone())
+                .unwrap()
+                .is_none()
+        );
+
+        let user = serde_json::json!({
+            "type": "user", "cwd": root.path(), "timestamp": "2026-06-03T12:00:00Z",
+            "message": {"content": "real request"}
+        });
+        std::fs::write(&path, format!("{user}\n{result}")).unwrap();
+        let pending = crate::prepare_validated_session_import(root.path(), migration)
+            .unwrap()
+            .expect("real user request makes the session importable");
+        let turns = codex_app_server_protocol::build_turns_from_rollout_items(
+            &pending.session.rollout_items,
+        );
+        assert_eq!(turns.len(), 1, "tool output must not start a user turn");
+        let parsed = read_session_import(&path).unwrap();
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[1].role, MessageRole::Assistant);
+        assert_eq!(
+            parsed.messages[1].text,
+            "[external_agent_tool_result]\ntool output\n[/external_agent_tool_result]"
+        );
+
+        let mut mixed = result;
+        mixed["message"]["content"][0]["text"] = serde_json::json!("real follow-up");
+        std::fs::write(&path, mixed.to_string()).unwrap();
+        assert!(summarize_session(&path).unwrap().is_some());
+        let parsed = read_session_import(&path).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].role, MessageRole::User);
+        assert_eq!(
+            parsed.messages[0].text,
+            "real follow-up\n\n[external_agent_tool_result]\ntool output\n[/external_agent_tool_result]"
         );
     }
 }

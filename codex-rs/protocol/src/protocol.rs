@@ -815,7 +815,7 @@ impl WritableRoot {
 
         // Check if the path is under any of the read-only subpaths.
         for subpath in &self.read_only_subpaths {
-            if path.starts_with(subpath) {
+            if crate::permissions::path_is_within_denied_root(path, subpath.as_path()) {
                 return false;
             }
         }
@@ -838,7 +838,9 @@ impl WritableRoot {
 
         self.protected_metadata_names
             .iter()
-            .any(|name| first_component.as_os_str() == std::ffi::OsStr::new(name))
+            .any(|name| crate::permissions::path_component_matches(
+                first_component.as_os_str(), std::ffi::OsStr::new(name),
+            ))
     }
 }
 
@@ -6889,9 +6891,8 @@ mod tests {
 
     #[test]
     fn file_system_policy_rejects_legacy_bridge_for_non_workspace_writes() {
-        let cwd = Path::new(r"C:\workspace");
-        let external_write_path =
-            AbsolutePathBuf::from_absolute_path(r"C:\temp").expect("absolute windows temp path");
+        let cwd = test_path_buf("/workspace");
+        let external_write_path = test_path_buf("/external-write").abs();
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: external_write_path,
@@ -6900,7 +6901,7 @@ mod tests {
         }]);
 
         let err = policy
-            .to_legacy_sandbox_policy(NetworkSandboxPolicy::Restricted, cwd)
+            .to_legacy_sandbox_policy(NetworkSandboxPolicy::Restricted, &cwd)
             .expect_err("non-workspace writes should be rejected");
 
         assert!(
@@ -6945,6 +6946,10 @@ mod tests {
                     .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
                     .expect("legacy bridge should preserve legacy policy semantics");
 
+            // The semantic probes cannot see a lost TMPDIR exclusion while
+            // TMPDIR is unset, and read access is unconditional for every
+            // legacy policy, so also pin the reconstructed fields.
+            assert_eq!(actual, expected);
             assert_same_sandbox_policy_semantics(&expected, &actual, cwd.path());
         }
     }
@@ -6974,7 +6979,7 @@ mod tests {
     }
 
     #[test]
-    fn item_started_event_from_non_web_search_emits_no_legacy_events() {
+    fn item_started_event_from_user_message_emits_no_legacy_events() {
         let event = ItemStartedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
@@ -7080,6 +7085,7 @@ mod tests {
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");
+                assert_eq!(event.invocation.arguments, Some(json!({"arg": "value"})));
                 assert_eq!(event.connector_id.as_deref(), Some("connector"));
                 assert_eq!(
                     event.mcp_app_resource_uri.as_deref(),
@@ -7087,6 +7093,7 @@ mod tests {
                 );
                 assert_eq!(event.link_id.as_deref(), Some("link_123"));
                 assert_eq!(event.app_name.as_deref(), Some("Calendar"));
+                assert_eq!(event.template_id.as_deref(), Some("calendar_template"));
                 assert_eq!(event.action_name.as_deref(), Some("create_event"));
                 assert_eq!(event.plugin_id.as_deref(), Some("sample@test"));
             }
@@ -7201,6 +7208,7 @@ mod tests {
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");
+                assert_eq!(event.invocation.arguments, Some(json!({"arg": "value"})));
                 assert_eq!(event.connector_id.as_deref(), Some("connector"));
                 assert_eq!(
                     event.mcp_app_resource_uri.as_deref(),
@@ -7208,6 +7216,7 @@ mod tests {
                 );
                 assert_eq!(event.link_id.as_deref(), Some("link_123"));
                 assert_eq!(event.app_name.as_deref(), Some("Calendar"));
+                assert_eq!(event.template_id.as_deref(), Some("calendar_template"));
                 assert_eq!(event.action_name.as_deref(), Some("create_event"));
                 assert_eq!(event.plugin_id.as_deref(), Some("sample@test"));
                 assert_eq!(event.duration, Duration::from_millis(42));
@@ -7430,7 +7439,11 @@ mod tests {
         .unwrap();
         value.as_object_mut().unwrap().remove("started_at_ms");
 
-        assert!(serde_json::from_value::<ItemStartedEvent>(value).is_err());
+        let err = serde_json::from_value::<ItemStartedEvent>(value).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `started_at_ms`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -7649,7 +7662,8 @@ mod tests {
         assert_eq!(serialized["history_mode"], json!("legacy"));
         let mut unknown = serialized;
         unknown["history_mode"] = json!("future");
-        assert!(serde_json::from_value::<SessionMeta>(unknown).is_err());
+        let err = serde_json::from_value::<SessionMeta>(unknown).unwrap_err();
+        assert!(err.to_string().contains("unknown variant `future`"), "{err}");
         Ok(())
     }
 
@@ -7822,6 +7836,35 @@ mod tests {
             .remove("summary");
         // The fixture must otherwise be valid, so an unrelated decode failure cannot pass.
         serde_json::from_value::<RolloutLine>(current_with_legacy_field)?;
+
+        let mut current_with_legacy_agent_type = json!({
+            "timestamp": "2026-08-24T00:00:00Z",
+            "format_version": CURRENT_ROLLOUT_FORMAT_VERSION,
+            "type": "session_meta",
+            "payload": {
+                "session_id": "00000000-0000-0000-0000-000000000001",
+                "id": "00000000-0000-0000-0000-000000000001",
+                "timestamp": "2026-08-24T00:00:00Z",
+                "cwd": "/tmp",
+                "originator": "codex",
+                "cli_version": "0.0.0",
+                "model_provider": null,
+                "base_instructions": null,
+                "agent_type": "worker"
+            }
+        });
+        let error = serde_json::from_value::<RolloutLine>(current_with_legacy_agent_type.clone())
+            .err()
+            .expect("current rollouts must reject legacy agent_type");
+        assert_eq!(
+            error.to_string(),
+            "rollout format version 1 does not accept session_meta.agent_type"
+        );
+        current_with_legacy_agent_type["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_type");
+        serde_json::from_value::<RolloutLine>(current_with_legacy_agent_type)?;
 
         let future_version = CURRENT_ROLLOUT_FORMAT_VERSION + 1;
         let future = json!({
@@ -8748,6 +8791,11 @@ mod tests {
         assert!(receipt.action_bounds_hash.is_empty());
         assert!(receipt.runtime_identity().is_none());
         let expected_wire_identity = receipt.wire_identity();
+        // Persisted receipts are rejected when this derived form drifts.
+        assert_eq!(
+            expected_wire_identity,
+            "v1|unchanged_wait|4:hash|8:revision|await_state_change"
+        );
         let serialized = serde_json::to_value(receipt).expect("receipt serialization");
         assert!(serialized.get("avoidedTokenUsage").is_none());
         assert!(serialized.get("actionBoundsHash").is_none());
@@ -8776,6 +8824,8 @@ mod tests {
         assert_ne!(first.runtime_identity(), second.runtime_identity());
 
         let serialized = serde_json::to_value(&first).expect("receipt serialization");
+        // The deserializer drops unknown fields, so check the wire form itself.
+        assert!(!serialized.to_string().contains("bounds-a"), "{serialized}");
         let deserialized: TurnTimingDeterministicContinuationReceipt =
             serde_json::from_value(serialized.clone()).expect("receipt deserialization");
         assert_eq!(deserialized.wire_identity(), first.wire_identity());

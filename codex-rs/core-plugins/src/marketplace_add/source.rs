@@ -95,12 +95,6 @@ pub(super) fn stage_marketplace_source<F>(
 where
     F: Fn(&str, Option<&str>, &[String], &Path) -> Result<String, MarketplaceAddError>,
 {
-    if !sparse_paths.is_empty() && !matches!(source, MarketplaceSource::Git { .. }) {
-        return Err(MarketplaceAddError::InvalidRequest(
-            "--sparse is only supported for git marketplace sources".to_string(),
-        ));
-    }
-
     match source {
         MarketplaceSource::Git { url, ref_name } => {
             clone_source(url, ref_name.as_deref(), sparse_paths, staged_root)
@@ -399,7 +393,7 @@ mod tests {
         let MarketplaceSource::Local { path } = source else {
             panic!("expected local path source");
         };
-        assert!(path.is_absolute());
+        assert_eq!(path, std::env::current_dir().unwrap().canonicalize().unwrap());
     }
 
     #[test]
@@ -434,24 +428,6 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("--ref is only supported for git marketplace sources"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn non_git_sources_reject_sparse_checkout() {
-        let path = std::env::current_dir().unwrap();
-        let err = stage_marketplace_source(
-            &MarketplaceSource::Local { path },
-            &["plugins/foo".to_string()],
-            Path::new("/tmp"),
-            |_url, _ref_name, _sparse_paths, _staged_root| Ok(String::new()),
-        )
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("--sparse is only supported for git marketplace sources"),
             "unexpected error: {err}"
         );
     }

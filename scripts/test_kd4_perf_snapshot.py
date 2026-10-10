@@ -63,6 +63,31 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                 measure.assert_not_called()
                 self.assertEqual(output.read_text(), "previous evidence")
 
+    def test_preflight_rejects_hardlinked_report_aliases_without_overwriting_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "attempts.jsonl"
+            original = b'{"event.name":"codex.model_attempt","sampling_request_id":"request"}\n'
+            source.write_bytes(original)
+            alias = root / "report.txt"
+            alias.hardlink_to(source)
+            with (
+                mock.patch.object(kd4_perf_snapshot, "measure_scenario") as measure,
+                mock.patch.object(kd4_perf_snapshot, "environment_metadata") as environment,
+                mock.patch.object(sys, "stdout", io.StringIO()),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                kd4_perf_snapshot.main([
+                    "--analysis-only", "--model-attempt-jsonl", str(source),
+                    "--model-attempt-report", str(alias),
+                ])
+            self.assertEqual(raised.exception.code, 2)
+            measure.assert_not_called()
+            environment.assert_not_called()
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(alias.read_bytes(), original)
+
     def test_cleanup_abort_saves_completed_evidence_and_stops_even_if_allowed(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "snapshot.json"

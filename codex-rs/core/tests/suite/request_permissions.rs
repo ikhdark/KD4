@@ -405,7 +405,7 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 
     let result = parse_result(&results.single_request().function_call_output(call_id));
     assert!(
-        result.exit_code.is_none() || result.exit_code == Some(0),
+        result.exit_code == Some(0),
         "unexpected exit code/output: {:?} {}",
         result.exit_code,
         result.stdout
@@ -629,7 +629,7 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
 
     let result = parse_result(&results.single_request().function_call_output(call_id));
     assert!(
-        result.exit_code.is_none() || result.exit_code == Some(0),
+        result.exit_code == Some(0),
         "unexpected exit code/output: {:?} {}",
         result.exit_code,
         result.stdout
@@ -642,9 +642,14 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> Result<()> {
     require_network!();
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -653,6 +658,9 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        // Without a sandbox backend the approved command runs unsandboxed and
+        // the outside write would succeed whether or not the grant was applied.
+        config.set_windows_elevated_sandbox_enabled(true);
         config
             .permissions
             .set_permission_profile(permission_profile_for_config)
@@ -670,9 +678,7 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
 
     let outside_dir = tempfile::tempdir()?;
     let outside_write = outside_dir.path().join("workspace-write-outside.txt");
-    let placeholder = test.workspace_path("workspace-write-placeholder.txt");
     let _ = fs::remove_file(&outside_write);
-    let _ = fs::remove_file(&placeholder);
 
     let call_id = "request_permissions_workspace_write_outside";
     let command = write_and_read_command(&outside_write, "outside-cwd-ok");
@@ -693,8 +699,15 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
         ..RequestPermissionProfile::default()
     };
     let native_requested_permissions = native_permissions(requested_permissions.clone())?;
-    let event =
-        shell_event_with_request_permissions(call_id, &command, &native_requested_permissions)?;
+    // A sandboxed PowerShell launch needs more than the shared helper's one second.
+    let args = json!({
+        "kind": "script",
+        "command": command,
+        "timeout_ms": 10_000_u64,
+        "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
+        "additional_permissions": native_requested_permissions,
+    });
+    let event = ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?);
 
     let _ = mount_sse_once(
         &server,
@@ -732,20 +745,15 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
 
     let result = parse_result(&results.single_request().function_call_output(call_id));
     assert!(
-        result.exit_code.is_none() || result.exit_code == Some(0),
+        result.exit_code == Some(0),
         "unexpected exit code/output: {:?} {}",
         result.exit_code,
         result.stdout
     );
     assert!(result.stdout.contains("outside-cwd-ok"));
     assert_eq!(fs::read_to_string(&outside_write)?, "outside-cwd-ok");
-    assert!(
-        !placeholder.exists(),
-        "placeholder path should remain untouched"
-    );
 
     let _ = fs::remove_file(outside_write);
-    let _ = fs::remove_file(placeholder);
     Ok(())
 }
 
@@ -973,9 +981,11 @@ async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Resu
             .permissions
             .set_permission_profile(permission_profile_for_config)
             .expect("set permission profile");
+        // With inline permission requests disabled, only a preapproved grant
+        // can admit the explicit request below.
         config
             .features
-            .enable(Feature::ExecPermissionApprovals)
+            .disable(Feature::ExecPermissionApprovals)
             .expect("test config should allow feature update");
         config
             .features
@@ -1061,7 +1071,7 @@ async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Resu
         .expect("expected exec-call output");
     let result = parse_result(&exec_output);
     assert!(
-        result.exit_code.is_none_or(|exit_code| exit_code == 0),
+        result.exit_code == Some(0),
         "expected success output, got exit_code={:?}, stdout={:?}",
         result.exit_code,
         result.stdout
@@ -1162,16 +1172,21 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls(
         })
         .await?;
 
-    if let Some(approval) = wait_for_exec_approval_or_completion(&test).await {
-        test.codex
-            .submit(Op::ExecApproval {
-                id: approval.effective_approval_id(),
-                turn_id: None,
-                decision: ReviewDecision::Approved,
-            })
-            .await?;
-        wait_for_completion(&test).await;
-    }
+    // Without a Windows sandbox backend this write always prompts and then runs
+    // unsandboxed, so the sticky grant is only visible on the approval itself.
+    let approval = expect_exec_approval(&test, &command).await;
+    assert_eq!(
+        approval.additional_permissions,
+        Some(native_permissions(normalized_requested_permissions)?)
+    );
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::Approved,
+        })
+        .await?;
+    wait_for_completion(&test).await;
 
     let shell_output = responses
         .function_call_output_text("shell-call")
@@ -1179,7 +1194,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls(
         .expect("expected shell-call output");
     let result = parse_result(&shell_output);
     assert!(
-        result.exit_code.is_none_or(|exit_code| exit_code == 0),
+        result.exit_code == Some(0),
         "expected success output, got exit_code={:?}, stdout={:?}",
         result.exit_code,
         result.stdout
@@ -1192,9 +1207,14 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls(
 
 
 
-#[tokio::test(flavor = "current_thread")]
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() -> Result<()> {
     require_network!();
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1203,6 +1223,9 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        // With a sandbox backend a preapproved command runs without a prompt,
+        // so the approvals expected below prove these calls were not preapproved.
+        config.set_windows_elevated_sandbox_enabled(true);
         config
             .permissions
             .set_permission_profile(permission_profile_for_config)
@@ -1689,8 +1712,8 @@ async fn granular_inline_execution_approval(
             })
             .await?;
         if shell_denied {
-            // The shell emitter reports a terminal user denial; the turn must
-            // publish that result rather than ask the model to continue.
+            // Denial terminates this command, not the turn. Publish its Declined
+            // item before relaying the refusal to the model continuation below.
             let event = wait_for_event_with_timeout(
                 &test.codex,
                 |event| match event {
@@ -1777,7 +1800,7 @@ async fn granular_inline_execution_approval(
             result.stdout
         );
         assert!(
-            result.exit_code.is_none() || result.exit_code == Some(0),
+            result.exit_code == Some(0),
             "{}",
             result.stdout
         );

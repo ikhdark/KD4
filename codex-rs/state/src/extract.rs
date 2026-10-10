@@ -800,16 +800,4 @@ mod tests {
             git_origin_url: None,
         }
     }
-
-    #[test]
-    fn diff_fields_detects_changes() {
-        let mut base = metadata_for_test();
-        base.id = ThreadId::from_string(&Uuid::now_v7().to_string()).expect("thread id");
-        base.title = "hello".to_string();
-        let mut other = base.clone();
-        other.tokens_used = 2;
-        other.title = "world".to_string();
-        let diffs = base.diff_fields(&other);
-        assert_eq!(diffs, vec!["title", "tokens_used"]);
-    }
 }

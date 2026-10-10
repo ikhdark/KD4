@@ -70,19 +70,24 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
         ]),
     )
     .await;
-    mount_sse_once_match(
-        &server,
-        |req: &wiremock::Request| {
-            request_body_contains(req, SPAWN_CALL_ID)
-                && request_header(req, "x-openai-subagent").is_none()
-        },
-        sse(vec![
-            ev_response_created("resp-parent-2"),
-            ev_assistant_message("msg-parent-2", "parent done"),
-            ev_completed("resp-parent-2"),
-        ]),
-    )
-    .await;
+    // Child completion may arrive during the parent's continuation, requiring one more
+    // request to consume the notification. Identity must hold in either ordering.
+    let mut parent_follow_up_mocks = Vec::new();
+    for index in 2..=3 {
+        let response_id = format!("resp-parent-{index}");
+        parent_follow_up_mocks.push(mount_sse_once_match(
+            &server,
+            |req: &wiremock::Request| {
+                request_body_contains(req, SPAWN_CALL_ID)
+                    && request_header(req, "x-openai-subagent").is_none()
+            },
+            sse(vec![
+                ev_response_created(&response_id),
+                ev_assistant_message(&format!("msg-parent-{index}"), "parent done"),
+                ev_completed(&response_id),
+            ]),
+        ).await);
+    }
 
     let mut builder = test_codex().with_config(|config| {
         config
@@ -99,7 +104,7 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
             .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;
-    submit_turn_with_timeout(&test, PARENT_PROMPT).await?;
+    submit_turn_with_timeout(&test, PARENT_PROMPT, &server).await?;
 
     let parent = wait_for_matching_request(&parent_mock, "parent request", |request| {
         request.body_contains_text(PARENT_PROMPT) && request.header("x-openai-subagent").is_none()
@@ -119,6 +124,26 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
         .ok_or_else(|| anyhow!("child request missing x-codex-window-id"))?;
     let (parent_thread_id, parent_generation) = split_window_id(&parent_window_id)?;
     let (child_thread_id, child_generation) = split_window_id(&child_window_id)?;
+    assert_eq!(parent_thread_id, test.session_configured.thread_id.to_string());
+    let continuations: Vec<_> = parent_follow_up_mocks.iter()
+        .flat_map(ResponseMock::requests)
+        .collect();
+    assert!((1..=2).contains(&continuations.len()));
+    for continuation in &continuations {
+        let spawn_output = continuation.function_call_output_text(SPAWN_CALL_ID)
+            .ok_or_else(|| anyhow!("parent continuation must retain its spawn result"))?;
+        let spawn_result: serde_json::Value = serde_json::from_str(&spawn_output)?;
+        assert_eq!(spawn_result["agent_id"].as_str(), Some(child_thread_id));
+        assert_eq!(continuation.header("x-codex-window-id"), Some(parent_window_id.clone()));
+        assert_eq!(continuation.header("x-codex-parent-thread-id"), None);
+    }
+    assert_eq!(parent.header("x-codex-parent-thread-id"), None);
+    for request in [&parent, &child] {
+        assert_eq!(
+            request.body_json()["client_metadata"]["x-codex-window-id"].as_str(),
+            request.header("x-codex-window-id").as_deref()
+        );
+    }
 
     assert_eq!(parent_generation, 0);
     assert_eq!(child_generation, 0);
@@ -146,7 +171,11 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
     Ok(())
 }
 
-async fn submit_turn_with_timeout(test: &TestCodex, prompt: &str) -> Result<()> {
+async fn submit_turn_with_timeout(
+    test: &TestCodex,
+    prompt: &str,
+    server: &wiremock::MockServer,
+) -> Result<()> {
     let session_model = test.session_configured.model.clone();
     let cwd = test.config.cwd.clone();
     let (sandbox_policy, permission_profile) =
@@ -185,11 +214,18 @@ async fn submit_turn_with_timeout(test: &TestCodex, prompt: &str) -> Result<()> 
     let EventMsg::TurnStarted(turn_started) = turn_started else {
         unreachable!("event predicate only matches turn started events");
     };
-    wait_for_event_result(test, "turn complete", |event| match event {
+    let completed = wait_for_event_result(test, "turn complete", |event| match event {
         EventMsg::TurnComplete(event) => event.turn_id == turn_started.turn_id,
         _ => false,
     })
     .await?;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!("event predicate only accepts matching completion");
+    };
+    if completed.error.is_some() {
+        eprintln!("diagnostic requests: {:#?}", server.received_requests().await);
+    }
+    assert_eq!(completed.error, None);
 
     Ok(())
 }

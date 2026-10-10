@@ -9,6 +9,11 @@ import math
 import re
 from typing import Any
 
+try:
+    from scripts.kd4_timing_analysis import _is_rg_no_match
+except ImportError:
+    from kd4_timing_analysis import _is_rg_no_match
+
 SCHEMA_VERSION = 1
 # Read persisted fields, not synthesized zero defaults from aggregate reports.
 _METRICS = {
@@ -133,9 +138,11 @@ def _number(value: Any) -> bool:
 
 def tool_observation(name: str, arguments: str, output: str) -> dict[str, Any]:
     """Retain small facts, never raw commands, outputs, or private arguments."""
+    decoded_arguments = None
     try:
+        decoded_arguments = json.loads(arguments)
         arguments = json.dumps(
-            json.loads(arguments), sort_keys=True, separators=(",", ":")
+            decoded_arguments, sort_keys=True, separators=(",", ":")
         )
     except ValueError:
         pass
@@ -146,12 +153,24 @@ def tool_observation(name: str, arguments: str, output: str) -> dict[str, Any]:
     result = result if isinstance(result, dict) else {}
     tool = name.rsplit(".", 1)[-1]
     exit_code = result.get("exit_code")
+    outcome = result
     if type(exit_code) is not int:
         match = re.search(
             r"(?m)^(?:Process exited with code|Exit code:)\s*(-?\d+)\s*$", output
         )
         exit_code = int(match[1]) if match else None
+        # Remove only the recognized exit receipt; any remaining text can be
+        # an error and must prevent a no-match interpretation.
+        outcome = {"output": (output[:match.start()] + output[match.end():]).strip()} if match else {}
     command = tool in ("exec_command", "shell_command", "shell", "write_stdin")
+    no_match = (
+        isinstance(decoded_arguments, dict)
+        and _is_rg_no_match(
+            decoded_arguments.get("cmd", decoded_arguments.get("command")),
+            exit_code,
+            outcome,
+        )
+    )
     environment_crash = (
         command and type(exit_code) is int and (exit_code & 0xFFFFFFFF) in {
             0xC0000005, 0xC000001D, 0xC0000094, 0xC00000FD,
@@ -170,7 +189,7 @@ def tool_observation(name: str, arguments: str, output: str) -> dict[str, Any]:
         "toolKnown": tool != "unknown" and bool(tool),
         "signature": hashlib.sha256((name + "\0" + arguments).encode()).hexdigest(),
         "command": command,
-        "commandFailed": exit_code != 0 if command and type(exit_code) is int else None,
+        "commandFailed": exit_code != 0 and not no_match if command and type(exit_code) is int else None,
         "environmentCrash": environment_crash if command and type(exit_code) is int else None,
         "mayHideCommands": tool in ("exec", "wait"),
         "checkpoint": tool == "context_checkpoint",

@@ -356,6 +356,52 @@ async fn failed_automatic_refresh_is_shared_and_explicit_refresh_bypasses_cooldo
 }
 
 #[tokio::test]
+async fn in_flight_refresh_does_not_publish_after_account_identity_changes() {
+    for notify_etag in [false, true] {
+        let home = tempdir().unwrap();
+        let endpoint = ControlledModelsEndpoint::new(vec![ControlledResponse::Models(
+            vec![remote_model("old-account-only", "Old Account", 1)],
+            Some("old-account-etag".into()),
+        )]);
+        let identity = Arc::new(Mutex::new("first-account".to_string()));
+        let current = Arc::clone(&identity);
+        let manager = Arc::new(OpenAiModelsManager::new(
+            home.path().into(),
+            endpoint.clone(),
+            Some(AuthManager::from_auth_for_testing(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            )),
+            Arc::new(move || current.lock().unwrap().clone()),
+        ));
+        let refresh = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                if notify_etag {
+                    manager.notify_etag("new-etag".into(), DEFAULT_HTTP_CLIENT_FACTORY).await;
+                } else {
+                    manager
+                        .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+                        .await
+                        .expect("identity change discards the obsolete response");
+                }
+            }
+        });
+        endpoint.wait_for_fetches(1).await;
+        *identity.lock().unwrap() = "second-account".into();
+        endpoint.release_one();
+        timeout(Duration::from_secs(5), refresh).await.unwrap().unwrap();
+        // Inspect publication before a public read could reset stale state.
+        let state = manager.state.read().await;
+        assert!(!state.remote_models.iter().any(|model| model.slug == "old-account-only"));
+        assert_eq!(state.etag, None);
+        drop(state);
+        assert!(manager.get_remote_models().await.iter().all(|model| model.slug != "old-account-only"));
+        assert!(!home.path().join(MODEL_CACHE_FILE).exists(), "old identity must not publish to disk");
+        assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn automatic_refresh_retries_after_cooldown_or_identity_change() {
     for change_identity in [false, true] {
         let home = tempdir().unwrap();
@@ -486,6 +532,64 @@ async fn probe_repeated_handshake_etag_fetches() {
 }
 
 #[tokio::test]
+async fn completed_stale_etag_notices_revalidate_again_and_304_renews_cached_catalog() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = Arc::new(NotModifiedModelsEndpoint::default());
+    let manager = Arc::new(openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+    let cached = vec![remote_model("revalidated-model", "Revalidated", 1)];
+    manager
+        .cache_manager
+        .persist_cache(
+            &cached,
+            Some("catalog-etag".to_string()),
+            crate::client_version_to_whole(),
+        )
+        .await;
+    assert!(manager.try_load_cache().await.expect("load cache"));
+    manager
+        .cache_manager
+        .manipulate_cache_for_test(|fetched_at| {
+            *fetched_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        })
+        .await
+        .expect("age cache");
+    manager.state.write().await.fresh_until = Some(Instant::now());
+
+    // Notices coalesce only while active or pending, so each completed notice for the
+    // same mismatching ETag sends another conditional fetch with the cached validator.
+    for _ in 0..3 {
+        Arc::clone(&manager)
+            .notify_etag("handshake-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY)
+            .await;
+    }
+
+    assert_eq!(
+        *endpoint
+            .observed_etags
+            .lock()
+            .expect("observed ETags lock should not be poisoned"),
+        vec![Some("catalog-etag".to_string()); 3]
+    );
+    assert_eq!(manager.get_etag().await.as_deref(), Some("catalog-etag"));
+    assert!(
+        manager.memory_is_fresh().await,
+        "a 304 confirms the in-memory catalog"
+    );
+    assert_models_contain(&manager.get_remote_models().await, &cached);
+    let renewed = manager
+        .cache_manager
+        .load_fresh(&crate::client_version_to_whole())
+        .await
+        .expect("read cache")
+        .expect("a 304 renews the aged cached representation");
+    assert_eq!(renewed.models, cached);
+    assert_eq!(renewed.etag.as_deref(), Some("catalog-etag"));
+}
+
+#[tokio::test]
 async fn same_manager_serializes_refresh_and_cache_publication() {
     let codex_home = tempdir().expect("temp dir");
     let endpoint = ControlledModelsEndpoint::new(vec![
@@ -556,8 +660,13 @@ async fn same_manager_serializes_refresh_and_cache_publication() {
 async fn cache_corruption_keeps_offline_fallback_and_recovers_online() {
     for contents in [
         b"{not-json".to_vec(),
+        // Without the current identity and a fresh timestamp this entry is skipped as a
+        // miss before its models are decoded.
         serde_json::to_vec(&json!({
-            "client_version": crate::client_version_to_whole(), "models": "invalid"
+            "client_version": crate::client_version_to_whole(),
+            "provider_cache_identity": "test-provider-identity",
+            "fetched_at": Utc::now(),
+            "models": "invalid"
         }))
         .expect("json"),
     ] {
@@ -566,6 +675,13 @@ async fn cache_corruption_keeps_offline_fallback_and_recovers_online() {
         let endpoint =
             TestModelsEndpoint::new(vec![vec![remote_model("recovered-model", "Recovered", 1)]]);
         let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+        assert!(
+            matches!(
+                manager.try_load_cache().await,
+                Err(CodexErr::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+            ),
+            "the fixture must be rejected as corrupt, not skipped as a miss"
+        );
         let fallback = manager
             .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
             .await
@@ -1050,7 +1166,10 @@ fn openai_manager_for_tests_with_auth(
 async fn offline_refresh_revalidates_identity_at_cache_and_catalog_boundaries() {
     // Switch identity at different read boundaries during one offline refresh.
     // An obsolete account's disk catalog must never become the returned catalog.
-    for switch_after in 0..=5 {
+    // An unswitched refresh reads the identity 11 times: six up to the cache load, then
+    // the post-load check, the apply, the publication check, the freshness mark and the
+    // catalog read.
+    for switch_after in 0..=10 {
         let codex_home = tempdir().expect("temp dir");
         let reads = Arc::new(AtomicUsize::new(0));
         let threshold = Arc::new(AtomicUsize::new(usize::MAX));
@@ -1771,7 +1890,14 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
 
 #[tokio::test]
 async fn refresh_available_models_replaces_obsolete_cache_before_decoding_models() {
-    for old_version in [None, Some("0.1.0")] {
+    // Identity-less files are skipped by the identity scope before their version is read;
+    // only an entry for the current identity reaches the version check.
+    for (old_version, identity) in [
+        (None, None),
+        (Some("0.1.0"), None),
+        (None, Some("test-provider-identity")),
+        (Some("0.1.0"), Some("test-provider-identity")),
+    ] {
         let remote_models = vec![remote_model("current", "Current", /*priority*/ 5)];
         let codex_home = tempdir().expect("temp dir");
         let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
@@ -1792,8 +1918,17 @@ async fn refresh_available_models_replaces_obsolete_cache_before_decoding_models
         if let Some(version) = old_version {
             cache["client_version"] = json!(version);
         }
+        if let Some(identity) = identity {
+            cache["provider_cache_identity"] = json!(identity);
+        }
         let cache_path = codex_home.path().join(MODEL_CACHE_FILE);
         std::fs::write(&cache_path, cache.to_string()).expect("write legacy cache");
+        assert!(
+            !manager
+                .try_load_cache()
+                .await
+                .expect("an obsolete entry is a miss, not a model decode error")
+        );
 
         manager
             .refresh_available_models(
@@ -2421,16 +2556,22 @@ async fn refresh_available_models_uses_cached_chatgpt_when_external_api_key_is_u
 async fn refresh_available_models_fetches_with_chatgpt_auth_tokens() {
     let dynamic_slug = "dynamic-model-only-for-test-chatgpt-auth-tokens";
     let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model(
-        dynamic_slug,
-        "ChatGPT Auth Tokens",
-        /*priority*/ 1,
-    )]]);
     let auth = chatgpt_auth_tokens_for_tests(codex_home.path()).await;
+    assert!(auth.is_external_chatgpt_tokens());
+    let auth_manager = AuthManager::from_auth_for_testing(auth);
+    // Eligibility must come from the token auth itself, not from a hard-coded endpoint flag.
+    let endpoint = TestAuthAwareModelsEndpoint::new(
+        Some(Arc::clone(&auth_manager)),
+        vec![vec![remote_model(
+            dynamic_slug,
+            "ChatGPT Auth Tokens",
+            /*priority*/ 1,
+        )]],
+    );
     let manager = openai_manager_for_tests_with_auth(
         codex_home.path().to_path_buf(),
         endpoint.clone(),
-        Some(AuthManager::from_auth_for_testing(auth)),
+        Some(auth_manager),
     );
 
     manager

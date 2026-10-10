@@ -27,10 +27,8 @@ use crate::types::WindowsToml;
 use codex_features::FeaturesToml;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
-use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -371,7 +369,7 @@ pub struct ConfigToml {
     pub completed_tool_history_projection: Option<bool>,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
-    /// Default: `60000` (1 minute).
+    /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: Option<u64>,
 
     /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
@@ -925,22 +923,6 @@ where
     Ok(model_providers)
 }
 
-pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
-    match provider {
-        LMSTUDIO_OSS_PROVIDER_ID | OLLAMA_OSS_PROVIDER_ID => Ok(()),
-        LEGACY_OLLAMA_CHAT_PROVIDER_ID => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            OLLAMA_CHAT_PROVIDER_REMOVED_ERROR,
-        )),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "Invalid OSS provider '{provider}'. Must be one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}"
-            ),
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,16 +973,19 @@ region = "us-west-2"
             codex_model_provider_info::merge_configured_model_providers(providers, overrides)
                 .is_err()
         );
-        assert!(
-            toml::from_str::<ConfigToml>(
-                r#"
+        let err = toml::from_str::<ConfigToml>(
+            r#"
 [model_providers.custom]
 name = "Custom"
 [model_providers.custom.aws]
 region = "us-west-2"
-"#
-            )
-            .is_err()
+"#,
+        )
+        .expect_err("aws auth on a custom provider should be rejected");
+        assert!(
+            err.to_string()
+                .contains("model_providers.custom: provider aws is only supported for"),
+            "unexpected error: {err}"
         );
     }
 

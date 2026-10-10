@@ -1796,6 +1796,10 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
     assert_eq!(payload.as_array().expect("events array").len(), 1);
     assert_eq!(payload[0]["event_type"], "codex_thread_initialized");
     assert_eq!(payload[0]["event_params"]["session_id"], "session-thread-1");
+    assert_eq!(payload[0]["event_params"]["thread_id"], "thread-1");
+    assert_eq!(payload[0]["event_params"]["model"], "gpt-5");
+    assert_eq!(payload[0]["event_params"]["ephemeral"], true);
+    assert_eq!(payload[0]["event_params"]["initialization_mode"], "resumed");
     assert_eq!(
         payload[0]["event_params"]["app_server_client"]["product_client_id"],
         DEFAULT_ORIGINATOR
@@ -2280,6 +2284,13 @@ async fn final_approval_outcome_maps_known_no_review_policies() {
             "policy_forbidden",
             json!("policy_forbidden"),
         ),
+        // Control: a rejection is only policy-forbidden under `never`.
+        (
+            AskForApproval::OnRequest,
+            CommandExecutionStatus::Declined,
+            "not_needed",
+            json!("approval_denied"),
+        ),
     ] {
         let mut reducer = AnalyticsReducer::default();
         let mut events = Vec::new();
@@ -2631,6 +2642,102 @@ async fn compact_tool_items_emit_identical_analytics_events() {
         }
         // Every field the event reads survives compaction.
         assert_eq!(payloads[0], payloads[1]);
+        // Identical copies could still be wrong together, so pin what each event derives
+        // from its item.
+        let event = &payloads[0][0];
+        let expected_params = match event["event_type"].as_str().expect("event type") {
+            "codex_command_execution_event" => json!({
+                "item_id": "item-1",
+                "tool_name": "shell",
+                "terminal_status": "completed",
+                "failure_kind": null,
+                "execution_duration_ms": 42,
+                "command_execution_source": "agent",
+                "exit_code": 0,
+                "command_total_action_count": 1,
+                "command_read_action_count": 0,
+                "command_list_files_action_count": 0,
+                "command_search_action_count": 0,
+                "command_unknown_action_count": 1,
+            }),
+            "codex_file_change_event" => json!({
+                "item_id": "file-change-1",
+                "tool_name": "apply_patch",
+                "terminal_status": "completed",
+                "failure_kind": null,
+                "execution_duration_ms": null,
+                "file_change_count": 3,
+                "file_add_count": 1,
+                "file_update_count": 0,
+                "file_delete_count": 1,
+                "file_move_count": 1,
+            }),
+            "codex_mcp_tool_call_event" => json!({
+                "item_id": "mcp-1",
+                "tool_name": "search",
+                "terminal_status": "failed",
+                "failure_kind": "tool_error",
+                "execution_duration_ms": 2,
+                "mcp_server_name": "server",
+                "mcp_tool_name": "search",
+                "mcp_error_present": true,
+                "plugin_id": "sample@test",
+            }),
+            "codex_dynamic_tool_call_event" => json!({
+                "item_id": "dynamic-1",
+                "tool_name": "render",
+                "terminal_status": "completed",
+                "failure_kind": null,
+                "execution_duration_ms": 3,
+                "dynamic_tool_name": "render",
+                "success": true,
+                "output_content_item_count": 3,
+                "output_text_item_count": 2,
+                "output_image_item_count": 1,
+            }),
+            "codex_collab_agent_tool_call_event" => json!({
+                "item_id": "collab-1",
+                "tool_name": "wait_agent",
+                "terminal_status": "completed",
+                "failure_kind": null,
+                "execution_duration_ms": null,
+                "sender_thread_id": "thread-1",
+                "receiver_thread_count": 2,
+                "receiver_thread_ids": ["thread-a", "thread-b"],
+                "requested_model": "gpt-5",
+                "requested_reasoning_effort": "high",
+                "agent_state_count": 2,
+                "completed_agent_count": 1,
+                "failed_agent_count": 1,
+            }),
+            "codex_web_search_event" => json!({
+                "item_id": "web-1",
+                "tool_name": "web_search",
+                "terminal_status": "completed",
+                "failure_kind": null,
+                "execution_duration_ms": null,
+                "web_search_action": "search",
+                "query_present": true,
+                "query_count": 2,
+            }),
+            "codex_image_generation_event" => json!({
+                "item_id": "image-1",
+                "tool_name": "image_generation",
+                "terminal_status": "completed",
+                "failure_kind": null,
+                "execution_duration_ms": null,
+                "revised_prompt_present": true,
+                "saved_path_present": true,
+            }),
+            other => panic!("unexpected tool item event type: {other}"),
+        };
+        for (field, expected) in expected_params.as_object().expect("expected params") {
+            assert_eq!(
+                &event["event_params"][field.as_str()],
+                expected,
+                "{context}: {field}"
+            );
+        }
     }
 }
 
@@ -2774,6 +2881,7 @@ async fn command_execution_approval_response_publishes_user_review_event() {
     assert_eq!(payload[0]["event_params"]["reviewer"], "user");
     assert_eq!(payload[0]["event_params"]["trigger"], "initial");
     assert_eq!(payload[0]["event_params"]["status"], "approved");
+    assert_eq!(payload[0]["event_params"]["resolution"], "none");
     assert_eq!(payload[0]["event_params"]["started_at_ms"], 1_000);
     assert_eq!(payload[0]["event_params"]["completed_at_ms"], 1_042);
     assert_eq!(payload[0]["event_params"]["duration_ms"], 42);
@@ -3593,11 +3701,22 @@ async fn reducer_ingests_skill_invoked_fact() {
     let mut events = Vec::new();
     let tracking = test_tracking_context("thread-1", "turn-1");
     let skill_path = PathBuf::from("/Users/abc/.codex/skills/doc/SKILL.md");
-    let expected_skill_id = skill_id_for_local_skill(
-        /*repo_url*/ None,
-        /*repo_root*/ None,
-        skill_path.as_path(),
-        "doc",
+    // Derived from the id rule, sha1("personal_<absolute path>_<skill name>"), not from the
+    // helper the reducer calls, so a change to the rule cannot move the expectation with it.
+    let expected_skill_id = {
+        let raw_id = format!("personal_{}_doc", expected_absolute_path(&skill_path));
+        let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
+        sha1::Digest::update(&mut hasher, raw_id.as_bytes());
+        format!("{:x}", sha1::Digest::finalize(hasher))
+    };
+    assert_eq!(
+        skill_id_for_local_skill(
+            /*repo_url*/ None,
+            /*repo_root*/ None,
+            skill_path.as_path(),
+            "doc",
+        ),
+        expected_skill_id
     );
 
     reducer
@@ -4425,6 +4544,42 @@ async fn turn_lifecycle_emits_turn_event() {
     assert!(payload["event_params"].get("product_client_id").is_none());
     assert_eq!(payload["event_params"]["ephemeral"], json!(false));
     assert_eq!(payload["event_params"]["workspace_kind"], json!(null));
+    assert_eq!(payload["event_params"]["submission_type"], json!(null));
+    assert_eq!(payload["event_params"]["thread_source"], json!("user"));
+    assert_eq!(payload["event_params"]["initialization_mode"], json!("new"));
+    assert_eq!(payload["event_params"]["model"], json!("gpt-5"));
+    assert_eq!(payload["event_params"]["model_provider"], json!("openai"));
+    assert_eq!(payload["event_params"]["sandbox_policy"], json!("read_only"));
+    assert_eq!(payload["event_params"]["reasoning_effort"], json!(null));
+    assert_eq!(payload["event_params"]["reasoning_summary"], json!(null));
+    assert_eq!(payload["event_params"]["service_tier"], json!("default"));
+    assert_eq!(
+        payload["event_params"]["approval_policy"],
+        json!("on-request")
+    );
+    assert_eq!(
+        payload["event_params"]["sandbox_network_access"],
+        json!(true)
+    );
+    assert_eq!(payload["event_params"]["collaboration_mode"], json!("plan"));
+    assert_eq!(payload["event_params"]["personality"], json!(null));
+    assert_eq!(payload["event_params"]["is_first_turn"], json!(true));
+    assert_eq!(
+        payload["event_params"]["before_first_sampling_ms"],
+        json!(100)
+    );
+    assert_eq!(payload["event_params"]["sampling_ms"], json!(700));
+    assert_eq!(
+        payload["event_params"]["between_sampling_overhead_ms"],
+        json!(50)
+    );
+    assert_eq!(payload["event_params"]["tool_blocking_ms"], json!(250));
+    assert_eq!(
+        payload["event_params"]["after_last_sampling_ms"],
+        json!(134)
+    );
+    assert_eq!(payload["event_params"]["sampling_request_count"], json!(2));
+    assert_eq!(payload["event_params"]["sampling_retry_count"], json!(1));
     assert_eq!(payload["event_params"]["num_input_images"], json!(1));
     assert_eq!(payload["event_params"]["status"], json!("completed"));
     assert_eq!(payload["event_params"]["steer_count"], json!(0));

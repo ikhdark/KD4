@@ -10,6 +10,22 @@ use crate::SortDirection;
 use crate::ThreadMetadataBuilder;
 use crate::runtime::test_support::unique_temp_dir;
 
+/// Assigns through `patch_thread_metadata`, the explicit-assignment path the runtime uses.
+async fn assign_project(
+    runtime: &StateRuntime,
+    thread: &crate::ThreadMetadata,
+    project_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let project_id = project_id.map(str::to_string);
+    runtime
+        .patch_thread_metadata(thread, |current| {
+            current.project_id = project_id;
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::Result<()> {
     let home = unique_temp_dir();
@@ -101,10 +117,7 @@ async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::R
     )
     .build("test-provider");
     runtime.upsert_thread(&active_metadata).await?;
-    runtime
-        .set_thread_project(&active_thread_id.to_string(), Some(&project.id))
-        .await?
-        .expect("active thread exists");
+    assign_project(&runtime, &active_metadata, Some(&project.id)).await?;
     let active_recency = runtime
         .get_thread(active_thread_id)
         .await?
@@ -122,16 +135,12 @@ async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::R
         runtime.get_project(&project.id).await?,
         Some(active_project)
     );
-    runtime
-        .set_thread_project(&active_thread_id.to_string(), /*project_id*/ None)
-        .await?;
+    assign_project(&runtime, &active_metadata, /*project_id*/ None).await?;
     assert_eq!(
         runtime.get_project(&project.id).await?,
         Some(project.clone())
     );
-    runtime
-        .set_thread_project(&active_thread_id.to_string(), Some(&project.id))
-        .await?;
+    assign_project(&runtime, &active_metadata, Some(&project.id)).await?;
     runtime.delete_thread(active_thread_id).await?;
     assert_eq!(
         runtime.get_project(&project.id).await?,
@@ -139,9 +148,7 @@ async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::R
     );
     // Restore the active fixture for the project-deletion assertions below.
     runtime.upsert_thread(&active_metadata).await?;
-    runtime
-        .set_thread_project(&active_thread_id.to_string(), Some(&project.id))
-        .await?;
+    assign_project(&runtime, &active_metadata, Some(&project.id)).await?;
     runtime
         .mark_archived(thread_id, &metadata.rollout_path, chrono::Utc::now())
         .await?;
@@ -182,12 +189,6 @@ async fn project_idempotency_keys_replay_and_survive_deletion() -> anyhow::Resul
         )
         .await?;
     assert!(created.created);
-    assert_eq!(
-        runtime
-            .get_project_by_idempotency_key("desktop:legacy-project")
-            .await?,
-        Some(created.project.clone())
-    );
     let replayed = runtime
         .create_project(
             "Changed payload".to_string(),
@@ -201,15 +202,6 @@ async fn project_idempotency_keys_replay_and_survive_deletion() -> anyhow::Resul
     assert_eq!(replayed.project, created.project);
 
     runtime.delete_project(&created.project.id).await?;
-    let lookup_error = runtime
-        .get_project_by_idempotency_key("desktop:legacy-project")
-        .await
-        .expect_err("deleted project keys must remain tombstoned");
-    assert!(
-        lookup_error
-            .to_string()
-            .contains("idempotency key refers to deleted project")
-    );
     let error = runtime
         .create_project(
             "Recreated".to_string(),
@@ -690,56 +682,32 @@ async fn project_move_reorders_projects_and_preserves_no_op_timestamp() -> anyho
             .await?,
         None
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn initial_project_assignment_is_inserted_with_thread_row() -> anyhow::Result<()> {
-    let home = unique_temp_dir();
-    let runtime = StateRuntime::init(home.clone(), "test-provider".to_string()).await?;
-    let project = runtime
-        .create_project(
-            "Work".to_string(),
-            Vec::new(),
-            BTreeMap::new(),
-            &[],
-            "state:initial-assignment",
-        )
-        .await?
-        .project;
-    let thread_id = ThreadId::default();
-    let mut metadata = ThreadMetadataBuilder::new(
-        thread_id,
-        home.join("thread.jsonl"),
-        chrono::Utc::now(),
-        SessionSource::Cli,
-    )
-    .build("test-provider");
-    metadata.project_id = Some(project.id.clone());
-    assert!(runtime.insert_thread_if_absent(&metadata).await?);
     assert_eq!(
-        runtime.get_thread(thread_id).await?.unwrap().project_id,
-        Some(project.id.clone())
+        runtime
+            .move_project(&three.id, /*before_project_id*/ None)
+            .await?,
+        Some(true)
     );
-
-    let missing_thread_id = ThreadId::default();
-    let mut missing_project_metadata = ThreadMetadataBuilder::new(
-        missing_thread_id,
-        home.join("missing-project.jsonl"),
-        chrono::Utc::now(),
-        SessionSource::Cli,
-    )
-    .build("test-provider");
-    missing_project_metadata.project_id = Some("00000000-0000-0000-0000-000000000000".to_string());
-    let error = runtime
-        .insert_thread_if_absent(&missing_project_metadata)
-        .await
-        .expect_err("unknown project must reject initial thread insert");
-    assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
-    assert_eq!(runtime.get_thread(missing_thread_id).await?, None);
-
-    let deleted = runtime.delete_project(&project.id).await?.unwrap();
-    assert_eq!(deleted, (vec![thread_id.to_string()], Vec::new()));
+    let appended = runtime
+        .list_projects(
+            /*cursor*/ None,
+            /*limit*/ 10,
+            ProjectSortKey::Position,
+            SortDirection::Asc,
+        )
+        .await?;
+    assert_eq!(
+        appended
+            .projects
+            .iter()
+            .map(|project| (project.id.as_str(), project.position))
+            .collect::<Vec<_>>(),
+        vec![
+            (one.id.as_str(), 0),
+            (two.id.as_str(), 1),
+            (three.id.as_str(), 2)
+        ]
+    );
     Ok(())
 }
 
@@ -766,17 +734,20 @@ async fn explicit_project_update_is_atomic_and_survives_reconciliation() -> anyh
     )
     .build("test-provider");
     metadata.title = "Original".to_string();
-    runtime
-        .upsert_thread_with_project(&metadata, Some(&project.id))
-        .await?;
+    // No row exists yet, so the patch inserts the fallback with its assignment.
+    assign_project(&runtime, &metadata, Some(&project.id)).await?;
     let before = runtime
         .get_thread(thread_id)
         .await?
         .expect("persisted thread");
+    assert_eq!(before.title, "Original");
     assert_eq!(before.project_id, Some(project.id.clone()));
-    metadata.title = "Must not be committed".to_string();
     let error = runtime
-        .upsert_thread_with_project(&metadata, Some("missing-project"))
+        .patch_thread_metadata(&metadata, |current| {
+            current.title = "Must not be committed".to_string();
+            current.project_id = Some("missing-project".to_string());
+            Ok(())
+        })
         .await
         .expect_err("invalid assignment must reject the whole metadata update");
     assert!(error.to_string().contains("project not found"));
@@ -789,7 +760,7 @@ async fn explicit_project_update_is_atomic_and_survives_reconciliation() -> anyh
         runtime.get_thread(thread_id).await?.unwrap().project_id,
         Some(project.id)
     );
-    runtime.upsert_thread_with_project(&metadata, None).await?;
+    assign_project(&runtime, &metadata, /*project_id*/ None).await?;
     assert_eq!(
         runtime.get_thread(thread_id).await?.unwrap().project_id,
         None

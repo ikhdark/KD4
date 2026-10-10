@@ -11,7 +11,6 @@
 //! that does not overlap reserved bottom-pane space. It does not persist pet
 //! selection or decide when modal/popover UI should suppress the sprite.
 
-#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -299,18 +298,42 @@ impl AmbientPet {
                 .saturating_sub(notification.kind.lifetime());
         }
         let animation_name = self
-            .visible_notification(Instant::now())
+            .visible_notification(now)
             .map_or("idle", |notification| notification.kind.animation_name());
-        let animation = self
+        let (mut animation_name, mut animation) = self
             .pet
             .animations
-            .get(animation_name)
-            .or_else(|| self.pet.animations.get("idle"))?;
-        if animation.loop_start.is_none()
-            && elapsed >= animation.total_duration()
-            && let Some(fallback) = self.pet.animations.get(&animation.fallback)
-        {
-            return Some((fallback, elapsed - animation.total_duration()));
+            .get_key_value(animation_name)
+            .or_else(|| self.pet.animations.get_key_value("idle"))?;
+        let mut visited = HashMap::new();
+        while animation.loop_start.is_none() {
+            let duration = animation.total_duration();
+            if elapsed < duration || duration.is_zero() {
+                break;
+            }
+            if let Some(previous_elapsed) = visited.insert(animation_name.as_str(), elapsed) {
+                // Skip whole fallback cycles instead of traversing once per elapsed
+                // period. Subtraction avoids overflowing a sum of track durations.
+                let cycle = previous_elapsed.saturating_sub(elapsed);
+                if cycle.is_zero() {
+                    break;
+                }
+                let nanos = elapsed.as_nanos() % cycle.as_nanos();
+                elapsed = Duration::new(
+                    (nanos / 1_000_000_000) as u64,
+                    (nanos % 1_000_000_000) as u32,
+                );
+                visited.clear();
+                continue;
+            }
+            let Some((fallback_name, fallback)) =
+                self.pet.animations.get_key_value(&animation.fallback)
+            else {
+                break;
+            };
+            elapsed -= duration;
+            animation_name = fallback_name;
+            animation = fallback;
         }
         Some((animation, elapsed))
     }
@@ -528,6 +551,78 @@ mod tests {
         assert_eq!(request.frame, PathBuf::from("frame-0.png"));
         let delay = pet.next_frame_delay().unwrap();
         assert!(delay > Duration::from_secs(1) && delay <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn chained_one_shots_reach_idle_and_schedule_its_next_frame() {
+        let mut pet = test_ambient_pet(FrameRequester::test_dummy(), true);
+        let primary = Animation {
+            frames: vec![AnimationFrame {
+                sprite_index: 1,
+                duration: Duration::from_secs(20),
+            }],
+            loop_start: None,
+            fallback: "transition".to_string(),
+        };
+        let transition = Animation {
+            fallback: "idle".to_string(),
+            ..primary.clone()
+        };
+        let mut idle = test_animation();
+        for frame in &mut idle.frames {
+            frame.duration = Duration::from_secs(30);
+        }
+        pet.pet.animations.insert("running".to_string(), primary);
+        pet.pet.animations.insert("transition".to_string(), transition);
+        pet.pet.animations.insert("idle".to_string(), idle);
+        pet.set_notification(PetNotificationKind::Running, None);
+        pet.animation_started_at = Instant::now() - Duration::from_secs(45);
+        assert_eq!(
+            pet.draw_request(Rect::new(0, 0, 80, 30), 29).unwrap().frame,
+            PathBuf::from("frame-0.png")
+        );
+        let delay = pet.next_frame_delay().unwrap();
+        assert!(delay > Duration::from_secs(24) && delay <= Duration::from_secs(25));
+    }
+
+    #[test]
+    fn one_shot_fallback_cycles_skip_elapsed_periods() {
+        for self_cycle in [true, false] {
+            let mut pet = test_ambient_pet(FrameRequester::test_dummy(), true);
+            let mut idle = test_animation();
+            idle.loop_start = None;
+            for frame in &mut idle.frames {
+                frame.duration = Duration::from_secs(20);
+            }
+            if !self_cycle {
+                idle.frames.truncate(1);
+                idle.fallback = "transition".to_string();
+                pet.pet.animations.insert(
+                    "transition".to_string(),
+                    Animation {
+                        frames: vec![AnimationFrame {
+                            sprite_index: 1,
+                            duration: Duration::from_secs(20),
+                        }],
+                        loop_start: None,
+                        fallback: "idle".to_string(),
+                    },
+                );
+            }
+            pet.pet.animations.insert("idle".to_string(), idle);
+            // Both cycles last 40 seconds; the remainder is five seconds.
+            let now = Instant::now();
+            pet.animation_started_at = now
+                .checked_sub(Duration::from_secs(1_000_005))
+                .unwrap_or_else(|| now - Duration::from_secs(85));
+            assert_eq!(
+                pet.draw_request(Rect::new(0, 0, 80, 30), 29).unwrap().frame,
+                PathBuf::from("frame-0.png"),
+                "self cycle: {self_cycle}"
+            );
+            let delay = pet.next_frame_delay().unwrap();
+            assert!(delay > Duration::from_secs(14) && delay <= Duration::from_secs(15));
+        }
     }
 
     #[test]

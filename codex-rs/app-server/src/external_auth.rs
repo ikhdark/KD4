@@ -124,6 +124,7 @@ mod tests {
             }
             let bridge =
                 ExternalAuthBridge::new(outgoing.clone(), CodexAuth::from_api_key("original"));
+            let started = tokio::time::Instant::now();
             let mut refresh = Box::pin(bridge.refresh(ExternalAuthRefreshContext {
                 reason: ExternalAuthRefreshReason::Unauthorized,
                 previous_account_id: None,
@@ -143,6 +144,12 @@ mod tests {
             assert_eq!(
                 refresh.await.expect_err("refresh deadline").to_string(),
                 "auth refresh request timed out after 10s"
+            );
+            // Awaiting on a paused clock jumps to whichever timer is next, so
+            // the deadline is only proven by how much virtual time has passed.
+            assert!(
+                started.elapsed() < EXTERNAL_AUTH_REFRESH_TIMEOUT + Duration::from_secs(1),
+                "deadline restarted after delivery; saturated={saturated}"
             );
             assert_eq!(outgoing.pending_callback_count().await, 0);
             rx.recv().await.expect("delivered request");

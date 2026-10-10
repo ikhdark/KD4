@@ -274,6 +274,42 @@ def test_notification_bytes_are_bounded_and_consumption_releases_budget() -> Non
     assert router.next_global_notification(0) == notification
 
 
+def test_notification_item_budget_is_shared_across_routes() -> None:
+    # Six independently usable routes still share one configured item limit.
+    router = MessageRouter(max_notifications=6)
+    router.register_turn("turn")
+    router.register_login("login")
+    goal = router.register_goal("thread")
+    notifications = [
+        event(),
+        event(turnId="early-turn"),
+        event(turnId="turn"),
+        event("account/login/completed", loginId="early-login"),
+        event("account/login/completed", loginId="login"),
+        event(turnId="goal-turn", threadId="thread"),
+    ]
+    for notification in notifications:
+        router.route_notification(notification)
+    with pytest.raises(CodexError, match="buffer limit"):
+        router.route_notification(event(turnId="another-turn"))
+    assert router._budget.items == 6
+
+    # Refusal must not evict another route, and consumption frees shared capacity.
+    router.register_turn("early-turn")
+    router.register_login("early-login")
+    assert [
+        router.next_global_notification(0),
+        router.next_turn_notification("early-turn", 0),
+        router.next_turn_notification("turn", 0),
+        router.next_login_notification("early-login", 0),
+        router.next_login_notification("login", 0),
+        goal.next_notification(0),
+    ] == notifications
+    assert router._budget.items == router._budget.bytes == 0
+    router.route_notification(notifications[0])
+    assert router.next_global_notification(0) == notifications[0]
+
+
 def test_early_replay_transfers_budget_without_duplicate_charges() -> None:
     router = MessageRouter(max_notifications=1)
     notification = event(turnId="turn")
@@ -345,6 +381,54 @@ def test_failure_wakes_all_consumers_even_with_full_buffer() -> None:
         thread.join(1)
         assert not thread.is_alive()
     assert outcomes == [failure] * 3
+
+
+def test_failure_wakes_already_blocked_consumers_with_full_shared_budget(monkeypatch) -> None:
+    budget = _BufferBudget(max_items=1)
+    full_queue = _NotificationQueue(budget)
+    full_queue.put(event())
+    notifications = _NotificationQueue(budget)
+    failure = TransportClosedError("closed")
+    waiting = threading.Event()
+    waiting_threads = set()
+    original_wait = notifications._condition.wait
+    outcomes = []
+
+    def observed_wait(timeout=None):
+        # Called under the queue condition, so fail() cannot race the last wait.
+        waiting_threads.add(threading.get_ident())
+        if len(waiting_threads) == 3:
+            waiting.set()
+        return original_wait(timeout)
+
+    def receive():
+        try:
+            notifications.get()
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    monkeypatch.setattr(notifications._condition, "wait", observed_wait)
+    threads = [threading.Thread(target=receive, daemon=True) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    try:
+        assert waiting.wait(2), "consumers did not block before failure"
+        assert budget.items == 1
+        notifications.fail(failure)
+        for thread in threads:
+            thread.join(1)
+            assert not thread.is_alive()
+        assert outcomes == [failure] * 3
+        assert budget.items == 1, "failing another queue must not release this queue's item"
+    finally:
+        # Even a missing notify_all regression must not leave test workers behind.
+        notifications.fail(failure)
+        with notifications._condition:
+            notifications._condition.notify_all()
+        for thread in threads:
+            thread.join(1)
+        full_queue.fail(failure)
+    assert budget.items == budget.bytes == 0
 
 
 def test_abandoned_queue_returns_its_shared_budget() -> None:
@@ -697,12 +781,19 @@ def test_async_worker_handoff_cannot_extend_operation_deadline() -> None:
                     finished.set()
 
         client._worker_slots = DelayedRelease()
+        operation = asyncio.create_task(client._call_sync(lambda: "completed"))
         try:
+            # The watchdog must not supply the TimeoutError this test expects.
+            done, _ = await asyncio.wait({operation}, timeout=0.5)
+            assert operation in done, "SDK operation exceeded its delivery deadline"
             with pytest.raises(TimeoutError):
-                await asyncio.wait_for(client._call_sync(lambda: "completed"), 0.5)
+                await operation
         finally:
             release.set()
-        assert await asyncio.to_thread(finished.wait, 1)
+            assert await asyncio.to_thread(finished.wait, 1)
+            if not operation.done():
+                operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
 
     asyncio.run(scenario())
 

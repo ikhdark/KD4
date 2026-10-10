@@ -391,6 +391,7 @@ mod tests {
     #[tokio::test]
     async fn request_duration_excludes_the_response_telemetry_callback() {
         struct SlowTelemetry {
+            callback_started: Mutex<Option<Instant>>,
             callback_duration: Mutex<Duration>,
             request_duration: Mutex<Option<Duration>>,
         }
@@ -399,6 +400,7 @@ mod tests {
             fn on_transport_phase(&self, _attempt: u64, observation: TransportPhaseObservation) {
                 if observation.phase == TransportPhase::ResponseHeaders {
                     let start = Instant::now();
+                    *self.callback_started.lock().unwrap() = Some(start);
                     std::thread::sleep(Duration::from_millis(50));
                     *self.callback_duration.lock().unwrap() = start.elapsed();
                 }
@@ -416,9 +418,11 @@ mod tests {
         }
 
         let recorder = Arc::new(SlowTelemetry {
+            callback_started: Mutex::new(None),
             callback_duration: Mutex::new(Duration::ZERO),
             request_duration: Mutex::new(None),
         });
+        let started = Instant::now();
         let result = run_with_request_telemetry_non_idempotent(
             RetryPolicy {
                 max_retries: 0,
@@ -447,8 +451,13 @@ mod tests {
             .lock()
             .unwrap()
             .expect("request timing");
+        let callback_started = recorder.callback_started.lock().unwrap().expect("callback timing");
+        let callback_duration = *recorder.callback_duration.lock().unwrap();
+        assert!(callback_duration >= Duration::from_millis(50));
+        // The request measurement must fit entirely before the response callback,
+        // regardless of how long the request task was descheduled.
         assert!(
-            measured < *recorder.callback_duration.lock().unwrap(),
+            measured <= callback_started.duration_since(started),
             "request duration included the telemetry callback: {measured:?}",
         );
     }

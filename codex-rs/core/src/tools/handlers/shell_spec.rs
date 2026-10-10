@@ -358,7 +358,17 @@ pub(crate) fn create_shell_command_tool_for_policy(
                 u64::MAX,
             ),
         ),
-        ("stall_timeout_ms".to_string(), stall_timeout_schema()),
+        (
+            "stall_timeout_ms".to_string(),
+            bounded_integer(
+                format!(
+                    "Maximum time without stdout or stderr before cancelling the command. Defaults to {} ms. Set zero to disable this silence timeout; timeout_ms still applies. This native route does not return a resumable session; use exec_command for a non-terminating stall observation.",
+                    crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
+                ),
+                0,
+                u64::MAX,
+            ),
+        ),
     ]);
     if options.allow_login_shell {
         properties.insert(

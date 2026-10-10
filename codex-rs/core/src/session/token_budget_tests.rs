@@ -83,6 +83,20 @@ async fn reminders_are_opt_in_and_once_per_window() {
     assert!(history_text(session.clone_history().await.raw_items()).contains("remaining 5"));
 }
 
+#[test]
+fn recovery_tools_require_both_notes_and_history() {
+    let tools = crate::session::tests::token_budget_recovery_tool_stubs();
+    assert!(recovery_tools_registered(&tools));
+    assert!(!recovery_tools_registered(&[]));
+    for tool in &tools {
+        assert!(!recovery_tools_registered(&[Arc::clone(tool)]));
+        assert!(!recovery_tools_registered(&[
+            Arc::clone(tool),
+            Arc::clone(tool),
+        ]));
+    }
+}
+
 #[tokio::test]
 async fn recovery_prompts_require_recovery_tools() {
     for recovery_tools in [false, true] {
@@ -156,7 +170,8 @@ async fn fresh_window_preserves_environment_and_cancellation_preserves_history()
     maybe_record(&session, &turn, Some(0), true).await.unwrap();
     let history_before = session.clone_history().await.raw_items().to_vec();
     let ids_before = session.state.lock().await.auto_compact_window_ids();
-    let cwd_before = turn.cwd().clone();
+    // The old window never held an environment block, so only the rebuild can supply one.
+    assert!(!history_text(&history_before).contains("<environment_context>"));
     session.request_new_context_window().await;
     let cancelled = CancellationToken::new();
     cancelled.cancel();
@@ -185,8 +200,15 @@ async fn fresh_window_preserves_environment_and_cancellation_preserves_history()
     assert_eq!(ids_after.first_window_id, ids_before.first_window_id);
     assert_eq!(ids_after.previous_window_id, Some(ids_before.window_id));
     assert!(!session.new_context_window_requested().await);
-    assert_eq!(turn.cwd(), &cwd_before);
     let text = history_text(session.clone_history().await.raw_items());
+    let environment_cwd = step.environments.turn_environments[0]
+        .cwd()
+        .inferred_native_path_string();
+    assert!(
+        text.contains("<environment_context>")
+            && text.contains(&format!("<cwd>{environment_cwd}</cwd>")),
+        "{text}"
+    );
     assert!(!text.contains("save notes now"));
     assert!(text.contains("Current accepted request: do not modify X."));
     assert!(text.contains(&format!(

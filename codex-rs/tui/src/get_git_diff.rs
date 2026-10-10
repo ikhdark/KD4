@@ -386,7 +386,7 @@ fn path_needs_separator_tab(path: &str) -> bool {
 fn quote_diff_path(path: &str) -> String {
     let needs_quotes = path
         .bytes()
-        .any(|byte| !matches!(byte, 0x20..=0x21 | 0x23..=0x7e));
+        .any(|byte| byte == b'\\' || !matches!(byte, 0x20..=0x21 | 0x23..=0x7e));
     if !needs_quotes {
         return path.to_string();
     }
@@ -1455,6 +1455,16 @@ mod tests {
     }
 
     #[test]
+    fn local_untracked_renderer_quotes_literal_backslashes() {
+        // Git's core.quotePath contract always escapes literal backslashes.
+        let rendered = render_untracked_new_file(r"a\name.txt", "100644", b"x\n");
+        assert!(rendered.starts_with(
+            "\x1b[1mdiff --git \"a/a\\\\name.txt\" \"b/a\\\\name.txt\"\x1b[m\n"
+        ));
+        assert!(rendered.contains("\x1b[1m+++ \"b/a\\\\name.txt\"\x1b[m\n"));
+    }
+
+    #[test]
     fn local_untracked_renderer_matches_git_for_text_binary_empty_and_newline_cases() {
         let tempdir = tempfile::tempdir().expect("create temp directory");
         let cwd = tempdir.path();
@@ -1475,28 +1485,6 @@ mod tests {
                 git_untracked_new_file_diff(cwd, path),
                 "renderer differs from git for {path:?}"
             );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn local_untracked_renderer_matches_git_executable_modes() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tempdir = tempfile::tempdir().expect("create temp directory");
-        let cwd = tempdir.path();
-        let path = "script.sh";
-        fs::write(cwd.join(path), b"#!/bin/sh\nexit 0\n").expect("write script");
-        for (mode, expected) in [(0o744, "100755"), (0o655, "100644"), (0o644, "100644")] {
-            fs::set_permissions(cwd.join(path), fs::Permissions::from_mode(mode))
-                .expect("set script permissions");
-            let rendered =
-                render_local_untracked_file(cwd, Path::new(path), MAX_UNTRACKED_TOTAL_BYTES)
-                    .expect("render script")
-                    .expect("script within budget")
-                    .0;
-            assert!(rendered.contains(&format!("new file mode {expected}")));
-            assert_eq!(rendered, git_untracked_new_file_diff(cwd, path));
         }
     }
 

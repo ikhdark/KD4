@@ -86,6 +86,26 @@ pub(crate) fn read_only_sandbox(readable_root: std::path::PathBuf) -> FileSystem
     }])
 }
 
+pub(crate) fn read_only_sandbox_with_denied(
+    readable_root: std::path::PathBuf,
+    denied: std::path::PathBuf,
+) -> FileSystemSandboxContext {
+    sandbox_context(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: absolute_path(readable_root),
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: absolute_path(denied),
+            },
+            access: FileSystemAccessMode::Deny,
+        },
+    ])
+}
+
 pub(crate) fn workspace_write_sandbox(
     writable_root: std::path::PathBuf,
 ) -> FileSystemSandboxContext {

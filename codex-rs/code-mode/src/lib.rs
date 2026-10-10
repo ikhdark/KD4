@@ -14,5 +14,3 @@ pub use service::FallbackCodeModeSessionProvider;
 pub use service::InProcessCodeModeSession;
 pub use service::InProcessCodeModeSessionProvider;
 pub use service::NoopCodeModeSessionDelegate;
-pub use v8_init::V8JitMode;
-pub use v8_init::initialize_v8;

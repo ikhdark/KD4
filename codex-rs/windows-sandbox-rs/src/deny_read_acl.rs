@@ -123,18 +123,19 @@ mod tests {
     #[test]
     fn plan_includes_existing_canonical_targets() {
         let tmp = TempDir::new().expect("tempdir");
-        let existing = tmp.path().join("secret.env");
-        std::fs::write(&existing, "secret").expect("write secret");
+        std::fs::create_dir(tmp.path().join("nested")).expect("create nested dir");
+        std::fs::write(tmp.path().join("secret.env"), "secret").expect("write secret");
+        // A `..` spelling keeps the lexical entry distinct from its canonical target.
+        let existing = tmp.path().join("nested").join("..").join("secret.env");
+        let canonical = dunce::canonicalize(tmp.path())
+            .expect("canonical tempdir")
+            .join("secret.env");
+        assert_ne!(existing, canonical);
 
         let planned: HashSet<PathBuf> = plan_deny_read_acl_paths(std::slice::from_ref(&existing))
             .into_iter()
             .collect();
-        let expected: HashSet<PathBuf> = [
-            existing.clone(),
-            dunce::canonicalize(&existing).expect("canonical path"),
-        ]
-        .into_iter()
-        .collect();
+        let expected: HashSet<PathBuf> = [existing, canonical].into_iter().collect();
 
         assert_eq!(planned, expected);
     }

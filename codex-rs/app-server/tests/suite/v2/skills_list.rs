@@ -126,46 +126,6 @@ async fn expect_skills_changed_notification(
     Ok(())
 }
 
-fn write_plugin_with_skill(
-    repo_root: &std::path::Path,
-    plugin_name: &str,
-    skill_name: &str,
-) -> Result<()> {
-    std::fs::create_dir_all(repo_root.join(".git"))?;
-    std::fs::create_dir_all(repo_root.join(".agents/plugins"))?;
-    std::fs::write(
-        repo_root.join(".agents/plugins/marketplace.json"),
-        format!(
-            r#"{{
-  "name": "local-marketplace",
-  "plugins": [
-    {{
-      "name": "{plugin_name}",
-      "source": {{
-        "source": "local",
-        "path": "./{plugin_name}"
-      }}
-    }}
-  ]
-}}"#
-        ),
-    )?;
-
-    let plugin_root = repo_root.join(plugin_name);
-    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
-    std::fs::write(
-        plugin_root.join(".codex-plugin/plugin.json"),
-        format!(r#"{{"name":"{plugin_name}"}}"#),
-    )?;
-
-    let skill_dir = plugin_root.join("skills").join(skill_name);
-    std::fs::create_dir_all(&skill_dir)?;
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        format!("---\nname: {skill_name}\ndescription: {skill_name} description\n---\n\n# Body\n"),
-    )?;
-    Ok(())
-}
 
 fn write_cached_remote_plugin_with_skill(
     codex_home: &std::path::Path,
@@ -497,10 +457,22 @@ async fn skills_list_excludes_plugin_skills_when_workspace_codex_plugins_disable
     let repo_root = TempDir::new()?;
     let server = MockServer::start().await;
     write_skill(&codex_home, "home-skill")?;
-    write_plugin_with_skill(repo_root.path(), "demo-plugin", "plugin-skill")?;
-    write_plugins_enabled_config_with_base_url(
-        codex_home.path(),
-        &format!("{}/backend-api/", server.uri()),
+    write_cached_local_curated_plugin_with_skill(codex_home.path())?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"chatgpt_base_url = "{}/backend-api/"
+
+[features]
+plugins = true
+# This fixture installs a local curated plugin, not a remote catalog bundle.
+remote_plugin = false
+
+[plugins."google-calendar@openai-curated"]
+enabled = true
+"#,
+            server.uri()
+        ),
     )?;
     write_chatgpt_auth(
         codex_home.path(),
@@ -511,53 +483,58 @@ async fn skills_list_excludes_plugin_skills_when_workspace_codex_plugins_disable
             .plan_type("team"),
         AuthCredentialsStoreMode::File,
     )?;
-    Mock::given(method("GET"))
-        .and(path("/backend-api/accounts/account-123/settings"))
-        .and(header("authorization", "Bearer chatgpt-token"))
-        .and(header("chatgpt-account-id", "account-123"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"beta_settings":{"enable_plugins":false}}"#),
+    for plugins_enabled in [true, false] {
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/backend-api/accounts/account-123/settings"))
+            .and(header("authorization", "Bearer chatgpt-token"))
+            .and(header("chatgpt-account-id", "account-123"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "beta_settings": { "enable_plugins": plugins_enabled }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .without_managed_config()
+            .build()
+            .await?;
+        timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+        let request_id = mcp
+            .send_skills_list_request(SkillsListParams {
+                cwds: vec![repo_root.path().to_path_buf()],
+                force_reload: true,
+            })
+            .await?;
+
+        let response: JSONRPCResponse = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
         )
-        .mount(&server)
-        .await;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .without_managed_config()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_skills_list_request(SkillsListParams {
-            cwds: vec![repo_root.path().to_path_buf()],
-            force_reload: true,
-        })
-        .await?;
-
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(response)?;
-    assert_eq!(data.len(), 1);
-    assert!(
-        data[0]
-            .skills
-            .iter()
-            .any(|skill| skill.name == "home-skill"),
-        "non-plugin skills should remain available"
-    );
-    assert!(
-        data[0]
-            .skills
-            .iter()
-            .all(|skill| skill.name != "demo-plugin:plugin-skill"),
-        "plugin skills should be hidden when workspace Codex plugins are disabled"
-    );
+        .await??;
+        let SkillsListResponse { data } = to_response(response)?;
+        assert_eq!(data.len(), 1);
+        assert!(
+            data[0]
+                .skills
+                .iter()
+                .any(|skill| skill.name == "home-skill"),
+            "non-plugin skills should remain available"
+        );
+        assert_eq!(
+            data[0]
+                .skills
+                .iter()
+                .any(|skill| skill.name == "google-calendar:meeting-prep"),
+            plugins_enabled,
+            "the installed plugin skill must be visible only when workspace policy allows plugins",
+        );
+    }
     Ok(())
 }
 

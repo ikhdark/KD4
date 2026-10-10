@@ -148,6 +148,8 @@ async fn legacy_fast_metadata_exposes_fast_command() {
 #[tokio::test]
 async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    // An unconfigured session queues every submission, pending compaction or not.
+    chat.thread_id = Some(ThreadId::new());
 
     chat.dispatch_command(SlashCommand::Compact);
 
@@ -167,12 +169,7 @@ async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
     assert!(chat.bottom_pane.is_task_running());
     assert!(chat.input_queue.user_turn_pending_start);
 
-    chat.bottom_pane.set_composer_text(
-        "queued before compact turn start".to_string(),
-        Vec::new(),
-        Vec::new(),
-    );
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    queue_composer_text_with_tab(&mut chat, "queued before compact turn start");
 
     assert!(chat.input_queue.pending_steers.is_empty());
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
@@ -181,6 +178,13 @@ async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
         "queued before compact turn start"
     );
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+
+    // The follow-up waits for the compaction turn instead of racing it.
+    handle_turn_started(&mut chat, "turn-1");
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+    assert!(chat.input_queue.queued_user_messages.is_empty());
 }
 
 #[tokio::test]
@@ -215,7 +219,7 @@ async fn queued_slash_compact_dispatches_after_active_turn() {
 
 #[tokio::test]
 async fn queued_slash_review_with_args_does_not_submit_a_review_turn() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
     handle_turn_started(&mut chat, "turn-1");
 
@@ -224,6 +228,30 @@ async fn queued_slash_review_with_args_does_not_submit_a_review_turn() {
     complete_turn_with_message(&mut chat, "turn-1", Some("done"));
 
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    // The capture command travels as an app event, so an empty op channel alone would also hold
+    // if the inline text had been captured or the command had never been dequeued.
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::CodexOp(Op::BugCreate { .. }))),
+        "inline /review text must not be captured; events: {events:?}"
+    );
+    let rendered = events
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 80)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("`/review` accepts no inline text"),
+        "expected inline-args rejection, got {rendered:?}"
+    );
+    assert!(chat.input_queue.queued_user_messages.is_empty());
 }
 
 #[tokio::test]
@@ -962,7 +990,8 @@ async fn restored_queued_goal_slash_command_emits_set_goal_event() {
     restored_chat.thread_id = Some(thread_id);
     restored_chat.maybe_send_next_queued_input();
 
-    let _ = next_goal_draft(&mut restored_rx, thread_id);
+    let goal = next_goal_draft(&mut restored_rx, thread_id);
+    assert_eq!(goal.objective, "improve benchmark coverage");
     assert_no_submit_op(&mut restored_op_rx);
     assert_eq!(
         restored_chat.bottom_pane.composer_text(),
@@ -1649,6 +1678,8 @@ async fn unavailable_slash_command_is_available_from_local_recall() {
 #[tokio::test]
 async fn removed_memory_command_is_rejected_without_submission() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    // Without a configured session a submission would be queued and never reach `op_rx`.
+    chat.thread_id = Some(ThreadId::new());
 
     submit_composer_text(&mut chat, "/debug-m-drop");
 

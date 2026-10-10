@@ -21,6 +21,10 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
         !rendered.contains("refreshing limits"),
         "expected /status to avoid transient refresh text in terminal history, got: {rendered}"
     );
+    assert!(
+        rendered.contains("refresh requested; run /status again shortly."),
+        "expected /status to tell the user to rerun it while limits load, got: {rendered}"
+    );
     let first_request_id = match rx.try_recv() {
         Ok(AppEvent::RefreshRateLimits {
             origin: RateLimitRefreshOrigin::StatusCommand {
@@ -105,7 +109,7 @@ async fn status_command_renders_native_and_foreign_instruction_sources() {
         "expected /status to show native-relative and environment-native foreign paths, got: {rendered}"
     );
     assert!(
-        !rendered.contains("Agents.md  <none>"),
+        !rendered.contains("<none>"),
         "expected /status to avoid stale <none> when app-server provided instruction sources, got: {rendered}"
     );
 }
@@ -144,6 +148,10 @@ async fn status_command_overlapping_refreshes_update_matching_cells_only() {
     assert!(
         !second_rendered.contains("refreshing limits"),
         "expected /status to avoid transient refresh text in terminal history, got: {second_rendered}"
+    );
+    assert!(
+        second_rendered.contains("refresh requested; run /status again shortly."),
+        "expected /status to tell the user to rerun it while limits load, got: {second_rendered}"
     );
 
     chat.finish_status_rate_limit_refresh(first_request_id, Ok(Vec::new()));

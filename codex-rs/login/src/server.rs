@@ -223,7 +223,7 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
         let shutdown_notify = shutdown_notify.clone();
         let server = server;
         tokio::spawn(async move {
-            let mut callback_result = LoginCallbackResult::default();
+            let mut callback_result: Option<LoginCallbackResult> = None;
             let result = loop {
                 tokio::select! {
                     _ = shutdown_notify.notified() => {
@@ -243,6 +243,7 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                 &pkce,
                                 actual_port,
                                 &state,
+                                callback_result.is_some(),
                             )
                             .await;
 
@@ -252,7 +253,7 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                 None
                             }
                             HandledRequest::RedirectWithHeader { header, result } => {
-                                callback_result = result;
+                                callback_result = Some(result);
                                 let redirect = Response::empty(302).with_header(header);
                                 let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
                                 None
@@ -271,7 +272,9 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                     )
                                 })
                                 .await;
-                                Some(result.map(|()| callback_result))
+                                Some(result.and_then(|()| {
+                                    callback_result.ok_or_else(|| io::Error::other("Login was not completed"))
+                                }))
                             }
                             HandledRequest::RedirectAndExit { header, result } => {
                                 match tokio::task::spawn_blocking(move || {
@@ -343,6 +346,7 @@ async fn process_request(
     pkce: &PkceCodes,
     actual_port: u16,
     state: &str,
+    callback_completed: bool,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
@@ -510,6 +514,13 @@ async fn process_request(
             }
         }
         "/success" => {
+            // This display-only URL is not proof of authentication. Only the validated
+            // callback, after credentials are persisted, may enable local completion.
+            if !callback_completed {
+                return HandledRequest::Response(
+                    Response::from_string("Login was not completed").with_status_code(403),
+                );
+            }
             let use_streamlined_success = parsed_url
                 .query_pairs()
                 .any(|(key, value)| key == "codex_streamlined_login" && value == "true");

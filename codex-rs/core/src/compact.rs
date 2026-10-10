@@ -1461,20 +1461,6 @@ fn retain_latest_task_state_fragment(part: &ContentItem, seen: &mut bool) -> boo
     true
 }
 
-#[cfg(test)]
-pub(crate) fn collect_unresolved_user_messages(
-    items: &[ResponseItem],
-) -> Vec<CompactedUserMessage> {
-    let unresolved = unresolved_compaction_items(items);
-    collect_user_messages(&unresolved)
-}
-
-#[cfg(test)]
-pub(crate) fn collect_unresolved_agent_messages(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    let unresolved = unresolved_compaction_items(items);
-    append_bounded_agent_messages_with_indices(&unresolved, COMPACT_AGENT_MESSAGE_MAX_TOKENS).0
-}
-
 fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
     let mut current = items.to_vec();
     crate::context_manager::retire_expired_turn_advice(&mut current);
@@ -1487,21 +1473,6 @@ fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
         (*index < end || is_compaction_summary_item(item))
             && compaction_call_id(item).is_none_or(|id| !pending_output_ids.contains(id))
     }).map(|(_, item)| item.clone()).collect()
-}
-
-#[cfg(test)]
-fn unresolved_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    let start = unresolved_compaction_start(items);
-    strip_compaction_startup_envelopes(
-        items
-            .iter()
-            .enumerate()
-            .filter(|(index, item)| {
-                *index >= start || crate::session::is_unified_exec_resume_invalidation(item)
-            })
-            .map(|(_, item)| item.clone())
-            .collect::<Vec<_>>(),
-    )
 }
 
 fn unresolved_compaction_start(items: &[ResponseItem]) -> usize {
@@ -1663,32 +1634,6 @@ pub(crate) fn compaction_context_message(text: String) -> ResponseItem {
     item
 }
 
-#[cfg(test)]
-pub(crate) fn build_unresolved_user_history(items: &[ResponseItem]) -> (Vec<ResponseItem>, usize) {
-    let (history, retained_images, _) = build_unresolved_input_checkpoint(items);
-    (history, retained_images)
-}
-
-#[cfg(test)]
-pub(crate) fn build_unresolved_input_checkpoint(
-    items: &[ResponseItem],
-) -> (Vec<ResponseItem>, usize, bool) {
-    let (mut history, retained_image_count, omitted_image_count, omitted_text, _) =
-        build_bounded_unresolved_input_history(items);
-    if omitted_image_count > 0 {
-        history.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: compaction_image_omission_marker(omitted_image_count),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        });
-    }
-    (history, retained_image_count, omitted_text)
-}
-
 /// Preserve the actual user requests and the latest
 /// assistant handoff as well as the unconsumed tail. A model-generated boundary
 /// means input was observed, not that the requested work was completed.
@@ -1761,14 +1706,7 @@ pub(crate) fn build_task_input_checkpoint(
 }
 
 #[cfg(test)]
-fn build_bounded_unresolved_input_history(
-    items: &[ResponseItem],
-) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
-    build_bounded_input_history(unresolved_compaction_items(items), false)
-}
-
-#[cfg(test)]
-fn build_local_task_input_checkpoint(
+pub(crate) fn build_local_task_input_checkpoint(
     items: &[ResponseItem],
 ) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
     // The local summarizer supplies a new handoff; unlike opaque remote compaction,
@@ -2167,19 +2105,6 @@ async fn persist_compaction_recovery(
     // before replacement history can retire the exact source text.
     sess.flush_tool_history_persistence().await?;
     Ok(sidecar)
-}
-
-#[cfg(test)]
-fn compaction_text_recovery_canonical(
-    source_items: &[ResponseItem],
-    omitted_text: bool,
-) -> Option<CanonicalToolResult> {
-    if !omitted_text {
-        return None;
-    }
-    Some(compaction_text_recovery_for_items(
-        unresolved_compaction_items(source_items),
-    ))
 }
 
 fn local_compaction_source_recovery(
@@ -2616,7 +2541,9 @@ async fn drain_to_completed(
     let inference_trace_context = InferenceTraceContext::disabled();
     let stream_result = tokio::select! {
         _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-        result = client_session.stream(
+        result = async {
+            let service_tier = crate::session::turn::service_tier_for_sampling(sess, turn_context).await;
+            client_session.stream(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
@@ -2625,12 +2552,13 @@ async fn drain_to_completed(
                 turn_context.reasoning_effort.clone(),
             ),
             turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
+            service_tier,
             responses_metadata,
             // Rollout tracing currently models remote compaction only; local compaction streams
             // are left untraced until the reducer has a first-class local compaction lifecycle.
             &inference_trace_context,
-        ) => result,
+            ).await
+        } => result,
     };
     drop(model_request_timing_guard);
     let mut stream = stream_result?;

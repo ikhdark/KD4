@@ -369,28 +369,40 @@ pub(super) fn split_server_envelope_for_transport(
     loop {
         let chunk_size = usize::max(1, message_size_bytes.div_ceil(segment_count));
         segment_count = message_size_bytes.div_ceil(chunk_size);
-        let segments = raw
-            .chunks(chunk_size)
-            .enumerate()
-            .map(|(segment_id, chunk)| {
-                build_chunk_envelope(
-                    &envelope,
-                    segment_id,
-                    segment_count,
-                    message_size_bytes,
-                    chunk,
-                )
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let mut segments_fit = true;
-        for segment in &segments {
-            if serialized_len(segment)? > REMOTE_CONTROL_SEGMENT_MAX_BYTES {
-                segments_fit = false;
-                break;
-            }
-        }
-        if segments_fit {
-            return Ok(segments);
+        // All non-final chunks have equal base64 length. Only the decimal
+        // segment id changes their wire size, so check the largest full-chunk
+        // id and the possibly shorter final chunk before allocating the batch.
+        let last_id = segment_count - 1;
+        let full_chunks_fit = segment_count == 1
+            || serialized_chunk_len(
+                &envelope,
+                last_id - 1,
+                segment_count,
+                message_size_bytes,
+                &raw[..chunk_size],
+            )? <= REMOTE_CONTROL_SEGMENT_MAX_BYTES;
+        if full_chunks_fit
+            && serialized_chunk_len(
+                &envelope,
+                last_id,
+                segment_count,
+                message_size_bytes,
+                &raw[last_id * chunk_size..],
+            )? <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
+        {
+            return raw
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(segment_id, chunk)| {
+                    build_chunk_envelope(
+                        &envelope,
+                        segment_id,
+                        segment_count,
+                        message_size_bytes,
+                        chunk,
+                    )
+                })
+                .collect();
         }
         if chunk_size == 1 {
             return Err(io::Error::new(
@@ -401,7 +413,8 @@ pub(super) fn split_server_envelope_for_transport(
         let next_segment_count = segment_count + 1;
         let next_chunk_size = usize::max(1, message_size_bytes.div_ceil(next_segment_count));
         segment_count = if next_chunk_size == chunk_size {
-            message_size_bytes
+            // Skip only the repeated quotient, not all remaining chunk sizes.
+            message_size_bytes.div_ceil(chunk_size - 1)
         } else {
             next_segment_count
         };

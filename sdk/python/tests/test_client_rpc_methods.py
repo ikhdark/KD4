@@ -51,6 +51,8 @@ def test_over_cap_newline_free_stderr_is_drained_on_success() -> None:
         _WRITE_NEWLINE_FREE_STDERR
         + 'sys.stdout.write(\'{"method":"diagnostic/noisy","params":{}}\\n\')\n'
         + "sys.stdout.flush()\n"
+        # Keep EOF from racing delivery; this test checks drainage, not failure.
+        + "sys.stdin.read()\n"
     )
     try:
         client.start()
@@ -390,13 +392,24 @@ def test_stdout_notifications_preserve_typed_and_unknown_payloads(known) -> None
         "reasoningOutputTokens": 0,
         "totalTokens": 3,
     }
+    total_usage = {
+        "cachedInputTokens": 4,
+        "inputTokens": 10,
+        "outputTokens": 8,
+        "reasoningOutputTokens": 3,
+        "totalTokens": 18,
+    }
     message = (
         {
             "method": "thread/tokenUsage/updated",
             "params": {
                 "threadId": "thread-1",
                 "turnId": "turn-1",
-                "tokenUsage": {"last": usage, "total": usage},
+                "tokenUsage": {
+                    "last": usage,
+                    "total": total_usage,
+                    "modelContextWindow": 32768,
+                },
             },
         }
         if known
@@ -418,6 +431,7 @@ def test_stdout_notifications_preserve_typed_and_unknown_payloads(known) -> None
             assert isinstance(event.payload, ThreadTokenUsageUpdatedNotification)
             assert event.payload.turn_id == "turn-1"
             assert event.payload.token_usage.last.total_tokens == 3
+            assert event.payload.model_dump(by_alias=True, exclude_none=True) == message["params"]
         else:
             event = client.next_notification(timeout_s=5)
             assert isinstance(event.payload, UnknownNotification)

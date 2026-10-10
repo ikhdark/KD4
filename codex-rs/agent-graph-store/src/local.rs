@@ -362,6 +362,7 @@ mod tests {
         let closed_great_grandchild_thread_id = thread_id(/*suffix*/ 26);
         let unrelated_parent_thread_id = thread_id(/*suffix*/ 27);
         let unrelated_child_thread_id = thread_id(/*suffix*/ 28);
+        let open_child_below_closed_edge = thread_id(/*suffix*/ 29);
 
         for (parent_thread_id, child_thread_id, status) in [
             (
@@ -399,6 +400,11 @@ mod tests {
                 unrelated_child_thread_id,
                 ThreadSpawnEdgeStatus::Open,
             ),
+            (
+                closed_child_thread_id,
+                open_child_below_closed_edge,
+                ThreadSpawnEdgeStatus::Open,
+            ),
         ] {
             store
                 .upsert_thread_spawn_edge(parent_thread_id, child_thread_id, status)
@@ -419,6 +425,7 @@ mod tests {
                 closed_grandchild_thread_id,
                 open_grandchild_thread_id,
                 closed_great_grandchild_thread_id,
+                open_child_below_closed_edge,
             ]
         );
 

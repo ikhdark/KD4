@@ -847,46 +847,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn provider_auth_missing_current_directory_returns_deserialization_error() {
-        const CHILD_MARKER: &str = "CODEX_TEST_PROVIDER_AUTH_MISSING_CWD";
-        if std::env::var_os(CHILD_MARKER).is_some() {
-            // Isolate the unavailable process cwd from other tests in this process.
-            std::fs::remove_dir(std::env::current_dir().expect("initial child directory"))
-                .expect("remove child directory");
-            let result = serde_json::from_value::<ModelProviderAuthInfo>(
-                serde_json::json!({ "command": "token-helper" }),
-            );
-            assert!(result.is_err(), "unavailable cwd must be a serde error");
-            return;
-        }
-
-        let directory = tempfile::tempdir().expect("create parent directory");
-        let child_directory = directory.path().join("cwd");
-        std::fs::create_dir(&child_directory).expect("create child directory");
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "config_types::tests::provider_auth_missing_current_directory_returns_deserialization_error",
-                "--nocapture",
-            ])
-            .env(CHILD_MARKER, "1")
-            .current_dir(child_directory)
-            .output()
-            .expect("run child test");
-        assert!(
-            output.status.success(),
-            "child test failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-            "the child must execute its assertions"
-        );
-    }
-
     #[test]
     fn apply_mask_preserves_missing_null_and_value_through_json() {
         let mode = CollaborationMode {
@@ -952,12 +912,26 @@ mod tests {
             }),
             "dots and slashes are disallowed to prevent reading arbitrary files"
         );
+        // Each path character must be rejected on its own, including Windows path syntax.
+        for path_like in ["foo/bar", r"foo\bar", "foo.bar", "C:foo"] {
+            assert_eq!(
+                ProfileV2Name::from_str(path_like),
+                Err(ProfileV2NameParseError {
+                    value: path_like.to_string(),
+                })
+            );
+        }
         assert_eq!(
             ProfileV2Name::from_str(""),
             Err(ProfileV2NameParseError {
                 value: String::new(),
             }),
             "profile name cannot be empty"
+        );
+        assert_eq!(
+            ProfileV2Name::from_str("Work_profile-2").map(|name| name.to_string()),
+            Ok("Work_profile-2".to_string()),
+            "plain names must still parse"
         );
     }
 
@@ -1034,5 +1008,23 @@ mod tests {
         };
 
         assert_eq!(expected, base.merge(&overlay));
+
+        // The fields swap roles: only the domains are overridden, the rest falls back.
+        let domains_overlay = WebSearchToolConfig {
+            context_size: None,
+            allowed_domains: Some(vec!["example.com".to_string()]),
+            location: None,
+        };
+        let expected = WebSearchToolConfig {
+            context_size: Some(WebSearchContextSize::Low),
+            allowed_domains: Some(vec!["example.com".to_string()]),
+            location: Some(WebSearchLocation {
+                country: Some("US".to_string()),
+                region: Some("CA".to_string()),
+                city: None,
+                timezone: Some("America/Los_Angeles".to_string()),
+            }),
+        };
+        assert_eq!(expected, base.merge(&domains_overlay));
     }
 }

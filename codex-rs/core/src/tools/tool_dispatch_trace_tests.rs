@@ -7,6 +7,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ToolLifecycleBoundary;
 use codex_protocol::protocol::ToolLifecycleTimerWait;
 use codex_protocol::protocol::ToolLifecycleWakeReason;
+use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_rollout_trace::ToolCallRequester;
@@ -32,17 +33,20 @@ use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::turn_timing::ToolCallTimingLineage;
 use crate::turn_timing::TurnTimingState;
 
 #[test]
 fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
     let turn_timing = Arc::new(TurnTimingState::default());
     turn_timing.mark_turn_started();
-    let timing = ToolDispatchTiming::new_with_turn_clock(
-        Arc::clone(&turn_timing),
-        tokio::time::Instant::now(),
-        false,
-    );
+    // Accepted a minute before the turn clock started: a boundary stamped from
+    // the tool's own instants instead of the turn clock would read >= 60 s.
+    let accepted_at = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("monotonic clock is older than a minute");
+    let timing =
+        ToolDispatchTiming::new_with_turn_clock(Arc::clone(&turn_timing), accepted_at, false);
     timing.mark_first_poll();
     turn_timing.adjust_parallel_gate_waiters(1);
     timing.mark_parallel_gate_admitted();
@@ -59,13 +63,24 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
     assert!(timing.mark_relay_enqueue());
     let execution_id = timing.execution_id().clone();
     assert!(timing.mark_relay_delivery(&execution_id));
-    timing.mark_next_model_sample_start();
 
     let snapshot = timing.snapshot(tokio::time::Instant::now());
     assert!(snapshot.first_poll_at_ms.is_some());
-    let boundaries = snapshot
-        .lifecycle_events
+    // The tool's own timing ends at delivery. The turn appends the next sample
+    // start to the recorded call when it dispatches the following request.
+    turn_timing.record_tool_dispatch_timing(
+        "call-1",
+        "shell_command",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        snapshot.clone(),
+    );
+    turn_timing.mark_model_request_dispatched();
+    let recorded = turn_timing.complete_snapshot().protocol_timing();
+    let boundaries = recorded
+        .tool_calls
         .iter()
+        .flat_map(|call| call.lifecycle_events.iter())
         .map(|event| event.boundary)
         .collect::<Vec<_>>();
     assert_eq!(
@@ -81,6 +96,16 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
             ToolLifecycleBoundary::RelayDelivery,
             ToolLifecycleBoundary::NextModelSampleStart,
         ]
+    );
+    let offsets = recorded
+        .tool_calls
+        .iter()
+        .flat_map(|call| call.lifecycle_events.iter())
+        .map(|event| event.at_ms)
+        .collect::<Vec<_>>();
+    assert!(
+        offsets.iter().all(|at_ms| *at_ms < 60_000),
+        "every boundary is an offset on the turn clock: {offsets:?}"
     );
     assert_eq!(snapshot.retry_count, 1);
     assert_eq!(snapshot.reentry_count, 1);
@@ -515,7 +540,8 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
     session.terminal_tasks.close();
     session.terminal_tasks.wait().await;
 
-    let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
+    let bundle = single_bundle_dir(temp.path())?;
+    let replayed = codex_rollout_trace::replay_bundle(&bundle)?;
     assert_eq!(
         replayed.tool_calls["direct-call"].model_visible_call_id,
         Some("direct-call".to_string()),
@@ -556,6 +582,22 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
             .is_some(),
         "code-mode calls should keep the result returned to JavaScript",
     );
+
+    for (call_id, expected) in [
+        ("direct-call", serde_json::json!({
+            "type": "direct_response",
+            "response_item": {
+                "type": "function_call_output", "call_id": "direct-call", "output": "ok"
+            }
+        })),
+        ("code-mode-call", serde_json::json!({"type": "code_mode_response", "value": "ok"})),
+    ] {
+        let payload_id = replayed.tool_calls[call_id].raw_result_payload_id.as_ref().unwrap();
+        let payload = &replayed.raw_payloads[payload_id];
+        let captured: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join(&payload.path))?)?;
+        assert_eq!(captured, expected, "result bytes for {call_id}");
+    }
 
     Ok(())
 }

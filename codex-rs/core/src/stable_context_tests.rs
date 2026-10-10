@@ -734,16 +734,17 @@ fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history()
 }
 
 #[test]
-fn mixed_stable_and_ordinary_user_message_sets_latest_real_user_boundary() {
+fn trusted_mixed_stable_and_ordinary_message_does_not_move_latest_real_user_boundary() {
     let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
     let usage = "<skills_usage_instructions>\nusage\n</skills_usage_instructions>";
     let selected = skill("a");
+    let current = repository("current");
     let mut mixed = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![
             ContentItem::InputText {
-                text: repository("current"),
+                text: current.clone(),
             },
             ContentItem::InputText {
                 text: "new ordinary task".to_string(),
@@ -765,11 +766,19 @@ fn mixed_stable_and_ordinary_user_message_sets_latest_real_user_boundary() {
         StableContextTarget::Sampling,
     );
 
-    let text = visible_text(&projection.items);
-    assert!(text.contains(&usage));
-    assert!(text.contains(&catalog));
-    assert!(text.contains(&selected.as_str()));
-    assert!(text.contains(&"new ordinary task"));
+    // A trusted item never becomes the real-user boundary, so the volatile
+    // skill stays before "use a" rather than before the ordinary remainder.
+    assert_eq!(
+        visible_text(&projection.items),
+        vec![
+            current.as_str(),
+            usage,
+            catalog,
+            selected.as_str(),
+            "use a",
+            "new ordinary task",
+        ]
+    );
 }
 
 #[test]
@@ -899,13 +908,28 @@ fn base_and_compact_catalog_identities_are_deterministic_without_local_reuse() {
             component.kind == StableContextKind::BaseModel && !component.local_reused
         }));
     }
-    let catalog = first
-        .components()
-        .iter()
-        .find(|component| component.kind == StableContextKind::SkillCatalog)
-        .expect("catalog component");
-    assert!(!catalog.identity.semantic_id.contains("task"));
-    assert!(!catalog.identity.semantic_id.contains("time"));
+    // The catalog identity is not scoped to the turn or the surrounding task.
+    let catalog_identities = [("turn-1", "select"), ("turn-2", "select again")].map(
+        |(turn_id, task)| {
+            project_stable_context(
+                vec![
+                    text_message_for_turn("developer", catalog, turn_id),
+                    text_message_for_turn("user", task, turn_id),
+                    text_message_for_turn("user", &selected, turn_id),
+                ]
+                .into(),
+                StableContextTarget::Sampling,
+            )
+            .manifest
+            .components()
+            .iter()
+            .find(|component| component.kind == StableContextKind::SkillCatalog)
+            .expect("catalog component")
+            .identity
+            .clone()
+        },
+    );
+    assert_eq!(catalog_identities[0], catalog_identities[1]);
 }
 
 #[test]

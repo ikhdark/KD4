@@ -39,6 +39,10 @@ fn error_completion_identity_preserves_producer_attempt_and_full_error() {
         AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(), thread,
         &AgentStatus::Completed(Some("done".into())), None,
     ).unwrap();
+    let hidden_a = make(thread, "/root/worker", None, &format!("{long_error}cause-a{long_error}"));
+    let hidden_b = make(thread, "/root/worker", None, &format!("{long_error}cause-b{long_error}"));
+    assert_eq!(hidden_a.content, hidden_b.content, "the distinct causes must be outside the bounded display");
+    assert_ne!(hidden_a.id, hidden_b.id, "deduplication must use the full error, not its display");
     assert!(success.id.is_none(), "successful follow-ups are not suppressed");
 }
 

@@ -114,11 +114,6 @@ async fn entered_review_mode_uses_request_hint() {
     }
 }
 
-/// Entering review mode renders the current changes banner when requested.
-
-
-
-
 #[tokio::test]
 async fn live_app_server_review_prompt_item_is_not_rendered() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -277,7 +272,7 @@ async fn esc_with_review_queued_steers_shows_warning_and_does_not_interrupt() {
 
     assert!(!chat.input_queue.submit_pending_steers_after_interrupt);
     assert_eq!(chat.input_queue.pending_steers.len(), 1);
-    assert_no_submit_op(&mut op_rx);
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 
     let cells = drain_insert_history(&mut rx);
     let last = lines_to_single_string(cells.last().expect("review warning"));
@@ -1029,6 +1024,13 @@ async fn ctrl_c_interrupts_active_review_without_quitting() {
 
     next_interrupt_op(&mut op_rx);
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+
+    // A running task interrupts on its own; without one, only review mode keeps Ctrl+C from quitting.
+    chat.bottom_pane.set_task_running(/*running*/ false);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+    next_interrupt_op(&mut op_rx);
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[tokio::test]
@@ -1222,6 +1224,8 @@ async fn direct_budget_limited_turn_uses_budget_message_snapshot() {
 #[tokio::test]
 async fn budget_limited_turn_restores_queued_input_without_submitting() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    // Queued input is only ever auto-submitted on a configured session.
+    chat.thread_id = Some(ThreadId::new());
     chat.input_queue
         .queued_user_messages
         .push_back(UserMessage::from("follow-up after budget stop").into());
@@ -1266,7 +1270,7 @@ async fn interrupted_turn_pending_steers_message_snapshot() {
 /// The one-shot capture prompt dismisses back to the normal composer.
 #[tokio::test]
 async fn review_capture_prompt_escape_dismisses() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.open_bug_capture_prompt();
     let header = render_bottom_first_row(&chat, /*width*/ 60);
@@ -1279,6 +1283,12 @@ async fn review_capture_prompt_escape_dismisses() {
     assert!(
         chat.is_normal_backtrack_mode(),
         "expected to be back in normal composer mode"
+    );
+    // The prompt accepts empty text on Enter, so a dismissal must not look like a submission.
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::CodexOp(AppCommand::BugCreate { .. }))),
+        "Esc must not submit the capture prompt"
     );
 }
 

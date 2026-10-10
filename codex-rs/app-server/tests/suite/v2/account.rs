@@ -514,7 +514,7 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
 
     let turn_req = mcp
         .send_turn_start_request(codex_app_server_protocol::TurnStartParams {
-            thread_id: thread.thread.id,
+            thread_id: thread.thread.id.clone(),
             client_user_message_id: None,
             input: vec![codex_app_server_protocol::UserInput::Text {
                 text: "Hello".to_string(),
@@ -530,16 +530,25 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
         Some("pro"),
     )
     .await?;
-    let _turn_resp: JSONRPCResponse = timeout(
+    let turn_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let _turn_completed = timeout(
+    let started: codex_app_server_protocol::TurnStartResponse = to_response(turn_resp)?;
+    let turn_completed = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        turn_completed.params.expect("turn/completed params must be present"),
+    )?;
+    assert_eq!(completed.thread_id, thread.thread.id);
+    assert_eq!(completed.turn.id, started.turn.id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+    assert_eq!(completed.turn.error, None);
 
     let requests = responses_mock.requests();
     assert_eq!(requests.len(), 2);
@@ -553,6 +562,18 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Counts the model requests the server received. A capped mock stops
+/// recording at its cap, so a retry is only visible in the server's own log.
+async fn responses_request_count(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count()
 }
 
 #[tokio::test]
@@ -573,8 +594,7 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
     }));
-    let _responses_mock =
-        responses::mount_response_sequence(&mock_server, vec![unauthorized]).await;
+    responses::mount_response_sequence(&mock_server, vec![unauthorized]).await;
 
     let initial_access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
@@ -671,6 +691,11 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
     )?;
     assert_eq!(completed.turn.status, TurnStatus::Failed);
     assert!(completed.turn.error.is_some());
+    assert_eq!(
+        responses_request_count(&mock_server).await,
+        1,
+        "rejected refresh must not retry the model request",
+    );
 
     Ok(())
 }
@@ -694,8 +719,7 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
     }));
-    let _responses_mock =
-        responses::mount_response_sequence(&mock_server, vec![unauthorized]).await;
+    responses::mount_response_sequence(&mock_server, vec![unauthorized]).await;
 
     let initial_access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
@@ -798,6 +822,11 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
     )?;
     assert_eq!(completed.turn.status, TurnStatus::Failed);
     assert!(completed.turn.error.is_some());
+    assert_eq!(
+        responses_request_count(&mock_server).await,
+        1,
+        "rejected refresh must not retry the model request",
+    );
 
     Ok(())
 }
@@ -820,8 +849,7 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
     }));
-    let _responses_mock =
-        responses::mount_response_sequence(&mock_server, vec![unauthorized]).await;
+    responses::mount_response_sequence(&mock_server, vec![unauthorized]).await;
 
     let initial_access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
@@ -918,6 +946,11 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
     )?;
     assert_eq!(completed.turn.status, TurnStatus::Failed);
     assert!(completed.turn.error.is_some());
+    assert_eq!(
+        responses_request_count(&mock_server).await,
+        1,
+        "rejected refresh must not retry the model request",
+    );
 
     Ok(())
 }

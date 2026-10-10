@@ -113,6 +113,12 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     let client = HttpClientBuilder::new()
         .without_redirects()
         .build_direct()?;
+    // A guessed success URL (including display flags) must not complete the login or
+    // prevent the real callback from subsequently authenticating this same server.
+    let early_success = client
+        .get(format!("http://127.0.0.1:{login_port}/success?codex_streamlined_login=true"))
+        .send()
+        .await?;
     let url = format!(
         "http://127.0.0.1:{login_port}/auth/callback?code=abc&state=test_state_123.onboarding_entrypoint=life_sciences"
     );
@@ -128,6 +134,10 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 
     // Wait for server shutdown
     let callback_result = server.block_until_done_with_callback_result().await?;
+    assert!(
+        !early_success.status().is_success(),
+        "display parameters cannot authorize an unauthenticated success page"
+    );
     assert_eq!(
         callback_result,
         LoginCallbackResult {
@@ -147,6 +157,37 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     assert_eq!(json["tokens"]["refresh_token"], "refresh-123");
     assert_eq!(json["tokens"]["account_id"], chatgpt_account_id);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn success_page_without_callback_does_not_complete_login() -> Result<()> {
+    require_network!();
+
+    let tmp = tempdir()?;
+    let mut opts = ServerOptions::new(
+        tmp.path().to_path_buf(),
+        codex_login::CLIENT_ID.to_string(),
+        None,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+        codex_login::test_support::transport_default_auth_route_config(),
+    );
+    opts.port = 0;
+    opts.open_browser = false;
+    let server = codex_login::run_login_server_async(opts).await?;
+    let client = HttpClientBuilder::new().without_redirects().build_direct()?;
+    let response = client
+        .get(format!("http://127.0.0.1:{}/success", server.actual_port))
+        .send()
+        .await?;
+    // Cancel before assertions so an implementation that correctly keeps
+    // waiting for the callback never leaves its listener running on failure.
+    server.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), server.block_until_done()).await?;
+    assert!(!tmp.path().join("auth.json").exists());
+    assert!(result.is_err(), "viewing the success page is not authentication");
+    assert!(!response.status().is_success(), "unauthenticated success requests must be rejected");
     Ok(())
 }
 

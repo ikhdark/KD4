@@ -717,6 +717,7 @@ fn is_ctrl_exit_combo(key_event: KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::ActionMenuOption;
     use super::ExternalAgentConfigMigrationOutcome;
     use super::ExternalAgentConfigMigrationScreen;
     use super::MigrationView;
@@ -1028,6 +1029,18 @@ mod tests {
                 crossterm::event::KeyEventKind::Repeat,
             ));
             assert!(!screen.is_done());
+        }
+        // Held navigation keys are the exception: they still move the highlight.
+        for (code, expected) in [
+            (KeyCode::Down, ActionMenuOption::Customize),
+            (KeyCode::Up, ActionMenuOption::Proceed),
+        ] {
+            screen.handle_key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            ));
+            assert_eq!(screen.highlighted_action, expected);
         }
         screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(

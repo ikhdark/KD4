@@ -497,6 +497,11 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
     .await;
 
     let request = resumed_mock.single_request();
+    assert_eq!(
+        request.body_json()["model"].as_str(),
+        Some("gpt-5.4"),
+        "the explicit override, not the persisted or startup model, must be selected"
+    );
     let developer_texts = request.message_input_texts("developer");
     let model_switch_count = developer_texts
         .iter()

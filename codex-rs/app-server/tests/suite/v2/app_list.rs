@@ -69,8 +69,26 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn list_apps_returns_empty_when_connectors_disabled() -> Result<()> {
+    // The directory lists the app, so only the disabled feature can hide it.
+    let connectors = vec![AppInfo {
+        id: "beta".to_string(),
+        name: "Beta".to_string(),
+        description: Some("Beta connector".to_string()),
+        logo_url: None,
+        logo_url_dark: None,
+        icon_assets: None,
+        icon_dark_assets: None,
+        distribution_channel: None,
+        branding: None,
+        app_metadata: None,
+        labels: None,
+        install_url: None,
+        is_accessible: false,
+        is_enabled: true,
+        plugin_display_names: Vec::new(),
+    }];
     let (server_url, server_handle) = start_apps_server_with_delays(
-        Vec::new(),
+        connectors,
         vec![connector_tool("beta", "Beta App")?],
         Duration::ZERO,
         Duration::ZERO,

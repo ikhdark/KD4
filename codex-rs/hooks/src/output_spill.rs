@@ -69,7 +69,7 @@ impl HookOutputSpiller {
     /// output, plus a path back to the preserved full text.
     pub(crate) async fn maybe_spill_text(&self, thread_id: ThreadId, text: String) -> String {
         if approx_token_count(&text) > HOOK_OUTPUT_TOKEN_LIMIT {
-            self.prune_crash_leftovers(None).await;
+            self.prune_crash_leftovers().await;
         }
         self.spill_text(thread_id, text).await
     }
@@ -108,7 +108,7 @@ impl HookOutputSpiller {
         clippy::await_holding_invalid_type,
         reason = "The try-lock prevents concurrent asynchronous pruning even when a prune exceeds the throttle interval"
     )]
-    async fn prune_crash_leftovers(&self, protected_path: Option<&Path>) {
+    async fn prune_crash_leftovers(&self) {
         let Ok(mut last_prune) = self.last_prune.try_lock() else {
             return;
         };
@@ -118,7 +118,6 @@ impl HookOutputSpiller {
         *last_prune = Some(Instant::now());
         if let Err(err) = prune_crash_leftovers_at(
             self.output_dir.as_ref(),
-            protected_path,
             SPILL_RETENTION_POLICY,
             SystemTime::now(),
         )
@@ -140,7 +139,7 @@ impl HookOutputSpiller {
             .iter()
             .any(|text| approx_token_count(text) > HOOK_OUTPUT_TOKEN_LIMIT)
         {
-            self.prune_crash_leftovers(None).await;
+            self.prune_crash_leftovers().await;
         }
         let mut spilled = Vec::with_capacity(texts.len());
         for text in texts {
@@ -158,7 +157,7 @@ impl HookOutputSpiller {
             .iter()
             .any(|fragment| approx_token_count(&fragment.text) > HOOK_OUTPUT_TOKEN_LIMIT)
         {
-            self.prune_crash_leftovers(None).await;
+            self.prune_crash_leftovers().await;
         }
         let mut spilled = Vec::with_capacity(fragments.len());
         for fragment in fragments {
@@ -173,7 +172,6 @@ impl HookOutputSpiller {
 
 async fn prune_crash_leftovers_at(
     output_dir: &Path,
-    protected_path: Option<&Path>,
     policy: SpillRetentionPolicy,
     now: SystemTime,
 ) -> std::io::Result<()> {
@@ -182,7 +180,7 @@ async fn prune_crash_leftovers_at(
 
     for file in files {
         let expired = age_at(now, file.modified) > policy.max_age;
-        if expired && !is_protected(&file, protected_path) && remove_spill_file(&file).await {
+        if expired && remove_spill_file(&file).await {
             continue;
         }
         retained.push(file);
@@ -195,7 +193,7 @@ async fn prune_crash_leftovers_at(
         if retained_count <= policy.max_files && retained_bytes <= policy.max_bytes {
             break;
         }
-        if is_protected(file, protected_path) || age_at(now, file.modified) < policy.active_grace {
+        if age_at(now, file.modified) < policy.active_grace {
             continue;
         }
         if remove_spill_file(file).await {
@@ -268,10 +266,6 @@ fn ignore_disappeared<T>(result: std::io::Result<T>) -> std::io::Result<Option<T
 
 fn age_at(now: SystemTime, modified: SystemTime) -> Duration {
     now.duration_since(modified).unwrap_or_default()
-}
-
-fn is_protected(file: &SpillFile, protected_path: Option<&Path>) -> bool {
-    protected_path.is_some_and(|protected_path| file.path == protected_path)
 }
 
 async fn remove_spill_file(file: &SpillFile) -> bool {

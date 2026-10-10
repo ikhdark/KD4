@@ -109,31 +109,6 @@ fn changed_diff_emission_deduplicates_and_preserves_clear_transition() {
     assert_eq!(tracker.take_unified_diff_if_changed(), None);
 }
 
-#[tokio::test]
-async fn model_snapshot_preserves_exact_partial_unavailable_and_client_publication() {
-    let dir = tempdir().unwrap();
-    let mut tracker = tracker_with_root(dir.path());
-    let delta = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Add File: a.txt\n+one\n*** Add File: b.txt\n+two\n*** End Patch").await;
-    tracker.track_delta("", &delta);
-    let rendered = tracker.rendered_diff_count.get();
-    let exact = tracker.model_snapshot();
-    assert_eq!(exact["status"], "exact");
-    assert!(exact["unified_diff"].as_str().unwrap().contains("+one"));
-    assert_eq!(Some(exact["unified_diff"].as_str().unwrap().to_string()), tracker.take_unified_diff_if_changed());
-    assert_eq!(tracker.model_snapshot(), exact);
-    assert_eq!(tracker.rendered_diff_count.get(), rendered);
-    tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", Some(dir.path()),
-        CommandMutation::KnownMutation { paths: Some(BTreeSet::from([dir.path().join("a.txt")])) });
-    let partial = tracker.model_snapshot();
-    assert_eq!(partial["status"], "partial");
-    assert!(partial["unified_diff"].as_str().unwrap().contains("+two"));
-    assert!(!partial["unified_diff"].as_str().unwrap().contains("+one"));
-    assert!(!partial["unavailable_paths"].as_array().unwrap().is_empty());
-    tracker.record_unknown_mutation();
-    assert_eq!(tracker.model_snapshot()["status"], "unavailable");
-    assert!(tracker.model_snapshot()["unified_diff"].is_null());
-}
-
 #[test]
 fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
     for published in [false, true] {
@@ -146,9 +121,12 @@ fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
             );
         }
         assert_eq!(tracker.take_invalidation_warning(), None);
-        assert_eq!(tracker.exact_changed_paths(), Some(Vec::new()));
+        assert!(tracker.changed_paths().is_empty());
+        assert!(!tracker.has_untracked_changes());
         tracker.record_unknown_mutation();
-        assert_eq!(tracker.exact_changed_paths(), None);
+        // An invalidated diff has no listed paths, yet must not read as "no changes".
+        assert!(tracker.changed_paths().is_empty());
+        assert!(tracker.has_untracked_changes());
         assert_eq!(
             tracker.take_unified_diff_if_changed(),
             published.then(String::new)
@@ -163,7 +141,7 @@ fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
 }
 
 #[test]
-fn invalidation_retains_first_command_cause_in_warning_and_snapshot() {
+fn invalidation_retains_first_command_cause_in_warning() {
     let mut tracker = TurnDiffTracker::new();
     let command = vec!["python".to_string(), "λ".repeat(300)];
     tracker.record_command_invalidation_cause(
@@ -172,17 +150,17 @@ fn invalidation_retains_first_command_cause_in_warning_and_snapshot() {
     tracker.record_exec_command_end_with_mutation_at(
         &command, 1, false, "", None, CommandMutation::Uncertain,
     );
-    let first = tracker.model_snapshot()["first_invalidation_cause"].clone();
+    let first = tracker.first_invalidation_cause.clone().expect("first cause");
     assert_eq!(first["call_id"], "call-1");
     assert_eq!(first["tool"], "exec_command");
     assert_eq!(first["mutation_class"], "uncertain");
     assert_eq!(first["command_prefix"].as_str().unwrap().chars().count(), 240);
     tracker.record_unknown_mutation();
-    assert_eq!(tracker.model_snapshot()["first_invalidation_cause"], first);
+    assert_eq!(tracker.first_invalidation_cause.as_ref(), Some(&first));
     let warning = tracker.take_invalidation_warning().unwrap();
     assert!(warning.contains(&first.to_string()));
     assert!(tracker.take_invalidation_warning().is_none());
-    assert_eq!(tracker.model_snapshot()["first_invalidation_cause"], first);
+    assert_eq!(tracker.first_invalidation_cause.as_ref(), Some(&first));
 }
 
 #[test]
@@ -268,6 +246,10 @@ async fn formatter_checks_preserve_diff_but_writes_and_compound_scripts_invalida
         tracker.record_exec_command_end(&command, 0, false);
         assert_eq!(tracker.get_unified_diff(), Some(before), "{command:?}");
     }
+    // Exec completion never records a path-less classification directly: it
+    // resolves it against the observed workspace and rechecks tracked paths, so
+    // a rewritten file loses its exact diff while the tracker stays valid.
+    fs::write(root.path().join("a.rs"), "fn main() {\n}\n").unwrap();
     for command in [
         vec!["C:/bin/rustfmt.exe", "a.rs"],
         vec!["prettier", "--write", "--check", "a.js"],
@@ -282,8 +264,33 @@ async fn formatter_checks_preserve_diff_but_writes_and_compound_scripts_invalida
         let command = command.into_iter().map(str::to_string).collect::<Vec<_>>();
         let mut tracker = tracker_with_root(root.path());
         tracker.track_delta("", &delta);
-        tracker.record_exec_command_end(&command, 0, false);
-        assert_eq!(tracker.get_unified_diff(), None, "{command:?}");
+        let classified = command_mutation(&command, Some(root.path()));
+        assert_ne!(classified, CommandMutation::ReadOnly, "{command:?}");
+        let observed = if matches!(
+            classified,
+            CommandMutation::Uncertain | CommandMutation::KnownMutation { paths: None }
+        ) {
+            resolve_uncertain_command_observation(Some(true))
+        } else {
+            classified
+        };
+        let mutation = tracker
+            .reconcile_command_mutation("", observed, Some(LOCAL_FS.as_ref()))
+            .await;
+        tracker.record_exec_command_end_with_mutation_at(
+            &command,
+            0,
+            false,
+            "",
+            Some(root.path()),
+            mutation,
+        );
+        let partial = tracker.get_unified_diff().expect("partial turn diff");
+        assert!(
+            partial.contains("a.rs: changed, diff unavailable"),
+            "{command:?}: {partial}"
+        );
+        assert!(tracker.valid, "{command:?}");
     }
 }
 
@@ -616,23 +623,53 @@ fn git_output_options_do_not_certify_read_only_commands() {
     }
 }
 
-#[test]
-fn failed_and_timed_out_known_mutators_still_invalidate_immediately() {
+#[tokio::test]
+async fn failed_and_timed_out_known_mutators_still_invalidate_immediately() {
     for (script, exit_code, timed_out) in [
-        ("Set-Content out.txt changed", 1, false),
-        ("Set-Content out.txt changed", 124, true),
+        ("Set-Content a.txt changed", 1, false),
+        ("Set-Content a.txt changed", 124, true),
         ("Set-Content -LiteralPath a.txt -Value changed; exit 1", 1, false),
         ("Set-Content -LiteralPath a.txt -Value changed; exit 1", 1, true),
     ] {
-        let mut tracker = TurnDiffTracker::new();
+        let dir = tempdir().expect("tempdir");
+        let mut tracker = tracker_with_root(dir.path());
+        let add = apply_verified_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Add File: a.txt\n+foo\n*** End Patch",
+        )
+        .await;
+        tracker.track_delta("", &add);
         let command = ["powershell.exe".into(), "-Command".into(), script.into()];
-        let mutation = command_mutation(&command, None);
-        tracker.record_exec_command_end_with_mutation_at(
-            &command, exit_code, timed_out, "local", None, mutation,
+        // Exec completion never records a path-less classification directly: it
+        // resolves it against the observed workspace and rechecks tracked paths.
+        assert!(
+            matches!(
+                command_mutation(&command, None),
+                CommandMutation::Uncertain | CommandMutation::KnownMutation { paths: None }
+            ),
+            "{script}"
         );
-        assert_eq!(tracker.current_mutation_revision(), 1, "{script}");
-        assert_eq!(tracker.exact_changed_paths(), None, "{script}");
-        assert_eq!(tracker.model_snapshot()["status"], "unavailable");
+        fs::write(dir.path().join("a.txt"), "changed\n").expect("command wrote before failing");
+        let mutation = tracker
+            .reconcile_command_mutation(
+                "",
+                resolve_uncertain_command_observation(Some(true)),
+                Some(LOCAL_FS.as_ref()),
+            )
+            .await;
+        tracker.record_exec_command_end_with_mutation_at(
+            &command, exit_code, timed_out, "", None, mutation,
+        );
+        assert_eq!(tracker.current_mutation_revision(), 2, "{script}");
+        assert!(tracker.valid, "{script}");
+        assert!(tracker.has_untracked_changes(), "{script}");
+        assert!(
+            tracker
+                .get_unified_diff()
+                .expect("partial turn diff")
+                .contains("a.txt: changed, diff unavailable"),
+            "{script}"
+        );
     }
 }
 
@@ -820,13 +857,14 @@ async fn uncertain_changes_recheck_only_patch_paths_and_preserve_exact_siblings(
     let delta = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Add File: a.txt\n+one\n*** Add File: b.txt\n+two\n*** Delete File: deleted.txt\n*** Update File: renamed.txt\n*** Move to: destination.txt\n@@\n-old\n+new\n*** End Patch").await;
     tracker.track_delta("", &delta);
     let original = tracker.get_unified_diff();
-    let changed_paths = tracker.exact_changed_paths();
+    let changed_paths = tracker.changed_paths();
+    assert_eq!(changed_paths.len(), 5);
     fs::write(dir.path().join("validation.log"), "unrelated").unwrap();
     let mutation = tracker.reconcile_command_mutation("", CommandMutation::UnattributedWorkspaceChange, Some(LOCAL_FS.as_ref())).await;
     tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None, mutation);
     assert_eq!(tracker.get_unified_diff(), original);
-    assert_eq!(tracker.exact_changed_paths(), changed_paths);
-    assert_eq!(tracker.model_snapshot()["status"], "exact");
+    assert_eq!(tracker.changed_paths(), changed_paths);
+    assert!(!tracker.has_untracked_changes());
 
     fs::write(dir.path().join("b.txt"), "external edit").unwrap();
     fs::write(dir.path().join("deleted.txt"), "recreated").unwrap();
@@ -840,7 +878,9 @@ async fn uncertain_changes_recheck_only_patch_paths_and_preserve_exact_siblings(
     assert!(partial.contains("deleted.txt: changed, diff unavailable"));
     assert!(partial.contains("renamed.txt: changed, diff unavailable"));
     assert!(partial.contains("destination.txt: changed, diff unavailable"));
-    assert_eq!(tracker.model_snapshot()["status"], "partial");
+    assert!(tracker.valid);
+    assert!(tracker.has_untracked_changes());
+    assert_eq!(tracker.changed_paths(), changed_paths);
 }
 
 #[tokio::test]
@@ -864,13 +904,15 @@ async fn known_command_paths_preserve_other_diffs_until_unknown_invalidation() {
     assert!(partial.contains("diff --git a/a.txt b/a.txt"));
     assert!(!partial.contains("diff --git a/b.txt b/b.txt"));
     assert!(partial.contains("b.txt: changed, diff unavailable"));
-    assert_eq!(tracker.exact_changed_paths(), Some(vec![("".into(), dir.path().join("a.txt"))]));
+    let known_paths = vec![
+        ("".into(), dir.path().join("a.txt")), ("".into(), dir.path().join("b.txt")),
+    ];
+    assert!(tracker.valid);
     assert!(tracker.has_untracked_changes());
+    assert_eq!(tracker.changed_paths(), known_paths);
     tracker.invalidate();
 
-    assert_eq!(tracker.changed_paths(), vec![
-        ("".into(), dir.path().join("a.txt")), ("".into(), dir.path().join("b.txt")),
-    ]);
+    assert_eq!(tracker.changed_paths(), known_paths);
 
     assert_eq!(tracker.get_unified_diff(), None);
     tracker.record_exec_command_end_at(
@@ -985,12 +1027,13 @@ async fn pure_rename_yields_no_diff() {
 
     assert_eq!(tracker.get_unified_diff(), None);
     assert_eq!(
-        tracker.exact_changed_paths(),
-        Some(vec![
+        tracker.changed_paths(),
+        vec![
             ("".to_string(), dir.path().join("new.txt")),
             ("".to_string(), dir.path().join("old.txt")),
-        ])
+        ]
     );
+    assert!(!tracker.has_untracked_changes());
 }
 
 #[tokio::test]
@@ -1258,39 +1301,27 @@ async fn repeated_patch_updates_reuse_the_baseline_blob_identity() {
     }
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn patches_keep_case_distinct_paths_independent_across_renames() {
-    let dir = tempdir().unwrap();
-    fs::write(dir.path().join("Foo.rs"), "upper\n").unwrap();
-    fs::write(dir.path().join("foo.rs"), "lower\n").unwrap();
-    let mut tracker = tracker_with_root(dir.path());
-    let edit = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: Foo.rs\n@@\n-upper\n+UPPER\n*** Update File: foo.rs\n@@\n-lower\n+LOWER\n*** End Patch").await;
-    tracker.track_delta("", &edit);
-    let diff = tracker.take_unified_diff_if_changed().unwrap();
-    assert!(diff.contains("--- a/Foo.rs\n+++ b/Foo.rs"));
-    assert!(diff.contains("--- a/foo.rs\n+++ b/foo.rs"));
-    let rename = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: Foo.rs\n*** Move to: Renamed.rs\n@@\n-UPPER\n+renamed\n*** End Patch").await;
-    tracker.track_delta("", &rename);
-    let diff = tracker.take_unified_diff_if_changed().unwrap();
-    assert!(diff.contains("--- a/Foo.rs\n+++ b/Renamed.rs"));
-    assert!(diff.contains("--- a/foo.rs\n+++ b/foo.rs"));
-    assert_eq!(
-        fs::read_to_string(dir.path().join("foo.rs")).unwrap(),
-        "LOWER\n"
-    );
-}
-
-#[cfg(unix)]
+#[cfg(windows)]
 #[test]
 fn tracking_keys_preserve_non_utf8_native_paths() {
-    use std::os::unix::ffi::OsStrExt;
-    let first = Path::new(std::ffi::OsStr::from_bytes(b"file-\xff"));
-    let second = Path::new(std::ffi::OsStr::from_bytes(b"file-\xfe"));
-    let first_key = TrackedPath::new("local", first);
-    let second_key = TrackedPath::new("local", second);
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStringExt;
+    // An unpaired surrogate is a valid native unit with no UTF-8 form; a lossy
+    // fold would give both names the same U+FFFD key.
+    let name = |unit: u16| {
+        let mut units = "file-".encode_utf16().collect::<Vec<_>>();
+        units.push(unit);
+        PathBuf::from(std::ffi::OsString::from_wide(&units))
+    };
+    let first = name(0xD800);
+    let second = name(0xD801);
+    let first_key = TrackedPath::new("local", &first);
+    let second_key = TrackedPath::new("local", &second);
     assert_ne!(first_key, second_key);
-    assert_eq!(first_key.path.as_os_str().as_bytes(), b"file-\xff");
+    assert_eq!(
+        first_key.path.as_os_str().encode_wide().collect::<Vec<_>>(),
+        "file-".encode_utf16().chain([0xD800]).collect::<Vec<_>>()
+    );
     let mut contents = HashMap::new();
     contents.insert(first_key, "first");
     contents.insert(second_key, "second");

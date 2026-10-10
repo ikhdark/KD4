@@ -202,11 +202,16 @@ mod review_regressions {
     #[test]
     fn heredoc_closing_delimiter_must_be_exact() {
         for delimiter in ["NOTEOF", "echo EOF", "suffixEOF"] {
-            assert!(
+            // The wrapper is not stripped, so the heredoc opener is reported
+            // as the patch's first line.
+            assert_eq!(
                 parse_patch(&format!(
                     "<<'EOF'\n*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch\n{delimiter}"
-                ))
-                .is_err()
+                )),
+                Err(ParseError::InvalidPatchError(
+                    "The first line of the patch must be '*** Begin Patch'".to_string()
+                )),
+                "{delimiter}"
             );
         }
     }

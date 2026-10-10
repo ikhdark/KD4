@@ -199,6 +199,11 @@ impl ChatComposer {
                 code: KeyCode::Char('h'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('\u{0008}'),
+                modifiers: KeyModifiers::NONE,
+                ..
             } => {
                 if let Some(search) = self.history_search.as_ref() {
                     let mut query = search.query.clone();
@@ -210,6 +215,11 @@ impl ChatComposer {
             KeyEvent {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('\u{0015}'),
+                modifiers: KeyModifiers::NONE,
                 ..
             } => {
                 self.update_history_search_query(String::new());
@@ -597,6 +607,26 @@ mod tests {
             vec![1..3, 4..5]
         );
         assert!(ChatComposer::case_insensitive_match_ranges("git", "").is_empty());
+    }
+
+    #[test]
+    fn history_search_query_editing_accepts_raw_control_chords() {
+        for (code, modifiers, expected) in [
+            (KeyCode::Char('h'), KeyModifiers::CONTROL, "a"),
+            (KeyCode::Char('\u{0008}'), KeyModifiers::NONE, "a"),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL, ""),
+            (KeyCode::Char('\u{0015}'), KeyModifiers::NONE, ""),
+        ] {
+            let (tx, _rx) = unbounded_channel::<AppEvent>();
+            let mut composer =
+                ChatComposer::new(true, AppEventSender::new(tx), true, String::new(), true);
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+            for ch in "ab".chars() {
+                composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            composer.handle_key_event(KeyEvent::new(code, modifiers));
+            assert_eq!(composer.history_search.as_ref().unwrap().query, expected);
+        }
     }
 
     #[test]

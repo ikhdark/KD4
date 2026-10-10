@@ -501,27 +501,6 @@ impl TurnDiffTracker {
         self.attributed_mutation_revision
     }
 
-    /// Net changed paths, including both sides of renames. Never infer an empty
-    /// change set from an invalidated diff.
-    #[cfg(test)]
-    pub(crate) fn exact_changed_paths(&self) -> Option<Vec<(String, PathBuf)>> {
-        if !self.valid {
-            return None;
-        }
-        Some(self.baseline_by_path.keys().chain(self.current_by_path.keys())
-            .filter(|path| !self.unavailable_paths.contains(*path))
-            .filter(|path| {
-                match (self.baseline_by_path.get(*path), self.current_by_path.get(*path)) {
-                    (Some(before), Some(after)) =>
-                        before.content != after.content || before.mode != after.mode,
-                    (None, None) => false,
-                    _ => true,
-                }
-            })
-            .map(|path| (path.environment_id.clone(), path.path.clone()))
-            .collect::<BTreeSet<_>>().into_iter().collect())
-    }
-
     pub(crate) fn has_untracked_changes(&self) -> bool {
         !self.valid || !self.unavailable_paths.is_empty()
     }
@@ -548,33 +527,6 @@ impl TurnDiffTracker {
         } else {
             self.unified_diff.clone()
         }
-    }
-
-    /// An on-demand snapshot, not a workspace diff. Reuse rendered fragments
-    /// without consuming the client's change notification or reading files.
-    #[cfg(test)]
-    pub(crate) fn model_snapshot(&self) -> serde_json::Value {
-        let status = if !self.valid {
-            "unavailable"
-        } else if self.unavailable_paths.is_empty() {
-            "exact"
-        } else {
-            "partial"
-        };
-        let diff = self.valid.then(|| {
-            if self.aggregate_dirty { self.flatten_diff() } else { self.unified_diff.clone() }
-                .unwrap_or_default()
-        });
-        serde_json::json!({
-            "status": status,
-            "mutation_revision": self.mutation_revision,
-            "first_invalidation_cause": self.first_invalidation_cause,
-            "scope": "Current turn's tracked apply_patch text changes only; not a working-tree diff. Untracked or pre-existing changes are outside this scope. Recovery snapshots are historical, not freshness proof.",
-            "unified_diff": diff,
-            "unavailable_paths": self.unavailable_paths.iter().map(|path| serde_json::json!({
-                "environment_id": path.environment_id, "path": path.path,
-            })).collect::<Vec<_>>(),
-        })
     }
 
     /// Returns the latest aggregate only when it differs from the last value

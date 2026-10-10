@@ -22,42 +22,6 @@ const PROJECT_SELECT: &str = "SELECT projects.*,
     FROM projects";
 
 impl StateRuntime {
-    pub async fn set_thread_project(
-        &self,
-        thread_id: &str,
-        project_id: Option<&str>,
-    ) -> anyhow::Result<Option<Option<String>>> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(project_id) = project_id {
-            let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects WHERE id = ?")
-                .bind(project_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            if exists == 0 {
-                tx.rollback().await?;
-                anyhow::bail!("project not found: {project_id}");
-            }
-        }
-        let previous =
-            sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM threads WHERE id = ?")
-                .bind(thread_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(previous) = previous else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-        if previous.as_deref() != project_id {
-            sqlx::query("UPDATE threads SET project_id = ? WHERE id = ?")
-                .bind(project_id)
-                .bind(thread_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(Some(previous))
-    }
-
     pub async fn list_projects(
         &self,
         cursor: Option<&str>,
@@ -103,36 +67,6 @@ impl StateRuntime {
         };
         tx.commit().await?;
         Ok(project)
-    }
-
-    pub async fn get_project_by_idempotency_key(
-        &self,
-        idempotency_key: &str,
-    ) -> anyhow::Result<Option<Project>> {
-        let mut tx = self.pool.begin().await?;
-        let project_id = sqlx::query_scalar::<_, String>(
-            "SELECT project_id FROM project_idempotency_keys WHERE key = ?",
-        )
-        .bind(idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(project_id) = project_id else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
-            .push(" WHERE id = ")
-            .push_bind(&project_id)
-            .build()
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(row) = row else {
-            tx.rollback().await?;
-            anyhow::bail!("idempotency key refers to deleted project: {idempotency_key}");
-        };
-        let project = project_from_row_in_tx(&mut tx, &row).await?;
-        tx.commit().await?;
-        Ok(Some(project))
     }
 
     pub async fn create_project(

@@ -4,6 +4,8 @@ import asyncio
 import sys
 import threading
 
+import pytest
+
 from openai_codex.async_client import AsyncCodexClient
 from openai_codex.client import CodexConfig
 from openai_codex.generated.v2_all import (
@@ -166,15 +168,15 @@ def test_cancelled_turn_start_cleans_up_after_late_response() -> None:
         client._sync.turn_interrupt = interrupt  # type: ignore[method-assign]
         client._sync.unregister_turn_notifications = unregister  # type: ignore[method-assign]
         operation = asyncio.create_task(client.turn_start("thread-1", "hello"))
-        assert await asyncio.to_thread(started.wait, 1)
-        operation.cancel()
-        done, _ = await asyncio.wait({operation}, timeout=0.5)
-        completed_before_release = operation in done
-        release.set()
         try:
+            assert await asyncio.to_thread(started.wait, 1)
+            operation.cancel()
+            done, _ = await asyncio.wait({operation}, timeout=0.5)
+            completed_before_release = operation in done
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
             await operation
-        except asyncio.CancelledError:
-            pass
         cleanup_completed = await asyncio.to_thread(cleanup_done.wait, 1)
         return completed_before_release, calls, cleanup_completed
 
@@ -198,8 +200,7 @@ def test_cancelled_notification_wait_preserves_notification_order() -> None:
 
         client._sync.next_turn_notification = observed_next  # type: ignore[method-assign]
         wait = asyncio.create_task(client.next_turn_notification("turn-1"))
-        while not poll_started.is_set():
-            await asyncio.sleep(0.001)
+        assert await asyncio.to_thread(poll_started.wait, 1)
         wait.cancel()
         first = Notification(
             method="unknown/first",
@@ -211,10 +212,8 @@ def test_cancelled_notification_wait_preserves_notification_order() -> None:
         )
         client._sync._router.route_notification(first)
         client._sync._router.route_notification(second)
-        try:
+        with pytest.raises(asyncio.CancelledError):
             await wait
-        except asyncio.CancelledError:
-            pass
 
         return (
             await asyncio.wait_for(client.next_turn_notification("turn-1"), 0.5),

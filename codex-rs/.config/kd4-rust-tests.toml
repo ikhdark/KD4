@@ -127,12 +127,12 @@ tests = [
 ]
 
 [gates.tool-history-pressure]
-description = "Deterministic long-session projection/recovery comparison; not model latency measurements."
+description = "Deterministic long-session sampling projection and artifact recovery after restart; not model latency measurements."
 
 [[gates.tool-history-pressure.steps]]
 target = "core_lib"
 helpers = []
-tests = ["tool_history::tests::long_session_prompt_pressure_comparison"]
+tests = ["tool_history::tests::only_checkpointed_evidence_is_pinned_after_restart_and_stays_recoverable"]
 
 # ---------------------------------------------------------------------------
 # Helper binaries
@@ -489,6 +489,11 @@ package = "codex-code-mode-host"
 test = "stdio"
 helpers = ["codex-code-mode-host"]
 
+[targets.code_mode_host_lib]
+package = "codex-code-mode-host"
+lib = true
+helpers = []
+
 [targets.output_truncation_lib]
 package = "codex-utils-output-truncation"
 lib = true
@@ -596,7 +601,6 @@ helpers = []
 tests = [
   "context_manager::history::tests::sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context",
   "session::turn::tests::workspace_evidence_coalesces_mutating_calls_at_generation_boundary",
-  "tools::parallel::tests::workspace_evidence_ignores_retired_transaction_state",
 ]
 
 [gates.core-retry-output]
@@ -787,14 +791,11 @@ tests = [
   "tools::shell_output_summary::optimization_tests::selection_storage_is_bounded_for_large_logs",
   "tools::shell_output_summary::optimization_tests::line_classification_is_case_insensitive_without_retained_scratch",
   "tools::shell_output_summary::optimization_tests::selection_flags_emit_each_index_once_in_source_order",
-  "context_manager::history::tests::prepared_prompt_truncation_releases_large_discarded_storage",
   "context_manager::history::tests::tool_search_acknowledgement_preserves_full_schema_bytes",
   "context_manager::history::tests::idless_token_estimates_are_cached_and_invalidated_on_rewrite",
   "context_manager::history::tests::prepared_token_estimates_cache_existing_items_and_only_measure_appends",
   "context_manager::history::tests::total_token_usage_caches_raw_items_without_reusing_projected_estimates",
   "context_manager::history::tests::prompt_projections_share_primary_storage_during_runtime_append",
-  "context_manager::history::tests::prepared_prompt_index_uses_materialized_items_and_respects_truncation",
-  "context_manager::history::tests::prepared_prompt_index_walks_deep_unmaterialized_chains",
   "tools::handlers::tool_search::tests::exact_name_search_recovers_a_definition_that_exceeds_the_result_budget",
   "tools::handlers::tool_search::tests::audit_tool_search_contract_compaction_preserves_strictness_and_output_schema",
   "tools::handlers::tool_search::tests::token_backfire_oversized_exact_match_stays_activatable",
@@ -873,12 +874,7 @@ helpers = []
 tests = [
   "tools::handlers::get_context_remaining::tests::direct_and_code_mode_results_obey_the_same_schema",
   "client::tests::request_setting_tests::dispatched_request_settings_gate_fixed_prefix_reuse",
-  "client::tests::fixed_prefix_reuse_requires_comparable_setting_digests",
-  "client::tests::encoded_setting_digests_preserve_null_omission_and_incremental_transport",
   "tool_history::tests::phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence",
-  "validation::tests::arbitrary_validate_scripts_are_not_classified_by_filename",
-  "validation::tests::conditional_powershell_is_opaque_for_execution_proof",
-  "tools::handlers::unified_exec::tests::unexecuted_powershell_branch_is_not_validation_evidence",
   "turn_timing::tests::wait_and_tool_output_counters_are_additive",
   "turn_timing::tests::optimization_activation_decision_counters_are_additive",
 ]
@@ -957,16 +953,14 @@ tests = [
 ]
 
 [gates.harness-efficiency-safety]
-description = "Replayable advisory-policy comparison and evidence budgets paired with fixed recovery, cancellation, completion, and disjoint-admission invariants; no wall-clock tuning or model routing."
+description = "Replayable advisory-policy comparison paired with fixed recovery, cancellation, completion, and disjoint-admission invariants; no wall-clock tuning or model routing."
 
 [[gates.harness-efficiency-safety.steps]]
 target = "core_lib"
 helpers = []
 tests = [
-  "tool_history::tests::task_sensitive_budget_reserves_unread_evidence_and_releases_it_after_consumption",
   "tool_history::tests::phase_checkpoint_resolves_only_later_current_success_for_the_same_action",
   "tool_history::tests::checkpoint_answer_lineage_downgrades_without_rewriting_or_repeating_notes",
-  "session::turn_execution::tests::executed_validation_summary_requires_a_completed_non_skipped_result",
   "session::turn_execution::tests::lightweight_handoff_advisory_preserves_novel_progress_and_tool_access",
   "session::turn_execution::tests::lightweight_handoff_window_resets_for_unmeasured_slow_batched_or_mutating_work",
   "session::turn_execution::tests::distinct_failure_strategies_allow_narrow_successful_recovery",

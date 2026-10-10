@@ -140,157 +140,6 @@ fn plugin_command_rejects_excessive_output() {
     assert!(started.elapsed() < Duration::from_secs(15));
 }
 
-#[cfg(unix)]
-#[test]
-fn zip_extraction_restores_executable_permission_without_special_bits() {
-    use std::os::unix::fs::PermissionsExt;
-    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    zip.start_file(
-        "root/run",
-        SimpleFileOptions::default().unix_permissions(0o755),
-    )
-    .unwrap();
-    zip.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
-    let bytes = zip.finish().unwrap().into_inner();
-    let destination = tempdir().unwrap();
-    extract_zipball_to_dir(&bytes, destination.path()).unwrap();
-    assert_eq!(
-        std::fs::metadata(destination.path().join("run"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o755
-    );
-    assert!(
-        Command::new(destination.path().join("run"))
-            .status()
-            .unwrap()
-            .success()
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn plugin_git_unix_exit_poll_retains_root_identity_until_cleanup() {
-    use std::os::unix::process::CommandExt;
-    use std::os::unix::process::ExitStatusExt;
-
-    for (script, exit_code, signal) in [
-        ("exit 23", Some(23), None),
-        ("kill -TERM $$", None, Some(libc::SIGTERM)),
-    ] {
-        let child = Command::new("sh")
-            .args(["-c", script])
-            .process_group(0)
-            .spawn()
-            .expect("owned root");
-        let pid = child.id();
-        let mut owner = GitChild {
-            child,
-            completed: false,
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let status = loop {
-            if let Some(status) = owner.try_wait().expect("observe root exit") {
-                break status;
-            }
-            assert!(std::time::Instant::now() < deadline, "root did not exit");
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert_eq!(status.code(), exit_code);
-        assert_eq!(status.signal(), signal);
-
-        // Observe the kernel independently: the owner's poll must not consume
-        // the exited root that pins the numeric group identity during cleanup.
-        // SAFETY: siginfo_t permits zero initialization for a WNOHANG probe.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            // SAFETY: the owned child PID and writable info buffer remain valid;
-            // WNOWAIT prevents this independent observation from reaping it.
-            unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            },
-            0
-        );
-        // SAFETY: successful waitid populated the SIGCHLD fields.
-        assert_eq!(unsafe { info.si_pid() }, pid as libc::pid_t);
-        drop(owner);
-        // SAFETY: waitpid accepts a null status pointer; this probes that the
-        // owner already reaped its exact former child and never sends a signal.
-        let result =
-            unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
-        assert_eq!(result, -1, "owner cleanup must reap the root");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ECHILD)
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn plugin_git_unix_runner_preserves_only_successful_background_helper() {
-    for exit_code in [0, 23] {
-        let tmp = tempdir().expect("helper markers");
-        let ready = tmp.path().join("ready");
-        let release = tmp.path().join("release");
-        let survived = tmp.path().join("survived");
-        // Positional arguments keep paths out of shell source. The helper is
-        // bounded even if an assertion interrupts the parent before release.
-        let script = r#"
-            (
-                printf ready > "$1"
-                count=0
-                while [ ! -e "$2" ] && [ "$count" -lt 500 ]; do
-                    sleep 0.01
-                    count=$((count + 1))
-                done
-                if [ -e "$2" ]; then printf survived > "$3"; fi
-            ) &
-            while [ ! -e "$1" ]; do sleep 0.01; done
-            printf 'root output'
-            printf 'root diagnostic' >&2
-            exit "$4"
-        "#;
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", script, "git-helper"])
-            .arg(&ready)
-            .arg(&release)
-            .arg(&survived)
-            .arg(exit_code.to_string());
-        let output = run_git_command_with_timeout(
-            &mut command,
-            "Git Unix helper fixture",
-            Duration::from_secs(5),
-        )
-        .expect("root output completes without waiting for helper");
-        assert_eq!(output.status.code(), Some(exit_code));
-        assert_eq!(output.stdout, b"root output");
-        assert_eq!(output.stderr, b"root diagnostic");
-        assert!(ready.exists(), "helper really started before root exit");
-        std::fs::write(&release, b"release").expect("release helper");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !survived.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            survived.exists(),
-            exit_code == 0,
-            "failed Git roots terminate helpers; successful roots preserve them"
-        );
-        if exit_code == 0 {
-            assert_eq!(std::fs::read(&survived).unwrap(), b"survived");
-        }
-    }
-}
-
 #[cfg(windows)]
 #[tokio::test]
 async fn plugin_git_large_output_startup_sync() {
@@ -462,6 +311,23 @@ fn plugin_git_timeout_reaps_descendants_and_preserves_stderr() {
 fn git_command_sanitizes_ambient_repository_environment() {
     let command = git_command(Path::new("git"));
 
+    // The loop below reads the runtime list, so pin the variables that redirect
+    // Git away from `-C` or inject configuration: dropping one must fail here.
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        assert!(
+            REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES.contains(&name),
+            "{name} must stay in the sanitized Git environment"
+        );
+    }
     for name in REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES {
         assert_eq!(
             command

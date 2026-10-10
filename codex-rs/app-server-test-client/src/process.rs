@@ -287,6 +287,27 @@ mod tests {
 
         assert_eq!(pid, 42);
         assert_eq!(*calls.borrow(), vec!["preflight", "kill", "spawn"]);
+
+        // Control: without a restart request the existing listeners are left alone.
+        calls.borrow_mut().clear();
+        let pid = start_prepared_serve(
+            false,
+            || {
+                calls.borrow_mut().push("preflight");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("kill");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("spawn");
+                Ok(7)
+            },
+        )?;
+
+        assert_eq!(pid, 7);
+        assert_eq!(*calls.borrow(), vec!["spawn"]);
         Ok(())
     }
 

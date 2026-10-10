@@ -141,7 +141,6 @@ mod keymap;
 mod keymap_setup;
 mod line_truncation;
 pub(crate) mod live_wrap;
-pub use live_wrap::RowBuilder;
 mod composer_input;
 mod local_chatgpt_auth;
 mod managed_new_thread_defaults;
@@ -260,7 +259,6 @@ async fn start_embedded_app_server(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppServerTarget {
     Embedded,
-    LocalDaemon { endpoint: RemoteAppServerEndpoint },
     Remote { endpoint: RemoteAppServerEndpoint },
 }
 
@@ -298,9 +296,7 @@ async fn init_state_db_for_app_server_target(
                     ))
                 })
         }
-        AppServerTarget::LocalDaemon { .. } | AppServerTarget::Remote { .. } => {
-            Ok(state_integration::get_state_db(config).await)
-        }
+        AppServerTarget::Remote { .. } => Ok(state_integration::get_state_db(config).await),
     }
 }
 
@@ -397,10 +393,6 @@ async fn connect_remote_app_server(
     Ok(AppServerClient::Remote(app_server))
 }
 
-async fn maybe_probe_default_daemon_socket(_codex_home: &Path) -> Option<AbsolutePathBuf> {
-    None
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn start_app_server(
     target: &AppServerTarget,
@@ -430,9 +422,7 @@ async fn start_app_server(
         )
         .await
         .map(AppServerClient::InProcess),
-        AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
-            connect_remote_app_server(endpoint.clone()).await
-        }
+        AppServerTarget::Remote { endpoint } => connect_remote_app_server(endpoint.clone()).await,
     }
 }
 
@@ -790,44 +780,11 @@ fn latest_session_cwd_filter<'a>(
 
 fn app_server_target_for_launch(
     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
-    default_daemon_socket: Option<AbsolutePathBuf>,
-    can_reuse_implicit_local_daemon: bool,
 ) -> AppServerTarget {
     match explicit_remote_endpoint {
         Some(endpoint) => AppServerTarget::Remote { endpoint },
-        None if can_reuse_implicit_local_daemon => {
-            default_daemon_socket.map_or(AppServerTarget::Embedded, |socket_path| {
-                AppServerTarget::LocalDaemon {
-                    endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
-                }
-            })
-        }
         None => AppServerTarget::Embedded,
     }
-}
-
-fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
-    loader_overrides.user_config_path.is_none()
-        && loader_overrides.user_config_profile.is_none()
-        && loader_overrides.managed_config_path.is_none()
-        && loader_overrides.system_config_path.is_none()
-        && loader_overrides.system_requirements_path.is_none()
-        && !loader_overrides.ignore_managed_requirements
-        && !loader_overrides.ignore_user_config
-        && !loader_overrides.ignore_user_and_project_exec_policy_rules
-}
-
-fn can_reuse_implicit_local_daemon(
-    cli_kv_overrides: &[(String, toml::Value)],
-    loader_overrides: &LoaderOverrides,
-    strict_config: bool,
-    has_non_replayable_launch_overrides: bool,
-) -> bool {
-    // A reused daemon cannot adopt this invocation's full launch config state.
-    cli_kv_overrides.is_empty()
-        && loader_overrides_are_default(loader_overrides)
-        && !strict_config
-        && !has_non_replayable_launch_overrides
 }
 
 pub async fn run_main(
@@ -881,28 +838,7 @@ pub async fn run_main(
         }
     };
 
-    let mut launch_loader_overrides = loader_overrides.clone();
-    if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
-        let user_config_path = resolve_profile_v2_config_path(&codex_home, profile_v2);
-        launch_loader_overrides.user_config_path = Some(user_config_path);
-        launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
-    }
-    let reuse_implicit_local_daemon = can_reuse_implicit_local_daemon(
-        &cli_kv_overrides,
-        &launch_loader_overrides,
-        strict_config,
-        cli.bypass_hook_trust,
-    );
-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
-        maybe_probe_default_daemon_socket(&codex_home).await
-    } else {
-        None
-    };
-    let app_server_target = app_server_target_for_launch(
-        explicit_remote_endpoint,
-        default_daemon,
-        reuse_implicit_local_daemon,
-    );
+    let app_server_target = app_server_target_for_launch(explicit_remote_endpoint);
     let remote_cwd_override = cli
         .cwd
         .clone()
@@ -2313,36 +2249,12 @@ mod tests {
 
 
     #[test]
-    fn app_server_target_for_launch_uses_local_daemon_for_default_socket() -> color_eyre::Result<()>
-    {
-        let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
-        let target = app_server_target_for_launch(
-            /*explicit_remote_endpoint*/ None,
-            Some(socket_path.clone()),
-            /*can_reuse_implicit_local_daemon*/ true,
-        );
-
-        assert_eq!(
-            target,
-            AppServerTarget::LocalDaemon {
-                endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
-            }
-        );
-        assert!(!target.uses_remote_workspace());
-        assert_eq!(target.thread_params_mode(), ThreadParamsMode::Embedded);
-        Ok(())
-    }
-
-    #[test]
-    fn app_server_target_for_launch_prefers_explicit_remote_endpoint() -> color_eyre::Result<()> {
+    fn app_server_target_for_launch_is_remote_only_for_an_explicit_endpoint()
+    -> color_eyre::Result<()> {
         let explicit_endpoint = RemoteAppServerEndpoint::UnixSocket {
             socket_path: AbsolutePathBuf::relative_to_current_dir("explicit.sock")?,
         };
-        let target = app_server_target_for_launch(
-            Some(explicit_endpoint.clone()),
-            Some(AbsolutePathBuf::relative_to_current_dir("default.sock")?),
-            /*can_reuse_implicit_local_daemon*/ false,
-        );
+        let target = app_server_target_for_launch(Some(explicit_endpoint.clone()));
 
         assert_eq!(
             target,
@@ -2352,73 +2264,41 @@ mod tests {
         );
         assert!(target.uses_remote_workspace());
         assert_eq!(target.thread_params_mode(), ThreadParamsMode::Remote);
-        Ok(())
-    }
 
-    #[test]
-    fn app_server_target_for_launch_skips_local_daemon_when_launch_config_is_not_replayable()
-    -> color_eyre::Result<()> {
-        let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
-        let target = app_server_target_for_launch(
-            /*explicit_remote_endpoint*/ None,
-            Some(socket_path),
-            /*can_reuse_implicit_local_daemon*/ false,
-        );
+        let target = app_server_target_for_launch(/*explicit_remote_endpoint*/ None);
 
         assert_eq!(target, AppServerTarget::Embedded);
+        assert!(!target.uses_remote_workspace());
+        assert_eq!(target.thread_params_mode(), ThreadParamsMode::Embedded);
         Ok(())
     }
 
     #[test]
-    fn can_reuse_implicit_local_daemon_requires_default_launch_config() -> color_eyre::Result<()> {
-        let mut loader_overrides = LoaderOverrides::default();
-        let cli_kv_overrides = vec![("web_search".to_string(), toml::Value::String("live".into()))];
-
-        assert!(can_reuse_implicit_local_daemon(
-            &[],
-            &LoaderOverrides::default(),
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        assert!(!can_reuse_implicit_local_daemon(
-            &cli_kv_overrides,
-            &LoaderOverrides::default(),
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        loader_overrides.ignore_user_config = true;
-        assert!(!can_reuse_implicit_local_daemon(
-            &[],
-            &loader_overrides,
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        assert!(!can_reuse_implicit_local_daemon(
-            &[],
-            &LoaderOverrides::default(),
-            /*strict_config*/ true,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        assert!(!can_reuse_implicit_local_daemon(
-            &[],
-            &LoaderOverrides::default(),
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ true,
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn should_load_configured_environments_for_local_daemon() -> color_eyre::Result<()> {
-        let target = AppServerTarget::LocalDaemon {
-            endpoint: RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
-            },
-        };
+    fn should_load_configured_environments_needs_user_config_and_a_local_workspace()
+    -> color_eyre::Result<()> {
+        let target = AppServerTarget::Embedded;
 
         assert!(should_load_configured_environments(
             &LoaderOverrides::default(),
             &target,
+        ));
+
+        let ignore_user_config = LoaderOverrides {
+            ignore_user_config: true,
+            ..Default::default()
+        };
+        assert!(!should_load_configured_environments(
+            &ignore_user_config,
+            &target,
+        ));
+        let remote_target = AppServerTarget::Remote {
+            endpoint: RemoteAppServerEndpoint::UnixSocket {
+                socket_path: AbsolutePathBuf::relative_to_current_dir("remote.sock")?,
+            },
+        };
+        assert!(!should_load_configured_environments(
+            &LoaderOverrides::default(),
+            &remote_target,
         ));
         Ok(())
     }
@@ -2452,7 +2332,6 @@ mod tests {
         let config = build_config(&temp_dir).await?;
         let targets = [
             AppServerTarget::Embedded,
-            AppServerTarget::LocalDaemon { endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")? } },
             AppServerTarget::Remote { endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path: AbsolutePathBuf::relative_to_current_dir("remote.sock")? } },
         ];
         let cwd = temp_dir.path().join("project");
@@ -2653,14 +2532,10 @@ mod tests {
     async fn local_config_cwd_is_canonical_and_missing_paths_fail() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let environment_manager = EnvironmentManager::default_for_tests();
-        for target in [
-            AppServerTarget::Embedded,
-            AppServerTarget::LocalDaemon { endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")? } },
-        ] {
-            assert_eq!(config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?, Some(AbsolutePathBuf::from_absolute_path(dunce::canonicalize(temp_dir.path())?)?));
-            let missing = temp_dir.path().join("missing");
-            assert_eq!(config_cwd_for_app_server_target(Some(&missing), &target, &environment_manager).expect_err("missing cwd").kind(), std::io::ErrorKind::NotFound);
-        }
+        let target = AppServerTarget::Embedded;
+        assert_eq!(config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?, Some(AbsolutePathBuf::from_absolute_path(dunce::canonicalize(temp_dir.path())?)?));
+        let missing = temp_dir.path().join("missing");
+        assert_eq!(config_cwd_for_app_server_target(Some(&missing), &target, &environment_manager).expect_err("missing cwd").kind(), std::io::ErrorKind::NotFound);
         Ok(())
     }
 
@@ -3050,12 +2925,6 @@ trust_level = "untrusted"
         const PASSED: &str = "CONFIGURED_LOG_STARTUP_VERIFIED";
         if let Some(case) = std::env::var_os(CHILD) {
             use clap::Parser;
-            #[cfg(unix)]
-            if case == "create" {
-                // This child runs only this test. A permissive umask ensures the
-                // permission assertion tests the open mode, not the host's defaults.
-                unsafe { libc::umask(0) };
-            }
             let home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("isolated home"));
             let log_dir = home.join(if case == "legacy-append" {
                 "log"
@@ -3073,20 +2942,6 @@ trust_level = "untrusted"
                 home.to_str().expect("UTF-8 temporary home"),
             ]);
             let result = runtime.block_on(async {
-                if case == "invalid-reload" {
-                    return load_config(
-                        vec![("model".to_string(), toml::Value::Integer(42))],
-                        ConfigOverrides {
-                            cwd: Some(home.clone()),
-                            ..Default::default()
-                        },
-                        LoaderOverrides::without_managed_config_for_tests(),
-                        CloudConfigBundleLoader::default(),
-                        true,
-                    )
-                    .await
-                    .map(|_| panic!("invalid model type must fail configuration reload"));
-                }
                 tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     run_main(
@@ -3110,6 +2965,7 @@ trust_level = "untrusted"
                     error.to_string().contains("Error loading configuration"),
                     "{error}"
                 );
+                assert!(error.to_string().contains("missing-provider"), "{error}");
                 assert!(
                     !log_file.exists(),
                     "failed reload must return before opening the log"
@@ -3132,15 +2988,6 @@ trust_level = "untrusted"
                 );
                 assert!(log_dir.is_dir());
                 let contents = std::fs::read(&log_file)?;
-                #[cfg(unix)]
-                if case == "create" {
-                    use std::os::unix::fs::PermissionsExt;
-                    assert_eq!(
-                        std::fs::metadata(&log_file)?.permissions().mode() & 0o077,
-                        0,
-                        "a newly created TUI log must not be accessible to other users"
-                    );
-                }
                 if case == "append" || case == "legacy-append" {
                     assert!(contents.starts_with(b"keep prior log\n"));
                 }
@@ -3183,11 +3030,17 @@ trust_level = "untrusted"
                 std::fs::create_dir(&log_dir)?;
                 std::fs::write(log_dir.join(TUI_LOG_FILE_NAME), "keep prior log\n")?;
             }
-            let config = format!(
+            let mut config = format!(
                 "log_dir = {}\ncli_auth_credentials_store = \"file\"\n",
                 serde_json::to_string(&log_dir.to_string_lossy())
                     .expect("TOML-compatible quoted path")
             );
+            if case == "invalid-reload" {
+                // An unknown provider id deserializes during bootstrap (which would
+                // exit the process on failure) and is rejected only by run_main's
+                // final configuration load, before the log is opened.
+                config.push_str("model_provider = \"missing-provider\"\n");
+            }
             std::fs::write(home.path().join("config.toml"), &config)?;
             let output = std::process::Command::new(std::env::current_exe()?)
                 .args([

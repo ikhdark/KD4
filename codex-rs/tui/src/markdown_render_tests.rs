@@ -1319,9 +1319,10 @@ fn table_separates_logical_rows_after_wrapped_content() {
             .then_some(idx)
         })
         .collect();
+    // "debugging" is the cell's last word, so its line is where the wrapped row really ends.
     let wrapped_row_end = lines
         .iter()
-        .position(|line| line.contains("logging output"))
+        .position(|line| line.contains("debugging"))
         .expect("expected final wrapped line");
     assert_eq!(separator_indices.len(), 2);
     assert!(separator_indices[1] > wrapped_row_end);

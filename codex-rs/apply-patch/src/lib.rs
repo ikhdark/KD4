@@ -1891,22 +1891,57 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "same\r\nchanged\r\nlast"
         );
-        assert!(
-            apply_patch(
-                &patch,
-                &cwd,
-                &mut Vec::new(),
-                &mut Vec::new(),
-                LOCAL_FS.as_ref(),
-                None
-            )
-            .await
-            .is_err()
-        );
+        let failure = apply_patch(
+            &patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.delta().is_empty());
+        let (error, _) = failure.into_parts();
+        let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(mismatch.kind, PatchContextMismatchKind::StaleRange);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "same\r\nchanged\r\nlast"
         );
+    }
+
+    #[tokio::test]
+    async fn revision_bound_ranges_reject_overlap_and_reverse_order_before_writes() {
+        for (first, second, valid) in [("2:3", "3:4", false), ("3:4", "1:2", false), ("1:2", "3:4", true)] {
+            let dir = tempdir().unwrap();
+            let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+            let original = "one\ntwo\nthree\nfour\n";
+            fs::write(dir.path().join("source.txt"), original).unwrap();
+            let hash = format!("{:x}", Sha256::digest(original));
+            let patch = wrap_patch(&format!(
+                "*** Add File: prefix.txt\n+prefix\n*** Update File: source.txt\n@@ codex-range {first} sha256:{hash}\n+first replacement\n@@ codex-range {second} sha256:{hash}\n+second replacement"
+            ));
+            let result = apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await;
+            if valid {
+                result.unwrap();
+                assert_eq!(fs::read_to_string(dir.path().join("source.txt")).unwrap(), "first replacement\nsecond replacement\n");
+                assert_eq!(fs::read_to_string(dir.path().join("prefix.txt")).unwrap(), "prefix\n");
+            } else {
+                let failure = result.unwrap_err();
+                assert!(failure.delta().is_empty());
+                assert!(failure.delta().is_exact());
+                let (error, _) = failure.into_parts();
+                let ApplyPatchError::PatchContextMismatch(mismatch) = error else { panic!("{error:?}"); };
+                assert_eq!(mismatch.kind, PatchContextMismatchKind::RangeOrderMismatch);
+                assert_eq!((mismatch.hunk_ordinal, mismatch.chunk_ordinal), (2, 2));
+                assert_eq!(mismatch.current_content_sha256, hash);
+                assert_eq!(fs::read_to_string(dir.path().join("source.txt")).unwrap(), original);
+                assert!(!dir.path().join("prefix.txt").exists());
+            }
+        }
     }
 
     #[test]
@@ -1960,8 +1995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revision_bound_replacements_reduce_payload_without_changing_bytes_or_freshness() {
-        let mut measurements = Vec::new();
+    async fn revision_bound_replacements_match_contextual_bytes_and_reject_stale_revisions() {
         for count in [64, 256, 1024] {
             for newline in ["\n", "\r\n"] {
                 for trailing_newline in [false, true] {
@@ -2031,16 +2065,9 @@ mod tests {
                     .unwrap_err();
                     assert!(error.delta().is_empty());
                     assert_eq!(fs::read(path).unwrap(), drifted.as_bytes());
-                    assert!(compact.len() < ordinary.len());
-                    measurements.push(serde_json::json!({
-                        "lines_replaced": count, "crlf": newline == "\r\n",
-                        "trailing_newline": trailing_newline,
-                        "contextual_patch_bytes": ordinary.len(), "range_patch_bytes": compact.len(),
-                    }));
                 }
             }
         }
-        eprintln!("range_patch_comparison {}", serde_json::json!(measurements));
     }
 
     #[tokio::test]
@@ -2068,6 +2095,16 @@ mod tests {
             .unwrap_err();
             assert!(failure.delta().is_empty());
             assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+            // The patch itself is well formed; only the source precondition fails.
+            let (error, _) = failure.into_parts();
+            let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+                panic!("{body:?}: {error:?}");
+            };
+            assert_eq!(
+                mismatch.kind,
+                PatchContextMismatchKind::ExpectedLinesNotFound,
+                "{body:?}"
+            );
         }
         for (contents, body, expected) in [
             ("alpha\n\n", "@@\n-\n+replacement", "alpha\nreplacement\n"),
@@ -2459,7 +2496,10 @@ mod tests {
 
         let (start, end, excerpt) =
             bounded_patch_mismatch_excerpt(&lines, &chunk).expect("anchored candidate");
-        assert!(start <= 2 && end >= 4, "{start}-{end}");
+        // The anchored candidate first differs at line 4, shown with three
+        // context lines either side. The other tied candidate would give 2-8
+        // and the single-line fallback at the anchor 1-5.
+        assert_eq!((start, end), (1, 7));
         assert!(excerpt.contains("static LOCK"), "{excerpt}");
         assert!(excerpt.contains("#[test]"), "{excerpt}");
     }
@@ -2550,7 +2590,10 @@ mod tests {
 
     #[test]
     fn patch_context_mismatch_excerpt_is_utf8_and_byte_bounded() {
-        let long_line = "é".repeat(PATCH_MISMATCH_MAX_BYTES);
+        // Three-byte characters: the 4064 bytes left for this line after the
+        // anchor line and both prefixes end inside a character, so truncation
+        // has to back up to a boundary instead of cutting at the budget.
+        let long_line = "\u{754c}".repeat(PATCH_MISMATCH_MAX_BYTES);
         let lines = vec![
             "unique-anchor".to_string(),
             long_line,
@@ -2565,10 +2608,12 @@ mod tests {
 
         let (start, end, excerpt) =
             bounded_patch_mismatch_excerpt(&lines, &chunk).expect("unique mismatch location");
-        assert_eq!(start, 1);
-        assert!(end <= PATCH_MISMATCH_MAX_LINES);
+        // The excerpt stops in the mismatched line, kept up to the last whole
+        // character that fits the budget.
+        assert_eq!((start, end), (1, 2));
         assert!(excerpt.len() <= PATCH_MISMATCH_MAX_BYTES);
-        assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
+        assert!(excerpt.len() > PATCH_MISMATCH_MAX_BYTES - '\u{754c}'.len_utf8());
+        assert!(excerpt.ends_with('\u{754c}'));
     }
 
     #[tokio::test]
@@ -3318,29 +3363,35 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 
-        // When a later chunk fails, re-checking each chunk alone must not
-        // report the anchored chunk as ambiguous.
-        let patch = wrap_patch(&format!(
-            "*** Update File: {}\n@@\n     1 => (\n@@\n     ),\n+    3 => (),\n@@\n-    missing => (),",
-            path.display()
-        ));
-        let failure = apply_patch(
-            &patch,
-            &PathUri::from_host_native_path(dir.path()).unwrap(),
-            &mut Vec::<u8>::new(),
-            &mut Vec::<u8>::new(),
-            LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(
-            failure.contains("Failed to find expected lines"),
-            "{failure}"
-        );
-        assert!(!failure.contains("Ambiguous"), "{failure}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // When a chunk fails, re-checking chunks alone must not report the
+        // anchored chunk as ambiguous. Only chunks after the failing one are
+        // re-checked, so the anchored chunk is placed on either side of it.
+        for chunks in [
+            "@@\n     1 => (\n@@\n     ),\n+    3 => (),\n@@\n-    missing => (),",
+            "@@\n     1 => (\n@@\n-    missing => (),\n@@\n     ),\n+    3 => (),",
+        ] {
+            let patch = wrap_patch(&format!(
+                "*** Update File: {}\n{chunks}",
+                path.display()
+            ));
+            let failure = apply_patch(
+                &patch,
+                &PathUri::from_host_native_path(dir.path()).unwrap(),
+                &mut Vec::<u8>::new(),
+                &mut Vec::<u8>::new(),
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                failure.contains("Failed to find expected lines"),
+                "{failure}"
+            );
+            assert!(!failure.contains("Ambiguous"), "{failure}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[tokio::test]

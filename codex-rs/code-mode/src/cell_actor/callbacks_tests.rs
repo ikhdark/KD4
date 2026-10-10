@@ -20,7 +20,10 @@ use crate::session_runtime::ToolName;
 
 struct PanickingCallbackHost;
 
-struct NonCooperativeCallbackHost;
+#[derive(Default)]
+struct NonCooperativeCallbackHost {
+    notify_token: std::sync::Mutex<Option<CancellationToken>>,
+}
 
 struct SlowSetupCallbackHost {
     setup: Duration,
@@ -162,8 +165,9 @@ impl CellHost for NonCooperativeCallbackHost {
         &self,
         _call_id: String,
         _text: String,
-        _cancellation_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> Result<(), String> {
+        *self.notify_token.lock().unwrap() = Some(cancellation_token);
         std::future::pending().await
     }
 
@@ -231,7 +235,7 @@ async fn tool_callback_timeout_rejects_the_js_promise_and_cancels_the_delegate()
         let cancellation_token = CancellationToken::new();
         spawn_tool(
             &mut tasks,
-            Arc::new(NonCooperativeCallbackHost),
+            Arc::new(NonCooperativeCallbackHost::default()),
             CellToolCall {
                 id: "tool-timeout".to_string(),
                 name: ToolName {
@@ -278,9 +282,10 @@ async fn notification_timeout_rejects_the_js_promise_and_cancels_the_delegate() 
     let mut tasks = JoinSet::new();
     let (runtime_tx, runtime_rx) = std_mpsc::channel();
     let cancellation_token = CancellationToken::new();
+    let host = Arc::new(NonCooperativeCallbackHost::default());
     spawn_notification(
         &mut tasks,
-        Arc::new(NonCooperativeCallbackHost),
+        Arc::clone(&host),
         NotificationInvocation {
             id: Some("notify-timeout".to_string()),
             call_id: "call-1".to_string(),
@@ -311,6 +316,9 @@ async fn notification_timeout_rejects_the_js_promise_and_cancels_the_delegate() 
         "code mode notification exceeded its 60000ms timeout"
     );
     assert!(cancellation_token.is_cancelled());
+    // The delegate holds its own delivery token, not the cell's.
+    let delivery_token = host.notify_token.lock().unwrap().clone().expect("delegate was notified");
+    assert!(delivery_token.is_cancelled());
 }
 
 #[tokio::test]
@@ -381,7 +389,7 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
 
     spawn_tool(
         &mut tool_tasks,
-        Arc::new(NonCooperativeCallbackHost),
+        Arc::new(NonCooperativeCallbackHost::default()),
         CellToolCall {
             id: "tool-stuck".to_string(),
             name: ToolName {
@@ -400,7 +408,7 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
     );
     spawn_notification(
         &mut notification_tasks,
-        Arc::new(NonCooperativeCallbackHost),
+        Arc::new(NonCooperativeCallbackHost::default()),
         NotificationInvocation {
             id: Some("notify-stuck".to_string()),
             call_id: "call-1".to_string(),
@@ -428,7 +436,10 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
         assert!(tool_cancellation.token().is_cancelled());
     });
     tokio::task::yield_now().await;
-    tokio::time::advance(CALLBACK_CANCELLATION_GRACE).await;
+    tokio::time::advance(CALLBACK_CANCELLATION_GRACE - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!cleanup.is_finished(), "callbacks keep the whole grace");
+    tokio::time::advance(Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
     cleanup
         .await
@@ -477,7 +488,7 @@ async fn ordinary_completion_keeps_notification_delivery_timeout() {
     let (runtime_tx, runtime_rx) = std_mpsc::channel();
     spawn_notification(
         &mut notifications,
-        Arc::new(NonCooperativeCallbackHost),
+        Arc::new(NonCooperativeCallbackHost::default()),
         NotificationInvocation {
             id: Some("accepted".into()),
             call_id: "call-1".into(),

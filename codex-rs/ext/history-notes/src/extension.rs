@@ -315,8 +315,12 @@ mod tests {
             tools
                 .iter()
                 .filter(|tool| !tool.supports_parallel_tool_calls())
-                .count(),
-            2
+                .map(|tool| tool.tool_name())
+                .collect::<Vec<_>>(),
+            vec![
+                codex_extension_api::ToolName::namespaced("notes", "append_to_file"),
+                codex_extension_api::ToolName::namespaced("notes", "write_file"),
+            ]
         );
         assert!(
             tools

@@ -660,7 +660,8 @@ fn recommended_plugins_require_remote_install_identity() {
         }]
     }));
 
-    assert!(response.is_err());
+    let error = response.expect_err("a recommendation without a remote ID must be rejected");
+    assert!(error.to_string().contains("missing field `id`"), "{error}");
 }
 
 #[test]

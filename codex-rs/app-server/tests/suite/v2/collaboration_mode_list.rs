@@ -15,7 +15,7 @@ use codex_app_server_protocol::CollaborationModeListResponse;
 use codex_app_server_protocol::CollaborationModeMask;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
-use codex_core::test_support::builtin_collaboration_mode_presets;
+use codex_protocol::config_types::ModeKind;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -49,15 +49,21 @@ async fn list_collaboration_modes_returns_presets() -> Result<()> {
     let CollaborationModeListResponse { data: items } =
         to_response::<CollaborationModeListResponse>(response)?;
 
-    let expected: Vec<CollaborationModeMask> = builtin_collaboration_mode_presets()
-        .into_iter()
-        .map(|preset| CollaborationModeMask {
-            name: preset.name,
-            mode: preset.mode,
-            model: preset.model,
-            reasoning_effort: preset.reasoning_effort,
-        })
-        .collect();
+    // Keep the public preset contract independent of the production generator.
+    let expected = vec![
+        CollaborationModeMask {
+            name: "Plan".to_string(),
+            mode: Some(ModeKind::Plan),
+            model: None,
+            reasoning_effort: None,
+        },
+        CollaborationModeMask {
+            name: "Default".to_string(),
+            mode: Some(ModeKind::Default),
+            model: None,
+            reasoning_effort: None,
+        },
+    ];
     assert_eq!(expected, items);
     Ok(())
 }

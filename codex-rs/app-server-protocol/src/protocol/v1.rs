@@ -12,7 +12,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 pub use codex_protocol::protocol::GitSha;
 use codex_protocol::protocol::ReviewDecision;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
@@ -197,15 +196,6 @@ pub struct GitDiffToRemoteParams {
 pub struct GetAuthStatusParams {
     pub include_token: Option<bool>,
     pub refresh_token: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecOneOffCommandParams {
-    pub command: Vec<String>,
-    pub timeout_ms: Option<u64>,
-    pub cwd: Option<PathBuf>,
-    pub sandbox_policy: Option<SandboxPolicy>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, TS)]

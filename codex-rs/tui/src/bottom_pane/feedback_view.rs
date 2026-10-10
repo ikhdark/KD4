@@ -652,17 +652,14 @@ mod tests {
 
     #[test]
     fn feedback_note_category_snapshots() {
-        for (category, include_logs, name) in [
-            (FeedbackCategory::BadResult, true, "feedback_view_bad_result"),
-            (FeedbackCategory::GoodResult, true, "feedback_view_good_result"),
-            (FeedbackCategory::Bug, true, "feedback_view_bug"),
-            (FeedbackCategory::Other, true, "feedback_view_other"),
-            (FeedbackCategory::SafetyCheck, true, "feedback_view_safety_check"),
-            // Preserve the existing snapshot identity for the no-logs note.
-            (FeedbackCategory::Bug, false, "feedback_view_with_connectivity_diagnostics"),
+        for (category, name) in [
+            (FeedbackCategory::BadResult, "feedback_view_bad_result"),
+            (FeedbackCategory::GoodResult, "feedback_view_good_result"),
+            (FeedbackCategory::Bug, "feedback_view_bug"),
+            (FeedbackCategory::Other, "feedback_view_other"),
+            (FeedbackCategory::SafetyCheck, "feedback_view_safety_check"),
         ] {
-            let mut view = make_view(category);
-            view.include_logs = include_logs;
+            let view = make_view(category);
             let rendered = render(&view, /*width*/ 60);
             insta::assert_snapshot!(name, rendered);
         }
@@ -695,8 +692,24 @@ mod tests {
             let area = Rect::new(3, 2, 24, height);
             let input = view.input_area(area);
             assert!(input.bottom() <= area.bottom());
-            let mut buf = Buffer::empty(area);
+            // Paragraph and Clear clip to the buffer, so a buffer sized to `area`
+            // would hide stray writes; render into a larger sentinel-filled one.
+            let mut buf = Buffer::empty(Rect::new(0, 0, 30, 12));
+            for cell in &mut buf.content {
+                cell.set_symbol("~");
+            }
             view.render(area, &mut buf);
+            for y in 0..12u16 {
+                for x in 0..30u16 {
+                    if !area.contains((x, y).into()) {
+                        assert_eq!(
+                            buf[(x, y)].symbol(),
+                            "~",
+                            "write outside {area:?} at {x},{y}"
+                        );
+                    }
+                }
+            }
             if let Some((x, y)) = view.cursor_pos(area) {
                 assert!(area.contains((x, y).into()));
             }

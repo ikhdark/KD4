@@ -439,6 +439,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_backpressured_request_does_not_leave_a_callback_or_request() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
+        let outgoing = OutgoingMessageSender::new(outgoing_tx);
+        outgoing
+            .send_notification(OutgoingNotification {
+                method: "occupied".to_string(),
+                params: None,
+            })
+            .await;
+        {
+            let send = outgoing.send_request("elicitation/create", None);
+            tokio::pin!(send);
+            tokio::select! {
+                biased;
+                _ = &mut send => panic!("full transport must block request admission"),
+                _ = std::future::ready(()) => {}
+            }
+            assert!(outgoing.request_id_to_callback.lock().await.is_empty());
+        }
+        assert!(outgoing.request_id_to_callback.lock().await.is_empty());
+        assert!(matches!(
+            outgoing_rx.recv().await,
+            Some(OutgoingMessage::Notification(OutgoingNotification { method, .. }))
+                if method == "occupied"
+        ));
+        assert!(matches!(
+            outgoing_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let pending = outgoing
+            .send_request("elicitation/create", Some(json!({"message": "next"})))
+            .await
+            .expect("cancellation must release transport admission");
+        let Some(OutgoingMessage::Request(request)) = outgoing_rx.recv().await else {
+            panic!("expected the next admitted request");
+        };
+        assert_eq!(request.id, pending.id);
+        assert_eq!(request.params, Some(json!({"message": "next"})));
+        outgoing
+            .notify_client_response(request.id, json!({"action": "decline"}))
+            .await;
+        assert_eq!(pending.receiver.await.unwrap(), json!({"action": "decline"}));
+        assert!(outgoing.request_id_to_callback.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn cancelling_an_elicitation_removes_its_callback() {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
         let outgoing = OutgoingMessageSender::new(outgoing_tx);

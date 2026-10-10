@@ -121,25 +121,35 @@ async fn typed_patch_commits_without_mutation_snapshots() {
         call_id: "evidence-failure".into(),
         tool_name: codex_tools::ToolName::plain("apply_patch"),
     };
+    let permissions = PermissionProfile::Disabled;
+    let codex_home = home.path().to_path_buf().abs();
+    let workspace_root = repo.path().to_path_buf().abs();
+    let attempt = SandboxAttempt {
+        codex_home: &codex_home,
+        sandbox: SandboxType::None,
+        sandbox_requested: false,
+        permissions: &permissions,
+        exec_server_permissions: &permissions,
+        enforce_managed_network: false,
+        sandbox_cwd: &cwd,
+        workspace_roots: std::slice::from_ref(&workspace_root),
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+        network_denial_cancellation_token: None,
+        network_proxy: None,
+    };
     let mut runtime = ApplyPatchRuntime::new();
-    runtime.begin_workspace_tracking(&req, &ctx).await.unwrap();
-    runtime.committed_delta = codex_apply_patch::apply_patch(
-        &req.action.patch,
-        &cwd,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        codex_exec_server::LOCAL_FS.as_ref(),
-        None,
-    )
-    .await
-    .unwrap();
+    let output = runtime.run(&req, &attempt, &ctx).await.unwrap();
     runtime.finish_pending_workspace_tracking(&ctx).await;
+    assert_eq!(output.exec_output.exit_code, 0);
+    assert_eq!(output.delta.changes().len(), 1);
     assert_eq!(
         std::fs::read_to_string(repo.path().join("written.txt")).unwrap(),
         "committed\n"
     );
-    assert_eq!(runtime.committed_delta().changes().len(), 1);
     assert!(!home.path().join("agent-task-coordination/snapshots").exists());
+    // Each call owns its runtime, and the runtime holds the patch gate until dropped.
+    drop(runtime);
 
     // A second call in the same bound attempt may edit the same path. Tracking
     // must not treat the earlier completed call as finalization of that path.
@@ -148,23 +158,14 @@ async fn typed_patch_commits_without_mutation_snapshots() {
             .into();
     ctx.call_id = "follow-up-edit".into();
     let mut follow_up = ApplyPatchRuntime::new();
-    follow_up.begin_workspace_tracking(&req, &ctx).await.unwrap();
-    follow_up.committed_delta = codex_apply_patch::apply_patch(
-        &req.action.patch,
-        &cwd,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        codex_exec_server::LOCAL_FS.as_ref(),
-        None,
-    )
-    .await
-    .unwrap();
+    let output = follow_up.run(&req, &attempt, &ctx).await.unwrap();
     follow_up.finish_pending_workspace_tracking(&ctx).await;
+    assert_eq!(output.exec_output.exit_code, 0);
+    assert_eq!(output.delta.changes().len(), 1);
     assert_eq!(
         std::fs::read_to_string(repo.path().join("written.txt")).unwrap(),
         "updated\n"
     );
-    assert_eq!(follow_up.committed_delta().changes().len(), 1);
     assert!(!home.path().join("agent-task-coordination/snapshots").exists());
 }
 
@@ -502,6 +503,7 @@ async fn file_system_sandbox_context_uses_active_attempt() {
         .try_into()
         .expect("native sandbox permissions");
     assert_eq!(native_permissions, expected_permissions);
+    assert_eq!(sandbox.workspace_roots, vec![PathUri::from_abs_path(&path)]);
     assert_eq!(
         sandbox.cwd,
         Some(codex_utils_path_uri::PathUri::from_abs_path(&path))

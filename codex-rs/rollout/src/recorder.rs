@@ -408,14 +408,6 @@ enum ThreadListRepairMode {
     StateDbOnly,
 }
 
-fn warn_thread_list_db_fallback() {
-    tracing::warn!(
-        operation = "list_threads",
-        reason = "db_error",
-        "state DB listing failed; using filesystem rollout scan"
-    );
-}
-
 fn initial_harness_build_info() -> codex_protocol::protocol::SessionBuildInfo {
     let build = codex_utils_build_info::BuildInfo::current();
     codex_protocol::protocol::SessionBuildInfo {
@@ -816,29 +808,20 @@ impl RolloutRecorder {
             )
             .await);
         }
-        if listing_has_metadata_filters {
-            let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
-            codex_state::record_fallback(
-                "list_threads",
-                "db_error",
-                /*telemetry_override*/ None,
-            );
-            return Ok(overlay_thread_item_metadata_from_state_db(
-                state_db_ctx.as_deref(),
-                page,
-                &reconciled_ids,
-            )
-            .await);
-        }
-        // If SQLite listing still fails, return the filesystem page rather than failing the list.
-        warn_thread_list_db_fallback();
-        codex_state::record_fallback("list_threads", "db_error", /*telemetry_override*/ None);
-        Ok(page_from_filesystem_scan(
-            fs_page,
-            sort_direction,
-            page_size,
-            sort_key,
-        ))
+        // SQLite listing failed and list_threads_db already logged why. Return the
+        // filesystem page rather than failing the list.
+        let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
+        codex_state::record_fallback(
+            "list_threads",
+            "db_error",
+            /*telemetry_override*/ None,
+        );
+        Ok(overlay_thread_item_metadata_from_state_db(
+            state_db_ctx.as_deref(),
+            page,
+            &reconciled_ids,
+        )
+        .await)
     }
 
     fn db_hit_needs_reconciliation(

@@ -35,6 +35,49 @@ fn review_prompt_template_renders_commit_variant() {
 }
 
 #[test]
+fn resolves_custom_review_without_losing_target_or_explicit_hint() {
+    let cwd = AbsolutePathBuf::current_dir().expect("cwd");
+    let target = ReviewTarget::Custom {
+        instructions: " \n Review Unicode λ changes \t ".to_string(),
+    };
+    for hint in [None, Some("chosen label"), Some("")] {
+        let resolved = resolve_review_request(
+            ReviewRequest {
+                target: target.clone(),
+                user_facing_hint: hint.map(str::to_string),
+            },
+            &cwd,
+        )
+        .expect("valid review request");
+        assert_eq!(resolved.prompt, "Review Unicode λ changes");
+        assert_eq!(resolved.target, target);
+        let expected_hint = hint.unwrap_or("Review Unicode λ changes");
+        assert_eq!(resolved.user_facing_hint, expected_hint);
+        let restored: ReviewRequest = resolved.into();
+        assert_eq!(restored.target, target);
+        assert_eq!(restored.user_facing_hint.as_deref(), Some(expected_hint));
+    }
+}
+
+#[test]
+fn rejects_blank_custom_review_even_with_a_user_facing_hint() {
+    let cwd = AbsolutePathBuf::current_dir().expect("cwd");
+    for instructions in ["", " \r\n\t", "\u{2003}"] {
+        let error = resolve_review_request(
+            ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: instructions.to_string(),
+                },
+                user_facing_hint: Some("not a review prompt".to_string()),
+            },
+            &cwd,
+        )
+        .expect_err("labels cannot make an empty review task executable");
+        assert_eq!(error.to_string(), "Review prompt cannot be empty");
+    }
+}
+
+#[test]
 fn review_rubric_stays_compact_without_losing_output_contracts() {
     assert!(
         REVIEW_PROMPT.len() <= 5_000,

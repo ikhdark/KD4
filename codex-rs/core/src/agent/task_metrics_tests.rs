@@ -304,24 +304,14 @@ fn rejects_inconsistent_or_unbounded_inputs() {
         ],
         ..metric_input()
     };
+    // Called directly: the test-only `evaluate` wrapper rejects oversized input
+    // itself, before the runtime bound is ever consulted.
     assert_eq!(
-        TaskMetrics::evaluate(too_many_usage_rows),
-        Err(MetricsError::TooManyRows)
-    );
-
-    let too_many_concurrency_rows = TaskMetricInput {
-        concurrency: vec![
-            ConcurrencySlice {
-                duration: Duration::ZERO,
-                active_turns: 0,
-                capacity: 5,
-            };
-            MAX_METRIC_ROWS + 1
-        ],
-        ..metric_input()
-    };
-    assert_eq!(
-        TaskMetrics::evaluate(too_many_concurrency_rows),
+        TaskMetrics::evaluate_with_concurrency_totals(
+            too_many_usage_rows,
+            Duration::ZERO,
+            Duration::ZERO,
+        ),
         Err(MetricsError::TooManyRows)
     );
 }

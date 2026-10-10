@@ -15,17 +15,15 @@ use crate::tools::exposure::DirectMcpToolEntrypoint;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DirectMcpToolSelection {
-    pub(crate) legacy_server_names: HashSet<String>,
     exact_tools: BTreeSet<DirectMcpToolEntrypoint>,
 }
 
 impl DirectMcpToolSelection {
     fn includes(&self, tool: &McpToolInfo) -> bool {
-        self.legacy_server_names.contains(&tool.server_name)
-            || self.exact_tools.contains(&DirectMcpToolEntrypoint {
-                server_name: tool.server_name.clone(),
-                tool_name: tool.tool.name.to_string(),
-            })
+        self.exact_tools.contains(&DirectMcpToolEntrypoint {
+            server_name: tool.server_name.clone(),
+            tool_name: tool.tool.name.to_string(),
+        })
     }
 }
 

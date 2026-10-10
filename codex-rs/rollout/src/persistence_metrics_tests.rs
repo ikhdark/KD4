@@ -140,10 +140,11 @@ fn retained_items_are_byte_identical() {
         serde_json::to_vec(&persisted[0]).expect("serialize persisted item"),
         serde_json::to_vec(&item).expect("serialize candidate item")
     );
-    assert_eq!(
-        measurement.post_filter.payload_bytes,
-        measurement.items[0].payload_bytes.expect("payload bytes")
-    );
+    let item_bytes = serde_json::to_vec(&item)
+        .expect("serialize candidate item")
+        .len() as u64;
+    assert_eq!(measurement.post_filter.payload_bytes, item_bytes);
+    assert_eq!(measurement.items[0].payload_bytes, Some(item_bytes));
 }
 
 #[test]

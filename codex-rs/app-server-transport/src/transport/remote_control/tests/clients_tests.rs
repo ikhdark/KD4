@@ -352,7 +352,7 @@ async fn revoke_remote_control_client_does_not_retry_forbidden() {
         let request = accept_http_request(&listener).await;
         assert_eq!(
             request.headers.get("authorization"),
-            Some(&"Bearer Access Token".to_string())
+            Some(&"Bearer stale-token".to_string())
         );
         assert_eq!(
             request.headers.get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
@@ -365,11 +365,55 @@ async fn revoke_remote_control_client_does_not_retry_forbidden() {
             "forbidden",
         )
         .await;
+
+        // Fresher auth is on disk, so a retry after recovery would arrive here.
+        assert!(
+            timeout(Duration::from_millis(100), accept_http_request(&listener))
+                .await
+                .is_err()
+        );
     });
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let mut stale_auth = remote_control_auth_dot_json(Some("account_id"));
+    stale_auth
+        .tokens
+        .as_mut()
+        .expect("stale auth should include tokens")
+        .access_token = "stale-token".to_string();
+    save_auth(
+        codex_home.path(),
+        &stale_auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("stale auth should save");
+    let auth_manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let mut fresh_auth = remote_control_auth_dot_json(Some("account_id"));
+    fresh_auth
+        .tokens
+        .as_mut()
+        .expect("fresh auth should include tokens")
+        .access_token = "fresh-token".to_string();
+    save_auth(
+        codex_home.path(),
+        &fresh_auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("fresh auth should save");
 
     let err = revoke_remote_control_client(
         &remote_control_url,
-        &remote_control_auth_manager(),
+        &auth_manager,
         RemoteControlClientsRevokeParams {
             environment_id: "env-123".to_string(),
             client_id: "client-123".to_string(),

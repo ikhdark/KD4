@@ -357,6 +357,12 @@ async fn marketplace_errors_show_actionable_backend_reason() {
         Err("Cannot remove a managed marketplace".to_string()),
     );
     assert!(render_bottom_popup(&chat, 120).contains("Cannot remove a managed marketplace"));
+    // The params check above never runs the add-failure handler that shows the popup.
+    chat.on_marketplace_add_loaded(
+        chat.config.cwd.to_path_buf(),
+        Err("Authentication required for this source".to_string()),
+    );
+    assert!(render_bottom_popup(&chat, 120).contains("Authentication required for this source"));
 }
 
 #[tokio::test]

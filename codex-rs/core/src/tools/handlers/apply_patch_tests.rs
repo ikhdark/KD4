@@ -41,12 +41,13 @@ async fn patch_reports_only_added_line_whitespace_and_conflict_diagnostics() {
     let payload = call.payload.clone();
     let result = ApplyPatchHandler::default().handle(call).await.unwrap().code_mode_result(&payload);
     assert_eq!(result["success"], true);
-    let diagnostics = result["diagnostics"].as_array().unwrap();
-    assert_eq!(diagnostics.len(), 5, "{result}");
-    assert_eq!(diagnostics[0]["line"], 2);
-    assert_eq!(diagnostics[0]["kind"], "trailing_whitespace");
-    assert_eq!(diagnostics[1]["kind"], "space_before_tab");
-    assert!(diagnostics[2..].iter().all(|item| item["kind"] == "conflict_marker"));
+    assert_eq!(result["diagnostics"], json!([
+        {"path": path, "line": 2, "kind": "trailing_whitespace"},
+        {"path": path, "line": 3, "kind": "space_before_tab"},
+        {"path": path, "line": 4, "kind": "conflict_marker"},
+        {"path": path, "line": 5, "kind": "conflict_marker"},
+        {"path": path, "line": 6, "kind": "conflict_marker"},
+    ]));
 }
 
 #[tokio::test]
@@ -87,6 +88,7 @@ async fn retained_retry_reaches_filesystem_once_and_hooks_see_expanded_code() {
     assert_eq!(diagnostic["hunk_ordinal"], 1);
     assert_eq!(diagnostic["chunk_ordinal"], 1);
     assert_eq!(diagnostic["current_content_sha256"], failed["retry"]["observed_source"]["sha256"]);
+    assert_eq!(diagnostic["current_content_sha256"], crate::tool_history::sha256(b"current\n"));
     assert!(diagnostic["current_excerpt"].is_string());
     assert!(diagnostic["current_line_start"].is_number());
     call.call_id = "retained-retry".into();

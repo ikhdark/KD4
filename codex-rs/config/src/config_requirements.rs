@@ -1920,8 +1920,9 @@ mod tests {
 
     #[test]
     fn deserialize_filesystem_deny_read_requirements() -> Result<()> {
-        let deny_read_0 = r"C:\Users\alice\.gitconfig";
-        let deny_read_1 = r"C:\Users\alice\.ssh";
+        let home = tempfile::tempdir()?;
+        let deny_read_0 = home.path().join(".gitconfig");
+        let deny_read_1 = home.path().join(".ssh");
         let toml_str = format!(
             r#"
             [permissions.filesystem]
@@ -1937,8 +1938,8 @@ mod tests {
             Some(Sourced::new(
                 FilesystemConstraints {
                     deny_read: vec![
-                        AbsolutePathBuf::from_absolute_path(deny_read_0)?.into(),
-                        AbsolutePathBuf::from_absolute_path(deny_read_1)?.into(),
+                        AbsolutePathBuf::from_absolute_path(&deny_read_0)?.into(),
+                        AbsolutePathBuf::from_absolute_path(&deny_read_1)?.into(),
                     ],
                 },
                 RequirementSource::Unknown,
@@ -2442,7 +2443,7 @@ mod tests {
         let config: ConfigRequirementsToml = from_str(toml_str)?;
         let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
 
-        let root = "C:\\repo";
+        let root = tempfile::tempdir()?;
         assert!(
             requirements
                 .permission_profile
@@ -2450,7 +2451,7 @@ mod tests {
                 .is_ok()
         );
         let workspace_write_profile = PermissionProfile::workspace_write_with(
-            &[AbsolutePathBuf::from_absolute_path(root)?],
+            &[AbsolutePathBuf::from_absolute_path(root.path())?],
             NetworkSandboxPolicy::Restricted,
             /*exclude_tmpdir_env_var*/ false,
             /*exclude_slash_tmp*/ false,
@@ -2557,9 +2558,9 @@ mod tests {
         );
 
         let requirements = ConfigRequirements::try_from(requirements_with_sources)?;
-        let root = "C:\\repo";
+        let root = tempfile::tempdir()?;
         let workspace_write_profile = PermissionProfile::workspace_write_with(
-            &[AbsolutePathBuf::from_absolute_path(root)?],
+            &[AbsolutePathBuf::from_absolute_path(root.path())?],
             NetworkSandboxPolicy::Restricted,
             /*exclude_tmpdir_env_var*/ false,
             /*exclude_slash_tmp*/ false,
@@ -2753,6 +2754,10 @@ statusMessage = "checking"
         assert_eq!(
             hooks.managed_dir.as_deref(),
             Some(std::path::Path::new("/enterprise/hooks"))
+        );
+        assert_eq!(
+            hooks.windows_managed_dir.as_deref(),
+            Some(std::path::Path::new(r"C:\enterprise\hooks"))
         );
         assert_eq!(hooks.handler_count(), 1);
         assert_eq!(hooks.hooks.pre_tool_use.len(), 1);

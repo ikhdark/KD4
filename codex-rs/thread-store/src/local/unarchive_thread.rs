@@ -177,7 +177,11 @@ mod tests {
         std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::fs::write(&destination, "must survive").unwrap();
         let original = std::fs::read(&archived).unwrap();
-        assert!(store.unarchive_thread(ArchiveThreadParams { thread_id }).await.is_err());
+        let error = store.unarchive_thread(ArchiveThreadParams { thread_id }).await.unwrap_err();
+        assert!(
+            matches!(&error, ThreadStoreError::Internal { message } if message.contains("conflicting rollout destination")),
+            "{error:?}"
+        );
         assert_eq!(std::fs::read(&archived).unwrap(), original);
         assert_eq!(std::fs::read_to_string(destination).unwrap(), "must survive");
     }
@@ -214,6 +218,14 @@ mod tests {
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid)
             .expect("archived session file");
+        let old_modified_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archived_path)
+            .expect("open archived session")
+            .set_times(std::fs::FileTimes::new().set_modified(old_modified_time))
+            .expect("set archived session mtime");
 
         codex_rollout::append_thread_name(home.path(), thread_id, "Named archive")
             .await
@@ -239,6 +251,10 @@ mod tests {
                 .expect("modified")
                 .into();
         assert_eq!(thread.updated_at, modified);
+        assert!(
+            modified > chrono::DateTime::<Utc>::from(old_modified_time),
+            "unarchive should refresh the restored rollout mtime"
+        );
         assert_eq!(thread.archived_at, None);
         assert_eq!(thread.preview, "Archived user message");
         assert_eq!(

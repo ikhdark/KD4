@@ -182,6 +182,8 @@ async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
 
     let first_request = requests.first().expect("expected first request");
     let second_request = requests.last().expect("expected second request");
+    assert_eq!(first_request.body_json()["model"], INITIAL_MODEL);
+    assert_eq!(second_request.body_json()["model"], NEXT_MODEL);
     let session_base_instructions = first_request.instructions_text();
     assert_eq!(session_base_instructions, SESSION_BASE_INSTRUCTIONS);
     assert_eq!(
@@ -274,7 +276,14 @@ async fn model_switch_with_unchanged_personality_reinjects_personality_delta() -
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 2, "expected two model requests");
 
+    assert_eq!(requests[0].body_json()["model"], "gpt-5.4");
+    assert!(requests[0].message_input_texts("developer").iter().any(|text| {
+        text.contains("<personality_spec>")
+            && text.contains("Be concise, direct, and engineering-focused.")
+    }));
     let second_request = requests.last().expect("expected second request");
+    let body = second_request.body_json();
+    assert_eq!(body["model"], next_model);
     let developer_texts = second_request.message_input_texts("developer");
     assert!(
         developer_texts
@@ -285,8 +294,9 @@ async fn model_switch_with_unchanged_personality_reinjects_personality_delta() -
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected the new model to receive the unchanged personality wording"
+            .any(|text| text.contains("<personality_spec>")
+                && text.contains("You are a deeply pragmatic, effective software engineer.")),
+        "the new model must receive its own personality wording, not only replayed old instructions"
     );
 
     Ok(())
@@ -561,17 +571,19 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
     assert_eq!(requests.len(), 2, "expected two model requests");
 
     let first_request = requests.first().expect("expected first request");
-    assert!(
-        !first_request.message_input_image_urls("user").is_empty(),
-        "first request should include the uploaded image"
-    );
+    assert_eq!(first_request.body_json()["model"], image_model_slug);
+    assert_eq!(first_request.message_input_image_urls("user"), vec![image_url]);
 
     let second_request = requests.last().expect("expected second request");
     assert!(
         second_request.message_input_image_urls("user").is_empty(),
         "second request should strip unsupported image content"
     );
+    assert_eq!(second_request.body_json()["model"], text_model_slug);
     let second_user_texts = second_request.message_input_texts("user");
+    for prompt in ["first turn", "second turn"] {
+        assert_eq!(second_user_texts.iter().filter(|text| text.as_str() == prompt).count(), 1);
+    }
     assert!(
         second_user_texts
             .iter()
@@ -758,6 +770,8 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
     assert_eq!(requests.len(), 2, "expected two model requests");
 
     let second_request = requests.last().expect("expected second request");
+    assert_eq!(requests[0].body_json()["model"], image_model_slug);
+    assert_eq!(second_request.body_json()["model"], text_model_slug);
     let image_generation_calls = second_request.inputs_of_type("image_generation_call");
     assert!(
         second_request.message_input_image_urls("user").is_empty(),
@@ -870,6 +884,12 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
     assert_eq!(requests.len(), 2, "expected two model requests");
 
     let second_request = requests.last().expect("expected second request");
+    assert_eq!(
+        second_request.message_input_texts("user").iter()
+            .filter(|text| text.as_str() == "after rollback").count(),
+        1,
+        "rollback must not discard the new user turn"
+    );
     assert!(
         !second_request
             .message_input_texts("user")
@@ -959,7 +979,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
     )
     .await;
 
-    mount_sse_sequence(
+    let responses = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
@@ -1097,6 +1117,11 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
     assert_eq!(smaller_window, Some(smaller_effective_window));
     assert_ne!(smaller_window, Some(large_effective_window));
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body_json()["model"], large_model_slug);
+    assert_eq!(requests[1].body_json()["model"], smaller_model_slug);
 
     Ok(())
 }

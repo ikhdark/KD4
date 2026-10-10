@@ -10,20 +10,8 @@ pub const CODEX_THREAD_ID_ENV_VAR: &str = "CODEX_THREAD_ID";
 ///
 /// Windows names are case-insensitive. Within a layer, the lexicographically
 /// last spelling wins, independently of HashMap iteration order. Across layers,
-/// the overlay always wins. Unix names remain case-sensitive.
+/// the overlay always wins.
 pub fn apply_env_overlay(env: &mut HashMap<String, String>, overlay: HashMap<String, String>) {
-    apply_env_overlay_for_platform(env, overlay, cfg!(windows));
-}
-
-fn apply_env_overlay_for_platform(
-    env: &mut HashMap<String, String>,
-    overlay: HashMap<String, String>,
-    is_windows: bool,
-) {
-    if !is_windows {
-        env.extend(overlay);
-        return;
-    }
     // Normalize both layers, including inherited or exact environments which
     // may already contain aliases. Do not sort the combined layers: doing so
     // would let spelling override explicit overlay precedence.
@@ -71,7 +59,7 @@ pub fn create_env_from_vars<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    populate_env_for_platform(vars, policy, thread_id, true)
+    populate_env_impl(vars, policy, thread_id, /*inject_pathext*/ true)
 }
 
 pub fn populate_env<I>(
@@ -82,26 +70,13 @@ pub fn populate_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    populate_env_impl(vars, policy, thread_id, true, /*inject_pathext*/ false)
-}
-
-fn populate_env_for_platform<I>(
-    vars: I,
-    policy: &ShellEnvironmentPolicy,
-    thread_id: Option<&str>,
-    is_windows: bool,
-) -> HashMap<String, String>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    populate_env_impl(vars, policy, thread_id, is_windows, is_windows)
+    populate_env_impl(vars, policy, thread_id, /*inject_pathext*/ false)
 }
 
 fn populate_env_impl<I>(
     vars: I,
     policy: &ShellEnvironmentPolicy,
     thread_id: Option<&str>,
-    is_windows: bool,
     inject_pathext: bool,
 ) -> HashMap<String, String>
 where
@@ -112,24 +87,17 @@ where
     let mut env_map: HashMap<String, String> = match policy.inherit {
         ShellEnvironmentPolicyInherit::All => vars.into_iter().collect(),
         ShellEnvironmentPolicyInherit::None => HashMap::new(),
-        ShellEnvironmentPolicyInherit::Core => {
-            let core_env_vars = if is_windows {
+        ShellEnvironmentPolicyInherit::Core => vars
+            .into_iter()
+            .filter(|(k, _)| {
                 WINDOWS_CORE_ENV_VARS
-            } else {
-                UNIX_CORE_ENV_VARS
-            };
-
-            vars.into_iter()
-                .filter(|(k, _)| {
-                    core_env_vars
-                        .iter()
-                        .any(|allowed| allowed.eq_ignore_ascii_case(k))
-                })
-                .collect()
-        }
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(k))
+            })
+            .collect(),
     };
 
-    apply_env_overlay_for_platform(&mut env_map, HashMap::new(), is_windows);
+    apply_env_overlay(&mut env_map, HashMap::new());
 
     // Windows command lookup needs PATHEXT, but the policy's explicit exclude
     // and include-only filters remain authoritative.
@@ -157,7 +125,7 @@ where
     }
 
     // Step 4 - Apply user-provided overrides.
-    apply_env_overlay_for_platform(&mut env_map, policy.r#set.clone(), is_windows);
+    apply_env_overlay(&mut env_map, policy.r#set.clone());
 
     // Step 5 - If include_only is non-empty, keep only the matching vars.
     if !policy.include_only.is_empty() {
@@ -166,17 +134,14 @@ where
 
     // Step 6 - Populate the thread ID environment variable when provided.
     if let Some(thread_id) = thread_id {
-        apply_env_overlay_for_platform(
+        apply_env_overlay(
             &mut env_map,
             HashMap::from([(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string())]),
-            is_windows,
         );
     }
 
     env_map
 }
-
-pub const UNIX_CORE_ENV_VARS: &[&str] = &["HOME", "LOGNAME", "PATH", "SHELL", "USER"];
 
 pub const WINDOWS_CORE_ENV_VARS: &[&str] = &[
     // Core path resolution
@@ -233,18 +198,13 @@ mod tests {
                 [("Path", "overlay-mixed"), ("PATH", "overlay-upper")],
             ] {
                 let mut env = make_vars(&inherited).into_iter().collect();
-                apply_env_overlay_for_platform(&mut env, HashMap::new(), true);
+                apply_env_overlay(&mut env, HashMap::new());
                 assert_eq!(env, HashMap::from([("Path".into(), "mixed".into())]));
-                apply_env_overlay_for_platform(
-                    &mut env,
-                    make_vars(&overlay).into_iter().collect(),
-                    true,
-                );
+                apply_env_overlay(&mut env, make_vars(&overlay).into_iter().collect());
                 assert_eq!(env, HashMap::from([("Path".into(), "overlay-mixed".into())]));
-                apply_env_overlay_for_platform(
+                apply_env_overlay(
                     &mut env,
                     HashMap::from([("PATH".into(), "last-layer".into())]),
-                    true,
                 );
                 assert_eq!(env, HashMap::from([("PATH".into(), "last-layer".into())]));
             }
@@ -316,28 +276,30 @@ mod tests {
     }
 
     #[test]
-    fn unix_overrides_preserve_distinct_case_names() {
+    fn public_environment_uses_native_platform_semantics() {
+        let vars = make_vars(&[
+            ("HOME", "/home/user"),
+            ("USER", "user"),
+            ("USERPROFILE", "C:\\Users\\user"),
+            ("PATH", "upper"),
+            ("Path", "mixed"),
+        ]);
         let policy = ShellEnvironmentPolicy {
-            inherit: ShellEnvironmentPolicyInherit::All,
-            r#set: HashMap::from([("PATH".to_string(), "replacement-path".to_string())]),
+            inherit: ShellEnvironmentPolicyInherit::Core,
             ..Default::default()
         };
+        let expected = HashMap::from([
+            ("USERPROFILE".to_string(), "C:\\Users\\user".to_string()),
+            ("Path".to_string(), "mixed".to_string()),
+        ]);
+        assert_eq!(populate_env(vars.clone(), &policy, None), expected);
+        let mut expected_with_lookup_defaults = expected;
+        expected_with_lookup_defaults.insert(
+            "PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string(),
+        );
         assert_eq!(
-            populate_env_for_platform(
-                make_vars(&[
-                    ("Path", "inherited-path"),
-                    ("codex_thread_id", "old-thread")
-                ]),
-                &policy,
-                Some("current-thread"),
-                false,
-            ),
-            HashMap::from([
-                ("PATH".to_string(), "replacement-path".to_string()),
-                ("Path".to_string(), "inherited-path".to_string()),
-                ("codex_thread_id".to_string(), "old-thread".to_string()),
-                ("CODEX_THREAD_ID".to_string(), "current-thread".to_string()),
-            ])
+            create_env_from_vars(vars, &policy, None),
+            expected_with_lookup_defaults,
         );
     }
 
@@ -358,9 +320,7 @@ mod tests {
         };
 
         // Check a few sample vars instead of the full Windows core list.
-        let result = populate_env_for_platform(
-            vars, &policy, /*thread_id*/ None, /*is_windows*/ true,
-        );
+        let result = create_env_from_vars(vars, &policy, /*thread_id*/ None);
         let expected = HashMap::from([
             (
                 "Shell".to_string(),
@@ -386,59 +346,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = populate_env_for_platform(
-            Vec::new(),
-            &policy,
-            /*thread_id*/ None,
-            /*is_windows*/ true,
-        );
+        let result = create_env_from_vars(Vec::new(), &policy, /*thread_id*/ None);
         let expected = HashMap::from([("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string())]);
 
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn core_inherit_preserves_unix_identity_vars() {
-        let vars = make_vars(&[
-            ("HOME", "/home/codex"),
-            ("LOGNAME", "codex"),
-            ("PATH", "/usr/bin"),
-            ("SHELL", "/bin/sh"),
-            ("USER", "codex"),
-            ("USERPROFILE", "windows-only"),
-        ]);
-        let policy = ShellEnvironmentPolicy {
-            inherit: ShellEnvironmentPolicyInherit::Core,
-            ignore_default_excludes: true,
-            ..Default::default()
-        };
-
-        let result = populate_env_for_platform(vars, &policy, None, /*is_windows*/ false);
-
-        assert_eq!(
-            result,
-            HashMap::from([
-                ("HOME".to_string(), "/home/codex".to_string()),
-                ("LOGNAME".to_string(), "codex".to_string()),
-                ("PATH".to_string(), "/usr/bin".to_string()),
-                ("SHELL".to_string(), "/bin/sh".to_string()),
-                ("USER".to_string(), "codex".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn pathext_is_not_injected_on_unix_or_past_policy_filters() {
-        let none_policy = ShellEnvironmentPolicy {
-            inherit: ShellEnvironmentPolicyInherit::None,
-            ignore_default_excludes: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            populate_env_for_platform(Vec::new(), &none_policy, None, false),
-            HashMap::new()
-        );
-
+    fn pathext_is_not_injected_past_policy_filters() {
         let filtered_policy = ShellEnvironmentPolicy {
             inherit: ShellEnvironmentPolicyInherit::None,
             ignore_default_excludes: true,
@@ -446,17 +361,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            populate_env_for_platform(Vec::new(), &filtered_policy, None, true),
+            create_env_from_vars(Vec::new(), &filtered_policy, None),
             HashMap::new()
         );
     }
 
     #[test]
     fn non_utf8_process_entries_are_skipped_without_panicking() {
+        #[cfg(windows)]
         fn non_utf8_os_string() -> OsString {
             use std::os::windows::ffi::OsStringExt;
 
             OsString::from_wide(&[0xd800])
+        }
+
+        #[cfg(unix)]
+        fn non_utf8_os_string() -> OsString {
+            use std::os::unix::ffi::OsStringExt;
+
+            OsString::from_vec(vec![0xff])
         }
 
         let vars = [

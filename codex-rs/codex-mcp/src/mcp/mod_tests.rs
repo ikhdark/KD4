@@ -608,6 +608,12 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
         }
         other => panic!("expected streamable http transport, got {other:?}"),
     }
+
+    // The host-owned apps server is withheld without ChatGPT auth; configured servers stay.
+    let without_auth = effective_mcp_servers(&config, /*auth*/ None);
+    assert!(without_auth.contains_key("sample"));
+    assert!(without_auth.contains_key("docs"));
+    assert!(!without_auth.contains_key(CODEX_APPS_MCP_SERVER_NAME));
 }
 
 #[tokio::test]

@@ -70,7 +70,7 @@ pub(crate) async fn wait_for_workspace_baseline() {
 
 #[cfg(test)]
 #[tokio::test]
-async fn baseline_capture_overlaps_preparation_but_precedes_effects() {
+async fn workspace_baseline_wait_releases_on_ready_and_is_a_no_op_outside_dispatch() {
     let ready = CancellationToken::new();
     let prepared = CancellationToken::new();
     let capture = async {
@@ -3940,9 +3940,16 @@ mod tests {
 
         let workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
         let first = canonical_workspace_evidence_key_cached(cwd, &mut cache, &workspace).await;
+        assert_eq!(cache.get(cwd), Some(&first));
+
+        // Recomputing would return `first` again, so only a cache hit can
+        // return a key the resolver never produces.
+        let sentinel = std::path::PathBuf::from("cached-key-sentinel");
+        cache.insert(cwd.to_path_buf(), sentinel.clone());
         let second = canonical_workspace_evidence_key_cached(cwd, &mut cache, &workspace).await;
 
-        assert_eq!(first, second);
+        assert_ne!(first, sentinel);
+        assert_eq!(second, sentinel);
         assert_eq!(cache.len(), 1);
     }
 
@@ -4559,7 +4566,17 @@ mod tests {
 
     #[tokio::test]
     async fn unscoped_stdin_baseline_skips_storage_without_certifying_freshness() {
+        // Only a Git workspace has storage to capture: the pause and the
+        // capture counter below never engage for a plain directory.
         let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
         let batch = WorkspaceEvidenceGenerationBatch::new();
         let classification = crate::tool_history::classify_workspace_tool_call(
@@ -4609,15 +4626,16 @@ mod tests {
             call_id: "poll".into(),
             internal_chat_message_metadata_passthrough: None,
         };
-        let projected = history.project_with_workspace_identity(
-            Arc::from([call, response]),
+        let items: Arc<[ResponseItem]> = Arc::from([call, response]);
+        let notices = crate::tool_history::tests::freshness_notices(
+            &history,
+            &items,
             baseline.revision.as_ref(),
+            &cache,
         );
-        let (_, output) =
-            crate::tool_history::canonical_textual_output_identity(&projected.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(notice["valid_for_current_workspace"], false);
-        assert_eq!(notice["historical_authenticity"], "authenticated");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
+        assert_eq!(notices[0]["historical_authenticity"], "authenticated");
     }
 
     #[tokio::test]
@@ -4804,11 +4822,14 @@ mod tests {
         let payload = ToolPayload::Function {
             arguments: r#"{"cmd":"cargo test","workdir":"missing-workspace"}"#.to_string(),
         };
-        let admission_hint = crate::tool_history::classify_workspace_tool_call(
+        let mut admission_hint = crate::tool_history::classify_workspace_tool_call(
             "cargo_test",
             &payload,
             std::path::Path::new("missing-workspace"),
         );
+        // Classifying again would not produce this cwd, so equality below
+        // proves the outer classification was reused rather than recomputed.
+        admission_hint.workspace_cwd = std::path::PathBuf::from("outer-classification-sentinel");
 
         let (admission, inner_evidence) = workspace_tool_call_classifications_for_dispatch(
             &ToolCallSource::Direct,
@@ -4965,10 +4986,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_workspace_or_serial_admission_skips_workspace_resource_resolution() {
-        let missing = std::path::PathBuf::from("definitely-missing-workspace-resource");
+        // A resolvable repository: without the early return each call would
+        // return its root and populate the cache.
+        let root = tempfile::tempdir().expect("temporary workspace root");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("repository marker");
         let classification = crate::tool_history::WorkspaceCallClassification {
             observes_workspace: false,
-            workspace_cwd: missing,
+            workspace_cwd: repo,
             source_dependencies: Default::default(),
         };
         let canonical_resources = Arc::new(crate::git_workspace::WorkspaceRootCache::default());
@@ -5097,14 +5122,16 @@ mod tests {
             },
         };
 
-        for (error, kind) in [
+        for (error, kind, message) in [
             (
                 FunctionCallError::RespondToModel("invalid query".to_string()),
                 "failed",
+                "invalid query",
             ),
             (
                 FunctionCallError::DeniedToModel("access denied".to_string()),
                 "denied",
+                "access denied",
             ),
         ] {
             let detail =
@@ -5126,12 +5153,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(body).expect("diagnostic");
             assert_eq!(value["tool_search_failure"]["call_id"], "search-failed");
             assert_eq!(value["tool_search_failure"]["kind"], kind);
-            assert!(
-                !value["tool_search_failure"]["message"]
-                    .as_str()
-                    .expect("explanation")
-                    .is_empty()
-            );
+            assert_eq!(value["tool_search_failure"]["message"], message);
         }
 
         assert_eq!(
@@ -5987,7 +6009,6 @@ mod tests {
             };
             assert_eq!(output.success, Some(true), "{:?}", output.body);
             assert!(output.body.to_text().unwrap().contains("before"));
-            let historical_output = output.body.to_text().unwrap();
             let canonical = vec![call, ResponseItem::from(read)];
             session
                 .record_conversation_items(&turn, &canonical)
@@ -6025,24 +6046,19 @@ mod tests {
                 .git_workspace
                 .workspace_evidence_identity(workspace.path())
                 .await;
+            // The read output itself is delivered unchanged in both cases (the
+            // helper checks that); only the appended verdict differs.
             let history = session.clone_history().await;
-            let projected = history.tool_history_state().project_with_workspace_cache(
-                Arc::from(history.raw_items().to_vec()),
+            let items: Arc<[ResponseItem]> = Arc::from(history.raw_items().to_vec());
+            let mut notices = crate::tool_history::tests::freshness_notices(
+                &history.tool_history_state(),
+                &items,
                 identity.as_ref(),
                 session.services.git_workspace.as_ref(),
             );
-            let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
-                panic!("projected read result");
-            };
             if changed_file == "source.txt" {
-                let mut stale: serde_json::Value =
-                    serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
-                let digest = stale
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("historical_digest")
-                    .expect("authenticated historical read");
-                assert_eq!(digest, historical_output);
+                assert_eq!(notices.len(), 1, "{notices:?}");
+                let mut stale = notices.remove(0);
                 assert_eq!(stale["qualification"], "Observed dependency change");
                 assert_eq!(stale["historical_authenticity"], "authenticated");
                 assert_eq!(stale["workspace_evidence_freshness"], "changed");
@@ -6054,21 +6070,17 @@ mod tests {
                     stale,
                     serde_json::json!({
                         "call_id": "read-before-edit",
-                        "rerun": { "instruction": "This notice is not a request to rerun tests or builds. Revalidate only if current evidence is essential to the task, using the cheapest scoped read or check with supported arguments; otherwise report the affected claim as unverified. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence." },
                         "reason": "source dependencies were invalidated after capture; this does not establish which dependency changed; current workspace freshness is unverified",
                         "stale_workspace_evidence": true,
                         "reason_code": "source_dependencies_invalidated",
                         "valid_for_current_workspace": false,
                         "observed_revision": observed_revision,
-                        "current_revision": identity,
-                        "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                     })
                 );
             } else {
-                assert_eq!(
-                    projected.items.as_ref(),
-                    history.raw_items(),
-                    "disjoint edit keeps the actual read output"
+                assert!(
+                    notices.is_empty(),
+                    "a disjoint edit keeps the read current: {notices:?}"
                 );
             }
         }
@@ -6215,16 +6227,15 @@ mod tests {
         let revision = history
             .workspace_evidence_revision_for_test("nested-read")
             .expect("nested read registers workspace evidence");
-        assert_eq!(
-            history
-                .project_with_workspace_cache(
-                    Arc::clone(&canonical),
-                    revision.as_ref(),
-                    session.services.git_workspace.as_ref(),
-                )
-                .items,
-            canonical,
-            "a successful nested read must remain visible at its captured revision"
+        assert!(
+            crate::tool_history::tests::freshness_notices(
+                &history,
+                &canonical,
+                revision.as_ref(),
+                session.services.git_workspace.as_ref(),
+            )
+            .is_empty(),
+            "a successful nested read must remain current at its captured revision"
         );
         let dependencies = result.projected_source_dependencies().cloned();
         let outcome_context = result.outcome_context();
@@ -6323,25 +6334,37 @@ mod tests {
             assert_eq!(stored, text);
         }
         let evidence = history.tool_history_state();
+        // Without a dependency watch the result is never current, so the
+        // verdict's authenticity is what shows whether the hashes agree.
+        let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+        let stored_verdict = crate::tool_history::tests::freshness_notices(
+            &evidence,
+            &canonical,
+            Some(&revision),
+            &cache,
+        );
+        assert_eq!(stored_verdict.len(), 1);
         assert_eq!(
-            evidence
-                .project_with_workspace_identity(Arc::clone(&canonical), Some(&revision))
-                .items,
-            canonical,
+            stored_verdict[0]["historical_authenticity"], "authenticated",
             "the observation must authenticate the payload history actually stores"
         );
+        assert_eq!(stored_verdict[0]["reason_code"], "workspace_freshness_unverified");
         let mut altered = canonical.to_vec();
         let ResponseItem::FunctionCallOutput { output, .. } = altered.last_mut().unwrap() else {
             panic!("function output");
         };
         *output = FunctionCallOutputPayload::from_text("unrecorded output".to_string());
-        let projected = evidence.project_with_workspace_identity(Arc::from(altered), Some(&revision));
-        let (_, notice) =
-            crate::tool_history::canonical_textual_output_identity(projected.items.last().unwrap())
-                .unwrap();
-        let notice: serde_json::Value = serde_json::from_str(&notice).unwrap();
-        assert_eq!(notice["reason_code"], "output_mismatch");
-        assert_eq!(notice["valid_for_current_workspace"], false);
+        let altered: Arc<[ResponseItem]> = Arc::from(altered);
+        let notices = crate::tool_history::tests::freshness_notices(
+            &evidence,
+            &altered,
+            Some(&revision),
+            &cache,
+        );
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["reason_code"], "output_mismatch");
+        assert_eq!(notices[0]["historical_authenticity"], "unverified");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
     }
 
 
@@ -7165,17 +7188,18 @@ mod tests {
             CancellationToken::new(),
             Arc::clone(&timing),
         ));
-        for _ in 0..100 {
-            if turn_context
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while turn_context
                 .turn_timing_state
                 .lifecycle_context()
                 .parallel_gate_waiter_count
-                == 1
+                != 1
             {
-                break;
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("dispatch should reach the held parallel gate");
         assert_eq!(
             turn_context
                 .turn_timing_state
@@ -7448,10 +7472,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opted_in_handler_prepares_during_baseline_capture_and_reads_after_it() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        #[derive(Default)]
+        struct Boundaries {
+            prepared: AtomicBool,
+            read: AtomicBool,
+        }
+        struct OverlappingHandler(Arc<Boundaries>);
+        impl ToolExecutor<ToolInvocation> for OverlappingHandler {
+            fn tool_name(&self) -> codex_tools::ToolName {
+                codex_tools::ToolName::plain("shell_command")
+            }
+
+            fn spec(&self) -> codex_tools::ToolSpec {
+                ImmediateHandler {
+                    tool_name: self.tool_name(),
+                }
+                .spec()
+            }
+
+            fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+                let boundaries = Arc::clone(&self.0);
+                Box::pin(async move {
+                    boundaries.prepared.store(true, Ordering::SeqCst);
+                    wait_for_workspace_baseline().await;
+                    boundaries.read.store(true, Ordering::SeqCst);
+                    Ok(
+                        Box::new(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
+                            as Box<dyn crate::tools::context::ToolOutput>,
+                    )
+                })
+            }
+        }
+        impl CoreToolRuntime for OverlappingHandler {
+            fn prepares_during_workspace_baseline(&self) -> bool {
+                true
+            }
+        }
+
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let boundaries = Arc::new(Boundaries::default());
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([
+                Arc::new(OverlappingHandler(Arc::clone(&boundaries))) as Arc<dyn CoreToolRuntime>
+            ]),
+            Vec::new(),
+        ));
+        let step_context =
+            StepContext::for_test(Arc::new(turn_context)).with_tool_router_for_test(router);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
+        let repo = tempfile::tempdir().expect("temporary repository cwd");
+        let init_status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .status()
+            .expect("launch git init");
+        assert!(init_status.success(), "initialize temporary repository");
+        let pause = session
+            .services
+            .git_workspace
+            .pause_next_workspace_evidence_capture();
+
+        let call_task = tokio::spawn(
+            runtime.handle_tool_call(
+                ToolCall {
+                    tool_name: codex_tools::ToolName::plain("shell_command"),
+                    call_id: "overlapping-baseline".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "command": "rg needle .",
+                            "workdir": repo.path(),
+                        })
+                        .to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_started())
+            .await
+            .expect("the baseline capture starts");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !boundaries.prepared.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("preparation must overlap the paused baseline capture");
+        assert!(
+            !boundaries.read.load(Ordering::SeqCst),
+            "the read boundary must wait for the baseline"
+        );
+
+        pause.release();
+        call_task
+            .await
+            .expect("workspace call task should join")
+            .expect("workspace call should succeed");
+        assert!(boundaries.read.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn workspace_evidence_without_compatible_baseline_recaptures_after_call() {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
-        let workspace = tempfile::tempdir().expect("non-Git workspace cwd");
+        // Only a Git workspace has an identity to capture: in a plain
+        // directory a skipped capture also yields `None`.
+        let workspace = tempfile::tempdir().expect("workspace cwd");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let call_id = "post-call-recapture";
         let response = ResponseInputItem::FunctionCallOutput {
             call_id: call_id.to_string(),
@@ -7493,14 +7633,22 @@ mod tests {
             ResponseItem::from(response),
         ]);
         let history = session.clone_history().await;
-        let projected = history
+        let recaptured = history
             .tool_history_state()
-            .project_with_workspace_identity(Arc::clone(&canonical), None);
-        let (_, notice) = crate::tool_history::canonical_textual_output_identity(&projected.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(&notice).unwrap();
-        assert_eq!(notice["reason_code"], "workspace_identity_unavailable");
-        assert_eq!(notice["historical_authenticity"], "authenticated");
-        assert_eq!(notice["valid_for_current_workspace"], false);
+            .workspace_evidence_revision_for_test(call_id)
+            .expect("the call registers workspace evidence")
+            .expect("the post-call capture records the repository identity");
+        assert!(recaptured.repository_root.is_some());
+        let notices = crate::tool_history::tests::freshness_notices(
+            &history.tool_history_state(),
+            &canonical,
+            None,
+            session.services.git_workspace.as_ref(),
+        );
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["reason_code"], "workspace_identity_unavailable");
+        assert_eq!(notices[0]["historical_authenticity"], "authenticated");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
     }
 
     #[tokio::test]
@@ -7584,11 +7732,12 @@ mod tests {
             ),
             "the original payload's file must not invalidate the executed read"
         );
-        let before = history.project_with_workspace_identity(Arc::clone(&canonical), None);
-        let (_, notice) = crate::tool_history::canonical_textual_output_identity(&before.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(&notice).unwrap();
-        assert_eq!(notice["reason_code"], "workspace_identity_unavailable");
-        assert_eq!(notice["historical_authenticity"], "authenticated");
+        let cache = session.services.git_workspace.as_ref();
+        let before =
+            crate::tool_history::tests::freshness_notices(&history, &canonical, None, cache);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0]["reason_code"], "workspace_identity_unavailable");
+        assert_eq!(before[0]["historical_authenticity"], "authenticated");
         assert!(
             history.invalidate_source_dependencies(
                 Some(&std::collections::BTreeSet::from([executed_path])),
@@ -7596,10 +7745,10 @@ mod tests {
             ),
             "the executed payload's file must invalidate the result"
         );
-        let after = history.project_with_workspace_identity(canonical, None);
-        let (_, notice) = crate::tool_history::canonical_textual_output_identity(&after.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(&notice).unwrap();
-        assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
+        let after =
+            crate::tool_history::tests::freshness_notices(&history, &canonical, None, cache);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["reason_code"], "source_dependencies_invalidated");
     }
 
     #[tokio::test]
@@ -8451,15 +8600,20 @@ mod tests {
             cancellation_token.clone(),
         ));
 
-        for _ in 0..100 {
-            if turn_context
-                .turn_timing_state
-                .lifecycle_context()
-                .parallel_gate_waiter_count
-                == 1
-            {
-                break;
-            }
+        // Admission can await a blocking worker; a fixed yield count is not
+        // synchronization. Use real time for this watchdog while Tokio time
+        // stays paused for the cancellation/cleanup assertions below.
+        let admission_started = Instant::now();
+        while turn_context
+            .turn_timing_state
+            .lifecycle_context()
+            .parallel_gate_waiter_count
+            != 1
+        {
+            assert!(
+                admission_started.elapsed() < Duration::from_secs(5),
+                "dispatch should reach the held parallel gate"
+            );
             tokio::task::yield_now().await;
         }
         assert_eq!(

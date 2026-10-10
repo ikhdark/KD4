@@ -1318,14 +1318,23 @@ async fn skills_list_pages_preserve_handles_and_respect_serialized_budget() -> T
     }
     assert!(pages > 1);
     assert_eq!(found, expected);
-    for args in [
-        serde_json::json!({"authority":{"kind":"orchestrator"},"cursor":"stale:1"}),
-        serde_json::json!({"authority":{"kind":"orchestrator"}}),
+    for (args, expected) in [
+        (
+            serde_json::json!({"authority":{"kind":"orchestrator"},"cursor":"stale:1"}),
+            "skills.list cursor is stale; restart from the first page",
+        ),
+        (
+            serde_json::json!({"authority":{"kind":"orchestrator"}}),
+            "skills.list response budget leaves no room for a complete skill; increase the output budget",
+        ),
     ] {
         let result = list
             .handle(skills_tool_call(list.tool_name(), args, 16))
             .await;
-        assert!(matches!(result, Err(FunctionCallError::RespondToModel(_))));
+        assert_eq!(
+            result.err(),
+            Some(FunctionCallError::RespondToModel(expected.to_string()))
+        );
     }
     Ok(())
 }

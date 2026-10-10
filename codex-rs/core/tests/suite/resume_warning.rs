@@ -181,19 +181,26 @@ async fn resumed_model_difference_uses_model_switch_context_without_legacy_warni
 
     let mut legacy_warning = None;
     let mut turn_error = None;
-    loop {
-        let event = conversation.next_event().await.expect("next event");
-        match event.msg {
-            EventMsg::Warning(WarningEvent { message })
-                if message.contains("gpt-5.2") && message.contains("gpt-5.4") =>
-            {
-                legacy_warning = Some(message);
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let event = conversation.next_event().await.expect("next event");
+            match event.msg {
+                EventMsg::Warning(WarningEvent { message })
+                    if message.contains("gpt-5.2") && message.contains("gpt-5.4") =>
+                {
+                    legacy_warning = Some(message);
+                }
+                EventMsg::Error(error) => turn_error = Some(error.message),
+                EventMsg::TurnComplete(completed) => {
+                    assert_eq!(completed.error, None);
+                    break;
+                }
+                _ => {}
             }
-            EventMsg::Error(error) => turn_error = Some(error.message),
-            EventMsg::TurnComplete(_) => break,
-            _ => {}
         }
-    }
+    })
+    .await
+    .expect("resumed turn must complete");
     assert_eq!(
         legacy_warning, None,
         "legacy resume warnings are no longer emitted"
@@ -203,9 +210,13 @@ async fn resumed_model_difference_uses_model_switch_context_without_legacy_warni
         "resumed turn should reach the model provider"
     );
 
-    let developer_texts = response_mock
-        .single_request()
-        .message_input_texts("developer");
+    let request = response_mock.single_request();
+    assert_eq!(request.body_json()["model"].as_str(), Some("gpt-5.4"));
+    let developer_texts = request.message_input_texts("developer");
+    assert_eq!(
+        developer_texts.iter().filter(|text| text.contains("<model_switch>")).count(),
+        1
+    );
     assert!(
         developer_texts
             .iter()

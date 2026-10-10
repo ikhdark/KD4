@@ -605,7 +605,6 @@ pub(crate) struct ChatWidget {
     /// hidden for that thread instead of resurfacing it on every matching draft.
     dismissed_plan_mode_nudge_scopes: HashSet<PlanModeNudgeScope>,
     thread_name: Option<String>,
-    thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     normal_placeholder_text: String,
     side_placeholder_text: String,
@@ -1325,14 +1324,6 @@ impl ChatWidget {
 
     pub(crate) fn set_pending_thread_approvals(&mut self, threads: Vec<String>) {
         self.bottom_pane.set_pending_thread_approvals(threads);
-    }
-
-    pub(crate) fn clear_thread_rename_block(&mut self) {
-        self.thread_rename_block_message = None;
-    }
-
-    pub(crate) fn set_thread_rename_block_message(&mut self, message: impl Into<String>) {
-        self.thread_rename_block_message = Some(message.into());
     }
 
     pub(crate) fn set_interrupted_turn_notice_mode(&mut self, mode: InterruptedTurnNoticeMode) {

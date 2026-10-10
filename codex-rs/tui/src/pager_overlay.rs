@@ -155,6 +155,10 @@ impl PagerView {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            self.update_last_content_height(0);
+            return;
+        }
         Clear.render(area, buf);
         self.render_header(area, buf);
         let content_area = self.content_area(area);
@@ -229,6 +233,9 @@ impl PagerView {
         total_len: usize,
     ) {
         let sep_y = content_area.bottom();
+        if sep_y >= full_area.bottom() {
+            return;
+        }
         let sep_rect = Rect::new(full_area.x, sep_y, full_area.width, 1);
 
         Span::from("─".repeat(sep_rect.width as usize))
@@ -789,8 +796,8 @@ impl TranscriptOverlay {
     }
 
     fn render_hints(&self, area: Rect, buf: &mut Buffer) {
-        let line1 = Rect::new(area.x, area.y, area.width, 1);
-        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+        let line1 = Rect::new(area.x, area.y, area.width, 1).intersection(area);
+        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1).intersection(area);
         render_key_hints(
             line1,
             buf,
@@ -840,7 +847,7 @@ impl TranscriptOverlay {
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let top_h = area.height.saturating_sub(3);
         let top = Rect::new(area.x, area.y, area.width, top_h);
-        let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
+        let bottom = Rect::new(area.x, area.y + top_h, area.width, area.height.min(3));
         self.view.render(top, buf);
         self.render_hints(bottom, buf);
     }
@@ -908,8 +915,8 @@ impl StaticOverlay {
     }
 
     fn render_hints(&self, area: Rect, buf: &mut Buffer) {
-        let line1 = Rect::new(area.x, area.y, area.width, 1);
-        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+        let line1 = Rect::new(area.x, area.y, area.width, 1).intersection(area);
+        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1).intersection(area);
         render_key_hints(
             line1,
             buf,
@@ -945,7 +952,7 @@ impl StaticOverlay {
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let top_h = area.height.saturating_sub(3);
         let top = Rect::new(area.x, area.y, area.width, top_h);
-        let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
+        let bottom = Rect::new(area.x, area.y + top_h, area.width, area.height.min(3));
         self.view.render(top, buf);
         self.render_hints(bottom, buf);
     }
@@ -1070,6 +1077,34 @@ mod tests {
 
     fn static_overlay(lines: Vec<Line<'static>>, title: &str) -> StaticOverlay {
         StaticOverlay::with_title(lines, title.to_string(), default_pager_keymap())
+    }
+
+    #[test]
+    fn overlays_stay_inside_short_viewports() {
+        for height in 0..=4 {
+            let area = Rect::new(2, 2, 20, height);
+            for transcript in [false, true] {
+                let mut buf = Buffer::empty(Rect::new(0, 0, 24, 9));
+                for cell in &mut buf.content {
+                    cell.set_symbol("#");
+                }
+                if transcript {
+                    let mut overlay = transcript_overlay(vec![Arc::new(TestCell {
+                        lines: vec![Line::from("content")],
+                    })]);
+                    overlay.render(area, &mut buf);
+                } else {
+                    static_overlay(vec![Line::from("content")], "title").render(area, &mut buf);
+                }
+                for y in 0..9 {
+                    for x in 0..24 {
+                        if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+                            assert_eq!(buf[(x, y)].symbol(), "#", "height={height}, transcript={transcript}, ({x}, {y})");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn pager_view(
@@ -1238,6 +1273,23 @@ mod tests {
         });
 
         assert_eq!(calls.get(), 1);
+
+        // Each key dimension must invalidate the cached tail, or it would freeze.
+        let mut width = 40;
+        let mut key = key;
+        for step in 0..4usize {
+            match step {
+                0 => key.revision = 2,
+                1 => key.animation_tick = Some(1),
+                2 => key.is_stream_continuation = true,
+                _ => width = 41,
+            }
+            overlay.sync_live_tail(width, Some(key), |_| {
+                calls.set(calls.get() + 1);
+                Some(vec![HyperlinkLine::from("tail")])
+            });
+            assert_eq!(calls.get(), step + 2, "step {step}");
+        }
     }
 
     fn buffer_to_text(buf: &Buffer, area: Rect) -> String {
@@ -1686,20 +1738,28 @@ mod tests {
             overlay.consolidate_cells(0..3, cell("merged"));
             assert_eq!(overlay.view.renderables.len(), 2 + usize::from(live));
             let area = Rect::new(0, 0, 40, 3);
-            let mut buffer = Buffer::empty(area);
-            overlay
+            let rendered: Vec<String> = overlay
                 .view
                 .renderables
-                .last()
-                .unwrap()
-                .render(area, &mut buffer);
-            let text: String = buffer
-                .content
                 .iter()
-                .map(ratatui::buffer::Cell::symbol)
+                .map(|renderable| {
+                    let mut buffer = Buffer::empty(area);
+                    renderable.render(area, &mut buffer);
+                    let text: String = buffer
+                        .content
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect();
+                    text.trim().to_string()
+                })
                 .collect();
-            assert!(text.contains(if live { "tail" } else { "d" }));
-            assert!(!text.contains("old-"));
+            // Exact text per renderable: no replaced cell survives, and a substring check would
+            // also accept "merged" for "d".
+            let mut expected = vec!["merged", "d"];
+            if live {
+                expected.push("tail");
+            }
+            assert_eq!(rendered, expected);
         }
     }
 

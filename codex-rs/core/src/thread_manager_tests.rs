@@ -1686,6 +1686,17 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
         .await
         .expect("start thread to roll back");
     assert!(!started.was_already_running);
+    started.thread.ensure_rollout_materialized().await;
+    started.thread.flush_rollout().await.expect("flush created thread");
+    let persisted = thread_store
+        .read_thread(ReadThreadParams {
+            thread_id: started.thread_id,
+            include_archived: true,
+            include_history: true,
+        })
+        .await
+        .expect("rollback must start with actual persisted thread data");
+    assert_eq!(persisted.thread_id, started.thread_id);
     assert!(
         manager
             .rollback_thread_spawn(started.thread_id, &started.thread)
@@ -1693,6 +1704,17 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
     );
     assert!(manager.list_thread_ids().await.is_empty());
     assert!(manager.get_thread(started.thread_id).await.is_err());
+    assert!(!started.thread.is_running());
+    assert!(matches!(
+        thread_store
+            .read_thread(ReadThreadParams {
+                thread_id: started.thread_id,
+                include_archived: true,
+                include_history: true,
+            })
+            .await,
+        Err(ThreadStoreError::ThreadNotFound { thread_id }) if thread_id == started.thread_id
+    ));
     assert!(
         !manager
             .rollback_thread_spawn(started.thread_id, &started.thread)
@@ -1804,12 +1826,41 @@ async fn missing_error_path_rollback_resumed_thread_preserves_persistence_and_ow
     assert!(reused.was_already_running);
     assert!(Arc::ptr_eq(&resumed.thread, &reused.thread));
 
+    resumed.thread.ensure_rollout_materialized().await;
+    resumed.thread.flush_rollout().await.expect("flush resumed thread");
+    let persisted_before = thread_store
+        .read_thread(ReadThreadParams {
+            thread_id: resumed.thread_id,
+            include_archived: true,
+            include_history: true,
+        })
+        .await
+        .expect("resumed thread data must exist before rollback");
+    let history_before = persisted_before.history.expect("persisted resumed history").items;
+    assert!(history_before.iter().any(|item| {
+        response_item_matches_ignoring_id(item, &user_msg("hello"))
+    }));
+
     assert!(
         manager
             .rollback_resumed_thread_spawn(resumed.thread_id, &resumed.thread)
             .await
     );
     assert!(manager.get_thread(resumed.thread_id).await.is_err());
+    assert!(!resumed.thread.is_running());
+    let persisted_after = thread_store
+        .read_thread(ReadThreadParams {
+            thread_id: resumed.thread_id,
+            include_archived: true,
+            include_history: true,
+        })
+        .await
+        .expect("rollback of a resume must preserve the pre-existing thread");
+    assert_eq!(persisted_after.thread_id, resumed.thread_id);
+    assert_eq!(
+        serde_json::to_value(persisted_after.history.expect("retained history").items).unwrap(),
+        serde_json::to_value(history_before).unwrap()
+    );
     assert_eq!(in_memory_store.calls().await.delete_thread, 0);
 }
 

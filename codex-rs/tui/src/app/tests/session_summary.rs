@@ -166,4 +166,29 @@ async fn session_summary_remote_identity_does_not_require_a_local_rollout() {
         exit.format_exit_messages(false),
         vec!["Session ID: 123e4567-e89b-12d3-a456-426614174000"]
     );
+
+    // A resumable local rollout must not turn a remote session into a local resume hint.
+    let temp_dir = tempdir().expect("temp dir");
+    let rollout_path = temp_dir.path().join("rollout.jsonl");
+    std::fs::write(&rollout_path, "{}\n").expect("write rollout");
+    let summary = session_summary(
+        TokenUsage::default(),
+        Some(thread_id),
+        None,
+        Some(&rollout_path),
+        true,
+    )
+    .await
+    .expect("remote session identity");
+    assert_eq!(summary.resume_hint, None);
+    assert_eq!(
+        summary.into_lines(),
+        vec![Line::from(
+            "Session ID: 123e4567-e89b-12d3-a456-426614174000"
+        )]
+    );
+    assert_eq!(
+        resume_hint_for_resumable_thread(Some(thread_id), None, Some(&rollout_path), true).await,
+        None
+    );
 }

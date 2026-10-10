@@ -2,7 +2,6 @@ use super::AppServerTransport;
 use super::CHANNEL_CAPACITY;
 use super::TransportEvent;
 use super::acquire_app_server_startup_lock;
-use super::app_server_control_socket_path;
 use super::start_control_socket_acceptor;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
@@ -43,6 +42,15 @@ fn listen_unix_socket_accepts_absolute_custom_path() {
             socket_path: absolute_path("/tmp/codex.sock")
         })
     );
+    // A rooted path without a drive is not absolute on Windows and resolves
+    // against the current drive; only a drive path is kept exactly as given.
+    match AppServerTransport::from_listen_url(r"unix://C:\codex-test\codex.sock") {
+        Ok(AppServerTransport::UnixSocket { socket_path }) => assert_eq!(
+            socket_path.as_path(),
+            Path::new(r"C:\codex-test\codex.sock")
+        ),
+        other => panic!("expected unix socket transport, got {other:?}"),
+    }
 }
 
 #[test]
@@ -386,7 +394,7 @@ fn absolute_path(path: &str) -> AbsolutePathBuf {
 
 fn default_control_socket_path() -> AbsolutePathBuf {
     let codex_home = find_codex_home().expect("codex home");
-    app_server_control_socket_path(&codex_home).expect("default control socket path")
+    test_socket_path(codex_home.as_path())
 }
 
 fn test_socket_path(temp_dir: &Path) -> AbsolutePathBuf {

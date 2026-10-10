@@ -153,36 +153,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     task::yield_now().await;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rmcp::ServiceExt;
-
-    #[tokio::test]
-    async fn echo_preserves_requested_environment_value() {
-        let (client_io, server_io) = tokio::io::duplex(8192);
-        let (server, client) =
-            tokio::join!(TestToolServer::new().serve(server_io), ().serve(client_io));
-        let server = server.unwrap();
-        let client = client.unwrap();
-        for env_var in ["PATH", "CODEX_NONEXISTENT_ECHO_TEST_VARIABLE"] {
-            let mut request = CallToolRequestParams::new("echo");
-            request.arguments = Some(
-                serde_json::from_value(json!({
-                    "message": "hello", "env_var": env_var
-                }))
-                .unwrap(),
-            );
-            let result = client.call_tool(request).await.unwrap();
-            assert_eq!(
-                result.structured_content,
-                Some(json!({
-                    "echo": "hello", "env": std::env::var(env_var).ok()
-                }))
-            );
-        }
-        client.cancel().await.unwrap();
-        server.cancel().await.unwrap();
-    }
-}

@@ -258,18 +258,23 @@ pub fn truncate_rollout_after_turn_id(
         )));
     }
 
+    let mut active_turn_id = last_turn_id;
     let terminal_index = items
         .iter()
         .enumerate()
         .skip(target_start_index.saturating_add(1))
         .find_map(|(index, item)| match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                active_turn_id = &event.turn_id;
+                None
+            }
             RolloutItem::EventMsg(EventMsg::TurnComplete(event))
                 if event.turn_id == last_turn_id =>
             {
                 Some(index)
             }
             RolloutItem::EventMsg(EventMsg::TurnAborted(event))
-                if event.turn_id.as_deref().is_none_or(|id| id == last_turn_id) =>
+                if event.turn_id.as_deref().unwrap_or(active_turn_id) == last_turn_id =>
             {
                 Some(index)
             }

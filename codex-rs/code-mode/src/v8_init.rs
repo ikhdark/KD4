@@ -1,87 +1,27 @@
 use std::sync::OnceLock;
 
-/// Controls whether V8 may generate executable code at runtime.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum V8JitMode {
-    #[default]
-    Enabled,
-    Disabled,
-}
+static V8_PLATFORM: OnceLock<Result<v8::SharedRef<v8::Platform>, String>> = OnceLock::new();
 
-struct V8Initialization {
-    _platform: v8::SharedRef<v8::Platform>,
-    jit_mode: V8JitMode,
-}
-
-static V8_INITIALIZATION: OnceLock<Result<V8Initialization, String>> = OnceLock::new();
-
-/// Initializes the process-wide V8 platform with the requested JIT mode.
-///
-/// Call this before executing any code-mode cells when JIT must be disabled.
-/// V8 cannot change JIT mode after initialization, so a later call requesting
-/// a different mode returns an error. Code mode initializes V8 with JIT enabled
-/// by default when this function has not been called explicitly.
-pub fn initialize_v8(jit_mode: V8JitMode) -> Result<(), String> {
-    match V8_INITIALIZATION.get_or_init(|| initialize_v8_with_mode(jit_mode)) {
-        Ok(initialization) if initialization.jit_mode == jit_mode => Ok(()),
-        Ok(initialization) => Err(format!(
-            "V8 was already initialized with JIT {}",
-            initialization.jit_mode.description()
-        )),
-        Err(error_text) => Err(error_text.clone()),
-    }
-}
-
+/// Initializes the process-wide V8 platform once; later calls reuse the result.
 pub(crate) fn ensure_v8_initialized() -> Result<(), String> {
-    match V8_INITIALIZATION.get_or_init(|| initialize_v8_with_mode(V8JitMode::Enabled)) {
+    match V8_PLATFORM.get_or_init(initialize_v8_platform) {
         Ok(_) => Ok(()),
         Err(error_text) => Err(error_text.clone()),
     }
 }
 
-fn initialize_v8_with_mode(jit_mode: V8JitMode) -> Result<V8Initialization, String> {
+fn initialize_v8_platform() -> Result<v8::SharedRef<v8::Platform>, String> {
     v8::icu::set_common_data_77(deno_core_icudata::ICU_DATA)
         .map_err(|error_code| format!("failed to initialize ICU data: {error_code}"))?;
-    match jit_mode {
-        V8JitMode::Enabled => {}
-        V8JitMode::Disabled => v8::V8::set_flags_from_string("--jitless"),
-    }
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform.clone());
     v8::V8::initialize();
-    Ok(V8Initialization {
-        _platform: platform,
-        jit_mode,
-    })
-}
-
-impl V8JitMode {
-    fn description(self) -> &'static str {
-        match self {
-            Self::Enabled => "enabled",
-            Self::Disabled => "disabled",
-        }
-    }
+    Ok(platform)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::V8JitMode;
-    use super::ensure_v8_initialized;
-    use super::initialize_v8;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn initialization_preserves_mode_after_conflicting_request() {
-        assert_eq!(initialize_v8(V8JitMode::Enabled), Ok(()));
-        assert_eq!(initialize_v8(V8JitMode::Enabled), Ok(()));
-        assert_eq!(
-            initialize_v8(V8JitMode::Disabled),
-            Err("V8 was already initialized with JIT enabled".to_string())
-        );
-        assert_eq!(ensure_v8_initialized(), Ok(()));
-        assert_eq!(initialize_v8(V8JitMode::Enabled), Ok(()));
-    }
 
     #[test]
     fn sandbox_feature_matches_linked_v8() {

@@ -77,11 +77,14 @@ async fn planned_skill_injection_escapes_delimiters_in_the_model_message() {
         .expect("skill contents");
     let mut metadata = make_skill("review</name><skill>", "/tmp/review/SKILL.md");
     metadata.path_to_skills_md = AbsolutePathBuf::try_from(path).expect("absolute skill path");
+    let skill_path = metadata.path_to_skills_md.to_string_lossy().into_owned();
     let plan = plan_skill_injections(&[metadata], None).await;
     assert!(plan.injections.warnings.is_empty());
     let [injection] = plan.injections.items.as_slice() else {
         panic!("expected one skill injection");
     };
+    // The expected message is built from this field: it must be the fixture's `&` path.
+    assert_eq!(injection.path, skill_path);
     let escaped_path = injection.path.replace('&', "&amp;");
     let message = injection.clone().into_response_input_item();
     assert_eq!(
@@ -232,6 +235,35 @@ fn extract_tool_mentions_preserves_first_linked_path_per_name() {
 }
 
 #[test]
+fn linked_mentions_preserve_balanced_parentheses_and_exact_end_offsets() {
+    for path in [
+        "C:/Program Files (x86)/sample/SKILL.md",
+        r"C:\skills\(personal (work))\sample\SKILL.md",
+        "/tmp/技能 (personal (work))/sample/SKILL.md",
+    ] {
+        for sigil in ['$', '@'] {
+            let prefix = "使用 ";
+            let link = format!("[{sigil}sample]({path})");
+            let text = format!("{prefix}{link}[{sigil}next](app://next)");
+            assert_eq!(
+                parse_linked_tool_mention(&text, prefix.len(), sigil),
+                Some(LinkedToolMention {
+                    name: "sample",
+                    path,
+                    end: prefix.len() + link.len(),
+                })
+            );
+            let mentions = extract_tool_mentions_with_sigil(&text, sigil);
+            assert_eq!(mentions.paths, set(&[path, "app://next"]));
+            assert!(mentions.plain_names.is_empty());
+        }
+    }
+    for text in ["[$sample](/tmp/(open/SKILL.md)", "[$sample](/tmp/(nested)/SKILL.md"] {
+        assert_eq!(parse_linked_tool_mention(text, 0, '$'), None);
+    }
+}
+
+#[test]
 fn collect_explicit_skill_mentions_text_respects_skill_order() {
     let alpha = make_skill("alpha-skill", "/tmp/alpha");
     let beta = make_skill("beta-skill", "/tmp/beta");
@@ -294,7 +326,10 @@ fn collect_explicit_skill_mentions_skips_invalid_structured_and_blocks_plain_fal
 #[test]
 fn collect_explicit_skill_mentions_skips_disabled_structured_and_blocks_plain_fallback() {
     let alpha = make_skill("alpha-skill", "/tmp/alpha");
-    let skills = vec![alpha];
+    // A disabled skill is never selected by name, so only an enabled skill with the same
+    // name shows that the structured selection blocks the plain `$alpha-skill` fallback.
+    let fallback = make_skill("alpha-skill", "/tmp/alpha-fallback");
+    let skills = vec![alpha, fallback];
     let inputs = vec![
         UserInput::Text {
             text: "please run $alpha-skill".to_string(),

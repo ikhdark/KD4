@@ -2905,6 +2905,23 @@ function Get-CimInstance {
             with self.subTest(value=value):
                 self.assertEqual(rust_build_status_support.positive_float(value), expected)
 
+    def test_finite_gib_budgets_do_not_overflow_during_byte_conversion(self):
+        # One GiB is 2**30 bytes. A finite float budget remains a finite
+        # integer byte budget even when its byte count exceeds float range.
+        gib = float(2**1023)
+        expected = 2**1053
+        self.assertEqual(rust_build_status_support.bytes_from_gib(gib), expected)
+        self.assertIsNone(rust_build_status_support.bytes_from_gib(None))
+        for value, count in ((0.5, 536870912), (1.25, 1342177280), (2**-31, 0)):
+            with self.subTest(value=value):
+                self.assertEqual(rust_build_status_support.bytes_from_gib(value), count)
+        with (
+            mock.patch.object(rust_build_status, "target_disk_report", return_value="disk") as report,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(rust_build_status.main(["disk", "--warn-gib", str(gib)]), 0)
+        report.assert_called_once_with(warn_bytes=expected)
+
     def test_cli_rejects_nonfinite_positive_floats_before_dispatch(self) -> None:
         prune_options = (
             "--warn-gib",

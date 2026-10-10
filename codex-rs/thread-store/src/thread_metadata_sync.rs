@@ -597,6 +597,20 @@ mod tests {
             Some("first user text")
         );
         assert_eq!(update.patch.title.as_deref(), Some("first user text"));
+
+        let sync = ThreadMetadataSync::for_resume(&resume_params(
+            thread_id,
+            vec![
+                RolloutItem::EventMsg(EventMsg::UserMessage(user_message("first user text"))),
+                RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(goal_update(
+                    thread_id,
+                    "ship the refactor",
+                ))),
+            ],
+        ));
+
+        let update = sync.take_pending_update().expect("pending metadata update");
+        assert_eq!(update.patch.preview.as_deref(), Some("first user text"));
     }
 
     #[test]

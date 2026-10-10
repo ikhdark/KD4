@@ -1,4 +1,5 @@
 use super::*;
+use crate::SkillError;
 use crate::SkillMetadata;
 use crate::config_rules::resolve_disabled_skill_paths;
 use crate::config_rules::skill_config_rules_from_stack;
@@ -185,6 +186,30 @@ enabled = {enabled}
     )
 }
 
+/// Discovery always includes the developer's real `$HOME/.agents/skills`, which the service
+/// cannot redirect, so error assertions cover only the roots a test owns.
+fn errors_under(outcome: &SkillLoadOutcome, roots: &[&Path]) -> Vec<SkillError> {
+    let roots = roots
+        .iter()
+        .flat_map(|root| {
+            [
+                root.to_path_buf(),
+                dunce::canonicalize(root).expect("fixture root should canonicalize"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    outcome
+        .errors
+        .iter()
+        .filter(|error| {
+            roots
+                .iter()
+                .any(|root| error.path.as_path().starts_with(root))
+        })
+        .cloned()
+        .collect()
+}
+
 async fn skills_for_config_with_stack(
     skills_service: &SkillsService,
     cwd: &TempDir,
@@ -306,6 +331,12 @@ async fn skills_for_config_short_circuits_on_the_stable_input_identity() {
         .await;
     assert!(first.outcome().skills.iter().any(|skill| skill.name == "skill-a"));
     write_user_skill(&codex_home, "b", "skill-b", "from b");
+    // A fallback hit in the roots cache would hide a missing input-cache fast path.
+    skills_service
+        .snapshot_cache
+        .write()
+        .expect("roots cache lock")
+        .clear();
     let second = skills_service.snapshot_for_config(&input, Some(fs)).await;
 
     assert_eq!(first.outcome().skills, second.outcome().skills);
@@ -465,7 +496,24 @@ async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
         "---\nname: runtime-skill\ndescription: runtime skill\n---\n\n# Body\n",
     )
     .expect("write skill");
+    assert_eq!(
+        skills_service
+            .snapshot_cache
+            .read()
+            .expect("roots cache lock")
+            .len(),
+        1
+    );
     skills_service.set_extra_roots(vec![extra_skills_root.abs()]);
+    assert_eq!(
+        skills_service
+            .snapshot_cache
+            .read()
+            .expect("roots cache lock")
+            .len(),
+        0,
+        "replacing extra roots must drop snapshots cached for the previous roots"
+    );
 
     let runtime_snapshot = skills_service
         .snapshot_for_cwd(
@@ -491,7 +539,13 @@ async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
         )
         .await;
     let replaced_outcome = replaced_snapshot.outcome();
-    assert_eq!(replaced_outcome.errors, Vec::new());
+    assert_eq!(
+        errors_under(
+            replaced_outcome,
+            &[codex_home.path(), cwd.path(), extra_root.path()]
+        ),
+        Vec::new()
+    );
     assert!(
         replaced_outcome
             .skills
@@ -511,8 +565,19 @@ async fn set_extra_roots_applies_to_config_loads_and_empty_clears() {
         /*bundled_skills_enabled*/ true,
     );
 
-    let empty_outcome =
-        skills_for_config_with_stack(&skills_service, &cwd, &config_layer_stack, &[]).await;
+    // Reuse one input: its identity keys the input cache, and extra roots are not part of
+    // that key, so only the invalidation in `set_extra_roots` can expose the new roots.
+    let skills_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_layer_stack.clone(),
+        bundled_skills_enabled_from_stack(&config_layer_stack),
+    );
+    let empty_outcome = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await
+        .outcome()
+        .clone();
     assert!(
         empty_outcome
             .skills
@@ -530,8 +595,11 @@ async fn set_extra_roots_applies_to_config_loads_and_empty_clears() {
     .expect("write skill");
     skills_service.set_extra_roots(vec![extra_skills_root.abs()]);
 
-    let runtime_outcome =
-        skills_for_config_with_stack(&skills_service, &cwd, &config_layer_stack, &[]).await;
+    let runtime_outcome = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await
+        .outcome()
+        .clone();
     assert!(
         runtime_outcome
             .skills
@@ -540,8 +608,11 @@ async fn set_extra_roots_applies_to_config_loads_and_empty_clears() {
     );
 
     skills_service.set_extra_roots(Vec::new());
-    let cleared_outcome =
-        skills_for_config_with_stack(&skills_service, &cwd, &config_layer_stack, &[]).await;
+    let cleared_outcome = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await
+        .outcome()
+        .clone();
     assert!(
         cleared_outcome
             .skills
@@ -710,7 +781,10 @@ async fn skills_for_cwd_uses_repo_roots_only_with_executor_filesystem() {
         let has_repo_fs = fs.is_some();
         let snapshot = skills_service.snapshot_for_cwd(&skills_input, true, fs).await;
         let outcome = snapshot.outcome();
-        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            errors_under(outcome, &[codex_home.path(), cwd.path()]),
+            Vec::new()
+        );
         let user = outcome.skills.iter().find(|skill| skill.name == "user-skill")
             .expect("user root remains available without executor filesystem");
         assert_eq!(user.scope, SkillScope::User);

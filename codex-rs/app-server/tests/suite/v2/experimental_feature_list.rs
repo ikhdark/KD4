@@ -204,8 +204,9 @@ stream_max_retries = 0
     std::fs::create_dir_all(&project_config_dir)?;
     std::fs::write(
         project_config_dir.join("config.toml"),
+        // Off is the non-default value, so only the project layer can produce it.
         r#"[features]
-auth_elicitation = true
+auth_elicitation = false
 "#,
     )?;
 
@@ -225,21 +226,24 @@ auth_elicitation = true
     let ThreadStartResponse { thread, .. } =
         read_response::<ThreadStartResponse>(&mut mcp, thread_start_id).await?;
 
-    let request_id = mcp
-        .send_experimental_feature_list_request(ExperimentalFeatureListParams {
-            cursor: None,
-            limit: None,
-            thread_id: Some(thread.id),
-        })
-        .await?;
+    for (thread_id, expected) in [(Some(thread.id), false), (None, true)] {
+        let request_id = mcp
+            .send_experimental_feature_list_request(ExperimentalFeatureListParams {
+                cursor: None,
+                limit: None,
+                thread_id: thread_id.clone(),
+            })
+            .await?;
 
-    let actual = read_response::<ExperimentalFeatureListResponse>(&mut mcp, request_id).await?;
-    let auth_elicitation = actual
-        .data
-        .iter()
-        .find(|feature| feature.name == "auth_elicitation")
-        .expect("auth_elicitation feature should be present");
-    assert!(auth_elicitation.enabled);
+        let actual =
+            read_response::<ExperimentalFeatureListResponse>(&mut mcp, request_id).await?;
+        let auth_elicitation = actual
+            .data
+            .iter()
+            .find(|feature| feature.name == "auth_elicitation")
+            .expect("auth_elicitation feature should be present");
+        assert_eq!(auth_elicitation.enabled, expected, "thread_id={thread_id:?}");
+    }
 
     Ok(())
 }
@@ -293,15 +297,16 @@ async fn experimental_feature_enablement_set_applies_to_global_and_thread_config
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
+    // Off is the non-default value, so the reads below depend on the set call.
     let actual = set_experimental_feature_enablement(
         &mut mcp,
-        BTreeMap::from([("auth_elicitation".to_string(), true)]),
+        BTreeMap::from([("auth_elicitation".to_string(), false)]),
     )
     .await?;
     assert_eq!(
         actual,
         ExperimentalFeatureEnablementSetResponse {
-            enablement: BTreeMap::from([("auth_elicitation".to_string(), true)]),
+            enablement: BTreeMap::from([("auth_elicitation".to_string(), false)]),
         }
     );
 
@@ -313,7 +318,7 @@ async fn experimental_feature_enablement_set_applies_to_global_and_thread_config
                 .additional
                 .get("features")
                 .and_then(|features| features.get("auth_elicitation")),
-            Some(&json!(true))
+            Some(&json!(false))
         );
     }
 

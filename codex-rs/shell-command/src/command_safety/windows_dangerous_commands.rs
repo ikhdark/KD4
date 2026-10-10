@@ -271,7 +271,7 @@ fn has_force_delete_cmdlet(tokens: &[String]) -> bool {
     let mut has_delete = false;
     let mut has_force = false;
     for token in tokens {
-        for (index, segment) in token.split([';', '|', '&', '\n', '\r', '\t']).enumerate() {
+        for (index, segment) in token.split([';', '|', '&', '\n', '\r']).enumerate() {
             if index > 0 {
                 has_delete = false;
                 has_force = false;
@@ -708,8 +708,24 @@ mod tests {
     }
 
     #[test]
+    fn powershell_literal_tab_in_path_does_not_hide_force_delete() {
+        // A tab inside a quoted path is argument data, not a command separator.
+        // PowerShell's native AST retains all three elements in one CommandAst.
+        for script in [
+            "Remove-Item 'a\tb' -Force",
+            "Remove-Item -Force 'a\tb'",
+            "Remove-Item\tfile\t-Force",
+        ] {
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["powershell", "-Command", script])),
+                "{script:?}"
+            );
+        }
+    }
+
+    #[test]
     fn powershell_force_delete_does_not_cross_command_separators() {
-        for separator in [";", "|", "&", "\n", "\r", "\t", "&&", "||"] {
+        for separator in [";", "|", "&", "\n", "\r", "&&", "||"] {
             let tokens = vec_str(&[
                 "Get-ChildItem",
                 &format!("-Force{separator}Remove-Item"),

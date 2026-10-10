@@ -716,6 +716,13 @@ async fn reports_invalid_prompts_for_discoverable_plugins() {
 #[tokio::test]
 async fn does_not_expand_local_plugins_by_installed_apps() {
     let codex_home = tempdir().expect("tempdir should succeed");
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features]
+plugins = true
+remote_plugin = false
+"#,
+    );
     let curated_root = curated_plugins_repo_path(codex_home.path());
     write_openai_curated_marketplace(&curated_root, &["sample", "slack", "hubspot"]);
     write_plugin_app(&curated_root, "sample", "sample", "connector_sample");
@@ -723,6 +730,14 @@ async fn does_not_expand_local_plugins_by_installed_apps() {
 
     let plugins = load_plugins_config(codex_home.path(), codex_home.path()).await;
     let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    // Installed plugins only expose apps under Codex-backend auth, and local curated
+    // plugins only stay loaded while the remote catalog is off. `hubspot` declares the
+    // same connector as the installed plugin, so it is the expansion candidate.
+    plugins_manager.set_auth_mode(Some(AuthMode::Chatgpt));
+    assert_eq!(
+        installed_app_connector_ids(&plugins_manager, &plugins).await,
+        ["connector_calendar"]
+    );
     let discoverable_plugins = list_discoverable_plugins(
         &plugins_manager,
         discovery_input(plugins, &[], &[], &[]),
@@ -835,6 +850,13 @@ source = "/tmp/{sales_marketplace_name}"
 
     let plugins = load_plugins_config(codex_home.path(), codex_home.path()).await;
     let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    // Installed plugins only expose apps under Codex-backend auth; without it there
+    // is no installed sales app for the curated plugins to be expanded by.
+    plugins_manager.set_auth_mode(Some(AuthMode::Chatgpt));
+    assert_eq!(
+        installed_app_connector_ids(&plugins_manager, &plugins).await,
+        [hubspot_app_id, granola_app_id]
+    );
     let discoverable_plugins = list_discoverable_plugins(
         &plugins_manager,
         discovery_input(plugins, &[], &[], &[]),
@@ -964,6 +986,16 @@ plugins = true
         }]
     );
 
+    // The unlisted plugin is neither configured nor a fallback, so only the loaded
+    // app admits it.
+    let without_loaded_app = list_discoverable_plugins(
+        &plugins_manager,
+        discovery_input(plugins.clone(), &[], &[], &[]),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(without_loaded_app, Vec::new());
+
     let cache_entries = std::fs::read_dir(codex_home.path().join("cache/remote_plugin_catalog"))
         .expect("catalog cache directory should exist")
         .collect::<std::io::Result<Vec<_>>>()
@@ -1013,6 +1045,19 @@ async fn list_discoverable_plugins(
 
 fn string_set(values: &[&str]) -> HashSet<String> {
     values.iter().map(ToString::to_string).collect()
+}
+
+async fn installed_app_connector_ids(
+    plugins_manager: &PluginsManager,
+    plugins: &PluginsConfigInput,
+) -> Vec<String> {
+    plugins_manager
+        .plugins_for_config(plugins)
+        .await
+        .effective_apps()
+        .into_iter()
+        .map(|connector_id| connector_id.0)
+        .collect()
 }
 
 async fn install_marketplace_plugin(codex_home: &Path, marketplace_root: &Path, plugin_name: &str) {

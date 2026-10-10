@@ -21,7 +21,11 @@ use crate::version::CODEX_CLI_VERSION;
 pub(crate) use crate::updates_cache::dismiss_version;
 
 pub(crate) async fn startup_version_info(config: &Config) -> Option<VersionInfo> {
-    if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
+    startup_version_info_for(config, CODEX_CLI_VERSION).await
+}
+
+async fn startup_version_info_for(config: &Config, current_version: &str) -> Option<VersionInfo> {
+    if !config.check_for_update_on_startup || is_source_build_version(current_version) {
         return None;
     }
 
@@ -43,7 +47,7 @@ pub(crate) async fn startup_version_info(config: &Config) -> Option<VersionInfo>
         });
     }
 
-    info.filter(|info| is_newer_version(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false))
+    info.filter(|info| is_newer_version(&info.latest_version, current_version).unwrap_or(false))
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -112,14 +116,18 @@ mod tests {
         assert_eq!(super::get_upgrade_version_for_popup(None), None);
     }
 
+    // Tests build as the 0.0.0 source version, which suppresses update checks, so the
+    // cached-release behavior is driven as a packaged release would see it.
+    const RELEASE_VERSION: &str = "1.2.3";
+
     async fn get_upgrade_version(config: &Config) -> Option<String> {
-        startup_version_info(config)
+        startup_version_info_for(config, RELEASE_VERSION)
             .await
             .map(|info| info.latest_version)
     }
 
     async fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
-        let info = startup_version_info(config).await;
+        let info = startup_version_info_for(config, RELEASE_VERSION).await;
         super::get_upgrade_version_for_popup(info.as_ref()).map(str::to_owned)
     }
 
@@ -146,14 +154,10 @@ mod tests {
             });
             let bytes = serde_json::to_vec(&fresh).expect("cache JSON");
             tokio::fs::write(&cache, &bytes).await.expect("fresh cache");
-            if is_source_build_version(CODEX_CLI_VERSION) {
-                // Ordinary source release builds intentionally suppress update checks.
-                // Worker placement below requires a nonzero numeric release version at build time.
-                assert_eq!(get_upgrade_version(&config).await, None);
-                assert_eq!(get_upgrade_version_for_popup(&config).await, None);
-                assert_eq!(tokio::fs::read(&cache).await.unwrap(), bytes);
-                return;
-            }
+            // Source builds suppress update checks even with a newer release cached.
+            assert!(startup_version_info_for(&config, "0.0.0").await.is_none());
+            assert_eq!(tokio::fs::read(&cache).await.unwrap(), bytes);
+
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let blocker = tokio::task::spawn_blocking(move || {
@@ -193,7 +197,7 @@ mod tests {
             assert_eq!(get_upgrade_version_for_popup(&config).await, None);
 
             let same_version = serde_json::json!({
-                "latest_version": CODEX_CLI_VERSION,
+                "latest_version": RELEASE_VERSION,
                 "last_checked_at": Utc::now(),
                 "dismissed_version": null
             });
@@ -204,6 +208,8 @@ mod tests {
             config.check_for_update_on_startup = false;
             tokio::fs::write(&cache, &bytes).await.unwrap();
             assert_eq!(get_upgrade_version_for_popup(&config).await, None);
+            // The startup entry point honors the opt-out whatever version this binary carries.
+            assert!(startup_version_info(&config).await.is_none());
             assert_eq!(tokio::fs::read(&cache).await.unwrap(), bytes);
         });
     }

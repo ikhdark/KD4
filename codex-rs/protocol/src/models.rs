@@ -883,20 +883,6 @@ pub enum AgentMessageInputContent {
     EncryptedContent { encrypted_content: String },
 }
 
-/// Returns the locally readable text when an agent message is entirely plaintext.
-pub fn plaintext_agent_message_content(content: &[AgentMessageInputContent]) -> Option<String> {
-    let mut text_parts = Vec::with_capacity(content.len());
-    for part in content {
-        match part {
-            AgentMessageInputContent::InputText { text } => text_parts.push(text.as_str()),
-            AgentMessageInputContent::EncryptedContent { .. } => return None,
-        }
-    }
-
-    let text = text_parts.join("\n");
-    (!text.trim().is_empty()).then_some(text)
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageDetail {
@@ -2561,20 +2547,6 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_agent_message_content_rejects_mixed_encrypted_content() {
-        let content = vec![
-            AgentMessageInputContent::InputText {
-                text: "Message Type: MESSAGE\nPayload:\n".to_string(),
-            },
-            AgentMessageInputContent::EncryptedContent {
-                encrypted_content: "encrypted-payload".to_string(),
-            },
-        ];
-
-        assert_eq!(plaintext_agent_message_content(&content), None);
-    }
-
-    #[test]
     fn response_input_message_conversion_preserves_phase() {
         let item = ResponseItem::from(ResponseInputItem::Message {
             role: "assistant".to_string(),
@@ -3327,6 +3299,14 @@ mod tests {
             "glob_scan_max_depth": 0,
         }))
         .expect_err("zero glob scan depth should fail deserialization");
+
+        // Depth one is the minimum, so only the zero makes the value above invalid.
+        let minimum: FileSystemPermissions = serde_json::from_value(serde_json::json!({
+            "entries": [],
+            "glob_scan_max_depth": 1,
+        }))
+        .expect("depth one should deserialize");
+        assert_eq!(minimum.glob_scan_max_depth, NonZeroUsize::new(1));
     }
 
     #[test]
@@ -3718,7 +3698,8 @@ mod tests {
                 "data": "BASE64",
                 "mimeType": "image/png",
                 "_meta": {
-                    "codex/imageDetail": "high",
+                    // Not the default detail, so ignoring the metadata cannot pass.
+                    "codex/imageDetail": "low",
                 },
             })],
             structured_content: None,
@@ -3735,7 +3716,7 @@ mod tests {
             items,
             vec![FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,BASE64".into(),
-                detail: Some(ImageDetail::High),
+                detail: Some(ImageDetail::Low),
             }]
         );
 

@@ -983,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn has_running_turns_tracks_runtime_running_flag_only() {
+    async fn running_turn_count_tracks_runtime_running_flag_only() {
         let manager = ThreadWatchManager::new();
         manager
             .upsert_thread(&test_thread(
@@ -992,25 +992,22 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(manager.running_turn_count().await, 0);
+        // The published count is what the runtime consumes.
+        let published = || *manager.subscribe_running_turn_count().borrow();
+        assert_eq!(published(), 0);
 
         let _permission_guard = manager
             .note_permission_requested(INTERACTIVE_THREAD_ID)
             .await;
-        assert_eq!(manager.running_turn_count().await, 0);
+        assert_eq!(published(), 0);
 
         manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
-        assert_eq!(manager.running_turn_count().await, 1);
-        let running = manager.subscribe_running_turn_count();
-        assert_eq!(*running.borrow(), 1);
-        drop(running);
+        assert_eq!(published(), 1);
 
         manager
             .note_turn_completed(INTERACTIVE_THREAD_ID, false)
             .await;
-        assert_eq!(manager.running_turn_count().await, 0);
-        let completed = manager.subscribe_running_turn_count();
-        assert_eq!(*completed.borrow(), 0);
+        assert_eq!(published(), 0);
     }
 
     #[tokio::test]

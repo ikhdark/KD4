@@ -15,6 +15,65 @@ fn registry_error(status: http::StatusCode, code: Option<&str>) -> ExecServerErr
 }
 
 #[tokio::test]
+async fn process_close_discards_buffered_later_output() {
+    // ExecProcessEvent's contract makes Closed terminal for output, even when
+    // a malformed peer sent a later event before the missing close arrived.
+    for recovery in [None, Some(false), Some(true)] {
+        let state = SessionState::new(true);
+        let mut events = state.subscribe_events();
+        assert!(!state.publish_ordered_event(ExecProcessEvent::Output(ProcessOutputChunk {
+            seq: 4,
+            stream: ExecOutputStream::Stdout,
+            chunk: b"must not follow close".to_vec().into(),
+        })).unwrap());
+        let prefix = ProcessOutputChunk {
+            seq: 1,
+            stream: ExecOutputStream::Stdout,
+            chunk: b"valid prefix".to_vec().into(),
+        };
+        if let Some(with_gap) = recovery {
+            assert!(state.recover_events(ReadResponse {
+                chunks: vec![prefix.clone()],
+                next_seq: 4,
+                exited: true,
+                exit_code: Some(7),
+                closed: true,
+                failure: None,
+                output_gap: with_gap.then_some(crate::protocol::ProcessOutputGap {
+                    through_seq: 0,
+                    exit_seq: Some(2),
+                }),
+                sandbox_denied: false,
+            }).unwrap());
+        } else {
+            assert!(!state.publish_ordered_event(ExecProcessEvent::Closed {
+                seq: 3, sandbox_denied: Some(false),
+            }).unwrap());
+            assert!(!state.publish_ordered_event(ExecProcessEvent::Exited {
+                seq: 2, exit_code: 7, sandbox_denied: Some(false),
+            }).unwrap());
+            assert!(state.publish_ordered_event(ExecProcessEvent::Output(prefix.clone())).unwrap());
+        }
+        for expected in [
+            ExecProcessEvent::Output(prefix),
+            ExecProcessEvent::Exited { seq: 2, exit_code: 7, sandbox_denied: Some(false) },
+            ExecProcessEvent::Closed { seq: 3, sandbox_denied: Some(false) },
+        ] {
+            assert_eq!(tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await.unwrap().unwrap(), expected, "recovery={recovery:?}");
+        }
+        let next = events.recv();
+        tokio::pin!(next);
+        assert!(futures::poll!(&mut next).is_pending(),
+            "Closed must not be followed by buffered output: recovery={recovery:?}");
+        let ordered = state.ordered_events.lock().unwrap();
+        assert_eq!(ordered.last_published_seq, 3);
+        assert!(ordered.pending.is_empty());
+        assert_eq!(ordered.pending_bytes, 0);
+    }
+}
+
+#[tokio::test]
 async fn recovery_reads_healthy_process_while_another_reply_is_held() {
     use codex_exec_server_protocol::JSONRPCMessage;
     use codex_exec_server_protocol::JSONRPCResponse;

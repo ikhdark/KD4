@@ -269,6 +269,15 @@ async fn collect_process_event_snapshots(
         let closed = matches!(snapshot, ProcessEventSnapshot::Closed { .. });
         snapshots.push(snapshot);
         if closed {
+            // The receiver may time out or report a closed channel; it must not
+            // deliver anything after the close.
+            assert!(
+                !matches!(
+                    timeout(Duration::from_millis(100), events.recv()).await,
+                    Ok(Ok(_))
+                ),
+                "close must be the final event"
+            );
             drop(session);
             return Ok(snapshots);
         }
@@ -337,7 +346,6 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
     let mut exit_code = None;
     let mut closed = false;
     for (index, event) in actual.iter().enumerate() {
-        assert!(!closed, "close must be the final event");
         let seq = match event {
             ProcessEventSnapshot::Output { seq, stream, text } => {
                 match stream {
@@ -431,7 +439,9 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            // The helper is this test binary; without TEMP its startup would
+            // place its scratch directory under the Windows directory.
+            env: std::env::vars().collect(),
             tty: false,
             pipe_stdin: false,
             arg0: None,

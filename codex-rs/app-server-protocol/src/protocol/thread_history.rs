@@ -256,14 +256,6 @@ impl ThreadHistoryBuilder {
             .or_else(|| self.turns.last().cloned())
     }
 
-    /// Returns active turn metadata without cloning its growing item list.
-    pub fn active_turn_change_snapshot(&self) -> Option<ThreadHistoryTurnChange> {
-        self.current_turn
-            .as_ref()
-            .map(ThreadHistoryTurnChange::from_pending_turn)
-            .or_else(|| self.turns.last().map(ThreadHistoryTurnChange::from_turn))
-    }
-
     /// Returns the current turn only while it is still in progress.
     ///
     /// Interrupted turns intentionally remain open briefly so late items can still be grouped
@@ -408,6 +400,57 @@ impl ThreadHistoryBuilder {
     /// Handles one live event and returns its incremental history projection.
     pub fn handle_event_with_changes(&mut self, event: &EventMsg) -> ThreadHistoryChangeSet {
         self.collect_changes(|builder| builder.handle_event(event))
+    }
+
+    /// Explicit turn ownership carried by item and terminal lifecycle events.
+    pub fn scoped_event_turn_id(event: &EventMsg) -> Option<&str> {
+        match event {
+            EventMsg::ItemStarted(value) => Some(value.turn_id.as_str()),
+            EventMsg::ItemCompleted(value) => Some(value.turn_id.as_str()),
+            EventMsg::ExecCommandBegin(value) => Some(value.turn_id.as_str()),
+            EventMsg::ExecCommandEnd(value) => Some(value.turn_id.as_str()),
+            EventMsg::ApplyPatchApprovalRequest(value) => Some(value.turn_id.as_str()),
+            EventMsg::PatchApplyBegin(value) => Some(value.turn_id.as_str()),
+            EventMsg::PatchApplyEnd(value) => Some(value.turn_id.as_str()),
+            EventMsg::DynamicToolCallRequest(value) => Some(value.turn_id.as_str()),
+            EventMsg::DynamicToolCallResponse(value) => Some(value.turn_id.as_str()),
+            EventMsg::TurnComplete(value) => Some(value.turn_id.as_str()),
+            EventMsg::TurnAborted(value) => value.turn_id.as_deref(),
+            EventMsg::EnteredReviewMode(value) => value.turn_id.as_deref(),
+            EventMsg::ExitedReviewMode(value) => value.turn_id.as_deref(),
+            _ => None,
+        }
+        .filter(|id| !id.is_empty())
+    }
+
+    pub fn contains_turn(&self, turn_id: &str) -> bool {
+        self.current_turn.as_ref().is_some_and(|turn| turn.id == turn_id)
+            || self.turns.iter().any(|turn| turn.id == turn_id)
+    }
+
+    /// Reduce a late scoped event against a turn retained by an external index.
+    /// Moves its item buffer temporarily, rather than retaining or cloning a
+    /// second copy of the index's completed history. The current turn and mirror
+    /// suppression state remain owned by this reducer.
+    pub fn handle_event_with_retained_turn(
+        &mut self,
+        event: &EventMsg,
+        turn: &mut Turn,
+    ) -> ThreadHistoryChangeSet {
+        assert!(Self::scoped_event_turn_id(event) == Some(turn.id.as_str())
+            || matches!(event, EventMsg::CollabWaitingEnd(payload)
+                if turn.items.iter().any(|item| matches!(item,
+                    ThreadItem::CollabAgentToolCall { id, tool: CollabAgentTool::Wait, .. }
+                    if id == &payload.call_id))));
+        assert!(!self.contains_turn(&turn.id));
+        let items = std::mem::take(&mut turn.items);
+        let mut retained = turn.clone();
+        retained.items = items;
+        let position = self.turns.len();
+        self.turns.push(retained);
+        let changes = self.handle_event_with_changes(event);
+        *turn = self.turns.remove(position);
+        changes
     }
 
     pub fn handle_rollout_item(&mut self, item: &RolloutItem) {
@@ -1991,7 +2034,7 @@ mod tests {
                 target: ReviewTarget::Custom {
                     instructions: "review this".into(),
                 },
-                user_facing_hint: Some("Review requested.".into()),
+                user_facing_hint: Some("Review the staged changes.".into()),
                 turn_id: Some("turn-1".into()),
                 item_id: Some("entered-review".into()),
             }),
@@ -2024,7 +2067,7 @@ mod tests {
             vec![
                 ThreadItem::EnteredReviewMode {
                     id: "entered-review".into(),
-                    review: "Review requested.".into(),
+                    review: "Review the staged changes.".into(),
                 },
                 ThreadItem::ExitedReviewMode {
                     id: "exited-review".into(),
@@ -3989,7 +4032,29 @@ mod tests {
 
     #[test]
     fn reconstructs_collab_resume_end_item() {
-        for message in [None, Some("result".to_string())] {
+        for (status, call_status, state_status, message, last_agent_message) in [
+            (
+                AgentStatus::Completed(None),
+                CollabAgentToolCallStatus::Completed,
+                crate::protocol::v2::CollabAgentStatus::Completed,
+                None,
+                None,
+            ),
+            (
+                AgentStatus::Completed(Some("result".to_string())),
+                CollabAgentToolCallStatus::Completed,
+                crate::protocol::v2::CollabAgentStatus::Completed,
+                Some("result".to_string()),
+                Some("result".to_string()),
+            ),
+            (
+                AgentStatus::Errored("child failed".to_string()),
+                CollabAgentToolCallStatus::Failed,
+                crate::protocol::v2::CollabAgentStatus::Errored,
+                Some("child failed".to_string()),
+                None,
+            ),
+        ] {
             let events = vec![
                 EventMsg::UserMessage(UserMessageEvent {
                     client_id: None,
@@ -4008,7 +4073,7 @@ mod tests {
                         .expect("valid receiver thread id"),
                     receiver_agent_nickname: None,
                     receiver_agent_role: None,
-                    status: AgentStatus::Completed(message.clone()),
+                    status,
                 }),
             ];
 
@@ -4024,7 +4089,7 @@ mod tests {
                 ThreadItem::CollabAgentToolCall {
                     id: "resume-1".into(),
                     tool: CollabAgentTool::ResumeAgent,
-                    status: CollabAgentToolCallStatus::Completed,
+                    status: call_status,
                     sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
                     receiver_thread_ids: vec!["00000000-0000-0000-0000-000000000002".into()],
                     prompt: None,
@@ -4033,10 +4098,10 @@ mod tests {
                     agents_states: [(
                         "00000000-0000-0000-0000-000000000002".into(),
                         CollabAgentState {
-                            status: crate::protocol::v2::CollabAgentStatus::Completed,
-                            message: message.clone(),
+                            status: state_status,
+                            message,
                             surfaced_result: None,
-                            last_agent_message: message,
+                            last_agent_message,
                         },
                     )]
                     .into_iter()
@@ -4180,6 +4245,371 @@ mod tests {
                 .collect(),
             }
         );
+    }
+
+    fn replay_events_in_one_turn(events: &[EventMsg]) -> Vec<ThreadItem> {
+        let mut builder = ThreadHistoryBuilder::new();
+        wait_history_test_start_turn(&mut builder, "turn-1");
+        for event in events {
+            builder.handle_event(event);
+        }
+        let mut turns = builder.finish();
+        assert_eq!(turns.len(), 1);
+        turns.remove(0).items
+    }
+
+    #[test]
+    fn mcp_tool_call_begin_opens_in_progress_item_that_end_replaces() {
+        let events = [
+            EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
+                call_id: "mcp-1".into(),
+                invocation: McpInvocation {
+                    server: "docs".into(),
+                    tool: "lookup".into(),
+                    arguments: None,
+                },
+                connector_id: Some("calendar".into()),
+                mcp_app_resource_uri: Some("ui://widget/lookup.html".into()),
+                link_id: Some("link_calendar".into()),
+                app_name: Some("Calendar".into()),
+                template_id: Some("calendar_template".into()),
+                action_name: Some("lookup".into()),
+                plugin_id: Some("sample@test".into()),
+            }),
+            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+                call_id: "mcp-1".into(),
+                invocation: McpInvocation {
+                    server: "docs".into(),
+                    tool: "lookup".into(),
+                    arguments: None,
+                },
+                connector_id: None,
+                mcp_app_resource_uri: None,
+                link_id: None,
+                app_name: None,
+                template_id: None,
+                action_name: None,
+                plugin_id: None,
+                duration: Duration::from_millis(8),
+                result: Err("boom".into()),
+            }),
+        ];
+
+        assert_eq!(
+            replay_events_in_one_turn(&events[..1]),
+            vec![ThreadItem::McpToolCall {
+                id: "mcp-1".into(),
+                server: "docs".into(),
+                tool: "lookup".into(),
+                status: McpToolCallStatus::InProgress,
+                arguments: serde_json::Value::Null,
+                app_context: Some(McpToolCallAppContext {
+                    connector_id: "calendar".into(),
+                    link_id: Some("link_calendar".into()),
+                    resource_uri: Some("ui://widget/lookup.html".into()),
+                    app_name: Some("Calendar".into()),
+                    template_id: Some("calendar_template".into()),
+                    action_name: Some("lookup".into()),
+                }),
+                mcp_app_resource_uri: Some("ui://widget/lookup.html".into()),
+                plugin_id: Some("sample@test".into()),
+                result: None,
+                error: None,
+                duration_ms: None,
+            }]
+        );
+        // The end event reuses the call id, so it replaces the begin item in place.
+        assert_eq!(
+            replay_events_in_one_turn(&events),
+            vec![ThreadItem::McpToolCall {
+                id: "mcp-1".into(),
+                server: "docs".into(),
+                tool: "lookup".into(),
+                status: McpToolCallStatus::Failed,
+                arguments: serde_json::Value::Null,
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                result: None,
+                error: Some(McpToolCallError {
+                    message: "boom".into(),
+                }),
+                duration_ms: Some(8),
+            }]
+        );
+    }
+
+    #[test]
+    fn view_image_tool_call_becomes_image_view_item() {
+        let path = test_path_buf("/tmp/view-image.png").abs();
+        assert_eq!(
+            replay_events_in_one_turn(&[EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
+                call_id: "view-image-1".into(),
+                path: codex_utils_path_uri::PathUri::from_abs_path(&path),
+            })]),
+            vec![ThreadItem::ImageView {
+                id: "view-image-1".into(),
+                path: codex_utils_path_uri::LegacyAppPathString::from_abs_path(&path),
+            }]
+        );
+    }
+
+    #[test]
+    fn sub_agent_activity_event_becomes_activity_item() {
+        let agent_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid agent thread id");
+        assert_eq!(
+            replay_events_in_one_turn(&[EventMsg::SubAgentActivity(
+                codex_protocol::protocol::SubAgentActivityEvent {
+                    event_id: "activity-1".into(),
+                    occurred_at_ms: 0,
+                    agent_thread_id,
+                    agent_path: codex_protocol::AgentPath::root()
+                        .join("worker")
+                        .expect("worker path"),
+                    kind: codex_protocol::protocol::SubAgentActivityKind::Interrupted,
+                },
+            )]),
+            vec![ThreadItem::SubAgentActivity {
+                id: "activity-1".into(),
+                kind: crate::protocol::v2::SubAgentActivityKind::Interrupted,
+                agent_thread_id: "00000000-0000-0000-0000-000000000002".into(),
+                agent_path: "/root/worker".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn context_compacted_event_appends_context_compaction_item() {
+        let items = replay_events_in_one_turn(&[
+            EventMsg::UserMessage(UserMessageEvent {
+                client_id: None,
+                message: "hello".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            }),
+            EventMsg::ContextCompacted(ContextCompactedEvent),
+        ]);
+        assert_eq!(items.len(), 2);
+        // The marker takes the next generated id after the user message's `item-1`.
+        assert_eq!(
+            items[1],
+            ThreadItem::ContextCompaction {
+                id: "item-2".into()
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_close_begin_and_end_items() {
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let receiver = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        let begin = || {
+            EventMsg::CollabCloseBegin(codex_protocol::protocol::CollabCloseBeginEvent {
+                call_id: "close-1".into(),
+                started_at_ms: 0,
+                sender_thread_id: sender,
+                receiver_thread_id: receiver,
+            })
+        };
+        assert_eq!(
+            replay_events_in_one_turn(&[begin()]),
+            vec![ThreadItem::CollabAgentToolCall {
+                id: "close-1".into(),
+                tool: CollabAgentTool::CloseAgent,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: sender.to_string(),
+                receiver_thread_ids: vec![receiver.to_string()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::new(),
+            }]
+        );
+
+        for (status, call_status, state_status, message) in [
+            (
+                AgentStatus::Shutdown,
+                CollabAgentToolCallStatus::Completed,
+                crate::protocol::v2::CollabAgentStatus::Shutdown,
+                None,
+            ),
+            (
+                AgentStatus::Errored("child failed".to_string()),
+                CollabAgentToolCallStatus::Failed,
+                crate::protocol::v2::CollabAgentStatus::Errored,
+                Some("child failed".to_string()),
+            ),
+            (
+                AgentStatus::NotFound,
+                CollabAgentToolCallStatus::Failed,
+                crate::protocol::v2::CollabAgentStatus::NotFound,
+                None,
+            ),
+        ] {
+            let items = replay_events_in_one_turn(&[
+                begin(),
+                EventMsg::CollabCloseEnd(codex_protocol::protocol::CollabCloseEndEvent {
+                    call_id: "close-1".into(),
+                    completed_at_ms: 0,
+                    sender_thread_id: sender,
+                    receiver_thread_id: receiver,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
+                    status,
+                }),
+            ]);
+            // The end event replaces the in-progress begin item instead of adding a second one.
+            assert_eq!(
+                items,
+                vec![ThreadItem::CollabAgentToolCall {
+                    id: "close-1".into(),
+                    tool: CollabAgentTool::CloseAgent,
+                    status: call_status,
+                    sender_thread_id: sender.to_string(),
+                    receiver_thread_ids: vec![receiver.to_string()],
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: [(
+                        receiver.to_string(),
+                        CollabAgentState {
+                            status: state_status,
+                            message,
+                            surfaced_result: None,
+                            last_agent_message: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn collab_spawn_end_without_usable_agent_is_failed() {
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let spawned = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        for (new_thread_id, status, expected_state) in [
+            // No thread was created, so even a non-error status is a failed spawn.
+            (None, AgentStatus::PendingInit, None),
+            (
+                Some(spawned),
+                AgentStatus::Errored("spawn failed".to_string()),
+                Some(CollabAgentState {
+                    status: crate::protocol::v2::CollabAgentStatus::Errored,
+                    message: Some("spawn failed".to_string()),
+                    surfaced_result: None,
+                    last_agent_message: None,
+                }),
+            ),
+            (
+                Some(spawned),
+                AgentStatus::NotFound,
+                Some(CollabAgentState {
+                    status: crate::protocol::v2::CollabAgentStatus::NotFound,
+                    message: None,
+                    surfaced_result: None,
+                    last_agent_message: None,
+                }),
+            ),
+        ] {
+            let items = replay_events_in_one_turn(&[EventMsg::CollabAgentSpawnEnd(
+                codex_protocol::protocol::CollabAgentSpawnEndEvent {
+                    call_id: "spawn-1".into(),
+                    completed_at_ms: 0,
+                    sender_thread_id: sender,
+                    new_thread_id,
+                    new_agent_nickname: None,
+                    new_agent_role: None,
+                    prompt: "inspect the repo".into(),
+                    model: "gpt-5.4-mini".into(),
+                    reasoning_effort: codex_protocol::openai_models::ReasoningEffort::Medium,
+                    status,
+                },
+            )]);
+            assert_eq!(
+                items,
+                vec![ThreadItem::CollabAgentToolCall {
+                    id: "spawn-1".into(),
+                    tool: CollabAgentTool::SpawnAgent,
+                    status: CollabAgentToolCallStatus::Failed,
+                    sender_thread_id: sender.to_string(),
+                    receiver_thread_ids: new_thread_id.iter().map(ToString::to_string).collect(),
+                    prompt: Some("inspect the repo".into()),
+                    model: Some("gpt-5.4-mini".into()),
+                    reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+                    agents_states: expected_state
+                        .map(|state| (spawned.to_string(), state))
+                        .into_iter()
+                        .collect(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn collab_send_input_end_with_errored_or_missing_receiver_is_failed() {
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let receiver = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        for (status, state_status, message) in [
+            (
+                AgentStatus::Errored("child failed".to_string()),
+                crate::protocol::v2::CollabAgentStatus::Errored,
+                Some("child failed".to_string()),
+            ),
+            (
+                AgentStatus::NotFound,
+                crate::protocol::v2::CollabAgentStatus::NotFound,
+                None,
+            ),
+        ] {
+            let items = replay_events_in_one_turn(&[EventMsg::CollabAgentInteractionEnd(
+                codex_protocol::protocol::CollabAgentInteractionEndEvent {
+                    call_id: "send-1".into(),
+                    completed_at_ms: 0,
+                    sender_thread_id: sender,
+                    receiver_thread_id: receiver,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
+                    prompt: "new task".into(),
+                    status,
+                },
+            )]);
+            assert_eq!(
+                items,
+                vec![ThreadItem::CollabAgentToolCall {
+                    id: "send-1".into(),
+                    tool: CollabAgentTool::SendInput,
+                    status: CollabAgentToolCallStatus::Failed,
+                    sender_thread_id: sender.to_string(),
+                    receiver_thread_ids: vec![receiver.to_string()],
+                    prompt: Some("new task".into()),
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: [(
+                        receiver.to_string(),
+                        CollabAgentState {
+                            status: state_status,
+                            message,
+                            surfaced_result: None,
+                            last_agent_message: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                }]
+            );
+        }
     }
 
     #[test]
@@ -4434,6 +4864,9 @@ mod tests {
             Some("worker panicked")
         );
         assert_eq!(turn.started_at, Some(20));
+        // The preceding Error already marks the turn failed; only the abort supplies these.
+        assert_eq!(turn.completed_at, Some(21));
+        assert_eq!(turn.duration_ms, Some(800));
     }
 
     #[test]
@@ -4819,7 +5252,13 @@ mod tests {
                 "hook-run-1",
             )],
         });
-        let expected_item = ThreadItem::from(hook_prompt.clone());
+        let expected_item = ThreadItem::HookPrompt {
+            id: "hook-prompt-1".into(),
+            fragments: vec![crate::protocol::v2::HookPromptFragment {
+                text: "Retry with tests.".into(),
+                hook_run_id: "hook-run-1".into(),
+            }],
+        };
         let mut builder = ThreadHistoryBuilder::new();
         builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-a".into(),
@@ -4917,40 +5356,6 @@ mod tests {
                 }],
                 removed_turn_ids: Vec::new(),
             }
-        );
-    }
-
-    #[test]
-    fn active_turn_change_snapshot_returns_metadata_without_materializing_items() {
-        let mut builder = ThreadHistoryBuilder::new();
-        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
-            turn_id: "turn-a".into(),
-            trace_id: None,
-            started_at: Some(10),
-            model_context_window: None,
-            collaboration_mode_kind: Default::default(),
-        }));
-        builder.handle_event(&EventMsg::UserMessage(UserMessageEvent {
-            client_id: None,
-            message: "hello".into(),
-            images: None,
-            text_elements: Vec::new(),
-            local_images: Vec::new(),
-            ..Default::default()
-        }));
-
-        assert_eq!(
-            builder.active_turn_change_snapshot(),
-            Some(ThreadHistoryTurnChange {
-                turn_id: "turn-a".into(),
-                status: TurnStatus::InProgress,
-                error: None,
-                started_at: Some(10),
-                completed_at: None,
-                duration_ms: None,
-                timing: None,
-                surfaced_result: None,
-            })
         );
     }
 

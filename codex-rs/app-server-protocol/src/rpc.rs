@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_decoder_preserves_valid_envelopes_and_extension_fields() {
+    fn wire_decoder_preserves_valid_envelopes_and_ignores_extension_fields() {
         for input in [
             r#"{"id":1,"method":"example","params":null}"#,
             r#"{"method":"example"}"#,
@@ -201,6 +201,8 @@ mod tests {
     fn overloaded_error_has_one_code_and_typed_retryable_data() {
         let error = overloaded_error(OverloadReason::TransportIngress, "queue full");
 
+        // Clients match on the numeric wire value, so pin it rather than the constant.
+        assert_eq!(error.code, -32001);
         assert_eq!(error.code, OVERLOADED_ERROR_CODE);
         assert_eq!(error.message, "queue full");
         assert_eq!(

@@ -101,3 +101,32 @@ pub fn format_config_layer_source(source: &ConfigLayerSource, config_toml_file: 
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigLayerSource;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn precedence_preserves_order_between_distinct_project_layers() {
+        let first = ConfigLayerSource::Project {
+            dot_codex_folder: test_path_buf("/z/.codex").abs(),
+        };
+        let second = ConfigLayerSource::Project {
+            dot_codex_folder: test_path_buf("/a/.codex").abs(),
+        };
+        assert_ne!(first, second);
+        assert_eq!(first.precedence(), second.precedence());
+        // Config assembly stable-sorts layers by precedence, so project layers must tie to
+        // keep their root-to-cwd order.
+        let mut layers = vec![
+            ConfigLayerSource::SessionFlags,
+            first.clone(),
+            second.clone(),
+        ];
+        layers.sort_by_key(ConfigLayerSource::precedence);
+        assert_eq!(layers, vec![first, second, ConfigLayerSource::SessionFlags]);
+    }
+}

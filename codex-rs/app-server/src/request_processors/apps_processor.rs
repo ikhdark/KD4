@@ -667,10 +667,6 @@ async fn send_app_list_updated_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-
-    struct DropFlag(Arc<AtomicBool>);
 
     #[tokio::test]
     async fn app_list_notification_retries_after_full_queue_without_recording_unsent_data() {
@@ -750,47 +746,26 @@ mod tests {
         ), "force refresh still deduplicates within its own request");
     }
 
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-
+    // The loaders are borrowed here; the request loop that owns them is not driven.
     #[tokio::test(start_paused = true)]
-    async fn app_list_timeout_drops_both_owned_loaders() {
-        let accessible_dropped = Arc::new(AtomicBool::new(false));
-        let directory_dropped = Arc::new(AtomicBool::new(false));
+    async fn app_list_load_times_out_at_the_shared_deadline() {
+        let accessible_loader = std::future::pending::<AppListLoadResult>();
+        let directory_loader = std::future::pending::<AppListLoadResult>();
+        tokio::pin!(accessible_loader);
+        tokio::pin!(directory_loader);
 
-        {
-            let accessible_flag = DropFlag(Arc::clone(&accessible_dropped));
-            let directory_flag = DropFlag(Arc::clone(&directory_dropped));
-            let accessible_loader = async move {
-                let _flag = accessible_flag;
-                std::future::pending::<AppListLoadResult>().await
-            };
-            let directory_loader = async move {
-                let _flag = directory_flag;
-                std::future::pending::<AppListLoadResult>().await
-            };
-            tokio::pin!(accessible_loader);
-            tokio::pin!(directory_loader);
-
-            let started = tokio::time::Instant::now();
-            let result = next_app_list_load(
-                accessible_loader.as_mut(),
-                directory_loader.as_mut(),
-                /*accessible_loaded*/ false,
-                /*all_loaded*/ false,
-                started + APP_LIST_LOAD_TIMEOUT,
-            )
-            .await;
-            assert_eq!(result.err(), Some(internal_error(format!(
-                "timed out waiting for app lists after {} seconds", APP_LIST_LOAD_TIMEOUT.as_secs()
-            ))));
-            assert_eq!(started.elapsed(), APP_LIST_LOAD_TIMEOUT);
-        }
-
-        assert!(accessible_dropped.load(Ordering::Acquire));
-        assert!(directory_dropped.load(Ordering::Acquire));
+        let started = tokio::time::Instant::now();
+        let result = next_app_list_load(
+            accessible_loader.as_mut(),
+            directory_loader.as_mut(),
+            /*accessible_loaded*/ false,
+            /*all_loaded*/ false,
+            started + APP_LIST_LOAD_TIMEOUT,
+        )
+        .await;
+        assert_eq!(result.err(), Some(internal_error(format!(
+            "timed out waiting for app lists after {} seconds", APP_LIST_LOAD_TIMEOUT.as_secs()
+        ))));
+        assert_eq!(started.elapsed(), APP_LIST_LOAD_TIMEOUT);
     }
 }

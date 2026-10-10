@@ -54,8 +54,6 @@ mod wait_for_environment;
 
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
-#[cfg(test)]
-use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
@@ -225,7 +223,10 @@ where
 
 pub(crate) fn resolve_search_repository_root(cwd: &Path) -> PathBuf {
     #[cfg(test)]
-    let _ = SEARCH_ROOT_DISCOVERIES.try_with(|count| count.set(count.get() + 1));
+    SEARCH_ROOT_DISCOVERIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(cwd.to_path_buf());
     resolve_repository_root(cwd)
 }
 
@@ -233,10 +234,9 @@ pub(crate) fn resolve_repository_root(cwd: &Path) -> PathBuf {
     resolve_repository_root_with(cwd, get_git_repo_root)
 }
 
+// Search classification runs on blocking threads, which task-locals do not reach.
 #[cfg(test)]
-tokio::task_local! {
-    static SEARCH_ROOT_DISCOVERIES: std::cell::Cell<usize>;
-}
+static SEARCH_ROOT_DISCOVERIES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 fn resolve_repository_root_with(
     cwd: &Path,
@@ -621,22 +621,42 @@ fn uri_permissions_are_preapproved(
     granted_permissions: UriAdditionalPermissionProfile,
     cwd: &PathUri,
 ) -> bool {
-    intersect_uri_permission_profiles(effective_permissions.clone(), granted_permissions, cwd)
-        == *effective_permissions
-}
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
 
-#[cfg(test)]
-fn permissions_are_preapproved(
-    effective_permissions: &AdditionalPermissionProfile,
-    granted_permissions: AdditionalPermissionProfile,
-    cwd: &Path,
-) -> bool {
-    let materialized_effective_permissions = intersect_permission_profiles(
-        effective_permissions.clone(),
-        effective_permissions.clone(),
-        cwd,
-    );
-    intersect_permission_profiles(effective_permissions.clone(), granted_permissions, cwd)
+    let mut effective_permissions = effective_permissions.clone();
+    let mut granted_permissions = granted_permissions;
+    // A deny glob carried by the grant reaches the effective profile unchanged and narrows both
+    // sides equally. Compare without it: the intersection rejects every path while the request
+    // side holds a glob, so a glob of the request's own still fails the comparison below.
+    if let (Some(effective), Some(granted)) = (
+        effective_permissions.file_system.as_mut(),
+        granted_permissions.file_system.as_mut(),
+    ) {
+        let shared = granted
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.access == FileSystemAccessMode::Deny
+                    && matches!(entry.path, FileSystemPath::GlobPattern { .. })
+                    && effective.entries.contains(entry)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        effective.entries.retain(|entry| !shared.contains(entry));
+        granted.entries.retain(|entry| !shared.contains(entry));
+    }
+    // A stored grant is already bound to the cwd. Bind the effective profile the same way, with
+    // its own denies kept off the request side so that they cannot reject its entries here.
+    let mut allowed_permissions = effective_permissions.clone();
+    if let Some(allowed) = allowed_permissions.file_system.as_mut() {
+        allowed
+            .entries
+            .retain(|entry| entry.access != FileSystemAccessMode::Deny);
+    }
+    let materialized_effective_permissions =
+        intersect_uri_permission_profiles(allowed_permissions, effective_permissions.clone(), cwd);
+    intersect_uri_permission_profiles(effective_permissions, granted_permissions, cwd)
         == materialized_effective_permissions
 }
 
@@ -676,27 +696,46 @@ mod tests {
                 source: ToolCallSource::Direct,
                 payload: payload.clone(),
             };
-            super::SEARCH_ROOT_DISCOVERIES
-                .scope(std::cell::Cell::new(0), async {
-                    let output = if shell_handler {
-                        super::ShellCommandHandler::default()
-                            .handle(invocation)
-                            .await
-                    } else {
-                        super::ExecCommandHandler::default()
-                            .handle(invocation)
-                            .await
-                    }
-                    .expect("ordinary command executes");
-                    assert_eq!(super::SEARCH_ROOT_DISCOVERIES.with(std::cell::Cell::get), 0);
-                    assert!(
-                        output
-                            .code_mode_result(&payload)
-                            .to_string()
-                            .contains("root-discovery-probe")
-                    );
-                })
-                .await;
+            let discovered_for_workdir = || {
+                let workdir = temp.path().file_name().unwrap();
+                super::SEARCH_ROOT_DISCOVERIES
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|cwd| cwd.ends_with(workdir))
+            };
+            let output = if shell_handler {
+                super::ShellCommandHandler::default()
+                    .handle(invocation)
+                    .await
+            } else {
+                super::ExecCommandHandler::default()
+                    .handle(invocation)
+                    .await
+            }
+            .expect("ordinary command executes");
+            assert!(!discovered_for_workdir());
+            assert!(
+                output
+                    .code_mode_result(&payload)
+                    .to_string()
+                    .contains("root-discovery-probe")
+            );
+            // Control: the handlers' own classification call does reach the probe
+            // for a search command, from the blocking thread it runs on.
+            let search_cwd = temp.path().to_path_buf();
+            crate::tools::run_blocking_command_analysis(move || {
+                super::command_search::classify_rg_search_with_repository(
+                    &["rg".to_string(), "needle".to_string()],
+                    /*shell_type*/ None,
+                    search_cwd.as_path(),
+                    || super::resolve_search_repository_root(search_cwd.as_path()),
+                )
+            })
+            .await
+            .expect("classification task")
+            .expect("search classification");
+            assert!(discovered_for_workdir());
             assert_eq!(
                 std::fs::read_to_string(temp.path().join("mutation-probe")).unwrap(),
                 "observed"
@@ -757,8 +796,8 @@ mod tests {
     use super::EffectiveAdditionalPermissions;
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;
-    use super::permissions_are_preapproved;
     use super::resolve_repository_root_with;
+    use super::uri_permissions_are_preapproved;
     use crate::sandboxing::SandboxPermissions;
     use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
@@ -769,8 +808,8 @@ mod tests {
     use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::GranularApprovalConfig;
-    use codex_sandboxing::policy_transforms::intersect_permission_profiles;
-    use codex_sandboxing::policy_transforms::merge_permission_profiles;
+    use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
+    use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
@@ -981,16 +1020,33 @@ mod tests {
 
     #[test]
     fn relative_deny_glob_grants_remain_preapproved_after_materialization() {
-        let cwd = tempdir().expect("tempdir");
-        let requested_permissions = AdditionalPermissionProfile {
+        use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
+        use codex_utils_path_uri::PathUri;
+
+        let temp = tempdir().expect("tempdir");
+        let cwd = PathUri::from_abs_path(
+            &AbsolutePathBuf::from_absolute_path(temp.path()).expect("absolute path"),
+        );
+        let project_root_write = FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Write,
+        };
+        let requested_permissions = UriAdditionalPermissionProfile {
+            network: None,
+            file_system: Some(FileSystemPermissions {
+                entries: vec![project_root_write.clone()],
+                glob_scan_max_depth: None,
+            }),
+        };
+        // The URI intersection drops every path grant when the request itself carries a deny
+        // glob, so the glob arrives on the granted side, where it is bound to the cwd.
+        let granted_permissions = UriAdditionalPermissionProfile {
+            network: None,
             file_system: Some(FileSystemPermissions {
                 entries: vec![
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Special {
-                            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
-                        },
-                        access: FileSystemAccessMode::Write,
-                    },
+                    project_root_write,
                     FileSystemSandboxEntry {
                         path: FileSystemPath::GlobPattern {
                             pattern: "**/*.env".to_string(),
@@ -1000,21 +1056,49 @@ mod tests {
                 ],
                 glob_scan_max_depth: None,
             }),
-            ..Default::default()
         };
-        let stored_grant = intersect_permission_profiles(
+        let stored_grant = intersect_uri_permission_profiles(
             requested_permissions.clone(),
-            requested_permissions.clone(),
-            cwd.path(),
+            granted_permissions,
+            &cwd,
         );
+        let widened_request = UriAdditionalPermissionProfile {
+            network: None,
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![cwd.parent().expect("tempdir parent")]),
+            )),
+        };
+        // A glob of the request's own cannot be evaluated; it must not hide the wider root.
+        let mut widened_request_with_glob = widened_request.clone();
+        widened_request_with_glob
+            .file_system
+            .as_mut()
+            .expect("file system permissions")
+            .entries
+            .push(FileSystemSandboxEntry {
+                path: FileSystemPath::GlobPattern {
+                    pattern: "**/*.key".to_string(),
+                },
+                access: FileSystemAccessMode::Deny,
+            });
         let effective_permissions =
-            merge_permission_profiles(Some(&requested_permissions), Some(&stored_grant))
+            merge_uri_permission_profiles(Some(&requested_permissions), Some(&stored_grant))
                 .expect("merged permissions");
 
-        assert!(permissions_are_preapproved(
+        for widened_request in [widened_request, widened_request_with_glob] {
+            let widened_permissions =
+                merge_uri_permission_profiles(Some(&widened_request), Some(&stored_grant))
+                    .expect("merged permissions");
+            assert!(
+                !uri_permissions_are_preapproved(&widened_permissions, stored_grant.clone(), &cwd),
+                "{widened_request:?}"
+            );
+        }
+        assert!(uri_permissions_are_preapproved(
             &effective_permissions,
             stored_grant,
-            cwd.path(),
+            &cwd,
         ));
     }
 }

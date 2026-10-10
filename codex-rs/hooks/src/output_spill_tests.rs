@@ -213,7 +213,11 @@ async fn spill_batches_throttle_cleanup_and_keep_writer_directories() -> Result<
         last_prune: Arc::default(),
     };
     let thread_id = ThreadId::new();
-    let expired = output_dir.join(thread_id.to_string()).join("expired.txt");
+    // Another thread's directory: the spills below recreate their own, which
+    // would hide a sweep that removes emptied directories.
+    let expired = output_dir
+        .join(ThreadId::new().to_string())
+        .join("expired.txt");
     write_spill(expired.as_ref(), "old", SystemTime::UNIX_EPOCH)?;
     let text = "output ".repeat(2000);
     let outputs = spiller
@@ -238,7 +242,7 @@ async fn spill_batches_throttle_cleanup_and_keep_writer_directories() -> Result<
         "a second sweep ran inside the throttle interval"
     );
     *spiller.last_prune.lock().await = Some(Instant::now() - Duration::from_secs(61));
-    spiller.prune_crash_leftovers(None).await;
+    spiller.prune_crash_leftovers().await;
     assert!(
         !expired.exists(),
         "cleanup did not resume after the throttle interval"
@@ -252,7 +256,7 @@ async fn cleanup_keeps_empty_directories_available_to_writers() -> Result<()> {
     let thread_dir = dir.path().join("thread");
     let expired = thread_dir.join("expired.txt");
     write_spill(&expired, "old", SystemTime::UNIX_EPOCH)?;
-    prune_crash_leftovers_at(dir.path(), None, SPILL_RETENTION_POLICY, SystemTime::now()).await?;
+    prune_crash_leftovers_at(dir.path(), SPILL_RETENTION_POLICY, SystemTime::now()).await?;
     assert!(!expired.exists());
     let pending_write = thread_dir.join("new.txt");
     fs::write(&pending_write, "full output").await?;
@@ -278,7 +282,6 @@ async fn output_spill_prunes_expired_crash_leftovers() -> Result<()> {
 
     prune_crash_leftovers_at(
         &output_dir,
-        None,
         test_policy(
             Duration::from_secs(24 * 60 * 60),
             Duration::from_secs(60 * 60),
@@ -306,7 +309,6 @@ async fn output_spill_preserves_current_files_inside_active_grace() -> Result<()
 
     prune_crash_leftovers_at(
         &output_dir,
-        None,
         test_policy(
             Duration::from_secs(24 * 60 * 60),
             Duration::from_secs(60 * 60),
@@ -323,7 +325,9 @@ async fn output_spill_preserves_current_files_inside_active_grace() -> Result<()
 
 #[tokio::test]
 async fn output_spill_quota_prunes_oldest_crash_leftovers_by_count_and_bytes() -> Result<()> {
-    for (max_files, max_bytes, first_retained) in [(3, u64::MAX, 2), (usize::MAX, 16, 3)] {
+    // Four 8-byte files outside active_grace: the two newest fit the count
+    // quota, and only the newest fits the 8-byte quota.
+    for (max_files, max_bytes, first_retained) in [(2, u64::MAX, 2), (usize::MAX, 8, 3)] {
         let dir = tempdir()?;
         let output_dir = dir.path().join(HOOK_OUTPUTS_DIR);
         let thread_dir = output_dir.join(ThreadId::new().to_string());
@@ -342,14 +346,9 @@ async fn output_spill_quota_prunes_oldest_crash_leftovers_by_count_and_bytes() -
                 Ok(path)
             })
             .collect::<Result<Vec<_>>>()?;
-        let current = thread_dir.join("current.txt");
-        // Older than every candidate and outside active_grace: only explicit
-        // protection can preserve this file when either quota is exceeded.
-        write_spill(&current, "12345678", now - Duration::from_secs(10 * 60 * 60))?;
 
         prune_crash_leftovers_at(
             &output_dir,
-            Some(&current),
             test_policy(
                 Duration::from_secs(30 * 24 * 60 * 60),
                 Duration::from_secs(60 * 60),
@@ -363,7 +362,6 @@ async fn output_spill_quota_prunes_oldest_crash_leftovers_by_count_and_bytes() -
         for (index, path) in old_files.iter().enumerate() {
             assert_eq!(path.exists(), index >= first_retained, "{path:?}");
         }
-        assert!(current.exists());
     }
     Ok(())
 }

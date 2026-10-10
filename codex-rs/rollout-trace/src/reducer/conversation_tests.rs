@@ -102,7 +102,8 @@ fn only_the_builtin_exec_is_labeled_as_javascript() -> anyhow::Result<()> {
     let payload = writer.write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input": [
         {"type":"custom_tool_call", "name":"exec", "call_id":"builtin", "input":"text(1)"},
         {"type":"custom_tool_call", "name":"exec", "namespace":null, "call_id":"null", "input":"text(2)"},
-        {"type":"custom_tool_call", "name":"exec", "namespace":"external", "call_id":"external", "input":"print('python')"}
+        {"type":"custom_tool_call", "name":"exec", "namespace":"external", "call_id":"external", "input":"print('python')"},
+        {"type":"custom_tool_call", "name":"apply_patch", "call_id":"other-builtin", "input":"*** Begin Patch"}
     ]}))?;
     append_inference_start(&writer, "inference-1", "turn-1", payload)?;
     let rollout = replay_bundle(temp.path())?;
@@ -113,6 +114,7 @@ fn only_the_builtin_exec_is_labeled_as_javascript() -> anyhow::Result<()> {
         vec![ConversationPart::Code { language: "javascript".into(), source: "text(1)".into() }],
         vec![ConversationPart::Code { language: "javascript".into(), source: "text(2)".into() }],
         vec![ConversationPart::Text { text: "print('python')".into() }],
+        vec![ConversationPart::Text { text: "*** Begin Patch".into() }],
     ]);
     Ok(())
 }
@@ -823,6 +825,49 @@ fn same_encrypted_reasoning_with_different_text_reuses_first_readable_body() -> 
     );
     assert_eq!(rollout.conversation_items.len(), 2);
 
+    Ok(())
+}
+
+#[test]
+fn repeated_image_tool_output_reuses_content_identity_across_payloads() -> anyhow::Result<()> {
+    for changed in [false, true] {
+        let temp = TempDir::new()?;
+        let writer = create_started_writer(&temp)?;
+        start_turn(&writer, "turn-1")?;
+        let output = |image: &str| json!({
+            "type": "function_call_output", "call_id": "image-call",
+            "output": [{"type": "input_image", "image_url": image}]
+        });
+        let first = writer.write_json_payload(
+            RawPayloadKind::InferenceRequest,
+            &json!({"input": [output("data:image/png;base64,AAAA")]}),
+        )?;
+        append_inference_start(&writer, "inference-1", "turn-1", first)?;
+        start_turn(&writer, "turn-2")?;
+        let second = writer.write_json_payload(
+            RawPayloadKind::InferenceRequest,
+            &json!({"input": [output(if changed {
+                "data:image/png;base64,BBBB"
+            } else {
+                "data:image/png;base64,AAAA"
+            })]}),
+        )?;
+        append_inference_start(&writer, "inference-2", "turn-2", second)?;
+        if changed {
+            expect_replay_error(
+                &temp,
+                "model-visible call id image-call was reused with different content",
+            )?;
+        } else {
+            let rollout = replay_bundle(temp.path())?;
+            assert_eq!(
+                rollout.inference_calls["inference-1"].request_item_ids,
+                rollout.inference_calls["inference-2"].request_item_ids,
+                "the same tool output remains the same conversation item when observed again"
+            );
+            assert_eq!(rollout.conversation_items.len(), 1);
+        }
+    }
     Ok(())
 }
 

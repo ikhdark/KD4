@@ -6,7 +6,6 @@ use crate::parse_mcp_tool;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FreeformTool {
@@ -92,51 +91,12 @@ pub fn dynamic_tool_to_responses_api_tool(
     )?))
 }
 
-pub fn coalesce_loadable_tool_specs(
-    specs: impl IntoIterator<Item = LoadableToolSpec>,
-) -> Vec<LoadableToolSpec> {
-    let mut coalesced_specs = Vec::new();
-    let mut namespace_indices = HashMap::<String, usize>::new();
-    for spec in specs {
-        match spec {
-            LoadableToolSpec::Function(tool) => {
-                coalesced_specs.push(LoadableToolSpec::Function(tool));
-            }
-            LoadableToolSpec::Namespace(mut namespace) => {
-                if let Some(&index) = namespace_indices.get(&namespace.name) {
-                    let LoadableToolSpec::Namespace(existing_namespace) =
-                        &mut coalesced_specs[index]
-                    else {
-                        unreachable!("namespace index must point to a namespace");
-                    };
-                    existing_namespace.tools.append(&mut namespace.tools);
-                } else {
-                    namespace_indices.insert(namespace.name.clone(), coalesced_specs.len());
-                    coalesced_specs.push(LoadableToolSpec::Namespace(namespace));
-                }
-            }
-        }
-    }
-    coalesced_specs
-}
-
 pub fn mcp_tool_to_responses_api_tool(
     tool_name: &ToolName,
     tool: &rmcp::model::Tool,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
     Ok(tool_definition_to_responses_api_tool(
         parse_mcp_tool(tool)?.renamed(tool_name.name.clone()),
-    ))
-}
-
-pub fn mcp_tool_to_deferred_responses_api_tool(
-    tool_name: &ToolName,
-    tool: &rmcp::model::Tool,
-) -> Result<ResponsesApiTool, serde_json::Error> {
-    Ok(tool_definition_to_responses_api_tool(
-        parse_mcp_tool(tool)?
-            .renamed(tool_name.name.clone())
-            .into_deferred(),
     ))
 }
 

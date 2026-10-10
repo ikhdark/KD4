@@ -25,8 +25,6 @@ use super::ImagegenArgs;
 use super::image_history_requirement;
 use super::imagegen_tool_spec;
 use super::request_for_call_args;
-use crate::IMAGE_GEN_NAMESPACE;
-use crate::IMAGEGEN_TOOL_NAME;
 
 const RESULT: &str = "cG5n";
 
@@ -204,11 +202,28 @@ fn requests_history_only_for_history_backed_edits() {
             ConversationHistoryRequirement::None
         );
     }
+    let arguments = serde_json::json!({
+        "prompt": "edit",
+        "referenced_image_paths": [std::env::current_dir().unwrap().join("image.png")],
+        "num_last_images_to_include": 1,
+    })
+    .to_string();
+    let args: ImagegenArgs = serde_json::from_str(&arguments).unwrap();
+    assert_eq!(
+        args.referenced_image_paths
+            .as_ref()
+            .expect("the native reference path must be present")
+            .len(),
+        1
+    );
+    assert_eq!(
+        image_history_requirement(&ToolPayload::Function { arguments }),
+        ConversationHistoryRequirement::None
+    );
     for arguments in [
         "{".to_string(),
         serde_json::json!({"num_last_images_to_include": 1}).to_string(),
         serde_json::json!({"prompt": "edit", "unknown": true, "num_last_images_to_include": 1}).to_string(),
-        serde_json::json!({"prompt": "edit", "referenced_image_paths": ["/tmp/image.png"], "num_last_images_to_include": 1}).to_string(),
     ] {
         assert_eq!(image_history_requirement(&ToolPayload::Function { arguments }), ConversationHistoryRequirement::None);
     }
@@ -219,9 +234,9 @@ fn uses_reserved_image_gen_namespace() {
     let ToolSpec::Namespace(spec) = imagegen_tool_spec() else {
         panic!("imagegen should advertise a namespace tool");
     };
-    assert_eq!(spec.name, IMAGE_GEN_NAMESPACE);
+    assert_eq!(spec.name, "image_gen");
     let ResponsesApiNamespaceTool::Function(function) = &spec.tools[0];
-    assert_eq!(function.name, IMAGEGEN_TOOL_NAME);
+    assert_eq!(function.name, "imagegen");
 }
 
 #[tokio::test]

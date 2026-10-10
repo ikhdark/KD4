@@ -1,4 +1,5 @@
 use anyhow::Result;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -59,6 +60,13 @@ async fn features_enable_and_disable_persist_without_losing_other_settings() -> 
 #[tokio::test]
 async fn features_enable_under_development_feature_prints_warning() -> Result<()> {
     let codex_home = TempDir::new()?;
+
+    // Control: enabling a stable feature does not print the warning.
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args(["features", "enable", "shell_tool"])
+        .assert()
+        .success()
+        .stderr(contains("Under-development features enabled").not());
 
     let mut cmd = codex_command(codex_home.path())?;
     cmd.args(["features", "enable", "runtime_metrics"])

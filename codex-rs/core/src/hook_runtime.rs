@@ -1221,7 +1221,11 @@ mod tests {
             prepare_additional_context_items(&session, &turn_context, vec![legacy_context.clone()])
                 .await;
 
-        assert_eq!(messages, additional_context_messages(vec![legacy_context]));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            super::single_developer_input_text(&messages[0]),
+            Some(legacy_context.as_str())
+        );
     }
 
     #[test]

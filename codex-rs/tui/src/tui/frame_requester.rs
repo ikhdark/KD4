@@ -402,6 +402,7 @@ mod tests {
             .expect("timed out waiting for first draw");
         assert!(first.is_ok(), "broadcast closed unexpectedly");
 
+        let requested_at = time::Instant::now();
         requester.schedule_frame_in(Duration::from_millis(50));
 
         time::advance(Duration::from_millis(49)).await;
@@ -415,6 +416,11 @@ mod tests {
             .await
             .expect("timed out waiting for delayed draw");
         assert!(second.is_ok(), "broadcast closed unexpectedly");
+        // The receive timeout alone would also accept a deadline pushed back by a frame interval.
+        assert!(
+            time::Instant::now() - requested_at < Duration::from_millis(50) + MIN_FRAME_INTERVAL,
+            "rate limiter delayed a draw requested beyond the minimum frame interval"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

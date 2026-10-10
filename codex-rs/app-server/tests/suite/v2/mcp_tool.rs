@@ -528,9 +528,11 @@ url = "{mcp_server_url}/mcp"
     let _: EnvironmentAddResponse = to_response(add_environment_response)?;
 
     let (filesystem_request_tx, filesystem_request_rx) = oneshot::channel();
+    let (environment_release_tx, environment_release_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let exec_server_handle = tokio::spawn(serve_environment_until_shutdown(
         exec_listener,
+        environment_release_rx,
         filesystem_request_tx,
         shutdown_rx,
     ));
@@ -582,7 +584,16 @@ url = "{mcp_server_url}/mcp"
         panic!("expected MCP elicitation request, got: {server_request:?}");
     };
 
+    // The environment only becomes usable now, so its runtime refresh has to happen while the
+    // elicitation is pending.
     let mut filesystem_request_rx = filesystem_request_rx;
+    assert!(
+        filesystem_request_rx.try_recv().is_err(),
+        "the environment was used before the elicitation was pending"
+    );
+    environment_release_tx
+        .send(())
+        .map_err(|()| anyhow::anyhow!("exec-server stub stopped before it was released"))?;
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             let status_request_id = mcp
@@ -1006,9 +1017,15 @@ async fn start_blocking_mcp_server() -> Result<(
 
 async fn serve_environment_until_shutdown(
     listener: TcpListener,
+    release_rx: oneshot::Receiver<()>,
     filesystem_request_tx: oneshot::Sender<()>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
+    // The environment stays unconnected until the test releases it.
+    tokio::select! {
+        released = release_rx => released?,
+        _ = &mut shutdown_rx => return Ok(()),
+    }
     let mut websocket = accept_exec_server_environment(
         listener,
         json!({

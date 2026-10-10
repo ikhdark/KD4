@@ -257,8 +257,15 @@ mod tests {
         }
         let pending = (0..65).map(|i| ((PathBuf::new(), PathBuf::from(i.to_string())), 0)).collect::<Vec<_>>();
         let completed = AtomicUsize::new(0);
-        sync_payload_files(&pending, 8, |_| { completed.fetch_add(1, Ordering::SeqCst); Ok(()) }).unwrap();
+        // More files than the limit must not add workers, whatever the caller requests.
+        let workers = std::sync::Mutex::new(std::collections::HashSet::<std::thread::ThreadId>::new());
+        sync_payload_files(&pending, usize::MAX, |_| {
+            workers.lock().unwrap().insert(std::thread::current().id());
+            completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }).unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), pending.len());
+        assert_eq!(workers.into_inner().unwrap().len(), MAX_CONCURRENT_PAYLOAD_SYNCS);
         sync_payload_files(&[], 8, |_| panic!("empty barrier must not perform I/O")).unwrap();
     }
 
@@ -324,6 +331,7 @@ mod tests {
         // Fault between publication and the rollout durability barrier.
         std::fs::remove_file(&blob).unwrap();
         assert_eq!(sync_payload_artifacts(&path).await.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(pending_sync().lock().unwrap().paths.keys().any(|(owner, _)| owner == &path));
         std::fs::write(&blob, bytes).unwrap();
         sync_payload_artifacts(&path).await.unwrap();
         assert!(!pending_sync().lock().unwrap().paths.keys().any(|(owner, _)| owner == &path));

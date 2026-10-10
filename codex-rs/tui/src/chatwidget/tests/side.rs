@@ -79,54 +79,11 @@ async fn suppressed_interrupted_turn_notice_skips_history_warning() {
     );
 }
 
-fn assert_side_rename_rejected(
+fn assert_side_slash_command_rejected(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>,
+    name: &str,
 ) {
-    let event = rx
-        .try_recv()
-        .expect("expected side conversation rename error");
-    match event {
-        AppEvent::InsertHistoryCell(cell) => {
-            let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
-            assert!(
-                rendered.contains("Side conversations are ephemeral and cannot be renamed."),
-                "expected side conversation rename error, got {rendered:?}"
-            );
-        }
-        other => panic!("expected InsertHistoryCell error, got {other:?}"),
-    }
-    assert!(rx.try_recv().is_err(), "expected no follow-up events");
-    assert!(op_rx.try_recv().is_err(), "expected no rename op");
-}
-
-#[tokio::test]
-async fn slash_rename_is_rejected_for_side_threads_with_or_without_args() {
-    for with_args in [false, true] {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_thread_rename_block_message(
-        "Side conversations are ephemeral and cannot be renamed.".to_string(),
-    );
-
-    if with_args {
-        chat.dispatch_command_with_args(SlashCommand::Rename, "investigate".to_string(), Vec::new());
-    } else {
-        chat.dispatch_command(SlashCommand::Rename);
-    }
-    assert_side_rename_rejected(&mut rx, &mut op_rx);
-    }
-}
-
-
-
-#[tokio::test]
-async fn disallowed_slash_commands_are_rejected_for_side_threads() {
-    for (command, name) in [(SlashCommand::Review, "review"), (SlashCommand::Side, "side")] {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_side_conversation_active(/*active*/ true);
-
-    chat.dispatch_command(command);
-
     let event = rx
         .try_recv()
         .expect("expected side conversation slash command error");
@@ -143,7 +100,39 @@ async fn disallowed_slash_commands_are_rejected_for_side_threads() {
         other => panic!("expected InsertHistoryCell error, got {other:?}"),
     }
     assert!(rx.try_recv().is_err(), "expected no follow-up events");
-    assert!(op_rx.try_recv().is_err(), "expected no review op");
+    assert!(op_rx.try_recv().is_err(), "expected no op");
+}
+
+#[tokio::test]
+async fn slash_rename_is_rejected_for_side_threads_with_or_without_args() {
+    for with_args in [false, true] {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_side_conversation_active(/*active*/ true);
+
+    if with_args {
+        chat.dispatch_command_with_args(SlashCommand::Rename, "investigate".to_string(), Vec::new());
+    } else {
+        chat.dispatch_command(SlashCommand::Rename);
+    }
+    // A rename request travels as an app event, so "no follow-up events" covers it.
+    assert_side_slash_command_rejected(&mut rx, &mut op_rx, "rename");
+    // Opening the rename prompt emits no event, so check the pane itself.
+    assert!(
+        chat.no_modal_or_popup_active(),
+        "a blocked /rename must not open the rename prompt"
+    );
+    }
+}
+
+#[tokio::test]
+async fn disallowed_slash_commands_are_rejected_for_side_threads() {
+    for (command, name) in [(SlashCommand::Review, "review"), (SlashCommand::Side, "side")] {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_side_conversation_active(/*active*/ true);
+
+    chat.dispatch_command(command);
+
+    assert_side_slash_command_rejected(&mut rx, &mut op_rx, name);
     }
 }
 

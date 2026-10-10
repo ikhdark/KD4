@@ -67,6 +67,8 @@ async fn replace_history_clears_auto_compact_window_prefill() {
     let mut state = SessionState::new(session_configuration);
 
     state.set_auto_compact_window_estimated_prefill(/*tokens*/ 100);
+    state.prompt_token_calibration.observe("provider", "model", Some((100, 200)));
+    assert_eq!(state.prompt_token_calibration.estimate("provider", "model", 100), 200);
     state.replace_history(Vec::new(), /*reference_context_item*/ None);
 
     assert_eq!(
@@ -75,6 +77,7 @@ async fn replace_history_clears_auto_compact_window_prefill() {
             prefill_input_tokens: None,
         }
     );
+    assert_eq!(state.prompt_token_calibration.estimate("provider", "model", 100), 100);
 }
 
 #[tokio::test]

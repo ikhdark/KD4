@@ -458,6 +458,14 @@ mod tests {
             super::read_secret_input(b"normal prompt\n".as_slice()).unwrap(),
             "normal prompt\n"
         );
+        let at_limit = vec![b'x'; super::MAX_SECRET_INPUT_BYTES as usize];
+        assert_eq!(
+            super::read_secret_input(at_limit.as_slice())
+                .unwrap()
+                .len(),
+            at_limit.len(),
+            "input of exactly the limit must be accepted"
+        );
         let mut input = std::io::repeat(b'x').take(super::MAX_SECRET_INPUT_BYTES + 2);
         let error = super::read_secret_input(&mut input).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

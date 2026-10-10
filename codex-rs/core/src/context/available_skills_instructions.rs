@@ -12,17 +12,13 @@ const SKILLS_USAGE_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_usage_instructions>"
 /// Model-context fragment describing the skills available to Codex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableSkillsInstructions {
-    skill_root_lines: Vec<String>,
     skill_lines: Vec<String>,
 }
 
 impl AvailableSkillsInstructions {
     /// Creates a skills context fragment from pre-rendered catalog lines.
     pub fn from_skill_lines(skill_lines: Vec<String>) -> Self {
-        Self {
-            skill_root_lines: Vec::new(),
-            skill_lines,
-        }
+        Self { skill_lines }
     }
 
     pub fn from_available_skills(available_skills: &AvailableSkills) -> Self {
@@ -33,10 +29,7 @@ impl AvailableSkillsInstructions {
                 available_skills.report.omitted_count
             ));
         }
-        Self {
-            skill_root_lines: available_skills.skill_root_lines.clone(),
-            skill_lines,
-        }
+        Self { skill_lines }
     }
 }
 
@@ -79,10 +72,7 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned(render_available_skills_body(
-            &self.skill_root_lines,
-            &self.skill_lines,
-        ))
+        std::borrow::Cow::Owned(render_available_skills_body(&self.skill_lines))
     }
 }
 
@@ -93,9 +83,9 @@ mod tests {
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
 
-    fn available_skills(skill_root_lines: Vec<String>) -> AvailableSkills {
-        AvailableSkills {
-            skill_root_lines,
+    #[test]
+    fn rendered_skill_catalog_does_not_repeat_shared_usage_guidance() {
+        let rendered = AvailableSkillsInstructions::from_available_skills(&AvailableSkills {
             skill_lines: vec!["- demo: example skill".to_string()],
             report: SkillRenderReport {
                 total_count: 1,
@@ -105,22 +95,14 @@ mod tests {
                 truncated_description_count: 0,
             },
             warning_message: None,
-        }
-    }
+        })
+        .render();
 
-    #[test]
-    fn rendered_skill_catalog_does_not_repeat_shared_usage_guidance() {
-        for skill_root_lines in [Vec::new(), vec!["- r0: C:\\workspace\\skills".to_string()]] {
-            let rendered = AvailableSkillsInstructions::from_available_skills(&available_skills(
-                skill_root_lines,
-            ))
-            .render();
-
-            assert!(rendered.starts_with("<skills_instructions>"));
-            assert!(rendered.ends_with("</skills_instructions>"));
-            assert!(!rendered.contains("How to use skills"));
-            assert!(!rendered.contains("read the selected `SKILL.md` completely"));
-        }
+        assert!(rendered.starts_with("<skills_instructions>"));
+        assert!(rendered.ends_with("</skills_instructions>"));
+        assert!(!rendered.contains("How to use skills"));
+        assert!(!rendered.contains(codex_core_skills::SKILLS_HOW_TO_USE));
+        assert!(!rendered.contains("read each selected `SKILL.md` completely"));
     }
 
     #[tokio::test]

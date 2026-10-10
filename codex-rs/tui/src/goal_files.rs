@@ -351,6 +351,11 @@ mod tests {
                     assert_eq!(request["method"], method);
                     if method == "fs/createDirectory" {
                         created_path = request["params"]["path"].clone();
+                        let attachment_id = created_path
+                            .as_str()
+                            .and_then(|path| path.strip_prefix("/remote/codex/attachments/"))
+                            .expect("fresh directory must be a child of the attachment root");
+                        assert!(Uuid::parse_str(attachment_id).is_ok(), "{attachment_id}");
                     } else if method == "fs/remove" {
                         // Roll back exactly this draft's fresh directory, never the home
                         // or attachment root which may contain previously committed goals.

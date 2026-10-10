@@ -480,6 +480,15 @@ mod tests {
     #[test]
     fn table_like_lines_inside_fenced_code_are_not_held() {
         assert_streamed_equals_full(&["```\n", "| a | b |\n", "```\n"]);
+        // Finalize flushes held lines too, so the release is pinned without it:
+        // the pipe line must already be emitted when its own commit is drained.
+        assert_eq!(
+            lines_to_plain_strings(&simulate_stream_markdown_for_tests(
+                &["```\n", "| a | b |\n"],
+                false,
+            )),
+            ["| a | b |"],
+        );
     }
 
     #[test]

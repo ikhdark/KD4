@@ -1028,7 +1028,25 @@ fn build_payload_deny_read_paths(explicit_deny_read_paths: Option<Vec<PathBuf>>)
     explicit_deny_read_paths.unwrap_or_default()
 }
 
+// Profile `filter_user_profile_roots` uses instead of USERPROFILE on the calling thread. Test
+// fixtures live below the developer's real profile, whose SSH configuration would otherwise
+// decide which of them survive.
+#[cfg(test)]
+thread_local! {
+    static TEST_USER_PROFILE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_user_profile(user_profile: &Path) {
+    TEST_USER_PROFILE.with(|profile| *profile.borrow_mut() = Some(user_profile.to_path_buf()));
+}
+
 fn filter_user_profile_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(user_profile) = TEST_USER_PROFILE.with(|profile| profile.borrow().clone()) {
+        return filter_user_profile_roots_for(roots, &user_profile);
+    }
     let Ok(user_profile) = std::env::var("USERPROFILE") else {
         return roots;
     };
@@ -1253,6 +1271,14 @@ mod tests {
         )
     }
 
+    /// Points the profile filter at an empty profile beside the fixtures.
+    fn isolate_user_profile(tmp: &TempDir) -> PathBuf {
+        let user_profile = tmp.path().join("user-profile");
+        fs::create_dir_all(&user_profile).expect("create user profile");
+        super::set_test_user_profile(&user_profile);
+        user_profile
+    }
+
     #[test]
     fn setup_request_prefers_explicit_proxy_settings() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1377,6 +1403,11 @@ mod tests {
             )
             .expect("unsupported profiles do not need setup refresh");
         }
+        // Any refresh that got as far as gathering roots creates the helper directory.
+        assert!(
+            !codex_home.exists(),
+            "skipped refresh must not prepare sandbox setup state"
+        );
     }
 
     #[test]
@@ -1736,6 +1767,7 @@ mod tests {
     #[test]
     fn build_payload_roots_preserves_helper_roots_when_read_override_is_provided() {
         let tmp = TempDir::new().expect("tempdir");
+        isolate_user_profile(&tmp);
         let codex_home = tmp.path().join("codex-home");
         let workspace_root = tmp.path().join("workspace-root");
         let command_cwd = tmp.path().join("workspace");
@@ -1783,6 +1815,7 @@ mod tests {
     #[test]
     fn build_payload_roots_replaces_full_read_policy_when_read_override_is_provided() {
         let tmp = TempDir::new().expect("tempdir");
+        isolate_user_profile(&tmp);
         let codex_home = tmp.path().join("codex-home");
         let workspace_root = tmp.path().join("workspace-root");
         let command_cwd = tmp.path().join("workspace");
@@ -1830,10 +1863,12 @@ mod tests {
     #[test]
     fn effective_write_roots_match_payload_filtering_for_overrides() {
         let tmp = TempDir::new().expect("tempdir");
+        let profile_ssh_dir = isolate_user_profile(&tmp).join(".ssh");
         let codex_home = tmp.path().join("codex-home");
         let command_cwd = tmp.path().join("workspace");
         let extra_root = tmp.path().join("extra-root");
         let sandbox_root = super::sandbox_dir(&codex_home);
+        fs::create_dir_all(&profile_ssh_dir).expect("create profile .ssh");
         fs::create_dir_all(&codex_home).expect("create codex home");
         fs::create_dir_all(&command_cwd).expect("create workspace");
         fs::create_dir_all(&extra_root).expect("create extra root");
@@ -1850,6 +1885,7 @@ mod tests {
             extra_root.clone(),
             codex_home.clone(),
             sandbox_root.clone(),
+            profile_ssh_dir.clone(),
         ];
         let request = super::SandboxSetupRequest {
             permissions: &permissions,
@@ -1879,16 +1915,20 @@ mod tests {
         let expected_extra = dunce::canonicalize(&extra_root).expect("canonical extra root");
         let forbidden_codex_home = dunce::canonicalize(&codex_home).expect("canonical codex home");
         let forbidden_sandbox = dunce::canonicalize(&sandbox_root).expect("canonical sandbox root");
+        let forbidden_profile_ssh =
+            dunce::canonicalize(&profile_ssh_dir).expect("canonical profile .ssh");
         assert_eq!(effective_write_roots, payload_write_roots);
         assert!(effective_write_roots.contains(&expected_workspace));
         assert!(effective_write_roots.contains(&expected_extra));
         assert!(!effective_write_roots.contains(&forbidden_codex_home));
         assert!(!effective_write_roots.contains(&forbidden_sandbox));
+        assert!(!effective_write_roots.contains(&forbidden_profile_ssh));
     }
 
     #[test]
     fn effective_write_roots_use_runtime_workspace_roots_for_workspace_root() {
         let tmp = TempDir::new().expect("tempdir");
+        isolate_user_profile(&tmp);
         let codex_home = tmp.path().join("codex-home");
         let workspace_root = tmp.path().join("workspace");
         let command_cwd = workspace_root.join("subdir");

@@ -86,10 +86,14 @@ async fn code_mode_only_exposes_direct_model_only_mcp_namespaces() -> Result<()>
             .then(|| tool.get("description").and_then(Value::as_str))
             .flatten()
     });
+    // Nested declarations use the code-mode identifier of the tool, not a
+    // readable approximation of its name.
+    let nested_name = codex_tools::code_mode_name_for_tool_name(
+        &codex_tools::ToolName::namespaced(SEARCH_CALENDAR_NAMESPACE, SEARCH_CALENDAR_CREATE_TOOL),
+    );
     assert!(
-        exec_description.is_some_and(|description| {
-            !description.contains("mcp__codex_apps__calendar_create_event(args:")
-        }),
+        exec_description
+            .is_some_and(|description| !description.contains(&format!("{nested_name}(args:"))),
         "direct-model-only MCP namespace should not be available through exec: {body}"
     );
 

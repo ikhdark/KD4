@@ -120,7 +120,9 @@ mod tests {
         for (script, expected) in [
             ("git diff --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", true),
             ("git diff; if ($LASTEXITCODE -ne 0) { Remove-Item a; exit 1 }", false),
-            ("$x='--list'; foreach ($x in @('-D')) { $x }; git branch $x main", false),
+            // No trailing branch name: with the stale `--list` binding this
+            // would be an approved read-only query.
+            ("$x='--list'; foreach ($x in @('-D')) { $x }; git branch $x", false),
             ("Get-ChildItem | ForEach-Object { $_.Delete() }", false),
         ] {
             assert_eq!(is_safe_command_windows(&vec_str(&["powershell.exe", "-NoProfile", "-Command", script])), expected, "{script}");
@@ -196,21 +198,20 @@ mod tests {
         ])));
 
         // pwsh parity
-        if let Some(pwsh) = try_find_pwsh_executable_blocking() {
-            assert!(is_safe_command_windows(&[
-                pwsh.as_path().to_str().unwrap().into(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Get-ChildItem".to_string(),
-            ]));
-        }
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
+        assert!(is_safe_command_windows(&[
+            pwsh.as_path().to_str().unwrap().into(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Get-ChildItem".to_string(),
+        ]));
     }
 
     #[test]
     fn admits_only_scalar_local_constant_bindings() {
-        let Some(powershell) = windows_powershell_path() else {
-            return;
-        };
+        let powershell = windows_powershell_path()
+            .expect("SystemRoot is required to locate Windows PowerShell");
         let invoke = |script: &str| {
             is_safe_command_windows(&vec_str(&[
                 powershell.as_str(),
@@ -244,9 +245,8 @@ mod tests {
 
     #[test]
     fn allows_reviewer_verification_cmdlets_but_not_registry_mutation() {
-        let Some(powershell) = windows_powershell_path() else {
-            return;
-        };
+        let powershell = windows_powershell_path()
+            .expect("SystemRoot is required to locate Windows PowerShell");
 
         {
             let script = r"Get-ItemProperty -Path HKCU:\Environment -Name Path";
@@ -293,9 +293,8 @@ mod tests {
             }
         }
 
-        let Some(powershell) = windows_powershell_path() else {
-            return;
-        };
+        let powershell = windows_powershell_path()
+            .expect("SystemRoot is required to locate Windows PowerShell");
         assert!(is_safe_command_windows(&vec_str(&[
             powershell.as_str(),
             "-NoProfile",
@@ -316,9 +315,8 @@ mod tests {
 
     #[test]
     fn allows_read_only_pipelines_and_git_usage() {
-        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
-            return;
-        };
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
 
         let pwsh: String = pwsh.as_path().to_str().unwrap().into();
         assert!(is_safe_command_windows(&[
@@ -362,19 +360,27 @@ mod tests {
 
     #[test]
     fn rejects_git_global_override_options() {
-        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
-            return;
-        };
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
 
         let pwsh: String = pwsh.as_path().to_str().unwrap().into();
+        // Control: plain `git status` is never approved, so the status rows
+        // below must start from the form that is approved without an override.
+        assert!(is_safe_command_windows(&[
+            pwsh.clone(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "git --no-optional-locks status".to_string(),
+        ]));
         for script in [
             "git -c core.pager=cat show HEAD:foo.rs",
             "git --config-env core.pager=PAGER show HEAD:foo.rs",
             "git --config-env=core.pager=PAGER show HEAD:foo.rs",
             "git --git-dir .evil-git diff HEAD~1..HEAD",
             "git --git-dir=.evil-git diff HEAD~1..HEAD",
-            "git --work-tree . status",
-            "git --work-tree=. status",
+            "git --no-optional-locks --work-tree . status",
+            "git --no-optional-locks --work-tree=. status",
             "git --exec-path .git/helpers show HEAD:foo.rs",
             "git --exec-path=.git/helpers show HEAD:foo.rs",
             "git --namespace attacker show HEAD:foo.rs",
@@ -642,16 +648,16 @@ mod tests {
             "`{chain}` is not recognized by powershell.exe"
         );
 
-        if let Some(pwsh) = try_find_pwsh_executable_blocking() {
-            assert!(
-                is_safe_command_windows(&[
-                    pwsh.as_path().to_str().unwrap().into(),
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    chain.to_string(),
-                ]),
-                "`{chain}` should be considered safe to pwsh.exe"
-            );
-        }
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
+        assert!(
+            is_safe_command_windows(&[
+                pwsh.as_path().to_str().unwrap().into(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                chain.to_string(),
+            ]),
+            "`{chain}` should be considered safe to pwsh.exe"
+        );
     }
 }

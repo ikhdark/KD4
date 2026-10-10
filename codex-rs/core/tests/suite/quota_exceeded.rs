@@ -54,6 +54,7 @@ async fn quota_exceeded_emits_single_error_event() -> Result<()> {
         .unwrap();
 
     let mut error_events = 0;
+    let mut quota_error = None;
 
     loop {
         let event = wait_for_event(&test.codex, |_| true).await;
@@ -65,8 +66,18 @@ async fn quota_exceeded_emits_single_error_event() -> Result<()> {
                     err.message,
                     "Quota exceeded. Check your plan and billing details."
                 );
+                quota_error = Some(err);
             }
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, quota_error);
+                break;
+            }
+            EventMsg::StreamError(error) => {
+                panic!("quota exhaustion must not be retried: {error:?}");
+            }
+            EventMsg::TurnAborted(aborted) => {
+                panic!("quota exhaustion must complete as a failure: {aborted:?}");
+            }
             _ => {}
         }
     }

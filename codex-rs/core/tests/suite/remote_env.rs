@@ -160,7 +160,6 @@ async fn serve_environment_with_agents_md(
 
     let mut agents_md_reads = 0;
     let mut agents_md_handle_id = None;
-    let mut snapshot_process_id = None;
     loop {
         let request = tokio::select! {
             request = read_exec_server_json(&mut websocket) => request,
@@ -220,39 +219,6 @@ async fn serve_environment_with_agents_md(
                 json!({
                     "id": request["id"],
                     "result": {}
-                })
-            }
-            Some("process/start") => {
-                let process_id = request["params"]["processId"]
-                    .as_str()
-                    .expect("process/start should include processId")
-                    .to_string();
-                assert!(
-                    request["params"]["argv"][0]
-                        .as_str()
-                        .is_some_and(|argv0| argv0.ends_with("powershell.exe")),
-                    "remote startup should capture a PowerShell snapshot"
-                );
-                snapshot_process_id = Some(process_id.clone());
-                json!({
-                    "id": request["id"],
-                    "result": { "processId": process_id }
-                })
-            }
-            Some("process/read")
-                if snapshot_process_id.as_deref() == request["params"]["processId"].as_str() =>
-            {
-                json!({
-                    "id": request["id"],
-                    "result": {
-                        "chunks": [],
-                        "nextSeq": 0,
-                        "exited": true,
-                        "exitCode": 0,
-                        "closed": true,
-                        "failure": null,
-                        "sandboxDenied": false,
-                    }
                 })
             }
             method => panic!("unexpected exec-server request: {method:?}"),

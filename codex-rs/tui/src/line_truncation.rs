@@ -11,7 +11,10 @@ pub(crate) fn line_width(line: &Line<'_>) -> usize {
 
 pub(crate) fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> Line<'static> {
     if max_width == 0 {
-        return Line::from(Vec::<Span<'static>>::new());
+        return Line {
+            spans: Vec::new(),
+            ..line
+        };
     }
 
     let Line {
@@ -104,6 +107,18 @@ mod tests {
     use super::*;
     use ratatui::style::Color;
     use ratatui::style::Style;
+
+    #[test]
+    fn ellipsis_only_retains_line_style_and_alignment() {
+        let style = Style::default().fg(Color::Red);
+        let line = Line::from("overflow").style(style).right_aligned();
+
+        let actual = truncate_line_with_ellipsis_if_overflow(line.clone(), 1);
+
+        assert_eq!(actual.to_string(), "…");
+        assert_eq!(actual.style, line.style);
+        assert_eq!(actual.alignment, line.alignment);
+    }
 
     #[test]
     fn cutoff_preserves_graphemes_and_styles() {

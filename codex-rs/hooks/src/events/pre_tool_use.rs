@@ -366,6 +366,7 @@ mod tests {
     fn command_input_uses_request_tool_name() {
         let mut request = request_for_tool_use("call-apply-patch");
         request.tool_name = "apply_patch".to_string();
+        request.matcher_aliases = vec!["Write".to_string(), "Edit".to_string()];
 
         let input_json = command_input_json(request).expect("serialize command input");
         let input: serde_json::Value =
@@ -879,6 +880,7 @@ mod tests {
 
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].run.id, runs[0].id);
+        assert!(completed[0].run.id.ends_with(":tool-call-123"));
     }
 
     fn handler() -> ConfiguredHandler {

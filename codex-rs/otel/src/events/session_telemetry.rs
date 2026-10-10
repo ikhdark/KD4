@@ -1948,6 +1948,15 @@ mod model_attempt_privacy_tests {
             normalized_context_component_hash("prompt text or a filesystem path"),
             None
         );
+        // Same length and shape as a real hash, so only the hex check can reject these.
+        assert_eq!(
+            normalized_context_component_hash("0123456789abcdef0123456g"),
+            None
+        );
+        assert_eq!(
+            normalized_context_component_semantic_id("repository:v1:0123456789abcdef0123456g"),
+            None
+        );
     }
 }
 

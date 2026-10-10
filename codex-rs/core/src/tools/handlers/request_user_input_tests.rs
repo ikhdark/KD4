@@ -313,6 +313,11 @@ async fn registered_user_input_output_schema_covers_answers_empty_and_interrupte
         json!({"answers":{"pick_one":{"answers":["B"]}},"interrupted":false}),
         json!({"answers":{},"interrupted":false}),
         json!({"answers":{},"interrupted":true}),
+        json!({"answers":{"pick_one":{"answers":["B"]}},"interrupted":false,"disposition":"answered"}),
+        json!({"answers":{},"interrupted":false,"disposition":"timed_out"}),
+        json!({"answers":{},"interrupted":false,"disposition":"skipped"}),
+        json!({"answers":{},"interrupted":true,"disposition":"interrupted"}),
+        json!({"answers":{},"interrupted":false,"disposition":"transport_error"}),
     ] {
         let (session, mut turn, events) =
             crate::session::tests::make_session_and_context_with_rx().await;
@@ -366,6 +371,8 @@ async fn registered_user_input_output_schema_covers_answers_empty_and_interrupte
             .expect("input cleanup");
     }
     assert!(!validator.is_valid(&json!({"answers":{"pick_one":["B"]},"interrupted":false})));
+    assert!(!validator.is_valid(&json!({"answers":{},"interrupted":false,"disposition":"approved"})));
+    assert!(!validator.is_valid(&json!({"answers":{},"interrupted":false,"disposition":true})));
 }
 
 #[tokio::test]

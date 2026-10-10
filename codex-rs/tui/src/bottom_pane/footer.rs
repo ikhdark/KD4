@@ -1223,7 +1223,6 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
 mod tests {
     use super::*;
     use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
-    use crate::test_backend::VT100Backend;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::Terminal;
@@ -1289,6 +1288,11 @@ mod tests {
         );
     }
 
+    /// Test-local mirror of the composer's footer orchestration.
+    ///
+    /// Snapshots drawn here pin this module's building blocks (left-side text, collapse rules,
+    /// right-indicator lines), not the composer wiring. The status-line and context-suppression
+    /// wiring is pinned by tests that render `ChatComposer` itself, below and in `chat_composer`.
     fn draw_footer_frame<B: Backend>(
         terminal: &mut Terminal<B>,
         height: u16,
@@ -1300,7 +1304,8 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, f.area().width, height);
-                let show_cycle_hint = !props.is_task_running;
+                let show_cycle_hint =
+                    !props.is_task_running && collaboration_mode_indicator.is_some();
                 let show_shortcuts_hint = match props.mode {
                     FooterMode::ComposerEmpty => true,
                     FooterMode::ComposerHasDraft => false,
@@ -1490,25 +1495,6 @@ mod tests {
             context_line,
         );
         assert_snapshot!(name, terminal.backend());
-    }
-
-    fn render_footer_with_mode_indicator_and_context(
-        width: u16,
-        props: &FooterProps,
-        collaboration_mode_indicator: Option<CollaborationModeIndicator>,
-        context_line: Line<'static>,
-    ) -> String {
-        let height = footer_height(props).max(1);
-        let mut terminal = Terminal::new(VT100Backend::new(width, height)).expect("terminal");
-        draw_footer_frame(
-            &mut terminal,
-            height,
-            props,
-            collaboration_mode_indicator,
-            /*ide_context_active*/ false,
-            context_line,
-        );
-        terminal.backend().vt100().screen().contents()
     }
 
     fn snapshot_footer_with_indicators(
@@ -1904,40 +1890,99 @@ mod tests {
 
     #[test]
     fn footer_status_line_truncates_to_keep_mode_indicator() {
-        let props = FooterProps {
-            mode: FooterMode::ComposerEmpty,
-            esc_backtrack_hint: false,
-            use_shift_enter_hint: false,
-            is_task_running: false,
-            queue_submissions: false,
-            collaboration_modes_enabled: true,
-            status_line_value: Some(Line::from(
-                "Status line content that is definitely too long to fit alongside the mode label"
-                    .to_string(),
-            )),
-            status_line_enabled: true,
-            key_hints: FooterKeyHints::default_bindings(),
-            active_agent_label: None,
+        // The composer owns this truncation and the compact-indicator fallback;
+        // `draw_footer_frame` only mirrors them, so render the composer itself.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::app_event::AppEvent>();
+        let mut composer = crate::bottom_pane::chat_composer::ChatComposer::new(
+            /*has_input_focus*/ true,
+            crate::app_event_sender::AppEventSender::new(tx),
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_status_line_enabled(/*enabled*/ true);
+        composer.set_status_line(Some(Line::from(
+            "Status line content that is definitely too long to fit alongside the mode label"
+                .to_string(),
+        )));
+        composer.set_collaboration_mode_indicator(Some(CollaborationModeIndicator::Plan));
+        let footer_row = |width: u16| -> String {
+            let area = Rect::new(0, 0, width, 6);
+            let mut buf = Buffer::empty(area);
+            crate::render::renderable::Renderable::render(&composer, area, &mut buf);
+            (0..width)
+                .map(|x| buf[(x, area.height - 1)].symbol())
+                .collect()
         };
 
-        let screen = render_footer_with_mode_indicator_and_context(
-            /*width*/ 80,
-            &props,
-            Some(CollaborationModeIndicator::Plan),
-            context_window_line(Some(50), /*used_tokens*/ None),
-        );
-        let collapsed = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        let wide = footer_row(/*width*/ 120);
         assert!(
-            collapsed.contains("Plan mode"),
-            "mode indicator should remain visible"
+            wide.contains("alongside the mode label") && !wide.contains('…'),
+            "status line should stay whole when there is room: {wide}"
         );
         assert!(
-            !collapsed.contains("shift+tab to cycle"),
-            "compact mode indicator should be used when space is tight"
+            wide.contains("Plan mode (shift+tab to cycle)"),
+            "full mode indicator should be used when there is room: {wide}"
+        );
+
+        let narrow = footer_row(/*width*/ 80);
+        assert!(
+            narrow.contains("Plan mode"),
+            "mode indicator should remain visible: {narrow}"
         );
         assert!(
-            screen.contains('…'),
-            "status line should be truncated with ellipsis to keep mode indicator"
+            !narrow.contains("shift+tab to cycle"),
+            "compact mode indicator should be used when space is tight: {narrow}"
+        );
+        assert!(
+            narrow.contains('…'),
+            "status line should be truncated with ellipsis to keep mode indicator: {narrow}"
+        );
+    }
+
+    #[test]
+    fn composer_status_line_footer_puts_mode_and_ide_context_on_the_right() {
+        // Composer-rendered counterparts of the `footer_status_line_enabled_*` snapshots, which
+        // `draw_footer_frame` only mirrors.
+        fn footer_row(composer: &crate::bottom_pane::chat_composer::ChatComposer) -> String {
+            let area = Rect::new(0, 0, 120, 6);
+            let mut buf = Buffer::empty(area);
+            crate::render::renderable::Renderable::render(composer, area, &mut buf);
+            (0..area.width)
+                .map(|x| buf[(x, area.height - 1)].symbol())
+                .collect()
+        }
+        // Right-aligned content stops `FOOTER_INDENT_COLS` short of the edge; comparing the
+        // padded row is what pins the side.
+        fn right_aligned(text: &str) -> String {
+            format!("{text:>width$}", width = 120 - FOOTER_INDENT_COLS)
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::app_event::AppEvent>();
+        let mut composer = crate::bottom_pane::chat_composer::ChatComposer::new(
+            /*has_input_focus*/ true,
+            crate::app_event_sender::AppEventSender::new(tx),
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_status_line_enabled(/*enabled*/ true);
+        composer.set_context_window(Some(50), /*used_tokens*/ None);
+
+        // The status layout owns the row even without a value, so the context indicator and
+        // the shortcuts hint both stay hidden.
+        assert_eq!(footer_row(&composer).trim(), "");
+
+        composer.set_collaboration_mode_indicator(Some(CollaborationModeIndicator::Plan));
+        assert_eq!(
+            footer_row(&composer).trim_end(),
+            right_aligned("Plan mode (shift+tab to cycle)")
+        );
+
+        composer.set_ide_context_active(/*active*/ true);
+        assert_eq!(
+            footer_row(&composer).trim_end(),
+            right_aligned("Plan mode (shift+tab to cycle) · IDE context")
         );
     }
 

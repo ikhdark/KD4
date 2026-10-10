@@ -7,6 +7,11 @@ license.workspace = true
 [lib]
 doctest = false
 
+# Examples are not test targets by default; this one carries unit tests.
+[[example]]
+name = "generate-relay-proto"
+test = true
+
 [lints]
 workspace = true
 

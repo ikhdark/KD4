@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import ast
 import importlib.resources as resources
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, get_args
 
 import tomllib
+
+import pytest
 
 import openai_codex
 import openai_codex.types as public_types
@@ -118,8 +121,42 @@ def _keyword_default(fn: object, name: str) -> object:
 
 def _assert_no_any_annotations(fn: object) -> None:
     """Reject loose annotations on public wrapper methods."""
-    for name, annotation in inspect.get_annotations(fn, eval_str=True).items():
-        assert annotation is not Any, f"{fn} has public annotation typed as Any: {name}"
+    annotations = inspect.get_annotations(fn, eval_str=True)
+    required = set(inspect.signature(fn).parameters) - {"self"}
+    assert required | {"return"} <= annotations.keys(), f"missing public annotations on {fn}"
+
+    def contains_any(annotation: object) -> bool:
+        if isinstance(annotation, (list, tuple)):
+            return any(contains_any(arg) for arg in annotation)
+        return annotation is Any or any(contains_any(arg) for arg in get_args(annotation))
+
+    for name, annotation in annotations.items():
+        assert not contains_any(annotation), f"{fn} has public annotation typed as Any: {name}"
+
+
+@pytest.mark.parametrize(
+    ("annotations", "valid"),
+    [
+        ({"return": int}, False),
+        ({"value": int}, False),
+        ({"value": Any, "return": int}, False),
+        ({"value": int, "return": Any}, False),
+        ({"value": list[dict[str, Any]], "return": int}, False),
+        ({"value": Callable[[Any], int], "return": int}, False),
+        ({"value": Callable[[int], Any], "return": int}, False),
+        ({"value": Callable[[str, int], list[str]], "return": int}, True),
+    ],
+)
+def test_annotation_check_rejects_missing_and_nested_any(annotations, valid) -> None:
+    def sample(value):
+        return value
+
+    sample.__annotations__ = annotations
+    if valid:
+        _assert_no_any_annotations(sample)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_no_any_annotations(sample)
 
 
 def test_root_exports_turn_result() -> None:
@@ -276,22 +313,28 @@ def test_types_module_exports_curated_public_types() -> None:
 def test_examples_use_public_import_surfaces() -> None:
     """Examples should teach users the public root and type-module imports only."""
     examples_root = Path(__file__).resolve().parents[1] / "examples"
-    private_import_markers = [
-        "openai_codex.api",
-        "openai_codex.client",
-        "openai_codex.generated",
-        "openai_codex.models",
-        "openai_codex.retry",
-    ]
-
-    offenders = {
-        str(path.relative_to(examples_root)): marker
-        for path in examples_root.rglob("*.py")
-        for marker in private_import_markers
-        if marker in path.read_text()
+    public_modules = {
+        "openai_codex": set(EXPECTED_ROOT_EXPORTS),
+        "openai_codex.types": set(EXPECTED_TYPES_EXPORTS),
     }
+    offenders = []
+    for path in sorted(examples_root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if isinstance(node, ast.Import):
+                imports = [(alias.name, None) for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imports = [(node.module, alias.name) for alias in node.names]
+            else:
+                continue
+            for module, name in imports:
+                if module != "openai_codex" and not module.startswith("openai_codex."):
+                    continue
+                if module not in public_modules or (
+                    name not in {None, "*"} and name not in public_modules[module]
+                ):
+                    offenders.append((str(path.relative_to(examples_root)), node.lineno, module, name))
 
-    assert offenders == {}
+    assert offenders == []
 
 
 def test_generated_public_signatures_are_snake_case_and_typed() -> None:

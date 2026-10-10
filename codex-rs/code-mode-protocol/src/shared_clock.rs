@@ -76,21 +76,35 @@ mod platform {
 mod tests {
     use super::shared_monotonic_now;
 
+    #[cfg(any(windows, unix))]
     #[test]
     fn shared_monotonic_clock_is_available_and_advances() {
+        let outer_start = std::time::Instant::now();
         let first = shared_monotonic_now()
             .expect("a supported platform exposes a shared monotonic source");
+        let inner_start = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(5));
+        let minimum_elapsed = inner_start.elapsed();
         let second = shared_monotonic_now().expect("second reading");
+        let maximum_elapsed = outer_start.elapsed();
 
         assert!(
             second > first,
             "the shared monotonic clock must advance: {first} then {second}"
         );
-        let elapsed_ms = (second - first) / 1_000_000;
+        let elapsed = std::time::Duration::from_nanos(second - first);
+        // Bracket the readings rather than assuming the scheduler resumes us
+        // within five seconds. Allow rounding between the two clock APIs.
+        let tolerance = std::time::Duration::from_millis(1);
         assert!(
-            (1..=5_000).contains(&elapsed_ms),
-            "a 5ms sleep should register as a plausible elapsed time, got {elapsed_ms}ms"
+            elapsed + tolerance >= minimum_elapsed && elapsed <= maximum_elapsed + tolerance,
+            "shared elapsed {elapsed:?} must match monotonic bracket {minimum_elapsed:?}..={maximum_elapsed:?}"
         );
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    #[test]
+    fn unsupported_platform_has_no_shared_monotonic_clock() {
+        assert_eq!(shared_monotonic_now(), None);
     }
 }

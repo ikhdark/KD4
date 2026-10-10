@@ -104,6 +104,7 @@ mod nested_deadline_transport {
     }
 
     /// Delivery consumes the original budget; repeated decoding must not restart it.
+    #[cfg(any(windows, unix))]
     #[test]
     fn delayed_and_repeated_delivery_preserves_the_original_deadline() {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -141,13 +142,15 @@ mod nested_deadline_transport {
             ..WireNestedToolCall::from(invocation(None))
         };
 
+        let before_receipt = Instant::now();
         let received = CodeModeNestedToolCall::from(wire)
             .nested_deadline
             .expect("the fallback still yields a deadline");
-        let remaining = received.saturating_duration_since(Instant::now());
+        let after_receipt = Instant::now();
+        let budget = Duration::from_millis(1_000);
         assert!(
-            remaining > Duration::from_millis(900) && remaining <= Duration::from_millis(1_000),
-            "the fallback restarts the budget at receipt: {remaining:?}"
+            (before_receipt + budget..=after_receipt + budget).contains(&received),
+            "the fallback deadline must be one second after receipt: {received:?}"
         );
     }
 

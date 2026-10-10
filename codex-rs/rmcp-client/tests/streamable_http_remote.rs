@@ -33,5 +33,12 @@ async fn streamable_http_remote_client_round_trips_through_exec_server() -> anyh
     let result = call_echo_tool(&client, "remote").await?;
     assert_eq!(result, expected_echo_result("remote"));
 
+    // Phase 4: the MCP server is still up, so the call can only fail once the
+    // exec-server is gone if its HTTP requests were routed through it.
+    drop(exec_server);
+    call_echo_tool(&client, "after-exec-server-exit")
+        .await
+        .expect_err("MCP HTTP requests must depend on the exec-server");
+
     Ok(())
 }

@@ -1629,7 +1629,11 @@ model_reasoning_effort = "high"
 "#,
     )?;
     set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
-    let config_before = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+    let config_path = codex_home.path().join("config.toml");
+    let config_before = std::fs::read_to_string(&config_path)?;
+    // Re-applying the same trust entry reproduces these bytes, so a write is
+    // only visible in the file's modification time.
+    let modified_before = std::fs::metadata(&config_path)?.modified()?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1658,8 +1662,13 @@ model_reasoning_effort = "high"
     assert_eq!(approval_policy, AskForApproval::OnRequest);
     assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
 
-    let config_after = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+    let config_after = std::fs::read_to_string(&config_path)?;
     assert_eq!(config_after, config_before);
+    assert_eq!(
+        std::fs::metadata(&config_path)?.modified()?,
+        modified_before,
+        "config.toml was rewritten for an already trusted project"
+    );
 
     Ok(())
 }

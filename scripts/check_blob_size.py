@@ -276,7 +276,13 @@ def write_step_summary(
 
 
 def markdown_code(value: str) -> str:
-    return f"<code>{html.escape(value).replace('|', '&#124;')}</code>"
+    escaped = (
+        html.escape(value)
+        .replace("|", "&#124;")
+        .replace("\r", "&#13;")
+        .replace("\n", "&#10;")
+    )
+    return f"<code>{escaped}</code>"
 
 
 def blob_status(blob: ChangedBlob, violation_paths: set[str]) -> str:

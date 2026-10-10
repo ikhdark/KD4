@@ -710,11 +710,13 @@ async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<(
     let marker2 = format!("resume-config-2-{}", Uuid::new_v4());
     let prompt2 = format!("echo {marker2}");
 
+    // Without a sandbox, Windows reports workspace-write as read-only, which is also what a
+    // dropped override would print. Only a mode that differs from every default discriminates.
     let output = test
         .cmd_with_server(&server)
         .arg("--skip-git-repo-check")
         .arg("--sandbox")
-        .arg("workspace-write")
+        .arg("danger-full-access")
         .arg("--model")
         .arg("gpt-5.1-high")
         .arg("-C")
@@ -733,8 +735,8 @@ async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<(
         "stderr missing model override: {stderr}"
     );
     assert!(
-        stderr.contains("sandbox: read-only"),
-        "stderr missing downgraded sandbox note: {stderr}"
+        stderr.contains("sandbox: danger-full-access"),
+        "stderr missing sandbox override: {stderr}"
     );
 
     let resumed_path = find_session_file_containing_marker(&sessions_dir, &marker2)

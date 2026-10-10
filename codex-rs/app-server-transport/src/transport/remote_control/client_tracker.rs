@@ -588,7 +588,7 @@ mod tests {
             .await
             .expect("initialize should open client");
 
-        let (connection_id, disconnect_sender) = match transport_event_rx
+        let (connection_id, disconnect_sender, writer) = match transport_event_rx
             .recv()
             .await
             .expect("connection opened should be sent")
@@ -596,8 +596,9 @@ mod tests {
             TransportEvent::ConnectionOpened {
                 connection_id,
                 disconnect_sender: Some(disconnect_sender),
+                writer,
                 ..
-            } => (connection_id, disconnect_sender),
+            } => (connection_id, disconnect_sender, writer),
             other => panic!("expected connection opened, got {other:?}"),
         };
         match transport_event_rx
@@ -612,12 +613,14 @@ mod tests {
             other => panic!("expected incoming initialize, got {other:?}"),
         }
 
+        assert!(!writer.is_closed(), "the outbound task must still be live");
         disconnect_sender.cancel();
         let closed_client_id = timeout(Duration::from_secs(1), client_tracker.bookkeep_join_set())
             .await
             .expect("bookkeeping should process the closed task")
             .expect("closed task should return client id");
         assert_eq!(closed_client_id.0, ClientId("client-1".to_string()));
+        assert!(writer.is_closed(), "cancellation must close the outbound receiver");
         client_tracker
             .close_client(&closed_client_id)
             .await

@@ -356,21 +356,16 @@ mod audit_tests {
     use super::*;
 
     #[test]
-    #[cfg(not(windows))]
-    fn audit_workspace_case_identity_keeps_distinct_native_paths() {
-        assert_ne!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
+    #[cfg(windows)]
+    fn audit_workspace_case_identity_is_windows_case_insensitive() {
+        assert_eq!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
         let scope = RepoScope {
             path: "Src".to_string(),
             recursive: true,
         };
-        assert!(scope.covers_path("Src/Lib.rs"));
-        assert!(!scope.covers_path("src/lib.rs"));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn audit_workspace_case_identity_is_windows_case_insensitive() {
-        assert_eq!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
+        assert!(scope.covers_path("src/lib.rs"));
+        // Case folding must not merge distinct names.
+        assert!(!scope.covers_path("srcs/lib.rs"));
     }
 
     #[test]

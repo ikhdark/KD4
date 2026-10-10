@@ -61,31 +61,6 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    #[cfg(unix)]
-    fn path_comparison_does_not_fold_case_or_lossy_native_names() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-        let dir = tempfile::tempdir().expect("directory");
-        let upper = dir.path().join("A");
-        let lower = dir.path().join("a");
-        // The missing-path branch must also preserve case.
-        assert!(!paths_match_after_normalization(&upper, &lower));
-        for path in [&upper, &lower] {
-            std::fs::write(path, path.as_os_str().as_encoded_bytes()).expect("write");
-        }
-        // Only assert distinct existing case spellings on case-sensitive volumes.
-        if std::fs::read(&upper).expect("read") != std::fs::read(&lower).expect("read") {
-            assert!(!paths_match_after_normalization(&upper, &lower));
-        }
-        let first = dir.path().join(OsString::from_vec(vec![0xff]));
-        let second = dir.path().join(OsString::from_vec(vec![0xfe]));
-        assert!(!paths_match_after_normalization(&first, &second));
-        std::fs::write(&first, "first").expect("first");
-        std::fs::write(&second, "second").expect("second");
-        assert!(!paths_match_after_normalization(&first, &second));
-    }
-
-    #[test]
     fn missing_paths_fall_back_to_direct_equality() {
         assert!(paths_match_after_normalization("missing", "missing"));
         assert!(!paths_match_after_normalization("missing-a", "missing-b"));

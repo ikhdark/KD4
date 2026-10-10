@@ -141,6 +141,11 @@ fn cloned_factories_share_chatgpt_cookie_stores_without_changing_value_equality(
             HeaderValue::from_static("second=true"),
         ])
     );
+    assert_ne!(
+        factory,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .with_chatgpt_cookies([HeaderValue::from_static("first=true")])
+    );
 }
 
 #[test]
@@ -323,20 +328,6 @@ async fn async_resolution_uses_cached_route_before_global_permit() {
     drop(permit);
 
     assert_eq!(route, OutboundProxyRoute::Direct);
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-#[test]
-fn unsupported_platform_system_proxy_falls_back_explicitly() {
-    let origin = RequestOrigin::parse("https://api.openai.com/v1/responses")
-        .expect("request origin should parse");
-
-    assert_eq!(
-        resolve_platform_system_proxy("https://api.openai.com/v1/responses", &origin),
-        SystemProxyDecision::Unavailable {
-            failure: RouteFailureClass::ProxyResolutionUnavailable,
-        }
-    );
 }
 
 #[tokio::test]

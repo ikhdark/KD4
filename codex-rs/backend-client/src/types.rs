@@ -387,6 +387,7 @@ impl Turn {
             .output_items
             .iter()
             .filter(|item| item.kind == "message")
+            .filter(|item| item.role.as_deref().is_none_or(|role| role == "assistant"))
             .flat_map(TurnItem::text_values)
             .collect();
 
@@ -595,6 +596,33 @@ mod tests {
         let details = fixture("diff");
         let messages = details.assistant_text_messages();
         assert_eq!(messages, vec!["Assistant response".to_string()]);
+    }
+
+    #[test]
+    fn assistant_text_messages_excludes_other_roles_and_nontext_fragments() {
+        let details: CodeTaskDetailsResponse = serde_json::from_value(serde_json::json!({
+            "current_assistant_turn": {
+                "output_items": [
+                    {"type": "message", "role": "user", "content": ["user input"]},
+                    {"type": "message", "role": "tool", "content": ["tool output"]},
+                    {"type": "message", "role": "assistant", "content": [
+                        "answer", {"content_type": "text", "text": "more answer"},
+                        {"content_type": "image", "text": "not text"}
+                    ]},
+                    {"type": "message", "content": ["legacy answer"]}
+                ],
+                "worklog": {"messages": [
+                    {"author": {"role": "assistant"}, "content": {"parts": ["worklog answer"]}},
+                    {"author": {"role": "user"}, "content": {"parts": ["worklog input"]}},
+                    {"content": {"parts": ["unattributed worklog"]}}
+                ]}
+            }
+        }))
+        .expect("task details");
+        assert_eq!(
+            details.assistant_text_messages(),
+            vec!["answer", "more answer", "legacy answer", "worklog answer"]
+        );
     }
 
     #[test]

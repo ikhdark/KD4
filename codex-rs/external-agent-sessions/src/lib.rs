@@ -188,14 +188,42 @@ mod tests {
         .to_string();
         std::fs::write(&source_path, &contents).expect("session");
 
-        let pending =
-            prepare_validated_session_import(root.path(), session_migration(&source_path))
-                .expect("prepare session")
-                .expect("pending import");
+        let pending = prepare_validated_session_import(
+            root.path(),
+            ExternalAgentSessionMigration {
+                path: source_path.clone(),
+                cwd: root.path().join("outdated-discovery-cwd"),
+                title: Some("outdated discovery title".to_string()),
+            },
+        )
+        .expect("prepare session")
+        .expect("pending import");
 
         assert_eq!(
             pending.source_content_sha256,
             format!("{:x}", Sha256::digest(contents))
+        );
+        assert_eq!(pending.source_path, source_path.canonicalize().unwrap());
+        assert_eq!(pending.session.cwd, root.path());
+        assert_eq!(pending.session.title.as_deref(), Some("first request"));
+        assert_eq!(pending.session.first_user_message.as_deref(), Some("first request"));
+
+        // Validation uses the cwd recorded in the session, not the discovery cwd.
+        let missing_cwd_source = root.path().join("missing-cwd-session.jsonl");
+        std::fs::write(
+            &missing_cwd_source,
+            serde_json::json!({
+                "type": "user",
+                "cwd": root.path().join("missing-cwd"),
+                "message": { "content": "first request" },
+            })
+            .to_string(),
+        )
+        .expect("session");
+        assert!(
+            prepare_validated_session_import(root.path(), session_migration(&missing_cwd_source))
+                .expect("prepare session")
+                .is_none()
         );
     }
 

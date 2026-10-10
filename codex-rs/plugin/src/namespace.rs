@@ -84,6 +84,13 @@ mod tests {
             .await,
             None
         );
+        // A blank declared name falls back to the root directory name.
+        fs::write(root.join(".codex-plugin/plugin.json"), r#"{"name":"  "}"#).unwrap();
+        assert_eq!(
+            plugin_namespace_for_root_uri(LOCAL_FS.as_ref(), &PathUri::from_abs_path(&root.abs()))
+                .await,
+            Some("sample".to_string())
+        );
     }
 
     #[tokio::test]

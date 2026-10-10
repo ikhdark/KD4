@@ -107,7 +107,7 @@ mod tests {
         let mut expected = crate::merge::plugin_connector_to_app_info("calendar".to_string());
         expected.name = "Calendar".to_string();
         expected.description = Some("Plan events".to_string());
-        expected.install_url = Some(connector_install_url("Calendar", "calendar"));
+        expected.install_url = Some("https://chatgpt.com/apps/calendar/calendar".to_string());
         expected.is_accessible = true;
         expected.plugin_display_names = vec!["Plugin".to_string()];
         assert_eq!(collect_accessible_connectors(tools), vec![expected]);

@@ -33,6 +33,45 @@ async fn detects_supported_builtin_fsmonitor_values() {
             FsmonitorOverride::Disabled,
         ),
         (
+            "unterminated config",
+            vec![response(config_args(), Some(b"true"))],
+            FsmonitorOverride::Disabled,
+        ),
+        (
+            "multiple config values",
+            vec![response(config_args(), Some(b"true\0helper\0"))],
+            FsmonitorOverride::Disabled,
+        ),
+        (
+            "non-UTF-8 config",
+            vec![response(config_args(), Some(b"\xff\0"))],
+            FsmonitorOverride::Disabled,
+        ),
+        (
+            "typed result must be complete",
+            vec![
+                response(config_args(), Some(b"2k\0")),
+                response(typed_config_args("2k"), Some(b"true\0false\0")),
+            ],
+            FsmonitorOverride::Disabled,
+        ),
+        (
+            "capability query failed",
+            vec![
+                response(config_args(), Some(b"true\0")),
+                response(capability_args(), None),
+            ],
+            FsmonitorOverride::Disabled,
+        ),
+        (
+            "capability substring is not support",
+            vec![
+                response(config_args(), Some(b"true\0")),
+                response(capability_args(), Some(b"feature: fsmonitor--daemon-disabled\n")),
+            ],
+            FsmonitorOverride::Disabled,
+        ),
+        (
             "helper path",
             vec![
                 response(config_args(), Some(b"/tmp/fsmonitor-helper\0")),

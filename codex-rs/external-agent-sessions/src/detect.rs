@@ -128,6 +128,12 @@ mod tests {
                 record("assistant", "ack", project_root.as_path()),
             ],
         );
+        write_session(
+            &external_agent_home,
+            &project_root,
+            "missing-root.jsonl",
+            &[record("user", "root is gone", &root.path().join("missing-repo"))],
+        );
 
         let sessions = detect_recent_sessions(&external_agent_home, root.path()).expect("detect");
 
@@ -518,7 +524,9 @@ mod tests {
         let source = root.path().join(".external");
         let project = root.path().join("repo");
         let modified_at = SystemTime::now();
-        for name in ["c", "a", "b"] {
+        // NTFS lists a directory in case-insensitive name order (a, b, C), so only
+        // the mixed case makes path order differ from the order the files are found in.
+        for name in ["b", "C", "a"] {
             let path = write_session(
                 &source,
                 &project,
@@ -533,7 +541,7 @@ mod tests {
                 .iter()
                 .map(|session| session.title.as_deref())
                 .collect::<Vec<_>>(),
-            vec![Some("a"), Some("b"), Some("c")]
+            vec![Some("C"), Some("a"), Some("b")]
         );
     }
 

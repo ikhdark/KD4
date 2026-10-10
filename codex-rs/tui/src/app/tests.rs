@@ -168,7 +168,8 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
 
     assert_eq!(app.transcript_cells.len(), 0);
 
-    app.active_thread_id = Some(ThreadId::new());
+    let active_thread_id = ThreadId::new();
+    app.active_thread_id = Some(active_thread_id);
     app.transcript_cells
         .push(Arc::new(history_cell::new_mcp_inventory_loading(
             /*animations_enabled*/ false,
@@ -181,6 +182,14 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
     );
 
     assert_eq!(app.transcript_cells.len(), 1);
+
+    app.handle_mcp_inventory_result(
+        Ok(Vec::new()),
+        McpServerStatusDetail::ToolsAndAuthOnly,
+        Some(active_thread_id),
+    );
+
+    assert_eq!(app.transcript_cells.len(), 0);
 }
 
 #[tokio::test]
@@ -4349,6 +4358,48 @@ async fn capped_resize_reflow_renders_recent_suffix_only() {
 }
 
 #[tokio::test]
+async fn capped_resize_reflow_counts_raw_soft_wrapped_rows() {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(2);
+    app.chat_widget.set_raw_output_mode(true);
+    app.transcript_cells = vec![Arc::new(AgentMarkdownCell::new(
+        "abcdefghijklmnopqrst".to_string(),
+        Path::new("/tmp"),
+    ))];
+
+    let rendered = app.render_transcript_lines_for_reflow(/*width*/ 4);
+
+    // Twenty ASCII columns occupy five terminal rows. Retain the final two rows
+    // without introducing hard newlines into copy-friendly raw output.
+    assert_eq!(
+        rendered.lines.iter().map(rendered_line_text).collect::<Vec<_>>(),
+        vec!["mnopqrst".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn capped_raw_resize_reflow_counts_wide_grapheme_wrap_boundaries() {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    app.chat_widget.set_raw_output_mode(true);
+    app.transcript_cells = vec![Arc::new(AgentMarkdownCell::new(
+        "界語漢字".to_string(),
+        Path::new("/tmp"),
+    ))];
+
+    // Each double-width glyph starts a new row at width three: the unused final
+    // column cannot hold the next glyph. Four glyphs therefore occupy four rows.
+    for (cap, expected) in [(3, "語漢字"), (2, "漢字")] {
+        app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(cap);
+        let rendered = app.render_transcript_lines_for_reflow(/*width*/ 3);
+        assert_eq!(
+            rendered.lines.iter().map(rendered_line_text).collect::<Vec<_>>(),
+            vec![expected.to_string()],
+            "raw terminal row cap {cap}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn uncapped_resize_reflow_renders_all_cells_when_row_cap_absent() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
     app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
@@ -4365,28 +4416,44 @@ async fn uncapped_resize_reflow_renders_all_cells_when_row_cap_absent() {
 }
 
 #[tokio::test]
-async fn resize_reflow_wraps_transcript_early_when_pet_is_enabled() {
+async fn history_insert_and_capped_replay_format_cells_at_pet_reserved_width() {
+    #[derive(Debug)]
+    struct RecordingCell(Arc<std::sync::Mutex<Vec<u16>>>);
+    impl HistoryCell for RecordingCell {
+        fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+            self.0.lock().expect("widths").push(width);
+            vec![Line::from("cell")]
+        }
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            vec![Line::from("cell")]
+        }
+    }
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
-    app.transcript_cells = vec![Arc::new(AgentMarkdownCell::new(
-        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".to_string(),
-        Path::new("/tmp"),
-    ))];
-
-    let without_pet = app.render_transcript_lines_for_reflow(/*width*/ 40);
     app.chat_widget
         .set_pet_image_support_for_tests(crate::pets::PetImageSupport::Supported(
             crate::pets::ImageProtocol::Kitty,
         ));
     app.chat_widget
         .install_test_ambient_pet_for_tests(/*animations_enabled*/ false);
-    let width = app.chat_widget.history_wrap_width(/*width*/ 40);
-    assert!(width < 40);
-    let with_pet = app.render_transcript_lines_for_reflow(width);
+    // Resize reflow and backtrack rebuild read the width from the real terminal backend, so only
+    // the insert and replay paths, which use the last known screen size, are driven here.
+    let mut tui = crate::tui::test_support::make_test_tui().expect("tui");
+    let terminal_width = tui.terminal.last_known_screen_size.width;
+    let reserved_width = app.chat_widget.history_wrap_width(terminal_width);
+    assert!(reserved_width < terminal_width);
+    let widths = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    assert!(
-        with_pet.lines.len() > without_pet.lines.len(),
-        "expected pet-enabled transcript reflow to wrap earlier"
+    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    app.insert_history_cell(&mut tui, Box::new(RecordingCell(widths.clone())));
+    assert_eq!(*widths.lock().expect("widths"), vec![reserved_width]);
+
+    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(3);
+    app.begin_initial_history_replay_buffer();
+    app.insert_history_cell(&mut tui, Box::new(RecordingCell(widths.clone())));
+    app.finish_initial_history_replay_buffer(&mut tui);
+    assert_eq!(
+        *widths.lock().expect("widths"),
+        vec![reserved_width, reserved_width]
     );
 }
 
@@ -4412,40 +4479,6 @@ async fn uncapped_resize_reflow_renders_all_cells_under_row_limit() {
             "cell 1".to_string(),
             String::new(),
             "cell 2".to_string(),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn initial_replay_buffer_keeps_recent_rows_when_row_cap_present() {
-    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(3);
-
-    app.begin_initial_history_replay_buffer();
-    for index in 0..5 {
-        App::buffer_initial_history_replay_display_lines(
-            app.initial_history_replay_buffer
-                .as_mut()
-                .expect("initial replay buffer active"),
-            vec![Line::from(format!("line {index}")).into()],
-            /*max_rows*/ 3,
-        );
-    }
-
-    let buffer = app
-        .initial_history_replay_buffer
-        .as_ref()
-        .expect("initial replay buffer should remain active");
-    assert_eq!(
-        buffer
-            .retained_lines
-            .iter()
-            .map(rendered_line_text)
-            .collect::<Vec<_>>(),
-        vec![
-            "line 2".to_string(),
-            "line 3".to_string(),
-            "line 4".to_string(),
         ]
     );
 }
@@ -4537,7 +4570,6 @@ async fn thread_switch_replay_buffer_uses_transcript_tail_mode_when_row_cap_pres
         .as_ref()
         .expect("thread switch replay buffer should be active");
     assert!(buffer.render_from_transcript_tail);
-    assert!(buffer.retained_lines.is_empty());
 }
 
 #[tokio::test]
@@ -5914,7 +5946,7 @@ async fn thread_rollback_response_discards_queued_active_thread_events() {
 }
 
 #[tokio::test]
-async fn new_session_requests_shutdown_for_previous_conversation() {
+async fn shutdown_current_thread_aborts_listener_without_submitting_op() {
     Box::pin(async {
         let (mut app, mut app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
 

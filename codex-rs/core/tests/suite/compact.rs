@@ -777,6 +777,32 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
     assert!(input.get("implementation").is_none());
 }
 
+async fn wait_for_successful_turn_complete(codex: &codex_core::CodexThread) {
+    let completed = wait_for_event_match(codex, |event| match event {
+        EventMsg::TurnComplete(completed) => Some(completed.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(completed.error, None);
+}
+
+async fn wait_for_failed_turn_complete(
+    codex: &codex_core::CodexThread,
+) -> codex_protocol::protocol::ErrorEvent {
+    let error = wait_for_event_match(codex, |event| match event {
+        EventMsg::Error(error) => Some(error.clone()),
+        _ => None,
+    })
+    .await;
+    let completed = wait_for_event_match(codex, |event| match event {
+        EventMsg::TurnComplete(completed) => Some(completed.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(completed.error.as_ref(), Some(&error));
+    error
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
     require_network!();
@@ -853,6 +879,7 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
     assert_eq!(input["hook_event_name"], "PostCompact");
     assert_eq!(input["trigger"], "manual");
     assert!(input.get("compact_summary").is_none());
+    assert_eq!(input["compaction_summary"], summary_with_prefix(SUMMARY_TEXT));
     assert!(input.get("status").is_none());
     assert!(input.get("error").is_none());
     assert!(input.get("reason").is_none());
@@ -1213,15 +1240,34 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         })
         .await
         .expect("submit user input");
-    wait_for_event_with_timeout(
+    let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
         &codex,
         |ev| matches!(ev, EventMsg::TurnComplete(_)),
         Duration::from_secs(15),
     )
-    .await;
+    .await
+    else {
+        unreachable!("predicate requires turn completion");
+    };
+    assert_eq!(completed.error, None);
 
     // collect the requests payloads from the model
     let requests_payloads = request_log.requests();
+    // These calls must really execute, and each unread result must survive
+    // compaction into the first continuation rather than vanish in normalization.
+    for (index, call_id, expected_stdout) in [
+        (2, "r1-shell", "make-react\n"),
+        (4, "r3-shell", "make-node\n"),
+        (6, "r6-shell", "make-python\n"),
+    ] {
+        let output = requests_payloads[index]
+            .function_call_output_text(call_id)
+            .expect("post-compaction request must retain the shell result")
+            .replace("\r\n", "\n");
+        let (header, stdout) = output.split_once("\nOutput:\n").expect("shell output envelope");
+        assert!(header.starts_with("Exit code: 0\nWall time: "), "{output}");
+        assert_eq!(stdout, expected_stdout);
+    }
     for request in &requests_payloads {
         assert_eq!(
             request
@@ -1404,17 +1450,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "message"
       },
       {
-        "arguments": "{\"command\":\"echo make-react\"}",
-        "call_id": "r1-shell",
-        "name": "shell_command",
-        "type": "function_call"
-      },
-      {
-        "call_id": "r1-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
         "content": [
           {
             "text": SUMMARIZATION_PROMPT,
@@ -1493,17 +1528,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "message"
       },
       {
-        "arguments": "{\"command\":\"echo make-node\"}",
-        "call_id": "r3-shell",
-        "name": "shell_command",
-        "type": "function_call"
-      },
-      {
-        "call_id": "r3-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
         "content": [
           {
             "text": SUMMARIZATION_PROMPT,
@@ -1580,17 +1604,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         ],
         "role": "user",
         "type": "message"
-      },
-      {
-        "arguments": "{\"command\":\"echo make-python\"}",
-        "call_id": "r6-shell",
-        "name": "shell_command",
-        "type": "function_call"
-      },
-      {
-        "call_id": "r6-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
       },
       {
         "content": [
@@ -1681,6 +1694,8 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     // test 3: the number of requests should be 7
     assert_eq!(requests_payloads.len(), 7);
+    codex.submit(Op::Shutdown).await.expect("shutdown shell session");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
@@ -3249,7 +3264,12 @@ async fn manual_compact_context_window_error_does_not_retry_with_trimmed_history
         "context_length_exceeded",
         CONTEXT_LIMIT_MESSAGE,
     );
-    let request_log = mount_sse_sequence(&server, vec![user_turn, compact_failed]).await;
+    let compact_recovery = sse(vec![
+        ev_assistant_message("m-recovery", SUMMARY_TEXT),
+        ev_completed("compact-recovery"),
+    ]);
+    let request_log =
+        mount_sse_sequence(&server, vec![user_turn, compact_failed, compact_recovery]).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -3277,8 +3297,8 @@ async fn manual_compact_context_window_error_does_not_retry_with_trimmed_history
     wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.unwrap();
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::Error(_))).await;
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let error = wait_for_failed_turn_complete(codex).await;
+    assert!(error.message.contains("context window"));
 
     let requests = request_log.requests();
     assert_eq!(
@@ -3291,6 +3311,30 @@ async fn manual_compact_context_window_error_does_not_retry_with_trimmed_history
     let compact_body = compact_attempt.to_string();
     assert!(body_contains_text(&compact_body, "first turn"));
     assert!(body_contains_text(&compact_body, SUMMARIZATION_PROMPT));
+    // A later explicit compact observes the untouched live history; inspecting
+    // only the failed request would also pass after destructive error handling.
+    codex.submit(Op::Compact).await.expect("retry compact explicitly");
+    wait_for_successful_turn_complete(codex).await;
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3, "only the explicit compact may add a request");
+    assert_eq!(
+        requests[2]
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| text.as_str() == "first turn")
+            .count(),
+        1
+    );
+    let assistant_messages = requests[2]
+        .inputs_of_type("message")
+        .into_iter()
+        .filter(|item| item["role"] == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages.len(), 1);
+    assert_eq!(
+        assistant_messages[0]["content"],
+        json!([{ "type": "output_text", "text": FIRST_REPLY }])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3308,7 +3352,12 @@ async fn manual_compact_context_window_error_does_not_batch_delete_history() {
         "context_length_exceeded",
         CONTEXT_LIMIT_MESSAGE,
     );
-    let request_log = mount_sse_sequence(&server, vec![user_turn, compact_failed]).await;
+    let compact_recovery = sse(vec![
+        ev_assistant_message("m-recovery", SUMMARY_TEXT),
+        ev_completed("compact-recovery"),
+    ]);
+    let request_log =
+        mount_sse_sequence(&server, vec![user_turn, compact_failed, compact_recovery]).await;
 
     let model_provider = non_openai_model_provider(&server);
     let test = test_codex()
@@ -3339,8 +3388,8 @@ async fn manual_compact_context_window_error_does_not_batch_delete_history() {
     wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.expect("trigger compact");
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::Error(_))).await;
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let error = wait_for_failed_turn_complete(codex).await;
+    assert!(error.message.contains("context window"));
 
     let requests = request_log.requests();
     assert_eq!(
@@ -3360,6 +3409,30 @@ async fn manual_compact_context_window_error_does_not_batch_delete_history() {
     let compact_body = compact_attempt.to_string();
     assert!(body_contains_text(&compact_body, "first turn"));
     assert!(body_contains_text(&compact_body, SUMMARIZATION_PROMPT));
+    // A later explicit compact observes the untouched live history; inspecting
+    // only the failed request would also pass after destructive error handling.
+    codex.submit(Op::Compact).await.expect("retry compact explicitly");
+    wait_for_successful_turn_complete(codex).await;
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3, "only the explicit compact may add a request");
+    assert_eq!(
+        requests[2]
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| text.as_str() == "first turn")
+            .count(),
+        1
+    );
+    let assistant_messages = requests[2]
+        .inputs_of_type("message")
+        .into_iter()
+        .filter(|item| item["role"] == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages.len(), 1);
+    assert_eq!(
+        assistant_messages[0]["content"],
+        json!([{ "type": "output_text", "text": FIRST_REPLY }])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3410,8 +3483,8 @@ async fn manual_compact_non_retryable_failure_is_not_retried() {
     wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.expect("trigger compact");
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::Error(_))).await;
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let error = wait_for_failed_turn_complete(codex).await;
+    assert!(error.message.contains("permanent compact failure"));
 
     assert_eq!(
         request_log.requests().len(),
@@ -3620,7 +3693,7 @@ async fn manual_compact_retryable_failure_retries_then_succeeds() {
         })
         .await
         .expect("submit user input");
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn_complete(codex).await;
 
     codex.submit(Op::Compact).await.expect("trigger compact");
 
@@ -3634,7 +3707,7 @@ async fn manual_compact_retryable_failure_retries_then_succeeds() {
         "expected reconnect stream error message, got {reconnect_message}"
     );
 
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn_complete(codex).await;
 
     assert_eq!(
         request_log.requests().len(),
@@ -4707,17 +4780,13 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
         })
         .await
         .expect("submit second user");
-    let error_message = wait_for_event_match(&codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let error_message = wait_for_failed_turn_complete(&codex).await.message;
 
     let requests = request_log.requests();
-    assert!(
-        requests.len() >= 2,
-        "expected first turn and at least one compaction request"
+    assert_eq!(
+        requests.len(),
+        2,
+        "context-window failure must neither retry nor sample the pending turn"
     );
 
     insta::assert_snapshot!(
@@ -4973,6 +5042,7 @@ async fn completed_plan_defers_mid_turn_compaction_for_one_request() -> Result<(
         "plan": [{"step": "implement and validate", "status": "completed"}],
     })
     .to_string();
+    let compact_summary = "## Goal\nFinish the planned work\n\n## Current state\nReady to answer\n\n## Completed work\nPlan marked completed\n\n## Unresolved work\nSend the final answer\n\n## Evidence\nThe extra tool was unsupported\n\n## Next action\nAnswer the user";
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
@@ -4986,7 +5056,7 @@ async fn completed_plan_defers_mid_turn_compaction_for_one_request() -> Result<(
                 ev_completed_with_tokens("extra-response", /*total_tokens*/ 97_000),
             ]),
             sse(vec![
-                ev_assistant_message("compact-message", "summary"),
+                ev_assistant_message("compact-message", compact_summary),
                 ev_completed_with_tokens("compact-response", /*total_tokens*/ 10_000),
             ]),
             sse(vec![
@@ -5004,10 +5074,19 @@ async fn completed_plan_defers_mid_turn_compaction_for_one_request() -> Result<(
     });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("finish the planned work").await?;
+    let completed = test
+        .submit_turn_and_capture_completion("finish the planned work")
+        .await?;
+    assert_eq!(completed.error, None);
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
+    assert!(requests[3].body_contains_text(compact_summary));
+    assert!(
+        !requests[3].body_contains_text(SUMMARIZATION_PROMPT),
+        "the fourth request must continue, not correct a malformed checkpoint"
+    );
     assert!(
         !requests[1].body_contains_text(SUMMARIZATION_PROMPT),
         "a completed plan must not compact before the request that may answer"

@@ -437,15 +437,10 @@ async fn defers_effective_tool_sets_when_search_is_available() {
 #[tokio::test]
 async fn directly_exposes_tools_required_by_enabled_plugin_skills() {
     let config = test_config().await;
-    let skill_tool = make_mcp_tool(
-        "skill-plugin",
-        "skill_tool",
-        "mcp__skill_plugin",
-        "skill_tool",
-        /*connector_id*/ None,
-        /*connector_name*/ None,
-    );
-    let deferred_tool = make_mcp_tool(
+    let plugin_tools = example_plugin_tools();
+    let skill_tool = plugin_tools[0].clone();
+    let sibling_tool = plugin_tools[1].clone();
+    let other_server_tool = make_mcp_tool(
         "other-plugin",
         "other_tool",
         "mcp__other_plugin",
@@ -453,17 +448,27 @@ async fn directly_exposes_tools_required_by_enabled_plugin_skills() {
         /*connector_id*/ None,
         /*connector_name*/ None,
     );
-    let mcp_tools = vec![skill_tool.clone(), deferred_tool.clone()];
+    let mcp_tools = vec![
+        skill_tool.clone(),
+        sibling_tool.clone(),
+        other_server_tool.clone(),
+    ];
+
+    // The selection comes from the only runtime producer: a selected plugin
+    // skill whose explicit toolExposure names one tool of a two-tool server.
+    let selected = resolve_selected_skill_mcp_exposure(
+        &[selected_plugin_skill("example-plugin", "example-plugin")],
+        &plugin_outcome(Some(example_plugin_tool_exposure(&["task"]))),
+        &mcp_tools,
+    );
+    assert!(selected.diagnostics.is_empty());
 
     let exposure = build_mcp_tool_exposure(
         &mcp_tools,
         /*connectors*/ None,
         &config,
         /*search_tool_enabled*/ true,
-        &DirectMcpToolSelection {
-            legacy_server_names: HashSet::from(["skill-plugin".to_string()]),
-            ..Default::default()
-        },
+        &selected.selection,
     );
 
     assert_eq!(
@@ -475,9 +480,9 @@ async fn directly_exposes_tools_required_by_enabled_plugin_skills() {
             exposure
                 .deferred_tools
                 .as_deref()
-                .expect("unrelated MCP tools should remain discoverable through tool_search")
+                .expect("undeclared MCP tools should remain discoverable through tool_search")
         ),
-        tool_names(&[deferred_tool])
+        tool_names(&[sibling_tool, other_server_tool])
     );
 }
 

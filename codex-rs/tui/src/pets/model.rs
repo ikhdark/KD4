@@ -288,9 +288,6 @@ fn load_pet_manifest(pet_dir: &Path, manifest_file: &str, fallback_id: &str) -> 
             .filter(|path| !path.is_empty())
             .unwrap_or("spritesheet.webp"),
     )?;
-    if !spritesheet_path.exists() {
-        bail!("missing spritesheet {}", spritesheet_path.display());
-    }
     let (spritesheet_width, spritesheet_height) =
         validate_app_spritesheet_dimensions(&spritesheet_path)?;
 
@@ -327,7 +324,17 @@ fn resolve_spritesheet_path(pet_dir: &Path, spritesheet_path: &str) -> Result<Pa
     {
         bail!("spritesheet path must stay inside {}", pet_dir.display());
     }
-    Ok(pet_dir.join(path))
+    let path = pet_dir.join(path);
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("missing spritesheet {}", path.display()))?;
+    let root = pet_dir.canonicalize()?;
+    if !resolved.starts_with(root) {
+        bail!("spritesheet path must stay inside {}", pet_dir.display());
+    }
+    // Keep the caller's path representation, including custom-selector paths.
+    // This validates links at load time, not against concurrent filesystem edits.
+    Ok(path)
 }
 
 fn validate_app_spritesheet_dimensions(path: &Path) -> Result<(u32, u32)> {
@@ -717,6 +724,51 @@ mod tests {
             Some(Component::Normal(_))
         ));
         assert!(!cache.to_string_lossy().contains("outside"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn manifest_spritesheet_rejects_child_links_outside_pet_directory() {
+        let dir = write_minimal_pet();
+        let outside = tempfile::tempdir().unwrap();
+        catalog::write_test_spritesheet(&outside.path().join("spritesheet.webp"));
+        let inside = dir.path().join("assets");
+        fs::create_dir(&inside).unwrap();
+        catalog::write_test_spritesheet(&inside.join("spritesheet.webp"));
+        let link = dir.path().join("linked");
+        fs::write(
+            dir.path().join("pet.json"),
+            r#"{"spritesheetPath":"linked/spritesheet.webp"}"#,
+        )
+        .unwrap();
+        for (target, allowed) in [(inside.as_path(), true), (outside.path(), false)] {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            #[cfg(windows)]
+            {
+                // Directory junctions do not require Windows symlink privileges.
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(target)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+            }
+            let result = Pet::load_with_codex_home(dir.path().to_str().unwrap(), None);
+            #[cfg(unix)]
+            fs::remove_file(&link).unwrap();
+            #[cfg(windows)]
+            fs::remove_dir(&link).unwrap();
+            if allowed {
+                assert!(result.is_ok(), "an internal child link is valid: {result:?}");
+            } else {
+                assert!(
+                    result.unwrap_err().to_string().contains("must stay inside"),
+                    "a manifest child link must not reach an unrelated spritesheet"
+                );
+            }
+        }
     }
 
     #[test]

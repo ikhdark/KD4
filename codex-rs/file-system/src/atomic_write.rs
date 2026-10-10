@@ -82,20 +82,35 @@ pub fn atomic_write_lock_path(write_path: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn acquire_atomic_write_lock(write_path: &Path) -> io::Result<AtomicWriteLock> {
+    let file = open_atomic_write_lock(write_path)?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(AtomicWriteLock { file })
+}
+
+/// Attempts the same transaction lock without waiting for another writer.
+/// `None` means contention; filesystem errors are still reported to the caller.
+pub fn try_acquire_atomic_write_lock(write_path: &Path) -> io::Result<Option<AtomicWriteLock>> {
+    let file = open_atomic_write_lock(write_path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(AtomicWriteLock { file })),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_atomic_write_lock(write_path: &Path) -> io::Result<File> {
     let lock_path = atomic_write_lock_path(write_path)?;
     if let Some(parent) = lock_path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(lock_path)?;
-    fs2::FileExt::lock_exclusive(&file)?;
-    Ok(AtomicWriteLock { file })
+        .open(lock_path)
 }
 
 pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
@@ -297,6 +312,20 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonblocking_transaction_lock_observes_contention_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("config.toml");
+        let first = acquire_atomic_write_lock(&destination).unwrap();
+        assert!(try_acquire_atomic_write_lock(&destination).unwrap().is_none());
+        drop(first);
+        let second = try_acquire_atomic_write_lock(&destination).unwrap().expect("released lock");
+        assert!(try_acquire_atomic_write_lock(&destination).unwrap().is_none());
+        drop(second);
+        assert!(try_acquire_atomic_write_lock(&destination).unwrap().is_some());
+        assert!(try_acquire_atomic_write_lock(Path::new("")).is_err());
+    }
 
     #[test]
     fn partial_staged_write_failure_preserves_original() {

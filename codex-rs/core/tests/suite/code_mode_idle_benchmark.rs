@@ -31,8 +31,10 @@ text(JSON.stringify(await Promise.all([
                 sse(vec![ev_assistant_message("msg-1", "done"), ev_completed("resp-2")]),
             ]).await;
             let start = Instant::now();
-            tokio::time::timeout(Duration::from_secs(30), test.submit_turn("Execute and report the result")).await??;
+            let completion = tokio::time::timeout(Duration::from_secs(30), test.submit_turn_and_capture_completion("Execute and report the result")).await??;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(completion.error, None);
+            assert_eq!(completion.last_agent_message.as_deref(), Some("done"));
             let request = model.last_request().expect("tool result reached next model request");
             let items = custom_tool_output_items(&request, "call-1");
             assert_eq!(items.len(), 1);

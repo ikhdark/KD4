@@ -69,10 +69,12 @@ mod tests {
                 ));
             }
         }
-        let output = ExecToolCallOutput {
+        let mut output = ExecToolCallOutput {
             exit_code: 127,
             ..Default::default()
         };
+        // A failure whose output names no permission error is not a hint.
+        output.stderr.text = "command not found".into();
         assert!(!is_likely_sandbox_denied(
             SandboxType::WindowsRestrictedToken,
             &output

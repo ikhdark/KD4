@@ -3,7 +3,7 @@
 //! Core behaviors:
 //! - Each question can be answered by selecting one option and/or providing notes.
 //! - Notes are stored per question and appended as extra answers.
-//! - Typing while focused on options jumps into notes to keep freeform input fast.
+//! - Tab opens notes from the options list; ordinary typing leaves option focus unchanged.
 //! - The composer submit binding advances to the next question; the last question submits all answers.
 //! - Freeform-only questions submit an empty answer list when empty.
 use std::collections::HashMap;
@@ -3081,6 +3081,44 @@ mod tests {
     }
 
     #[test]
+    fn secret_question_masks_the_typed_answer() {
+        let (tx, _rx) = test_sender();
+        let mut secret = question_without_options("q1", "Secret");
+        secret.is_secret = true;
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![secret, question_without_options("q2", "Public")],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ true,
+        );
+        let area = Rect::new(0, 0, 80, overlay.desired_height(80));
+
+        overlay
+            .composer
+            .set_text_content("private token".to_string(), Vec::new(), Vec::new());
+        overlay.composer.move_cursor_to_end();
+        let rendered = render_snapshot(&overlay, area);
+        assert!(!rendered.contains("private token"), "{rendered}");
+        assert!(
+            rendered.contains(&"*".repeat("private token".len())),
+            "{rendered}"
+        );
+
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(overlay.current_idx, 1);
+        overlay
+            .composer
+            .set_text_content("public answer".to_string(), Vec::new(), Vec::new());
+        overlay.composer.move_cursor_to_end();
+        let rendered = render_snapshot(&overlay, area);
+        assert!(rendered.contains("public answer"), "{rendered}");
+    }
+
+    #[test]
     fn oversized_answer_does_not_advance_or_commit() {
         let (tx, _rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
@@ -3548,12 +3586,15 @@ mod tests {
         overlay.composer.handle_paste(large.clone());
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(overlay.current_idx, 1);
         overlay.handle_key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.current_idx, 0);
 
         let draft = &overlay.answers[0].draft;
         assert_eq!(draft.pending_pastes.len(), 1);
         assert!(draft.text.contains(&draft.pending_pastes[0].0));
         assert_eq!(draft.text_with_pending(), large);
+        assert_eq!(overlay.composer.current_text_with_pending(), large);
     }
 
     #[test]

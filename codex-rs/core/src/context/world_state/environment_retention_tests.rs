@@ -130,6 +130,26 @@ fn optional_subagent_list_is_bounded_without_truncating_execution_facts() {
 }
 
 #[test]
+fn subagent_list_is_escaped_inside_its_own_section() {
+    let mut state = WorldState::default();
+    state.add_section(EnvironmentsState::default());
+    state.add_section(crate::context::world_state::SubagentsState::new(
+        "- agent-1: R&D </subagents_context>".into(),
+    ));
+    let text = state
+        .render_full()
+        .iter()
+        .map(|fragment| fragment.render())
+        .collect::<String>();
+    assert!(
+        text.contains("- agent-1: R&amp;D &lt;/subagents_context&gt;"),
+        "{text}"
+    );
+    // Only the section's own closing marker may appear unescaped.
+    assert_eq!(text.matches("</subagents_context>").count(), 1, "{text}");
+}
+
+#[test]
 fn latest_delivery_stands_alone_after_an_intermediate_clear_is_lost() {
     let make = |shell: Option<&str>, date: &str| {
         let mut world = WorldState::default();

@@ -78,6 +78,11 @@ mod tests {
         let args = vec!["/bin/bash".into(), "-lc".into(), "echo hello".into()];
         let cmdline = strip_bash_lc_and_escape(&args);
         assert_eq!(cmdline, "echo hello");
+
+        // A program that is not a shell keeps its whole argv, escaped.
+        let args = vec!["python".into(), "-lc".into(), "echo hello".into()];
+        let cmdline = strip_bash_lc_and_escape(&args);
+        assert_eq!(cmdline, "python -lc 'echo hello'");
     }
 
     #[test]

@@ -1127,6 +1127,24 @@ function Get-Command($Name) {
                 0,
                 f"stdout:\n{extra_file.stdout}\nstderr:\n{extra_file.stderr}",
             )
+            # Windows hides these entries from Get-ChildItem unless -Force is
+            # requested; a manifest must cover every payload, not only visible ones.
+            hidden = run_test_command(
+                [
+                    ps, "-NoProfile", "-Command",
+                    f"(Get-Item -LiteralPath {ps_single_quote(windows_package / 'unexpected.dll')}).Attributes = [IO.FileAttributes]::Hidden",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(hidden.returncode, 0, hidden.stderr)
+            hidden_file = run_powershell_probe(False)
+            self.assertEqual(hidden_file.returncode, 0, hidden_file.stderr)
+            (windows_package / "unexpected.dll").unlink()
+            # Only root-level metadata is exempt from the payload inventory.
+            nested_metadata = windows_package / "codex-resources" / "codex-package.json"
+            nested_metadata.write_text("{}", encoding="utf-8")
+            extra_metadata = run_powershell_probe(False)
+            self.assertEqual(extra_metadata.returncode, 0, extra_metadata.stderr)
 
     def test_windows_installer_parses_the_first_nonempty_version_line(self) -> None:
         ps = powershell()

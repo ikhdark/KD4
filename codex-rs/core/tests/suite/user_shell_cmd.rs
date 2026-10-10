@@ -274,6 +274,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
 
     let mut saw_replaced_abort = false;
     let mut saw_user_shell_end = false;
+    let mut saw_model_shell_end = false;
     let mut saw_turn_complete = false;
     for _ in 0..200 {
         let event = timeout(Duration::from_secs(20), fixture.codex.next_event())
@@ -289,6 +290,11 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
                 assert_eq!(ev.stdout.trim(), "user-shell");
                 saw_user_shell_end = true;
             }
+            EventMsg::ExecCommandEnd(ev) if ev.call_id == call_id => {
+                assert_eq!(ev.exit_code, Some(0));
+                assert_eq!(ev.stdout.trim(), "model-shell");
+                saw_model_shell_end = true;
+            }
             EventMsg::TurnComplete(completion) => {
                 assert_eq!(completion.error, None);
                 assert_eq!(completion.last_agent_message.as_deref(), Some("done"));
@@ -300,6 +306,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
     }
 
     assert!(saw_turn_complete, "expected turn to complete");
+    assert!(saw_model_shell_end, "the model's original command must finish successfully");
     assert!(
         saw_user_shell_end,
         "expected user shell command to finish while turn was active"
@@ -313,6 +320,11 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
         mock.requests().len(),
         2,
         "active turn should continue and issue the follow-up model request"
+    );
+    assert!(
+        mock.requests()[1].function_call_output_text(call_id)
+            .expect("model shell result in follow-up request")
+            .contains("model-shell")
     );
 
     Ok(())
@@ -352,21 +364,25 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
         begin_event.command
     );
 
-    let delta_event = wait_for_event_match(&test.codex, |ev| match ev {
-        EventMsg::ExecCommandOutputDelta(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
-    assert_eq!(delta_event.stream, ExecOutputStream::Stdout);
-    let chunk_text =
-        String::from_utf8(delta_event.chunk.clone()).expect("user command chunk is valid utf-8");
-    assert_eq!(chunk_text.trim(), "not-set");
-
-    let end_event = wait_for_event_match(&test.codex, |ev| match ev {
-        EventMsg::ExecCommandEnd(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
+    // Pipe reads may split even this short output at arbitrary byte boundaries.
+    let mut streamed_stdout = Vec::new();
+    let end_event = loop {
+        let event = wait_for_event(&test.codex, |ev| matches!(ev,
+            EventMsg::ExecCommandOutputDelta(_) | EventMsg::ExecCommandEnd(_) | EventMsg::Error(_)
+        )).await;
+        match event {
+            EventMsg::ExecCommandOutputDelta(event) => {
+                assert_eq!(event.call_id, begin_event.call_id);
+                assert_eq!(event.stream, ExecOutputStream::Stdout);
+                streamed_stdout.extend_from_slice(&event.chunk);
+            }
+            EventMsg::ExecCommandEnd(event) => break event,
+            EventMsg::Error(error) => panic!("user shell command failed: {error:?}"),
+            _ => unreachable!(),
+        }
+    };
+    assert_eq!(end_event.call_id, begin_event.call_id);
+    assert_eq!(String::from_utf8(streamed_stdout)?.trim(), "not-set");
     assert_eq!(end_event.exit_code, Some(0));
     assert_eq!(end_event.stdout.trim(), "not-set");
 
@@ -394,6 +410,23 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
         r"(?m)\A<user_shell_command>\n<command>\n{escaped_command}\n</command>\n<result>\nExit code: 0\nDuration: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\nnot-set\n</result>\n</user_shell_command>\z"
     );
     assert_regex_match(&expected_pattern, &command_message);
+
+    test.codex.flush_rollout().await?;
+    let rollout_path = test.codex.rollout_path().expect("shell history rollout");
+    let (items, _, parse_errors) =
+        codex_rollout::RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(parse_errors, 0);
+    let persisted_shell_messages = items.iter().filter(|item| {
+        matches!(item,
+            codex_protocol::protocol::RolloutItem::ResponseItem(
+                codex_protocol::models::ResponseItem::Message { role, content, .. }
+            ) if role == "user" && content.iter().any(|part| matches!(part,
+                codex_protocol::models::ContentItem::InputText { text }
+                    if text.replace("\r\n", "\n") == command_message
+            ))
+        )
+    }).count();
+    assert_eq!(persisted_shell_messages, 1, "the model-visible shell result must be persisted exactly once");
 
     Ok(())
 }
@@ -501,6 +534,7 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
         .context("function_call_output present for shell_command call")?;
 
     let truncation_headers = output.matches("Total output lines:").count();
+    assert!(output.lines().any(|line| line == "Exit code: 0"), "fixture command must succeed: {output}");
 
     assert_eq!(
         truncation_headers, 1,

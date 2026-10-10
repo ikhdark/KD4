@@ -660,8 +660,8 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
     assert_eq!(reloaded_agent_auth.run_task_id(), "task-123");
     assert_eq!(reloaded_agent_auth.record().agent_private_key, persisted.agent_private_key);
     assert_eq!(reloaded_agent_auth.plan_type(), AccountPlanType::Pro);
-    assert_eq!(reloaded_agent_auth.email(), agent_auth.email());
-    assert_eq!(reloaded_agent_auth.is_fedramp_account(), agent_auth.is_fedramp_account());
+    assert_eq!(reloaded_agent_auth.email(), Some("user@example.com"));
+    assert!(!reloaded_agent_auth.is_fedramp_account());
     Ok(())
 }
 
@@ -1519,6 +1519,219 @@ async fn authority_refresh_cancelled_waiter_releases_admission() {
     assert_eq!(source.refresh_count.load(Ordering::SeqCst), 1);
 }
 
+struct BlockedRefreshExternalAuth {
+    auth: CodexAuth,
+    entered: AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+#[tokio::test]
+async fn blocked_ephemeral_commit_does_not_block_clearing_external_auth() {
+    let home = tempdir().unwrap();
+    let manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("seed"), home.path().to_path_buf(),
+    );
+    let token = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("enterprise".to_string()),
+        chatgpt_account_id: Some("workspace-one".to_string()),
+    }).unwrap();
+    let auth = CodexAuth::from_external_chatgpt_tokens(&token, "workspace-one", Some("enterprise"))
+        .unwrap();
+    manager.set_external_auth(Arc::new(StaticExternalAuth(auth))).await.unwrap();
+    let (worker, clear_worker, cleared_while_blocked) = with_ephemeral_auth_entry(home.path(), |_| {
+        let refresh_manager = Arc::clone(&manager);
+        let (at_store_tx, at_store_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            crate::auth::storage::notify_before_next_ephemeral_store_lock(at_store_tx);
+            runtime.block_on(refresh_manager.refresh_token_from_authority())
+        });
+        let reached_store = at_store_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let clear_manager = Arc::clone(&manager);
+        let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
+        let clear_worker = std::thread::spawn(move || {
+            clear_manager.clear_external_auth();
+            let _ = cleared_tx.send(());
+        });
+        let cleared = reached_store && cleared_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        Ok((worker, clear_worker, cleared))
+    }).unwrap();
+    // Always release the store and join both workers before asserting the bounded-clear result.
+    clear_worker.join().unwrap();
+    let _refresh_result = worker.join().unwrap();
+    assert!(cleared_while_blocked, "a slow store must not hold the source lock hostage");
+    assert!(manager.auth_cached().is_none());
+}
+
+#[tokio::test]
+async fn failed_managed_logout_preserves_external_source_and_cache() {
+    let home = tempdir().unwrap();
+    let manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("seed"), home.path().to_path_buf(),
+    );
+    manager.set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key("active"))))
+        .await.unwrap();
+    std::fs::create_dir(home.path().join("auth.json")).unwrap();
+    assert!(manager.logout().await.is_err());
+    assert!(manager.has_external_auth());
+    assert_eq!(manager.auth_cached().as_ref().and_then(CodexAuth::api_key), Some("active"));
+}
+
+struct BlockedResolveExternalAuth {
+    auth: CodexAuth,
+    resolves: AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+impl ExternalAuth for BlockedResolveExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async {
+            if self.resolves.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.release.notified().await;
+            }
+            Ok(self.auth.clone())
+        })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        self.resolve()
+    }
+}
+
+#[tokio::test]
+async fn inflight_external_reload_preserves_cleared_or_replaced_source() {
+    for replace in [false, true] {
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+        let source = Arc::new(BlockedResolveExternalAuth {
+            auth: CodexAuth::from_api_key("obsolete"),
+            resolves: AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        });
+        manager.set_external_auth(source.clone()).await.unwrap();
+        let mut reload = Box::pin(manager.reload());
+        std::future::poll_fn(|cx| {
+            assert!(reload.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(source.resolves.load(Ordering::SeqCst), 2);
+        manager.clear_external_auth();
+        if replace {
+            manager.set_external_auth(Arc::new(StaticExternalAuth(
+                CodexAuth::from_api_key("replacement"),
+            ))).await.unwrap();
+        }
+        source.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), reload)
+            .await
+            .expect("obsolete source resolution must not block its replacement");
+        assert_eq!(
+            manager.auth_cached().as_ref().and_then(CodexAuth::api_key),
+            replace.then_some("replacement"),
+            "reload must not restore a provider removed while resolve was pending"
+        );
+    }
+}
+
+impl ExternalAuth for BlockedRefreshExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.auth.clone()) })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(self.auth.clone())
+        })
+    }
+}
+
+#[tokio::test]
+async fn inflight_external_refresh_preserves_cleared_or_replaced_source() {
+    for replace in [false, true] {
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+        let source = Arc::new(BlockedRefreshExternalAuth {
+            auth: CodexAuth::from_api_key("obsolete"),
+            entered: AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        });
+        manager.set_external_auth(source.clone()).await.unwrap();
+        let mut refresh = Box::pin(manager.refresh_token_from_authority());
+        std::future::poll_fn(|cx| {
+            assert!(refresh.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(source.entered.load(Ordering::SeqCst), 1);
+        manager.clear_external_auth();
+        if replace {
+            manager
+                .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
+                    "replacement",
+                ))))
+                .await
+                .unwrap();
+        }
+        source.release.notify_one();
+        let _result = tokio::time::timeout(Duration::from_secs(1), refresh)
+            .await
+            .expect("stale refresh must finish without waiting on its removed source");
+        assert_eq!(
+            manager.auth_cached().as_ref().and_then(CodexAuth::api_key),
+            replace.then_some("replacement"),
+            "a provider completing after removal must not restore obsolete credentials"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn inflight_external_refresh_does_not_restore_logged_out_ephemeral_tokens() {
+    let _api_key = EnvVarGuard::remove("CODEX_API_KEY");
+    let codex_home = tempdir().unwrap();
+    let manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("seed"),
+        codex_home.path().to_path_buf(),
+    );
+    let token = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("enterprise".to_string()),
+        chatgpt_account_id: Some("workspace-one".to_string()),
+    })
+    .unwrap();
+    let source = Arc::new(BlockedRefreshExternalAuth {
+        auth: CodexAuth::from_external_chatgpt_tokens(&token, "workspace-one", Some("enterprise"))
+            .unwrap(),
+        entered: AtomicUsize::new(0),
+        release: tokio::sync::Notify::new(),
+    });
+    manager.set_external_auth(source.clone()).await.unwrap();
+    let storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::default(),
+    );
+    assert!(storage.load().unwrap().is_some());
+    let mut refresh = Box::pin(manager.refresh_token_from_authority());
+    std::future::poll_fn(|cx| {
+        assert!(refresh.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(source.entered.load(Ordering::SeqCst), 1);
+    manager.logout().await.unwrap();
+    assert!(manager.auth_cached().is_none());
+    assert!(storage.load().unwrap().is_none());
+    source.release.notify_one();
+    let _result = tokio::time::timeout(Duration::from_secs(1), refresh)
+        .await
+        .expect("the removed provider must not block logout completion");
+    assert!(storage.load().unwrap().is_none(), "logout must remain durable for other managers");
+    assert!(manager.auth_cached().is_none(), "logout must remain visible in the original manager");
+}
+
 struct FailingExternalAuth {
     auth: CodexAuth,
     resolve_count: AtomicUsize,
@@ -2254,15 +2467,13 @@ async fn auth_manager_rejects_disallowed_stored_and_external_auth() {
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
 
     assert_eq!(manager.auth().await, None);
-    assert!(
-        manager
-            .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
-                "sk-external",
-            ))))
-            .await
-            .is_err(),
-        "external auth cannot bypass managed login policy"
-    );
+    let error = manager
+        .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
+            "sk-external",
+        ))))
+        .await
+        .expect_err("external auth cannot bypass managed login policy");
+    assert_eq!(error.to_string(), "ChatGPT login is required");
 }
 
 #[tokio::test]
@@ -2298,10 +2509,15 @@ async fn api_only_policy_rejects_access_tokens_before_hydration() {
 async fn workspace_policy_rejects_agent_identity_before_hydration() {
     let codex_home = tempdir().unwrap();
     let server = MockServer::start().await;
-    let record = agent_identity_record(WORKSPACE_ID_DISALLOWED);
+    let mut record = agent_identity_record(WORKSPACE_ID_DISALLOWED);
     let agent_identity =
         signed_agent_identity_jwt(&record, json!(record.plan_type)).expect("signed agent identity");
-    let _authapi_guard = EnvVarGuard::set("CODEX_AUTHAPI_BASE_URL", &server.uri());
+    // Point JWKS and task registration at the mock so any hydration attempt is recorded there
+    // instead of going to the production endpoints.
+    let chatgpt_base_url = format!("{}/backend-api", server.uri());
+    let _authapi_guard = EnvVarGuard::set("CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL", &server.uri());
+    let _jwks_guard = EnvVarGuard::set("CODEX_AGENT_IDENTITY_JWKS_BASE_URL", &chatgpt_base_url);
+    record.issuer_origin = Some(server.uri());
     let _access_token_reset = remove_access_token_env_var();
     let access_token_guard = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, &agent_identity);
     let mut config = build_config(
@@ -2310,6 +2526,7 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
         /*forced_chatgpt_workspace_id*/ None,
     )
     .await;
+    config.chatgpt_base_url = Some(chatgpt_base_url.clone());
     config.managed_auth_policy.allowed_chatgpt_workspaces =
         Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
     let manager =
@@ -2343,6 +2560,7 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
             /*forced_chatgpt_workspace_id*/ None,
         )
         .await;
+        config.chatgpt_base_url = Some(chatgpt_base_url.clone());
         config.managed_auth_policy.allowed_chatgpt_workspaces =
             Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
         let manager =
@@ -2385,6 +2603,26 @@ async fn workspace_policy_checks_the_selected_request_account() {
         AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
 
     assert_eq!(manager.auth().await, None);
+
+    // Control: the same credentials load once the policy names the selected account, so the
+    // rejection above is the workspace check and not a failed load.
+    let config = build_config(
+        codex_home.path(),
+        /*forced_login_method*/ None,
+        Some(vec![WORKSPACE_ID_DISALLOWED.to_string()]),
+    )
+    .await;
+    let manager =
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+
+    assert_eq!(
+        manager
+            .auth()
+            .await
+            .and_then(|auth| auth.get_account_id())
+            .as_deref(),
+        Some(WORKSPACE_ID_DISALLOWED)
+    );
 }
 
 #[tokio::test]

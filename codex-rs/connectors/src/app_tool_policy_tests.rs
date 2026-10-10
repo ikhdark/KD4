@@ -23,10 +23,19 @@ use super::*;
 
 #[test]
 fn malformed_policy_and_noncanonical_keys_are_rejected() {
-    for config in [
-        serde_json::json!({"apps": {"calendar": {"enabled": "invalid"}}}),
-        serde_json::json!({"apps": {" calendar ": {"enabled": false}}}),
-        serde_json::json!({"apps": {"": {"enabled": false}}}),
+    for (config, expected_error) in [
+        (
+            serde_json::json!({"apps": {"calendar": {"enabled": "invalid"}}}),
+            "invalid apps policy: ",
+        ),
+        (
+            serde_json::json!({"apps": {" calendar ": {"enabled": false}}}),
+            "invalid apps policy connector ID \" calendar \": ",
+        ),
+        (
+            serde_json::json!({"apps": {"": {"enabled": false}}}),
+            "invalid apps policy connector ID \"\": ",
+        ),
     ] {
         let stack = ConfigLayerStack::new(
             Vec::new(),
@@ -39,7 +48,13 @@ fn malformed_policy_and_noncanonical_keys_are_rejected() {
             &path,
             serde_json::from_value::<TomlValue>(config.clone()).unwrap(),
         );
-        assert!(AppToolPolicyEvaluator::new(&stack).is_err(), "{config}");
+        let Err(error) = AppToolPolicyEvaluator::new(&stack) else {
+            panic!("{config} should be rejected");
+        };
+        assert!(
+            error.to_string().starts_with(expected_error),
+            "{config}: {error}"
+        );
     }
 }
 
@@ -853,7 +868,16 @@ fn invalid_managed_connector_keys_cannot_bypass_disabled_policy() {
         };
         let stack =
             ConfigLayerStack::new(Vec::new(), ConfigRequirements::default(), requirements).unwrap();
-        assert!(AppToolPolicyEvaluator::new(&stack).is_err());
-        assert!(apps_config_from_layer_stack(&stack).is_err());
+        let expected_error = format!(
+            "invalid managed apps policy connector ID {id:?}: use a nonempty ID without surrounding whitespace"
+        );
+        let Err(error) = AppToolPolicyEvaluator::new(&stack) else {
+            panic!("managed connector ID {id:?} should be rejected");
+        };
+        assert_eq!(error.to_string(), expected_error);
+        assert_eq!(
+            apps_config_from_layer_stack(&stack).unwrap_err().to_string(),
+            expected_error
+        );
     }
 }

@@ -120,23 +120,35 @@ async fn stdio_command_uses_declared_environment_and_allocates_managed_root() ->
         .map(std::path::PathBuf::from)?
         .join("System32")
         .join("cmd.exe");
-    let command = StdioExecServerCommand {
+    let stdio_command = |script: &str, env: HashMap<String, String>| StdioExecServerCommand {
         program: program.to_string_lossy().into_owned(),
         args: vec![
             "/D".to_string(),
             "/S".to_string(),
             "/C".to_string(),
-            "if defined PATH (exit 9) else (exit 0)".to_string(),
+            script.to_string(),
         ],
-        env: HashMap::new(),
+        env,
         cwd: None,
     };
+    // Exit 0 needs both halves: the inherited PATH is gone and the declared
+    // variable arrived. cmd leaves an undefined %NAME% unexpanded.
+    let command = stdio_command(
+        "if defined PATH (exit 9) else if %CODEX_STDIO_DECLARED%==declared (exit 0) else (exit 8)",
+        HashMap::from([("CODEX_STDIO_DECLARED".to_string(), "declared".to_string())]),
+    );
 
-    let (mut child, managed_root) = spawn_stdio_command(&command).await?;
-    assert!(managed_root.id() > 0);
+    let (mut child, _managed_root) = spawn_stdio_command(&command).await?;
     let status = child.wait().await?;
-
     assert_eq!(status.code(), Some(0));
+
+    // This child waits on its open stdin pipe forever, so it exits only if the
+    // returned root really contains it.
+    let blocked = stdio_command("set /p input=", HashMap::new());
+    let (mut child, managed_root) = spawn_stdio_command(&blocked).await?;
+    managed_root.terminate()?;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await??;
+    assert_eq!(status.code(), Some(1));
     Ok(())
 }
 

@@ -136,6 +136,10 @@ async fn direct_route_connects_secure_websocket() {
         )
         .await
         .expect("direct websocket handshake should succeed");
+        assert!(
+            matches!(inner, ConnectionInner::Routed(_)),
+            "the direct route must bypass Tungstenite's environment-proxy dialer"
+        );
         drop(WebSocketConnection { inner });
 
         target_task.await.expect("target task should finish");
@@ -190,6 +194,12 @@ async fn transport_proxy_config_errors_redact_credentials_in_a_subprocess() {
             "WebSocket proxy error subprocess failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter that matches no test also exits successfully.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the proxy error probe did not run\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
         );
     })
     .await
@@ -387,14 +397,21 @@ async fn happy_eyeballs_does_not_wait_for_stalled_preferred_family() {
     let reachable = "127.0.0.1:443"
         .parse::<SocketAddr>()
         .expect("reachable address should parse");
+    let (drop_sender, mut drop_receiver) = tokio::sync::oneshot::channel::<()>();
+    let mut drop_sender = Some(drop_sender);
+    let started = tokio::time::Instant::now();
 
     let connected = tokio::time::timeout(
         Duration::from_secs(1),
-        connect_happy_eyeballs(vec![stalled, reachable], |address| async move {
-            if address == stalled {
-                std::future::pending::<()>().await;
+        connect_happy_eyeballs(vec![stalled, reachable], |address| {
+            let drop_sender = if address == stalled { drop_sender.take() } else { None };
+            async move {
+                let _drop_sender = drop_sender;
+                if address == stalled {
+                    std::future::pending::<()>().await;
+                }
+                Ok(address)
             }
-            Ok(address)
         }),
     )
     .await
@@ -402,6 +419,41 @@ async fn happy_eyeballs_does_not_wait_for_stalled_preferred_family() {
     .expect("alternate family should connect");
 
     assert_eq!(connected, reachable);
+    assert_eq!(started.elapsed(), HAPPY_EYEBALLS_DELAY);
+    assert_eq!(
+        drop_receiver.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+        "successful alternate connection must drop the stalled attempt"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn happy_eyeballs_cancellation_drops_all_started_attempts() {
+    let addresses = ["[2001:db8::1]:443", "127.0.0.1:443"]
+        .map(|address| address.parse::<SocketAddr>().unwrap());
+    let (first_sender, mut first_receiver) = tokio::sync::oneshot::channel::<()>();
+    let (second_sender, mut second_receiver) = tokio::sync::oneshot::channel::<()>();
+    let mut senders = vec![first_sender, second_sender];
+    let result = tokio::time::timeout(
+        HAPPY_EYEBALLS_DELAY + Duration::from_millis(1),
+        connect_happy_eyeballs(addresses.to_vec(), |_| {
+            let sender = senders.pop().expect("only the supplied addresses may start");
+            async move {
+                let _sender = sender;
+                std::future::pending::<std::io::Result<SocketAddr>>().await
+            }
+        }),
+    )
+    .await;
+    assert!(result.is_err(), "both attempts must remain stalled");
+    assert!(senders.is_empty(), "both attempts must have started");
+    for receiver in [&mut first_receiver, &mut second_receiver] {
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+            "cancelling the dial must release every pending attempt"
+        );
+    }
 }
 
 #[tokio::test]

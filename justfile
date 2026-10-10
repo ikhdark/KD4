@@ -97,16 +97,6 @@ fmt-check *args:
 kd4-perf-snapshot *args:
     @{{ python }} "{{ justfile_directory() }}/scripts/kd4_perf_snapshot.py" {args}
 
-# Compare rejected Desktop methods with this checkout's generated request schema.
-[working-directory("..")]
-[script("python")]
-desktop-protocol-drift *args:
-    import runpy
-    import sys
-    script = r"{{ justfile_directory() }}/scripts/desktop_protocol_drift.py"
-    sys.argv = [script, *sys.argv[1:]]
-    runpy.run_path(script, run_name="__main__")
-
 # Inspect committed blobs; pass --base, --head, and an explicit --allowlist.
 [working-directory("..")]
 [script("python")]

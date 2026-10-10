@@ -113,10 +113,21 @@ fn windows_sandbox_helper_staging_is_parallel_safe() -> anyhow::Result<()> {
             "parallel staging must copy the complete {name} helper"
         );
     }
+    // An already-staged helper must not be rewritten: Windows refuses to
+    // overwrite an executable that a sandbox process still has mapped. Hold the
+    // staged runner open without write sharing, as a mapped image would, so a
+    // re-copy fails with a sharing violation. Its mtime cannot show a re-copy:
+    // `std::fs::copy` preserves the source's last-write time.
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
     let staged = resources_dir.join("codex-command-runner.exe");
-    let modified = std::fs::metadata(&staged)?.modified()?;
-    super::stage_windows_sandbox_helpers_in(&resources_dir)?;
-    assert_eq!(std::fs::metadata(staged)?.modified()?, modified);
+    let in_use = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&staged)?;
+    super::stage_windows_sandbox_helpers_in(&resources_dir)
+        .context("re-staging must leave an in-use, already-staged helper untouched")?;
+    drop(in_use);
     Ok(())
 }
 
@@ -155,7 +166,7 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: future_secret,
+                path: future_secret.clone(),
             },
             access: FileSystemAccessMode::Deny,
         },
@@ -199,6 +210,9 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
         err.to_string(),
         "unsupported operation: windows unelevated restricted-token sandbox cannot enforce deny-read restrictions directly; refusing to run unsandboxed"
     );
+    assert!(!future_secret.exists(), "a refused command must never execute its write");
+    assert_eq!(std::fs::read_to_string(&secret)?, "glob secret\n");
+    assert_eq!(std::fs::read_to_string(&public)?, "public ok\n");
     Ok(())
 }
 

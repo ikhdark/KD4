@@ -451,6 +451,8 @@ mod tests {
             (TerminalTitleItem::Thread, "thread-title", "thread"),
             (TerminalTitleItem::Model, "model", "model-name"),
             (TerminalTitleItem::Status, "run-state", "status"),
+            (TerminalTitleItem::ContextUsed, "context-used", "context-usage"),
+            (TerminalTitleItem::SessionId, "thread-id", "session-id"),
             (TerminalTitleItem::ModelWithReasoning, "model-with-reasoning", "model-with-reasoning"),
             (TerminalTitleItem::Reasoning, "reasoning", "reasoning"),
         ] {

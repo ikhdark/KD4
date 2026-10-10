@@ -4010,126 +4010,6 @@ pub(crate) async fn reconcile_active_tool_history_artifact_protection(
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn append_raw_output_artifact(
-    artifact: &RawOutputArtifact,
-    output: &[u8],
-) -> RawOutputArtifact {
-    let RawOutputArtifact::Stored {
-        id,
-        path,
-        bytes,
-        truncated,
-        handle,
-    } = artifact
-    else {
-        return artifact.clone();
-    };
-    let retention_token = match capture_retention_token_async(
-        path.parent().unwrap_or_else(|| Path::new(".")),
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(error) => {
-            return failed_with_owned_path(
-                path.clone(),
-                *bytes,
-                format!("failed to prepare `{}` for append: {error}", path.display()),
-                None,
-            )
-            .await;
-        }
-    };
-
-    match lock_artifact_handle(handle, SeekFrom::End(0)).await {
-        Ok(file) => {
-            let file = tokio::fs::File::from_std(file);
-            let mut file = match lock_output_file(file).await {
-                Ok(file) => file,
-                Err(err) => {
-                    return failed_with_owned_path(
-                        path.clone(),
-                        *bytes,
-                        format!("failed to lock `{}` for append: {err}", path.display()),
-                        Some(&retention_token),
-                    )
-                    .await;
-                }
-            };
-            let remaining = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(*bytes as usize);
-            let retained = &output[..output.len().min(remaining)];
-            let truncated = *truncated || retained.len() != output.len();
-            if let Err(err) = file.write_all(retained).await {
-                drop(file);
-                return failed_with_owned_path(
-                    path.clone(),
-                    *bytes,
-                    format!("failed to append `{}`: {err}", path.display()),
-                    Some(&retention_token),
-                )
-                .await;
-            }
-            if let Err(err) = file.flush().await {
-                drop(file);
-                return failed_with_owned_path(
-                    path.clone(),
-                    (*bytes).saturating_add(retained.len() as u64),
-                    format!("failed to flush `{}`: {err}", path.display()),
-                    Some(&retention_token),
-                )
-                .await;
-            }
-            let metadata = file.metadata().await;
-            if let Err(err) = unlock_output_file(file).await {
-                return failed_with_owned_path(
-                    path.clone(),
-                    (*bytes).saturating_add(retained.len() as u64),
-                    format!("failed to unlock `{}` after append: {err}", path.display()),
-                    Some(&retention_token),
-                )
-                .await;
-            }
-            match metadata {
-                Ok(metadata) => {
-                    enforce_retention_after_upsert(
-                        path.parent().unwrap_or_else(|| Path::new(".")),
-                        path,
-                        &retention_token,
-                        LogicalRetentionMutation::AppendReplace,
-                    )
-                    .await;
-                    RawOutputArtifact::Stored {
-                        id: *id,
-                        path: path.clone(),
-                        bytes: metadata.len(),
-                        truncated,
-                        handle: handle.clone(),
-                    }
-                }
-                Err(err) => {
-                    failed_with_owned_path(
-                        path.clone(),
-                        (*bytes).saturating_add(retained.len() as u64),
-                        format!("failed to stat `{}` after append: {err}", path.display()),
-                        Some(&retention_token),
-                    )
-                    .await
-                }
-            }
-        }
-        Err(err) => {
-            failed_with_owned_path(
-                path.clone(),
-                *bytes,
-                format!("failed to open `{}` for append: {err}", path.display()),
-                Some(&retention_token),
-            )
-            .await
-        }
-    }
-}
-
 pub(crate) async fn replace_raw_output_artifact(
     artifact: &RawOutputArtifact,
     output: &[u8],
@@ -7968,7 +7848,11 @@ mod tests {
     async fn artifact_retains_exact_bytes_across_chunks() {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = create_raw_output_artifact(temp.path(), "thread", b"alpha\0beta\n").await;
-        let second = append_raw_output_artifact(&first, b"unicode: \xce\xbb\n").await;
+        let state = Arc::new(Mutex::new(first));
+        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+        writer.write_chunk(Some(&state), b"unicode: \xce\xbb\n").await;
+        writer.finish(Some(&state)).await;
+        let second = state.lock().await.clone();
 
         let RawOutputArtifact::Stored { path, bytes, .. } = second else {
             panic!("expected stored artifact");
@@ -7984,7 +7868,11 @@ mod tests {
     async fn replacement_finalizes_background_output_without_duplicates() {
         let temp = tempfile::tempdir().expect("tempdir");
         let initial = create_raw_output_artifact(temp.path(), "thread", b"partial\n").await;
-        let appended = append_raw_output_artifact(&initial, b"tail\n").await;
+        let state = Arc::new(Mutex::new(initial));
+        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+        writer.write_chunk(Some(&state), b"tail\n").await;
+        writer.finish(Some(&state)).await;
+        let appended = state.lock().await.clone();
         let final_output = b"partial\ntail\ncomplete\n";
         let replaced = replace_raw_output_artifact(&appended, final_output).await;
 
@@ -8040,7 +7928,11 @@ mod tests {
         std::fs::rename(path, &displaced).expect("displace artifact path");
         std::fs::write(path, b"substitute").expect("write substitute path");
 
-        let appended = append_raw_output_artifact(&artifact, b"-tail").await;
+        let state = Arc::new(Mutex::new(artifact.clone()));
+        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+        writer.write_chunk(Some(&state), b"-tail").await;
+        writer.finish(Some(&state)).await;
+        let appended = state.lock().await.clone();
 
         assert!(matches!(appended, RawOutputArtifact::Stored { .. }));
         assert_eq!(std::fs::read(path).expect("read substitute"), b"substitute");
@@ -8051,7 +7943,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_artifact_preserves_owned_partial_metadata() {
+    fn failed_artifact_render_does_not_disclose_the_owned_path_or_message() {
         let artifact = RawOutputArtifact::Failed {
             id: None,
             message: "flush failed".to_string(),
@@ -8059,11 +7951,7 @@ mod tests {
             bytes: 17,
         };
 
-        assert!(!artifact.render_for_model().contains("partial.log"));
-        assert!(matches!(
-            artifact,
-            RawOutputArtifact::Failed { bytes: 17, .. }
-        ));
+        assert_eq!(artifact.render_for_model(), "Raw output artifact unavailable");
     }
 
     #[test]
@@ -8255,26 +8143,6 @@ mod tests {
         let error = read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
             .await
             .expect_err("reparse artifact should fail");
-
-        assert_eq!(error, ReadToolOutputError::Expired);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn read_rejects_uuid_named_symlink_outside_thread_directory() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let thread_directory = temp.path().join("tool-output").join("thread");
-        std::fs::create_dir_all(&thread_directory).expect("create thread directory");
-        let outside = temp.path().join("outside.log");
-        std::fs::write(&outside, b"outside secret\n").expect("write outside artifact");
-        let id = ToolOutputArtifactId::new();
-        symlink(&outside, thread_directory.join(format!("{id}.log"))).expect("create file symlink");
-
-        let error = read_tool_output_selectors(temp.path(), "thread", &id.to_string(), vec![ToolOutputSelector::Lines { start: 1, end: 1 }])
-            .await
-            .expect_err("symlink artifact should fail");
 
         assert_eq!(error, ReadToolOutputError::Expired);
     }

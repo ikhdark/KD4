@@ -47,8 +47,12 @@ fn typed_message_records_keep_independent_daily_remainders() {
         }],
         ..Default::default()
     };
+    // Clients above this record's own total leave it no remainder; a remainder computed once
+    // for the whole day would also cancel the first record's.
+    let mut overreported = row.clone();
+    overreported.totals.turns = 3;
     let response = AnalyticsResponse::Messages(backend::DailyWorkspaceUsageCountResponse {
-        data: vec![row.clone(), row],
+        data: vec![row, overreported],
         ..Default::default()
     });
     assert_eq!(
@@ -65,7 +69,7 @@ fn typed_message_records_keep_independent_daily_remainders() {
             updated_at: None,
             data: vec![AccountAnalyticsDay {
                 date,
-                total: 20.0,
+                total: 13.0,
                 values: vec![
                     AccountAnalyticsValue {
                         key: "cli".into(),
@@ -75,7 +79,7 @@ fn typed_message_records_keep_independent_daily_remainders() {
                     AccountAnalyticsValue {
                         key: "other".into(),
                         label: "Other".into(),
-                        value: 4.0
+                        value: 2.0
                     },
                 ]
             }],

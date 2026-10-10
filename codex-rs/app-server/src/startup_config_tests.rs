@@ -92,7 +92,22 @@ async fn startup_loaders_rebuild_for_changed_auth_routing_or_thread_endpoint() {
 #[tokio::test]
 async fn startup_loaders_install_after_bootstrap_failure() {
     let (home, config) = fixture().await;
-    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+    // Start from a loader that yields a bundle, so the anonymous result below
+    // can only come from the loader that startup installs.
+    let manager = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleLoader::new(async { Ok(Some(CloudConfigBundle::default())) }),
+    );
+    assert!(
+        manager
+            .current_cloud_config_bundle()
+            .get()
+            .await
+            .unwrap()
+            .is_some()
+    );
     let auth = finish_startup_config_loaders(&manager, &config, None).await;
     assert!(auth.auth_cached().is_none());
     assert!(

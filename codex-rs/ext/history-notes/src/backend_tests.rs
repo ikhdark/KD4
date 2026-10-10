@@ -79,7 +79,7 @@ async fn routes_through_codex_backend_and_injects_trusted_session_agent_context(
             .expect("truncation policy header")
             .to_str()
             .expect("UTF-8 truncation policy"),
-        serde_json::to_string(&TruncationPolicy::Bytes(1024)).unwrap()
+        r#"{"mode":"bytes","limit":1024}"#
     );
     assert!(
         requests[0]

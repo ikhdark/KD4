@@ -409,7 +409,14 @@ fn save_oauth_tokens_with_keyring_with_fallback_to_file<K: KeyringStore + Clone 
         // As on load, a store lock failure is a coordination failure rather than evidence that
         // the keyring backend is unavailable. Falling back could leave a newer File token hidden
         // behind a stale Secrets entry.
-        Err(error) if error.downcast_ref::<OAuthStoreLockFailure>().is_some() => Err(error),
+        Err(error)
+            if error.downcast_ref::<OAuthStoreLockFailure>().is_some()
+                || error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    error.kind() == std::io::ErrorKind::WouldBlock
+                }) =>
+        {
+            Err(error)
+        }
         Err(error) => {
             let message = error.to_string();
             warn!("falling back to file storage for OAuth tokens: {message}");
@@ -1584,8 +1591,6 @@ mod tests {
         reason = "Holds write ordering while replacing credentials to prove persistence samples after admission"
     )]
     async fn persistence_samples_credentials_after_acquiring_write_order() -> Result<()> {
-        use rmcp::transport::auth::AuthorizationManager;
-        use rmcp::transport::auth::AuthorizationMetadata;
         use rmcp::transport::auth::CredentialStore;
         use rmcp::transport::auth::InMemoryCredentialStore;
         use rmcp::transport::auth::StoredCredentials;
@@ -1600,14 +1605,6 @@ mod tests {
                 None,
             ))
             .await?;
-        let mut manager = AuthorizationManager::new(&tokens.url).await?;
-        let mut metadata = AuthorizationMetadata::default();
-        metadata.authorization_endpoint = "https://example.test/authorize".into();
-        metadata.token_endpoint = "https://example.test/token".into();
-        manager.set_metadata(metadata);
-        manager.configure_client_id(&tokens.client_id)?;
-        manager.set_credential_store(store.clone());
-        let manager = Mutex::new(manager);
         let persistor = OAuthPersistor::new(
             tokens.server_name.clone(),
             tokens.url.clone(),
@@ -1617,11 +1614,9 @@ mod tests {
             AuthKeyringBackendKind::Direct,
             None,
         );
-        // Authentication does not block persistence. A busy disk write still
-        // bounds the caller's wait; a later attempt samples the latest token.
-        let manager_guard = manager.lock().await;
+        // An uncontended attempt persists. A busy disk write still bounds the
+        // caller's wait; a later attempt samples the latest token.
         persistor.persist_if_needed().await?;
-        drop(manager_guard);
         let guard = persistor.inner.persistence.operation_lock.lock().await;
         assert!(
             persistor

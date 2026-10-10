@@ -242,6 +242,13 @@ fn remote_compaction_evicts_raw_messages_and_bounds_tool_receipts() {
         encrypted_content: "opaque-state".to_string(),
         internal_chat_message_metadata_passthrough: None,
     };
+    let oversized = function_call_output(
+        "oversized",
+        "call-oversized",
+        &tool_history_receipt("call-oversized").replace("bounded evidence", &"x".repeat(20_000)),
+    );
+    // Authenticated, so only the token budget can evict the oversized pair.
+    assert!(response_item_has_valid_tool_history_receipt(&oversized));
     let items = vec![
         message(
             "raw-user",
@@ -251,7 +258,7 @@ fn remote_compaction_evicts_raw_messages_and_bounds_tool_receipts() {
             },
         ),
         function_call("oversized-call", "call-oversized"),
-        function_call_output("oversized", "call-oversized", &"x".repeat(20_000)),
+        oversized,
         function_call("plain-call", "call-plain"),
         function_call_output("plain", "call-plain", "artifact 123"),
         function_call("recoverable-call", "call-recoverable"),
@@ -276,6 +283,22 @@ fn remote_compaction_evicts_raw_messages_and_bounds_tool_receipts() {
             ),
             compaction
         ]
+    );
+
+    // One pair more than the item cap, all far below the token budget: only the cap can drop
+    // the oldest pair.
+    let pairs = (0..REMOTE_COMPACTION_TOOL_RECEIPT_MAX_ITEMS / 2 + 1)
+        .flat_map(|index| {
+            let call_id = format!("call-{index}");
+            [
+                function_call("call", &call_id),
+                function_call_output("output", &call_id, "ok"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bounded_remote_compacted_history(pairs.clone(), |_| true),
+        pairs[2..].to_vec()
     );
 }
 
@@ -418,28 +441,33 @@ async fn trim_function_call_history_scans_past_non_output_boundaries() {
             tool["description"] = serde_json::json!("search documentation ".repeat(256));
         }
     }
+    let call_boundary = function_call("boundary-call-id", "boundary-call");
     let recent_unrecoverable =
         custom_tool_call_output("recent-output-id", "recent-call-id", &"b".repeat(8_192));
     turn_context.model_info.context_window = Some(REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS + 1);
     turn_context.model_info.effective_context_window_percent = 100;
 
-    let mut history = ContextManager::new();
-    history.replace(vec![
+    let items = vec![
         prefix,
         search[0].clone(),
         search[1].clone(),
         rewrite_boundary.clone(),
+        call_boundary.clone(),
         recent_unrecoverable.clone(),
-    ]);
+    ];
+    let mut history = ContextManager::new();
+    history.replace(items.clone());
     let estimated_tokens_before = history
         .estimate_token_count_with_base_instructions(&base_instructions)
         .expect("token estimate before rewrite");
 
     let (rewritten_outputs, estimated_deleted_tokens) =
-        trim_function_call_history_to_fit_context_window(
+        trim_function_call_history_to_fit_context_window_for_prompt(
             &mut history,
             &turn_context,
             &base_instructions,
+            Some(&items),
+            0,
         );
     let estimated_tokens_after = history
         .estimate_token_count_with_base_instructions(&base_instructions)
@@ -452,7 +480,8 @@ async fn trim_function_call_history_scans_past_non_output_boundaries() {
     let receipt = parse_remote_tool_search_receipt(&tools[0]).expect("typed search receipt");
     assert!(!receipt.complete);
     assert_eq!(history.raw_items()[3], rewrite_boundary);
-    assert_eq!(history.raw_items()[4], recent_unrecoverable);
+    assert_eq!(history.raw_items()[4], call_boundary);
+    assert_eq!(history.raw_items()[5], recent_unrecoverable);
     assert!(estimated_tokens_after < estimated_tokens_before);
     assert_eq!(
         estimated_deleted_tokens,

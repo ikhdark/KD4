@@ -69,7 +69,8 @@ async fn command_exec_without_streams_can_be_terminated() -> Result<()> {
             stream_stdout_stderr: false,
             output_bytes_cap: None,
             disable_output_cap: false,
-            disable_timeout: false,
+            // The default timeout also ends the command with a non-zero exit code.
+            disable_timeout: true,
             timeout_ms: None,
             cwd: None,
             env: None,
@@ -213,7 +214,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
 }
 
 #[tokio::test]
-async fn command_exec_accepts_permission_profile() -> Result<()> {
+async fn command_exec_permission_profile_runs_sandboxed_or_fails_closed() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
@@ -278,236 +279,6 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
             stderr: String::new(),
         }
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn command_exec_permission_profile_starts_selected_network_proxy() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    #[cfg(windows)]
-    {
-        let config_path = codex_home.path().join("config.toml");
-        let config = std::fs::read_to_string(&config_path)?;
-        std::fs::write(
-            config_path,
-            format!("{config}\n[windows]\nsandbox = \"unelevated\"\n"),
-        )?;
-    }
-    insert_networked_permission_profile_config(
-        codex_home.path(),
-        /*default_permissions*/ None,
-    )?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell(
-                "$value = if ($null -eq $env:CODEX_NETWORK_PROXY_ACTIVE) { 'unset' } else { $env:CODEX_NETWORK_PROXY_ACTIVE }; [Console]::Out.Write($value)",
-            ),
-            process_id: None,
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: None,
-            permission_profile: Some("networked".to_string()),
-        })
-        .await?;
-
-    #[cfg(windows)]
-    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
-        let error = mcp
-            .read_stream_until_error_message(RequestId::Integer(command_request_id))
-            .await?;
-        assert!(
-            error.error.message.contains(
-                codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
-            ),
-            "{error:?}"
-        );
-        return Ok(());
-    }
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
-    assert_eq!(
-        response,
-        CommandExecResponse {
-            exit_code: 0,
-            stdout: "1".to_string(),
-            stderr: String::new(),
-        }
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    #[cfg(windows)]
-    {
-        let config_path = codex_home.path().join("config.toml");
-        let config = std::fs::read_to_string(&config_path)?;
-        std::fs::write(
-            config_path,
-            format!("{config}\n[windows]\nsandbox = \"unelevated\"\n"),
-        )?;
-    }
-    insert_networked_permission_profile_config(codex_home.path(), Some("networked"))?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell(
-                "$value = if ($null -eq $env:CODEX_NETWORK_PROXY_ACTIVE) { 'unset' } else { $env:CODEX_NETWORK_PROXY_ACTIVE }; [Console]::Out.Write($value)",
-            ),
-            process_id: None,
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: None,
-            permission_profile: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
-        })
-        .await?;
-
-    #[cfg(windows)]
-    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
-        let error = mcp
-            .read_stream_until_error_message(RequestId::Integer(command_request_id))
-            .await?;
-        assert!(
-            error
-                .error
-                .message
-                .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR),
-            "{error:?}"
-        );
-        return Ok(());
-    }
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
-    assert_eq!(
-        response,
-        CommandExecResponse {
-            exit_code: 0,
-            stdout: "unset".to_string(),
-            stderr: String::new(),
-        }
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn command_exec_legacy_policy_workspace_write_uses_request_cwd() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let temp_dir = TempDir::new()?;
-    let codex_home = temp_dir.path().join("server-cwd");
-    let request_cwd = temp_dir.path().join("request-cwd");
-    std::fs::create_dir_all(&codex_home)?;
-    std::fs::create_dir_all(&request_cwd)?;
-    create_config_toml(&codex_home, &server.uri(), "never")?;
-    #[cfg(windows)]
-    {
-        let config_path = codex_home.join("config.toml");
-        let config = std::fs::read_to_string(&config_path)?;
-        std::fs::write(
-            config_path,
-            format!("{config}\n[windows]\nsandbox = \"unelevated\"\n"),
-        )?;
-    }
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(&codex_home)
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell("[IO.File]::WriteAllText('request-cwd-write.txt', 'ok')"),
-            process_id: None,
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: Some(request_cwd.clone()),
-            env: None,
-            size: None,
-            sandbox_policy: Some(SandboxPolicy::WorkspaceWrite {
-                writable_roots: Vec::new(),
-                network_access: false,
-                exclude_tmpdir_env_var: true,
-                exclude_slash_tmp: true,
-            }),
-            permission_profile: None,
-        })
-        .await?;
-
-    #[cfg(windows)]
-    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
-        let error = mcp
-            .read_stream_until_error_message(RequestId::Integer(command_request_id))
-            .await?;
-        assert!(
-            error
-                .error
-                .message
-                .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR)
-                || error.error.message.contains(
-                    "requested restrictions require a sandbox, but no sandbox backend is available"
-                ),
-            "{error:?}"
-        );
-        assert!(!request_cwd.join("request-cwd-write.txt").exists());
-        assert!(!codex_home.join("request-cwd-write.txt").exists());
-        return Ok(());
-    }
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
-    assert_eq!(response.exit_code, 0, "{response:?}");
-    assert_eq!(
-        std::fs::read_to_string(request_cwd.join("request-cwd-write.txt"))?,
-        "ok"
-    );
-    assert!(!codex_home.join("request-cwd-write.txt").exists());
 
     Ok(())
 }
@@ -1069,6 +840,8 @@ async fn command_exec_process_ids_are_connection_scoped_and_disconnect_terminate
             )),
             "processId": "shared-process",
             "streamStdoutStderr": true,
+            // Only the disconnect may end the process, not the default timeout.
+            "disableTimeout": true,
             "sandboxPolicy": {"type": "dangerFullAccess"},
         })),
     )

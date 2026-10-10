@@ -1360,10 +1360,7 @@ async fn status_snapshot_uses_reasoning_override_when_config_empty() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!(
-        "status_snapshot_uses_default_reasoning_when_config_empty",
-        sanitized
-    );
+    assert_snapshot!(sanitized);
 }
 
 #[tokio::test]
@@ -1430,7 +1427,7 @@ async fn status_snapshot_keeps_available_limits_while_refreshing() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!("status_snapshot_shows_refreshing_limits_notice", sanitized);
+    assert_snapshot!(sanitized);
 }
 
 #[tokio::test]

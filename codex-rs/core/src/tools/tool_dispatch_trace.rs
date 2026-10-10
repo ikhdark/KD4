@@ -391,11 +391,6 @@ impl ToolDispatchTiming {
         true
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_next_model_sample_start(&self) {
-        self.record_boundary(ToolLifecycleBoundary::NextModelSampleStart);
-    }
-
     fn has_boundary(&self, boundary: ToolLifecycleBoundary) -> bool {
         self.lifecycle_events
             .lock()

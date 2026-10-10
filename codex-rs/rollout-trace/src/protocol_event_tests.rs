@@ -146,6 +146,62 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
 }
 
 #[test]
+fn user_shell_exec_commands_are_not_tool_runtime_boundaries() -> anyhow::Result<()> {
+    for (source, traced) in [
+        (ExecCommandSource::Agent, true),
+        (ExecCommandSource::UserShell, false),
+    ] {
+        let begin = EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            call_id: "call-shell".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 1234,
+            command: vec!["pwd".to_string()],
+            cwd: "file:///workspace/project".parse()?,
+            parsed_cmd: Vec::new(),
+            source,
+            interaction_input: None,
+        });
+        let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            output_metadata: None,
+            call_id: "call-shell".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 2345,
+            command: vec!["pwd".to_string()],
+            cwd: "file:///workspace/project".parse()?,
+            parsed_cmd: Vec::new(),
+            source,
+            interaction_input: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            aggregated_output: String::new(),
+            exit_code: Some(0),
+            duration: Duration::from_millis(1),
+            formatted_output: String::new(),
+            status: ExecCommandStatus::Completed,
+        });
+
+        let begin_trace = tool_runtime_trace_event(&begin);
+        let end_trace = tool_runtime_trace_event(&end);
+        if traced {
+            assert!(
+                matches!(begin_trace, Some(ToolRuntimeTraceEvent::Started { .. })),
+                "begin {source:?}"
+            );
+            assert!(
+                matches!(end_trace, Some(ToolRuntimeTraceEvent::Ended { .. })),
+                "end {source:?}"
+            );
+        } else {
+            assert!(begin_trace.is_none(), "begin {source:?}");
+            assert!(end_trace.is_none(), "end {source:?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn turn_lifecycle_mapping_preserves_ids_and_abort_status() -> anyhow::Result<()> {
     for (json, expected_turn, expected_status) in [
         (

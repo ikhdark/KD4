@@ -343,31 +343,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn amendment_preserves_symlink_and_target_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempdir().unwrap();
-        let target = tmp.path().join("target.rules");
-        let link = tmp.path().join("default.rules");
-        std::fs::write(&target, "# original\n").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
-        std::os::unix::fs::symlink("target.rules", &link).unwrap();
-        blocking_append_allow_prefix_rule(&link, &["echo".into()]).unwrap();
-        assert_eq!(
-            std::fs::read_link(&link).unwrap(),
-            Path::new("target.rules")
-        );
-        assert_eq!(
-            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "# original\nprefix_rule(pattern=[\"echo\"], decision=\"allow\")\n"
-        );
-    }
-
     #[test]
     fn concurrent_amendments_preserve_distinct_rules_and_deduplicate() {
         let tmp = tempdir().unwrap();

@@ -797,6 +797,16 @@ mod tests {
         });
         assert_eq!(patch.advance_recency_at, Some(later));
         assert_eq!(patch.updated_at, Some(earlier));
+
+        let mut patch = ThreadMetadataPatch {
+            advance_recency_at: Some(earlier),
+            ..Default::default()
+        };
+        patch.merge(ThreadMetadataPatch {
+            advance_recency_at: Some(later),
+            ..Default::default()
+        });
+        assert_eq!(patch.advance_recency_at, Some(later));
     }
 
     #[test]

@@ -494,6 +494,34 @@ mod tests {
     }
 
     #[test]
+    fn dotenv_values_cannot_set_codex_prefixed_variables() {
+        // These names belong to this test alone, and setting variables is
+        // thread-safe on Windows, so the shared process environment is not raced.
+        let blocked = [
+            "CODEX_ARG0_DOTENV_TEST_UPPER",
+            "codex_arg0_dotenv_test_lower",
+            "Codex_Arg0_Dotenv_Test_Mixed",
+        ];
+        let allowed = "ARG0_DOTENV_TEST_ALLOWED";
+        let dotenv = format!(
+            "{}=blocked\n{}=blocked\n{}=blocked\n{allowed}=allowed\n",
+            blocked[0], blocked[1], blocked[2]
+        );
+
+        super::set_filtered(dotenvy::from_read_iter(dotenv.as_bytes()));
+
+        for name in blocked {
+            assert_eq!(std::env::var_os(name), None, "{name}");
+        }
+        // The allowed entry follows the blocked ones, so filtering skips keys
+        // without abandoning the rest of the file.
+        assert_eq!(
+            std::env::var_os(allowed),
+            Some(std::ffi::OsString::from("allowed"))
+        );
+    }
+
+    #[test]
     fn janitor_continues_after_an_unreadable_lock() -> std::io::Result<()> {
         let root = tempfile::tempdir()?;
         let broken = root.path().join("broken");

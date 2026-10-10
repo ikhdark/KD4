@@ -110,7 +110,8 @@ if (modelEvaluations) {
     throw Error('missing required uncertainty case');
   }
   uncertaintyEvaluation = { status: 'reviewed_trials',
-    accepted: comparisons.every(row => row.candidateCorrectAndComplete && row.regressions.length === 0),
+    accepted: comparisons.every(row => row.baselineCorrectAndComplete &&
+      row.candidateCorrectAndComplete && row.regressions.length === 0),
     fixtureSha256: createHash('sha256').update(fixtureBytes).digest('hex'),
     trialsSha256: createHash('sha256').update(trialBytes).digest('hex'), comparisons,
     limitation: 'Scores are supplied independent review, not inferred from call counts; pairing does not eliminate provider variance.' };

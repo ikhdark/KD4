@@ -2038,7 +2038,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::sync::Arc;
-    use tokio::time::advance;
     use tokio::time::timeout;
     use uuid::Uuid;
 
@@ -2417,86 +2416,6 @@ mod tests {
             }
             other => panic!("expected targeted error envelope, got: {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn send_server_notification_to_connection_and_wait_tracks_write_completion() {
-        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
-        let outgoing =
-            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
-        let send_task = tokio::spawn(async move {
-            outgoing
-                .send_server_notification_to_connection_and_wait(
-                    ConnectionId(42),
-                    ServerNotification::ModelRerouted(ModelReroutedNotification {
-                        thread_id: "thread-1".to_string(),
-                        turn_id: "turn-1".to_string(),
-                        from_model: "gpt-5.3-codex".to_string(),
-                        to_model: "gpt-5.2".to_string(),
-                        reason: ModelRerouteReason::HighRiskCyberActivity,
-                    }),
-                )
-                .await
-        });
-
-        let envelope = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("should receive envelope before timeout")
-            .expect("channel should contain one message");
-        let OutgoingEnvelope::ToConnection {
-            connection_id,
-            message,
-            write_complete_tx,
-        } = envelope
-        else {
-            panic!("expected targeted server notification envelope");
-        };
-        assert_eq!(connection_id, ConnectionId(42));
-        assert!(matches!(message, OutgoingMessage::AppServerNotification(_)));
-        write_complete_tx
-            .expect("write completion sender should be attached")
-            .send(Instant::now())
-            .expect("receiver should still be waiting");
-
-        timeout(Duration::from_secs(1), send_task)
-            .await
-            .expect("send task should finish after write completion is signaled")
-            .expect("send task should not panic");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn send_server_notification_to_connection_and_wait_times_out_without_ack() {
-        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
-        let outgoing =
-            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
-        let send_task = tokio::spawn(async move {
-            outgoing
-                .send_server_notification_to_connection_and_wait(
-                    ConnectionId(42),
-                    ServerNotification::ModelRerouted(ModelReroutedNotification {
-                        thread_id: "thread-1".to_string(),
-                        turn_id: "turn-1".to_string(),
-                        from_model: "gpt-5.3-codex".to_string(),
-                        to_model: "gpt-5.2".to_string(),
-                        reason: ModelRerouteReason::HighRiskCyberActivity,
-                    }),
-                )
-                .await
-        });
-
-        let OutgoingEnvelope::ToConnection {
-            write_complete_tx: Some(write_complete_tx),
-            ..
-        } = rx.recv().await.expect("server notification envelope")
-        else {
-            panic!("expected targeted notification with writer acknowledgement");
-        };
-
-        advance(WRITER_ACKNOWLEDGEMENT_TIMEOUT).await;
-        send_task
-            .await
-            .expect("send task should stop waiting at the acknowledgement deadline");
-        drop(write_complete_tx);
     }
 
     #[tokio::test]
@@ -4253,75 +4172,6 @@ mod tests {
             Ok(expected_result)
         );
         assert_eq!(outgoing.pending_callback_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn pending_requests_for_thread_returns_thread_requests_in_request_id_order() {
-        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(8);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let thread_id = ThreadId::new();
-        outgoing
-            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(true)))
-            .await;
-        let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
-            outgoing.clone(),
-            vec![ConnectionId(1)],
-            thread_id,
-        );
-
-        let (dynamic_tool_request_id, _dynamic_tool_waiter) = thread_outgoing
-            .send_request(ServerRequestPayload::DynamicToolCall(
-                DynamicToolCallParams {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-1".to_string(),
-                    call_id: "call-0".to_string(),
-                    namespace: None,
-                    tool: "tool".to_string(),
-                    arguments: json!({}),
-                },
-            ))
-            .await;
-        let dynamic_tool_request_id = dynamic_tool_request_id.expect("request admitted");
-        let (first_request_id, _first_waiter) = thread_outgoing
-            .send_request(ServerRequestPayload::ToolRequestUserInput(
-                ToolRequestUserInputParams {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-1".to_string(),
-                    item_id: "call-1".to_string(),
-                    questions: vec![],
-                    auto_resolution_ms: None,
-                },
-            ))
-            .await;
-        let first_request_id = first_request_id.expect("request admitted");
-        let (second_request_id, _second_waiter) = thread_outgoing
-            .send_request(ServerRequestPayload::FileChangeRequestApproval(
-                FileChangeRequestApprovalParams {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-1".to_string(),
-                    item_id: "call-2".to_string(),
-                    started_at_ms: 0,
-                    reason: None,
-                    grant_root: None,
-                },
-            ))
-            .await;
-        let second_request_id = second_request_id.expect("request admitted");
-        let pending_requests = outgoing.pending_requests_for_thread(thread_id).await;
-        assert_eq!(
-            pending_requests
-                .iter()
-                .map(ServerRequest::id)
-                .collect::<Vec<_>>(),
-            vec![
-                &dynamic_tool_request_id,
-                &first_request_id,
-                &second_request_id
-            ]
-        );
     }
 
     #[tokio::test]

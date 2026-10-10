@@ -974,7 +974,7 @@ fn thread_created_lag_resync_uses_only_missed_broadcast_instances() -> Result<()
                     .into_iter()
                     .collect::<HashSet<_>>(),
                 HashSet::from([TEST_CONNECTION_ID]),
-                "lag recovery must not attach unrelated top-level threads to other connections"
+                "thread/start subscribes only the starting connection"
             );
 
             let _: TurnStartResponse = harness
@@ -1104,6 +1104,16 @@ fn thread_created_lag_resync_uses_only_missed_broadcast_instances() -> Result<()
                     .collect::<HashSet<_>>(),
                 HashSet::from([TEST_CONNECTION_ID, SECOND_TEST_CONNECTION_ID]),
                 "lag recovery must retry an already-handled child for newly initialized connections"
+            );
+            assert!(
+                !harness
+                    .processor
+                    .thread_processor
+                    .thread_state_manager
+                    .subscribed_connection_ids(top_level_thread_id)
+                    .await
+                    .contains(&SECOND_TEST_CONNECTION_ID),
+                "lag recovery must not attach unrelated top-level threads to other connections"
             );
             let queued = thread_created_rx.recv().await;
             assert_eq!(queued, Ok(missed_thread_id));
@@ -4395,8 +4405,10 @@ mod command_exec_control_rpc_tests {
             .display()
             .to_string()
             .replace('\'', "''");
+        let pid_file = dir.join("child-pid").display().to_string().replace('\'', "''");
         let script = format!(
-            "[Console]::Out.WriteLine('stdin-ready'); [Console]::Out.Flush(); \
+            "[IO.File]::WriteAllText('{pid_file}', [string]$PID); \
+             [Console]::Out.WriteLine('stdin-ready'); [Console]::Out.Flush(); \
              while (-not [IO.File]::Exists('{gate}')) {{ Start-Sleep -Milliseconds 10 }}; \
              $source = [Console]::OpenStandardInput(); $destination = [IO.File]::Create('{output}'); \
              try {{ $source.CopyTo($destination) }} finally {{ $destination.Dispose() }}"
@@ -4727,6 +4739,67 @@ mod command_exec_control_rpc_tests {
                     expected.len()
                 );
                 harness.shutdown().await;
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    #[serial(app_server_tracing)]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Held response metadata proves disconnect can terminate the child before cleanup"
+    )]
+    fn command_exec_rpc_disconnect_terminates_before_metadata_cleanup() -> Result<()> {
+        run_current_thread_test_with_stack(
+            "command_exec_rpc_disconnect_terminates_before_metadata_cleanup",
+            async {
+                use tokio::io::AsyncBufReadExt;
+                let mut harness = TracingHarness::new().await?;
+                let dir = TempDir::new()?;
+                start_gated_reader(&mut harness, dir.path(), "metadata-blocked-command", 60_000)
+                    .await;
+                let child_pid: u32 = std::fs::read_to_string(dir.path().join("child-pid"))?.parse()?;
+                let mut watcher = tokio::process::Command::new("powershell.exe")
+                    .args(["-NoLogo", "-NoProfile", "-Command", &format!(
+                        "$ErrorActionPreference = 'Stop'; $child = Get-Process -Id {child_pid}; \
+                         $null = $child.Handle; [Console]::Out.WriteLine('watching'); \
+                         [Console]::Out.Flush(); $child.WaitForExit()"
+                    )])
+                    .stdout(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()?;
+                let mut output = tokio::io::BufReader::new(watcher.stdout.take().unwrap());
+                let mut ready = String::new();
+                tokio::time::timeout(Duration::from_secs(15), output.read_line(&mut ready)).await??;
+                assert_eq!(ready.trim(), "watching", "watcher owns the live child handle");
+
+                let outgoing = Arc::clone(&harness.processor.outgoing);
+                let contexts = outgoing.lock_request_contexts_for_test().await;
+                let processor = Arc::clone(&harness.processor);
+                let session = Arc::clone(&harness.session);
+                let close = tokio::spawn(async move {
+                    processor.connection_closed(TEST_CONNECTION_ID, &session).await;
+                });
+                tokio::time::timeout(Duration::from_secs(5),
+                    harness.session.rpc_gate.cancellation_token().cancelled()).await?;
+                assert!(!close.is_finished(), "cleanup is blocked on response metadata");
+                let early_exit = tokio::time::timeout(Duration::from_secs(5), watcher.wait()).await;
+                assert!(!close.is_finished(), "metadata remains locked through observation");
+                // Always release cleanup before asserting the regression outcome, so
+                // a RED run still kills the real child rather than leaking it.
+                drop(contexts);
+                tokio::time::timeout(Duration::from_secs(5), close).await??;
+                let exited_before_cleanup = early_exit.is_ok();
+                let status = match early_exit {
+                    Ok(status) => status?,
+                    Err(_) => tokio::time::timeout(Duration::from_secs(15), watcher.wait()).await??,
+                };
+                assert!(status.success(), "OS watcher observes actual child termination");
+                assert!(!dir.path().join("received.bin").exists());
+                harness.shutdown().await;
+                assert!(exited_before_cleanup,
+                    "connection cancellation must kill command/exec before blocked metadata cleanup");
                 Ok(())
             },
         )

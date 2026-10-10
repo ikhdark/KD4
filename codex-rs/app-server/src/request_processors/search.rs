@@ -229,12 +229,28 @@ mod tests {
             .await
             .expect_err("the stopped session is gone");
 
+        // Close one connection while the other still owns a live session.
+        processor
+            .fuzzy_file_search_session_start_response(
+                first,
+                FuzzyFileSearchSessionStartParams {
+                    session_id: "shared".to_string(),
+                    roots,
+                },
+            )
+            .await
+            .expect("session restarts");
         processor.connection_closed(second).await;
         let error = processor
             .fuzzy_file_search_session_update_response(second, update())
             .await
             .expect_err("closing the connection stops its sessions");
         assert_eq!(error.message, "fuzzy file search session not found: shared");
+        processor
+            .fuzzy_file_search_session_update_response(first, update())
+            .await
+            .expect("closing a connection leaves other connections' sessions live");
+        processor.connection_closed(first).await;
         assert!(processor.fuzzy_search_sessions.lock().await.is_empty());
     }
 

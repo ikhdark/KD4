@@ -79,6 +79,13 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
 
     let requests = request_log.requests();
     assert_eq!(requests.len(), 5, "expected five model requests");
+    for request in &requests {
+        assert_eq!(
+            request.body_json()["client_metadata"]["x-codex-window-id"].as_str(),
+            request.header("x-codex-window-id").as_deref(),
+            "canonical body metadata and compatibility headers must agree"
+        );
+    }
 
     let (initial_thread_id, first_generation) = window_id_parts(&requests[0]);
     let (compact_thread_id, compact_generation) = window_id_parts(&requests[1]);
@@ -87,6 +94,7 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
     let (after_fork_thread_id, after_fork_generation) = window_id_parts(&requests[4]);
 
     assert_eq!(first_generation, 0);
+    assert_eq!(initial_thread_id, initial.session_configured.thread_id.to_string());
     assert_eq!(compact_thread_id, initial_thread_id);
     assert_eq!(compact_generation, 0);
     assert_eq!(after_compact_thread_id, initial_thread_id);
@@ -94,6 +102,7 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
     assert_eq!(after_resume_thread_id, initial_thread_id);
     assert_eq!(after_resume_generation, 1);
     assert_ne!(after_fork_thread_id, initial_thread_id);
+    assert_eq!(after_fork_thread_id, forked.thread_id.to_string());
     assert_eq!(after_fork_generation, 0);
 
     Ok(())
@@ -112,7 +121,12 @@ async fn submit_user_turn(codex: &Arc<CodexThread>, text: &str) -> Result<()> {
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("completion predicate accepts only TurnComplete");
+    };
+    assert_eq!(completed.error, None);
     Ok(())
 }
 
@@ -123,7 +137,12 @@ async fn submit_compact_turn(codex: &Arc<CodexThread>) -> Result<()> {
         panic!("expected warning event after compact");
     };
     assert_eq!(message, COMPACT_WARNING_MESSAGE);
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("completion predicate accepts only TurnComplete");
+    };
+    assert_eq!(completed.error, None);
     Ok(())
 }
 

@@ -285,6 +285,7 @@ async fn production_compact_outputs_complete_turn_non_regression() -> Result<()>
         });
     responder.expect(11).mount(&server).await;
     let completion=test.submit_turn_and_capture_completion("Read contract.txt, discover the mirror tool twice, verify its result and ROW_0500 from the command, update the contract, then write result.txt using current evidence. Do not modify untouched.txt.").await?;
+    assert_eq!(completion.error, None);
     assert_eq!(
         completion.last_agent_message.as_deref(),
         Some("Verified current contract, retained evidence, and MCP result.")

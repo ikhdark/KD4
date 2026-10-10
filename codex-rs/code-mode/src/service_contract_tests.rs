@@ -31,6 +31,8 @@ struct BlockingDelegate {
     notification_finished: AtomicBool,
     tool_finished: AtomicBool,
     tool_release: Notify,
+    /// When set, a cancelled tool also waits for `tool_release` before returning.
+    hold_cancelled_tool: AtomicBool,
 }
 
 struct HeldNotificationDelegate {
@@ -143,6 +145,7 @@ impl BlockingDelegate {
                 notification_finished: AtomicBool::new(false),
                 tool_finished: AtomicBool::new(false),
                 tool_release: Notify::new(),
+                hold_cancelled_tool: AtomicBool::new(false),
             }),
             events_rx,
         )
@@ -163,6 +166,9 @@ impl CodeModeSessionDelegate for BlockingDelegate {
                     Ok(serde_json::Value::Null)
                 }
                 _ = cancellation_token.cancelled() => {
+                    if self.hold_cancelled_tool.load(Ordering::Acquire) {
+                        self.tool_release.notified().await;
+                    }
                     self.tool_finished.store(true, Ordering::Release);
                     let _ = self.events_tx.send(DelegateEvent::ToolCancelled);
                     Err("cancelled".to_string())
@@ -758,6 +764,10 @@ async fn shutdown_delivers_notifications_while_natural_completion_is_draining() 
     let shutdown_service = Arc::clone(&service);
     let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
 
+    // Let shutdown reach the cell while the notification is still in flight.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!shutdown.is_finished());
+    assert!(events_rx.try_recv().is_err());
     delegate.release_notification();
     assert_eq!(
         next_event(&mut events_rx).await,
@@ -965,6 +975,7 @@ async fn dropped_initial_response_leaves_the_running_cell_owned_by_the_session()
 #[tokio::test]
 async fn natural_completion_cleans_up_callbacks_before_responding() {
     let (delegate, mut events_rx) = BlockingDelegate::new();
+    delegate.hold_cancelled_tool.store(true, Ordering::Release);
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
     let cell = service
         .execute(ExecuteRequest {
@@ -977,8 +988,17 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
         .unwrap();
 
     assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+    let mut initial_response = Box::pin(cell.initial_response());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut initial_response)
+            .await
+            .is_err(),
+        "the response must wait for the abandoned tool to finish"
+    );
+    assert!(!delegate.tool_finished.load(Ordering::Acquire));
+    delegate.tool_release.notify_one();
     assert_eq!(
-        cell.initial_response().await.unwrap(),
+        initial_response.await.unwrap(),
         RuntimeResponse::Result {
             output_loss: None,
             cell_id: cell_id("1"),

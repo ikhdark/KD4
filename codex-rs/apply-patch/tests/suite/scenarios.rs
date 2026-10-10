@@ -35,8 +35,8 @@ scenarios! {
     scenario_011_add_overwrites_existing_file: "011_add_overwrites_existing_file" => (0, ""),
     scenario_012_delete_directory_fails: "012_delete_directory_fails" => (1, "Failed to delete file"),
     scenario_013_rejects_invalid_hunk_header: "013_rejects_invalid_hunk_header" => (1, "is not a valid hunk header"),
-    scenario_014_update_file_appends_trailing_newline: "014_update_file_appends_trailing_newline" => (0, ""),
-    scenario_015_failure_after_partial_success_leaves_changes: "015_failure_after_partial_success_leaves_changes" => (1, "destination preimage is unreadable"),
+    scenario_014_update_file_preserves_missing_trailing_newline: "014_update_file_preserves_missing_trailing_newline" => (0, ""),
+    scenario_015_failure_after_partial_success_rolls_back: "015_failure_after_partial_success_rolls_back" => (1, "destination preimage is unreadable"),
     scenario_016_pure_addition_update_chunk: "016_pure_addition_update_chunk" => (0, ""),
     scenario_017_whitespace_padded_hunk_header: "017_whitespace_padded_hunk_header" => (0, ""),
     scenario_018_whitespace_padded_patch_markers: "018_whitespace_padded_patch_markers" => (0, ""),
@@ -116,7 +116,7 @@ fn run_apply_patch_scenario(
             output.stdout.is_empty(),
             "failed patches must not report success"
         );
-        if dir.ends_with("015_failure_after_partial_success_leaves_changes") {
+        if dir.ends_with("015_failure_after_partial_success_rolls_back") {
             assert!(!stderr.contains(&format!("A {}", tmp.path().join("created.txt").display())));
             assert!(!stderr.contains("Patch failed after applying these changes:"));
         }

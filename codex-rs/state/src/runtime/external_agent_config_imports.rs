@@ -25,12 +25,6 @@ pub struct ExternalAgentConfigImportFailureRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalAgentConfigImportDetailsRecord {
-    pub successes: Vec<ExternalAgentConfigImportSuccessRecord>,
-    pub failures: Vec<ExternalAgentConfigImportFailureRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalAgentConfigImportHistoryRecord {
     pub import_id: String,
     pub completed_at_ms: i64,
@@ -67,34 +61,6 @@ ON CONFLICT(import_id) DO UPDATE SET
         .await?;
 
         Ok(())
-    }
-
-    pub async fn external_agent_config_import_details_record(
-        &self,
-        import_id: &str,
-    ) -> anyhow::Result<Option<ExternalAgentConfigImportDetailsRecord>> {
-        let row = sqlx::query(
-            r#"
-SELECT
-    successes,
-    failures
-FROM external_agent_config_imports
-WHERE import_id = ?
-"#,
-        )
-        .bind(import_id)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-
-        row.map(|row| {
-            let successes: String = row.try_get("successes")?;
-            let failures: String = row.try_get("failures")?;
-            Ok(ExternalAgentConfigImportDetailsRecord {
-                successes: serde_json::from_str(&successes)?,
-                failures: serde_json::from_str(&failures)?,
-            })
-        })
-        .transpose()
     }
 
     pub async fn external_agent_config_import_history_records(

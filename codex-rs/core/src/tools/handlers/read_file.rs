@@ -1606,15 +1606,39 @@ mod tests {
 
     #[tokio::test]
     async fn read_status_resolves_paths_in_the_selected_environment() {
-        let mut call = invocation(Path::new("unused"), json!(null), false).await;
-        let environment = call.step_context.environments.primary().unwrap();
-        let expected = environment.cwd().join("source.rs").unwrap().inferred_native_path_string();
-        let environment_id = environment.environment_id.clone();
-        call.tool_name = ToolName::plain("read_status");
-        call.payload = ToolPayload::Function {
-            arguments: json!({"paths":["source.rs"], "environment_id":environment_id}).to_string(),
+        use crate::session::turn_context::TurnEnvironment;
+        use codex_utils_path_uri::PathUri;
+
+        // Select a second environment: with only the primary, ignoring the
+        // requested id would resolve to the same path.
+        let selected = tempfile::tempdir().unwrap();
+        let (session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = PermissionProfile::Disabled;
+        turn.environments.turn_environments.push(TurnEnvironment::new(
+            "selected".into(),
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            PathUri::from_host_native_path(selected.path()).unwrap(),
+            None,
+        ));
+        let resolved = |environment: &TurnEnvironment| {
+            environment.cwd().join("source.rs").unwrap().inferred_native_path_string()
         };
-        let payload = call.payload.clone();
+        let primary = resolved(turn.environments.primary().unwrap());
+        let expected = resolved(turn.environments.turn_environments.last().unwrap());
+        assert_ne!(primary, expected);
+        let payload = ToolPayload::Function {
+            arguments: json!({"paths":["source.rs"], "environment_id":"selected"}).to_string(),
+        };
+        let call = ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::new(turn)),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-status".to_string(),
+            tool_name: ToolName::plain("read_status"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        };
         let output = ReadStatusHandler.handle(call).await.unwrap().code_mode_result(&payload);
         assert_eq!(output["paths"][0]["path"], expected);
         assert_eq!(output["paths"][0]["status"], "unknown");
@@ -1972,27 +1996,28 @@ mod tests {
         let revision = history
             .workspace_evidence_revision_for_test("registered-file-read")
             .unwrap();
-        assert_eq!(
-            history
-                .project_with_workspace_cache(
-                    canonical.clone(),
-                    revision.as_ref(),
-                    &session.services.git_workspace
-                )
-                .items,
-            canonical
+        assert!(
+            crate::tool_history::tests::freshness_notices(
+                &history,
+                &canonical,
+                revision.as_ref(),
+                &session.services.git_workspace,
+            )
+            .is_empty()
         );
         std::fs::write(&path, "changed text\n").unwrap();
         assert!(
             history
                 .invalidate_source_dependencies(Some(&BTreeSet::from([path])), revision.as_ref())
         );
-        let projected = history.project_with_workspace_identity(canonical, revision.as_ref());
-        let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
-            panic!("expected stale read output");
-        };
-        let notice: serde_json::Value =
-            serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+        let mut notices = crate::tool_history::tests::freshness_notices(
+            &history,
+            &canonical,
+            revision.as_ref(),
+            &session.services.git_workspace,
+        );
+        assert_eq!(notices.len(), 1);
+        let notice = notices.remove(0);
         assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
         assert_eq!(notice["rerun"]["tool"], "read_file");
         let retry = notice["rerun"]["arguments"].clone();
@@ -2708,8 +2733,7 @@ mod tests {
 
         assert_eq!(result["results"][0]["status"], "ok");
         let text = result["results"][0]["text"].as_str().unwrap();
-        assert!(text.contains("first line"), "{text}");
-        assert!(text.contains("third line"), "{text}");
+        assert_eq!(text, "---\nname: demo-skill\ndescription: demo skill for locator reads\n---\nfirst line\nsecond line\nthird line\n");
         assert_eq!(
             result["path"],
             skill_md.to_string_lossy().as_ref(),
@@ -2740,12 +2764,8 @@ mod tests {
             .unwrap()
             .code_mode_result(&payload);
         assert_eq!(result["results"][0]["status"], "ok");
-        assert!(
-            result["results"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("third line")
-        );
+        assert_eq!(result["results"][0]["text"],
+            "---\nname: demo-skill\ndescription: demo skill for locator reads\n---\nfirst line\nsecond line\nthird line\n");
 
         call.payload = ToolPayload::Function {
             arguments:

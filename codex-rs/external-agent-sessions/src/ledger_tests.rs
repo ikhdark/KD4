@@ -32,6 +32,10 @@ fn completed_imports_do_not_read_source_files() {
     assert_eq!(ledger.records.len(), 1);
     assert_eq!(ledger.records[0].source_path, source_path);
     assert_eq!(ledger.records[0].imported_thread_id, imported_thread_id);
+    assert_eq!(
+        ledger.records[0].content_sha256,
+        format!("{:x}", Sha256::digest(contents))
+    );
 }
 
 #[test]

@@ -1298,10 +1298,11 @@ mod tests {
         let managed_ca_cert_path = dir.path().join("ca.pem");
         let inherited_bundle_path = dir.path().join("ca-bundle-parent.pem");
         let (managed_ca_cert, _) = generate_ca().unwrap();
+        let (parent_only_cert, _) = generate_ca().unwrap();
         fs::write(&managed_ca_cert_path, &managed_ca_cert).unwrap();
         fs::write(
             &inherited_bundle_path,
-            format!("parent roots\n{managed_ca_cert}"),
+            format!("parent roots\n{parent_only_cert}{managed_ca_cert}"),
         )
         .unwrap();
         let env = HashMap::from([(
@@ -1312,7 +1313,16 @@ mod tests {
         let trust_bundle =
             managed_ca_trust_bundle_for_cert_path(&managed_ca_cert_path, &env).unwrap();
         let baseline_bundle = fs::read_to_string(&trust_bundle.path).unwrap();
+        let baseline_certs = CertificateDer::pem_slice_iter(baseline_bundle.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(baseline_bundle.matches(&managed_ca_cert).count(), 1);
+        // Reading a bundle also drops the managed CA, so only a root unique to the inherited
+        // bundle shows that the bundle itself was skipped.
+        assert!(
+            !baseline_certs
+                .contains(&CertificateDer::from_pem_slice(parent_only_cert.as_bytes()).unwrap())
+        );
     }
 }

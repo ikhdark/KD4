@@ -1068,6 +1068,11 @@ mod tests {
         receipt.build_commit = "receipt-producer-build".to_string();
         receipt.build_built = "receipt-producer-time".to_string();
         let hash = target_hash(&target);
+        // SHA-256 of the fixture bytes written by `matching_receipt`.
+        assert_eq!(
+            hash,
+            "20da3f0647d7487daa5a64e4c588566abbb1f36e742f89cc93a928c5ca83f656"
+        );
 
         validate_desktop_runtime_receipt(&receipt, &processes, &target, Ok(&hash), 10, &home)
             .expect("producer metadata may differ from the doctor when the file hash matches");
@@ -1088,6 +1093,9 @@ mod tests {
         let err =
             validate_desktop_runtime_receipt(&receipt, &processes, &target, Ok(&hash), 10, &home)
                 .expect_err("a receipt for different bytes must not validate");
-        assert!(err.contains("hash"), "unexpected error: {err}");
+        assert_eq!(
+            err,
+            "receipt executable hash does not match the selected binary"
+        );
     }
 }

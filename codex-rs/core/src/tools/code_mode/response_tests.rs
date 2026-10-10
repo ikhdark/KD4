@@ -1103,14 +1103,18 @@ fn failed_runtime_response_builds_a_linkable_cell_item() {
     assert_eq!(item.tool, "code_mode_cell");
     assert_eq!(item.arguments["call_id"], "exec-call-3");
     assert_eq!(item.arguments["cell_id"], "cell-7");
+    assert_eq!(item.status, codex_protocol::items::DynamicToolCallStatus::Failed);
+    assert_eq!(item.duration, Some(Duration::from_millis(12)));
     assert_eq!(item.success, Some(false));
     assert_eq!(item.error.as_deref(), Some("TypeError at line 4"));
 }
 
 #[test]
 fn failed_cell_error_is_bounded_without_splitting_utf8() {
+    // The leading byte shifts every two-byte character so the cut point falls
+    // inside one; an aligned fixture never needs to back off to a boundary.
     let oversized_error = format!(
-        "{}{}",
+        "a{}{}",
         "é".repeat(MAX_FAILED_CELL_ERROR_BYTES),
         "TAIL_MUST_NOT_SURVIVE"
     );
@@ -1127,7 +1131,7 @@ fn failed_cell_error_is_bounded_without_splitting_utf8() {
     .expect("failed result should emit a cell item");
     let error = item.error.expect("failed cell error");
 
-    assert!(error.len() <= MAX_FAILED_CELL_ERROR_BYTES);
+    assert!(error.len() < MAX_FAILED_CELL_ERROR_BYTES);
     assert!(error.ends_with(FAILED_CELL_ERROR_TRUNCATION_MARKER));
     assert!(!error.contains("TAIL_MUST_NOT_SURVIVE"));
 }
@@ -1252,7 +1256,7 @@ async fn truncated_cell_recovery_covers_the_entire_omitted_gap() {
         RuntimeResponse::Result {
             output_loss: None,
             cell_id: CellId::new("full-gap".into()),
-            content_items: vec![RuntimeContentItem::InputText { text: source }],
+            content_items: vec![RuntimeContentItem::InputText { text: source.clone() }],
             error_text: None,
         },
         Some(300), usize::MAX, true, Instant::now(), Vec::new(), Vec::new(), None,
@@ -1267,7 +1271,9 @@ async fn truncated_cell_recovery_covers_the_entire_omitted_gap() {
     let selector = output.essential_inline["cell_output_recovery_selector"].clone();
     assert_eq!(selector, serde_json::json!({"kind":"lines", "start":start, "end":end}));
     let canonical = output.canonical_result(&ToolPayload::Custom { input: "fixture".into() }).unwrap();
-    let expected = std::str::from_utf8(&canonical.bytes).unwrap()
+    let canonical_text = std::str::from_utf8(&canonical.bytes).unwrap();
+    assert!(canonical_text.ends_with(&source), "canonical retention must preserve every authored Unicode and CRLF byte");
+    let expected = canonical_text
         .split_inclusive('\n').skip(start - 1).take(end - start + 1).collect::<String>();
     let home = tempfile::tempdir().unwrap();
     let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(

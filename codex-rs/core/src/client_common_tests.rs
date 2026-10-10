@@ -68,54 +68,65 @@ fn prompt_with_image_outputs() -> Prompt {
 
 #[test]
 fn responses_lite_request_copies_strip_image_details() {
-    let prompt = prompt_with_image_outputs();
-    let original = prompt.input.clone();
+    let original = prompt_with_image_outputs().input;
+    for representation in 0..4 {
+        let mut prompt = Prompt::default();
+        match representation {
+            0 => prompt.input = original.clone(),
+            1 => prompt.stable_context_fallback_input = original.clone(),
+            2 => prompt.tool_history_fallback_input = original.clone(),
+            3 => prompt.stable_context_tool_history_fallback_input = original.clone(),
+            _ => unreachable!(),
+        }
+        let formatted = |use_responses_lite| match representation {
+            0 => prompt.get_formatted_input_for_request(use_responses_lite),
+            1 => prompt.get_formatted_fallback_input_for_request(use_responses_lite),
+            2 => prompt.get_formatted_tool_history_fallback_input_for_request(use_responses_lite, false),
+            3 => prompt.get_formatted_tool_history_fallback_input_for_request(use_responses_lite, true),
+            _ => unreachable!(),
+        };
+        let stripped = formatted(true);
 
-    let stripped = prompt.get_formatted_input_for_request(/*use_responses_lite*/ true);
-
-    assert_eq!(
-        stripped.as_ref(),
-        &[
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputImage {
-                    image_url: "https://example.com/image.png".to_string(),
-                    detail: None,
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "function-call".to_string(),
-                output: FunctionCallOutputPayload::from_content_items(vec![
-                    FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,function".to_string(),
+        assert_eq!(
+            stripped.as_ref(),
+            &[
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputImage {
+                        image_url: "https://example.com/image.png".to_string(),
                         detail: None,
-                    },
-                ]),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::CustomToolCallOutput {
-                id: None,
-                call_id: "custom-call".to_string(),
-                name: None,
-                output: FunctionCallOutputPayload::from_content_items(vec![
-                    FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,custom".to_string(),
-                        detail: None,
-                    },
-                ]),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]
-    );
-    assert_eq!(prompt.input, original);
-    assert_eq!(
-        prompt.get_formatted_input_for_request(/*use_responses_lite*/ false),
-        original
-    );
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "function-call".to_string(),
+                    output: FunctionCallOutputPayload::from_content_items(vec![
+                        FunctionCallOutputContentItem::InputImage {
+                            image_url: "data:image/png;base64,function".to_string(),
+                            detail: None,
+                        },
+                    ]),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::CustomToolCallOutput {
+                    id: None,
+                    call_id: "custom-call".to_string(),
+                    name: None,
+                    output: FunctionCallOutputPayload::from_content_items(vec![
+                        FunctionCallOutputContentItem::InputImage {
+                            image_url: "data:image/png;base64,custom".to_string(),
+                            detail: None,
+                        },
+                    ]),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ]
+        );
+        assert_eq!(formatted(false), original, "representation {representation}");
+    }
 }
 
 #[test]

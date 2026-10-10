@@ -101,7 +101,8 @@ fn non_rgb_theme_accent_remains_active_fallback() {
 fn missing_terminal_colors_use_theme_accent_fallback() {
     let default_fg = None;
     let default_bg = Some((0, 0, 0));
-    let active_style = Style::default().fg(Color::Blue).bold();
+    // An RGB accent on truecolor leaves the missing foreground as the only fallback cause.
+    let active_style = Style::default().fg(rgb_color((0, 95, 135))).bold();
     let palette = TokenActivityPalette::from_parts(
         default_fg,
         default_bg,

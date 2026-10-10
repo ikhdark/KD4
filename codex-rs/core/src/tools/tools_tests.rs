@@ -73,6 +73,9 @@ fn shell_projection_complete_envelope_respects_requested_limit() {
 
     assert!(projected.reduced);
     assert!(approx_token_count(&projected.text) <= 64);
+    assert!(projected.text.starts_with("Exit code: 0\nWall time: 0 seconds\n"), "{}", projected.text);
+    assert!(projected.text.contains("\nOutput:\n"), "{}", projected.text);
+    assert!(projected.text.contains("{}[]"), "{}", projected.text);
 }
 
 #[test]

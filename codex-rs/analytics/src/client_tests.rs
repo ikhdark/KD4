@@ -557,6 +557,11 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
         (RequestId::Integer(5), sample_turn_steer_response()),
     ] {
         let expected_kind = std::mem::discriminant(&response);
+        let expected_payload = response
+            .clone()
+            .into_jsonrpc_parts(request_id.clone())
+            .expect("serialize original response")
+            .1;
         client.track_response(/*connection_id*/ 7, request_id.clone(), response);
         let Ok(AnalyticsFact::ClientResponse { connection_id, request_id: queued_id, response, thread_originator }) = receiver.try_recv() else {
             panic!("relevant response should be queued");
@@ -564,6 +569,14 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
         assert_eq!(connection_id, 7);
         assert_eq!(queued_id, request_id);
         assert_eq!(std::mem::discriminant(response.as_ref()), expected_kind);
+        assert_eq!(
+            response
+                .into_jsonrpc_parts(request_id)
+                .expect("serialize queued response")
+                .1,
+            expected_payload,
+            "queueing must preserve the response fields consumed by the reducer"
+        );
         assert_eq!(thread_originator, None);
     }
 

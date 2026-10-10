@@ -246,6 +246,10 @@ mod tests {
         ] {
             assert_eq!(find_builtin_command(name, all_enabled_flags()), Some(expected), "{name}");
         }
+        // The elongated /goal alias needs at least one `o` and nothing but `o`s.
+        for name in ["gal", "global", "gooxal"] {
+            assert_eq!(find_builtin_command(name, all_enabled_flags()), None, "{name}");
+        }
     }
 
     #[test]
@@ -259,6 +263,11 @@ mod tests {
         }];
 
         assert_eq!(find_slash_command("fast", flags, &commands), None);
+        assert!(
+            !commands_for_input(flags, &commands)
+                .iter()
+                .any(|item| matches!(item, SlashCommandItem::ServiceTier(_)))
+        );
     }
 
     #[test]

@@ -74,7 +74,7 @@ def runtime_env(tmp_path_factory: pytest.TempPathFactory) -> PreparedRuntimeEnv:
     isolated_site = temp_root / "site-packages"
     python = sys.executable
 
-    _run_command(
+    installed = _run_command(
         [
             python,
             "-m",
@@ -87,6 +87,10 @@ def runtime_env(tmp_path_factory: pytest.TempPathFactory) -> PreparedRuntimeEnv:
         cwd=ROOT,
         env=os.environ.copy(),
         timeout_s=240,
+    )
+    assert installed.returncode == 0, (
+        f"Failed to install isolated test dependencies.\n"
+        f"STDOUT:\n{installed.stdout}\nSTDERR:\n{installed.stderr}"
     )
     ensure_runtime_package_installed(
         python,

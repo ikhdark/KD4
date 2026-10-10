@@ -54,15 +54,15 @@ const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] =
     &["auth_elicitation", "remote_plugin", "tool_suggest"];
 
 fn runtime_refreshable_features_for_batch(params: &ConfigBatchWriteParams) -> Vec<Feature> {
-    let refresh_all = params.edits.iter().any(|edit| edit.key_path == "features");
+    let paths = params.edits.iter()
+        .filter_map(|edit| crate::config_manager_service::parse_key_path(&edit.key_path).ok())
+        .collect::<Vec<_>>();
+    let refresh_all = paths.iter().any(|path| path.as_slice() == ["features"]);
     SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT
         .iter()
         .filter(|feature_key| {
             refresh_all
-                || params
-                    .edits
-                    .iter()
-                    .any(|edit| edit.key_path.strip_prefix("features.") == Some(**feature_key))
+                || paths.iter().any(|path| path.as_slice() == ["features", **feature_key])
         })
         .filter_map(|feature_key| user_settable_feature_for_key(feature_key))
         .collect()
@@ -610,6 +610,25 @@ mod tests {
                 user_settable_feature_for_key(key).is_some(),
                 "experimental feature enablement key `{key}` is not user-settable"
             );
+        }
+    }
+
+    #[test]
+    fn batch_refresh_uses_parsed_feature_paths() {
+        let expected = user_settable_feature_for_key("tool_suggest").unwrap();
+        for key_path in ["features.tool_suggest", "\"features\".tool_suggest", "features.\"tool_suggest\""] {
+            let params = codex_app_server_protocol::ConfigBatchWriteParams {
+                edits: vec![codex_app_server_protocol::ConfigEdit {
+                    key_path: key_path.into(),
+                    value: serde_json::json!(true),
+                    merge_strategy: codex_app_server_protocol::MergeStrategy::Replace,
+                }],
+                file_path: None,
+                expected_version: None,
+                reload_user_config: true,
+            };
+            assert_eq!(super::runtime_refreshable_features_for_batch(&params), vec![expected],
+                "all accepted spellings of a feature path must refresh the same live gate: {key_path}");
         }
     }
 

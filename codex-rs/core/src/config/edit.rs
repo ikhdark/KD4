@@ -439,10 +439,19 @@ impl ConfigDocument {
             };
 
             if !matches!(config_item, TomlItem::ArrayOfTables(_)) {
-                if enabled {
+                // TOML also permits arrays of inline tables. Normalize that
+                // representation without discarding unrelated skill entries.
+                let Some(array) = config_item.as_array() else {
                     return false;
+                };
+                let mut tables = ArrayOfTables::new();
+                for entry in array.iter() {
+                    let Some(table) = entry.as_inline_table() else {
+                        return false;
+                    };
+                    tables.push(table.clone().into_table());
                 }
-                *config_item = TomlItem::ArrayOfTables(ArrayOfTables::new());
+                *config_item = TomlItem::ArrayOfTables(tables);
             }
 
             let TomlItem::ArrayOfTables(overrides) = config_item else {

@@ -1118,12 +1118,37 @@ mod worker {
         file.set_permissions(permissions.clone())
     }
 
+    fn is_rollout_temp_file_name(name: &str) -> bool {
+        let Some(stem) = name.strip_suffix(TEMP_SUFFIX) else {
+            return false;
+        };
+        if let Some(random) = stem.strip_prefix("rollout-compress-") {
+            return !random.is_empty() && random.bytes().all(|byte| byte.is_ascii_alphanumeric());
+        }
+        if !stem.starts_with("rollout-") {
+            return false;
+        }
+        // Retain cleanup of the legacy compression temporary name.
+        if stem.ends_with(".jsonl.zst") {
+            return true;
+        }
+        let Some((_, process_and_counter)) = stem.rsplit_once(".jsonl.decompress.") else {
+            return false;
+        };
+        let Some((process, counter)) = process_and_counter.split_once('.') else {
+            return false;
+        };
+        [process, counter].into_iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }
+
     async fn cleanup_stale_temp(entry: &tokio::fs::DirEntry) {
         let path = entry.path();
         if !path
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.ends_with(TEMP_SUFFIX))
+            .is_some_and(is_rollout_temp_file_name)
         {
             return;
         }

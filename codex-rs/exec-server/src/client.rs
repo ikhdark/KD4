@@ -1282,6 +1282,13 @@ impl SessionState {
             ordered_events.closed_published |= is_closed;
             published_closed |= is_closed;
             self.events.publish(event);
+            if is_closed {
+                // Closed is terminal, including for later events buffered before
+                // the missing prefix arrived or recovery supplied the close.
+                ordered_events.pending.clear();
+                ordered_events.pending_bytes = 0;
+                break;
+            }
         }
         published_closed
     }

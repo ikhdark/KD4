@@ -106,7 +106,21 @@ async fn run_owned_command(
 ) -> CommandRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
-    let timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_sec);
+    let Some(timeout_deadline) =
+        tokio::time::Instant::now().checked_add(Duration::from_secs(timeout_sec))
+    else {
+        return finish_command_run(
+            started_at,
+            started,
+            CommandRunCompletion {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some("hook timeout exceeds supported deadline range".to_string()),
+                outcome: "spawn_error",
+            },
+        );
+    };
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -642,8 +656,10 @@ mod tests {
 
     use codex_protocol::protocol::HookEventName;
 
+    // Covers only the bounded wait itself. terminate_command_tree's use of it
+    // is not driven here: a real child's kill cannot be made to hang.
     #[tokio::test]
-    async fn hook_process_kill_has_an_independent_timeout() {
+    async fn terminate_with_timeout_gives_up_on_a_pending_kill() {
         let started = tokio::time::Instant::now();
         let result = terminate_with_timeout(
             Duration::from_millis(10),
@@ -774,11 +790,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_timeout_returns_an_error_without_panicking_or_spawning() {
+        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
+        let handler = test_handler("must-not-spawn".to_string(), u64::MAX, &cwd);
+        let reservation = std::future::ready(Err(io::Error::other("admission sentinel")));
+        let result = run_command_with_reservation(
+            &explicit_test_shell(),
+            &handler,
+            "{}",
+            cwd.as_path(),
+            reservation,
+        )
+        .await;
+
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.stderr, "");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("hook timeout exceeds supported deadline range")
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_terminates_descendant_processes() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let marker = temp_dir.path().join("escaped-descendant.txt");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
 
+        // Start-Process leaves the child in the hook's Job. The Job permits
+        // breakaway, so a descendant that requests it is outside this test.
         #[cfg(windows)]
         let command = {
             let marker = marker.to_string_lossy().replace('\'', "''");
@@ -830,16 +871,31 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn normal_completion_terminates_redirected_descendants() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("cwd");
-        let handler = test_handler(
-            "(sleep 1; printf late > escaped.txt) </dev/null >/dev/null 2>&1 & printf '%s' $! > child.pid; exit 0".to_string(),
-            5,
-            &cwd,
-        );
+        #[cfg(windows)]
+        let command = {
+            let marker = temp_dir.path().join("escaped.txt");
+            let marker = marker.to_string_lossy().replace('\'', "''");
+            let child_script = temp_dir.path().join("child.ps1");
+            std::fs::write(
+                &child_script,
+                format!("Start-Sleep -Seconds 60; Set-Content -LiteralPath '{marker}' -Value late"),
+            )
+            .expect("write child script");
+            let child_script = child_script.to_string_lossy().replace('\'', "''");
+            format!(
+                "$child = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile -NonInteractive -File \"{child_script}\"'; Set-Content -Encoding ascii child.pid $child.Id; exit 0"
+            )
+        };
+        #[cfg(not(windows))]
+        let command = "(sleep 1; printf late > escaped.txt) </dev/null >/dev/null 2>&1 & printf '%s' $! > child.pid; exit 0".to_string();
+        // PowerShell startup can exceed five seconds under suite load; the hook
+        // must still complete normally rather than hit its timeout.
+        let timeout_sec = if cfg!(windows) { 30 } else { 5 };
+        let handler = test_handler(command, timeout_sec, &cwd);
         let result = run_command(&explicit_test_shell(), &handler, 0, "{}", cwd.as_path()).await;
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.error, None);

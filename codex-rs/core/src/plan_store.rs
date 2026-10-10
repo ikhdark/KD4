@@ -1191,6 +1191,16 @@ mod tests {
         let before = store.execution_snapshot().await;
         assert!(store.update_tool(serde_json::from_value(args.clone()).unwrap()).await.is_err());
         assert_eq!(store.execution_snapshot().await, before);
+        let before_lineage = store.snapshot_with_lineage().await;
+        store.record_accepted_input("unrelated-turn", ["Continue with deployment."].into_iter()).await;
+        assert!(store.update_tool(serde_json::from_value(args.clone()).unwrap()).await.is_err());
+        assert_eq!(store.execution_snapshot().await, before);
+        assert_eq!(store.snapshot_with_lineage().await, before_lineage);
+        store.record_accepted_input("older-turn", ["Do not deploy; review only."].into_iter()).await;
+        store.record_accepted_input("current-turn", ["Continue with deployment."].into_iter()).await;
+        assert!(store.update_tool(serde_json::from_value(args.clone()).unwrap()).await.is_err());
+        assert_eq!(store.execution_snapshot().await, before);
+        assert_eq!(store.snapshot_with_lineage().await, before_lineage);
         store.record_accepted_input("user-turn", ["Do not deploy; review only."].into_iter()).await;
         let update = store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap();
         assert_eq!(update.lineage.obligation_summary(&update.current).superseded, 1);

@@ -2128,12 +2128,14 @@ mod tests {
     #[test]
     fn next_reconnect_delay_stays_capped() {
         let mut reconnect_attempt = 9;
-        for _ in 0..3 {
+        for expected_attempt in 10..=12 {
             let delay = next_reconnect_delay(&mut reconnect_attempt);
             assert!(
                 (Duration::from_secs(27)..REMOTE_CONTROL_RECONNECT_BACKOFF_CAP).contains(&delay)
             );
-            assert!(reconnect_attempt >= 9);
+            // Jitter keeps a saturated delay below the cap, so every call still
+            // counts toward the attempt number the reconnect logs report.
+            assert_eq!(reconnect_attempt, expected_attempt);
         }
     }
 
@@ -2189,6 +2191,51 @@ mod tests {
             )
             .await
         );
+        assert_eq!(started_at.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preference_resolution_retry_wakes_on_auth_change_and_resets_backoff() {
+        let (transport_event_tx, _transport_event_rx) = mpsc::channel(1);
+        let (status_publisher, _status_rx) = remote_control_status_channel();
+        let mut websocket = RemoteControlWebsocket::new(
+            RemoteControlWebsocketConfig {
+                remote_control_url: "http://localhost/backend-api/".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
+                remote_control_target: None,
+                server_name: "test-server".to_string(),
+                http_clients: test_http_clients(),
+            },
+            /*state_db*/ None,
+            remote_control_auth_manager(),
+            RemoteControlChannels {
+                transport_event_tx,
+                status_publisher,
+                current_enrollment: test_current_enrollment(/*enrollment*/ None),
+                pairing_persistence_key: watch::channel(None).0,
+                desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
+            },
+            CancellationToken::new(),
+            Arc::new(enabled_desired_state_sender()),
+        );
+        let (auth_change_tx, auth_change_rx) = watch::channel(0u64);
+        websocket.auth_change_rx = auth_change_rx;
+        // Attempt 9 saturates the backoff: only the auth change can end the wait
+        // before the paused clock reaches the 27-second retry delay.
+        let mut retry_attempt = 9;
+        let started_at = tokio::time::Instant::now();
+
+        let (retry, ()) = tokio::join!(
+            websocket.wait_for_preference_resolution_retry(&mut retry_attempt),
+            async {
+                // Publish only after the wait has been polled once and parked.
+                tokio::task::yield_now().await;
+                auth_change_tx.send_modify(|revision| *revision += 1);
+            },
+        );
+
+        assert!(retry);
+        assert_eq!(retry_attempt, 0);
         assert_eq!(started_at.elapsed(), Duration::ZERO);
     }
 
@@ -2335,7 +2382,7 @@ mod tests {
         let remote_control_target =
             normalize_remote_control_url(&remote_control_url).expect("target should parse");
         let expected_error = format!(
-            "failed to connect app-server remote control websocket `{}`: HTTP error: 503 Service Unavailable, request-id: <none>, cf-ray: <none>, body: <omitted non-JSON response body>",
+            "failed to connect app-server remote control websocket `{}`: HTTP error: 503 Service Unavailable, request-id: request-503, cf-ray: ray-503, body: <omitted non-JSON response body>",
             remote_control_target.websocket_url
         );
         let server_task = tokio::spawn(async move {
@@ -2344,10 +2391,16 @@ mod tests {
                 request_line,
                 "GET /backend-api/wham/remote/control/server HTTP/1.1"
             );
+            // Only the request id and cf-ray are reported; other headers stay out.
             respond_with_status_and_headers(
                 stream,
                 "503 Service Unavailable",
-                &[("x-trace-id", "trace-503"), ("x-region", "us-east-1")],
+                &[
+                    ("x-trace-id", "trace-503"),
+                    ("x-region", "us-east-1"),
+                    ("x-request-id", "request-503"),
+                    ("cf-ray", "ray-503"),
+                ],
                 "upstream unavailable",
             )
             .await;
@@ -2357,9 +2410,9 @@ mod tests {
         let auth_manager = remote_control_auth_manager();
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
-        let current_enrollment = test_current_enrollment(Some(remote_control_enrollment(Some(
-            TEST_REMOTE_CONTROL_SERVER_TOKEN,
-        ))));
+        let mut expected_enrollment =
+            remote_control_enrollment(Some(TEST_REMOTE_CONTROL_SERVER_TOKEN));
+        let current_enrollment = test_current_enrollment(Some(expected_enrollment.clone()));
         let (status_publisher, status_rx) = remote_control_status_channel();
 
         let err = match connect_remote_control_websocket(
@@ -2390,7 +2443,9 @@ mod tests {
 
         server_task.await.expect("server task should succeed");
         assert_eq!(err.to_string(), expected_error);
-        assert!(current_enrollment.lock().await.is_some());
+        // A non-auth HTTP failure keeps the enrollment and its server token for the retry.
+        expected_enrollment.remote_control_target = remote_control_target;
+        assert_eq!(current_enrollment.snapshot(), Some(expected_enrollment));
         assert_eq!(
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
@@ -3068,7 +3123,7 @@ mod tests {
             normalize_remote_control_url(&remote_control_url).expect("target should parse");
         let (transport_event_tx, transport_event_rx) = mpsc::channel(1);
         drop(transport_event_rx);
-        let (status_publisher, _status_rx) = remote_control_status_channel();
+        let (status_publisher, mut status_rx) = remote_control_status_channel();
         let shutdown_token = CancellationToken::new();
         let (desired_state_tx, _desired_state_rx) =
             watch::channel(RemoteControlDesiredState::Enabled {
@@ -3102,7 +3157,12 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        timeout(TEST_HTTP_ACCEPT_TIMEOUT, status_rx.wait_for(|status| {
+            status.status == RemoteControlConnectionStatus::Errored
+        }))
+        .await
+        .expect("connection failure should enter reconnect backoff")
+        .expect("status publisher should remain live");
         shutdown_token.cancel();
 
         timeout(Duration::from_millis(100), websocket_task)
@@ -4131,14 +4191,20 @@ mod tests {
             last_completed_client_chunk_seq_id_by_stream: HashMap::new(),
             client_segment_reassembler: ClientSegmentReassembler::default(),
         };
+        // A complete, valid message: only the wire size can cause the drop.
+        let raw = br#"{"jsonrpc":"2.0","method":"initialized"}"#;
         let chunk = client_chunk_envelope(
             "client-1", "stream-1", /*seq_id*/ 4, /*segment_id*/ 0,
-            /*segment_count*/ 1, /*message_size_bytes*/ 1, b"x",
+            /*segment_count*/ 1, raw.len(), raw,
         );
 
         assert!(matches!(
-            state.observe_client_message(chunk, REMOTE_CONTROL_SEGMENT_MAX_BYTES + 1),
+            state.observe_client_message(chunk.clone(), REMOTE_CONTROL_SEGMENT_MAX_BYTES + 1),
             ClientSegmentObservation::Dropped
+        ));
+        assert!(matches!(
+            state.observe_client_message(chunk, REMOTE_CONTROL_SEGMENT_MAX_BYTES),
+            ClientSegmentObservation::Forward(_)
         ));
     }
 

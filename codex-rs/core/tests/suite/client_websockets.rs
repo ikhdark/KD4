@@ -1008,25 +1008,14 @@ async fn responses_websocket_preconnect_is_reused_even_with_header_changes() {
         .expect("websocket preconnect failed");
     let prompt = prompt_with_input(vec![message_item("hello")]);
     let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
-    let mut stream = client_session
-        .stream(
-            &prompt,
-            &harness.model_info,
-            &harness.session_telemetry,
-            harness.effort.clone(),
-            harness.summary,
-            /*service_tier*/ None,
-            &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
-        )
-        .await
-        .expect("websocket stream failed");
-
-    while let Some(event) = stream.next().await {
-        if matches!(event, Ok(ResponseEvent::Completed { .. })) {
-            break;
-        }
-    }
+    stream_until_complete_with_metadata(
+        &mut client_session,
+        &harness,
+        &prompt,
+        /*service_tier*/ None,
+        &responses_metadata,
+    )
+    .await;
 
     assert_eq!(server.handshakes().len(), 1);
     assert_eq!(server.single_connection().len(), 1);
@@ -1048,8 +1037,9 @@ async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes(
     let mut client_session = harness.client.new_session();
     let prompt = prompt_with_input(vec![message_item("hello")]);
     let prewarm_responses_metadata = prewarm_metadata(&harness, /*turn_id*/ None);
-    client_session
-        .prewarm_websocket(
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client_session.prewarm_websocket(
             &prompt,
             &harness.model_info,
             &harness.session_telemetry,
@@ -1057,29 +1047,24 @@ async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes(
             harness.summary,
             /*service_tier*/ None,
             &prewarm_responses_metadata,
-        )
-        .await
-        .expect("websocket prewarm failed");
+        ),
+    )
+    .await
+    .expect("websocket prewarm timed out")
+    .expect("websocket prewarm failed");
     let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
-    let mut stream = client_session
-        .stream(
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream_until_complete_with_metadata(
+            &mut client_session,
+            &harness,
             &prompt,
-            &harness.model_info,
-            &harness.session_telemetry,
-            harness.effort.clone(),
-            harness.summary,
             /*service_tier*/ None,
             &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
-        )
-        .await
-        .expect("websocket stream failed");
-
-    while let Some(event) = stream.next().await {
-        if matches!(event, Ok(ResponseEvent::Completed { .. })) {
-            break;
-        }
-    }
+        ),
+    )
+    .await
+    .expect("prewarmed websocket follow-up timed out");
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
@@ -1540,6 +1525,7 @@ async fn responses_websocket_emits_rate_limit_events() {
     let mut saw_rate_limits = None;
     let mut saw_models_etag = None;
     let mut saw_reasoning_included = false;
+    let mut completed = false;
 
     while let Some(event) = stream.next().await {
         match event.expect("event") {
@@ -1552,11 +1538,15 @@ async fn responses_websocket_emits_rate_limit_events() {
             ResponseEvent::ServerReasoningIncluded(true) => {
                 saw_reasoning_included = true;
             }
-            ResponseEvent::Completed { .. } => break,
+            ResponseEvent::Completed { .. } => {
+                completed = true;
+                break;
+            }
             _ => {}
         }
     }
 
+    assert!(completed, "websocket stream ended before completion");
     let rate_limits = saw_rate_limits.expect("missing rate limits");
     let primary = rate_limits.primary.expect("missing primary window");
     assert_eq!(primary.used_percent, 42.0);
@@ -1613,9 +1603,17 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         .await
         .expect("build websocket codex");
 
-    // Keep speculative warmup from consuming the usage-limit response for this turn.
-    let warmup = server.wait_for_request(0, 0).await.body_json();
-    assert_eq!(warmup["generate"].as_bool(), Some(false));
+    // Finish speculative warmup before submitting the turn so it cannot consume the error.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        server.wait_for_response_batch(0, 0),
+    )
+    .await
+    .expect("startup warmup response");
+    assert_eq!(
+        server.wait_for_request(0, 0).await.body_json()["generate"],
+        false
+    );
 
     let submission_id = test
         .codex
@@ -1685,6 +1683,12 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         error_event.message
     );
 
+    let completed = wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!();
+    };
+    assert_eq!(completed.error, Some(error_event));
+
     server.shutdown().await;
 }
 
@@ -1718,6 +1722,18 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
         .await
         .expect("build websocket codex");
 
+    // Finish speculative warmup before submitting the turn so it cannot consume the error.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        server.wait_for_response_batch(0, 0),
+    )
+    .await
+    .expect("startup warmup response");
+    assert_eq!(
+        server.wait_for_request(0, 0).await.body_json()["generate"],
+        false
+    );
+
     let submission_id = test
         .codex
         .submit(Op::UserInput {
@@ -1745,6 +1761,12 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
+
+    let completed = wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!();
+    };
+    assert_eq!(completed.error, Some(error_event));
 
     server.shutdown().await;
 }
@@ -1825,7 +1847,10 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
                 );
             }
             EventMsg::Error(error) => panic!("unexpected terminal error: {error:?}"),
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
+                break;
+            }
             _ => {}
         }
     }
@@ -2056,6 +2081,7 @@ async fn responses_websocket_creates_when_non_input_request_fields_change() {
 
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second.get("previous_response_id"), None);
+    assert_eq!(second["instructions"], "base instructions two");
     assert_eq!(
         second["input"],
         serde_json::to_value(&prompt_two.input).expect("serialize full input")
@@ -2093,6 +2119,7 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_non_in
 
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second.get("previous_response_id"), None);
+    assert_eq!(second["instructions"], "base instructions two");
     assert_eq!(
         second["input"],
         serde_json::to_value(&prompt_two.input).expect("serialize full input")
@@ -2150,7 +2177,12 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
         .expect("websocket stream failed");
     let mut saw_error = false;
     while let Some(event) = second_stream.next().await {
-        if event.is_err() {
+        if let Err(error) = event {
+            assert!(
+                matches!(&error, codex_protocol::error::CodexErr::InvalidRequest(message)
+                    if message == "synthetic websocket failure"),
+                "unexpected websocket error: {error:?}"
+            );
             saw_error = true;
             break;
         }
@@ -2240,7 +2272,12 @@ async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
 
     let saw_error = tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(event) = second_stream.next().await {
-            if event.is_err() {
+            if let Err(error) = event {
+                assert!(
+                    matches!(&error, codex_protocol::error::CodexErr::InvalidRequest(message)
+                        if message == "synthetic websocket failure"),
+                    "unexpected websocket error: {error:?}"
+                );
                 return true;
             }
         }

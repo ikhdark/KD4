@@ -216,9 +216,10 @@ async fn repository_runners_require_committed_declarations_and_supply_execution_
             } else {
                 record(&collector, "exec_command", &payload, &output, "runner");
             }
-            assert!(collector.fresh_successful_validation(), "{command} nested={nested}");
             assert!(control.observe_progress(&baseline, &collector, &settled())
                 .contains(&TurnTimingProgressKind::ValidationResult));
+            control.settle(&baseline, &collector, &settled());
+            assert_eq!(control.validated_mutation_revision, Some(0), "{command} nested={nested}");
         }
         for (field, value) in [
             ("executed_tests", json!(0)),
@@ -683,14 +684,24 @@ fn native_selector_reuse_rejects_incomplete_and_shared_only_results() {
         {"kind":"lines","start":1,"end":1}, {"kind":"lines","start":2,"end":2}
     ]}).to_string();
     let requested = json!({"path":"file","offset":2,"limit":1}).to_string();
+    // Only the result varies; the envelope itself is reusable.
+    let reselect = |result: Value| crate::tools::handlers::reselect_read_file_output(
+        &previous, &requested, &json!({
+            "artifact_id":null,"canonical_sha256":"source","canonical_bytes":13,
+            "retained_bytes":0,"complete":true,"results":[result]
+        }),
+    );
+    let reused = reselect(json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":true,
+        "text":"second\n","canonical_range":{"start":6,"end":13}}))
+        .expect("a complete delivered selection is reusable");
+    assert_eq!(reused["results"][0]["text"], "second\n");
     for result in [
-        json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":false,"text":"partial"}),
+        json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":false,
+            "text":"partial","canonical_range":{"start":6,"end":13}}),
         json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":true,"value":{"shared":true}}),
         json!({"selector":{"kind":"lines","start":2,"end":2},"status":"aggregate_omitted","complete":false}),
     ] {
-        assert!(crate::tools::handlers::reselect_read_file_output(
-            &previous, &requested, &json!({"results":[result]}),
-        ).is_none());
+        assert!(reselect(result).is_none());
     }
 }
 

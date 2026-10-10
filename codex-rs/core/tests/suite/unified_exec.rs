@@ -120,12 +120,16 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
                 permission.clone(),
             )
             .await?;
-            wait_for_event_with_timeout(
+            let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
                 &test.codex,
                 |event| matches!(event, EventMsg::TurnComplete(_)),
                 Duration::from_secs(120),
             )
-            .await;
+            .await else {
+                unreachable!("completion predicate");
+            };
+            assert!(completed.error.is_none(), "{completed:?}");
+            assert_eq!(completed.last_agent_message.as_deref(), Some("Observed command output."));
             let requests = request_log.requests();
             assert_eq!(
                 requests.len(),
@@ -645,6 +649,8 @@ async fn exec_command_retained_session_lifecycle_completes_without_stale_process
                 }
             }
             EventMsg::TurnComplete(event) => {
+                assert!(event.error.is_none(), "{event:?}");
+                assert_eq!(event.last_agent_message.as_deref(), Some("done"));
                 assert_eq!(
                     outputs.len(),
                     expected_call_ids.len(),
@@ -1662,12 +1668,16 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
     )
     .await?;
 
-    wait_for_event_with_timeout(
+    let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
         &test.codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
         UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
     )
-    .await;
+    .await else {
+        unreachable!("completion predicate");
+    };
+    assert!(completed.error.is_none(), "{completed:?}");
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
 
     let start_output = request_log
         .function_call_output_text(start_call_id)
@@ -1735,12 +1745,16 @@ async fn unified_exec_runs_on_windows() -> Result<()> {
 
     submit_unified_exec_turn(&test, "summarize large output", PermissionProfile::Disabled).await?;
 
-    wait_for_event_with_timeout(
+    let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
         &test.codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
         UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
     )
-    .await;
+    .await else {
+        unreachable!("completion predicate");
+    };
+    assert!(completed.error.is_none(), "{completed:?}");
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
 
     let requests = request_log.requests();
     assert!(!requests.is_empty(), "expected at least one POST request");

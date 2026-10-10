@@ -140,7 +140,11 @@ def _duration(value):
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("duration must be numeric or null")
-    if not math.isfinite(value) or value < 0:
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite or value < 0:
         raise ValueError("duration must be finite and nonnegative")
     return value
 

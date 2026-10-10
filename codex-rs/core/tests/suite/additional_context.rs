@@ -787,16 +787,14 @@ async fn additional_context_overflow_resets_stale_values_in_the_model_request() 
             .as_array()
             .expect("model input array")
             .iter()
-            .filter_map(|item| {
-                let role = item["role"].as_str()?;
-                let content = item["content"].as_array()?;
-                let [content] = content.as_slice() else {
-                    return None;
-                };
-                let text = content["text"].as_str()?;
-                (text.starts_with("<application_context source=")
-                    || text.starts_with("<external_context source="))
-                .then(|| (role.to_string(), text.to_string()))
+            .flat_map(|item| {
+                item["content"].as_array().into_iter().flatten().filter_map(move |content| {
+                    let role = item["role"].as_str()?;
+                    let text = content["text"].as_str()?;
+                    (text.starts_with("<application_context source=")
+                        || text.starts_with("<external_context source="))
+                    .then(|| (role.to_string(), text.to_string()))
+                })
             })
             .collect()
     }
@@ -821,6 +819,17 @@ async fn additional_context_overflow_resets_stale_values_in_the_model_request() 
     assert!(current[0].1.len() < 1_024);
     assert!(current.len() <= 256);
     assert!(current.iter().map(|(_, text)| text.len()).sum::<usize>() <= 160_000);
+    let serialized_fragments = current.iter().map(|(role, text)| {
+        serde_json::json!({
+            "type": "message",
+            "role": role,
+            "content": [{"type": "input_text", "text": text}],
+        })
+    }).collect::<Vec<_>>();
+    assert!(
+        serde_json::to_vec(&serialized_fragments)?.len() <= 160_000,
+        "the admission budget includes JSON escaping and message envelopes, not only text bytes"
+    );
     assert!(current.iter().skip(1).any(|(role, text)| {
         role == "developer"
             && text == &application_context("unchanged", "unchanged context remains available")

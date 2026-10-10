@@ -483,28 +483,38 @@ mod tests {
 
     #[test]
     fn git_branch_global_options_respect_safety_rules() {
+        // A harmless global option neither blocks a read-only query nor
+        // excuses a mutation; an overriding one is unsafe by itself.
         assert!(is_known_safe_command(&vec_str(&[
             "git",
+            "--no-pager",
             "branch",
             "--show-current",
         ])));
         assert!(!is_known_safe_command(&vec_str(&[
-            "git", "branch", "-d", "feature",
+            "git", "--no-pager", "branch", "-d", "feature",
+        ])));
+        assert!(!is_known_safe_command(&vec_str(&[
+            "git", "-C", ".", "branch", "--show-current",
         ])));
         assert!(!is_known_safe_command(&vec_str(&[
             "bash",
             "-lc",
-            "git branch -d feature",
+            "git --no-pager branch -d feature",
         ])));
     }
 
     #[test]
     fn git_first_positional_is_the_subcommand() {
         // In git, the first non-option token is the subcommand. Later positional
-        // args (like branch names) must not be treated as subcommands.
-        assert!(!is_known_safe_command(&vec_str(&[
-            "git", "checkout", "status",
-        ])));
+        // args (like branch names) must not be treated as subcommands. Each later
+        // name here would be approved if the scan continued past `checkout`.
+        for command in [
+            vec_str(&["git", "checkout", "log"]),
+            vec_str(&["git", "--no-optional-locks", "checkout", "status"]),
+        ] {
+            assert!(!is_known_safe_command(&command), "{command:?}");
+        }
     }
 
     #[test]
@@ -590,10 +600,21 @@ mod tests {
 
     #[test]
     fn git_global_override_flags_are_not_safe() {
+        // Plain `git status` is never approved, so every status case starts from
+        // the `--no-optional-locks` form that is approved without the override.
         assert!(!is_known_safe_command(&vec_str(&[
-            "git", "-C", ".", "status",
+            "git",
+            "--no-optional-locks",
+            "-C",
+            ".",
+            "status",
         ])));
-        assert!(!is_known_safe_command(&vec_str(&["git", "-C.", "status",])));
+        assert!(!is_known_safe_command(&vec_str(&[
+            "git",
+            "--no-optional-locks",
+            "-C.",
+            "status",
+        ])));
         assert!(!is_known_safe_command(&vec_str(&[
             "git",
             "-c",
@@ -604,6 +625,7 @@ mod tests {
         ])));
         assert!(!is_known_safe_command(&vec_str(&[
             "git",
+            "--no-optional-locks",
             "-ccore.pager=cat",
             "status",
         ])));
@@ -613,8 +635,8 @@ mod tests {
             vec_str(&["git", "--config-env=core.pager=PAGER", "show", "HEAD"]),
             vec_str(&["git", "--git-dir", ".evil-git", "diff", "HEAD~1..HEAD"]),
             vec_str(&["git", "--git-dir=.evil-git", "diff", "HEAD~1..HEAD"]),
-            vec_str(&["git", "--work-tree", ".", "status"]),
-            vec_str(&["git", "--work-tree=.", "status"]),
+            vec_str(&["git", "--no-optional-locks", "--work-tree", ".", "status"]),
+            vec_str(&["git", "--no-optional-locks", "--work-tree=.", "status"]),
             vec_str(&["git", "--exec-path", ".git/helpers", "show", "HEAD"]),
             vec_str(&["git", "--exec-path=.git/helpers", "show", "HEAD"]),
             vec_str(&["git", "--namespace", "attacker", "show", "HEAD"]),
@@ -631,12 +653,14 @@ mod tests {
         assert!(!is_known_safe_command(&vec_str(&[
             "bash",
             "-lc",
-            "git -C .project-deps/test-fixtures status",
+            "git --no-optional-locks -C .project-deps/test-fixtures status",
         ])));
+        // No `~` revision here: the script parser rejects that word on its own,
+        // which would hide a `--git-dir=` that stopped being unsafe.
         assert!(!is_known_safe_command(&vec_str(&[
             "bash",
             "-lc",
-            "git --git-dir=.evil-git diff HEAD~1..HEAD",
+            "git --git-dir=.evil-git diff HEAD",
         ])));
     }
 
@@ -743,11 +767,9 @@ mod tests {
     fn windows_powershell_full_path_is_safe() {
         {}
 
-        let Some(powershell) = crate::powershell::try_find_pwsh_executable_blocking()
+        let powershell = crate::powershell::try_find_pwsh_executable_blocking()
             .or_else(crate::powershell::try_find_powershell_executable_blocking)
-        else {
-            return;
-        };
+            .expect("a PowerShell host is required to verify this behavior");
         let powershell = powershell.as_path().to_str().unwrap();
 
         assert!(is_known_safe_command(&vec_str(&[
@@ -836,13 +858,15 @@ mod tests {
 
     #[test]
     fn bash_lc_unsafe_examples() {
+        // `ls -1` is approved as a three-argument script (see bash_lc_safe_examples),
+        // so only the argv shape and the quoting can make these two unsafe.
         assert!(
-            !is_known_safe_command(&vec_str(&["bash", "-lc", "git", "status"])),
+            !is_known_safe_command(&vec_str(&["bash", "-lc", "ls", "-1"])),
             "Four arg version is not known to be safe."
         );
         assert!(
-            !is_known_safe_command(&vec_str(&["bash", "-lc", "'git status'"])),
-            "The extra quoting around 'git status' makes it a program named 'git status' and is therefore unsafe."
+            !is_known_safe_command(&vec_str(&["bash", "-lc", "'ls -1'"])),
+            "The extra quoting around 'ls -1' makes it a program named 'ls -1' and is therefore unsafe."
         );
 
         assert!(

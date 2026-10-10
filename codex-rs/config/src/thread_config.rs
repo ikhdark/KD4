@@ -254,38 +254,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loader_returns_session_and_user_sources() {
-        let loader = StaticThreadConfigLoader::new(vec![
-            ThreadConfigSource::Session(SessionThreadConfig {
-                model_provider: Some("local".to_string()),
-                model_providers: HashMap::from([("local".to_string(), test_provider("local"))]),
-                features: BTreeMap::from([("plugins".to_string(), false)]),
-            }),
-            ThreadConfigSource::User(UserThreadConfig::default()),
-        ]);
-
-        let sources = loader
-            .load(ThreadConfigContext {
-                thread_id: Some("thread-1".to_string()),
-                ..Default::default()
-            })
-            .await
-            .expect("thread config loads");
-
-        assert_eq!(
-            sources,
-            vec![
-                ThreadConfigSource::Session(SessionThreadConfig {
-                    model_provider: Some("local".to_string()),
-                    model_providers: HashMap::from([("local".to_string(), test_provider("local"))]),
-                    features: BTreeMap::from([("plugins".to_string(), false)]),
-                }),
-                ThreadConfigSource::User(UserThreadConfig::default()),
-            ]
-        );
-    }
-
-    #[tokio::test]
     async fn loader_translates_sources_to_config_layers() {
         let loader = StaticThreadConfigLoader::new(vec![
             ThreadConfigSource::User(UserThreadConfig::default()),

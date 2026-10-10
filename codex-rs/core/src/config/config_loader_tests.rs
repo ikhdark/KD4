@@ -2600,6 +2600,9 @@ async fn project_layers_disabled_when_untrusted_or_unknown() -> std::io::Result<
     let project_root = tmp.path().join("project");
     let nested = project_root.join("child");
     tokio::fs::create_dir_all(nested.join(".codex")).await?;
+    // Without a root marker the project root is the cwd, and the trust entry
+    // keyed on `project` would never apply.
+    tokio::fs::write(project_root.join(".git"), "gitdir: here").await?;
     tokio::fs::write(
         nested.join(".codex").join(CONFIG_TOML_FILE),
         r#"foo = "child"
@@ -2649,8 +2652,12 @@ profile = "ignored"
         .collect();
     assert_eq!(project_layers_untrusted.len(), 1);
     assert!(
-        project_layers_untrusted[0].disabled_reason.is_some(),
-        "expected untrusted project layer to be disabled"
+        project_layers_untrusted[0]
+            .disabled_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("is marked as untrusted")),
+        "expected untrusted project layer to be disabled: {:?}",
+        project_layers_untrusted[0].disabled_reason
     );
     assert_eq!(
         project_layers_untrusted[0].config,
@@ -2696,8 +2703,12 @@ profile = "ignored"
         .collect();
     assert_eq!(project_layers_unknown.len(), 1);
     assert!(
-        project_layers_unknown[0].disabled_reason.is_some(),
-        "expected unknown-trust project layer to be disabled"
+        project_layers_unknown[0]
+            .disabled_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("as a trusted project")),
+        "expected unknown-trust project layer to be disabled: {:?}",
+        project_layers_unknown[0].disabled_reason
     );
     assert_eq!(
         project_layers_unknown[0].config,

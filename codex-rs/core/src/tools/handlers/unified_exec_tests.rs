@@ -334,7 +334,7 @@ async fn nested_exec_command_preserves_explicit_output_caps() {
             assert_eq!(retained, b"output line\n".repeat(1000));
         }
         if !reduced {
-            assert_eq!(result["output"].as_str().unwrap().lines().count(), 1000);
+            assert_eq!(result["output"], "output line\n".repeat(1000));
         }
         if cap == Some(0) {
             assert_eq!(result["output"], "");
@@ -362,7 +362,7 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
     assert_eq!(result["streams_complete"], true);
     assert_eq!(result["output_reduced"], true);
     let parsed: serde_json::Value = serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
-    assert_eq!(parsed["value"].as_str().unwrap().len(), 120000);
+    assert_eq!(parsed["value"], "x".repeat(120_000));
     assert_eq!(result["stderr"].as_str().unwrap().trim(), "progress");
     let visible = codex_code_mode::model_visible_tool_result(
         &codex_tools::ToolName::plain("exec_command"), &result,
@@ -1275,7 +1275,12 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
         arguments: serde_json::json!({
             "kind": "argv",
             "program": "rg",
+            // Without the validation tag this exact miss is cacheable, so
+            // only the tag explains the second launch.
             "args": [
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
                 "-n",
                 "__codex_validation_unmatched_probe__",
                 search_target.clone(),
@@ -1888,6 +1893,8 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
     assert!(code_mode["raw_output_artifact_id"].is_null());
     assert!(code_mode.to_string().contains("ripgrep"));
 
+    // Ids are never reused, so the next id alone cannot show the release.
+    assert!(!session.services.unified_exec_manager.has_process_reservations_for_test().await);
     let process_id = session
         .services
         .unified_exec_manager
@@ -2540,7 +2547,10 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
 
-    assert_eq!(command.last().map(String::as_str), Some("echo hello"));
+    // The session shell is PowerShell, whose argv also ends with the script.
+    assert_eq!(resolved.shell_type, ShellType::Cmd);
+    let shell_args: Vec<&str> = command.iter().skip(1).map(String::as_str).collect();
+    assert_eq!(shell_args, ["/d", "/c", "echo hello"]);
     Ok(())
 }
 

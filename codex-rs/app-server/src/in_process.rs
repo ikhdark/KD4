@@ -1327,7 +1327,30 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_failure_closes_in_process_runtime_and_settles_waiting_request() {
-        let client = start_test_client_with_capacity(SessionSource::Cli, 1).await;
+        #[derive(Default)]
+        struct BlockingLoader {
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        impl ThreadConfigLoader for BlockingLoader {
+            fn load(
+                &self,
+                _context: codex_config::ThreadConfigContext,
+            ) -> codex_config::ThreadConfigLoaderFuture<'_, Vec<codex_config::ThreadConfigSource>>
+            {
+                Box::pin(async {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    Err(codex_config::ThreadConfigLoadError::new(
+                        codex_config::ThreadConfigLoadErrorCode::Internal,
+                        None,
+                        "intentional loader failure",
+                    ))
+                })
+            }
+        }
+        let loader = Arc::new(BlockingLoader::default());
+        let client = start_test_client_with_loader(SessionSource::Cli, 1, loader.clone()).await;
         let outgoing = client._test_outgoing.upgrade().expect("runtime sender");
         outgoing
             .send_server_notification_to_connection_and_wait(
@@ -1352,21 +1375,27 @@ mod tests {
             )
             .await;
         let sender = client.sender();
-        let request = sender.request(ClientRequest::ConfigRequirementsRead {
+        let request = sender.request(ClientRequest::ThreadStart {
             request_id: RequestId::Integer(99),
-            params: None,
+            params: ThreadStartParams::default(),
         });
         tokio::pin!(request);
         assert!(
             futures::poll!(&mut request).is_pending(),
             "request must be admitted before delivery fails"
         );
+        // Admission alone does not prevent a fast request from legitimately
+        // succeeding before failure. Hold the real handler until failure settles it.
+        timeout(Duration::from_secs(5), loader.started.notified())
+            .await
+            .expect("request reaches thread config loading before delivery fails");
         outgoing
             .fail_connection_delivery(IN_PROCESS_CONNECTION_ID)
             .await;
-        let result = timeout(Duration::from_secs(2), request)
-            .await
-            .expect("request must not hang after delivery failure");
+        let result = timeout(Duration::from_secs(2), request).await;
+        // Release fixture work before assertions, including on a failing baseline.
+        loader.release.notify_one();
+        let result = result.expect("request must not hang after delivery failure");
         assert!(
             match result {
                 Err(_) => true,

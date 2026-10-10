@@ -131,6 +131,47 @@ async fn unserializable_approval_keys_never_hit_the_cache() {
     assert!(session.services.tool_approvals.lock().await.map.is_empty());
 }
 
+#[tokio::test]
+async fn cached_approval_requires_every_key_and_never_caches_empty_requests() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    assert_eq!(
+        with_cached_approval(&session.services, "apply_patch", vec!["a", "b"], || async {
+            ReviewDecision::ApprovedForSession
+        }).await,
+        ReviewDecision::ApprovedForSession
+    );
+    assert_eq!(
+        with_cached_approval(&session.services, "apply_patch", vec!["b"], || async {
+            panic!("a subset of approved file keys must reuse the session grant")
+        }).await,
+        ReviewDecision::ApprovedForSession
+    );
+    assert_eq!(
+        with_cached_approval(&session.services, "apply_patch", vec!["b", "c"], || async {
+            ReviewDecision::Denied
+        }).await,
+        ReviewDecision::Denied
+    );
+    assert_eq!(
+        with_cached_approval(&session.services, "apply_patch", vec!["c"], || async {
+            ReviewDecision::Approved
+        }).await,
+        ReviewDecision::Approved
+    );
+    for keys in [vec!["c"], vec![], vec![]] {
+        let fetched = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            with_cached_approval(&session.services, "apply_patch", keys, || async {
+                fetched.store(true, std::sync::atomic::Ordering::Relaxed);
+                ReviewDecision::ApprovedForSession
+            }).await,
+            ReviewDecision::ApprovedForSession
+        );
+        assert!(fetched.load(std::sync::atomic::Ordering::Relaxed),
+            "one-shot approvals and empty key sets must not bypass the approval fetch");
+    }
+}
+
 #[test]
 fn bash_permission_request_payload_preserves_optional_description() {
     assert_eq!(

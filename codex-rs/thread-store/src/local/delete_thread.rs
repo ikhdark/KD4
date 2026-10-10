@@ -306,18 +306,7 @@ pub(super) async fn rollback_created_thread(
     // so dropping the caller cannot restore files for an already-deleted row.
     tokio::spawn(async move {
         let staged = stage_thread_deletes(&store, &[thread_id]).await?;
-        if let Some(state_db) = store.state_db().await {
-            state_db
-                .delete_thread(thread_id)
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!(
-                        "failed to delete state for rolled-back thread {thread_id}: {err}"
-                    ),
-                })?;
-        }
-        staged.commit().await;
-        Ok(())
+        commit_thread_delete(staged, thread_id).await
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -333,6 +322,34 @@ pub(super) async fn delete_thread(
     let staged = stage_thread_deletes(store, &[thread_id]).await?;
     if !staged.found_thread(thread_id) {
         return Err(ThreadStoreError::ThreadNotFound { thread_id });
+    }
+    // Cancellation during staging still restores files. Once SQLite deletion
+    // starts, an owned task must finish the same commit path as rollback.
+    let StagedThreadDelete { store, thread_ids, found_thread_ids, files } = staged;
+    let store = store.clone();
+    tokio::spawn(async move {
+        let staged = StagedThreadDelete {
+            store: &store,
+            thread_ids,
+            found_thread_ids,
+            files,
+        };
+        commit_thread_delete(staged, thread_id).await
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("thread deletion persistence task failed: {err}"),
+    })?
+}
+
+async fn commit_thread_delete(
+    staged: StagedThreadDelete<'_>,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<()> {
+    if let Some(state_db) = staged.store.state_db().await {
+        state_db.delete_thread(thread_id).await.map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to delete state for thread {thread_id}: {err}"),
+        })?;
     }
     staged.commit().await;
     Ok(())
@@ -725,7 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_delete_treats_vanished_path_as_already_deleted() {
+    async fn staged_delete_of_missing_rollout_finds_no_thread_and_stages_nothing() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let uuid = Uuid::from_u128(305);
@@ -734,13 +751,17 @@ mod tests {
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
         std::fs::remove_file(&path).expect("remove session file");
 
+        // The lookup only returns rollouts that exist, so this is the
+        // missing-thread path. A rollout that vanishes between lookup and
+        // staging is not driven here.
         let staged = store
             .stage_thread_deletes(&[thread_id])
             .await
             .expect("stage delete");
         assert!(!staged.found_thread(thread_id));
+        assert!(staged.files.staged_files.is_empty());
+        assert!(staged.files.staging_dir.is_none());
         staged.commit().await;
-        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -792,17 +813,29 @@ mod tests {
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let path =
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
-        let _lock = std::fs::OpenOptions::new()
+        let lock = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0x0000_0001 | 0x0000_0002)
             .open(&path)
             .expect("lock rollout without delete sharing");
 
-        store
+        let err = store
             .preflight_delete_thread(DeleteThreadParams { thread_id })
             .await
             .expect_err("locked rollout must fail before deletion begins");
+        assert!(
+            matches!(
+                &err,
+                ThreadStoreError::Internal { message } if message.contains("cannot be deleted")
+            ),
+            "unexpected preflight error: {err}"
+        );
         assert!(path.exists());
+        drop(lock);
+        store
+            .preflight_delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect("unlocked rollout passes preflight");
     }
 
     #[tokio::test]
@@ -935,6 +968,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_thread_removes_its_sqlite_metadata() {
+        // ThreadStore::delete_thread promises rollout data AND associated metadata.
+        let (home, store, state, thread_id, path) = rollback_fixture().await;
+        store.delete_thread(DeleteThreadParams { thread_id }).await.expect("delete indexed thread");
+        assert!(!path.exists());
+        assert!(state.get_thread(thread_id).await.unwrap().is_none(), "deleted thread must not remain in SQLite listings");
+        assert!(codex_rollout::find_thread_name_by_id(home.path(), &thread_id).await.unwrap().is_none());
+        assert!(matches!(store.read_thread(crate::ReadThreadParams {
+            thread_id, include_archived: true, include_history: false,
+        }).await, Err(ThreadStoreError::ThreadNotFound { .. })));
+        state.close().await;
+    }
+
+    #[tokio::test]
     async fn rollback_created_thread_removes_files_state_and_name_index() {
         for materialized in [true, false] {
             let (home, store, state, thread_id, path) = rollback_fixture().await;
@@ -977,6 +1024,15 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_created_thread_restores_files_and_state_on_primary_failure() {
+        assert_primary_delete_failure_restores_persistence(false).await;
+    }
+
+    #[tokio::test]
+    async fn delete_thread_restores_files_and_state_on_primary_failure() {
+        assert_primary_delete_failure_restores_persistence(true).await;
+    }
+
+    async fn assert_primary_delete_failure_restores_persistence(direct_delete: bool) {
         use sqlx::Connection;
         let (home, store, state, thread_id, path) = rollback_fixture().await;
         let original = std::fs::read(&path).unwrap();
@@ -988,10 +1044,12 @@ mod tests {
         .unwrap();
         sqlx::query("CREATE TRIGGER reject_rollback BEFORE DELETE ON threads BEGIN SELECT RAISE(ABORT, 'blocked primary delete'); END")
             .execute(&mut connection).await.unwrap();
-        let error = store
-            .rollback_created_thread(thread_id)
-            .await
-            .expect_err("real primary transaction must fail");
+        let result = if direct_delete {
+            store.delete_thread(DeleteThreadParams { thread_id }).await
+        } else {
+            store.rollback_created_thread(thread_id).await
+        };
+        let error = result.expect_err("real primary transaction must fail");
         assert!(error.to_string().contains("blocked primary delete"));
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(state.get_thread(thread_id).await.unwrap().is_some());
@@ -1014,10 +1072,12 @@ mod tests {
             .execute(&mut connection)
             .await
             .unwrap();
-        store
-            .rollback_created_thread(thread_id)
-            .await
-            .expect("retry completes both persistence surfaces");
+        let result = if direct_delete {
+            store.delete_thread(DeleteThreadParams { thread_id }).await
+        } else {
+            store.rollback_created_thread(thread_id).await
+        };
+        result.expect("retry completes both persistence surfaces");
         assert!(!path.exists());
         assert!(state.get_thread(thread_id).await.unwrap().is_none());
         connection.close().await.unwrap();
@@ -1026,6 +1086,15 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_created_thread_completion_survives_cancellation_after_primary_commit() {
+        assert_delete_completion_survives_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    async fn delete_thread_completion_survives_cancellation_after_primary_commit() {
+        assert_delete_completion_survives_cancellation(true).await;
+    }
+
+    async fn assert_delete_completion_survives_cancellation(direct_delete: bool) {
         use sqlx::Connection;
         use std::time::Duration;
         let (home, store, state, thread_id, path) = rollback_fixture().await;
@@ -1042,8 +1111,13 @@ mod tests {
             .await
             .unwrap();
         let deleting = store.clone();
-        let operation =
-            tokio::spawn(async move { deleting.rollback_created_thread(thread_id).await });
+        let operation = tokio::spawn(async move {
+            if direct_delete {
+                deleting.delete_thread(DeleteThreadParams { thread_id }).await
+            } else {
+                deleting.rollback_created_thread(thread_id).await
+            }
+        });
         tokio::time::timeout(Duration::from_secs(3), async {
             while state.get_thread(thread_id).await.unwrap().is_some() {
                 tokio::time::sleep(Duration::from_millis(10)).await;

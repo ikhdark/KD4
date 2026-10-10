@@ -361,6 +361,46 @@ def boundary_reached(program, test, callee, boundary):
 
     Unresolved wrapper/branch paths remain None, not real-tool coverage.
     """
+    def direct_reach(function, call, env):
+        if isinstance(function, ast.AsyncFunctionDef) or any(
+            isinstance(node, (ast.Yield, ast.YieldFrom))
+            for node in descendants(function)
+        ):
+            # Calling a coroutine/generator need not start its body. Consumption
+            # and awaiting are outside this direct-call reachability subset.
+            return None
+        # Only the simple enclosing-if subset below proves execution. Loops,
+        # expression branches and earlier exits can bypass a syntactically
+        # reached call; keep those paths unknown rather than clearing a warning.
+        uncertain = any(
+            (
+                isinstance(node, (
+                    ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.BoolOp,
+                    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+                    ast.Try, ast.TryStar, ast.With, ast.AsyncWith, ast.Match,
+                ))
+                and call in ast.walk(node)
+            )
+            or (
+                isinstance(node, (ast.Return, ast.Raise, ast.Break, ast.Continue))
+                and (node.lineno, node.col_offset) < (call.lineno, call.col_offset)
+                and call not in ast.walk(node)
+            )
+            for node in descendants(function)
+        )
+        state = None if uncertain else True
+        for branch in descendants(function):
+            if isinstance(branch, ast.If):
+                in_body = any(call in ast.walk(node) for node in branch.body)
+                in_else = any(call in ast.walk(node) for node in branch.orelse)
+                if in_body or in_else:
+                    truth = known_truth(branch.test, env)
+                    if truth is None:
+                        state = None
+                    elif truth != in_body:
+                        return False
+        return state
+
     module, _, function, _ = program.functions[test]
     producer = program.functions[callee][2]
     calls = [
@@ -381,19 +421,9 @@ def boundary_reached(program, test, callee, boundary):
         env.update(
             {kw.arg: expand(kw.value, caller_env) for kw in call.keywords if kw.arg}
         )
-        state = True
-        for branch in descendants(producer):
-            if isinstance(branch, ast.If):
-                in_body = any(boundary in ast.walk(node) for node in branch.body)
-                in_else = any(boundary in ast.walk(node) for node in branch.orelse)
-                if in_body or in_else:
-                    truth = known_truth(branch.test, env)
-                    if truth is None:
-                        state = None
-                    elif truth != in_body:
-                        state = False
-                        break
-        states.append(state)
+        path = (direct_reach(function, call, caller_env),
+                direct_reach(producer, boundary, env))
+        states.append(False if False in path else None if None in path else True)
     return True if True in states else None if None in states else False
 
 

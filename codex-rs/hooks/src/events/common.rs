@@ -253,8 +253,34 @@ mod tests {
 
     #[test]
     fn matcher_omitted_matches_all_occurrences() {
-        assert!(matches_matcher(/*matcher*/ None, Some("Bash")));
-        assert!(matches_matcher(/*matcher*/ None, Some("Write")));
+        use codex_protocol::protocol::HookSource;
+        use codex_utils_absolute_path::test_support::PathBufExt;
+        use codex_utils_absolute_path::test_support::test_path_buf;
+        // The test-only `matches_matcher` answers for an omitted matcher without
+        // touching runtime code; the runtime rule is the dispatcher's selection.
+        let handlers = [crate::engine::ConfiguredHandler {
+            event_name: HookEventName::PreToolUse,
+            matcher: None,
+            command: "echo hook".into(),
+            timeout_sec: 5,
+            status_message: None,
+            source_path: test_path_buf("/tmp/hooks.json").abs(),
+            source: HookSource::User,
+            display_order: 0,
+            env: Default::default(),
+        }];
+        for tool_name in ["Bash", "Write"] {
+            assert_eq!(
+                crate::engine::dispatcher::select_handlers(
+                    &handlers,
+                    HookEventName::PreToolUse,
+                    Some(tool_name),
+                )
+                .len(),
+                1,
+                "{tool_name}"
+            );
+        }
     }
 
     #[test]

@@ -199,7 +199,8 @@ fn environment_placement_resolves_relative_cwd_beneath_plugin_root() {
 
 #[test]
 fn executor_environment_placement_resolves_foreign_uri_cwd() {
-    let plugin_root = PathUri::parse("file:///C:/plugins/demo").expect("plugin root URI");
+    // A POSIX root is the foreign convention on this host: it has no host-native path.
+    let plugin_root = PathUri::parse("file:///opt/plugins/demo").expect("plugin root URI");
     let outcome = parse_executor_plugin_mcp_config(
         &plugin_root,
         r#"{"demo":{"command":"demo-mcp","cwd":"scripts"}}"#,
@@ -215,9 +216,7 @@ fn executor_environment_placement_resolves_foreign_uri_cwd() {
                 stdio_server(
                     "demo-mcp",
                     "executor-1",
-                    LegacyAppPathString::from(
-                        plugin_root.join("scripts").expect("executor cwd URI"),
-                    ),
+                    LegacyAppPathString::from_path(Path::new("/opt/plugins/demo/scripts")),
                     Vec::new(),
                 ),
             )]),

@@ -1096,6 +1096,11 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
+
+        let non_fedramp = auth_provider_from_auth(&CodexAuth::AgentIdentity(
+            agent_identity_auth(/*chatgpt_account_is_fedramp*/ false).await,
+        ));
+        assert!(!non_fedramp.to_auth_headers().contains_key("X-OpenAI-Fedramp"));
     }
 
     #[tokio::test]

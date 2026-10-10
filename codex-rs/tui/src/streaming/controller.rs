@@ -1162,6 +1162,15 @@ mod tests {
             "expected no live tail outside table holdback state",
         );
         assert!(!ctrl.has_live_tail());
+
+        // Committing the line is what reaches the holdback decision: prose is queued, not held.
+        assert!(ctrl.push("\n"));
+        assert!(
+            ctrl.current_tail_lines().is_empty(),
+            "expected committed prose to bypass the live tail",
+        );
+        assert!(!ctrl.has_live_tail());
+        assert_eq!(ctrl.queued_lines(), 1);
     }
 
     #[test]
@@ -1199,7 +1208,9 @@ mod tests {
         ctrl.push("second line\n");
 
         let (cell, idle) = ctrl.on_commit_tick();
-        assert!(cell.is_some(), "expected 1 emitted line");
+        let mut lines = cell
+            .expect("expected 1 emitted line")
+            .transcript_lines(u16::MAX);
         assert!(!idle, "queue should still have lines");
         let remaining_before = ctrl.queued_lines();
         assert!(remaining_before > 0, "should have queued lines left");
@@ -1207,15 +1218,27 @@ mod tests {
         ctrl.set_width(Some(20));
 
         let (cell, source) = ctrl.finalize();
-        let final_lines = cell
-            .map(|c| lines_to_plain_strings(&c.transcript_lines(u16::MAX)))
-            .unwrap_or_default();
-
-        assert!(
-            final_lines.iter().any(|l| l.contains("second line")),
-            "un-emitted 'second line' was lost after resize; got: {final_lines:?}",
+        lines.extend(
+            cell.expect("expected un-emitted lines from finalize")
+                .transcript_lines(u16::MAX),
         );
-        assert!(source.is_some(), "expected source from finalize");
+        let streamed: Vec<String> = lines_to_plain_strings(&lines)
+            .into_iter()
+            .map(|line| line.chars().skip(2).collect())
+            .collect();
+
+        // Every source word exactly once and in order: no row lost, no emitted row replayed.
+        assert_eq!(
+            streamed.join(" ").split_whitespace().collect::<Vec<_>>(),
+            "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ second line"
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            "resize after a partial drain lost or replayed rows; got: {streamed:?}",
+        );
+        assert_eq!(
+            source.as_deref(),
+            Some("AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ\nsecond line\n")
+        );
     }
 
     #[test]
@@ -1227,7 +1250,11 @@ mod tests {
         ctrl.flush_render_for_frame();
 
         let (cell, idle) = ctrl.on_commit_tick();
-        assert!(cell.is_some(), "expected 1 emitted line");
+        let mut drained = lines_to_plain_strings(
+            &cell
+                .expect("expected 1 emitted line")
+                .transcript_lines(u16::MAX),
+        );
         assert!(!idle, "queue should still have lines");
         assert!(ctrl.queued_lines() > 0, "expected pending queued lines");
 
@@ -1238,7 +1265,6 @@ mod tests {
             "resize must preserve pending queued lines"
         );
 
-        let mut drained = Vec::new();
         for _ in 0..64 {
             let (cell, is_idle) = ctrl.on_commit_tick();
             if let Some(cell) = cell {
@@ -1249,9 +1275,17 @@ mod tests {
             }
         }
 
-        assert!(
-            drained.iter().any(|l| l.contains("second line")),
-            "pending lines should continue draining after resize; got {drained:?}",
+        // The emitted row plus the rows drained after the resize are the source exactly once.
+        let streamed: Vec<String> = drained
+            .iter()
+            .map(|line| line.chars().skip(2).collect())
+            .collect();
+        assert_eq!(
+            streamed.join(" ").split_whitespace().collect::<Vec<_>>(),
+            "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ second line"
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            "pending lines should drain exactly once after resize; got {drained:?}",
         );
     }
 
@@ -1507,6 +1541,9 @@ mod tests {
 
         ctrl.push("| Key | Value |\n");
         ctrl.push("| --- | --- |\n");
+        ctrl.flush_render_for_frame();
+        assert!(ctrl.has_live_tail(), "confirmed table must have been rendered");
+        assert_eq!(ctrl.core.rendered_source_len, ctrl.core.raw_source.len());
         assert_eq!(
             ctrl.queued_lines(),
             1,
@@ -1627,13 +1664,7 @@ mod tests {
 
     #[test]
     fn controller_renders_separators_for_multi_table_response_shape() {
-        let source = "Absolutely. Here are several different Markdown table patterns you can use for rendering tests.\n\n| Name  | Role      |
-  Location |\n|-------|-----------|----------|\n| Ava   | Engineer  | NYC      |\n| Malik | Designer  | Berlin   |\n| Priya | PM        | Remote
-  |\n\n| Item        | Qty | Price | In Stock |\n|:------------|----:|------:|:--------:|\n| Keyboard    |   2 | 49.99 |    Yes   |\n| Mouse       |  10
-   | 19.50 |    Yes   |\n| Monitor     |   1 | 219.0 |    No    |\n\n| Field         | Example                         | Notes
-  |\n|---------------|----------------------------------|--------------------------|\n| Escaped pipe  | `foo \\| bar`                    | Should stay
-  in one cell  |\n| Inline code   | `let x = value;`                | Monospace inline content |\n| Link          | [OpenAI](https://openai.com)    |
-  Standard markdown link   |\n";
+        let source = "Absolutely. Here are several different Markdown table patterns you can use for rendering tests.\n\n| Name  | Role      | Location |\n|-------|-----------|----------|\n| Ava   | Engineer  | NYC      |\n| Malik | Designer  | Berlin   |\n| Priya | PM        | Remote   |\n\n| Item        | Qty | Price | In Stock |\n|:------------|----:|------:|:--------:|\n| Keyboard    |   2 | 49.99 |    Yes   |\n| Mouse       |  10 | 19.50 |    Yes   |\n| Monitor     |   1 | 219.0 |    No    |\n\n| Field         | Example                         | Notes                    |\n|---------------|----------------------------------|--------------------------|\n| Escaped pipe  | `foo \\| bar`                    | Should stay in one cell  |\n| Inline code   | `let x = value;`                | Monospace inline content |\n| Link          | [OpenAI](https://openai.com)    | Standard markdown link   |\n";
 
         let chunked = source
             .split_inclusive('\n')
@@ -1641,9 +1672,16 @@ mod tests {
             .collect::<Vec<_>>();
         let deltas = chunked.iter().map(String::as_str).collect::<Vec<_>>();
         let streamed = collect_streamed_lines(&deltas, Some(120));
+        assert_eq!(
+            streamed.iter().filter(|line| line.contains('━')).count(),
+            3,
+            "expected one header separator per table in streamed output: {streamed:?}"
+        );
         assert!(
-            streamed.iter().any(|line| line.contains('━')),
-            "expected table separator in streamed output: {streamed:?}"
+            !streamed
+                .iter()
+                .any(|line| line.trim_start().starts_with('|')),
+            "no table row should remain raw in streamed output: {streamed:?}"
         );
     }
 
@@ -2092,6 +2130,12 @@ mod tests {
             remaining.iter().any(|line| line.contains("second line")),
             "expected pending second line after resize: {remaining:?}",
         );
+        // The first line rewraps into several rows at width 20; none of them may be replayed.
+        assert_eq!(
+            remaining.join(" ").split_whitespace().collect::<Vec<_>>(),
+            ["second", "line", "remains", "pending"],
+            "only the pending second line may remain after resize: {remaining:?}",
+        );
     }
 
     #[test]
@@ -2101,7 +2145,14 @@ mod tests {
         ctrl.push("tail line\n");
 
         let (first_emit, idle) = ctrl.on_commit_tick();
-        assert!(first_emit.is_some(), "expected first wrapped line emission");
+        let mut streamed = lines_to_plain_strings(
+            &first_emit
+                .expect("expected first wrapped line emission")
+                .transcript_lines(u16::MAX),
+        )
+        .into_iter()
+        .map(|line| line.chars().skip(2).collect::<String>())
+        .collect::<Vec<_>>();
         assert!(!idle, "expected remaining queued content after one tick");
         assert!(
             ctrl.queued_lines() > 0,
@@ -2120,6 +2171,15 @@ mod tests {
         assert!(
             remaining.iter().any(|line| line.contains("tail line")),
             "un-emitted content should remain after resize remap: {remaining:?}",
+        );
+        // The emitted row plus the remainder are the source exactly once, in order.
+        streamed.extend(remaining);
+        assert_eq!(
+            streamed.join(" ").split_whitespace().collect::<Vec<_>>(),
+            "The quick brown fox jumps over the lazy dog near the riverbank. tail line"
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            "resize after a partial wrapped emit lost or replayed content: {streamed:?}",
         );
     }
 

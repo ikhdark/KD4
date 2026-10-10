@@ -17,6 +17,7 @@ use super::AuthModeWidget;
 use super::ContinueWithDeviceCodeState;
 use super::SignInState;
 use super::cancel_login_attempt;
+use super::complete_login;
 use super::mark_url_hyperlink;
 use super::onboarding_request_id;
 
@@ -175,8 +176,18 @@ fn set_device_code_state_for_active_attempt(
         return false;
     }
 
-    *guard = SignInState::ChatGptDeviceCode(next_state);
-    *error.write().unwrap() = None;
+    let completion = match &mut *guard {
+        SignInState::ChatGptDeviceCode(state) => next_state
+            .login_id()
+            .and_then(|login_id| state.completions.remove(login_id)),
+        _ => None,
+    };
+    if let Some((success, message)) = completion {
+        complete_login(&mut guard, error, success, message);
+    } else {
+        *guard = SignInState::ChatGptDeviceCode(next_state);
+        *error.write().unwrap() = None;
+    }
     drop(guard);
     request_frame.schedule_frame();
     true

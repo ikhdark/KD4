@@ -54,6 +54,7 @@ pub struct App {
     pub details_inflight: bool,
     // Environment filter state
     pub env_filter: Option<String>,
+    pub env_user_selected: bool,
     pub env_modal: Option<EnvModalState>,
     pub apply_modal: Option<ApplyModalState>,
     pub best_of_modal: Option<BestOfModalState>,
@@ -75,6 +76,20 @@ pub struct App {
 }
 
 impl App {
+    pub fn select_environment(&mut self, environment: Option<String>) {
+        self.env_filter = environment;
+        self.env_user_selected = true;
+    }
+
+    pub fn accepts_details(&self, id: &TaskId) -> bool {
+        self.diff_overlay.as_ref().is_some_and(|overlay| overlay.task_id == *id)
+    }
+
+    pub fn close_details(&mut self) {
+        self.diff_overlay = None;
+        self.details_inflight = false;
+    }
+
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
@@ -85,6 +100,7 @@ impl App {
             refresh_inflight: false,
             details_inflight: false,
             env_filter: None,
+            env_user_selected: false,
             env_modal: None,
             apply_modal: None,
             best_of_modal: None,

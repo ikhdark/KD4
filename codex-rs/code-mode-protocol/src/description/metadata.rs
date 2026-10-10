@@ -66,16 +66,6 @@ pub fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition
     definition
 }
 
-pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata {
-    EnabledToolMetadata {
-        tool_name: definition.tool_name.clone(),
-        global_name: normalize_code_mode_identifier(&definition.name),
-        description: definition.description.clone(),
-        kind: definition.kind,
-        default_timeout_ms: definition.default_timeout_ms,
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EnabledToolMetadata {
     pub tool_name: ToolName,
@@ -591,23 +581,17 @@ mod tests {
                 output_schema: Some(schema.clone()),
                 default_timeout_ms: None,
             };
-            // Exercise serialization and the metadata boundary used by discovery.
+            // Exercise serialization before the definition is augmented.
             let decoded =
                 serde_json::from_value(serde_json::to_value(definition).unwrap()).unwrap();
             let augmented = augment_tool_definition(decoded);
             assert_eq!(augmented.output_schema, Some(schema));
             assert_eq!(
-                enabled_tool_metadata(&augmented),
-                EnabledToolMetadata {
-                    tool_name: ToolName::plain("answer"),
-                    global_name: "answer".to_string(),
-                    default_timeout_ms: None,
-                    kind: CodeModeToolKind::Function,
-                    description: format!(
-                        "Answer.\n\nexec tool declaration:\n```ts\n{envelope}declare const tools: {{ answer(args: unknown, options?: {{ timeout_ms?: number }}): Promise<{expected_output}>; }};\n```",
-                        envelope = if marker { MCP_RESULT_ENVELOPE } else { "" },
-                    ).into(),
-                }
+                augmented.description.as_ref(),
+                format!(
+                    "Answer.\n\nexec tool declaration:\n```ts\n{envelope}declare const tools: {{ answer(args: unknown, options?: {{ timeout_ms?: number }}): Promise<{expected_output}>; }};\n```",
+                    envelope = if marker { MCP_RESULT_ENVELOPE } else { "" },
+                )
             );
         }
     }

@@ -193,6 +193,56 @@ fn truncate_rollout_after_turn_id_rejects_in_progress_turn() {
 }
 
 #[test]
+fn truncate_rollout_after_turn_id_rejects_another_turns_anonymous_abort() {
+    let rollout = vec![
+        turn_started("turn-1"),
+        RolloutItem::EventMsg(EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+            message: "failed before a terminal boundary was persisted".to_string(),
+            codex_error_info: None,
+        })),
+        turn_started("turn-2"),
+        RolloutItem::EventMsg(EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+            turn_id: None,
+            reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+            timing: None,
+        })),
+    ];
+
+    let err = truncate_rollout_after_turn_id(&rollout, "turn-1")
+        .expect_err("turn-2's anonymous abort is not turn-1's terminal boundary");
+    assert!(matches!(
+        err,
+        CodexErr::InvalidRequest(message)
+            if message == "lastTurnId 'turn-1' has no persisted terminal boundary"
+    ));
+}
+
+#[test]
+fn truncate_rollout_after_turn_id_accepts_own_anonymous_or_explicit_abort() {
+    for turn_id in [None, Some("turn-1".to_string())] {
+        let rollout = vec![
+            turn_started("turn-1"),
+            RolloutItem::EventMsg(EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+                turn_id,
+                reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+                timing: None,
+            })),
+            turn_started("turn-2"),
+            turn_completed("turn-2"),
+        ];
+        let truncated = truncate_rollout_after_turn_id(&rollout, "turn-1").unwrap();
+        assert_eq!(
+            serde_json::to_value(&truncated).unwrap(),
+            serde_json::to_value(&rollout[..2]).unwrap()
+        );
+    }
+}
+
+#[test]
 fn truncates_rollout_from_start_before_nth_user_only() {
     let items = [
         user_msg("u1"),
@@ -574,5 +624,13 @@ fn truncates_rollout_to_last_n_fork_turns_discards_rolled_back_assistant_instruc
     assert_eq!(
         serde_json::to_value(&truncated).unwrap(),
         serde_json::to_value(&expected).unwrap()
+    );
+
+    // Two fork turns survive the rollback, so asking for two keeps everything.
+    // A rolled-back turn that still counted would start the result at index 2.
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
+    assert_eq!(
+        serde_json::to_value(&truncated).unwrap(),
+        serde_json::to_value(&rollout).unwrap()
     );
 }

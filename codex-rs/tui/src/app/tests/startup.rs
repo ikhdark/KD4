@@ -398,10 +398,11 @@ async fn ignore_same_thread_resume_reports_noop_for_current_thread() {
 
 #[tokio::test]
 async fn ignore_same_thread_resume_allows_reattaching_displayed_inactive_thread() {
-    let mut app = make_test_app().await;
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
     let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
     app.chat_widget.handle_thread_session(session);
+    while app_event_rx.try_recv().is_ok() {}
 
     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
         path: Some(test_path_buf("/tmp/project")),
@@ -409,5 +410,11 @@ async fn ignore_same_thread_resume_allows_reattaching_displayed_inactive_thread(
     });
 
     assert!(!ignored);
-    assert!(app.transcript_cells.is_empty());
+    // The already-viewing notice travels as a history-cell event, not through transcript_cells.
+    while let Ok(event) = app_event_rx.try_recv() {
+        assert!(
+            !matches!(event, AppEvent::InsertHistoryCell(_)),
+            "reattaching must not report an already-viewing notice: {event:?}"
+        );
+    }
 }

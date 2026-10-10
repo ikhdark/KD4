@@ -3335,5 +3335,16 @@ mod tests {
             sandbox_policy_mode(&permission_profile, Path::new("/")),
             "external_sandbox"
         );
+
+        // Control: the network restriction is what demotes full-disk access.
+        let network_enabled = PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::Managed,
+            &FileSystemSandboxPolicy::unrestricted(),
+            NetworkSandboxPolicy::Enabled,
+        );
+        assert_eq!(
+            sandbox_policy_mode(&network_enabled, Path::new("/")),
+            "full_access"
+        );
     }
 }

@@ -627,37 +627,21 @@ async fn exec_command_consumes_pushed_remote_process_events(
             "workdir": "nested",
             "yield_time_ms": 30_000,
         }),
-        PushedExecScenario::RemoteApproval => json!({
-            "kind": "script",
-            "cmd": "ignored by fake exec-server",
-            "yield_time_ms": 30_000,
-            "sandbox_permissions": "require_escalated",
-            "justification": "exercise remote approval cwd",
-        }),
         _ => json!({
             "kind": "script",
             "cmd": "ignored by fake exec-server",
             "yield_time_ms": 30_000,
         }),
     };
-    let mut responses = vec![sse(vec![
+    let responses = vec![sse(vec![
         ev_response_created("resp-1"),
         ev_function_call(CALL_ID, tool_name, &tool_arguments.to_string()),
         ev_completed("resp-1"),
+    ]), sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-2", "done"),
+        ev_completed("resp-2"),
     ])];
-    if matches!(
-        scenario,
-        PushedExecScenario::Complete
-            | PushedExecScenario::LegacyShellAdapter
-            | PushedExecScenario::RemoteApproval
-            | PushedExecScenario::ReplayGap
-    ) {
-        responses.push(sse(vec![
-            ev_response_created("resp-2"),
-            ev_assistant_message("msg-2", "done"),
-            ev_completed("resp-2"),
-        ]));
-    }
     let response_mock = mount_sse_sequence(&server, responses).await;
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
     let (replay_barrier_tx, replay_barrier_rx) = tokio::sync::oneshot::channel();
@@ -727,9 +711,10 @@ async fn exec_command_consumes_pushed_remote_process_events(
         None
     };
 
-    // Foreign path conventions cannot seed a host sandbox. The approval case
-    // still exercises the explicit escalation flow, but its initial profile
-    // must be unsandboxed so the remote cwd can reach the exec server.
+    // Foreign path conventions cannot seed a host sandbox, so every case runs
+    // unsandboxed. An unsandboxed on-request turn never prompts, even for an
+    // escalation request; the approval case uses `UnlessTrusted`, under which
+    // this unmatched, non-allowlisted command must be approved first.
     let profile = PermissionProfile::Disabled;
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(profile, test.config.cwd.as_path());
@@ -760,7 +745,7 @@ async fn exec_command_consumes_pushed_remote_process_events(
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 environments: Some(environments),
                 approval_policy: Some(if matches!(scenario, PushedExecScenario::RemoteApproval) {
-                    AskForApproval::OnRequest
+                    AskForApproval::UnlessTrusted
                 } else {
                     AskForApproval::Never
                 }),
@@ -779,6 +764,7 @@ async fn exec_command_consumes_pushed_remote_process_events(
         })
         .await?;
     let mut saw_exec_command_begin = false;
+    let mut saw_exec_approval = false;
     loop {
         let event = timeout(Duration::from_secs(5), test.codex.next_event())
             .await
@@ -790,6 +776,7 @@ async fn exec_command_consumes_pushed_remote_process_events(
             }
             EventMsg::ExecApprovalRequest(event) if event.call_id == CALL_ID => {
                 assert!(matches!(scenario, PushedExecScenario::RemoteApproval));
+                saw_exec_approval = true;
                 assert_eq!(
                     event.cwd_uri.as_ref().map(ToString::to_string).as_deref(),
                     Some("file:///home/remote/workspace")
@@ -802,10 +789,19 @@ async fn exec_command_consumes_pushed_remote_process_events(
                     })
                     .await?;
             }
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(completed) => {
+                assert!(completed.error.is_none(), "{completed:?}");
+                assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
+                break;
+            }
             _ => {}
         }
     }
+    assert_eq!(
+        saw_exec_approval,
+        matches!(scenario, PushedExecScenario::RemoteApproval),
+        "only the approval case should raise an exec approval, and it must raise one"
+    );
     let process_read_requests = timeout(Duration::from_secs(5), exec_server)
         .await
         .context("fake exec-server should observe process cleanup")??;
@@ -814,7 +810,14 @@ async fn exec_command_consumes_pushed_remote_process_events(
         PushedExecScenario::DirectDenied | PushedExecScenario::LegacyExit
     ) {
         assert!(saw_exec_command_begin);
-        assert_eq!(response_mock.requests().len(), 1);
+        // Sandbox denial closes the process, not the model turn. Its observed
+        // exit must reach the model without manufacturing a live poll handle.
+        assert_eq!(response_mock.requests().len(), 2);
+        let output = response_mock.last_request().expect("denial continuation")
+            .function_call_output_text(CALL_ID).expect("denied command output");
+        let output: Value = serde_json::from_str(&output)?;
+        assert_eq!(output["exit_code"], 1);
+        assert!(output.get("session_id").is_none(), "{output}");
         assert_eq!(
             process_read_requests,
             usize::from(matches!(scenario, PushedExecScenario::LegacyExit)),

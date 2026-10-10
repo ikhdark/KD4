@@ -1523,6 +1523,73 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn remote_startup_deadline_covers_blocked_initialized_write() {
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (transport, peer) = tokio::io::duplex(8);
+        let stream = WebSocketStream::from_raw_socket(transport, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+        let respond_to_initialize = async {
+            let frame = peer
+                .next()
+                .await
+                .expect("initialize frame")
+                .expect("valid frame");
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&frame.into_text().expect("text frame")).expect("request")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            peer.send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({ "userAgent": "test/1" }),
+                }))
+                .expect("response JSON")
+                .into(),
+            ))
+            .await
+            .expect("initialize response");
+            // Keep the peer open without consuming the final initialized frame.
+            peer
+        };
+        let (result, mut peer) = timeout(
+            INITIALIZE_TIMEOUT + Duration::from_secs(2),
+            async {
+                tokio::join!(
+                    RemoteAppServerClient::connect_with_stream(
+                        1,
+                        "blocked-peer".to_owned(),
+                        stream,
+                        crate::initialize_params("test", "1", false, false, &[]),
+                    ),
+                    respond_to_initialize,
+                )
+            },
+        )
+        .await
+        .expect("the connection deadline must include writing initialized");
+        let error = result
+            .err()
+            .expect("an unread initialized frame must time out");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        let mut partial_notification = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            peer.get_mut().read_to_end(&mut partial_notification),
+        )
+        .await
+        .expect("failed initialization must close its transport")
+        .expect("read partial notification before EOF");
+        assert!(
+            !partial_notification.is_empty(),
+            "the final initialized write must start after the response"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn remote_shutdown_deadline_covers_full_queue_and_reaps_worker() {
         use tokio::io::AsyncReadExt;
         use tokio_tungstenite::tungstenite::protocol::Role;

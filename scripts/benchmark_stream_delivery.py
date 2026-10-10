@@ -3,8 +3,8 @@
 
 Compiles immutable copies of the owning Rust modules with the checkout's rustc.
 Tracing is disabled and pretty_assertions uses std assertions in this isolated
-harness. Renderer-dependent table_detect tests are excluded; chunking and
-holdback tests run unchanged. This measures CPU and virtual boundaries, not
+harness. Renderer-dependent tests are explicitly excluded; chunking and the
+holdback differential test run unchanged. This measures CPU and virtual boundaries, not
 provider tokens, network latency, markdown rendering, or terminal paint.
 """
 
@@ -119,6 +119,14 @@ def main() -> None:
                 if data.count(marker) != 1:
                     raise RuntimeError("table_detect test boundary changed")
                 data = data.replace(marker, b"#[cfg(any())]\nmod tests {")
+            elif source == "tui/src/streaming/table_holdback.rs":
+                # This renderer integration test needs pulldown_cmark too.
+                # Keep the scanner differential test and production code intact.
+                marker = (b"    #[test]\n"
+                          b"    fn indented_fence_markers_do_not_change_table_holdback() {")
+                if data.count(marker) != 1:
+                    raise RuntimeError("table_holdback renderer test boundary changed")
+                data = data.replace(marker, b"    #[cfg(any())]\n" + marker)
             (work / Path(source).name).write_bytes(data)
         harness = work / "main.rs"
         harness.write_text(HARNESS, encoding="utf-8")
@@ -134,7 +142,10 @@ def main() -> None:
         "scope": "isolated production primitives; tracing disabled; no UI/network timing",
         "compiler": compiler,
         "source_sha256": hashes,
-        "excluded_tests": ["table_detect renderer integration and markdown_stream rendering tests"],
+        "excluded_tests": [
+            "table_detect renderer integration and markdown_stream rendering tests",
+            "table_holdback::tests::indented_fence_markers_do_not_change_table_holdback",
+        ],
         "scanner_us": {"samples": timings, "median": statistics.median(timings), "min": min(timings), "max": max(timings)},
         "boundary_probes": records[len(timings):],
         "primitive_test_output": test_output,

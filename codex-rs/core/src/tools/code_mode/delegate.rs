@@ -605,14 +605,19 @@ mod tests {
         };
         let old = start(Arc::clone(&old_session), old_turn);
         let replacement = start(Arc::clone(&new_session), new_turn);
-        drop(old); // A late old drop must not revoke its replacement.
         let cell = CellId::new("handoff".into());
         broker.mark_cell_ready_for_dispatch(&cell);
-        tokio::time::timeout(std::time::Duration::from_secs(10), broker.notify("handoff-parent".into(), cell, "replacement-only".into(), CancellationToken::new())).await?.map_err(anyhow::Error::msg)?;
+        // The retired worker is still alive and was spawned first, so only the
+        // dequeue fence keeps it from taking the queued notification.
+        tokio::time::timeout(std::time::Duration::from_secs(10), broker.notify("handoff-parent".into(), cell.clone(), "replacement-only".into(), CancellationToken::new())).await?.map_err(anyhow::Error::msg)?;
         let old_history = serde_json::to_string(&old_session.clone_history().await.into_raw_items())?;
         let new_history = serde_json::to_string(&new_session.clone_history().await.into_raw_items())?;
         assert!(!old_history.contains("replacement-only"));
         assert!(new_history.contains("replacement-only"));
+        drop(old); // A late old drop must not revoke its replacement.
+        tokio::time::timeout(std::time::Duration::from_secs(10), broker.notify("handoff-parent".into(), cell, "after-old-drop".into(), CancellationToken::new())).await?.map_err(anyhow::Error::msg)?;
+        let new_history = serde_json::to_string(&new_session.clone_history().await.into_raw_items())?;
+        assert!(new_history.contains("after-old-drop"));
         drop(replacement);
         Ok(())
     }

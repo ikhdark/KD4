@@ -83,8 +83,9 @@ async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTi
         .await;
     let inline = start.elapsed();
     let (mut response, mut started, mut completed) = (None, None, None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while response.is_none() || started.is_none() || completed.is_none() {
-        let envelope = tokio::time::timeout(Duration::from_secs(20), harness.outgoing_rx.recv())
+        let envelope = tokio::time::timeout_at(deadline, harness.outgoing_rx.recv())
             .await
             .expect("turn deadline")
             .expect("outgoing open");
@@ -166,16 +167,21 @@ fn turn_start_inline_cpu_split_benchmark() {
     for (label, bytes) in PAYLOADS {
         let line = turn_line(1, "00000000-0000-0000-0000-000000000000", &"x".repeat(bytes));
         let (mut parse, mut typed, mut estimate) = (Vec::new(), Vec::new(), Vec::new());
-        for _ in 0..WARMUP_ROUNDS + MEASURED_ROUNDS * 3 {
+        for round in 0..WARMUP_ROUNDS + MEASURED_ROUNDS * 3 {
             let start = Instant::now();
             let request = parse_request(&line);
-            parse.push(start.elapsed().as_secs_f64() * 1e6);
+            let parse_us = start.elapsed().as_secs_f64() * 1e6;
             let start = Instant::now();
             let client_request = super::super::deserialize_client_request(request).unwrap();
-            typed.push(start.elapsed().as_secs_f64() * 1e6);
+            let typed_us = start.elapsed().as_secs_f64() * 1e6;
             let start = Instant::now();
             let estimated = serialized_request_queue_bytes(true, &client_request);
-            estimate.push(start.elapsed().as_secs_f64() * 1e6);
+            let estimate_us = start.elapsed().as_secs_f64() * 1e6;
+            if round >= WARMUP_ROUNDS {
+                parse.push(parse_us);
+                typed.push(typed_us);
+                estimate.push(estimate_us);
+            }
             assert!(estimated >= bytes);
         }
         eprintln!(
@@ -183,6 +189,7 @@ fn turn_start_inline_cpu_split_benchmark() {
             json!({
                 "scenario": "turn-start-inline-cpu",
                 "payload": label,
+                "rounds": parse.len(),
                 "line_bytes": line.len(),
                 "median_transport_parse_us": median_us(&mut parse),
                 "median_typed_deserialize_us": median_us(&mut typed),

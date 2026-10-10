@@ -155,6 +155,26 @@ def test_source_sdk_package_declares_beta_documentation() -> None:
     }
 
 
+def test_live_runtime_fixture_rejects_failed_dependency_install(tmp_path, monkeypatch) -> None:
+    import test_real_app_server_integration as integration
+
+    monkeypatch.setattr(
+        integration,
+        "_run_command",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="installer output", stderr="dependency installation failed"
+        ),
+    )
+    monkeypatch.setattr(
+        integration,
+        "ensure_runtime_package_installed",
+        lambda *args, **kwargs: pytest.fail("runtime setup continued after dependency failure"),
+    )
+    factory = SimpleNamespace(mktemp=lambda _: tmp_path)
+    with pytest.raises(AssertionError, match="dependency installation failed"):
+        integration.runtime_env.__wrapped__(factory)
+
+
 def test_release_metadata_retries_without_invalid_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

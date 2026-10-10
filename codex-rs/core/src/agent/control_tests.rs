@@ -377,26 +377,29 @@ fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
     })
 }
 
-fn history_contains_assistant_inter_agent_communication(
+fn history_contains_inter_agent_communication(
     history_items: &[ResponseItem],
     expected: &InterAgentCommunication,
 ) -> bool {
+    // The session records mail as an AgentMessage and then assigns its id and
+    // turn metadata, so compare the fields the sender controls.
+    let ResponseItem::AgentMessage {
+        author: expected_author,
+        recipient: expected_recipient,
+        content: expected_content,
+        ..
+    } = expected.to_model_input_item()
+    else {
+        return false;
+    };
     history_items.iter().any(|item| {
-        let ResponseItem::Message { role, content, .. } = item else {
-            return false;
-        };
-        if role != "assistant" {
-            return false;
-        }
-        content.iter().any(|content_item| match content_item {
-            ContentItem::OutputText { text } => {
-                serde_json::from_str::<InterAgentCommunication>(text)
-                    .ok()
-                    .as_ref()
-                    == Some(expected)
-            }
-            ContentItem::InputText { .. } | ContentItem::InputImage { .. } => false,
-        })
+        matches!(
+            item,
+            ResponseItem::AgentMessage { author, recipient, content, .. }
+                if *author == expected_author
+                    && *recipient == expected_recipient
+                    && *content == expected_content
+        )
     })
 }
 
@@ -1017,7 +1020,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
         .await
         .raw_items()
         .to_vec();
-    assert!(!history_contains_assistant_inter_agent_communication(
+    assert!(!history_contains_inter_agent_communication(
         &history_items,
         &communication
     ));
@@ -2619,8 +2622,17 @@ fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                 .await
                 .expect("no-hint child thread should be registered");
             let no_hint_history = no_hint_child_thread.codex.session.clone_history().await;
-            assert!(
-                !history_contains_text(no_hint_history.raw_items(), "Child subagent guidance."),
+            // Without a hint the fork may only add what an absent hint renders to;
+            // neither the parent's nor a default hint may leak in.
+            let mut expected_no_hint_history = expected_history[..2].to_vec();
+            expected_no_hint_history.extend(
+                crate::context_manager::updates::build_developer_update_item(
+                    crate::stable_context::multi_agent_usage_hint_sections(None),
+                ),
+            );
+            assert_eq!(
+                strip_response_item_ids(no_hint_history.raw_items()),
+                strip_response_item_ids(&expected_no_hint_history),
                 "full-history forked child should not add empty subagent guidance"
             );
 
@@ -3584,10 +3596,47 @@ async fn resume_agent_releases_slot_after_resume_failure() {
     );
     let control = manager.agent_control();
 
-    let _ = control
-        .resume_agent_from_rollout(config.clone(), ThreadId::new(), SessionSource::Exec)
+    let resumable_id = control
+        .spawn_agent(
+            config.clone(),
+            text_input("hello"),
+            /*session_source*/ None,
+        )
         .await
-        .expect_err("resume should fail for missing rollout path");
+        .expect("spawn_agent should succeed");
+    let resumable_thread = manager
+        .get_thread(resumable_id)
+        .await
+        .expect("resumable thread");
+    persist_thread_for_tree_resume(&resumable_thread, "legacy resumable agent").await;
+    let _ = control
+        .shutdown_live_agent(resumable_id)
+        .await
+        .expect("shutdown resumable thread");
+
+    // A stored thread resumes far enough to reserve its slot; the closing
+    // parent then rejects it, so the failure happens while the slot is held.
+    let parent_thread_id = ThreadId::new();
+    let closing_parent = control.state.begin_closing_agent_tree(parent_thread_id);
+    let err = control
+        .resume_agent_from_rollout(
+            config.clone(),
+            resumable_id,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+        )
+        .await
+        .expect_err("resume should fail under a closing parent");
+    assert_matches!(
+        err,
+        CodexErr::UnsupportedOperation(message) if message.contains("is closing")
+    );
+    drop(closing_parent);
 
     let resumed_id = control
         .spawn_agent(config, text_input("hello"), /*session_source*/ None)
@@ -3718,20 +3767,19 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
         .expect("completion watcher finishes")
         .expect("completion watcher succeeds");
 
+    // Ops are only captured for live threads, so check every thread: a
+    // completion redirected to the root would show up here.
     assert!(
         !harness
             .manager
             .captured_ops()
             .into_iter()
-            .any(|(thread_id, op)| {
-                thread_id == worker_thread_id
-                    && matches!(
-                        op,
-                        Op::InterAgentCommunication { communication }
-                            if communication.author == tester_path
-                                && communication.recipient == worker_path
-
-                    )
+            .any(|(_, op)| {
+                matches!(
+                    op,
+                    Op::InterAgentCommunication { communication }
+                        if communication.author == tester_path
+                )
             })
     );
 
@@ -3749,7 +3797,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
         None,
     )
     .expect("completed status renders");
-    assert!(!history_contains_assistant_inter_agent_communication(
+    assert!(!history_contains_inter_agent_communication(
         &root_history_items,
         &InterAgentCommunication::new(
             tester_path,
@@ -3902,6 +3950,23 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     .await
     .expect("completion watcher should queue a direct-parent message");
 
+    // Delivered mail waits in a mailbox, not in history, so a duplicate sent to
+    // the root is only visible as a captured op.
+    assert!(
+        !harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id != worker_thread_id
+                    && matches!(
+                        op,
+                        Op::InterAgentCommunication { communication }
+                            if communication.author == tester_path
+                    )
+            })
+    );
+
     let root_history_items = root_thread
         .codex
         .session
@@ -3909,7 +3974,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         .await
         .raw_items()
         .to_vec();
-    assert!(!history_contains_assistant_inter_agent_communication(
+    assert!(!history_contains_inter_agent_communication(
         &root_history_items,
         &InterAgentCommunication::new(
             tester_path,
@@ -4705,11 +4770,12 @@ fn list_agent_subtree_thread_ids_includes_anonymous_and_closed_descendants() {
             .await
             .expect("reviewer spawn should succeed");
 
+            // close_agent, unlike a plain shutdown, persists the edge as Closed.
             let _ = harness
                 .control
-                .shutdown_live_agent(no_path_grandchild_thread_id)
+                .close_agent(no_path_grandchild_thread_id)
                 .await
-                .expect("no-path grandchild shutdown should succeed");
+                .expect("no-path grandchild close should succeed");
 
             let mut worker_subtree_thread_ids = harness
                 .manager

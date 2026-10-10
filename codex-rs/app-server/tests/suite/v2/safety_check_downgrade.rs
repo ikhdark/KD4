@@ -19,7 +19,6 @@ use codex_app_server_protocol::TurnModerationMetadataNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
-use codex_app_server_protocol::WarningNotification;
 use core_test_support::require_network;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -253,9 +252,8 @@ async fn response_model_field_mismatch_emits_model_rerouted_notification_v2_when
 }
 
 #[tokio::test]
-async fn model_verification_emits_typed_notification_and_warning_v2() -> Result<()> {
+async fn model_verification_emits_typed_notification_without_a_warning_v2() -> Result<()> {
     require_network!();
-    const REQUESTED_MODEL: &str = "gpt-5.5";
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -310,24 +308,21 @@ async fn model_verification_emits_typed_notification_and_warning_v2() -> Result<
     .await??;
     let turn_start: TurnStartResponse = to_response(turn_resp)?;
 
-    let (verification, warning) =
-        collect_model_verification_notifications_and_warning(&mut mcp).await?;
+    let (verification, warnings) = collect_model_verification_and_warnings(&mut mcp).await?;
     assert_eq!(
         verification,
         ModelVerificationNotification {
-            thread_id: thread.id.clone(),
+            thread_id: thread.id,
             turn_id: turn_start.turn.id,
             verifications: vec![ModelVerification::TrustedAccessForCyber],
         }
     );
+    // The fixture model is unknown to the catalog; verification itself adds no warning.
     assert_eq!(
-        warning,
-        WarningNotification {
-            thread_id: Some(thread.id),
-            message: format!(
-                "Code Mode is enabled in configuration, but model `{REQUESTED_MODEL}` does not advertise Code Mode support. This may degrade model performance. Disable `features.code_mode` and `features.code_mode_only`, or select a model whose metadata enables Code Mode."
-            ),
-        }
+        warnings,
+        vec![format!(
+            "Model metadata for `{REQUESTED_MODEL}` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."
+        )]
     );
 
     Ok(())
@@ -459,11 +454,12 @@ async fn collect_turn_notifications_and_validate_no_warning_item(
     }
 }
 
-async fn collect_model_verification_notifications_and_warning(
+/// Returns the verification notification and every `warning` message seen up to `turn/completed`.
+async fn collect_model_verification_and_warnings(
     mcp: &mut TestAppServer,
-) -> Result<(ModelVerificationNotification, WarningNotification)> {
+) -> Result<(ModelVerificationNotification, Vec<String>)> {
     let mut verification = None;
-    let mut warning = None;
+    let mut warnings = Vec::new();
 
     loop {
         let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
@@ -479,10 +475,12 @@ async fn collect_model_verification_notifications_and_warning(
                 verification = Some(payload);
             }
             "warning" => {
-                let params = notification
+                let message = notification
                     .params
-                    .ok_or_else(|| anyhow::anyhow!("warning notifications must include params"))?;
-                warning = Some(serde_json::from_value(params)?);
+                    .as_ref()
+                    .and_then(|params| params["message"].as_str())
+                    .ok_or_else(|| anyhow::anyhow!("warning notifications must include a message"))?;
+                warnings.push(message.to_string());
             }
             "model/rerouted" => {
                 anyhow::bail!("verification-only response must not emit model/rerouted");
@@ -507,10 +505,7 @@ async fn collect_model_verification_notifications_and_warning(
                         "expected model/verification notification before turn/completed"
                     )
                 })?;
-                let warning = warning.ok_or_else(|| {
-                    anyhow::anyhow!("expected warning notification before turn/completed")
-                })?;
-                return Ok((verification, warning));
+                return Ok((verification, warnings));
             }
             _ => {}
         }

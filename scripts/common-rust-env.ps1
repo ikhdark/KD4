@@ -80,7 +80,12 @@ function ConvertTo-CodexRustByteSize {
         "P" = [decimal]1125899906842624
         "E" = [decimal]1152921504606846976
     }
-    $bytes = $number * $multipliers[$matches[2].ToUpperInvariant()]
+    $multiplier = $multipliers[$matches[2].ToUpperInvariant()]
+    # Reject out-of-range counts before multiplication can overflow Decimal.
+    if ($number -gt ([decimal][int64]::MaxValue / $multiplier)) {
+        return $null
+    }
+    $bytes = $number * $multiplier
     if ($bytes -ne [decimal]::Truncate($bytes) -or $bytes -gt [int64]::MaxValue) {
         return $null
     }

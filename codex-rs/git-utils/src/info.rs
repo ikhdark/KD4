@@ -1670,8 +1670,21 @@ mod tests {
         );
         let head = run_git(&repo, &["rev-parse", "HEAD"]);
         run_git(&repo, &["update-ref", "refs/remotes/origin/closer", &head]);
+        let branches = [branch, "closer".to_string()];
         assert_eq!(
-            find_closest_sha(&repo, &[branch, "closer".to_string()], &remotes).await,
+            find_closest_sha(&repo, &branches, &remotes).await,
+            Some(GitSha::new(&head))
+        );
+        // Without a zero-distance candidate the smaller distance (1 against 2)
+        // must win whichever branch is visited first.
+        run_git(&repo, &["commit", "--allow-empty", "-m", "local again"]);
+        assert_eq!(
+            find_closest_sha(&repo, &branches, &remotes).await,
+            Some(GitSha::new(&head))
+        );
+        let [branch, closer] = branches;
+        assert_eq!(
+            find_closest_sha(&repo, &[closer, branch], &remotes).await,
             Some(GitSha::new(&head))
         );
     }

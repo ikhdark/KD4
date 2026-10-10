@@ -777,7 +777,8 @@ mod tests {
         assert!(
             matches!(thread_id_from_rollout(&path).await, RolloutThreadId::Id(id) if id == metadata_id)
         );
-        // Identity is read from the metadata head; a full scan would fail on this tail.
+        // A corrupt tail after the metadata head must not change the identity. The full-scan
+        // fallback skips such a record and agrees, so this does not pin the head-only read.
         let mut contents = std::fs::read(&path).unwrap();
         contents.extend_from_slice(b"\xff\xfe not utf-8\n");
         std::fs::write(&path, contents).unwrap();

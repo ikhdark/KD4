@@ -478,6 +478,8 @@ mod tests {
             hooks: vec![
                 hook("path:new", HookTrustStatus::Untrusted),
                 hook("path:changed", HookTrustStatus::Modified),
+                // Already trusted: must stay out of the review count and the trust-all write.
+                hook("path:trusted", HookTrustStatus::Trusted),
             ],
             warnings: Vec::new(),
             errors: Vec::new(),
@@ -513,6 +515,13 @@ mod tests {
         let mut entry = entry();
         assert!(!review_is_needed(/*bypass_hook_trust*/ true, &entry));
         assert!(review_is_needed(/*bypass_hook_trust*/ false, &entry));
+        entry.hooks = vec![
+            hook("path:trusted", HookTrustStatus::Trusted),
+            hook("path:managed", HookTrustStatus::Managed),
+        ];
+        for bypass in [false, true] {
+            assert!(!review_is_needed(bypass, &entry));
+        }
         entry.hooks.clear();
         for bypass in [false, true] {
             assert!(!review_is_needed(bypass, &entry));

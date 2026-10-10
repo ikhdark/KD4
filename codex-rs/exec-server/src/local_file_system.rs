@@ -1608,14 +1608,17 @@ mod tests {
         std::fs::create_dir_all(source.join("sub"))?;
         std::fs::create_dir(&destination)?;
         std::fs::write(source.join("a.txt"), b"original")?;
-        std::fs::write(source.join("sub/a.txt"), b"replacement")?;
         if file_alias {
+            std::fs::write(source.join("sub/a.txt"), b"replacement")?;
             std::fs::create_dir(destination.join("sub"))?;
             std::os::windows::fs::symlink_file(
                 source.join("a.txt"),
                 destination.join("sub/a.txt"),
             )?;
         } else {
+            // Directories only below `sub`: a file there would be rejected by the
+            // file-level check even if the directory-level one were missing.
+            std::fs::create_dir(source.join("sub/nested"))?;
             std::os::windows::fs::symlink_dir(&source, destination.join("sub"))?;
         }
         let error = DirectFileSystem
@@ -1629,7 +1632,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(std::fs::read(source.join("a.txt"))?, b"original");
-        assert_eq!(std::fs::read(source.join("sub/a.txt"))?, b"replacement");
+        if file_alias {
+            assert_eq!(std::fs::read(source.join("sub/a.txt"))?, b"replacement");
+        } else {
+            assert!(!source.join("nested").exists());
+        }
         Ok(())
     }
 

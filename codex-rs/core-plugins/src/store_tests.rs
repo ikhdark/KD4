@@ -272,7 +272,13 @@ fn remote_plugin_install_metadata_follows_installed_cache_lifecycle() {
     let source = AbsolutePathBuf::try_from(tmp.path().join("sample-plugin")).unwrap();
 
     assert_eq!(store.remote_plugin_id(&plugin_id).unwrap(), None);
-    assert!(store.write_remote_plugin_id(&plugin_id, "plugins~Plugin_sample").is_err());
+    assert_eq!(
+        store
+            .write_remote_plugin_id(&plugin_id, "plugins~Plugin_sample")
+            .unwrap_err()
+            .to_string(),
+        "cannot write remote identity for uninstalled plugin `sample-plugin@openai-curated-remote`"
+    );
     assert!(!store.plugin_base_root(&plugin_id).exists());
 
     store
@@ -449,9 +455,10 @@ fn active_plugin_version_reads_version_directory_name() {
 #[test]
 fn active_plugin_version_prefers_default_local_version_when_multiple_versions_exist() {
     let tmp = tempdir().unwrap();
+    // A semantic version sorts after `local`, so only the default preference selects `local`.
     write_plugin(
         &tmp.path().join("plugins/cache/debug"),
-        "sample-plugin/0123456789abcdef",
+        "sample-plugin/10.0.0",
         "sample-plugin",
     );
     write_plugin(
@@ -767,18 +774,33 @@ fn active_plugin_version_orders_mixed_versions_consistently() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
 #[test]
-fn install_rejects_unsupported_socket_entries() {
+fn install_rejects_unsupported_junction_entries() {
     let tmp = tempdir().unwrap();
     write_plugin(tmp.path(), "source", "sample-plugin");
     let source = tmp.path().join("source");
-    let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("payload"), "outside the plugin").unwrap();
+    // Directory junctions do not require Windows symlink privileges.
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(source.join("linked"))
+        .arg(&outside)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
     let store = PluginStore::new(tmp.path().to_path_buf());
     let id = PluginId::new("sample-plugin".to_string(), "debug".to_string()).unwrap();
     let error = store
         .install(AbsolutePathBuf::try_from(source).unwrap(), id.clone())
         .unwrap_err();
-    assert!(error.to_string().contains("unsupported"));
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported plugin source entry type"),
+        "{error}"
+    );
     assert!(!store.is_installed(&id));
 }

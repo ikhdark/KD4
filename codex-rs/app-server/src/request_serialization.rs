@@ -933,11 +933,18 @@ mod tests {
 
     #[tokio::test]
     async fn turn_interrupt_uses_the_thread_control_lane() {
+        let interrupt = codex_app_server_protocol::ClientRequest::TurnInterrupt {
+            request_id: codex_app_server_protocol::RequestId::Integer(1),
+            params: codex_app_server_protocol::TurnInterruptParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+        };
         let (key, access) = RequestSerializationQueueKey::from_scope(
             ConnectionId(1),
-            ClientRequestSerializationScope::ThreadControl {
-                thread_id: "thread-1".to_string(),
-            },
+            interrupt
+                .serialization_scope()
+                .expect("turn/interrupt is serialized"),
         )
         .await;
         let (mutation_key, mutation_access) = RequestSerializationQueueKey::from_scope(

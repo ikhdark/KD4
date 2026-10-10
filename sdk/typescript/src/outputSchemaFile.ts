@@ -16,6 +16,13 @@ export async function createOutputSchemaFile(schema: unknown): Promise<OutputSch
     throw new Error("outputSchema must be a plain JSON object");
   }
 
+  const serializedSchema = JSON.stringify(schema);
+  // Objects with toJSON (for example Date) can serialize to a non-object.
+  // Validate the actual JSON document before creating a temporary file.
+  if (!serializedSchema?.startsWith("{")) {
+    throw new Error("outputSchema must be a plain JSON object");
+  }
+
   const schemaDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-output-schema-"));
   const schemaPath = path.join(schemaDir, "schema.json");
   const cleanup = async () => {
@@ -27,7 +34,7 @@ export async function createOutputSchemaFile(schema: unknown): Promise<OutputSch
   };
 
   try {
-    await fs.writeFile(schemaPath, JSON.stringify(schema), "utf8");
+    await fs.writeFile(schemaPath, serializedSchema, "utf8");
     return { schemaPath, cleanup };
   } catch (error) {
     await cleanup();

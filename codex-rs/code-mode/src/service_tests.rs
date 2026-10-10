@@ -86,7 +86,8 @@ await new Promise(() => {});
     drop(started);
     service.shutdown().await.unwrap();
     drop(service);
-    let restored = InProcessCodeModeSession::new();
+    // The same counting delegate, so a replayed effect would be recorded.
+    let restored = InProcessCodeModeSession::with_delegate(delegate.clone());
     assert_eq!(restored.wait(WaitRequest {
         cell_id: id, yield_time_ms: 1,
         recovery: Some(crate::ReceiptRecovery { path: path.clone(), terminal_only: false }),
@@ -594,12 +595,20 @@ async fn namespace_aliases_do_not_shadow_tools_or_inherit_prototype_members() {
                     tool_name: ToolName::plain(name),
                     ..exec_command_definition()
                 })
+                // A flat `__proto____run` derives no alias; only a registered
+                // namespace puts the `__proto__` key in front of the installer.
+                .chain(std::iter::once(ToolDefinition {
+                    name: "proto_run".to_string(),
+                    tool_name: ToolName::namespaced("__proto__", "run"),
+                    ..exec_command_definition()
+                }))
                 .collect(),
             source: r#"
 text(await tools.web({query: "canonical namespace collision"}));
 text(await tools.web__run({query: "flat survives"}));
 text({noAlias: tools.web.run === undefined,
       noInheritedMember: tools.other.toString === undefined,
+      ownProtoNamespace: typeof Object.getOwnPropertyDescriptor(tools, "__proto__")?.value?.run === "function",
       prototypeUnchanged: Object.getPrototypeOf(tools) === Object.prototype,
       noPollution: Object.prototype.run === undefined});
 "#
@@ -618,7 +627,8 @@ text({noAlias: tools.web.run === undefined,
         vec![
             serde_json::json!({"tool":"web", "input":{"query":"canonical namespace collision"}}),
             serde_json::json!({"tool":"web__run", "input":{"query":"flat survives"}}),
-            serde_json::json!({"noAlias":true, "noInheritedMember":true, "prototypeUnchanged":true, "noPollution":true}),
+            serde_json::json!({"noAlias":true, "noInheritedMember":true, "ownProtoNamespace":true,
+                "prototypeUnchanged":true, "noPollution":true}),
         ]
     );
 }

@@ -616,8 +616,22 @@ mod tests {
     #[tokio::test]
     async fn debug_sandbox_defaults_legacy_configs_to_read_only() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        // An empty config already resolves to read-only, so give the fallback an ambient
+        // legacy mode that it must not inherit.
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "sandbox_mode = \"danger-full-access\"\n",
+        )?;
         let codex_home_path = codex_home.path().to_path_buf();
 
+        let ambient_config = build_debug_sandbox_config(
+            Vec::new(),
+            ConfigOverrides::default(),
+            Some(codex_home_path.clone()),
+            ManagedRequirementsMode::Include,
+            /*strict_config*/ false,
+        )
+        .await?;
         let read_only_config = build_debug_sandbox_config(
             Vec::new(),
             ConfigOverrides {
@@ -645,6 +659,11 @@ mod tests {
         .await?;
 
         assert!(!config_uses_permission_profiles(&config));
+        assert_ne!(
+            ambient_config.permissions.file_system_sandbox_policy(),
+            read_only_config.permissions.file_system_sandbox_policy(),
+            "test fixture should distinguish the ambient sandbox_mode from read-only"
+        );
         assert_eq!(
             config.permissions.file_system_sandbox_policy(),
             read_only_config.permissions.file_system_sandbox_policy(),

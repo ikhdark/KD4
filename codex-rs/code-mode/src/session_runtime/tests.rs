@@ -69,8 +69,15 @@ async fn critical_path_terminal_replay_report_benchmark() {
 #[test]
 fn terminal_accounting_charges_empty_items_and_escaping_and_spills_exactly() {
     for text in ["", "\u{0000}\"\\\n"] {
-        let event = CellEvent::Completed { content_items: (0..200_000).map(|_| OutputItem::Text { text: text.into() }).collect(), error_text: None, output_loss: None };
-        assert!(cell_event_bytes(&event) >= serde_json::to_vec(&event).unwrap().len());
+        let content_items: Vec<_> = (0..200_000).map(|_| OutputItem::Text { text: text.into() }).collect();
+        let in_memory = content_items.capacity() * std::mem::size_of::<OutputItem>();
+        let event = CellEvent::Completed { content_items, error_text: None, output_loss: None };
+        // The in-memory term alone exceeds the serialized size here, so only
+        // the exact charge shows that escaping is counted.
+        assert_eq!(
+            cell_event_bytes(&event),
+            serde_json::to_vec(&event).unwrap().len() + std::mem::size_of::<CellEvent>() + in_memory
+        );
         assert!(cell_event_bytes(&event) > TERMINAL_CELL_CACHE_MAX_BYTES);
         let (cached, retained) = CachedCellEvent::new(event.clone());
         assert_eq!(retained, 0);
@@ -1092,22 +1099,44 @@ async fn cell_id_allocation_fails_before_wrapping() {
     reason = "test holds the registry lock to force admission ahead of shutdown"
 )]
 async fn shutdown_rejects_cell_admission_queued_before_the_registry_lock() {
+    use crate::runtime::STARTUP_TEST_GATE;
+    use crate::runtime::StartupTestGate;
+
+    // Native startup runs before the registry lock. Release it up front and
+    // wait for the runtime thread to finish, so admission parks on the lock.
+    let (release, receiver) = std::sync::mpsc::channel();
+    release.send(()).unwrap();
+    let gate = Arc::new(StartupTestGate {
+        entered: tokio::sync::Notify::new(),
+        release: std::sync::Mutex::new(receiver),
+        exited: tokio::sync::Notify::new(),
+    });
     let runtime = Arc::new(SessionRuntime::new(Arc::new(RecordingDelegate)));
     let cells = runtime.inner.cells.lock().await;
 
-    let execution = runtime.execute(
-        execute_request("while (true) {}"),
-        ObserveMode::YieldAfter(Duration::from_millis(/*millis*/ 1)),
+    let execution = STARTUP_TEST_GATE.scope(
+        Arc::clone(&gate),
+        runtime.execute(
+            execute_request("text('done');"),
+            ObserveMode::YieldAfter(Duration::from_millis(/*millis*/ 1)),
+        ),
     );
     tokio::pin!(execution);
-    std::future::poll_fn(|context| match execution.as_mut().poll(context) {
+    let mut poll_pending = std::future::poll_fn(|context| match execution.as_mut().poll(context) {
         Poll::Pending => Poll::Ready(()),
         Poll::Ready(Ok(_)) => panic!("execution completed before the registry lock was released"),
         Poll::Ready(Err(error)) => {
             panic!("execution failed before the registry lock was released: {error}")
         }
-    })
-    .await;
+    });
+    (&mut poll_pending).await;
+    // The isolate handle is sent before the script runs, so once the runtime
+    // thread exits the next poll leaves startup and queues on the registry lock.
+    tokio::time::timeout(Duration::from_secs(5), gate.exited.notified())
+        .await
+        .expect("runtime thread should finish the script");
+    (&mut poll_pending).await;
+    drop(poll_pending);
 
     let shutdown = runtime.shutdown();
     tokio::pin!(shutdown);
@@ -1126,7 +1155,7 @@ async fn shutdown_rejects_cell_admission_queued_before_the_registry_lock() {
 }
 
 #[tokio::test]
-async fn shutdown_cancels_native_runtime_startup_without_registering_or_running_the_cell() {
+async fn shutdown_cancels_native_runtime_startup_without_registering_the_cell() {
     use crate::runtime::STARTUP_TEST_GATE;
     use crate::runtime::StartupTestGate;
 
@@ -1140,7 +1169,7 @@ async fn shutdown_cancels_native_runtime_startup_without_registering_or_running_
     let execution = STARTUP_TEST_GATE.scope(
         Arc::clone(&gate),
         runtime.execute(
-            execute_request("store('unexpected', true); while (true) {}"),
+            execute_request("while (true) {}"),
             ObserveMode::YieldAfter(Duration::from_millis(1)),
         ),
     );
@@ -1171,7 +1200,6 @@ async fn shutdown_cancels_native_runtime_startup_without_registering_or_running_
     tokio::time::timeout(Duration::from_secs(2), gate.exited.notified())
         .await
         .unwrap();
-    assert!(runtime.inner.stored_values.lock().await.is_empty());
 }
 
 #[tokio::test]

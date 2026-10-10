@@ -1728,6 +1728,19 @@ fn surfaced_result_without_canonical_message_clears_plain_output_and_stays_typed
         value: serde_json::json!({"answer": 42}),
         canonical_message: None,
     };
+    let _ = processor.collect_thread_events(ServerNotification::ItemCompleted(
+        ItemCompletedNotification {
+            item: ThreadItem::AgentMessage {
+                id: "streamed".to_string(),
+                text: "streamed plain output".to_string(),
+                phase: None,
+            },
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+        },
+    ));
+    assert_eq!(processor.final_message(), Some("streamed plain output"));
 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
@@ -1754,13 +1767,12 @@ fn surfaced_result_without_canonical_message_clears_plain_output_and_stays_typed
     ));
 
     assert_eq!(processor.final_message(), None);
-    assert!(completed.events.iter().any(|event| {
-        matches!(
-            event,
-            ThreadEvent::TurnCompleted(completed)
-                if completed.surfaced_result.as_ref() == Some(&surfaced_result)
-        )
-    }));
+    // The stale turn item has an id the stream never delivered, so without the
+    // owner result it would be recovered as an agent message item here.
+    let [ThreadEvent::TurnCompleted(receipt)] = completed.events.as_slice() else {
+        panic!("only the turn receipt is emitted: {:?}", completed.events);
+    };
+    assert_eq!(receipt.surfaced_result.as_ref(), Some(&surfaced_result));
 }
 
 #[test]

@@ -264,6 +264,14 @@ mod tests {
         assert_eq!(install_method_label(&InstallMethod::Npm), "npm");
         assert_eq!(install_method_label(&InstallMethod::Bun), "bun");
         assert_eq!(install_method_label(&InstallMethod::Pnpm), "pnpm");
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            install_method_label(&InstallMethod::Standalone {
+                release_dir: absolute_temp_path(&dir, "release"),
+                resources_dir: None,
+            }),
+            standalone_install_method_label(cfg!(windows))
+        );
         assert_eq!(standalone_install_method_label(true), "standalone-windows");
         assert_eq!(standalone_install_method_label(false), "standalone-unix");
     }

@@ -18,7 +18,9 @@ impl Provider {
         #[cfg(windows)]
         let (command, args, name, script) = (
             "cmd.exe",
-            vec!["/d", "/s", "/c", "provider.cmd"],
+            // cmd.exe skips the current directory when
+            // NoDefaultCurrentDirectoryInExePath is set, so name it.
+            vec!["/d", "/s", "/c", ".\\provider.cmd"],
             "provider.cmd",
             "@echo off\r\nif exist fail exit /b 1\r\nif exist started goto second\r\necho started>started\r\n:wait\r\nif not exist release goto wait\r\necho first-token\r\nexit /b 0\r\n:second\r\necho started>second\r\necho second-token\r\n",
         );

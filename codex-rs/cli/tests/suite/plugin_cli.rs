@@ -495,6 +495,13 @@ async fn marketplace_list_includes_root_when_plugins_are_filtered_out() -> Resul
     let (codex_home, source) = setup_local_marketplace_with_explicit_empty_products()?;
     let expected_row = marketplace_list_row("debug", source.path());
 
+    // Control: the empty product list really does filter out the only plugin.
+    codex_command(codex_home.path())?
+        .args(["plugin", "list"])
+        .assert()
+        .success()
+        .stdout(contains("No marketplace plugins found."));
+
     codex_command(codex_home.path())?
         .args(["plugin", "marketplace", "list"])
         .assert()

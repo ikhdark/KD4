@@ -1085,7 +1085,9 @@ mod tests {
 
     #[tokio::test]
     async fn injected_response_item_wakes_a_suspended_owner_observer() {
-        let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let exec = ExecContext { session: Arc::new(session), turn: Arc::new(turn) };
+        let session = Arc::clone(&exec.session);
         let turn_state = {
             let mut active_turn = session.active_turn.lock().await;
             Arc::clone(
@@ -1112,7 +1114,7 @@ mod tests {
                     std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>().await
                 },
                 &cancellation,
-                next_input_activity(activity_rx, pending_activity),
+                queued_input_activity(&exec, Some(turn_state.as_ref()), activity_rx),
                 "wait cancelled",
             )
             .await

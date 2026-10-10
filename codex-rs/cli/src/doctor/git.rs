@@ -349,6 +349,21 @@ mod tests {
         );
         assert_eq!(
             old_windows_git_warning(
+                Some("git version 2.35.0.windows.1"),
+                /*is_windows*/ true
+            ),
+            None
+        );
+        assert_eq!(
+            old_windows_git_warning(
+                Some("git version 1.9.5.msysgit.1"),
+                /*is_windows*/ true
+            )
+            .as_deref(),
+            Some("old msysgit installation may corrupt Windows TUI rendering")
+        );
+        assert_eq!(
+            old_windows_git_warning(
                 Some("git version 2.34.1.windows.1"),
                 /*is_windows*/ false
             ),
@@ -478,6 +493,19 @@ mod tests {
 
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.details.contains(&"PATH git entries: 2".to_string()));
+        assert!(
+            check
+                .details
+                .contains(&r"PATH git #1: C:\Program Files\Git\cmd\git.exe".to_string())
+        );
+        assert!(
+            check
+                .details
+                .contains(&r"PATH git #2: D:\Tools\Git\cmd\git.exe".to_string())
+        );
+        assert!(check.details.contains(&"repo detected: true".to_string()));
+        assert!(check.details.contains(&r"repo root: C:\repo".to_string()));
+        assert!(check.details.contains(&".git entry: directory".to_string()));
         assert!(check.details.contains(&"git branch: main".to_string()));
         assert!(check.details.contains(&"core.fsmonitor: false".to_string()));
     }

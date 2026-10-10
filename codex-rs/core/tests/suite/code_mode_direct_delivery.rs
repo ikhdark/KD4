@@ -670,6 +670,7 @@ if (closed.obligations.unresolved.length) throw Error('work remains');
 text('Required work completed.');"#), ev_completed("fallback"),
     ])).await;
     let completed = test.submit_turn_and_capture_completion("Inspect and verify the source.").await?;
+    assert!(completed.error.is_none(), "{completed:?}");
     assert!(completed.surfaced_result.is_some());
     assert_eq!(completed.last_agent_message.as_deref(),
         Some("verified result"));

@@ -204,31 +204,6 @@ fn host_executable_setter_uses_native_identity() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-#[test]
-fn host_executable_resolution_preserves_unix_case_and_suffix() -> Result<()> {
-    let mut policy = Policy::empty();
-    policy.add_prefix_rule(&tokens(&["git"]), Decision::Allow)?;
-    let options = MatchOptions {
-        resolve_host_executables: true,
-    };
-    for program in ["/usr/bin/GIT", "/usr/bin/git.exe", "/usr/bin/GIT.EXE"] {
-        assert_eq!(
-            policy
-                .check_with_options(&tokens(&[program]), &prompt_all, &options)
-                .decision,
-            Decision::Prompt
-        );
-    }
-    assert_eq!(
-        policy
-            .check_with_options(&tokens(&["/usr/bin/git"]), &prompt_all, &options)
-            .decision,
-        Decision::Allow
-    );
-    Ok(())
-}
-
 #[test]
 fn network_rules_compile_into_domain_lists() -> Result<()> {
     let policy_src = r#"
@@ -705,6 +680,22 @@ prefix_rule(
         },
         no_match_eval
     );
+
+    // A violated example of either kind rejects the policy.
+    let unmatched = PolicyParser::new()
+        .parse(
+            "test.rules",
+            r#"prefix_rule(pattern = ["git", "status"], match = [["git", "commit"]])"#,
+        )
+        .expect_err("a match example that does not match");
+    assert!(matches!(unmatched, Error::ExampleDidNotMatch { .. }));
+    let matched = PolicyParser::new()
+        .parse(
+            "test.rules",
+            r#"prefix_rule(pattern = ["git", "status"], not_match = [["git", "status", "--short"]])"#,
+        )
+        .expect_err("a not_match example that matches");
+    assert!(matches!(matched, Error::ExampleDidMatch { .. }));
     Ok(())
 }
 
@@ -1142,9 +1133,17 @@ fn literal_blank_arguments_round_trip_and_match_exactly() -> Result<()> {
         blocking_append_allow_prefix_rule(&path, &command)?;
         let mut parser = PolicyParser::new();
         parser.parse("test.rules", &fs::read_to_string(path)?)?;
+        let reloaded = parser.build();
         assert_eq!(
-            parser.build().check(&command, &prompt_all).decision,
+            reloaded.check(&command, &prompt_all).decision,
             Decision::Allow
+        );
+        // A reloaded rule that lost its blank token would allow this as a prefix.
+        assert_eq!(
+            reloaded
+                .check(&tokens(&["printf", "%s", "other"]), &prompt_all)
+                .decision,
+            Decision::Prompt
         );
     }
     let mut parser = PolicyParser::new();

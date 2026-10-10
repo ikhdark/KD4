@@ -187,7 +187,6 @@ impl AuthProvider for BedrockSigV4AuthProvider {
 
 #[cfg(test)]
 mod tests {
-    use codex_api::AuthProvider;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
 
@@ -231,9 +230,17 @@ mod tests {
         );
         assert_eq!(first.unwrap().region(), "us-west-2");
         assert_eq!(second.unwrap().region(), "us-west-2");
-        let initialized = cell.get().expect("SDK context initialized");
-        resolve_auth_method(None, &aws, BedrockEndpoint::Runtime, &cell).await.unwrap();
-        assert!(std::ptr::eq(initialized, cell.get().unwrap()));
+        assert!(cell.get().is_some(), "SDK context initialized");
+        // A OnceCell never moves its value, so its address cannot show reuse. A
+        // call that would load a different region must return the cached context.
+        let other_region = ModelProviderAwsAuthInfo {
+            profile: aws.profile.clone(),
+            region: Some("eu-west-1".into()),
+        };
+        let reused = resolve_auth_method(None, &other_region, BedrockEndpoint::Runtime, &cell)
+            .await
+            .unwrap();
+        assert_eq!(reused.region(), "us-west-2");
         let managed = BedrockApiKeyAuth { api_key: "rotated".into(), region: "eu-west-1".into() };
         let method = resolve_auth_method(
             Some(&managed),
@@ -247,6 +254,15 @@ mod tests {
             "Bearer rotated",
         );
         assert_eq!(cell.get().unwrap().region(), "us-west-2");
+        // That cell was already initialized; only a fresh one can show the bypass.
+        let untouched = tokio::sync::OnceCell::new();
+        resolve_auth_method(
+            Some(&managed),
+            &ModelProviderAwsAuthInfo { profile: None, region: None },
+            BedrockEndpoint::Runtime,
+            &untouched,
+        ).await.unwrap();
+        assert!(untouched.get().is_none(), "managed auth must not initialize the SDK context");
     }
 
     #[tokio::test]
@@ -300,21 +316,18 @@ mod tests {
             },
         )
         .expect("configured region should resolve");
-        let provider = BearerAuthProvider {
-            token: Some(token),
-            account_id: None,
-            is_fedramp_account: false,
-        };
+        let method = BedrockAuthMethod::EnvBearerToken { token, region };
+        assert_eq!(method.region(), "us-west-2");
+        let provider = method.into_provider(BedrockEndpoint::Mantle);
         let mut headers = http::HeaderMap::new();
 
         provider.add_auth_headers(&mut headers);
 
-        assert_eq!(region, "us-west-2");
-        assert!(
+        assert_eq!(
             headers
                 .get(http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("Bearer bedrock-api-key-"))
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer bedrock-api-key-test")
         );
     }
 

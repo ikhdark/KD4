@@ -197,5 +197,14 @@ mod tests {
         s.jump_bottom(len, vis);
         assert_eq!(s.selected_idx, Some(9));
         assert_eq!(s.scroll_top, 6);
+
+        // 9 -> 5 -> 1, then the third page-up clamps at the first row.
+        s.page_up_clamped(len, vis);
+        s.page_up_clamped(len, vis);
+        assert_eq!(s.selected_idx, Some(1));
+        assert_eq!(s.scroll_top, 1);
+        s.page_up_clamped(len, vis);
+        assert_eq!(s.selected_idx, Some(0));
+        assert_eq!(s.scroll_top, 0);
     }
 }

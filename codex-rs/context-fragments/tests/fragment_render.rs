@@ -34,6 +34,29 @@ fn model_context_budget_enforces_aggregate_limit() {
 }
 
 #[test]
+fn model_context_budget_rejects_whole_items_without_spending_remaining_bytes() {
+    let mut budget = ModelContextBudget::new(2);
+    assert!(budget.try_take("abc"));
+    assert_eq!(budget.remaining_bytes(), 5);
+
+    // A rejected structured item must leave room for later, smaller items.
+    // Count UTF-8 bytes, not characters, and never admit a partial item.
+    assert!(!budget.try_take("😀é"));
+    assert_eq!(budget.remaining_bytes(), 5);
+    assert!(!budget.try_take_bytes(6));
+    assert_eq!(budget.remaining_bytes(), 5);
+    assert!(budget.try_take("😀"));
+    assert_eq!(budget.remaining_bytes(), 1);
+    assert!(budget.try_take_bytes(1));
+    assert_eq!(budget.remaining_bytes(), 0);
+    assert!(!budget.try_take("x"));
+    assert!(!budget.try_take_bytes(1));
+    assert!(budget.try_take(""));
+    assert!(budget.try_take_bytes(0));
+    assert_eq!(budget.remaining_bytes(), 0);
+}
+
+#[test]
 fn model_context_budget_truncates_at_utf8_boundary() {
     let mut budget = ModelContextBudget::new(9);
     let text = format!("a{}z", "😀".repeat(20));
@@ -220,6 +243,48 @@ fn additional_context_developer_render_uses_application_wrapper() {
         "<application_context source=\"automation_info\" kind=\"application\">\n\
 run &lt;trusted&gt; &amp; inspect\n\
 </application_context>"
+    );
+}
+
+#[test]
+fn additional_context_conversions_preserve_authority_and_escaped_payload() {
+    fn check<F: ContextualUserFragment + Clone + 'static>(
+        fragment: F,
+        role: &str,
+        expected_text: &str,
+    ) {
+        let content = vec![ContentItem::InputText {
+            text: expected_text.to_string(),
+        }];
+        let expected = ResponseItem::Message {
+            id: None,
+            role: role.to_string(),
+            content: content.clone(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        assert_eq!(ContextualUserFragment::into(fragment.clone()), expected);
+        let boxed: Box<dyn ContextualUserFragment> = Box::new(fragment.clone());
+        assert_eq!(boxed.into_boxed_response_item(), expected);
+        assert_eq!(
+            fragment.into_response_input_item(),
+            ResponseInputItem::Message {
+                role: role.to_string(),
+                content,
+                phase: None,
+            }
+        );
+    }
+
+    check(
+        AdditionalContextUserFragment::new("source&".to_string(), "<data> 😀".to_string()),
+        "user",
+        "<external_context source=\"source&amp;\" kind=\"untrusted\">\n&lt;data&gt; 😀\n</external_context>",
+    );
+    check(
+        AdditionalContextDeveloperFragment::new("source&".to_string(), "<data> 😀".to_string()),
+        "developer",
+        "<application_context source=\"source&amp;\" kind=\"application\">\n&lt;data&gt; 😀\n</application_context>",
     );
 }
 

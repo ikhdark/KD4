@@ -1833,10 +1833,12 @@ mod tests {
 
     #[test]
     fn display_path_prefers_cwd_without_git_repo() {
-        let cwd = PathBuf::from(r"C:\workspace\codex");
+        let directory = tempfile::tempdir().expect("temporary non-repository directory");
+        let cwd = directory.path();
         let path = cwd.join("tui").join("example.png");
+        assert!(path.is_absolute());
 
-        let rendered = display_path_for(&path, &cwd);
+        let rendered = display_path_for(&path, cwd);
 
         assert_eq!(
             rendered,
@@ -2170,6 +2172,13 @@ mod tests {
             fallback_diff_backgrounds(DiffTheme::Dark, DiffColorLevel::Ansi16),
         ));
 
+        // The backend snapshot records text only, so pin the styles here.
+        assert!(
+            lines.iter().all(|line| line.style.bg.is_none()
+                && line.spans.iter().all(|span| span.style.bg.is_none())),
+            "ANSI-16 diff lines should not set a background: {lines:?}"
+        );
+
         snapshot_lines(
             "ansi16_insert_delete_no_background",
             lines,
@@ -2461,16 +2470,13 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
-        let has_rgb = lines.iter().any(|line| {
-            line.spans.iter().any(|s| {
-                s.content.chars().any(char::is_alphabetic)
-                    && matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))
-            })
-        });
-        assert!(
-            has_rgb,
-            "add diff for .rs file should produce syntax-highlighted (RGB) spans"
-        );
+        let expected = highlight_code_to_styled_spans(
+            "pub fn sum(a: i32, b: i32) -> i32 { a + b }\n",
+            "rust",
+        )
+        .expect("Rust syntax");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].spans[3..], expected[0]);
     }
 
     #[test]
@@ -2490,20 +2496,29 @@ mod tests {
 
                 let lines =
                     create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
-                let rgb_tokens = lines
+                let expected = highlight_code_to_styled_spans(
+                    "export module math;\nexport int sum(int a, int b) { return a + b; }\n",
+                    "cpp",
+                )
+                .expect("C++ syntax");
+                assert_eq!(lines.len(), expected.len() + 1);
+                for (line, expected) in lines[1..].iter().zip(&expected) {
+                    assert_eq!(&line.spans[3..], expected.as_slice(), ".{extension}");
+                }
+                let styled_tokens = lines[1..]
                     .iter()
-                    .flat_map(|line| &line.spans)
+                    .flat_map(|line| &line.spans[3..])
                     .filter(|span| {
                         span.content.chars().any(char::is_alphabetic)
-                            && matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..)))
+                            && span.style.fg.is_some()
                     })
                     .map(|span| span.content.to_string())
                     .collect::<Vec<_>>();
                 assert!(
-                    !rgb_tokens.is_empty(),
-                    "add diff for .{extension} file should produce syntax-highlighted (RGB) spans"
+                    !styled_tokens.is_empty(),
+                    "add diff for .{extension} file should produce syntax-highlighted spans"
                 );
-                (extension, rgb_tokens.join("|"))
+                (extension, styled_tokens.join("|"))
             })
             .collect::<Vec<_>>();
 
@@ -2524,12 +2539,14 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[1].to_string(), "    1 +export module math;");
         assert_eq!(lines[2].to_string(), "    2 +export int value = 42;");
-        assert!(lines.iter().all(|line| {
-            line.spans
-                .iter()
-                .filter(|span| span.content.chars().any(char::is_alphabetic))
-                .all(|span| !matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
-        }));
+        let context = current_diff_render_style_context();
+        let expected_style = style_add(context.theme, context.color_level, context.diff_backgrounds);
+        for line in &lines[1..] {
+            // Plain content is one span with the insertion fallback style;
+            // syntax colors must not leak in under ANSI themes either.
+            assert_eq!(line.spans.len(), 4);
+            assert_eq!(line.spans[3].style, expected_style);
+        }
     }
 
     #[test]
@@ -2543,16 +2560,16 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
-        let has_rgb = lines.iter().any(|line| {
-            line.spans.iter().any(|s| {
-                s.content.chars().any(char::is_alphabetic)
-                    && matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))
-            })
-        });
-        assert!(
-            has_rgb,
-            "delete diff for .py file should produce syntax-highlighted (RGB) spans"
-        );
+        let expected = highlight_code_to_styled_spans("def scale(x):\n    return x * 2\n", "python")
+            .expect("Python syntax");
+        assert_eq!(lines.len(), expected.len() + 1);
+        for (line, expected) in lines[1..].iter().zip(expected) {
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|span| span.add_modifier(Modifier::DIM))
+                .collect();
+            assert_eq!(line.spans[3..], expected);
+        }
     }
 
     #[test]
@@ -2719,7 +2736,7 @@ mod tests {
         assert!(
             content
                 .iter()
-                .all(|span| !matches!(span.style.fg, Some(Color::Rgb(..))))
+                .all(|span| span.style.fg.is_none())
         );
     }
 
@@ -2742,16 +2759,9 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
-        let has_rgb = lines.iter().any(|line| {
-            line.spans.iter().any(|s| {
-                s.content.chars().any(char::is_alphabetic)
-                    && matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))
-            })
-        });
-        assert!(
-            has_rgb,
-            "rename from .xyzzy to .rs should produce syntax-highlighted (RGB) spans"
-        );
+        let expected = highlight_code_to_styled_spans(modified, "rust").expect("Rust syntax");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2].spans[3..], expected[0]);
     }
 
     #[test]

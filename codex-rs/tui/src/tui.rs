@@ -325,8 +325,10 @@ mod tests {
         let width = 12;
         let height = 4;
         let backend = VT100Backend::new(width, height);
+        // Anchor the empty old viewport one row below the new viewport top, so clearing
+        // from the old position would leave the stale row 1 behind.
         let mut terminal =
-            CustomTerminal::with_options_and_cursor_position(backend, Position { x: 0, y: 1 })
+            CustomTerminal::with_options_and_cursor_position(backend, Position { x: 0, y: 2 })
                 .expect("terminal");
         write!(
             terminal.backend_mut(),

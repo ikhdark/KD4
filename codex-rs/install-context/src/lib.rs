@@ -319,6 +319,21 @@ mod tests {
         assert_eq!(version_from_release_tag("v1.5.0"), None);
         assert_eq!(is_newer_version("1.2.4", "1.2.3"), Some(true));
         assert_eq!(is_newer_version("1.2.3", "1.2.4"), Some(false));
+        // Updates require a strictly newer numeric tuple, not string order or
+        // equality (which would repeatedly advertise the installed release).
+        for (latest, current, expected) in [
+            ("1.2.3", "1.2.3", false),
+            ("1.10.0", "1.9.99", true),
+            ("1.9.99", "1.10.0", false),
+            ("2.0.0", "1.99.99", true),
+            ("1.99.99", "2.0.0", false),
+        ] {
+            assert_eq!(
+                is_newer_version(latest, current),
+                Some(expected),
+                "{latest} compared with {current}"
+            );
+        }
         assert_eq!(is_newer_version("1.2.3-beta.1", "1.2.2"), None);
         assert_eq!(is_newer_version(" 1.2.3 ", "1.2.2"), Some(true));
         assert!(is_source_build_version("0.0.0"));
@@ -393,7 +408,7 @@ mod tests {
         fs::create_dir_all(&resources_dir)?;
         let exe_path = release_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
-        fs::write(resources_dir.join(default_rg_command()), "")?;
+        fs::write(resources_dir.join("rg.exe"), "")?;
         fs::write(resources_dir.join(TEST_RESOURCE_NAME), "")?;
         let canonical_release_dir =
             AbsolutePathBuf::from_absolute_path(release_dir.canonicalize()?)?;
@@ -421,7 +436,7 @@ mod tests {
         );
         assert_eq!(
             context.rg_command(),
-            canonical_resources_dir.join(default_rg_command()).into_path_buf()
+            canonical_resources_dir.join("rg.exe").into_path_buf()
         );
 
         fs::remove_dir_all(&resources_dir)?;
@@ -437,7 +452,7 @@ mod tests {
                 resources_dir: None,
             }
         );
-        assert_eq!(context.rg_command(), default_rg_command());
+        assert_eq!(context.rg_command(), PathBuf::from("rg.exe"));
         assert_eq!(context.bundled_resource(TEST_RESOURCE_NAME), None);
         Ok(())
     }
@@ -481,7 +496,7 @@ mod tests {
         let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
         fs::write(resources_dir.join(TEST_RESOURCE_NAME), "")?;
-        fs::write(path_dir.join(default_rg_command()), "")?;
+        fs::write(path_dir.join("rg.exe"), "")?;
         let canonical_package_dir =
             AbsolutePathBuf::from_absolute_path(package_dir.path().canonicalize()?)?;
         let canonical_bin_dir = AbsolutePathBuf::from_absolute_path(bin_dir.canonicalize()?)?;
@@ -510,7 +525,7 @@ mod tests {
         assert_eq!(
             context.rg_command(),
             canonical_path_dir
-                .join(default_rg_command())
+                .join("rg.exe")
                 .into_path_buf()
         );
         assert_eq!(
@@ -524,7 +539,7 @@ mod tests {
         let layout = context.package_layout.as_ref().expect("package layout");
         assert_eq!(layout.path_dir, None);
         assert_eq!(layout.resources_dir, None);
-        assert_eq!(context.rg_command(), default_rg_command());
+        assert_eq!(context.rg_command(), PathBuf::from("rg.exe"));
         assert_eq!(context.bundled_resource(TEST_RESOURCE_NAME), None);
         Ok(())
     }
@@ -545,7 +560,9 @@ mod tests {
         let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
         fs::write(resources_dir.join(TEST_RESOURCE_NAME), "")?;
-        fs::write(path_dir.join(default_rg_command()), "")?;
+        // These names come from the installer layout, not the lookup helper.
+        fs::write(path_dir.join("rg.exe"), "")?;
+        fs::write(resources_dir.join("rg.exe"), "")?;
         let canonical_package_dir =
             AbsolutePathBuf::from_absolute_path(package_dir.canonicalize()?)?;
         let canonical_bin_dir = AbsolutePathBuf::from_absolute_path(bin_dir.canonicalize()?)?;
@@ -576,13 +593,22 @@ mod tests {
         assert_eq!(
             context.rg_command(),
             canonical_path_dir
-                .join(default_rg_command())
+                .join("rg.exe")
                 .into_path_buf()
         );
         assert_eq!(
             context.bundled_resource(TEST_RESOURCE_NAME),
             Some(canonical_resources_dir.join(TEST_RESOURCE_NAME))
         );
+        // The process caches its install context. Missing files must fall back
+        // without requiring the context to be reconstructed.
+        fs::remove_file(path_dir.join("rg.exe"))?;
+        assert_eq!(
+            context.rg_command(),
+            canonical_resources_dir.join("rg.exe").into_path_buf()
+        );
+        fs::remove_file(resources_dir.join("rg.exe"))?;
+        assert_eq!(context.rg_command(), PathBuf::from("rg.exe"));
         Ok(())
     }
 
@@ -596,7 +622,7 @@ mod tests {
         fs::write(package_dir.path().join(PACKAGE_METADATA_FILENAME), "{}")?;
         let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
-        fs::write(path_dir.join(default_rg_command()), "")?;
+        fs::write(path_dir.join("rg.exe"), "")?;
         let canonical_path_dir = AbsolutePathBuf::from_absolute_path(path_dir.canonicalize()?)?;
 
         let context = InstallContext::from_exe(
@@ -608,7 +634,7 @@ mod tests {
         assert_eq!(
             context.rg_command(),
             canonical_path_dir
-                .join(default_rg_command())
+                .join("rg.exe")
                 .into_path_buf()
         );
         Ok(())
@@ -622,7 +648,7 @@ mod tests {
         let path_dir = package_dir.path().join(PATH_DIRNAME);
         fs::create_dir_all(&bin_dir)?;
         fs::create_dir_all(resources_dir.join(TEST_RESOURCE_NAME))?;
-        fs::create_dir_all(path_dir.join(default_rg_command()))?;
+        fs::create_dir_all(path_dir.join("rg.exe"))?;
         fs::write(package_dir.path().join(PACKAGE_METADATA_FILENAME), "{}")?;
         let exe_path = bin_dir.join("codex.exe");
         fs::write(&exe_path, "")?;
@@ -632,7 +658,7 @@ mod tests {
             /*method_override*/ None,
             /*codex_home*/ None,
         );
-        assert_eq!(context.rg_command(), default_rg_command());
+        assert_eq!(context.rg_command(), PathBuf::from("rg.exe"));
         assert_eq!(context.bundled_resource(TEST_RESOURCE_NAME), None);
         Ok(())
     }

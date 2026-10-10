@@ -49,6 +49,9 @@ async fn plan_mode_nudge_hides_while_task_or_modal_is_active() {
     chat.on_task_complete(
         /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
     );
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+
     chat.show_selection_view(SelectionViewParams {
         items: vec![SelectionItem {
             name: "Keep planning".to_string(),
@@ -507,6 +510,13 @@ async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override(
     assert!(
         events.iter().any(|event| matches!(
             event,
+            AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::High))
+        )),
+        "expected global reasoning default to be updated; events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
             AppEvent::UpdatePlanModeReasoningEffort(Some(ReasoningEffortConfig::High))
         )),
         "expected plan override to be updated; events: {events:?}"
@@ -821,11 +831,18 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
         vec![AppServerTurn {
             id: "turn-1".to_string(),
             items_view: codex_app_server_protocol::TurnItemsView::Full,
-            items: vec![AppServerThreadItem::AgentMessage {
-                id: "msg-plan".to_string(),
-                text: "Plan details".to_string(),
-                phase: Some(MessagePhase::FinalAnswer),
-            }],
+            // Without a proposed plan in the turn the prompt is skipped for live turns too.
+            items: vec![
+                AppServerThreadItem::Plan {
+                    id: "plan-1".to_string(),
+                    text: "- Step 1\n- Step 2\n".to_string(),
+                },
+                AppServerThreadItem::AgentMessage {
+                    id: "msg-plan".to_string(),
+                    text: "Plan details".to_string(),
+                    phase: Some(MessagePhase::FinalAnswer),
+                },
+            ],
             status: AppServerTurnStatus::Completed,
             error: None,
             started_at: None,
@@ -1430,8 +1447,12 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
         .set_composer_text("/plan build the plan".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    let items = match next_submit_op(&mut op_rx) {
-        Op::UserTurn { items, .. } => items,
+    let (items, collaboration_mode) = match next_submit_op(&mut op_rx) {
+        Op::UserTurn {
+            items,
+            collaboration_mode,
+            ..
+        } => (items, collaboration_mode),
         other => panic!("expected Op::UserTurn, got {other:?}"),
     };
     assert_eq!(items.len(), 1);
@@ -1442,16 +1463,17 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
             text_elements: Vec::new(),
         }
     );
+    assert_eq!(
+        collaboration_mode.map(|mode| mode.mode),
+        Some(ModeKind::Plan),
+        "the prompt itself must be submitted in Plan mode"
+    );
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
 }
 
 #[tokio::test]
 async fn collaboration_modes_defaults_to_code_on_startup() {
-    let chat = make_startup_chat_with_cli_overrides(vec![(
-        "features.collaboration_modes".to_string(),
-        TomlValue::Boolean(true),
-    )])
-    .await;
+    let chat = make_startup_chat_with_cli_overrides(Vec::new()).await;
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
     assert_eq!(
         chat.current_model(),
@@ -1545,11 +1567,18 @@ async fn entering_plan_mode_preserves_the_selected_reasoning_effort() {
 }
 
 #[tokio::test]
-async fn set_reasoning_effort_updates_active_collaboration_mask() {
+async fn set_reasoning_effort_drives_plan_mode_effort_without_plan_override() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
         .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
+
+    // The effort starts unset, so clearing it proves nothing until a value was applied.
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+    assert_eq!(
+        chat.current_reasoning_effort(),
+        Some(ReasoningEffortConfig::High)
+    );
 
     chat.set_reasoning_effort(/*effort*/ None);
 

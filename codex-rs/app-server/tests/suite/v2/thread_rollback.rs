@@ -219,7 +219,16 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
         other => panic!("expected user message item, got {other:?}"),
     }
 
-    // Resume and confirm the history is pruned.
+    // Restart before resuming: a loaded-thread resume could hide a rollback
+    // that changed only in-memory history without persisting it.
+    drop(mcp);
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    // Cold resume must reconstruct the pruned history from the rollout.
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id,

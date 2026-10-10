@@ -713,15 +713,36 @@ async fn queued_deadline_handback_does_not_wait_for_artifact_or_send_input() {
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let temp = tempfile::tempdir().unwrap();
-    let process = remote_process_with_options(WriteStatus::Accepted, None, None,
-        Some(create_raw_output_artifact(temp.path(), "queued", b"retained").await)).await;
+    let writes = Arc::new(AtomicUsize::new(0));
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let process = UnifiedExecProcess::from_exec_server_started(
+        StartedExecProcess {
+            process: Arc::new(DelayedInputExecProcess {
+                inner: MockExecProcess {
+                    process_id: "queued-input".to_string().into(),
+                    write_response: WriteResponse { status: WriteStatus::Accepted },
+                    read_responses: Mutex::new(VecDeque::new()),
+                    terminate_error: None,
+                    termination_control: None,
+                    wake_tx,
+                },
+                writes: Arc::clone(&writes),
+                acknowledgements: Arc::clone(&acknowledgements),
+            }),
+        },
+        Some(create_raw_output_artifact(temp.path(), "queued", b"retained").await),
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .expect("queued process registers");
     let manager = &session.services.unified_exec_manager;
     store_process_for_test(manager, &session, &turn, 1234, Arc::clone(&process)).await;
     let interaction = process.interaction_lock().lock_owned().await;
     let artifact = process.raw_output_artifact_owner_for_test().unwrap();
     let artifact_lock = artifact.lock().await;
     let response = tokio::time::timeout(Duration::from_secs(1), manager.write_stdin(super::WriteStdinRequest {
-        process_id: 1234, input: "must-not-be-written", yield_time_ms: 250,
+        process_id: 1234, input: "once\n", yield_time_ms: 250,
         max_output_tokens: None, truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
         nested_deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
     })).await.expect("queue timeout must hand back inside the outer deadline").unwrap();
@@ -729,6 +750,8 @@ async fn queued_deadline_handback_does_not_wait_for_artifact_or_send_input() {
     assert!(!response.process_exited);
     assert!(response.raw_output_artifact.is_none());
     assert!(response.repair_notice.unwrap().to_ascii_lowercase().contains("input was not delivered"));
+    assert_eq!(writes.load(Ordering::Acquire), 0, "queued input must not reach the executor");
+    assert_eq!(acknowledgements.load(Ordering::Acquire), 0);
     drop(artifact_lock);
     drop(interaction);
     manager.terminate_all_processes().await;
@@ -1098,10 +1121,14 @@ async fn stall_timeout_disabled_and_exited_processes_are_not_terminated() {
     for timeout in [None, Some(0)] {
         let process = remote_process(WriteStatus::Accepted, None).await;
         process.start_stall_watchdog(timeout);
+        // Let an incorrectly installed watchdog arm before advancing time.
+        tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(120)).await;
         tokio::task::yield_now().await;
         assert!(!process.has_exited());
         assert!(!process.termination_was_requested());
+        assert!(process.session_capabilities(false).observation.is_none());
+        assert!(process.snapshot_output().await.is_empty(), "disabled observation emits no notice");
         process.terminate_confirmed().await.unwrap();
     }
     let process = remote_process(WriteStatus::Accepted, None).await;
@@ -1112,6 +1139,8 @@ async fn stall_timeout_disabled_and_exited_processes_are_not_terminated() {
     assert!(!process.termination_was_requested());
     assert_eq!(process.failure_message(), None);
     assert_eq!(process.exit_code(), Some(0));
+    assert!(process.session_capabilities(false).observation.is_none());
+    assert!(process.snapshot_output().await.is_empty(), "exited processes emit no stall notice");
 }
 
 #[tokio::test]
@@ -2187,11 +2216,13 @@ async fn local_output_closes_while_artifact_finalization_stalls() {
     drop(stdout_tx);
     drop(stderr_tx);
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(10)).await;
+    // EOF must be observable before the artifact timeout, not merely by the
+    // time that timeout has elapsed. The storage owner remains locked here.
     tokio::time::timeout(Duration::from_millis(1), &mut closed)
         .await
         .expect("artifact finalization must not delay output closure");
     assert!(output_closed.load(Ordering::Acquire));
+    tokio::time::advance(Duration::from_secs(10)).await;
     assert!(
         !output_task.is_finished(),
         "the artifact worker must remain owned"

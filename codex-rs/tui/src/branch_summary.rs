@@ -792,6 +792,27 @@ mod tests {
                     + '_,
             >,
         > {
+            // Background probes must run in the status-line cwd and never prompt.
+            assert_eq!(command.cwd.as_deref(), Some(Path::new("/repo")));
+            let gh_env = [("GH_PROMPT_DISABLED", "1"), ("GIT_TERMINAL_PROMPT", "0")];
+            let git_env = [
+                ("GIT_OPTIONAL_LOCKS", "0"),
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GCM_INTERACTIVE", "Never"),
+            ];
+            let expected_env = if command.argv[0] == "gh" {
+                &gh_env[..]
+            } else {
+                &git_env[..]
+            };
+            for (key, value) in expected_env {
+                assert_eq!(
+                    command.env.get(*key),
+                    Some(&Some((*value).to_string())),
+                    "{key} for {:?}",
+                    command.argv
+                );
+            }
             self.seen
                 .lock()
                 .expect("seen lock")

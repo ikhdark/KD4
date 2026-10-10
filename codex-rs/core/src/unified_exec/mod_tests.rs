@@ -680,6 +680,20 @@ async fn validation_poll_waits_the_requested_yield(until_output: bool) -> anyhow
     let (session, turn) = test_session_and_turn().await;
     let (process_id, process, allow_terminate) =
         register_pollable_process(&session, &turn, "validation-poll", /*validation*/ true).await?;
+    if !until_output {
+        // A terminal session's empty poll ends at the first quiet gap, so only
+        // the validation exemption can keep the requested yield here.
+        session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get_mut(&process_id)
+            .expect("registered process")
+            .tty = true;
+    }
 
     emit_burst_then_go_silent(&process, Duration::from_secs(1));
     let started_at = Instant::now();
@@ -963,6 +977,7 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
         .approval_policy
         .set(codex_protocol::protocol::AskForApproval::Never)?;
     let cwd = turn.cwd().clone();
+    let variable = format!("CODEX_PERSISTENCE_{}", uuid::Uuid::new_v4().simple());
 
     let open_shell = exec_command(
         &session,
@@ -988,7 +1003,7 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     write_stdin(
         &session,
         process_id,
-        "$env:CODEX_INTERACTIVE_SHELL_VAR = 'codex'\n",
+        &format!("$env:{variable} = 'codex'\n"),
         /*yield_time_ms*/ 2_500,
     )
     .await?;
@@ -996,14 +1011,14 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     let out_2 = write_stdin(
         &session,
         process_id,
-        "Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\n",
+        &format!("Write-Output ('PERSISTED:' + $env:{variable})\n"),
         /*yield_time_ms*/ 2_500,
     )
     .await?;
     assert!(
         out_2
             .truncated_output(TEST_MAX_OUTPUT_TOKENS)
-            .contains("codex"),
+            .contains("PERSISTED:codex"),
         "expected environment variable output"
     );
 
@@ -1739,6 +1754,9 @@ async fn uncertain_command_workspace_baseline_precedes_launch() -> anyhow::Resul
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_timeouts() -> anyhow::Result<()> {
     const TEST_VAR_VALUE: &str = "unified_exec_var_123";
+    let variable = format!("CODEX_TIMEOUT_{}", uuid::Uuid::new_v4().simple());
+    // This marker can only come from execution, never echoed assignment/input.
+    let expected_output = format!("DELAYED:{TEST_VAR_VALUE}");
 
     let (session, turn) = test_session_and_turn().await;
 
@@ -1757,7 +1775,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     write_stdin(
         &session,
         process_id,
-        format!("$env:CODEX_INTERACTIVE_SHELL_VAR = '{TEST_VAR_VALUE}'\r\n").as_str(),
+        format!("$env:{variable} = '{TEST_VAR_VALUE}'\r\n").as_str(),
         /*yield_time_ms*/ 2_500,
     )
     .await?;
@@ -1765,14 +1783,14 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     let out_2 = write_stdin(
         &session,
         process_id,
-        "Start-Sleep -Seconds 5; Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\r\n",
+        &format!("Start-Sleep -Seconds 5; Write-Output ('DELAYED:' + $env:{variable})\r\n"),
         /*yield_time_ms*/ 10,
     )
     .await?;
     assert!(
         !out_2
             .truncated_output(TEST_MAX_OUTPUT_TOKENS)
-            .contains(TEST_VAR_VALUE),
+            .contains(&expected_output),
         "timeout too short should yield incomplete output"
     );
     assert_eq!(out_2.process_id, Some(process_id));
@@ -1783,7 +1801,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
             let output = write_stdin(&session, process_id, "", 1_000).await?;
             if output
                 .truncated_output(TEST_MAX_OUTPUT_TOKENS)
-                .contains(TEST_VAR_VALUE)
+                .contains(&expected_output)
             {
                 return Ok::<_, UnifiedExecError>(output);
             }
@@ -1794,7 +1812,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     assert!(
         out_3
             .truncated_output(TEST_MAX_OUTPUT_TOKENS)
-            .contains(TEST_VAR_VALUE),
+            .contains(&expected_output),
         "subsequent poll should retrieve output"
     );
     assert!(session.terminate_background_terminal(process_id).await);
@@ -1820,9 +1838,10 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
     let pid_path = fixture.path().join("command.pid");
     let pid_path_for_release = pid_path.clone();
 
-    // Lift the pause only after the command process has exited. The command
-    // outlasts the 250ms yield, so an unpaused yield would answer first no
-    // matter how quickly PowerShell starts.
+    // Lift the pause only after the command process has exited. Three seconds
+    // outlasts even the cold Windows executor's 2s floor on this 250ms request;
+    // a 1s child could finish before an unpaused yield and falsely pass.
+    assert!(clamp_yield_time(250) < 3_000, "fixture must outlast the effective yield");
     let release = tokio::spawn(async move {
         let pid = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -1853,7 +1872,7 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
     });
 
     let command = format!(
-        "[System.IO.File]::WriteAllText('{}', [string]$PID); Start-Sleep -Seconds 1; Write-Output unified-exec-done",
+        "[System.IO.File]::WriteAllText('{}', [string]$PID); Start-Sleep -Seconds 3; Write-Output unified-exec-done",
         pid_path.to_string_lossy().replace('\'', "''")
     );
     let response = exec_command(
@@ -1887,7 +1906,7 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<()> {
+async fn reusing_completed_process_replays_its_finished_response() -> anyhow::Result<()> {
     let (session, mut turn) = make_session_and_context().await;
     turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     let mut config = (*turn.config).clone();
@@ -1998,6 +2017,13 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
             .is_empty()
     );
     assert!(session.list_background_terminals().await.is_empty());
+
+    // Only an id that finished here has a response to replay.
+    let never_issued = process_id.wrapping_add(1);
+    assert!(matches!(
+        write_stdin(&session, never_issued, "", /*yield_time_ms*/ 100).await,
+        Err(UnifiedExecError::UnknownProcessId { process_id }) if process_id == never_issued
+    ));
 
     Ok(())
 }

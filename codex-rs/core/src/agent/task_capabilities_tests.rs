@@ -468,13 +468,19 @@ fn absolute_paths_accept_windows_case_aliases() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(any(windows, target_os = "linux"))]
 fn case_distinct_sibling_and_symlink_cannot_supply_repository_evidence() {
     let directory = tempfile::tempdir().expect("directory");
     let root = directory.path().join("Repo");
-    let sibling = directory.path().join("repo");
+    // Windows names are case-insensitive, so only Linux can hold a sibling differing by case.
+    let sibling = directory
+        .path()
+        .join(if cfg!(windows) { "sibling" } else { "repo" });
     std::fs::create_dir(&root).unwrap();
     std::fs::create_dir(&sibling).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&sibling, root.join("escape")).unwrap();
+    #[cfg(target_os = "linux")]
     std::os::unix::fs::symlink(&sibling, root.join("escape")).unwrap();
     assert!(normalize_absolute_repo_path(&root, &sibling.join("new.rs")).is_err());
     assert!(normalize_absolute_repo_path(&root, &root.join("escape/new.rs")).is_err());

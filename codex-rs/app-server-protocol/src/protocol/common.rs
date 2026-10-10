@@ -2078,17 +2078,26 @@ mod tests {
         ];
 
         for (legacy_method, canonical_method, params) in cases {
+            // The app-server decodes requests through the JSON-RPC envelope, not serde's tag.
+            let envelope_request = ClientRequest::try_from(JSONRPCRequest {
+                id: request_id(),
+                method: legacy_method.to_string(),
+                params: Some(params.clone()),
+                trace: None,
+            })?;
             let request: ClientRequest = serde_json::from_value(json!({
                 "method": legacy_method,
                 "id": 1,
                 "params": params,
             }))?;
 
+            assert_eq!(envelope_request, request);
             assert_eq!(request.method_name(), canonical_method);
             assert_eq!(
                 serde_json::to_value(&request)?["method"],
                 json!(canonical_method)
             );
+            assert_eq!(JSONRPCRequest::try_from(request)?.method, canonical_method);
         }
 
         Ok(())
@@ -2189,6 +2198,82 @@ mod tests {
     }
 
     #[test]
+    fn streamed_output_and_settings_notifications_require_delivery() {
+        let notifications = [
+            thread_settings_updated_notification(),
+            ServerNotification::PlanDelta(v2::PlanDeltaNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "item".to_string(),
+                delta: "delta".to_string(),
+            }),
+            ServerNotification::CommandExecOutputDelta(v2::CommandExecOutputDeltaNotification {
+                process_id: "process".to_string(),
+                stream: v2::CommandExecOutputStream::Stdout,
+                delta_base64: String::new(),
+                cap_reached: false,
+            }),
+            ServerNotification::ProcessOutputDelta(v2::ProcessOutputDeltaNotification {
+                process_handle: "process".to_string(),
+                stream: v2::ProcessOutputStream::Stdout,
+                delta_base64: String::new(),
+                cap_reached: false,
+            }),
+            ServerNotification::ProcessExited(v2::ProcessExitedNotification {
+                process_handle: "process".to_string(),
+                exit_code: 0,
+                stdout: String::new(),
+                stdout_cap_reached: false,
+                stderr: String::new(),
+                stderr_cap_reached: false,
+            }),
+            ServerNotification::McpServerStartupCompleted(
+                v2::McpServerStartupCompletedNotification {
+                    thread_id: None,
+                    ready: Vec::new(),
+                    failed: Vec::new(),
+                    cancelled: Vec::new(),
+                },
+            ),
+            ServerNotification::ReasoningSummaryTextDelta(
+                v2::ReasoningSummaryTextDeltaNotification {
+                    thread_id: "thread".to_string(),
+                    turn_id: "turn".to_string(),
+                    item_id: "item".to_string(),
+                    delta: "delta".to_string(),
+                    summary_index: 0,
+                },
+            ),
+            ServerNotification::ReasoningTextDelta(v2::ReasoningTextDeltaNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "item".to_string(),
+                delta: "delta".to_string(),
+                content_index: 0,
+            }),
+        ];
+
+        for notification in notifications {
+            assert!(
+                server_notification_requires_delivery(&notification),
+                "{notification} must survive backpressure"
+            );
+        }
+
+        // Control: the marker between reasoning deltas carries no transcript text.
+        assert!(!server_notification_requires_delivery(
+            &ServerNotification::ReasoningSummaryPartAdded(
+                v2::ReasoningSummaryPartAddedNotification {
+                    thread_id: "thread".to_string(),
+                    turn_id: "turn".to_string(),
+                    item_id: "item".to_string(),
+                    summary_index: 0,
+                },
+            )
+        ));
+    }
+
+    #[test]
     fn internal_notification_json_visibility_is_declared_with_notification() {
         let metadata = SERVER_NOTIFICATION_METADATA
             .iter()
@@ -2241,6 +2326,48 @@ mod tests {
         assert_eq!(
             thread_fork.serialization_scope(),
             Some(ClientRequestSerializationScope::Thread { thread_id })
+        );
+
+        // A path-only resume/fork has no thread id to key on, so it serializes on the rollout path.
+        let thread_resume_by_path = ClientRequest::ThreadResume {
+            request_id: request_id(),
+            params: v2::ThreadResumeParams {
+                path: Some(PathBuf::from("/tmp/resume-thread.jsonl")),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            thread_resume_by_path.serialization_scope(),
+            Some(ClientRequestSerializationScope::ThreadPath {
+                path: PathBuf::from("/tmp/resume-thread.jsonl")
+            })
+        );
+
+        let thread_fork_by_path = ClientRequest::ThreadFork {
+            request_id: request_id(),
+            params: v2::ThreadForkParams {
+                path: Some(PathBuf::from("/tmp/source-thread.jsonl")),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            thread_fork_by_path.serialization_scope(),
+            Some(ClientRequestSerializationScope::ThreadPath {
+                path: PathBuf::from("/tmp/source-thread.jsonl")
+            })
+        );
+
+        let process_kill = ClientRequest::ProcessKill {
+            request_id: request_id(),
+            params: v2::ProcessKillParams {
+                process_handle: "handle-1".to_string(),
+            },
+        };
+        assert_eq!(
+            process_kill.serialization_scope(),
+            Some(ClientRequestSerializationScope::Process {
+                process_handle: "handle-1".to_string()
+            })
         );
 
         let command_exec = ClientRequest::OneOffCommandExec {
@@ -3933,33 +4060,36 @@ mod tests {
         );
     }
 
+    fn thread_settings_updated_notification() -> ServerNotification {
+        ServerNotification::ThreadSettingsUpdated(v2::ThreadSettingsUpdatedNotification {
+            thread_id: "thr_123".to_string(),
+            thread_settings: v2::ThreadSettings {
+                cwd: absolute_path("/tmp/repo"),
+                approval_policy: v2::AskForApproval::Never,
+                sandbox_policy: v2::SandboxPolicy::DangerFullAccess,
+                permission_profile: None,
+                active_permission_profile: None,
+                model: "gpt-5.4".to_string(),
+                model_provider: "openai".to_string(),
+                service_tier: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: "gpt-5.4".to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                },
+                personality: None,
+            },
+        })
+    }
+
     #[test]
     fn thread_settings_updated_notification_is_marked_experimental() {
-        let notification =
-            ServerNotification::ThreadSettingsUpdated(v2::ThreadSettingsUpdatedNotification {
-                thread_id: "thr_123".to_string(),
-                thread_settings: v2::ThreadSettings {
-                    cwd: absolute_path("/tmp/repo"),
-                    approval_policy: v2::AskForApproval::Never,
-                    sandbox_policy: v2::SandboxPolicy::DangerFullAccess,
-                    permission_profile: None,
-                    active_permission_profile: None,
-                    model: "gpt-5.4".to_string(),
-                    model_provider: "openai".to_string(),
-                    service_tier: None,
-                    effort: None,
-                    summary: None,
-                    collaboration_mode: codex_protocol::config_types::CollaborationMode {
-                        mode: codex_protocol::config_types::ModeKind::Default,
-                        settings: codex_protocol::config_types::Settings {
-                            model: "gpt-5.4".to_string(),
-                            reasoning_effort: None,
-                            developer_instructions: None,
-                        },
-                    },
-                    personality: None,
-                },
-            });
+        let notification = thread_settings_updated_notification();
 
         assert_eq!(
             crate::experimental_api::ExperimentalApi::experimental_reason(&notification),
@@ -3982,30 +4112,49 @@ mod tests {
         );
     }
 
+    fn assert_client_method_is_unknown(method: &str, params: serde_json::Value) {
+        // The app-server decodes through the JSON-RPC envelope; typed clients use serde.
+        let envelope_err = ClientRequest::try_from(JSONRPCRequest {
+            id: RequestId::Integer(42),
+            method: method.to_string(),
+            params: Some(params.clone()),
+            trace: None,
+        })
+        .expect_err("removed method accepted by the JSON-RPC envelope");
+        let serde_err = serde_json::from_value::<ClientRequest>(json!({
+            "method": method,
+            "id": 42,
+            "params": params,
+        }))
+        .expect_err("removed method accepted by serde");
+        // A params mismatch on a still-registered method must not count as removal.
+        for err in [envelope_err, serde_err] {
+            assert!(
+                err.to_string().contains(&format!("unknown variant `{method}`")),
+                "{method} must be rejected as an unknown method: {err}"
+            );
+        }
+    }
+
     #[test]
     fn removed_memory_request_methods_are_rejected() {
         for method in ["memory/reset", "thread/memoryMode/set"] {
-            let request = serde_json::from_value::<ClientRequest>(json!({
-                "method": method,
-                "id": 42,
-                "params": { "threadId": "thread_123", "mode": "enabled" }
-            }));
-            assert!(request.is_err(), "removed method accepted: {method}");
+            assert_client_method_is_unknown(
+                method,
+                json!({ "threadId": "thread_123", "mode": "enabled" }),
+            );
         }
     }
 
     #[test]
     fn removed_realtime_request_method_is_rejected() {
-        let request = serde_json::from_value::<ClientRequest>(json!({
-            "method": "thread/realtime/appendText",
-            "id": 42,
-            "params": {
+        assert_client_method_is_unknown(
+            "thread/realtime/appendText",
+            json!({
                 "threadId": "thread_123",
                 "text": "hello"
-            }
-        }));
-
-        assert!(request.is_err());
+            }),
+        );
     }
 
     #[test]

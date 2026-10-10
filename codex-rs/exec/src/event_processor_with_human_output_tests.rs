@@ -28,6 +28,32 @@ use super::write_final_message;
 use crate::event_processor::EventProcessor;
 
 #[test]
+fn blended_token_total_is_nonnegative_and_saturates_at_the_display_limit() {
+    for (input, cached, output, expected) in [
+        (10, 3, 5, 12),
+        (2, 5, 3, 3),
+        (-1, -2, -3, 0),
+        (i64::MIN, i64::MAX, 7, 7),
+        (i64::MAX, 0, 1, i64::MAX),
+        (i64::MAX, i64::MAX, i64::MAX, i64::MAX),
+    ] {
+        let total = codex_app_server_protocol::TokenUsageBreakdown {
+            total_tokens: 0,
+            input_tokens: input,
+            cached_input_tokens: cached,
+            output_tokens: output,
+            reasoning_output_tokens: 0,
+        };
+        let usage = codex_app_server_protocol::ThreadTokenUsage {
+            last: total.clone(),
+            total,
+            model_context_window: None,
+        };
+        assert_eq!(super::blended_total(&usage), expected, "{input}/{cached}/{output}");
+    }
+}
+
+#[test]
 fn final_message_write_reports_closed_stdout_instead_of_panicking() {
     struct ClosedPipe;
     impl std::io::Write for ClosedPipe {

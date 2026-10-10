@@ -65,23 +65,6 @@ async fn verified_validation_paths_exclude_only_ignored_and_external_local_files
 }
 
 #[tokio::test]
-async fn checkout_content_snapshot_covers_clean_tracked_and_untracked_files() {
-    let (_temp, repo) = create_clean_git_repo().await;
-    std::fs::write(repo.join("tracked.txt"), b"one").unwrap();
-    run_git(repo.as_path(), &["add", "tracked.txt"]).await;
-    run_git(repo.as_path(), &["commit", "-m", "snapshot"]).await;
-    let first = capture_checkout_snapshot(repo.as_path()).await.unwrap();
-    assert_eq!(capture_checkout_snapshot(repo.as_path()).await.as_ref(), Some(&first));
-    run_git(repo.as_path(), &["update-index", "--assume-unchanged", "tracked.txt"]).await;
-    std::fs::write(repo.join("tracked.txt"), b"two").unwrap();
-    let tracked_change = capture_checkout_snapshot(repo.as_path()).await.unwrap();
-    assert_ne!(first, tracked_change);
-    std::fs::write(repo.join("new.txt"), b"new").unwrap();
-    let untracked_change = capture_checkout_snapshot(repo.as_path()).await.unwrap();
-    assert_ne!(tracked_change, untracked_change);
-}
-
-#[tokio::test]
 async fn completion_boundary_batched_ignores_match_single_path_attribution() {
     let (_temp, repo) = create_clean_git_repo().await;
     std::fs::write(repo.join(".gitignore"), "ignored/\n*.out\n").unwrap();
@@ -179,7 +162,7 @@ async fn git_internal_events_do_not_query_git_or_invalidate_snapshots() {
     let (_temp, repo) = create_clean_git_repo().await;
     let root = repo.as_path();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    cache.begin_source_path_change_observation(root, &root.join("file"), false).await.unwrap();
+    let source = cache.begin_source_path_change_observation(root, &root.join("file"), false).await.unwrap();
     for path in [
         ".git/objects/aa/object", ".git/objects/pack/new.pack",
         ".git/refs/codex/x", ".git/COMMIT_EDITMSG", ".git/ORIG_HEAD",
@@ -188,7 +171,7 @@ async fn git_internal_events_do_not_query_git_or_invalidate_snapshots() {
     ] {
         cache.record_watched_source_change_event(Some(vec![root.join(path)])).await;
         assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), 0, "{path}");
-        assert_eq!(cache.source_watcher_generation.load(Ordering::Acquire), 0, "{path}");
+        assert!(cache.source_path_change_observation_is_current(&source), "{path}");
         assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 0, "{path}");
     }
     assert!(!is_git_internal_source_event(&root.join("objects/file")));
@@ -199,6 +182,63 @@ async fn git_internal_events_do_not_query_git_or_invalidate_snapshots() {
         cache.record_watched_source_change_event(Some(vec![root.join(".git/objects/aa/object"), path])).await;
         assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before + 1);
     }
+}
+
+#[tokio::test]
+async fn git_internal_source_dependencies_are_invalidated_without_recapturing_workspace() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let root = repo.as_path();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let paths = [".git/config", ".git/HEAD", ".git/refs/heads/main"];
+    for relative in paths {
+        let path = root.join(relative);
+        let observations = cache
+            .begin_source_path_change_observations(
+                root,
+                &[(path.clone(), false), (root.join("file"), false), (root.join(".git"), true)],
+            )
+            .await
+            .expect("retained source watches");
+        // A direct source read is a dependency even when Git status would not
+        // change. Exercise the real watcher event owner, not a generic mutation.
+        std::fs::write(&path, "changed source dependency\n").unwrap();
+        cache.record_watched_source_change_event(Some(vec![path])).await;
+        assert!(!cache.source_path_change_observation_is_current(&observations[0]), "{relative}");
+        assert!(cache.source_path_change_observation_is_current(&observations[1]), "{relative}");
+        assert!(!cache.source_path_change_observation_is_current(&observations[2]), "{relative}");
+        assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), 0);
+        assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[tokio::test]
+async fn git_internal_mixed_batches_and_flood_preserve_capture_isolation() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let root = repo.as_path();
+    std::fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+    std::fs::create_dir(root.join("target")).unwrap();
+    let ignored = root.join("target/output");
+    std::fs::write(&ignored, "output").unwrap();
+    let internal = root.join(".git/config");
+    let source = root.join("file");
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    for (other, captures) in [(ignored, 0), (source.clone(), 1)] {
+        let observations = cache.begin_source_path_change_observations(root,
+            &[(internal.clone(), false), (other.clone(), false)],
+        ).await.unwrap();
+        cache.record_watched_source_change_event(Some(vec![internal.clone(), other])).await;
+        assert!(observations.iter().all(|value| cache.source_path_freshness(value) == SourceFreshness::Changed));
+        assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), captures);
+    }
+    let observation = cache.begin_source_path_change_observation(root, &source, false).await.unwrap();
+    let queries = cache.ignore_query_count.load(Ordering::Relaxed);
+    for index in 0..=SOURCE_CHANGE_JOURNAL_CAPACITY {
+        cache.record_watched_source_change_event(Some(vec![root.join(format!(".git/objects/{index}"))])).await;
+    }
+    assert_eq!(cache.source_path_freshness(&observation), SourceFreshness::Unknown);
+    assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), 1);
+    assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), queries);
+    assert_eq!(cache.source_change_journal.lock().unwrap().events.len(), SOURCE_CHANGE_JOURNAL_CAPACITY);
 }
 
 #[tokio::test]
@@ -737,16 +777,17 @@ async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
         );
         let restored: ToolHistoryState =
             serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
-        let projected =
-            restored.project_with_workspace_identity(Arc::clone(&canonical), after.as_ref());
-        let ResponseItem::FunctionCallOutput { output, .. } = &projected.items[1] else {
-            panic!("projected tool output");
-        };
-        let text = output.text_content().expect("text output");
-        assert!(text.contains("\"stale_workspace_evidence\":true"));
-        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(notice["valid_for_current_workspace"], false);
-        assert_eq!(notice["historical_digest"], "first contents");
+        let notices = crate::tool_history::tests::freshness_notices(
+            &restored,
+            &canonical,
+            after.as_ref(),
+            &cache,
+        );
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["stale_workspace_evidence"], true);
+        assert_eq!(notices[0]["reason_code"], "workspace_identity_unavailable");
+        assert_eq!(notices[0]["historical_authenticity"], "authenticated");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
     }
 }
 
@@ -1321,14 +1362,49 @@ async fn stable_metadata_dependencies_refresh_remotes() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn confirmed_performance_git_dependency_fingerprints_use_blocking_pool() {
-    let runtime_thread = std::thread::current().id();
-    let worker_thread = run_blocking_git_metadata(|| Some(std::thread::current().id()))
-        .await
-        .expect("blocking metadata result");
+#[test]
+fn git_dependency_fingerprint_capture_waits_for_a_blocking_worker() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single-worker capture runtime");
+    runtime.block_on(async {
+        // Without a `.git` marker the fingerprint closure yields nothing and the capture has no
+        // later await, so it can stay pending only by waiting for the occupied blocking worker.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute root");
+        let source = GitWorkspaceMetadataSource {
+            cwd: root.clone(),
+            repo_root: root,
+            cache: GitWorkspaceCache::with_noop_watcher_for_tests(),
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            occupied_tx.send(()).expect("worker occupied notification");
+            release_rx.recv().expect("release occupied worker");
+        });
+        occupied_rx.await.expect("blocking worker occupied");
 
-    assert_ne!(worker_thread, runtime_thread);
+        let capture =
+            tokio::spawn(async move { StableMetadataDependencies::capture(&source).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !capture.is_finished(),
+            "fingerprint capture must not run on the runtime thread"
+        );
+
+        release_tx.send(()).expect("release worker");
+        blocker.await.expect("occupied worker exited");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), capture)
+                .await
+                .expect("capture finishes once a worker is free")
+                .expect("capture task"),
+            None
+        );
+    });
 }
 
 #[tokio::test]

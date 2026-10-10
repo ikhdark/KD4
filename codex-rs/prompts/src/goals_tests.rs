@@ -17,7 +17,9 @@ fn continuation_prompt_allows_complete_and_strict_blocked_updates() {
 
     assert!(prompt.contains("finish the stack"));
     assert!(prompt.contains("<objective>\nfinish the stack\n</objective>"));
+    assert!(prompt.contains("Tokens used: 1234"));
     assert!(prompt.contains("Token budget: 10000"));
+    assert!(prompt.contains("Tokens remaining: 8766"));
     assert!(prompt.contains("Call `update_goal` with status `\"complete\"`"));
     assert!(prompt.contains("status `\"blocked\"`"));
     assert!(prompt.contains("authoritative evidence establishes that user input, external change, or unavailable authorization is required and no permitted independent work remains"));
@@ -80,6 +82,7 @@ fn objective_updated_prompt_supersedes_previous_goal_context() {
     assert!(
         prompt.contains("<untrusted_objective>\nfinish the revised stack\n</untrusted_objective>")
     );
+    assert!(prompt.contains("Tokens used: 1234"));
     assert!(prompt.contains("Token budget: 10000"));
     assert!(prompt.contains("Tokens remaining: 8766"));
     assert!(

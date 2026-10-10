@@ -273,10 +273,13 @@ mod tests {
             })
             .await
             .expect_err("archived thread is hidden");
-        assert!(matches!(
-            hidden,
-            ThreadStoreError::ThreadNotFound { .. } | ThreadStoreError::InvalidRequest { .. }
-        ));
+        assert!(
+            matches!(
+                &hidden,
+                ThreadStoreError::ThreadNotFound { thread_id: missing } if *missing == thread_id
+            ),
+            "unexpected active-only read error: {hidden}"
+        );
     }
 
     async fn install_archival_update_failure(runtime: &codex_state::StateRuntime) {

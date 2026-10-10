@@ -1710,6 +1710,10 @@ mod tests {
                 "connector_display_name".to_string(),
                 Value::String("Search app".to_string()),
             ),
+            (
+                "connectorDescription".to_string(),
+                Value::String("Searches the app".to_string()),
+            ),
         ])));
         let result = RmcpClient::tools_with_connector_ids(ListToolsResult {
             tools: vec![tool],
@@ -1722,6 +1726,10 @@ mod tests {
         assert_eq!(
             result.tools[0].connector_name.as_deref(),
             Some("Search app")
+        );
+        assert_eq!(
+            result.tools[0].connector_description.as_deref(),
+            Some("Searches the app")
         );
     }
 

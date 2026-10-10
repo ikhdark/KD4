@@ -265,99 +265,6 @@ pub(crate) async fn capture_workspace_evidence_identity(
         .identity
 }
 
-/// Portable content identity, unlike the status/metadata freshness marker.
-/// Hash every indexed and non-ignored untracked path, including clean files.
-/// No partial hash is returned on drift, unsupported entries, or timeout.
-#[cfg(test)]
-pub(crate) async fn capture_checkout_snapshot(cwd: &Path) -> Option<String> {
-    let cancellation = CancellationToken::new();
-    let _cancel_on_drop = cancellation.clone().drop_guard();
-    timeout(WORKSPACE_GENERATION_DEADLINE, async {
-        let root = resolve_workspace_evidence_root(cwd).await.ok()??;
-        let list = || async {
-            let output = Command::new(codex_git_utils::git_executable_async().await)
-                .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .current_dir(&root)
-                .kill_on_drop(true)
-                .output().await.ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let paths = output.stdout.split(|byte| *byte == 0)
-                .filter(|path| !path.is_empty())
-                .map(|path| std::str::from_utf8(path).map(str::to_owned))
-                .collect::<Result<BTreeSet<_>, _>>().ok()?;
-            Some(paths)
-        };
-        let paths = list().await?;
-        let captured_paths = paths.clone();
-        let captured_root = root.clone();
-        let control = WorkspaceCaptureControl {
-            deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE,
-            cancellation,
-        };
-        let hash = tokio::task::spawn_blocking(move || {
-            let mut hash = Sha256::new();
-            hash.update(b"codex-checkout-content-v1\0");
-            let mut revisions = Vec::new();
-            let mut buffer = [0_u8; 64 * 1024];
-            for name in captured_paths {
-                if !control.active() {
-                    return None;
-                }
-                let relative = Path::new(&name);
-                if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
-                    return None;
-                }
-                let path = captured_root.join(relative);
-                hash.update((name.len() as u64).to_be_bytes());
-                hash.update(name.as_bytes());
-                let metadata = match std::fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == ErrorKind::NotFound => {
-                        hash.update(b"deleted\0");
-                        revisions.push((path, None));
-                        continue;
-                    }
-                    Err(_) => return None,
-                };
-                if metadata.file_type().is_symlink() {
-                    hash.update(b"symlink\0");
-                    let target = std::fs::read_link(&path).ok()?;
-                    hash.update(Sha256::digest(target.to_str()?.as_bytes()));
-                } else if metadata.is_file() {
-                    hash.update(b"file\0");
-                    let mut file = File::open(&path).ok()?;
-                    let (content_hash, bytes) = hash_workspace_content(
-                        &mut file, metadata.len(), &mut buffer, &control,
-                    )?;
-                    if bytes != metadata.len() {
-                        return None;
-                    }
-                    hash.update(content_hash.as_bytes());
-                } else {
-                    // A gitlink directory does not prove its recursive content.
-                    return None;
-                }
-                revisions.push((path, Some((metadata.len(), metadata.modified().ok()?, metadata.file_type()))));
-            }
-            for (path, before) in revisions {
-                let after = match std::fs::symlink_metadata(path) {
-                    Ok(metadata) => Some((metadata.len(), metadata.modified().ok()?, metadata.file_type())),
-                    Err(error) if error.kind() == ErrorKind::NotFound => None,
-                    Err(_) => return None,
-                };
-                if before != after || !control.active() {
-                    return None;
-                }
-            }
-            Some(format!("{:x}", hash.finalize()))
-        }).await.ok()??;
-        (list().await? == paths).then_some(hash)
-    }).await.ok().flatten()
-}
-
 async fn capture_workspace_evidence_identity_with_attribution(
     cwd: &Path,
 ) -> WorkspaceEvidenceCapture {
@@ -1739,7 +1646,18 @@ impl SourceChangeJournal {
                 .collect::<Vec<_>>();
             let subtree_keys = changed_paths
                 .iter()
-                .flat_map(|path| path.ancestors())
+                .flat_map(|path| {
+                    // Git's own bookkeeping (locks, objects, refs) is not worktree
+                    // content. It reaches watches at or under `.git`, but must not
+                    // make a recursive worktree watch stale after every Git query.
+                    let internal = is_git_internal_source_event(path);
+                    path.ancestors().filter(move |ancestor| {
+                        !internal
+                            || ancestor.components().any(|part| {
+                                part.as_os_str().to_string_lossy().eq_ignore_ascii_case(".git")
+                            })
+                    })
+                })
                 .map(source_change_path_key)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -2344,6 +2262,14 @@ impl GitWorkspaceCache {
             .load(Ordering::Acquire)
     }
 
+    /// Every started capture, including those outside a repository, which
+    /// `workspace_evidence_capture_count` does not count.
+    #[cfg(test)]
+    pub(crate) fn workspace_evidence_capture_sequence(&self) -> u64 {
+        self.workspace_evidence_capture_sequence
+            .load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_next_workspace_evidence_capture(
         &self,
@@ -2599,9 +2525,15 @@ impl GitWorkspaceCache {
     async fn record_watched_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) {
         let _guard = self.source_event_gate.write().await;
         let changed_paths = changed_paths.map(|paths| paths.into_iter()
-            .filter(|path| !is_generated_codex_eval_path(path) && !is_git_internal_source_event(path))
+            .filter(|path| !is_generated_codex_eval_path(path))
             .collect::<Vec<_>>());
         if changed_paths.as_ref().is_some_and(Vec::is_empty) { return; }
+        // Git metadata is still a valid direct source dependency. Journal it
+        // without querying Git or invalidating the worktree capture identity.
+        if changed_paths.as_ref().is_some_and(|paths| paths.iter().all(|path| is_git_internal_source_event(path))) {
+            self.record_source_change_with_capture_effect(changed_paths, false);
+            return;
+        }
         if changed_paths.is_none() { self.ignored_directories.lock().await.clear(); }
         let roots = self.repository_retention.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2610,6 +2542,7 @@ impl GitWorkspaceCache {
         let mut ignored = changed_paths.is_some();
         if let Some(paths) = &changed_paths {
             for path in paths {
+                if is_git_internal_source_event(path) { continue; }
                 let root = roots.iter().filter(|root| path.starts_with(root))
                     .max_by_key(|root| root.components().count());
                 match root {

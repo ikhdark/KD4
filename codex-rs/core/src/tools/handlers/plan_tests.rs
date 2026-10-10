@@ -272,9 +272,27 @@ async fn cancellation_while_waiting_for_plan_lock_preserves_revision_and_retry_p
     };
     let mut request = PlanHandler.handle(invocation(token.clone()));
     assert!(futures::poll!(&mut request).is_pending());
+    // Publication runs in a spawned task. Run it until it holds the publication
+    // gate: it is then past admission and parked on the plan lock `staged` holds.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let admitted = futures::poll!(std::pin::pin!(
+                session.services.plan_store.publication_guard()
+            ))
+            .is_pending();
+            if admitted {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication task should pass admission and wait for the plan lock");
     token.cancel();
     drop(staged);
-    assert!(request.await.is_err());
+    let result = request.await;
+    assert!(matches!(result, Err(FunctionCallError::RespondToModel(message))
+        if message.contains("cancelled before durable publication")));
     assert_eq!(session.services.plan_store.snapshot_with_lineage().await, before);
     assert!(events.try_recv().is_err());
     PlanHandler.handle(invocation(CancellationToken::new())).await.unwrap();

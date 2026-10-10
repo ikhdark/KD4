@@ -1262,7 +1262,8 @@ mod tests {
                 store('expected', bytes);
             "#),
             ("exec_command", json!({"output":"compact output", "stdout":"raw stdout ".repeat(1000),
-                "stderr":"raw stderr ".repeat(1000), "exit_code":0, "process_exited":true}), r#"
+                "stderr":"raw stderr ".repeat(1000), "streams_complete":true, "exit_code":0,
+                "process_exited":true}), r#"
                 const r = await tools.exec_command({});
                 text(r); r.reviewed = true; text(r);
                 r.stdout = 'CHANGED'; text(r); r.stdout = 'raw stdout '.repeat(1000);

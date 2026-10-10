@@ -12,6 +12,52 @@ import type {
 import { Thread } from "../src/thread";
 
 describe("Thread", () => {
+  it.each([
+    null,
+    [],
+    "schema",
+    42,
+    true,
+    new Date("2026-01-01T00:00:00Z"),
+    { toJSON: () => undefined },
+    { toJSON: () => [] },
+    { toJSON: () => null },
+    { toJSON: () => "{}" },
+  ])(
+    "rejects a non-object output schema before starting exec: %j",
+    async (outputSchema) => {
+      const exec = { run: jest.fn() };
+      const thread = new Thread(exec as unknown as CodexExec, {}, {});
+
+      await expect(thread.run("hello", { outputSchema })).rejects.toThrow(
+        "outputSchema must be a plain JSON object",
+      );
+      expect(exec.run).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{}, Object.assign(Object.create(null), { type: "object" })])(
+    "writes and removes a plain output schema: %j",
+    async (outputSchema) => {
+      let schemaPath: string | undefined;
+      let writtenSchema: unknown;
+      const exec = {
+        async *run(args: { outputSchemaFile?: string }): AsyncGenerator<string> {
+          schemaPath = args.outputSchemaFile;
+          writtenSchema = JSON.parse(await fs.readFile(schemaPath!, "utf8"));
+          yield JSON.stringify({ type: "thread.started", thread_id: "schema-thread" });
+        },
+      } as unknown as CodexExec;
+      const thread = new Thread(exec, {}, {});
+
+      await thread.run("hello", { outputSchema });
+
+      expect(writtenSchema).toEqual(outputSchema);
+      expect(schemaPath).toEqual(expect.any(String));
+      await expect(fs.stat(schemaPath!)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
   it("removes the output schema when input normalization fails", async () => {
     const mkdtemp = jest.spyOn(fs, "mkdtemp");
     const exec = { run: jest.fn() };

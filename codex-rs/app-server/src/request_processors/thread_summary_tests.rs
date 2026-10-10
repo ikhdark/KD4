@@ -6,7 +6,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
-fn started_notification_preserves_response_history_without_copying_it() -> Result<()> {
+fn started_notification_omits_turns_and_leaves_response_history_in_place() -> Result<()> {
     use codex_app_server_protocol::TurnItemsView;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;

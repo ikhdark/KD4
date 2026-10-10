@@ -886,18 +886,45 @@ mod tests {
             assert!(matches!(events.as_slice(), [ResponseEvent::Completed {
                 response_id, token_usage: None, end_turn: Some(true) }] if response_id == "done"));
         }
+        // Control: a well-formed usage object is still reported, including its details.
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let payload = json!({"type":"response.completed","response":{"id":"done","usage":{
+            "input_tokens": 10, "input_tokens_details": {"cached_tokens": 4},
+            "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 7},
+            "total_tokens": 30}}})
+        .to_string();
+        let events = interpreter
+            .process_payload(&payload)
+            .unwrap()
+            .collect::<Vec<_>>();
+        let expected_usage = TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 4,
+            output_tokens: 20,
+            reasoning_output_tokens: 7,
+            total_tokens: 30,
+        };
+        assert!(matches!(events.as_slice(), [ResponseEvent::Completed {
+            response_id, token_usage: Some(usage), end_turn: None }]
+            if response_id == "done" && *usage == expected_usage));
         for response in [
             json!({"end_turn":true}),
             json!({"id":"done","end_turn":"true"}),
         ] {
             let mut interpreter =
                 ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let payload = json!({"type":"response.completed","response":response}).to_string();
+            // Required fields stay strict; the rejection is a non-replayable protocol error.
+            let Err(ResponsesEventError::Api(ApiError::ProviderFailure { code, message })) =
+                interpreter.process_payload(&payload)
+            else {
+                panic!("completion without a valid id and end_turn must be rejected");
+            };
+            assert_eq!(code.as_deref(), Some("invalid_response"));
             assert!(
-                interpreter
-                    .process_payload(
-                        &json!({"type":"response.completed","response":response}).to_string()
-                    )
-                    .is_err()
+                message.starts_with("failed to parse ResponseCompleted"),
+                "{message}"
             );
         }
     }
@@ -913,11 +940,10 @@ mod tests {
                 .count(),
             0
         );
-        assert!(
-            interpreter
-                .process_payload(r#"{"type":"response.output_text.delta","delta":{}}"#)
-                .is_err()
-        );
+        assert!(matches!(
+            interpreter.process_payload(r#"{"type":"response.output_text.delta","delta":{}}"#),
+            Err(ResponsesEventError::Parse(_))
+        ));
     }
 
     #[test]

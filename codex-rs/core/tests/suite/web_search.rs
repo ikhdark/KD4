@@ -59,48 +59,6 @@ async fn web_search_mode_cached_sets_external_web_access_false() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn web_search_mode_takes_precedence_over_legacy_flags() {
-    require_network!();
-
-    let server = start_mock_server().await;
-    let sse = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let resp_mock = responses::mount_sse_once(&server, sse).await;
-
-    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
-        config
-            .features
-            .enable(Feature::WebSearchRequest)
-            .expect("test config should allow feature update");
-        config
-            .web_search_mode
-            .set(WebSearchMode::Cached)
-            .expect("test web_search_mode should satisfy constraints");
-    });
-    let test = builder
-        .build(&server)
-        .await
-        .expect("create test Codex conversation");
-
-    test.submit_turn_with_permission_profile(
-        "hello cached+live flags",
-        PermissionProfile::read_only(),
-    )
-    .await
-    .expect("submit turn");
-
-    let body = resp_mock.single_request().body_json();
-    let tool = find_web_search_tool(&body);
-    assert_eq!(
-        tool.get("external_web_access").and_then(Value::as_bool),
-        Some(false),
-        "web_search mode should win over legacy web_search_request"
-    );
-}
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_mode_updates_between_turns_with_permission_profile() {

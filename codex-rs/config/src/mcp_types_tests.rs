@@ -74,6 +74,7 @@ fn deserialize_remote_stdio_server_accepts_foreign_absolute_cwd() {
             cwd: Some(expected_cwd),
         }
     );
+    assert_eq!(cfg.environment_id, "remote");
 }
 
 
@@ -464,6 +465,6 @@ fn mcp_authentication_requires_http_transport() {
         let error =
             toml::from_str::<McpServerConfig>(&format!("command = 'server'\nauth = '{mode}'"))
                 .unwrap_err();
-        assert!(error.to_string().contains("auth"), "{error}");
+        assert_eq!(error.message(), "auth is not supported for stdio");
     }
 }

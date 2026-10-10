@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
-from app_server_harness import AppServerHarness, CapturedResponsesRequest
+from app_server_harness import AppServerHarness, CapturedResponsesRequest, MockSseResponse
 from app_server_helpers import (
     agent_message_texts,
     agent_message_texts_from_items,
@@ -127,8 +128,18 @@ def test_low_level_sync_stream_text_uses_real_turn_routing(tmp_path) -> None:
     assert [chunk.delta for chunk in chunks] == ["fir", "st"]
 
 
-def test_low_level_async_stream_text_allows_parallel_model_list(tmp_path) -> None:
+def test_low_level_async_stream_text_allows_parallel_model_list(tmp_path, monkeypatch) -> None:
     """Async stream_text should yield without blocking another app-server request."""
+    release_stream = threading.Event()
+    chunks = MockSseResponse.chunks
+
+    def paused_chunks(response, request):
+        for chunk in chunks(response, request):
+            yield chunk
+            if b'"delta": "one"' in chunk:
+                assert release_stream.wait(5), "model/list did not finish while stream was paused"
+
+    monkeypatch.setattr(MockSseResponse, "chunks", paused_chunks)
 
     async def scenario() -> None:
         """Leave a stream open while another async request completes."""
@@ -139,7 +150,6 @@ def test_low_level_async_stream_text_allows_parallel_model_list(tmp_path) -> Non
                     "msg-low-async-stream",
                     ["one", "two", "three"],
                 ),
-                delay_between_events_s=0.03,
             )
 
             async with AsyncCodex(config=harness.app_server_config()) as codex:
@@ -149,8 +159,11 @@ def test_low_level_async_stream_text_allows_parallel_model_list(tmp_path) -> Non
                     "low-level async",
                 )
                 first = await anext(stream)
-                models_task = asyncio.create_task(codex.models())
-                models = await asyncio.wait_for(models_task, timeout=1.0)
+                try:
+                    models_task = asyncio.create_task(codex.models())
+                    models = await asyncio.wait_for(models_task, timeout=1.0)
+                finally:
+                    release_stream.set()
                 remaining = [chunk.delta async for chunk in stream]
 
         assert {

@@ -2185,47 +2185,8 @@ fn history_prefix_divergence_separates_appending_from_rewriting() {
     );
 }
 
-#[test]
-fn budget_drops_are_read_from_the_representation_a_request_selects() {
-    let drops = |count: u32| crate::tool_history::ToolOutputBudgetDrops {
-        count,
-        tokens: u64::from(count) * 100,
-    };
-    let prompt = Prompt {
-        tool_output_budget_drops: [drops(1), drops(2), drops(3), drops(4)],
-        ..Prompt::default()
-    };
-
-    // Ordered to match `Prompt`'s four inputs: logical, stable-context
-    // fallback, tool-history fallback, both fallbacks.
-    assert_eq!(
-        prompt.selected_tool_output_budget_drops(
-            /*use_stable_context_fallback*/ false, /*use_tool_history_fallback*/ false
-        ),
-        drops(1)
-    );
-    assert_eq!(
-        prompt.selected_tool_output_budget_drops(
-            /*use_stable_context_fallback*/ true, /*use_tool_history_fallback*/ false
-        ),
-        drops(2)
-    );
-    assert_eq!(
-        prompt.selected_tool_output_budget_drops(
-            /*use_stable_context_fallback*/ false, /*use_tool_history_fallback*/ true
-        ),
-        drops(3)
-    );
-    assert_eq!(
-        prompt.selected_tool_output_budget_drops(
-            /*use_stable_context_fallback*/ true, /*use_tool_history_fallback*/ true
-        ),
-        drops(4)
-    );
-}
-
 #[tokio::test]
-async fn turn_timing_carries_prefix_divergence_and_selected_budget_drops() -> anyhow::Result<()> {
+async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let sse_body = concat!(
         "event: response.created\n",
@@ -2270,30 +2231,8 @@ async fn turn_timing_carries_prefix_divergence_and_selected_budget_drops() -> an
 
     let first_item = history_test_tool_output("call-1", "first result");
     let second_item = history_test_tool_output("call-2", "second result");
-    // Only the logical representation is dispatched over HTTP, so only its
-    // drops may be attributed; the fallbacks carry different numbers so
-    // reading the wrong one is visible.
-    let budget_drops = [
-        crate::tool_history::ToolOutputBudgetDrops {
-            count: 2,
-            tokens: 4_096,
-        },
-        crate::tool_history::ToolOutputBudgetDrops {
-            count: 7,
-            tokens: 70_000,
-        },
-        crate::tool_history::ToolOutputBudgetDrops {
-            count: 9,
-            tokens: 90_000,
-        },
-        crate::tool_history::ToolOutputBudgetDrops {
-            count: 11,
-            tokens: 110_000,
-        },
-    ];
     let prompt_for = |input: Vec<ResponseItem>| Prompt {
         input: input.into(),
-        tool_output_budget_drops: budget_drops,
         base_instructions: BaseInstructions {
             text: "stable base instructions".to_string(),
         },
@@ -2470,25 +2409,6 @@ async fn turn_timing_carries_prefix_divergence_and_selected_budget_drops() -> an
             (Some(3), Some(1), Some(1)),
         ],
         "turn timing must distinguish the appending request from the rewriting one"
-    );
-    assert_eq!(
-        categories
-            .iter()
-            .map(|category| (
-                category.tool_output_budget_drop_count,
-                category.tool_output_budget_dropped_token_count,
-            ))
-            .collect::<Vec<_>>(),
-        vec![(2, 4_096), (2, 4_096), (2, 4_096)],
-        "each request reports the drops of the representation it sent"
-    );
-    assert_eq!(
-        protocol.counters.tool_output_budget_drop_count, 6,
-        "counters total the per-request deltas"
-    );
-    assert_eq!(
-        protocol.counters.tool_output_budget_dropped_token_count,
-        12_288
     );
 
     Ok(())

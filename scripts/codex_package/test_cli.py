@@ -678,6 +678,49 @@ class CliPreflightTest(unittest.TestCase):
             self.assertEqual((package / "other").read_bytes(), b"other writer")
             self.assertFalse((package / "new").exists())
 
+    def test_publication_rollback_preserves_concurrent_archive_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged, output = root / "staged.zip", root / "package.zip"
+            staged.write_bytes(b"our archive")
+            real_link = os.link
+
+            def race(source, destination):
+                output.write_bytes(b"other writer")
+                return real_link(source, destination)
+
+            with self.assertRaisesRegex(RuntimeError, "already exists"):
+                with cli.publication_transaction([output]) as publication:
+                    with mock.patch.object(os, "link", side_effect=race):
+                        publication.activate(staged, output, force=False)
+            self.assertEqual(output.read_bytes(), b"other writer")
+            self.assertEqual(staged.read_bytes(), b"our archive")
+
+    def test_publication_rollback_removes_owned_output_after_interrupt(self) -> None:
+        for directory in (False, True):
+            with self.subTest(directory=directory), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                staged, output = root / "staged", root / "output"
+                if directory:
+                    staged.mkdir()
+                    (staged / "payload").write_bytes(b"our package")
+                    original = Path.rename
+                    owner, method = Path, "rename"
+                else:
+                    staged.write_bytes(b"our archive")
+                    original = cli.activate_archive
+                    owner, method = cli, "activate_archive"
+
+                def interrupt(*args, **kwargs):
+                    original(*args, **kwargs)
+                    raise KeyboardInterrupt()
+
+                with self.assertRaises(KeyboardInterrupt):
+                    with cli.publication_transaction([output]) as publication:
+                        with mock.patch.object(owner, method, new=interrupt):
+                            publication.activate(staged, output, force=False)
+                self.assertFalse(output.exists())
+
     def test_second_archive_activation_failure_restores_previous_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

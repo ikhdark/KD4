@@ -77,7 +77,9 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
             assert!(config.web_search_mode.set(WebSearchMode::Live).is_ok());
         });
     let test = builder.build(&server).await?;
-    let denied_path = test.config.cwd.join("denied.png");
+    // The tool error echoes this path, so its name must not satisfy the
+    // "denied"/"sandbox" check below.
+    let denied_path = test.config.cwd.join("reference.png");
     std::fs::write(&denied_path, TINY_PNG_BYTES)?;
     Mock::given(method("POST"))
         .and(path("/v1/images/edits"))

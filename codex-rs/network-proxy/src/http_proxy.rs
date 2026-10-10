@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_connect_accept_blocks_in_limited_mode() {
+    async fn http_connect_accept_requires_mitm_state_in_limited_mode() {
         let policy = {
             let mut policy = NetworkProxyConfig {
                 allow_local_binding: true,
@@ -1216,6 +1216,52 @@ mod tests {
         assert_eq!(
             response.headers().get("x-proxy-error").unwrap(),
             "blocked-by-mitm-required"
+        );
+
+        // The same limited-mode CONNECT is accepted for interception once MITM state exists.
+        let home = tempfile::tempdir().unwrap();
+        let mut config = NetworkProxyConfig {
+            enabled: true,
+            allow_local_binding: true,
+            mode: NetworkMode::Limited,
+            mitm: true,
+            ..NetworkProxyConfig::default()
+        };
+        config.set_allowed_domains(vec!["example.com".to_string()]);
+        let state = Arc::new(NetworkProxyState::with_reloader(
+            crate::state::build_config_state_with_codex_home(
+                config,
+                NetworkProxyConstraints::default(),
+                home.path(),
+            )
+            .unwrap(),
+            Arc::new(CountingReloader {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://example.com:443")
+            .header("host", "example.com:443")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(state);
+
+        let (response, request) = http_connect_accept(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            request.extensions().get::<ConnectMitmMode>().copied(),
+            Some(ConnectMitmMode::Enabled)
+        );
+        assert!(
+            request
+                .extensions()
+                .get::<Arc<mitm::MitmState>>()
+                .is_some()
         );
     }
 
@@ -1296,14 +1342,27 @@ mod tests {
 
     #[tokio::test]
     async fn http_connect_accept_defers_brokered_host_mitm_until_protocol_detection() {
+        // A broker-enabled config always carries MITM state; deferred interception needs it later.
+        let home = tempfile::tempdir().unwrap();
         let mut policy = NetworkProxyConfig {
+            enabled: true,
             allow_local_binding: true,
             credential_broker: true,
             mitm: true,
             ..NetworkProxyConfig::default()
         };
         policy.set_allowed_domains(vec!["github.com".to_string()]);
-        let state = Arc::new(network_proxy_state_for_policy(policy));
+        let state = Arc::new(NetworkProxyState::with_reloader(
+            crate::state::build_config_state_with_codex_home(
+                policy,
+                NetworkProxyConstraints::default(),
+                home.path(),
+            )
+            .unwrap(),
+            Arc::new(CountingReloader {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
         let mut env = HashMap::from([("GH_TOKEN".to_string(), "ghp-real".to_string())]);
         state.virtualize_child_credentials(&mut env);
 
@@ -1324,6 +1383,12 @@ mod tests {
         assert_eq!(
             request.extensions().get::<ConnectMitmMode>().copied(),
             Some(ConnectMitmMode::DetectTls)
+        );
+        assert!(
+            request
+                .extensions()
+                .get::<Arc<mitm::MitmState>>()
+                .is_some()
         );
     }
 
@@ -1545,7 +1610,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn http_plain_proxy_rejects_unix_socket_when_not_allowlisted() {
+    async fn http_plain_proxy_rejects_unix_socket_as_unsupported() {
         let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
 
         let mut req = Request::builder()

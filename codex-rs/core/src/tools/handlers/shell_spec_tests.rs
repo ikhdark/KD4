@@ -136,16 +136,24 @@ fn stall_timeout_schema_is_available_on_all_command_routes() {
         allow_login_shell: true,
         exec_permission_approvals_enabled: false,
     };
-    for spec in [
-        create_exec_command_tool(options),
-        create_shell_command_tool(options),
-        create_foreign_shell_command_tool(options, false),
+    for (spec, resumable) in [
+        (create_exec_command_tool(options), true),
+        (create_shell_command_tool(options), false),
+        (create_foreign_shell_command_tool(options, false), true),
     ] {
         let spec = serde_json::to_value(spec).unwrap();
         let field = if spec["name"] == "exec_command" { "cmd" } else { "command" };
         let schema = &spec["parameters"];
         let description = schema["properties"]["stall_timeout_ms"]["description"].as_str().unwrap();
         assert!(description.contains("Defaults to 60000 ms"));
+        if resumable {
+            assert!(description.contains("Silence never terminates the command"));
+            assert!(description.contains("live session"));
+        } else {
+            assert!(description.contains("cancel"), "{description}");
+            assert!(!description.contains("Silence never terminates"));
+            assert!(!description.contains("yielding its live session"));
+        }
         let validator = jsonschema::validator_for(schema).unwrap();
         for timeout in [0, 125, 60_000] {
             let mut arguments = json!({"stall_timeout_ms": timeout});
@@ -530,6 +538,48 @@ fn request_permissions_tool_includes_full_permission_schema() {
             ),
         })
     );
+
+    // The equality above derives `permissions` from the builder under test, so
+    // pin the advertised permission surface literally.
+    let serialized = serde_json::to_value(&tool).expect("serialize request_permissions tool");
+    assert_eq!(
+        serialized["parameters"]["properties"]["permissions"],
+        json!({
+            "type": "object",
+            "description": "Filesystem or network access request.",
+            "properties": {
+                "network": {
+                    "type": "object",
+                    "description": "Network access request.",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "True requests network access; false or omitted requests none."
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "file_system": {
+                    "type": "object",
+                    "description": "Filesystem access request.",
+                    "properties": {
+                        "read": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Absolute paths to grant read access; omit when none are needed."
+                        },
+                        "write": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Absolute paths to grant write access; omit when none are needed."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        })
+    );
 }
 
 #[test]
@@ -595,7 +645,18 @@ fn shell_command_tool_matches_expected_spec() {
                 u64::MAX,
             ),
         ),
-        ("stall_timeout_ms".to_string(), stall_timeout_schema()),
+        (
+            // The native route cancels on silence; it has no session to yield.
+            "stall_timeout_ms".to_string(),
+            bounded_integer(
+                format!(
+                    "Maximum time without stdout or stderr before cancelling the command. Defaults to {} ms. Set zero to disable this silence timeout; timeout_ms still applies. This native route does not return a resumable session; use exec_command for a non-terminating stall observation.",
+                    crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
+                ),
+                0,
+                u64::MAX,
+            ),
+        ),
         (
             "login".to_string(),
             JsonSchema::boolean(Some(
@@ -622,7 +683,7 @@ fn shell_command_tool_matches_expected_spec() {
 }
 
 #[test]
-fn command_tools_accept_legacy_untagged_and_canonical_kind_forms() {
+fn command_tools_advertise_a_flat_schema_and_reject_withdrawn_fields() {
     for (tool, script_field) in [
         (
             create_exec_command_tool(CommandToolOptions {

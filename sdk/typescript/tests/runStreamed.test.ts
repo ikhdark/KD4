@@ -86,13 +86,22 @@ describe("Codex", () => {
       await drainEvents(first.events);
 
       const second = await thread.runStreamed("second input");
-      await drainEvents(second.events);
+      const secondEvents = await drainEvents(second.events);
+      expect(secondEvents).toContainEqual({
+        type: "item.completed",
+        item: expect.objectContaining({ type: "agent_message", text: "Second response" }),
+      });
+      expect(secondEvents.at(-1)).toEqual(expect.objectContaining({ type: "turn.completed" }));
 
       // Check second request continues the same thread
-      expect(requests.length).toBeGreaterThanOrEqual(2);
+      expect(requests).toHaveLength(2);
       const secondRequest = requests[1];
       expect(secondRequest).toBeDefined();
       const payload = secondRequest!.json;
+      expect(payload.input.at(-1)).toEqual(expect.objectContaining({
+        role: "user",
+        content: [{ type: "input_text", text: "second input" }],
+      }));
 
       const assistantEntry = payload.input.find(
         (entry: { role: string }) => entry.role === "assistant",
@@ -133,14 +142,23 @@ describe("Codex", () => {
 
       const resumedThread = client.resumeThread(originalThread.id!);
       const second = await resumedThread.runStreamed("second input");
-      await drainEvents(second.events);
+      const secondEvents = await drainEvents(second.events);
+      expect(secondEvents).toContainEqual({
+        type: "item.completed",
+        item: expect.objectContaining({ type: "agent_message", text: "Second response" }),
+      });
+      expect(secondEvents.at(-1)).toEqual(expect.objectContaining({ type: "turn.completed" }));
 
       expect(resumedThread.id).toBe(originalThread.id);
 
-      expect(requests.length).toBeGreaterThanOrEqual(2);
+      expect(requests).toHaveLength(2);
       const secondRequest = requests[1];
       expect(secondRequest).toBeDefined();
       const payload = secondRequest!.json;
+      expect(payload.input.at(-1)).toEqual(expect.objectContaining({
+        role: "user",
+        content: [{ type: "input_text", text: "second input" }],
+      }));
 
       const assistantEntry = payload.input.find(
         (entry: { role: string }) => entry.role === "assistant",
@@ -201,9 +219,10 @@ describe("Codex", () => {
   });
 });
 
-async function drainEvents(events: AsyncGenerator<ThreadEvent>): Promise<void> {
-  let done = false;
-  do {
-    done = (await events.next()).done ?? false;
-  } while (!done);
+async function drainEvents(events: AsyncGenerator<ThreadEvent>): Promise<ThreadEvent[]> {
+  const collected: ThreadEvent[] = [];
+  for await (const event of events) {
+    collected.push(event);
+  }
+  return collected;
 }

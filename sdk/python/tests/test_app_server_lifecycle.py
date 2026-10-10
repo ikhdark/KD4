@@ -225,9 +225,24 @@ def test_archive_unarchive_round_trip_uses_materialized_rollout(tmp_path) -> Non
             thread = codex.thread_start()
             seeded = thread.run("materialize this thread before archive")
             archived = codex.thread_archive(thread.id)
+            archived_ids = {item.id for item in codex.thread_list(archived=True).data}
+            active_ids_before_restore = {
+                item.id for item in codex.thread_list(archived=False).data
+            }
             unarchived = codex.thread_unarchive(thread.id)
             read = unarchived.read()
+            active_ids_after_restore = {
+                item.id for item in codex.thread_list(archived=False).data
+            }
+            archived_ids_after_restore = {
+                item.id for item in codex.thread_list(archived=True).data
+            }
 
+    # Returning the same id is insufficient: restore must change saved state.
+    assert thread.id in archived_ids
+    assert thread.id not in active_ids_before_restore
+    assert thread.id in active_ids_after_restore
+    assert thread.id not in archived_ids_after_restore
     assert {
         "seeded_response": seeded.final_response,
         "archive_response": archived.model_dump(by_alias=True, mode="json"),

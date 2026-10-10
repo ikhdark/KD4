@@ -291,6 +291,17 @@ mod tests {
                 .expect("load wrong client enrollment"),
             None
         );
+        assert_eq!(
+            runtime
+                .get_remote_control_enrollment(
+                    "wss://example.com/backend-api/wham/remote/control/other-server",
+                    "account-a",
+                    Some("desktop-client"),
+                )
+                .await
+                .expect("load wrong target enrollment"),
+            None
+        );
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

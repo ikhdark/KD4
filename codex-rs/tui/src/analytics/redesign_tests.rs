@@ -26,15 +26,17 @@ fn keyboard_tabs_and_help_preserve_report_reading_position() {
     let mut view = fixture::view(models::AccountKind::Business);
     view.section = Section::Usage;
     view.sections[Section::Usage].detail = Some(6);
-    screen(&mut view, /*width*/ 80, /*height*/ 16);
+    // A four-row body is shorter than the six-line token report, so it has a nonzero offset to keep.
+    screen(&mut view, /*width*/ 80, /*height*/ 12);
     press(&mut view, KeyCode::PageDown);
-    screen(&mut view, /*width*/ 80, /*height*/ 16);
+    screen(&mut view, /*width*/ 80, /*height*/ 12);
     let offset = view.scroll_offset();
+    assert!(offset > 0);
     press(&mut view, KeyCode::BackTab);
     assert_eq!(view.section, Section::Credits);
-    screen(&mut view, /*width*/ 80, /*height*/ 16);
+    screen(&mut view, /*width*/ 80, /*height*/ 12);
     press(&mut view, KeyCode::PageDown);
-    screen(&mut view, /*width*/ 80, /*height*/ 16);
+    screen(&mut view, /*width*/ 80, /*height*/ 12);
     press(&mut view, KeyCode::Tab);
     assert_eq!(
         (
@@ -63,7 +65,7 @@ fn keyboard_tabs_and_help_preserve_report_reading_position() {
     press(&mut view, KeyCode::Char('?'));
     assert_eq!(view.scroll_offset(), offset);
     press(&mut view, KeyCode::Char('z'));
-    screen(&mut view, /*width*/ 80, /*height*/ 16);
+    screen(&mut view, /*width*/ 80, /*height*/ 12);
     let dashboard_offset = view.scroll_offset();
     press(&mut view, KeyCode::Char('?'));
     press(&mut view, KeyCode::Esc);
@@ -72,7 +74,7 @@ fn keyboard_tabs_and_help_preserve_report_reading_position() {
         (false, dashboard_offset)
     );
     press(&mut view, KeyCode::Enter);
-    screen(&mut view, /*width*/ 80, /*height*/ 16);
+    screen(&mut view, /*width*/ 80, /*height*/ 12);
     assert_eq!(
         (
             view.zoomed,

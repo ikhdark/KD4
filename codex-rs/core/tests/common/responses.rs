@@ -448,6 +448,55 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn matched_response_mocks_record_only_accepted_requests() {
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .expect("build HTTP client");
+        for use_sse in [false, true] {
+            let server = start_mock_server().await;
+            let matcher = |request: &wiremock::Request| {
+                request_has_last_message_input_text(request, "user", "accepted")
+            };
+            let body = if use_sse {
+                sse(vec![ev_completed("accepted-response")])
+            } else {
+                "configured response".to_string()
+            };
+            let captured = if use_sse {
+                mount_sse_once_match(&server, matcher, body.clone()).await
+            } else {
+                mount_response_once_match(
+                    &server,
+                    matcher,
+                    ResponseTemplate::new(202).set_body_string(body.clone()),
+                )
+                .await
+            };
+            let url = format!("{}/v1/responses", server.uri());
+            for (text, status, expected_count) in [
+                ("rejected", 404, 0),
+                ("accepted", if use_sse { 200 } else { 202 }, 1),
+                ("accepted", 404, 1),
+            ] {
+                let payload = serde_json::json!({"input": [{
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }]});
+                let response = client.post(&url).json(&payload).send().await.unwrap();
+                assert_eq!(response.status().as_u16(), status);
+                if status != 404 {
+                    assert_eq!(response.bytes().await.unwrap(), body.as_bytes());
+                }
+                assert_eq!(captured.requests().len(), expected_count);
+            }
+            assert_eq!(
+                captured.single_request().message_input_texts("user"),
+                vec!["accepted".to_string()]
+            );
+        }
+    }
+
     #[test]
     fn body_text_matching_preserves_escaped_trailing_quotes() {
         // JSON's escaped quote is two bytes (backslash + quote), distinct from
@@ -478,6 +527,25 @@ mod tests {
                 "{output_kind} must not be accepted before {call_kind}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_server_drop_closes_an_idle_connection() {
+        let server = start_websocket_server(vec![vec![vec![]]]).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(server.uri())
+            .await
+            .expect("connect websocket fixture");
+        let task = server.task.abort_handle();
+        // Keep the client and runtime alive while dropping a server waiting for
+        // its first request. Dropping a JoinHandle alone must not detach that wait.
+        drop(server);
+        let closed = tokio::time::timeout(Duration::from_secs(2), socket.next()).await;
+        // Clean up even when this regression fails against a detached server.
+        task.abort();
+        assert!(
+            matches!(closed, Ok(None) | Ok(Some(Err(_)))),
+            "dropping the fixture must close its idle socket: {closed:?}"
+        );
     }
 
     #[tokio::test]
@@ -673,8 +741,16 @@ pub struct WebSocketTestServer {
     #[cfg(test)]
     request_log_miss: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     response_batch_sent: Arc<Notify>,
-    shutdown: oneshot::Sender<()>,
+    shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WebSocketTestServer {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches it. Cancel active socket I/O as well as
+        // the accept loop when a test exits without explicit graceful shutdown.
+        self.task.abort();
+    }
 }
 
 impl WebSocketTestServer {
@@ -776,15 +852,16 @@ impl WebSocketTestServer {
         handshakes.first().cloned().unwrap()
     }
 
-    pub async fn shutdown(self) {
-        let _ = self.shutdown.send(());
-        let mut task = self.task;
-        if tokio::time::timeout(Duration::from_secs(10), &mut task)
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(Duration::from_secs(10), &mut self.task)
             .await
             .is_err()
         {
-            task.abort();
-            let _ = task.await;
+            self.task.abort();
+            let _ = (&mut self.task).await;
         }
     }
 }
@@ -1162,8 +1239,12 @@ pub async fn mount_response_once_match<M>(
 where
     M: wiremock::Match + Send + Sync + 'static,
 {
-    let (mock, response_mock) = base_mock();
-    mock.and(matcher)
+    let response_mock = ResponseMock::new();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(matcher)
+        // Record only accepted candidates, not requests routed to another mock.
+        .and(response_mock.clone())
         .respond_with(response)
         .up_to_n_times(1)
         .mount(server)
@@ -1191,13 +1272,7 @@ pub async fn mount_sse_once_match<M>(server: &MockServer, matcher: M, body: Stri
 where
     M: wiremock::Match + Send + Sync + 'static,
 {
-    let (mock, response_mock) = base_mock();
-    mock.and(matcher)
-        .respond_with(sse_response(body))
-        .up_to_n_times(1)
-        .mount(server)
-        .await;
-    response_mock
+    mount_response_once_match(server, matcher, sse_response(body)).await
 }
 
 pub async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock {
@@ -1481,7 +1556,7 @@ pub async fn start_websocket_server_with_headers(
         handshakes: handshakes_log,
         request_log_updated,
         response_batch_sent,
-        shutdown: shutdown_tx,
+        shutdown: Some(shutdown_tx),
         task,
     }
 }

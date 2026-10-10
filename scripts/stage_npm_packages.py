@@ -807,7 +807,7 @@ def artifact_tree_digest(artifact_dir: Path) -> str:
         artifact_dir.rglob("*"),
         key=lambda item: item.relative_to(artifact_dir).as_posix(),
     ):
-        if path.name == COMPLETE_MARKER:
+        if path == artifact_dir / COMPLETE_MARKER:
             continue
         relative = path.relative_to(artifact_dir).as_posix().encode("utf-8")
         if path.is_symlink():

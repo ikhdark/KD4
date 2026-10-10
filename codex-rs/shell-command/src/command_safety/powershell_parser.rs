@@ -1054,26 +1054,27 @@ mod tests {
             assert_eq!(analysis.direct_argv, None);
         }
 
-        let PowershellParseOutcome::Analysis(analysis) =
-            parser_response_with_mode("Standard", "7.5.0")
-        else {
-            panic!("expected parser analysis");
-        };
-        assert_eq!(
-            analysis.direct_argv,
-            Some(PowershellDirectArgvCandidate {
-                argv: vec!["python".to_string()],
-                native_argument_mode: "Standard".to_string(),
-                powershell_version: "7.5.0".to_string(),
-            })
-        );
+        // "Windows" is the default mode of PowerShell 7 on this platform.
+        for mode in ["Standard", "Windows"] {
+            let PowershellParseOutcome::Analysis(analysis) =
+                parser_response_with_mode(mode, "7.5.0")
+            else {
+                panic!("expected parser analysis");
+            };
+            assert_eq!(
+                analysis.direct_argv,
+                Some(PowershellDirectArgvCandidate {
+                    argv: vec!["python".to_string()],
+                    native_argument_mode: mode.to_string(),
+                    powershell_version: "7.5.0".to_string(),
+                })
+            );
+        }
     }
 
     #[test]
     fn parser_process_handles_multiple_requests() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
+        let powershell = try_find_powershell_executable_blocking().expect("Windows PowerShell");
         let powershell = powershell.as_path().to_str().unwrap();
         let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
 
@@ -1136,9 +1137,7 @@ mod tests {
 
     #[test]
     fn parser_process_reuses_deterministic_rejections() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
+        let powershell = try_find_powershell_executable_blocking().expect("Windows PowerShell");
         let mut parser = PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap())
             .expect("start parser");
         for _ in 0..2 {
@@ -1175,7 +1174,7 @@ mod tests {
     fn parser_syntax_diagnostics_are_bounded_and_legacy_errors_still_reject() {
         let legacy = deserialize_response(r#"{"id":1,"status":"parse_errors"}"#).unwrap();
         assert_eq!(legacy.into_outcome(), PowershellParseOutcome::SyntaxError(String::new()));
-        let Some(powershell) = try_find_powershell_executable_blocking() else { return };
+        let powershell = try_find_powershell_executable_blocking().expect("Windows PowerShell");
         let mut parser = PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap()).unwrap();
         let source = "foreach ($d in ) {}\n".repeat(20);
         let PowershellParseOutcome::SyntaxError(diagnostic) = parser.parse(&source).unwrap() else {
@@ -1191,9 +1190,7 @@ mod tests {
 
     #[test]
     fn parser_process_does_not_retain_oversized_syntax() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
+        let powershell = try_find_powershell_executable_blocking().expect("Windows PowerShell");
         let mut parser = PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap())
             .expect("start parser");
         let argument = "x".repeat(65_536);
@@ -1213,9 +1210,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn parser_process_resolves_each_request_against_the_current_path() {
-        let Some(powershell) = crate::powershell::try_find_pwsh_executable_blocking() else {
-            return;
-        };
+        let powershell = crate::powershell::try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
         let executable = fs::canonicalize(powershell.as_path()).expect("canonical pwsh");
         let mut parser =
             PowershellParserProcess::spawn(executable.to_str().unwrap()).expect("start parser");
@@ -1330,9 +1326,7 @@ mod tests {
 
     #[test]
     fn parser_cache_contention_does_not_queue_classification() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
+        let powershell = try_find_powershell_executable_blocking().expect("Windows PowerShell");
         let powershell = powershell.as_path().to_str().unwrap().to_string();
         let flavor = PowershellFlavor::from_requested_executable(&powershell).unwrap();
         let cached_parser = {
@@ -1361,9 +1355,7 @@ mod tests {
 
     #[test]
     fn parser_process_rejects_unsupported_top_level_forms() {
-        let Some(powershell) = try_find_powershell_executable_blocking() else {
-            return;
-        };
+        let powershell = try_find_powershell_executable_blocking().expect("Windows PowerShell");
         let powershell = powershell.as_path().to_str().unwrap();
         let mut parser = PowershellParserProcess::spawn(powershell).unwrap();
 

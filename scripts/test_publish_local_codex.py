@@ -112,13 +112,17 @@ function Write-ProofLine { param($Name, $Value); Write-Output "$Name : $Value" }
             command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 $homePath = {ps_single_quote(home)}
-try {{
-    Assert-NoCodexRunningTurns -LocalCodexHome $homePath
-    throw 'guard did not block'
+foreach ($attributes in @([IO.FileAttributes]::Normal, [IO.FileAttributes]::Hidden)) {{
+    [IO.File]::SetAttributes({ps_single_quote(running)}, $attributes)
+    try {{
+        Assert-NoCodexRunningTurns -LocalCodexHome $homePath
+        throw 'guard did not block'
+    }}
+    catch {{
+        if ($_.Exception.Message -notlike '*Activation deferred*other-chat*still-running*') {{ throw }}
+    }}
 }}
-catch {{
-    if ($_.Exception.Message -notlike '*Activation deferred*other-chat*still-running*') {{ throw }}
-}}
+[IO.File]::SetAttributes({ps_single_quote(running)}, [IO.FileAttributes]::Normal)
 Assert-NoCodexRunningTurns -LocalCodexHome $homePath -Force
 Add-Content -LiteralPath {ps_single_quote(running)} -Value '{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"still-running"}}}}'
 Assert-NoCodexRunningTurns -LocalCodexHome $homePath
@@ -933,6 +937,72 @@ catch {{
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("did not start", result.stdout)
         self.assertNotIn("desktopRestart: restarted", result.stdout)
+
+    def test_probe_timeouts_include_inherited_output_pipes(self) -> None:
+        from scripts.process_owner import run_owned
+
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        fixture = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        target = fixture / "probe.exe"
+        source = r"""
+using System;
+using System.Diagnostics;
+using System.Threading;
+public class InheritedPipeProbe {
+    public static int Main(string[] args) {
+        if (args.Length > 0 && args[0] == "hold") {
+            Thread.Sleep(5000);
+            return 0;
+        }
+        Process child = Process.Start(new ProcessStartInfo(typeof(InheritedPipeProbe).Assembly.Location, "hold") {
+            UseShellExecute = false, CreateNoWindow = true
+        });
+        System.IO.File.AppendAllText(Environment.GetEnvironmentVariable("PROBE_CHILD_IDS"), child.Id + "\n");
+        Console.WriteLine(args[0] == "--version" ? "codex 9.9.9" :
+            "{\"checks\":{\"local_publish.readiness\":{\"status\":\"ok\"},\"desktop.runtime_chain\":{\"status\":\"ok\"}}}");
+        return 0;
+    }
+}
+"""
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+Add-Type -TypeDefinition {ps_single_quote(source)} -OutputAssembly {ps_single_quote(target)} -OutputType ConsoleApplication
+$env:PROBE_CHILD_IDS = {ps_single_quote(fixture / "children.txt")}
+$timer = [Diagnostics.Stopwatch]::StartNew()
+$version = @(Get-VersionProofLines -Path {ps_single_quote(target)} -TimeoutMilliseconds 500)
+$versionElapsed = $timer.ElapsedMilliseconds
+$timer.Restart()
+$reason = $null
+$matched = Test-DesktopRuntimeProof -TargetPath {ps_single_quote(target)} -TimeoutMilliseconds 500 -FailureReason ([ref]$reason)
+$runtimeElapsed = $timer.ElapsedMilliseconds
+# Reap the fixture children before deleting their executable. Job termination
+# alone can precede the last Windows image-section reference being released.
+foreach ($childId in Get-Content -LiteralPath $env:PROBE_CHILD_IDS) {{
+    $child = Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue
+    if ($null -ne $child) {{
+        try {{
+            if ($child.Path -ne {ps_single_quote(target)}) {{ throw 'unexpected fixture child' }}
+            if (-not $child.WaitForExit(6000)) {{ throw 'fixture child did not exit' }}
+        }} finally {{ $child.Dispose() }}
+    }}
+}}
+@{{ Version = $version; Matched = $matched; Reason = $reason; VersionElapsed = $versionElapsed; RuntimeElapsed = $runtimeElapsed }} | ConvertTo-Json -Compress
+"""
+        result = run_owned(
+            [shell, "-NoProfile", "-Command", command], env=clean_env(),
+            text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = json.loads(result.stdout)
+        # Parent exit is not complete proof: inherited stdout/stderr must also
+        # finish within the probe budget, rather than accepting late output.
+        self.assertIn("timed out", output["Version"][0])
+        self.assertFalse(output["Matched"])
+        self.assertIn("timed out", output["Reason"])
+        self.assertLess(output["VersionElapsed"], 3000)
+        self.assertLess(output["RuntimeElapsed"], 3000)
 
     def test_runtime_probe_is_scoped_and_reports_failures(self) -> None:
         shell = powershell()

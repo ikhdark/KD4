@@ -113,7 +113,14 @@ async fn throttled_receiver_observes_changes_before_the_notification_window() {
     tx.add_changed_paths(&[path("a")]).await;
     let first_observed = Arc::clone(&observed);
     let first = throttled
-        .recv_with_observer(|_| {
+        .recv_with_observer(|event| {
+            assert_eq!(
+                event,
+                &FileWatcherEvent {
+                    paths: vec![path("a")],
+                    rescan_required: false,
+                }
+            );
             first_observed.fetch_add(1, Ordering::AcqRel);
         })
         .await;
@@ -122,7 +129,14 @@ async fn throttled_receiver_observes_changes_before_the_notification_window() {
 
     tx.add_changed_paths(&[path("b")]).await;
     let second_observed = Arc::clone(&observed);
-    let mut second = Box::pin(throttled.recv_with_observer(|_| {
+    let mut second = Box::pin(throttled.recv_with_observer(|event| {
+        assert_eq!(
+            event,
+            &FileWatcherEvent {
+                paths: vec![path("b")],
+                rescan_required: false,
+            }
+        );
         second_observed.fetch_add(1, Ordering::AcqRel);
     }));
     tokio::select! {
@@ -167,6 +181,32 @@ async fn throttled_receiver_emits_elapsed_pending_event_before_ready_raw_events(
             rescan_required: false,
         })
     );
+    assert_eq!(
+        throttled.recv().await,
+        Some(FileWatcherEvent {
+            paths: vec![path("c")],
+            rescan_required: false,
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttled_receiver_preserves_rescan_across_cancellation_and_later_paths() {
+    let (tx, rx) = watch_channel();
+    let mut throttled = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
+
+    tx.add_changed_paths(&[path("a")]).await;
+    assert!(throttled.recv().await.is_some());
+    tx.mark_rescan_required();
+    assert!(
+        timeout(TEST_THROTTLE_INTERVAL / 2, throttled.recv())
+            .await
+            .is_err()
+    );
+    tx.add_changed_paths(&[path("b")]).await;
+    assert!(throttled.recv().await.expect("pending rescan").rescan_required);
+    drop(tx);
+    assert_eq!(throttled.recv().await, None);
 }
 
 #[tokio::test(start_paused = true)]
@@ -525,6 +565,75 @@ async fn failed_watch_does_not_commit_a_logical_registration() {
     })
     .await
     .expect("failed registration should reconcile its degraded backend state");
+}
+
+#[tokio::test]
+async fn failed_batch_registration_restores_preexisting_watch_mode() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let first_root = temp_dir.path().join("first");
+    let second_root = temp_dir.path().join("second");
+    std::fs::create_dir(&first_root).expect("create first root");
+    std::fs::create_dir(&second_root).expect("create second root");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _existing = subscriber
+        .register_paths(vec![WatchPath {
+            path: first_root.clone(),
+            recursive: false,
+        }])
+        .expect("existing registration");
+
+    let registrations = [first_root.clone(), second_root.clone()]
+        .into_iter()
+        .map(|path| {
+            let requested = WatchPath {
+                path,
+                recursive: true,
+            };
+            let (actual, matched, fallback) = actual_watch_path(&requested);
+            SubscriberWatchRegistration {
+                key: SubscriberWatchKey { requested },
+                actual,
+                matched,
+                fallback,
+            }
+        })
+        .collect::<Vec<_>>();
+    // Reproduce removal between public path resolution and backend registration:
+    // the first mode upgrade succeeds, but the second backend watch must fail.
+    std::fs::remove_dir(&second_root).expect("remove second root after resolution");
+    assert!(watcher.register_paths(subscriber.id, &registrations).is_err());
+    assert_eq!(watcher.watch_counts_for_test(&first_root), Some((1, 0)));
+    assert_eq!(watcher.watch_counts_for_test(&second_root), None);
+    {
+        let state = watcher.state.read().expect("state lock");
+        let registered = &state
+            .subscribers
+            .get(&subscriber.id)
+            .expect("subscriber")
+            .watched_paths;
+        assert_eq!(registered.len(), 1);
+        assert!(registered.contains_key(&SubscriberWatchKey {
+            requested: WatchPath {
+                path: first_root.clone(),
+                recursive: false,
+            },
+        }));
+        let inner = watcher
+            .inner
+            .as_ref()
+            .expect("watcher inner")
+            .lock()
+            .expect("inner lock");
+        assert_eq!(
+            inner.watched_paths.get(&first_root),
+            Some(&RecursiveMode::NonRecursive)
+        );
+        assert!(!inner.watched_paths.contains_key(&second_root));
+    }
+    let changed = first_root.join("still-watched.txt");
+    std::fs::write(&changed, "retained watch").expect("write watched file");
+    recv_event_for(&mut rx, &changed).await;
 }
 
 #[tokio::test]
@@ -1324,6 +1433,58 @@ async fn ancestor_events_notify_child_watches() {
 }
 
 #[tokio::test]
+async fn ancestor_timestamp_reports_stop_at_a_watched_ancestor() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let parent = temp_dir.path().join("parent");
+    let root = parent.join("root");
+    let source = root.join("source.txt");
+    std::fs::create_dir_all(&root).expect("create watched root");
+
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut events) = watcher.add_subscriber();
+    let _root = subscriber.register_path(root.clone(), /*recursive*/ true);
+    let (raw_tx, raw_rx) = mpsc::channel(1);
+    watcher.spawn_event_loop_for_test(raw_rx);
+    let timestamp = |path: &Path| {
+        Ok(notify_event(
+            EventKind::Modify(ModifyKind::Any),
+            vec![path.to_path_buf()],
+        ))
+    };
+    async fn next_event(events: &mut Receiver) -> FileWatcherEvent {
+        timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("watch event timeout")
+            .expect("watcher remains open")
+    }
+
+    // Nothing watches `parent`, so its timestamp is the only evidence that the
+    // entry leading to the root may have been replaced.
+    raw_tx.send(timestamp(&parent)).await.expect("send event");
+    assert_eq!(next_event(&mut events).await.paths, vec![parent.clone()]);
+
+    let (other, _other_events) = watcher.add_subscriber();
+    let _missing = other.register_path(parent.join(".git"), /*recursive*/ false);
+    assert_eq!(watcher.watch_counts_for_test(&parent), Some((1, 0)));
+
+    // The watch on `parent` now reports its entries directly. The later source
+    // change proves the timestamp report was processed and not merely delayed.
+    raw_tx.send(timestamp(&parent)).await.expect("send event");
+    raw_tx.send(timestamp(&source)).await.expect("send event");
+    assert_eq!(next_event(&mut events).await.paths, vec![source]);
+
+    // A rename of that directory is not a timestamp report and still arrives.
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            vec![parent.clone()],
+        )))
+        .await
+        .expect("send event");
+    assert_eq!(next_event(&mut events).await.paths, vec![parent]);
+}
+
+#[tokio::test]
 async fn missing_file_watch_reports_requested_path_when_parent_changes() {
     // Parent changes report creation and deletion, but not unrelated siblings.
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1438,9 +1599,7 @@ async fn missing_watch_rekeys_canonical_identity_when_symlink_appears() {
     let (subscriber, mut rx) = watcher.add_subscriber();
     let _first = subscriber.register_path(requested_file.clone(), /*recursive*/ false);
 
-    if symlink_dir(&real_dir, &linked_dir).is_err() {
-        return;
-    }
+    symlink_dir(&real_dir, &linked_dir).expect("create directory symlink");
     let canonical_file = real_file.canonicalize().expect("canonical file");
     watcher
         .send_paths_for_test(vec![canonical_file.clone()])

@@ -45,6 +45,8 @@ elevated_windows_sandbox = true
     assert_eq!(migrated["config_version"].as_integer(), Some(1));
     assert_eq!(migrated["features"]["unified_exec"].as_bool(), Some(true));
     assert_eq!(migrated["features"]["apps"].as_bool(), Some(true));
+    assert!(migrated.get("experimental_use_unified_exec_tool").is_none());
+    assert!(migrated["features"].get("connectors").is_none());
     assert!(migrated["features"].get("terminal_resize_reflow").is_none());
     assert!(
         migrated["features"]
@@ -56,6 +58,11 @@ elevated_windows_sandbox = true
     assert_eq!(
         migrated["profiles"]["work"]["features"]["unified_exec"].as_bool(),
         Some(false)
+    );
+    assert!(
+        migrated["profiles"]["work"]
+            .get("experimental_use_unified_exec_tool")
+            .is_none()
     );
     assert!(migrated["notice"].get("hide_full_access_warning").is_none());
     assert!(

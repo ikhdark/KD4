@@ -948,6 +948,9 @@ fn function_output_with_image_uses_complete_json_canonical_result() {
                 image_url: "data:image/png;base64,AAA".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
+            FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: "opaque-provider-content".to_string(),
+            },
         ],
         Some(true),
     );
@@ -958,7 +961,11 @@ fn function_output_with_image_uses_complete_json_canonical_result() {
     let value: serde_json::Value =
         serde_json::from_slice(&canonical.bytes).expect("canonical JSON");
 
-    assert!(value.to_string().contains("data:image/png;base64,AAA"));
+    // Canonical recovery must retain typed producer content, not the lossy
+    // code-mode display string: item boundaries, image detail and opaque data.
+    let recovered: Vec<FunctionCallOutputContentItem> =
+        serde_json::from_value(value).expect("recover complete typed content");
+    assert_eq!(recovered, output.body);
     assert!(canonical.complete);
 }
 
@@ -1982,7 +1989,8 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     assert!(response.contains("error: exact retained failure marker 450"));
     assert!(!response.contains("ordinary-0300"));
     assert!(response.contains(&artifact_id.to_string()));
-    assert!(!response.contains(&artifact_path.display().to_string()));
+    // The response is JSON, which escapes path separators; match the file name.
+    assert!(!response.contains(&format!("{artifact_id}.log")));
     assert!(response.contains("Command preflight applied one repair"));
 
     let code_mode = output.code_mode_result(&ToolPayload::Function {
@@ -2328,13 +2336,14 @@ async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget(
 
 #[tokio::test]
 async fn exec_model_output_exposes_artifact_id_not_path() {
-    let (output, artifact_id, artifact_path, _retained_root) =
+    let (output, artifact_id, _artifact_path, _retained_root) =
         artifact_backed_exec_output(b"complete output requiring reduction\n", Some(2)).await;
 
     let response = output.response_text();
 
     assert!(response.contains(&artifact_id.to_string()));
-    assert!(!response.contains(&artifact_path.to_string_lossy().to_string()));
+    // The response is JSON, which escapes path separators; match the file name.
+    assert!(!response.contains(&format!("{artifact_id}.log")));
 }
 
 #[tokio::test]
@@ -2348,11 +2357,9 @@ async fn exec_code_mode_exposes_artifact_id_not_path() {
 
     assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
     assert!(result.get("raw_output_artifact").is_none());
-    assert!(
-        !result
-            .to_string()
-            .contains(&artifact_path.to_string_lossy().to_string())
-    );
+    // Serialized JSON escapes path separators; match the file name instead.
+    let artifact_file_name = format!("{artifact_id}.log");
+    assert!(!result.to_string().contains(&artifact_file_name));
 
     output.raw_output_artifact = Some(RawOutputArtifact::Failed {
         id: Some(artifact_id),
@@ -2367,11 +2374,7 @@ async fn exec_code_mode_exposes_artifact_id_not_path() {
         failed_result["raw_output_artifact_error"],
         "raw output artifact storage failed"
     );
-    assert!(
-        !failed_result
-            .to_string()
-            .contains(&artifact_path.to_string_lossy().to_string())
-    );
+    assert!(!failed_result.to_string().contains(&artifact_file_name));
 }
 
 #[tokio::test]
@@ -2440,7 +2443,10 @@ async fn fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contr
         assert_eq!(result["streams_complete"], expected);
         assert_eq!(result["stdout"].as_str(), expected.then_some("validation completed: 5 passed\r\n"));
         assert_eq!(result["output_complete"], false, "the chunk alone is not cumulative coverage");
-        assert!(output.raw_output.is_empty(), "canonical chunk is unchanged");
+        assert!(
+            output.canonical_result(&payload).expect("canonical chunk").bytes.is_empty(),
+            "canonical chunk is unchanged"
+        );
     }
 }
 
@@ -2455,6 +2461,12 @@ async fn fork91_cumulative_recovery_without_coordinates_does_not_guess_a_prefix(
     assert_eq!(result["raw_output_artifact_id"], id.to_string());
     assert!(result.get("recovery_selector").is_none());
     assert!(result.get("recovery").is_none());
+    // A reduced chunk has omitted lines but still no coordinates to place them.
+    output.raw_output = "last chunk line\n".repeat(600).into_bytes();
+    let reduced = output.code_mode_result(&payload);
+    assert_eq!(reduced["output_reduced"], true);
+    assert!(reduced.get("recovery_selector").is_none());
+    assert!(reduced.get("recovery").is_none());
     output.raw_output_artifact = None;
     assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
     output.raw_output = raw.into_bytes();
@@ -2476,6 +2488,20 @@ async fn fork91_no_match_requires_exact_error_free_terminal_streams() {
         assert_eq!(output.success_for_logging(), expected);
         assert_eq!(output.code_mode_result(&payload)["search_no_match"].as_bool().unwrap_or(false), expected);
     }
+    // Exact, error-free streams still prove nothing while the process is
+    // running or its output has not been drained.
+    output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+        aggregated_output: Vec::new(), stdout: Vec::new(), stderr: Vec::new(),
+        aggregated_output_is_exact: true, streams_are_exact: true,
+    }));
+    for (process_id, process_exited) in [(Some(7), true), (None, false)] {
+        output.process_id = process_id;
+        output.process_exited = process_exited;
+        assert!(!output.success_for_logging());
+        assert!(output.code_mode_result(&payload).get("search_no_match").is_none());
+    }
+    output.process_id = None;
+    output.process_exited = true;
     output.process_output = None;
     assert!(!output.success_for_logging(), "unknown streams are not a no-match proof");
     output.exit_code = Some(0);

@@ -82,7 +82,6 @@ async fn file_modified_time_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(updated_at)
 }
 
-pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportFailureRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportHistoryRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportSuccessRecord;
@@ -444,19 +443,16 @@ async fn open_goals_sqlite(
     open_sqlite(path, migrator, GOALS_DB, telemetry_override).await
 }
 
-async fn open_sqlite(
-    path: &Path,
-    migrator: &Migrator,
-    spec: RuntimeDbSpec,
-    telemetry_override: Option<&dyn DbTelemetry>,
+pub(crate) async fn connect_sqlite_pool_with_retry(
+    options: SqliteConnectOptions,
+    max_connections: u32,
+    started: Instant,
 ) -> anyhow::Result<SqlitePool> {
-    let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
-    let started = Instant::now();
     // Initial WAL/auto-vacuum pragmas can report SQLITE_BUSY before SQLite's
     // busy handler takes effect when another process creates the same database.
-    let pool_result = loop {
+    loop {
         let result = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             .connect_with(options.clone())
             .await;
         match result {
@@ -468,7 +464,18 @@ async fn open_sqlite(
             }
             result => break result.map_err(anyhow::Error::from),
         }
-    };
+    }
+}
+
+async fn open_sqlite(
+    path: &Path,
+    migrator: &Migrator,
+    spec: RuntimeDbSpec,
+    telemetry_override: Option<&dyn DbTelemetry>,
+) -> anyhow::Result<SqlitePool> {
+    let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
+    let started = Instant::now();
+    let pool_result = connect_sqlite_pool_with_retry(options, 5, started).await;
     crate::telemetry::record_init_result(
         telemetry_override,
         spec.kind,

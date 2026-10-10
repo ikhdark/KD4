@@ -281,10 +281,14 @@ try {
     const error = await rejected(() => await_command(value));
     check(error.evidence.terminal === value && unexpectedPolls === 0, "ambiguous terminal state accepted");
   }
-  check((await rejected(() => await_command(live(), { on_progress: () => false }))).evidence,
-    "semantic decision bypassed");
-  check((await rejected(() => await_command(live(), { max_observations: 1 }))).evidence,
-    "observation limit bypassed");
+  // write_stdin still throws here, so the stop reason and the poll count
+  // are what separate a stop from a failed poll.
+  const progressStop = await rejected(() => await_command(live(), { on_progress: () => false }));
+  check(progressStop.evidence && progressStop.message.includes("command progress needs review") &&
+    unexpectedPolls === 0, "semantic decision bypassed");
+  const limitStop = await rejected(() => await_command(live(), { max_observations: 1 }));
+  check(limitStop.evidence && limitStop.message.includes("command observation limit reached") &&
+    unexpectedPolls === 0, "observation limit bypassed");
   tools.write_stdin = async () => live("unexpected", 8);
   const changed = await rejected(() => await_command(live()));
   check(changed.evidence.observations.length === 2, "changed handle silently followed");

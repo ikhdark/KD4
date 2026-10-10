@@ -580,11 +580,84 @@ mod deadline_tests {
     }
 
     #[test]
-    fn smoke_deadline_bounds_plugin_read_and_stops_polling_after_expiry() {
+    fn state_polling_rereads_a_mismatched_state_until_it_converges_or_expires() {
+        let plugin_read = serde_json::json!({"plugin": {
+            "marketplaceName": REMOTE_MARKETPLACE_HINT,
+            "marketplacePath": null,
+            "summary": {
+                "id": "fixture-plugin", "remotePluginId": "fixture-remote", "name": "Fixture",
+                "shareContext": null, "source": {"type": "remote"}, "installed": false,
+                "enabled": false, "installPolicy": "AVAILABLE", "installPolicySource": null,
+                "authPolicy": "ON_USE", "availability": "AVAILABLE", "interface": null,
+                "keywords": []
+            },
+            "shareUrl": null, "description": null, "skills": [], "hooks": [], "apps": [],
+            "appTemplates": [], "mcpServers": []
+        }});
+        // This is the external peer's wire response; the production client performs its own decode.
+        let decoded: PluginReadResponse = serde_json::from_value(plugin_read.clone())
+            .expect("independent peer response obeys the public plugin/read schema");
+        assert!(!decoded.plugin.summary.installed);
+        let plugin_json = plugin_read.to_string().replace('\'', "''");
+        for (installed_from_read, budget) in [
+            (Some(3_usize), Duration::from_secs(10)),
+            (None, Duration::from_millis(1500)),
+        ] {
+            let installed = match installed_from_read {
+                Some(read) => format!("($reads -ge {read})"),
+                None => "$false".to_string(),
+            };
+            let body = format!(
+                "$reads = [int]$reads + 1; $result = '{plugin_json}' | ConvertFrom-Json; $result.plugin.summary.installed = {installed}; $response = @{{jsonrpc='2.0'; id=$request.id; result=$result}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 20 -Compress))"
+            );
+            let temp = tempfile::tempdir().expect("peer log root");
+            let log = temp.path().join("requests.jsonl");
+            let mut client = crate::tests::smoke_deadline_client(&log, &body);
+            let start = Instant::now();
+            let result = wait_for_installed_state(
+                &mut client,
+                "fixture-remote",
+                ExpectedInstalledState::Installed,
+                start + budget,
+            );
+            let elapsed = start.elapsed();
+            let requests = std::fs::read_to_string(&log).expect("actual plugin/read requests");
+            let requests = requests
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("RPC JSON"))
+                .collect::<Vec<_>>();
+            for request in &requests {
+                assert_eq!(request["method"], "plugin/read");
+                assert_eq!(request["params"]["pluginName"], "fixture-remote");
+            }
+            if let Some(installed_from_read) = installed_from_read {
+                let plugin =
+                    result.expect("polling continues until the expected state is observed");
+                assert!(plugin.installed);
+                assert_eq!(
+                    requests.len(),
+                    installed_from_read,
+                    "every mismatched read is followed by exactly one more plugin/read"
+                );
+            } else {
+                let error =
+                    result.expect_err("a state that never converges cannot outlive its deadline");
+                assert!(error.to_string().contains("deadline"), "{error:#}");
+                assert!(elapsed < budget + Duration::from_secs(2), "{elapsed:?}");
+                assert!(
+                    requests.len() >= 2,
+                    "a mismatched state is read again before expiry: {requests:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smoke_deadline_bounds_plugin_read_and_never_retries_a_failed_read() {
         for (body, budget) in [
             ("Start-Sleep -Seconds 5", Duration::from_millis(200)),
             (
-                "$response = @{jsonrpc='2.0'; id=$request.id; error=@{code=-32000; message='retryable test failure'}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
+                "$response = @{jsonrpc='2.0'; id=$request.id; error=@{code=-32000; message='plugin read failure'}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
                 Duration::from_secs(1),
             ),
         ] {
@@ -606,7 +679,7 @@ mod deadline_tests {
                     .contains(if body.starts_with("Start-Sleep") {
                         "deadline"
                     } else {
-                        "retryable test failure"
+                        "plugin read failure"
                     }),
                 "{error:#}"
             );
@@ -619,7 +692,7 @@ mod deadline_tests {
             assert_eq!(
                 requests.len(),
                 1,
-                "a retry sleep clipped to expiry cannot admit a second RPC"
+                "a stalled or failed plugin/read ends the wait without a second RPC"
             );
             assert_eq!(requests[0]["method"], "plugin/read");
             assert_eq!(requests[0]["params"]["pluginName"], "fixture-remote");

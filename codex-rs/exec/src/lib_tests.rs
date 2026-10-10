@@ -743,12 +743,13 @@ async fn thread_start_params_preserve_configured_permissions() {
 
     let params = thread_start_params_from_config(&config);
 
+    let active_profile = config
+        .permissions
+        .active_permission_profile()
+        .expect("default config selects a built-in permission profile");
     assert_eq!(params.sandbox, None);
     assert_eq!(params.thread_source, Some(codex_app_server_protocol::ThreadSource::User));
-    assert_eq!(
-        params.permissions,
-        permissions_selection_from_config(&config)
-    );
+    assert_eq!(params.permissions, Some(active_profile.id));
 }
 
 #[tokio::test]
@@ -802,11 +803,12 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
 
 #[test]
 fn active_profile_selection_uses_profile_id_only() {
-    let selection = permission_profile_id_from_active_profile(ActivePermissionProfile::new(
-        BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
-    ));
+    let selection = permission_profile_id_from_active_profile(ActivePermissionProfile {
+        id: "team-profile".to_string(),
+        extends: Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string()),
+    });
 
-    assert_eq!(selection, BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string());
+    assert_eq!(selection, "team-profile".to_string());
 }
 
 #[tokio::test]

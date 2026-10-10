@@ -289,10 +289,12 @@ fn unsettled_recovery_uses_durable_results_and_redacts_invocations() {
     super::rollout_reconstruction::append_unsettled_tool_recovery(&mut history, &items);
     let text = serde_json::to_string(&history).unwrap();
     assert!(!text.contains("SECRET"));
-    assert!(!text.contains("\"call_id\":\"settled\""));
     let ResponseItem::Message { content, .. } = &history[0] else { panic!("recovery message"); };
     let ContentItem::InputText { text } = &content[0] else { panic!("recovery text"); };
     let summary: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+    // Checked on the parsed page: inside the serialized history its quotes are escaped.
+    assert!(summary["operations"].as_array().unwrap().iter()
+        .all(|operation| operation["call_id"] != "settled"));
     assert_eq!(summary["unresolved_count"], 10);
     assert_eq!(summary["omitted_count"], 2);
     assert_eq!(summary["operations"].as_array().unwrap().len(), 8);
@@ -339,11 +341,13 @@ fn compaction_preserves_resume_boundary_before_reused_live_handle() {
         call("new"),
         output("new"),
     ]);
-    for build in [
-        crate::compact::build_task_input_checkpoint,
-        crate::compact::build_unresolved_input_checkpoint,
-    ] {
-        let (checkpoint, _, _) = build(&source);
+    // Remote compaction retains the previous handoff; local compaction does not.
+    let remote = |items: &[ResponseItem]| crate::compact::build_task_input_checkpoint(items).0;
+    let local =
+        |items: &[ResponseItem]| crate::compact::build_local_task_input_checkpoint(items).0;
+    let builders: [&dyn Fn(&[ResponseItem]) -> Vec<ResponseItem>; 2] = [&remote, &local];
+    for build in builders {
+        let checkpoint = build(&source);
         let boundary = checkpoint
             .iter()
             .position(is_unified_exec_resume_invalidation)
@@ -364,7 +368,7 @@ fn compaction_preserves_resume_boundary_before_reused_live_handle() {
         );
         let mut consumed = checkpoint;
         consumed.push(assistant_message("The new command is still running."));
-        let (again, _, _) = build(&consumed);
+        let again = build(&consumed);
         assert_eq!(
             again
                 .iter()
@@ -2673,7 +2677,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
  {
     let (session, turn_context) = make_session_and_context().await;
     let previous_model = "previous-rollout-model";
-    let previous_context_item = TurnContextItem {
+    let previous_context_item = accepted_context(TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         cwd: turn_context.cwd().clone(),
         workspace_roots: None,
@@ -2692,7 +2696,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
         context_provenance: None,
-    };
+    });
     let previous_turn_id = previous_context_item
         .turn_id
         .clone()
@@ -2726,7 +2730,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
                 ..Default::default()
             },
         )),
-        RolloutItem::TurnContext(previous_context_item),
+        RolloutItem::TurnContext(previous_context_item.clone()),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
                 surfaced_result: None,
@@ -2776,6 +2780,15 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             window_id: None,
         }),
     ];
+
+    // Prove there is an accepted baseline for compaction to invalidate.
+    let before = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items[..5])
+        .await;
+    assert_eq!(
+        serde_json::to_value(before.reference_context_item).unwrap(),
+        serde_json::to_value(Some(previous_context_item)).unwrap()
+    );
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
@@ -2939,7 +2952,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
  {
     let (session, turn_context) = make_session_and_context().await;
     let previous_model = "previous-rollout-model";
-    let previous_context_item = TurnContextItem {
+    let previous_context_item = accepted_context(TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         cwd: turn_context.cwd().clone(),
         workspace_roots: None,
@@ -2958,7 +2971,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
         context_provenance: None,
-    };
+    });
     let previous_turn_id = previous_context_item
         .turn_id
         .clone()
@@ -2992,7 +3005,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
                 ..Default::default()
             },
         )),
-        RolloutItem::TurnContext(previous_context_item),
+        RolloutItem::TurnContext(previous_context_item.clone()),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
                 surfaced_result: None,
@@ -3033,6 +3046,15 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
             window_id: None,
         }),
     ];
+
+    // Prove there is an accepted baseline for compaction to invalidate.
+    let before = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items[..5])
+        .await;
+    assert_eq!(
+        serde_json::to_value(before.reference_context_item).unwrap(),
+        serde_json::to_value(Some(previous_context_item)).unwrap()
+    );
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
@@ -3113,7 +3135,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
  {
     let (session, turn_context) = make_session_and_context().await;
     let previous_model = "previous-rollout-model";
-    let previous_context_item = TurnContextItem {
+    let previous_context_item = accepted_context(TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         cwd: turn_context.cwd().clone(),
         workspace_roots: None,
@@ -3132,7 +3154,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
         context_provenance: None,
-    };
+    });
     let previous_turn_id = previous_context_item
         .turn_id
         .clone()
@@ -3167,7 +3189,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
                 ..Default::default()
             },
         )),
-        RolloutItem::TurnContext(previous_context_item),
+        RolloutItem::TurnContext(previous_context_item.clone()),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
                 surfaced_result: None,
@@ -3219,6 +3241,15 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
             },
         )),
     ];
+
+    // Prove there is an accepted baseline for compaction to invalidate.
+    let before = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items[..5])
+        .await;
+    assert_eq!(
+        serde_json::to_value(before.reference_context_item).unwrap(),
+        serde_json::to_value(Some(previous_context_item)).unwrap()
+    );
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {

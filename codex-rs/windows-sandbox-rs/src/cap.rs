@@ -38,8 +38,6 @@ pub struct CapSids {
 #[derive(Clone)]
 struct CachedCapSids {
     caps: CapSids,
-    #[cfg(test)]
-    disk_load_count: usize,
 }
 
 static CAP_SIDS_CACHE: OnceLock<Mutex<HashMap<String, CachedCapSids>>> = OnceLock::new();
@@ -141,14 +139,7 @@ fn cached_cap_sids<'a>(
     if !cache.contains_key(&key) {
         let _lock = lock_cap_sid_file(codex_home)?;
         let caps = load_or_create_cap_sids_from_disk(codex_home)?;
-        cache.insert(
-            key.clone(),
-            CachedCapSids {
-                caps,
-                #[cfg(test)]
-                disk_load_count: 1,
-            },
-        );
+        cache.insert(key.clone(), CachedCapSids { caps });
     }
     cache
         .get_mut(&key)
@@ -217,16 +208,6 @@ fn keyed_cap_sid(
     Ok(sid)
 }
 
-#[cfg(test)]
-fn cap_sid_disk_load_count(codex_home: &Path) -> usize {
-    let key = canonical_path_key(&cap_sid_file(codex_home));
-    cap_sids_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .map_or(0, |cached| cached.disk_load_count)
-}
-
 pub fn workspace_write_cap_sid_for_root(
     codex_home: &Path,
     cwd: &Path,
@@ -265,7 +246,6 @@ pub fn workspace_write_root_specificity(root: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::cap_sid_disk_load_count;
     use super::load_or_create_cap_sids;
     use super::make_random_cap_sid_string;
     use super::workspace_cap_sid_for_cwd;
@@ -449,11 +429,14 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
 
         let first = load_or_create_cap_sids(home.path()).expect("first cap SID load");
+        // Without the persisted file a second disk load would mint and persist fresh SIDs.
+        let path = super::cap_sid_file(home.path());
+        std::fs::remove_file(&path).expect("remove persisted cap SIDs");
         let second = load_or_create_cap_sids(home.path()).expect("cached cap SID load");
 
         assert_eq!(first.workspace, second.workspace);
         assert_eq!(first.readonly, second.readonly);
-        assert_eq!(cap_sid_disk_load_count(home.path()), 1);
+        assert!(!path.exists(), "cached load must not touch the disk");
     }
 
     #[test]

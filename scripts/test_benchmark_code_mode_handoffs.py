@@ -141,6 +141,24 @@ class CodeModeHandoffsBenchmarkTest(unittest.TestCase):
             passed = self.run_benchmark(script, "--runs", "1", "--model-evaluations", str(path))
             self.assertEqual(passed.returncode, 0, passed.stderr)
             self.assertTrue(json.loads(passed.stdout)["uncertaintyEvaluation"]["accepted"])
+            # Faster correct work is not a matched latency comparison when
+            # the baseline was wrong or incomplete. Preserve that evidence,
+            # but do not let it substantiate the benchmark acceptance gate.
+            for field, invalid in (("correct", False), ("complete", False),
+                                   ("unsupportedConclusions", 1)):
+                with self.subTest(baseline=field):
+                    original = trials[0][field]
+                    trials[0][field] = invalid
+                    path.write_text(json.dumps(trials))
+                    unmatched = self.run_benchmark(
+                        script, "--runs", "1", "--model-evaluations", str(path)
+                    )
+                    trials[0][field] = original
+                    self.assertEqual(unmatched.returncode, 0, unmatched.stderr)
+                    evaluation = json.loads(unmatched.stdout)["uncertaintyEvaluation"]
+                    self.assertFalse(evaluation["accepted"])
+                    self.assertFalse(evaluation["comparisons"][0]["baselineCorrectAndComplete"])
+                    self.assertTrue(evaluation["comparisons"][0]["candidateCorrectAndComplete"])
             # Equal/faster wall time cannot hide extra inference, validation,
             # recovery, or retry work. Check each dimension independently.
             for metric in ("wallMs", "modelRequests", "toolCalls", "validationMs", "recoveries", "retries"):

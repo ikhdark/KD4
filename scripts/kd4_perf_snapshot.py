@@ -550,7 +550,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             for path in (args.output, args.model_attempt_report)
             if path is not None
         ]
-        if len(set(destinations)) != len(destinations) or inputs.intersection(
+        aliases = any(
+            destination.exists() and other.exists() and destination.samefile(other)
+            for index, destination in enumerate(destinations)
+            for other in (*inputs, *destinations[:index])
+        )
+        if aliases or len(set(destinations)) != len(destinations) or inputs.intersection(
             destinations
         ):
             raise ValueError(

@@ -302,6 +302,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // A raw per-read socket timeout has the same kind; only the deadline check reports this.
+        assert_eq!(error.to_string(), "HTTP request deadline expired");
         assert!(started.elapsed() < Duration::from_secs(1));
         Ok(())
     }

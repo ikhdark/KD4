@@ -370,10 +370,12 @@ fn fails_cleanly_for_invalid_images() {
         PromptImageMode::ResizeToFit,
     )
     .expect_err("invalid image should fail");
-    assert!(matches!(
-        err,
-        ImageProcessingError::Decode { .. } | ImageProcessingError::UnsupportedImageFormat { .. }
-    ));
+    // Unrecognized bytes are an unsupported format, not a decode failure; callers
+    // render a different placeholder for each.
+    assert!(
+        matches!(&err, ImageProcessingError::UnsupportedImageFormat { mime } if mime == "unknown"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

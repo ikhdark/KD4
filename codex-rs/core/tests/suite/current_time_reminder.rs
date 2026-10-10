@@ -359,14 +359,21 @@ async fn current_time_reminder_is_refreshed_after_compaction() -> Result<()> {
 
     test.submit_turn("before compact").await?;
     test.codex.submit(Op::Compact).await?;
-    wait_for_event(&test.codex, |event| {
+    let EventMsg::TurnComplete(compacted) = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
-    .await;
+    .await else {
+        unreachable!();
+    };
+    assert_eq!(compacted.error, None, "compaction must succeed before the refresh assertion");
     test.submit_turn("after compact").await?;
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 3);
+    assert_eq!(current_time_reminders(&requests[0]), vec![FIRST_REMINDER]);
+    assert!(requests[2].message_input_texts("user").iter().any(|text| {
+        text.starts_with(codex_core::compact::SUMMARY_PREFIX) && text.contains("compact summary")
+    }), "the next request must use the successfully installed compacted history");
     assert_eq!(
         current_time_reminders(&requests[2]),
         vec![SECOND_REMINDER],
@@ -421,10 +428,13 @@ async fn time_provider_failure_stops_before_inference() -> Result<()> {
     );
     assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Other));
 
-    wait_for_event(&test.codex, |event| {
+    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
-    .await;
+    .await else {
+        unreachable!();
+    };
+    assert_eq!(completed.error, Some(error));
     assert!(responses.requests().is_empty());
 
     Ok(())
@@ -510,17 +520,22 @@ async fn current_time_tool_returns_json_through_code_mode() -> Result<()> {
         .build(&server)
         .await?;
 
-    test.submit_turn("check the current time through code mode")
+    let completed = test
+        .submit_turn_and_capture_completion("check the current time through code mode")
         .await?;
+    assert_eq!(completed.error, None);
     let requests = responses.requests();
-    let (output, _) = requests[1]
+    assert_eq!(requests.len(), 2);
+    let (output, success) = requests[1]
         .custom_tool_call_output_content_and_success(CALL_ID)
         .expect("cell output");
+    assert_ne!(success, Some(false), "the clock cell must not report failure");
     let output = output.expect("cell text");
     let values = output
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .collect::<Vec<_>>();
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
     assert_eq!(
         values,
         vec![json!({"current_time": "2026-06-17 17:35:15 UTC"})]

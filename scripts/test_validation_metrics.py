@@ -71,7 +71,7 @@ class SummaryTest(unittest.TestCase):
         conflict["outcome"] = "failed"
         with self.assertRaisesRegex(ValueError, "conflicting"):
             metrics.summarize([value, conflict])
-        for duration in (-1, float("nan"), float("inf"), True, "1"):
+        for duration in (-1, float("nan"), float("inf"), 2**2048, True, "1"):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
                 metrics.summarize([record(lifecycle_seconds=duration)])
 
@@ -217,6 +217,27 @@ class PersistenceTest(unittest.TestCase):
             self.assertEqual(contract["kind"], metrics.KIND)
             self.assertIn("freshness", contract["proof"])
             self.assertEqual(contract["reasons"], list(metrics.REASONS))
+
+    def test_unrepresentable_durations_are_controlled_cli_errors(self):
+        # Imported ledgers can contain JSON integers outside the floating-point
+        # range used for timing reports. Reject them like other bad durations,
+        # rather than leaking a conversion traceback from the CLI.
+        for location in ("lifecycle", "phase", "command"):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temporary:
+                value = record()
+                if location == "lifecycle":
+                    value["lifecycle_seconds"] = 2**2048
+                elif location == "phase":
+                    value["phases"]["admission"] = 2**2048
+                else:
+                    value["commands"] = [{"wall_seconds": 2**2048}]
+                path = Path(temporary) / "validation-fixture.json"
+                path.write_text(json.dumps(value), encoding="utf-8")
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    self.assertEqual(metrics.main([str(path), "--json"]), 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("duration", stderr.getvalue())
 
     def test_non_string_metadata_kinds_do_not_abort_rollout_extraction(self):
         kinds = [[], ["bin"], {"target": "bin"}, None, 1, True]

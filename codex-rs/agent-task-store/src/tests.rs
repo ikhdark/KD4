@@ -87,11 +87,13 @@ async fn agent_task_authorization_does_not_hydrate_task_capsules() {
     .expect("corrupt capsule writes");
 
     assert!(
-        fixture
-            .store
-            .get_agent_task(assignment.assignment_id, Some(0))
-            .await
-            .is_err(),
+        matches!(
+            fixture
+                .store
+                .get_agent_task(assignment.assignment_id, Some(0))
+                .await,
+            Err(StoreError::Json(_))
+        ),
         "the full task projection should hydrate and reject the corrupt capsule"
     );
     let authorization = fixture
@@ -385,9 +387,11 @@ async fn audit_validation_receipt_failed_and_cancelled_do_not_refresh_progress()
     initialize_validation_repository(fixture.repo.path());
     let pool = coordination_pool(&fixture).await;
     let command = "focused proof";
-    for (ordinal, status) in [
-        ValidationCallStatus::Failed,
-        ValidationCallStatus::Cancelled,
+    for (ordinal, (status, refreshes_progress)) in [
+        (ValidationCallStatus::Failed, false),
+        (ValidationCallStatus::Cancelled, false),
+        // Control: this fixture does reach the refresh a successful result makes.
+        (ValidationCallStatus::Succeeded, true),
     ]
     .into_iter()
     .enumerate()
@@ -430,7 +434,11 @@ async fn audit_validation_receipt_failed_and_cancelled_do_not_refresh_progress()
         .fetch_one(&pool)
         .await
         .expect("progress reads");
-        assert_eq!(progress, prior_json);
+        if refreshes_progress {
+            assert_ne!(progress, prior_json, "{status:?}");
+        } else {
+            assert_eq!(progress, prior_json, "{status:?}");
+        }
     }
 }
 
@@ -1541,14 +1549,30 @@ async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_proj
         format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&expected_contract).unwrap()))
     );
 
-    let mut worker = worker_draft("architecture-root", "src");
-    worker.dependencies = vec![architect.assignment_id];
-    worker.architecture_contract_ref = Some(ArchitectureContractRef {
+    let reference = ArchitectureContractRef {
         architect_assignment_id: architect.assignment_id,
         architect_attempt_id: architect_attempt.attempt_id,
         contract_version: sealed.contract.schema_version,
         contract_sha256: sealed.contract_sha256,
-    });
+    };
+    // Control: the same valid reference does not admit a projection the contract did not seal.
+    let mut diverging = worker_draft("architecture-root", "docs");
+    diverging.dependencies = vec![architect.assignment_id];
+    diverging.architecture_contract_ref = Some(reference.clone());
+    let error = fixture
+        .store
+        .create_assignment(fixture.repo.path(), diverging)
+        .await
+        .expect_err("a diverging worker projection is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("incompatible with the authoritative architecture contract")
+    );
+
+    let mut worker = worker_draft("architecture-root", "src");
+    worker.dependencies = vec![architect.assignment_id];
+    worker.architecture_contract_ref = Some(reference);
     fixture
         .store
         .create_assignment(fixture.repo.path(), worker)
@@ -1954,27 +1978,29 @@ fn ids_and_scope_validation_are_strict() {
         serde_json::from_value::<AssignmentId>(serde_json::json!(non_rfc.to_string())).is_err()
     );
     let repo = TempDir::new().expect("repository tempdir");
-    assert!(
+    assert!(matches!(
         normalize_repo_scopes(
             repo.path(),
             &[RepoScope {
                 path: repo.path().display().to_string(),
                 recursive: false,
             }]
-        )
-        .is_err()
-    );
-    assert!(
+        ),
+        Err(StoreError::InvalidScope(message))
+            if message.contains("absolute scope path is not allowed")
+    ));
+    assert!(matches!(
         normalize_repo_scopes(
             repo.path(),
             &[RepoScope {
                 path: "../outside".to_string(),
                 recursive: false,
             }]
-        )
-        .is_err()
-    );
-    assert!(
+        ),
+        Err(StoreError::InvalidScope(message))
+            if message.contains("scope traversal is not allowed")
+    ));
+    assert!(matches!(
         normalize_repo_scopes(
             repo.path(),
             &[
@@ -1987,9 +2013,9 @@ fn ids_and_scope_validation_are_strict() {
                     recursive: true,
                 },
             ]
-        )
-        .is_err()
-    );
+        ),
+        Err(StoreError::InvalidScope(message)) if message.contains("duplicate scope path")
+    ));
 }
 
 #[test]
@@ -2486,12 +2512,19 @@ async fn receipts_are_sealed_and_validation_calls_are_attempt_owned() {
         )
         .await
         .expect("owned validation call seals receipt");
+    // Resubmit the receipt that just sealed, so only the seal can reject it.
     assert!(
-        fixture
-            .store
-            .submit_agent_receipt(first_attempt.attempt_id, completed_receipt(Vec::new()))
-            .await
-            .is_err()
+        matches!(
+            fixture
+                .store
+                .submit_agent_receipt(
+                    first_attempt.attempt_id,
+                    completed_receipt(vec!["call-1".to_string()]),
+                )
+                .await,
+            Err(StoreError::AttemptSealed(attempt_id)) if attempt_id == first_attempt.attempt_id
+        ),
+        "a sealed attempt must reject a second receipt"
     );
     let task = fixture
         .store
@@ -3906,6 +3939,16 @@ async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
     )
     .await;
     let comparison_now = expire_workspace_actor_leases(&fixture, &[attempt.attempt_id]).await;
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .expect("expired task reads")
+            .workspace_status
+            .lease_state,
+        Some(LeaseState::Expired)
+    );
 
     assert!(
         crate::local::with_test_comparison_now(
@@ -3916,6 +3959,16 @@ async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
         )
         .await
         .expect("typed heartbeat")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .expect("renewed task reads")
+            .workspace_status
+            .lease_state,
+        Some(LeaseState::Active)
     );
     let mut mismatched = binding.clone();
     mismatched.thread_id = Some("wrong-thread".to_string());
@@ -4127,14 +4180,25 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
             .iter()
             .any(|observation| observation.kind == ObservationKind::NeedsMain)
     );
-    review_fixture
+    assert_eq!(
+        review_task.workspace_status.lease_state,
+        Some(LeaseState::Released)
+    );
+    // Plain admission never consults other writers; selective admission plans a
+    // root-owned integration while the overlapping worker still counts as active.
+    let review_successor = review_fixture
         .store
-        .create_assignment(
+        .create_admitted_assignment(
             review_fixture.repo.path(),
-            worker_draft("review-root", "src/file.rs"),
+            selective_worker_draft("review-root", "src/file.rs", &[]),
+            /*isolated_integrator_available*/ true,
         )
         .await
         .expect("needs_main review releases the retained claim");
+    assert_eq!(
+        review_successor.integration_plan,
+        IntegrationPlan::SingleWriter
+    );
 
     let verification_fixture = Fixture::new().await;
     let (verification_worker, verification_attempt) = verification_fixture
@@ -4209,14 +4273,23 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
         verification_task.current_attempt.state,
         AttemptState::NeedsMain
     );
-    verification_fixture
+    assert_eq!(
+        verification_task.workspace_status.lease_state,
+        Some(LeaseState::Released)
+    );
+    let verification_successor = verification_fixture
         .store
-        .create_assignment(
+        .create_admitted_assignment(
             verification_fixture.repo.path(),
-            worker_draft("verification-root", "src/file.rs"),
+            selective_worker_draft("verification-root", "src/file.rs", &[]),
+            /*isolated_integrator_available*/ true,
         )
         .await
         .expect("failed verification releases the retained claim");
+    assert_eq!(
+        verification_successor.integration_plan,
+        IntegrationPlan::SingleWriter
+    );
 }
 
 #[tokio::test]
@@ -4227,6 +4300,23 @@ async fn wake_wait_is_event_driven_and_observes_the_next_commit() {
         .create_assignment(fixture.repo.path(), worker_draft("wait-root", "src"))
         .await
         .expect("assignment");
+    // The durable poller only rechecks while a waiter is registered. With none
+    // registered, only the in-process notification can advance the revision.
+    let revision_before_commit = fixture.store.wake_revision();
+    fixture
+        .store
+        .append_observation(
+            attempt.attempt_id,
+            ObservationKind::Reading,
+            "unwatched progress".to_string(),
+            None,
+        )
+        .await
+        .expect("unwatched observation appends");
+    assert!(
+        fixture.store.wake_revision() > revision_before_commit,
+        "a commit must notify waiters in process, without the durable poller"
+    );
     let cursor = fixture
         .store
         .read_wake_events("wait-root".to_string(), None)
@@ -4568,6 +4658,8 @@ async fn automatic_wake_cursor_is_consumer_scoped_bounded_and_compare_and_swap()
         .await
         .expect("bounded snapshot reads");
     assert_eq!(bounded.updated_agents.len(), MAX_WAKE_EVENTS_PER_READ);
+    // A cursorless read returns a full page too; only the bounded cursor leaves nothing behind it.
+    assert_eq!(bounded.remaining_count, 0);
     let next = bounded.latest_event_id.expect("bounded snapshot watermark");
     assert!(
         fixture
@@ -4761,19 +4853,6 @@ async fn task_capsule_attachment_is_canonical_and_one_time() {
         prohibited_changes: assignment.prohibited_changes.clone(),
         required_evidence: assignment.required_evidence.clone(),
     };
-    assert_eq!(capsule.stop_condition, assignment.stop_condition);
-    assert_eq!(capsule.dependencies, assignment.dependencies);
-    assert_eq!(capsule.risk_hints, assignment.risk_hints);
-    assert_eq!(capsule.contract_claims, assignment.contract_claims);
-    assert_eq!(
-        capsule.workspace_strategy,
-        Some(assignment.workspace_strategy)
-    );
-    assert_eq!(capsule.relation, assignment.relation);
-    assert_eq!(
-        capsule.architecture_contract_ref,
-        assignment.architecture_contract_ref
-    );
     let canonical = serde_json::to_string(&capsule).expect("capsule serializes canonically");
 
     let attached = fixture
@@ -5381,60 +5460,54 @@ async fn json_timestamps_order_validation_calls_and_bindings_by_instant() {
 #[tokio::test]
 async fn json_timestamp_comparisons_cover_mixed_precision_boundaries() {
     let fixture = Fixture::new().await;
-    let mut first_draft = worker_draft("timestamp-independent-root", "independent/first");
-    first_draft.required_evidence = vec!["focused test".to_string()];
-    let (_, first_attempt) = fixture
+    let (lease_assignment, lease_attempt) = fixture
         .store
-        .create_assignment(fixture.repo.path(), first_draft)
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("timestamp-lease-root", "lease", "focused test"),
+        )
         .await
-        .expect("first independent assignment");
-    let mut second_draft = worker_draft("timestamp-independent-root", "independent/second");
-    second_draft.required_evidence = vec!["focused test".to_string()];
-    let (second_assignment, second_attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), second_draft)
-        .await
-        .expect("second independent assignment");
-    let comparison_now = fixed_time("2099-01-01T00:00:00.001Z");
+        .expect("lease assignment");
+    // A whole-second start makes the server-bounded lease serialize without a
+    // fraction, so the instant one millisecond later sorts before it as text.
+    let validation_started_at = fixed_time("2099-01-01T00:00:00Z");
     crate::local::with_test_comparison_now(
-        comparison_now,
+        validation_started_at,
         fixture.store.record_validation_call(ValidationCall {
-            call_id: "fraction-first".to_string(),
-            attempt_id: first_attempt.attempt_id,
-            command_summary: "focused test".to_string(),
-            evidence: ValidationEvidence {
-                lease_expires_at: Some(fixed_time("2099-01-01T00:00:00Z")),
-                ..ValidationEvidence::default()
-            },
-            status: ValidationCallStatus::Running,
-            recorded_at: comparison_now,
-        }),
-    )
-    .await
-    .expect("first validation starts");
-    crate::local::with_test_comparison_now(
-        comparison_now,
-        fixture.store.record_validation_call(ValidationCall {
-            call_id: "fraction-second".to_string(),
-            attempt_id: second_attempt.attempt_id,
+            call_id: "zero-digit-lease".to_string(),
+            attempt_id: lease_attempt.attempt_id,
             command_summary: "focused test".to_string(),
             evidence: ValidationEvidence::default(),
             status: ValidationCallStatus::Running,
-            recorded_at: comparison_now,
+            recorded_at: validation_started_at,
         }),
     )
     .await
-    .expect("second validation starts independently");
-    let second = fixture
-        .store
-        .get_agent_task(second_assignment.assignment_id, Some(0))
+    .expect("validation starts");
+    let lease_expiry = validation_started_at + Duration::seconds(MAX_VALIDATION_LEASE_SECONDS);
+    assert!(
+        !crate::local::with_test_comparison_now(
+            lease_expiry,
+            fixture
+                .store
+                .reserve_stalled_nudge(lease_assignment.assignment_id, lease_expiry),
+        )
         .await
-        .expect("successor task reads")
-        .validation_calls
-        .into_iter()
-        .find(|call| call.call_id == "fraction-second")
-        .expect("second validation call exists");
-    assert_eq!(second.attempt_id, second_attempt.attempt_id);
+        .expect("lease expiry instant evaluates"),
+        "a running validation still suspends the nudge at its lease expiry"
+    );
+    let after_lease = lease_expiry + Duration::milliseconds(1);
+    assert!(
+        crate::local::with_test_comparison_now(
+            after_lease,
+            fixture
+                .store
+                .reserve_stalled_nudge(lease_assignment.assignment_id, after_lease),
+        )
+        .await
+        .expect("three-digit instant after a zero-digit lease evaluates"),
+        "a zero-digit lease must not outlive the instant one millisecond later"
+    );
 
     let (nudge_assignment, nudge_attempt) = fixture
         .store

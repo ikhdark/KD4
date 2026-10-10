@@ -406,12 +406,10 @@ mod tests {
 
     #[test]
     fn picker_subtitle_mentions_shortcuts() {
-        let previous: Span<'static> = previous_agent_shortcut().into();
-        let next: Span<'static> = next_agent_shortcut().into();
-        let subtitle = AgentNavigationState::picker_subtitle();
-
-        assert!(subtitle.contains(previous.content.as_ref()));
-        assert!(subtitle.contains(next.content.as_ref()));
+        assert_eq!(
+            AgentNavigationState::picker_subtitle(),
+            "Select an agent to watch. alt + ← previous, alt + → next."
+        );
     }
 
     #[test]

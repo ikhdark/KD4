@@ -216,6 +216,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sign_authenticates_request_method_url_headers_and_body() {
+        let context = test_context(None);
+        let time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let request = test_request();
+        let baseline = context.sign_at(request.clone(), time).await.unwrap();
+        assert_eq!(
+            context.sign_at(request.clone(), time).await.unwrap(),
+            baseline,
+            "identical requests at the same time must sign deterministically"
+        );
+        let authorization = baseline.headers.get(http::header::AUTHORIZATION).unwrap();
+        for field in ["method", "path", "query", "header", "body"] {
+            let mut changed = request.clone();
+            match field {
+                "method" => changed.method = Method::GET,
+                "path" => changed.url.push_str("/different"),
+                "query" => changed.url.push_str("?different=1"),
+                "header" => {
+                    changed.headers.insert(
+                        "x-test-header",
+                        http::HeaderValue::from_static("different"),
+                    );
+                }
+                "body" => changed.body = Bytes::from_static(b"{}"),
+                _ => unreachable!(),
+            }
+            let signed = context.sign_at(changed, time).await.unwrap();
+            assert_ne!(
+                signed.headers.get(http::header::AUTHORIZATION).unwrap(),
+                authorization,
+                "authorization must authenticate the actual {field}"
+            );
+        }
+    }
+
     #[test]
     fn credentials_provider_failures_are_retryable() {
         assert!(

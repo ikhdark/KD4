@@ -1090,6 +1090,9 @@ async fn thread_snapshot_stream_recovery_preserves_status_without_entering_retry
         Some(ReplayKind::ThreadSnapshot),
     );
     drain_insert_history(&mut rx);
+    // The delta below restores a remembered header, so check before it arrives.
+    assert_eq!(chat.status_state.current_status.header, "Working");
+    assert!(chat.status_state.retry_status_header.is_none());
 
     replay_agent_message_delta(&mut chat, "hello", ReplayKind::ThreadSnapshot);
 

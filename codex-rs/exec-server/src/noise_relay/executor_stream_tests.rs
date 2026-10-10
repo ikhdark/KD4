@@ -120,6 +120,12 @@ async fn removing_stream_aborts_writer_under_backpressure() -> Result<()> {
         timeout(Duration::from_secs(1), physical_outgoing_rx.recv()).await?,
         None
     );
+    // A writer that merely ran into the cleared transport reports its own close
+    // before it ends; an aborted one never does.
+    assert!(matches!(
+        closed_stream_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     disconnected_tx.send(true)?;
     drop(incoming_tx);

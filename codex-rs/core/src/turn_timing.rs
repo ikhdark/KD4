@@ -10,11 +10,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-#[cfg(test)]
-use futures::FutureExt;
 use tokio::sync::Notify;
-#[cfg(test)]
-use tokio_util::task::AbortOnDropHandle;
 
 use codex_analytics::TurnProfile;
 use codex_otel::TURN_TTFM_DURATION_METRIC;
@@ -193,19 +189,8 @@ impl TurnClock for SystemTurnClock {
     }
 }
 
-#[cfg(test)]
-#[derive(Default)]
-enum CheckoutSnapshotCapture {
-    #[default]
-    NotStarted,
-    Pending(AbortOnDropHandle<Option<String>>),
-    Closed,
-}
-
 pub(crate) struct TurnTimingState {
     live_phase: StdMutex<LiveTurnPhase>,
-    #[cfg(test)]
-    checkout_snapshot: StdMutex<CheckoutSnapshotCapture>,
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
     relay_queue_depth: AtomicU32,
@@ -298,7 +283,6 @@ impl std::fmt::Debug for TurnTimingState {
 #[derive(Clone, Debug)]
 pub(crate) struct TurnTimingSnapshot {
     pub(crate) credit_delta: Option<String>,
-    pub(crate) checkout_snapshot_sha256: Option<String>,
     pub(crate) started_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_secs: Option<i64>,
@@ -655,33 +639,9 @@ impl TurnTimingSnapshot {
             executed_validation_duration_ns: profile.counters.executed_validation_duration_ns,
             suppressed_validation_output_count: profile.counters.suppressed_validation_output_count,
             ready_startup_prewarm_count: profile.counters.ready_startup_prewarm_count,
-            // Summed over dispatched requests, each already attributed to the
-            // one representation it sent. A projection prepared and discarded
-            // never reaches this list, so it contributes nothing.
-            tool_output_budget_drop_count: profile.model_requests.iter().fold(
-                0,
-                |total, request| {
-                    total.saturating_add(
-                        request
-                            .request_token_categories
-                            .as_ref()
-                            .map_or(0, |categories| categories.tool_output_budget_drop_count),
-                    )
-                },
-            ),
-            tool_output_budget_dropped_token_count: profile.model_requests.iter().fold(
-                0,
-                |total, request| {
-                    total.saturating_add(
-                        request
-                            .request_token_categories
-                            .as_ref()
-                            .map_or(0, |categories| {
-                                categories.tool_output_budget_dropped_token_count
-                            }),
-                    )
-                },
-            ),
+            // No aggregate tool-output budget runs; the fields stay for the wire schema.
+            tool_output_budget_drop_count: 0,
+            tool_output_budget_dropped_token_count: 0,
             purpose_aggregates,
             same_purpose_continuation_count: profile.counters.same_purpose_continuation_count,
             wait_generations_with_same_revision_count,
@@ -751,7 +711,8 @@ impl TurnTimingSnapshot {
         TurnTiming {
             completion_assessment: None,
             credit_delta: self.credit_delta.clone(),
-            checkout_snapshot_sha256: self.checkout_snapshot_sha256.clone(),
+            // No checkout capture runs; the wire field stays for older records.
+            checkout_snapshot_sha256: None,
             schema_version: profile.schema_version,
             profile_valid,
             classification_complete: profile.classification_complete,
@@ -1112,7 +1073,6 @@ pub(crate) struct TimingCounters {
 struct TurnTimingStateInner {
     starting_credit_balance: Option<f64>,
     last_credit_balance: Option<f64>,
-    checkout_snapshot_sha256: Option<String>,
     started_sample: Option<ClockSample>,
     last_monotonic_ns: Option<u128>,
     activity: ActiveSet,
@@ -1607,8 +1567,6 @@ impl TurnTimingState {
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
             live_phase: Default::default(),
-            #[cfg(test)]
-            checkout_snapshot: Default::default(),
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
             relay_queue_depth: AtomicU32::new(0),
@@ -1738,41 +1696,6 @@ impl TurnTimingState {
         state.start(sample)
     }
 
-    #[cfg(test)]
-    pub(crate) fn start_checkout_snapshot(&self, cwd: &std::path::Path) {
-        let mut capture = self
-            .checkout_snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(*capture, CheckoutSnapshotCapture::NotStarted) {
-            let cwd = cwd.to_path_buf();
-            *capture = CheckoutSnapshotCapture::Pending(AbortOnDropHandle::new(tokio::spawn(
-                async move { crate::git_workspace::capture_checkout_snapshot(&cwd).await },
-            )));
-        }
-    }
-
-    /// Provenance is optional: never delay dispatch or let a capture include later tool edits.
-    /// Poll once, retaining only an already completed hash and aborting unfinished work on drop.
-    #[cfg(test)]
-    fn finish_checkout_snapshot(&self) {
-        let capture = {
-            let mut capture = self
-                .checkout_snapshot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::replace(&mut *capture, CheckoutSnapshotCapture::Closed)
-        };
-        if let CheckoutSnapshotCapture::Pending(task) = capture
-            && let Some(Ok(Some(hash))) = task.now_or_never()
-        {
-            let mut state = self.state();
-            if state.completed_snapshot.is_none() {
-                state.checkout_snapshot_sha256 = Some(hash);
-            }
-        }
-    }
-
     /// Capture the dispatched bytes independently of optional post-dispatch
     /// token accounting, so cancelled/failed attempts still have an identity.
     pub(crate) fn record_model_request_payload(
@@ -1781,8 +1704,6 @@ impl TurnTimingState {
         physical_attempt_id: &str,
         bytes: &[u8],
     ) {
-        #[cfg(test)]
-        self.finish_checkout_snapshot();
         let hash = format!("{:x}", Sha256::digest(bytes));
         let mut state = self.state();
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
@@ -1833,8 +1754,6 @@ impl TurnTimingState {
     }
 
     pub(crate) fn complete_snapshot(&self) -> TurnTimingSnapshot {
-        #[cfg(test)]
-        self.finish_checkout_snapshot();
         let mut state = self.state();
         let sample = self.clock.sample();
         state.complete(sample)
@@ -3342,10 +3261,6 @@ impl TurnTimingState {
     }
 
     pub(crate) fn record_tool_output_recovery(&self, retruncation_count: u32) {
-        self.record_tool_output_recovery_source(retruncation_count, false);
-    }
-
-    pub(crate) fn record_tool_output_recovery_source(&self, retruncation_count: u32, in_cell: bool) {
         let mut state = self.state();
         state.counters.tool_output_recovery_call_count = state
             .counters
@@ -3355,12 +3270,7 @@ impl TurnTimingState {
             .counters
             .tool_output_recovery_retruncation_count
             .saturating_add(retruncation_count);
-        if in_cell {
-            state.counters.tool_output_in_cell_recovery_call_count =
-                state.counters.tool_output_in_cell_recovery_call_count.saturating_add(1);
-        } else {
-            state.tool_output_recovery_read_pending_continuation = true;
-        }
+        state.tool_output_recovery_read_pending_continuation = true;
     }
 
     pub(crate) fn record_tool_output_artifact_reread(&self) {
@@ -4262,7 +4172,6 @@ impl TurnTimingStateInner {
         let snapshot = TurnTimingSnapshot {
             credit_delta: self.starting_credit_balance.zip(self.last_credit_balance)
                 .map(|(start, end)| (start - end).to_string()),
-            checkout_snapshot_sha256: self.checkout_snapshot_sha256.clone(),
             started_at_unix_ms: started_sample.map(|started| started.time.wall_unix_ms),
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),
             completed_at_unix_secs: started_sample.map(|_| sample.time.wall_unix_ms / 1_000),

@@ -1204,6 +1204,14 @@ mod tests {
         assert_eq!(start.service_tier, resume.service_tier);
         assert_eq!(resume.service_tier, fork.service_tier);
         let expected_permission_profile = config.permissions.effective_permission_profile();
+        // Anchor the legacy sandbox label: the equalities below alone accept three `None`s.
+        assert_eq!(
+            start.sandbox,
+            codex_app_server_protocol::SandboxMode::from_permission_profile(
+                &expected_permission_profile,
+                config.cwd.as_path(),
+            )
+        );
         assert_eq!(start.permission_profile, Some(expected_permission_profile));
         assert_eq!(start.permission_profile, resume.permission_profile);
         assert_eq!(resume.permission_profile, fork.permission_profile);
@@ -1591,6 +1599,14 @@ mod tests {
     #[test]
     fn remote_initialize_params_forward_openai_form_capability() {
         let mut args = test_remote_connect_args("ws://localhost/rpc".to_string());
+        // Control: the capability is forwarded from the args, not hardcoded.
+        assert!(
+            !args
+                .initialize_params()
+                .capabilities
+                .expect("initialize capabilities")
+                .mcp_server_openai_form_elicitation
+        );
         args.mcp_server_openai_form_elicitation = true;
 
         assert!(
@@ -1606,13 +1622,12 @@ mod tests {
         let client = start_test_client(SessionSource::Exec).await;
         let initialize = client.initialize_response();
 
-        assert_eq!(
-            initialize.user_agent(),
-            initialize
-                .raw()
-                .get("userAgent")
-                .and_then(serde_json::Value::as_str)
-        );
+        let user_agent = initialize
+            .raw()
+            .get("userAgent")
+            .and_then(serde_json::Value::as_str)
+            .expect("initialize requires a string userAgent");
+        assert_eq!(initialize.user_agent(), Some(user_agent));
         assert!(initialize.build_info().is_some());
         assert!(initialize.runtime_info().is_some());
         assert!(initialize.server_capabilities().is_some());
@@ -2288,13 +2303,20 @@ mod tests {
 
         assert!(endpoint("wss://example.com:443").supports_auth_token());
         assert!(endpoint("ws://127.0.0.1:4500").supports_auth_token());
+        assert!(endpoint("ws://localhost:4500").supports_auth_token());
+        assert!(endpoint("ws://[::1]:4500").supports_auth_token());
         assert!(!endpoint("ws://example.com:4500").supports_auth_token());
+        // Plaintext is loopback-only: other IP literals and `localhost` look-alikes are refused.
+        assert!(!endpoint("ws://192.168.1.10:4500").supports_auth_token());
+        assert!(!endpoint("ws://[2001:db8::1]:4500").supports_auth_token());
+        assert!(!endpoint("ws://localhost.example.com:4500").supports_auth_token());
         assert!(!endpoint("not a URL").supports_auth_token());
     }
 
     #[tokio::test]
     async fn remote_duplicate_request_id_keeps_original_waiter() {
         let (first_request_seen_tx, first_request_seen_rx) = tokio::sync::oneshot::channel();
+        let (duplicate_checked_tx, duplicate_checked_rx) = tokio::sync::oneshot::channel();
         let (websocket_url, server) = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
@@ -2305,15 +2327,11 @@ mod tests {
             first_request_seen_tx
                 .send(request.id.clone())
                 .expect("request id should send");
-            assert!(
-                timeout(
-                    Duration::from_millis(100),
-                    read_websocket_message(&mut websocket)
-                )
+            // Keep the original ID reserved until duplicate rejection is observed,
+            // rather than assuming the client is scheduled within a fixed delay.
+            duplicate_checked_rx
                 .await
-                .is_err(),
-                "duplicate request should not be forwarded to the server"
-            );
+                .expect("duplicate should be checked before replying");
             write_websocket_message(
                 &mut websocket,
                 JSONRPCMessage::Response(JSONRPCResponse {
@@ -2327,7 +2345,10 @@ mod tests {
                 }),
             )
             .await;
-            let _ = websocket.next().await;
+            assert!(
+                matches!(websocket.next().await, Some(Ok(Message::Close(_)))),
+                "duplicate request must not reach the wire before shutdown"
+            );
         })
         .await;
         let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -2352,19 +2373,25 @@ mod tests {
             .expect("server should observe the first request");
         assert_eq!(first_request_id, RequestId::Integer(1));
 
-        let second_err = second_request_handle
-            .request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
+        let second_err = timeout(
+            Duration::from_secs(2),
+            second_request_handle.request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
                 params: codex_app_server_protocol::GetAccountParams {
                     refresh_token: false,
                 },
-            })
-            .await
-            .expect_err("duplicate request id should be rejected");
+            }),
+        )
+        .await
+        .expect("duplicate rejection must not wait for the original response")
+        .expect_err("duplicate request id should be rejected");
         assert_eq!(
             second_err.to_string(),
             "account/read transport error: duplicate remote app-server request id `1`"
         );
+        duplicate_checked_tx
+            .send(())
+            .expect("release original response after duplicate rejection");
 
         let first_response = first_request
             .await
@@ -3294,7 +3321,9 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_surfaces_lagged_markers() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
+        // The worker below has already exited, so its command receiver is gone too. Keeping one
+        // alive would park the final shutdown on an unanswered command until its 5s deadline.
+        let (command_tx, _) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::channel(1);
         let worker_handle = tokio::spawn(async {});
         event_tx

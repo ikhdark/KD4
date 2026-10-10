@@ -265,7 +265,8 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     client.shutdown().await?;
 
     let mut client = start_in_process_client(config, loader_overrides).await?;
-    let reads_before_resume = thread_store.calls().await.read_thread_with_history;
+    let calls_before_resume = thread_store.calls().await;
+    let reads_before_resume = calls_before_resume.read_thread_with_history;
     // A non-local store has no rollout path. Its persisted conversation must
     // still be resumable, without requiring a second history-bearing read.
     let resume_result = client
@@ -293,9 +294,16 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     }]));
     assert!(matches!(&items[1], ThreadItem::AgentMessage { text, .. } if text == "Done"));
 
+    let calls_after_resume = thread_store.calls().await;
     assert_eq!(
-        thread_store.calls().await.read_thread_with_history,
+        calls_after_resume.read_thread_with_history,
         reads_before_resume + 1
+    );
+    // The store's other history-bearing read is what a resume falls back to
+    // when the probe's history is not forwarded.
+    assert_eq!(
+        calls_after_resume.load_history,
+        calls_before_resume.load_history
     );
 
     client

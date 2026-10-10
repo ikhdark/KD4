@@ -164,6 +164,11 @@ mod tests {
         let mut provider_headers = HeaderMap::new();
         provider_headers.insert("openai-organization", HeaderValue::from_static("org-test"));
         provider_headers.insert("openai-project", HeaderValue::from_static("project-test"));
+        // Not an organization or project scope header, so it must not leave the provider.
+        provider_headers.insert(
+            "x-provider-secret",
+            HeaderValue::from_static("provider-only"),
+        );
         let costs = client
             .query_api_key_turn_costs(
                 &["turn-priced".to_string(), "turn-response".to_string()],
@@ -200,6 +205,9 @@ mod tests {
                 },
             ]
         );
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].headers.contains_key("x-provider-secret"));
     }
 
     #[tokio::test]

@@ -314,11 +314,11 @@ async fn process_kill_terminates_running_process() -> Result<()> {
         "Start-Sleep -Seconds 30".to_string(),
     ];
     let spawn_request_id = mcp
-        .send_process_spawn_request(process_spawn_params(
-            process_handle.clone(),
-            codex_home.path(),
-            command,
-        )?)
+        .send_process_spawn_request(ProcessSpawnParams {
+            // The default timeout also ends the process with a non-zero exit code.
+            timeout_ms: Some(None),
+            ..process_spawn_params(process_handle.clone(), codex_home.path(), command)?
+        })
         .await?;
 
     let response = mcp

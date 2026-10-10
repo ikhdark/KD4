@@ -3,7 +3,7 @@ use super::ResponsesApiNamespace;
 use super::ResponsesApiNamespaceTool;
 use super::ResponsesApiTool;
 use super::dynamic_tool_to_responses_api_tool;
-use super::mcp_tool_to_deferred_responses_api_tool;
+use super::mcp_tool_to_responses_api_tool;
 use super::tool_definition_to_responses_api_tool;
 use crate::JsonSchema;
 use crate::ToolDefinition;
@@ -93,9 +93,10 @@ fn dynamic_tool_to_responses_api_tool_preserves_defer_loading() {
 }
 
 #[test]
-fn mcp_tool_to_deferred_responses_api_tool_sets_defer_loading() {
+fn mcp_tool_to_responses_api_tool_uses_the_callable_name_and_keeps_the_output_schema() {
+    // The server's raw tool name differs from the callable name on purpose.
     let tool = rmcp::model::Tool::new(
-        "lookup_order",
+        "lookup-order",
         "Look up an order",
         std::sync::Arc::new(rmcp::model::object(json!({
             "type": "object",
@@ -108,16 +109,16 @@ fn mcp_tool_to_deferred_responses_api_tool_sets_defer_loading() {
     );
 
     assert_eq!(
-        mcp_tool_to_deferred_responses_api_tool(
+        mcp_tool_to_responses_api_tool(
             &ToolName::namespaced("mcp__codex_apps__", "lookup_order"),
             &tool,
         )
-        .expect("convert deferred tool"),
+        .expect("convert MCP tool"),
         ResponsesApiTool {
             name: "lookup_order".to_string(),
             description: "Look up an order".to_string(),
             strict: false,
-            defer_loading: Some(true),
+            defer_loading: None,
             parameters: JsonSchema::object(
                 BTreeMap::from([(
                     "order_id".to_string(),
@@ -126,7 +127,21 @@ fn mcp_tool_to_deferred_responses_api_tool_sets_defer_loading() {
                 Some(vec!["order_id".to_string()]),
                 Some(false.into())
             ),
-            output_schema: None,
+            output_schema: Some(
+                json!({
+                    "x-codex-mcp-result": true,
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "array", "items": {"type": "object"}},
+                        "structuredContent": {},
+                        "isError": {"type": "boolean"},
+                        "_meta": {"type": "object"}
+                    },
+                    "required": ["content"],
+                    "additionalProperties": false
+                })
+                .into()
+            ),
         }
     );
 }
@@ -172,43 +187,5 @@ fn loadable_tool_spec_namespace_serializes_with_deferred_child_tools() {
                 }
             ]
         })
-    );
-}
-
-#[test]
-fn coalescing_preserves_first_occurrence_and_child_order() {
-    let tool = |name: &str| ResponsesApiTool {
-        name: name.to_string(),
-        description: name.to_string(),
-        strict: false,
-        defer_loading: None,
-        parameters: JsonSchema::default(),
-        output_schema: None,
-    };
-    let namespace = |name: &str, description: &str, names: &[&str]| {
-        LoadableToolSpec::Namespace(ResponsesApiNamespace {
-            name: name.to_string(),
-            description: description.to_string(),
-            tools: names
-                .iter()
-                .map(|name| ResponsesApiNamespaceTool::Function(tool(name)))
-                .collect(),
-        })
-    };
-    assert_eq!(
-        super::coalesce_loadable_tool_specs([
-            LoadableToolSpec::Function(tool("plain1")),
-            namespace("a", "first", &["a1"]),
-            LoadableToolSpec::Function(tool("plain2")),
-            namespace("b", "second", &["b1"]),
-            namespace("a", "later", &["a2", "a3"]),
-            namespace("b", "later", &["b2"]),
-        ]),
-        vec![
-            LoadableToolSpec::Function(tool("plain1")),
-            namespace("a", "first", &["a1", "a2", "a3"]),
-            LoadableToolSpec::Function(tool("plain2")),
-            namespace("b", "second", &["b1", "b2"]),
-        ]
     );
 }

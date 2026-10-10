@@ -23,40 +23,22 @@ pub const SKILL_DESCRIPTION_TRUNCATED_WARNING: &str = "Skill descriptions were s
 pub const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
     "Exceeded skills context budget. All skill descriptions were removed and";
 pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "This is a budgeted capability catalog in stable order. Load full instructions through the skill locator. For omitted or newly relevant host skills, search read_file(path=\"skill:catalog\") before assuming a capability is unavailable; use force_fresh=true after a catalog change. For other sources, use their provider-specific discovery routes.";
-const SKILLS_INTRO_WITH_ALIASES: &str = "Catalog entries give a skill name, concise purpose, and deterministic `SKILL.md` locator. Expand `rN/...` locators through the roots below.";
 pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by the user or clearly matched by the task. Announce each skill on first use in the conversation, state ordering when needed, and reassess relevance on later turns without repeating the announcement.
 - Before task actions, the main agent must read each selected `SKILL.md` completely. Do not delegate that reading or interpretation.
 - Load `skill:` locators with `read_file`, and file, environment, orchestrator, or custom resources through their stated provider; resolve relative references from the skill source.
 - Read task-required linked instructions with the same mechanism, load only relevant variants, and reuse supplied scripts, templates, and assets.
 - If a named skill or required read is unavailable, state it and use the safest fallback; retry a rejected shell read through a dedicated read-only route."###;
 
-pub fn render_available_skills_body(skill_root_lines: &[String], skill_lines: &[String]) -> String {
-    let intro_len = if skill_root_lines.is_empty() {
-        SKILLS_INTRO_WITH_ABSOLUTE_PATHS.len() + 1
-    } else {
-        SKILLS_INTRO_WITH_ALIASES.len() + "\n### Skill roots\n".len()
-    };
+pub fn render_available_skills_body(skill_lines: &[String]) -> String {
     let capacity = "\n## Skills\n".len()
-        + intro_len
+        + SKILLS_INTRO_WITH_ABSOLUTE_PATHS.len()
+        + 1
         + "### Available skills\n".len()
-        + skill_root_lines
-            .iter()
-            .chain(skill_lines)
-            .map(|line| line.len() + 1)
-            .sum::<usize>();
+        + skill_lines.iter().map(|line| line.len() + 1).sum::<usize>();
     let mut rendered = String::with_capacity(capacity);
     rendered.push_str("\n## Skills\n");
-    if skill_root_lines.is_empty() {
-        rendered.push_str(SKILLS_INTRO_WITH_ABSOLUTE_PATHS);
-        rendered.push('\n');
-    } else {
-        rendered.push_str(SKILLS_INTRO_WITH_ALIASES);
-        rendered.push_str("\n### Skill roots\n");
-        for line in skill_root_lines {
-            rendered.push_str(line);
-            rendered.push('\n');
-        }
-    }
+    rendered.push_str(SKILLS_INTRO_WITH_ABSOLUTE_PATHS);
+    rendered.push('\n');
     rendered.push_str("### Available skills\n");
     for line in skill_lines {
         rendered.push_str(line);
@@ -105,7 +87,6 @@ pub enum SkillRenderSideEffects<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableSkills {
-    pub skill_root_lines: Vec<String>,
     pub skill_lines: Vec<String>,
     pub report: SkillRenderReport,
     pub warning_message: Option<String>,
@@ -183,7 +164,6 @@ fn build_available_skills_from_lines(
         None
     };
     let available = AvailableSkills {
-        skill_root_lines: Vec::new(),
         skill_lines,
         report,
         warning_message,
@@ -747,28 +727,21 @@ mod tests {
     }
 
     #[test]
-    fn catalog_render_preserves_roots_and_skill_order() {
+    fn catalog_render_preserves_skill_order() {
         let skills = vec![
             "- alpha: first (skill:one)".to_string(),
             "- beta: second (skill:two)".to_string(),
         ];
-        for roots in [
-            vec![],
-            vec!["- r0 = /skills".to_string(), "- r1 = /plugins".to_string()],
-        ] {
-            let text = render_available_skills_body(&roots, &skills);
-            let (heading, catalog) = text.split_once("### Available skills\n").unwrap();
-            assert!(heading.starts_with("\n## Skills\n"));
-            assert_eq!(
-                catalog,
-                "- alpha: first (skill:one)\n- beta: second (skill:two)\n"
-            );
-            if roots.is_empty() {
-                assert!(!heading.contains("### Skill roots"));
-            } else {
-                assert!(heading.ends_with("### Skill roots\n- r0 = /skills\n- r1 = /plugins\n"));
-            }
-        }
+        let text = render_available_skills_body(&skills);
+        let (heading, catalog) = text.split_once("### Available skills\n").unwrap();
+        assert_eq!(
+            heading,
+            format!("\n## Skills\n{SKILLS_INTRO_WITH_ABSOLUTE_PATHS}\n")
+        );
+        assert_eq!(
+            catalog,
+            "- alpha: first (skill:one)\n- beta: second (skill:two)\n"
+        );
     }
 
     #[test]
@@ -785,10 +758,10 @@ mod tests {
             SkillRenderSideEffects::None,
         )
         .expect("skills should render");
-        let text = render_available_skills_body(&rendered.skill_root_lines, &rendered.skill_lines);
+        let text = render_available_skills_body(&rendered.skill_lines);
 
-        assert!(rendered.skill_root_lines.is_empty());
-        assert!(!text.contains("/Users/private"), "{text}");
+        // Match the directory component: the fixture root is `C:\Users\private\...` here.
+        assert!(!text.contains("private"), "{text}");
         assert!(!text.contains("r0/"), "{text}");
         for skill in &skills {
             assert!(text.contains(&skill.name), "{text}");
@@ -1194,7 +1167,6 @@ mod tests {
             assert_eq!(rendered.report.total_count, skills.len(), "{scenario}");
             assert_eq!(rendered.report.included_count, skills.len(), "{scenario}");
             assert_eq!(rendered.report.omitted_count, 0, "{scenario}");
-            assert!(rendered.skill_root_lines.is_empty(), "{scenario}");
             assert_eq!(
                 rendered.skill_lines,
                 skills
@@ -1203,9 +1175,9 @@ mod tests {
                     .collect::<Vec<_>>(),
                 "{scenario}"
             );
-            let body =
-                render_available_skills_body(&rendered.skill_root_lines, &rendered.skill_lines);
-            assert!(!body.contains("/Users/private"), "{scenario}: {body}");
+            let body = render_available_skills_body(&rendered.skill_lines);
+            // Match the directory component: the fixture root is `C:\Users\private\...` here.
+            assert!(!body.contains("private"), "{scenario}: {body}");
             assert!(!body.contains("r0/"), "{scenario}: {body}");
             for (line, skill) in rendered.skill_lines.iter().zip(&skills) {
                 let locator = line.rsplit(" — ").next().expect("catalog locator");
@@ -1238,7 +1210,6 @@ mod tests {
         assert_eq!(rendered.report.total_count, 2);
         assert_eq!(rendered.report.included_count, 1);
         assert_eq!(rendered.report.omitted_count, 1);
-        assert!(rendered.skill_root_lines.is_empty());
         assert_eq!(rendered.skill_lines, vec![expected_skill_line(&alpha, "")]);
         assert_eq!(
             rendered.warning_message.as_deref(),

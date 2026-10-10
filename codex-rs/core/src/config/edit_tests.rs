@@ -1218,3 +1218,24 @@ fn set_project_trust_preserves_inline_project_fields_on_disk() {
     let actual: TomlValue = toml::from_str(&contents).expect("parse persisted config");
     assert_eq!(actual, expected);
 }
+#[test]
+fn skill_toggle_preserves_inline_array_entries() {
+    for enabled in [false, true] {
+        let home = tempdir().unwrap();
+        let path = home.path().join(CONFIG_TOML_FILE);
+        let initial = "[skills]\ninclude_instructions = false\nconfig = [{ name = 'target', enabled = false }, { name = 'unrelated', enabled = false }]\n";
+        // The public config schema accepts this ordinary TOML array form.
+        let parsed: codex_config::config_toml::ConfigToml = toml::from_str(initial).unwrap();
+        assert_eq!(parsed.skills.unwrap().config.len(), 2);
+        std::fs::write(&path, initial).unwrap();
+        ConfigEditsBuilder::new(home.path())
+            .with_edits([ConfigEdit::SetSkillConfigByName { name: "target".into(), enabled }])
+            .apply_blocking().unwrap();
+        let actual: TomlValue = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut expected: TomlValue = toml::from_str(initial).unwrap();
+        if enabled {
+            expected["skills"]["config"].as_array_mut().unwrap().remove(0);
+        }
+        assert_eq!(actual, expected, "enabled={enabled}");
+    }
+}

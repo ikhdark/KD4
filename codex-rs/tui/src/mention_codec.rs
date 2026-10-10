@@ -211,6 +211,16 @@ mod tests {
                 },
             ]
         );
+
+        // Links to non-tool destinations and env-var names stay ordinary text.
+        let literal = "See [$docs](https://example.com/docs) and [$PATH](app://path).";
+        assert_eq!(
+            decode_history_mentions(literal),
+            DecodedHistoryText {
+                text: literal.to_string(),
+                mentions: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -295,6 +305,26 @@ mod tests {
             encoded,
             "[$google-calendar:availability](/tmp/google-calendar/availability/SKILL.md)"
         );
+    }
+
+    #[test]
+    fn history_mentions_round_trip_parenthesized_skill_paths() {
+        for path in [
+            "C:/Program Files (x86)/sample/SKILL.md",
+            "/tmp/skills (personal (work))/sample/SKILL.md",
+        ] {
+            for sigil in ['$', '@'] {
+                let text = format!("Use {sigil}sample now.");
+                let mentions = vec![MentionBinding {
+                    sigil,
+                    mention: "sample".to_string(),
+                    path: path.to_string(),
+                }];
+                let decoded = decode_history_mentions(&encode_history_mentions(&text, &mentions));
+                assert_eq!(decoded.text, text);
+                assert_eq!(decoded.mentions, mentions);
+            }
+        }
     }
 
     #[test]

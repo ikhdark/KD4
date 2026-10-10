@@ -515,6 +515,10 @@ mod tests {
             let mut failed = false;
             while let Some(event) = rx.recv().await {
                 completed |= matches!(event, Ok(ResponseEvent::Completed { .. }));
+                if let Err(error) = &event {
+                    assert_matches!(error, ApiError::Stream(message)
+                        if message == "idle timeout waiting for SSE after 80ms");
+                }
                 failed |= event.is_err();
             }
             assert_eq!(completed, productive);
@@ -556,7 +560,7 @@ mod tests {
     /// Local CPU/channel benchmark; never contacts a provider. Timing is descriptive,
     /// not a performance assertion, so it stays outside ordinary test runs.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "manual local benchmark; timing is descriptive"]
     async fn transport_audit_benchmark() {
         for (name, payload) in [
             ("delta", json!({"type":"response.output_text.delta","delta":"x".repeat(256)})),
@@ -591,8 +595,10 @@ mod tests {
         }
     }
 
+    /// Same contract as `transport_audit_benchmark`: measures time to the first
+    /// event when a 16 MiB frame is coalesced behind it.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "manual local benchmark; timing is descriptive"]
     async fn transport_audit_coalesced_benchmark() {
         let first = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n";
         let tail = format!("data: {{\"type\":\"future.event\",\"padding\":\"{}\"}}\n\n", "x".repeat(16 * 1024 * 1024));

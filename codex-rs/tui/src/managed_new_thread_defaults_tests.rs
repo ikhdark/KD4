@@ -23,23 +23,35 @@ fn defaults() -> NewThreadModelDefaults {
 
 #[tokio::test]
 async fn applies_managed_defaults_to_a_new_thread_config() {
-    let (_codex_home, mut actual) = test_config().await;
-    actual.model = Some("configured-model".to_string());
-    actual.model_reasoning_effort = Some(ReasoningEffort::Low);
-    actual.service_tier = Some("flex".to_string());
-    let mut expected = actual.clone();
-    expected.model = Some("managed-model".to_string());
-    expected.model_reasoning_effort = Some(ReasoningEffort::High);
-    expected.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+    // The managed tier is normalized through `ServiceTier`: the legacy `fast` alias becomes the
+    // canonical request value, and ids `ServiceTier` does not know pass through unchanged.
+    for (managed_tier, expected_tier) in [
+        ("priority", "priority"),
+        ("fast", "priority"),
+        ("custom-tier", "custom-tier"),
+    ] {
+        let (_codex_home, mut actual) = test_config().await;
+        actual.model = Some("configured-model".to_string());
+        actual.model_reasoning_effort = Some(ReasoningEffort::Low);
+        actual.service_tier = Some("flex".to_string());
+        let mut expected = actual.clone();
+        expected.model = Some("managed-model".to_string());
+        expected.model_reasoning_effort = Some(ReasoningEffort::High);
+        expected.service_tier = Some(expected_tier.to_string());
+        let managed = NewThreadModelDefaults {
+            service_tier: Some(managed_tier.to_string()),
+            ..defaults()
+        };
 
-    apply_managed_new_thread_defaults(
-        &mut actual,
-        Some(&defaults()),
-        &[],
-        &ConfigOverrides::default(),
-    );
+        apply_managed_new_thread_defaults(
+            &mut actual,
+            Some(&managed),
+            &[],
+            &ConfigOverrides::default(),
+        );
 
-    assert_eq!(actual, expected);
+        assert_eq!(actual, expected, "managed tier {managed_tier}");
+    }
 }
 
 #[tokio::test]

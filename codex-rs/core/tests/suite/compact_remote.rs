@@ -189,8 +189,11 @@ async fn automatic_compaction_stops_when_replacement_still_exceeds_limit() -> Re
         match wait_for_event_with_timeout(&codex, |_| true, REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT)
             .await
         {
-            EventMsg::Error(event) => error = Some(event.message),
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::Error(event) => error = Some(event),
+            EventMsg::TurnComplete(turn) => {
+                assert_eq!(turn.error.as_ref(), error.as_ref());
+                break;
+            }
             _ => {}
         }
     }
@@ -203,7 +206,7 @@ async fn automatic_compaction_stops_when_replacement_still_exceeds_limit() -> Re
     assert!(
         error
             .as_ref()
-            .is_some_and(|message| message.contains("Compaction did not bring")),
+            .is_some_and(|event| event.message.contains("Compaction did not bring")),
         "ineffective compaction must produce an actionable error: {error:?}; requests={}",
         requests.requests().len()
     );
@@ -258,9 +261,9 @@ async fn oversized_pending_input_stops_after_one_compaction_without_sampling() -
         match wait_for_event_with_timeout(codex, |_| true, REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT)
             .await
         {
-            EventMsg::Error(event) => error = Some(event.message),
+            EventMsg::Error(event) => error = Some(event),
             EventMsg::TurnComplete(turn) => {
-                assert!(turn.error.is_some());
+                assert_eq!(turn.error.as_ref(), error.as_ref());
                 break;
             }
             _ => {}
@@ -269,7 +272,7 @@ async fn oversized_pending_input_stops_after_one_compaction_without_sampling() -
     assert!(
         error
             .as_ref()
-            .is_some_and(|message| message.contains("prompt still exceeds")),
+            .is_some_and(|event| event.message.contains("prompt still exceeds")),
         "{error:?}"
     );
     let request = requests.single_request();
@@ -402,8 +405,9 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         compact_body.contains("\"type\":\"compaction_trigger\""),
         "expected v2 compaction request to include the compaction_trigger item"
     );
-    assert!(
-        !compact_body.contains("ENCRYPTED_CONTEXT_COMPACTION_SUMMARY"),
+    assert_eq!(
+        compact_request.input().last(),
+        Some(&serde_json::json!({"type": "compaction_trigger"})),
         "expected v2 compaction trigger item to omit encrypted_content"
     );
 

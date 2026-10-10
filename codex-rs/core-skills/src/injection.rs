@@ -765,9 +765,18 @@ pub fn parse_linked_tool_mention<'a>(
     }
 
     let mut path_end = path_start + 1;
-    while let Some(next_byte) = text_bytes.get(path_end)
-        && *next_byte != b')'
-    {
+    let mut depth = 1usize;
+    while let Some(next_byte) = text_bytes.get(path_end) {
+        match next_byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
         path_end += 1;
     }
     if text_bytes.get(path_end) != Some(&b')') {

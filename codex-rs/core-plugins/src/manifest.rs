@@ -1017,8 +1017,16 @@ mod tests {
 
     #[test]
     fn uri_manifest_resolves_resources_below_foreign_root() {
-        let plugin_root =
-            PathUri::parse("file:///C:/plugins/demo-plugin").expect("plugin root URI");
+        let foreign_root = if cfg!(windows) {
+            "file:///plugins/demo-plugin"
+        } else {
+            "file:///C:/plugins/demo-plugin"
+        };
+        let plugin_root = PathUri::parse(foreign_root).expect("foreign plugin root URI");
+        assert_ne!(
+            plugin_root.infer_path_convention(),
+            Some(codex_utils_path_uri::PathConvention::native())
+        );
         let manifest_path = plugin_root
             .join(".codex-plugin/plugin.json")
             .expect("manifest URI");

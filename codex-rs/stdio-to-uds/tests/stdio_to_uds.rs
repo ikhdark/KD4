@@ -1,4 +1,3 @@
-use std::io::ErrorKind;
 use std::io::Read;
 use std::process::Command;
 use std::process::ExitStatus;
@@ -16,10 +15,18 @@ use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn pipes_stdin_and_stdout_through_socket() -> anyhow::Result<()> {
-    // This test intentionally avoids `read_to_end()` on the server side because
-    // waiting for EOF can race with socket half-close behavior on slower runners.
-    // Reading the exact request length keeps the test deterministic.
-    //
+    assert_socket_relay(/*wait_for_client_eof*/ false).await
+}
+
+#[tokio::test]
+async fn stdin_eof_half_closes_socket_before_reading_response() -> anyhow::Result<()> {
+    assert_socket_relay(/*wait_for_client_eof*/ true).await
+}
+
+async fn assert_socket_relay(wait_for_client_eof: bool) -> anyhow::Result<()> {
+    // Keep both peer behaviors: responding immediately after the request and
+    // waiting for EOF before responding. The latter must not deadlock when the
+    // adapter's stdin has closed but its stdout still needs to receive data.
     // We also use `std::process::Command` (instead of `assert_cmd`) so we can
     // poll/kill on timeout and include incremental server events + stderr in
     // failure output, which makes flaky failures actionable to debug.
@@ -28,16 +35,11 @@ async fn pipes_stdin_and_stdout_through_socket() -> anyhow::Result<()> {
     let request = b"request";
     let request_path = dir.path().join("request.txt");
     std::fs::write(&request_path, request).context("failed to write child stdin fixture")?;
-    let listener = match UnixListener::bind(&socket_path).await {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            eprintln!("skipping test: failed to bind unix socket: {err}");
-            return Ok(());
-        }
-        Err(err) => {
-            return Err(err).context("failed to bind test unix socket");
-        }
-    };
+    // A bind failure is a test failure: skipping here would report a relay
+    // that never ran as a pass.
+    let listener = UnixListener::bind(&socket_path)
+        .await
+        .context("failed to bind test unix socket")?;
 
     let (event_tx, event_rx) = mpsc::channel();
     let server_task = tokio::spawn(async move {
@@ -48,11 +50,19 @@ async fn pipes_stdin_and_stdout_through_socket() -> anyhow::Result<()> {
             .await
             .context("failed to accept test connection")?;
         let _ = event_tx.send("accepted connection".to_string());
-        let mut received = vec![0; request.len()];
-        connection
-            .read_exact(&mut received)
-            .await
-            .context("failed to read data from client")?;
+        let mut received = Vec::new();
+        if wait_for_client_eof {
+            connection
+                .read_to_end(&mut received)
+                .await
+                .context("failed to read through client EOF")?;
+        } else {
+            received.resize(request.len(), 0);
+            connection
+                .read_exact(&mut received)
+                .await
+                .context("failed to read data from client")?;
+        }
         let _ = event_tx.send(format!("read {} bytes", received.len()));
         connection
             .write_all(b"response")

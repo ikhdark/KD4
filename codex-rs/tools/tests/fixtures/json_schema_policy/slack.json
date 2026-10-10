@@ -9,6 +9,7 @@
         "properties": {
           "channel_id": {
             "type": "string",
+            "title": "Channel",
             "description": "Slack channel ID."
           },
           "message": {
@@ -17,7 +18,10 @@
           },
           "post_at": {
             "type": "integer",
-            "description": "Unix timestamp for delivery."
+            "description": "Unix timestamp for delivery.",
+            "examples": [
+              1767225600
+            ]
           },
           "thread_ts": {
             "description": "Optional parent thread timestamp.",
@@ -71,7 +75,10 @@
       "expected_pruned": [
         "/$defs/UnusedPayload"
       ],
-      "expected_dropped_fields": []
+      "expected_dropped_fields": [
+        "/properties/channel_id/title",
+        "/properties/post_at/examples"
+      ]
     }
   ]
 }

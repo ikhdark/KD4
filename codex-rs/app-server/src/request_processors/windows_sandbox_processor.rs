@@ -226,7 +226,7 @@ fn resolve_allowed_windows_sandbox_setup_mode(
 fn determine_windows_sandbox_readiness(config: &Config) -> WindowsSandboxReadinessResponse {
     let level = WindowsSandboxLevel::from_config(config);
     determine_windows_sandbox_readiness_for_platform(
-        true,
+        cfg!(windows),
         level,
         matches!(level, WindowsSandboxLevel::Elevated)
             && sandbox_setup_is_complete(config.codex_home.as_path()),
@@ -303,7 +303,11 @@ sandbox = "elevated"
                 .await
                 .expect("readiness")
                 .status,
-            WindowsSandboxReadiness::UpdateRequired
+            if cfg!(windows) {
+                WindowsSandboxReadiness::UpdateRequired
+            } else {
+                WindowsSandboxReadiness::Unsupported
+            }
         );
         std::fs::write(home.path().join("config.toml"), "").expect("clear config");
         processor.config_manager.invalidate_load_cache();
@@ -313,7 +317,11 @@ sandbox = "elevated"
                 .await
                 .expect("readiness")
                 .status,
-            WindowsSandboxReadiness::NotConfigured
+            if cfg!(windows) {
+                WindowsSandboxReadiness::NotConfigured
+            } else {
+                WindowsSandboxReadiness::Unsupported
+            }
         );
     }
 

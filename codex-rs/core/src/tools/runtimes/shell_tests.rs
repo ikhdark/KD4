@@ -77,7 +77,7 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
     assert_eq!(keys.len(), 1);
     assert_eq!(
         keys[0].command,
-        canonicalize_command_for_approval(&request.command_for_approval)
+        vec!["__codex_powershell_script__", "pwsh", "profiles-enabled", "Get-ChildItem"]
     );
     assert_ne!(
         keys[0].command,

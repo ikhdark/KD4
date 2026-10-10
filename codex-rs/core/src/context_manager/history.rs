@@ -18,7 +18,6 @@ use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryProjection;
 use crate::tool_history::ToolHistoryState;
 use crate::tool_history::ToolHistorySubstitution;
-use crate::tool_history::ToolOutputBudgetDrops;
 use crate::tool_history::item_call_id;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -196,10 +195,6 @@ pub(crate) struct PreparedPromptInput {
     prompt_provenance: PromptProvenanceSidecar,
     fingerprint: Option<PreparedHistoryFingerprint>,
     policy: PreparedHistoryPolicy,
-    /// Aggregate-output-budget drops for the four representations above, in
-    /// `[items, fallback_items, unreplaced_items, unreplaced_fallback_items]`
-    /// order. Preparing an unchanged projection again leaves these untouched.
-    tool_output_budget_drops: [ToolOutputBudgetDrops; 4],
 }
 
 impl PreparedPromptInput {
@@ -209,16 +204,6 @@ impl PreparedPromptInput {
 
     pub(crate) fn shared_items(&self) -> Arc<[ResponseItem]> {
         self.items.shared()
-    }
-
-    /// Budget drops per representation, ordered to match `Prompt`'s inputs.
-    pub(crate) fn tool_output_budget_drops(&self) -> [ToolOutputBudgetDrops; 4] {
-        [
-            self.tool_output_budget_drops[0],
-            self.tool_output_budget_drops[1],
-            self.tool_output_budget_drops[2],
-            self.tool_output_budget_drops[3],
-        ]
     }
 
     pub(crate) fn shared_fallback_items(&self) -> Arc<[ResponseItem]> {
@@ -453,38 +438,6 @@ impl ContextManager {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.token_info = info;
-        self.sync_tool_result_token_budget();
-    }
-
-    /// The raw tool-result working set scales with the active model context
-    /// window and the task's unread/unresolved evidence, within a hard ceiling.
-    fn sync_tool_result_token_budget(&mut self) {
-        let budget = self
-            .token_info
-            .as_ref()
-            .and_then(|info| info.model_context_window)
-            .map(|window| {
-                let usage = self.token_info.as_ref().map(|info| &info.last_token_usage);
-                // Observed output demand is an estimate, not a configured
-                // output limit. Retain a floor for the next synthesis.
-                let generation_room = usage.map_or(4096, |usage| {
-                    usize::try_from(usage.output_tokens).unwrap_or(0)
-                        .saturating_mul(2).max(4096)
-                });
-                self.tool_history.task_sensitive_tool_result_budget(
-                    window,
-                    usage.map_or(0, |usage| usize::try_from(usage.input_tokens).unwrap_or(0)),
-                    generation_room,
-                )
-            });
-        if self
-            .tool_history
-            .configured_model_visible_tool_result_token_budget()
-            != budget
-        {
-            Arc::make_mut(&mut self.tool_history)
-                .set_model_visible_tool_result_token_budget(budget);
-        }
     }
 
     pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
@@ -770,9 +723,6 @@ impl ContextManager {
             prompt_provenance,
             fingerprint,
             policy,
-            // Filled by `apply_tool_history_projection`, which is where the
-            // aggregate budget actually runs.
-            tool_output_budget_drops: Default::default(),
         };
         if prepared.fingerprint.is_some() {
             *self
@@ -802,7 +752,7 @@ impl ContextManager {
             input_modalities,
             target,
             workspace_identity,
-            Some(git_workspace),
+            git_workspace,
             true,
         )
     }
@@ -829,28 +779,9 @@ impl ContextManager {
             input_modalities,
             target,
             workspace_identity,
-            Some(git_workspace),
+            git_workspace,
             false,
         )
-    }
-
-    /// The non-agentic summarizer cannot dereference receipts. Use the existing
-    /// priority-ordered, budgeted raw fallback: diagnostic and active evidence
-    /// gets the allowance before generic digests, without a recovery loop.
-    #[cfg(test)]
-    pub(crate) fn for_compaction_prompt_with_completed_tool_projection(
-        self,
-        input_modalities: &[InputModality],
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-    ) -> Arc<[ResponseItem]> {
-        self.prepare_for_prompt_with_completed_tool_projection_target(
-            input_modalities,
-            StableContextTarget::FailOpen,
-            workspace_identity,
-            None,
-            true,
-        )
-        .shared_unreplaced_items()
     }
 
     /// The local summarizer cannot recover artifacts. Keep acquired evidence
@@ -873,25 +804,18 @@ impl ContextManager {
         input_modalities: &[InputModality],
         target: StableContextTarget,
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-        git_workspace: Option<&crate::git_workspace::GitWorkspaceCache>,
+        git_workspace: &crate::git_workspace::GitWorkspaceCache,
         completed_tool_projection: bool,
     ) -> PreparedPromptInput {
         let tool_history = Arc::clone(&self.tool_history);
-        // Only sampling requests anchor: compaction prompts and generic
-        // preparation must see the fully budgeted projection.
-        let anchor_slot = match (target, git_workspace) {
-            (StableContextTarget::Sampling, Some(_)) => {
-                Some(Arc::clone(&self.sampling_projection_anchor))
-            }
-            _ => None,
-        };
+        // Only sampling requests anchor on the previous request's projection.
+        let anchor_slot = (target == StableContextTarget::Sampling)
+            .then(|| Arc::clone(&self.sampling_projection_anchor));
         let prepared = self.prepare_for_prompt_target(input_modalities, target);
         let items = prepared.shared_items();
         let fallback_items = prepared.shared_fallback_items();
         let shares_input = Arc::ptr_eq(&items, &fallback_items);
-        if let (Some(anchor_slot), Some(git_workspace), true) =
-            (anchor_slot.as_ref(), git_workspace, shares_input)
-        {
+        if let (Some(anchor_slot), true) = (anchor_slot.as_ref(), shares_input) {
             let anchor = anchor_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -906,7 +830,6 @@ impl ContextManager {
             }) {
                 tracing::debug!(
                     tool_history_projection_policy = "stable_sampling_continuation",
-                    aggregate_tool_result_budget_applied = false,
                     "selected provider-bound tool history projection"
                 );
                 let prepared = apply_tool_history_projection(
@@ -928,45 +851,28 @@ impl ContextManager {
                 return prepared;
             }
         }
-        let project = |items: Arc<[ResponseItem]>| match git_workspace {
-            Some(cache)
-                if completed_tool_projection || ToolHistoryState::has_phase_checkpoint(&items) =>
-            {
+        let project = |items: Arc<[ResponseItem]>| {
+            if completed_tool_projection || ToolHistoryState::has_phase_checkpoint(&items) {
                 tracing::debug!(
                     tool_history_projection_policy = "sampling_checkpoints_and_freshness",
-                    aggregate_tool_result_budget_applied = false,
                     "selected provider-bound tool history projection"
                 );
-                tool_history.project_sampling_with_workspace_cache(items, workspace_identity, cache)
-            }
-            Some(cache) => {
+                tool_history.project_sampling_with_workspace_cache(
+                    items,
+                    workspace_identity,
+                    git_workspace,
+                )
+            } else {
                 tracing::debug!(
                     tool_history_projection_policy = "workspace_freshness_only",
-                    aggregate_tool_result_budget_applied = false,
                     "selected provider-bound tool history projection"
                 );
-                tool_history.project_workspace_freshness_with_cache(items, workspace_identity, cache)
+                tool_history.project_workspace_freshness_with_cache(
+                    items,
+                    workspace_identity,
+                    git_workspace,
+                )
             }
-            None if target == StableContextTarget::Sampling => {
-                tracing::debug!(
-                    tool_history_projection_policy = "raw_sampling",
-                    aggregate_tool_result_budget_applied = false,
-                    "selected provider-bound tool history projection"
-                );
-                ToolHistoryProjection {
-                    items: Arc::clone(&items),
-                    unreplaced_items: items,
-                    ..Default::default()
-                }
-            }
-            None => {
-                tracing::debug!(
-                    tool_history_projection_policy = "aggregate_budget",
-                    aggregate_tool_result_budget_applied = true,
-                    "selected provider-bound tool history projection"
-                );
-                tool_history.project_with_workspace_identity(items, workspace_identity)
-            },
         };
         let projection = project(Arc::clone(&items));
         // Most prompts have identical sampling and fallback input. Reuse this
@@ -1018,7 +924,6 @@ impl ContextManager {
 
     pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
         self.tool_history = Arc::new(state);
-        self.sync_tool_result_token_budget();
         self.clear_sampling_projection_anchor();
     }
 
@@ -1054,11 +959,7 @@ impl ContextManager {
         // Every tool-history mutation affects the projection applied after
         // canonical preparation. Re-run that projection against current state
         // while preserving the normalized history and its token estimates.
-        let changed = mutation.apply(Arc::make_mut(&mut self.tool_history));
-        if changed {
-            self.sync_tool_result_token_budget();
-        }
-        changed
+        mutation.apply(Arc::make_mut(&mut self.tool_history))
     }
 
     pub(crate) fn mark_tool_history_consumed_with_delta(
@@ -1067,11 +968,7 @@ impl ContextManager {
         generation: ModelGenerationId,
     ) -> std::collections::BTreeSet<String> {
         // Keep the same post-cache projection boundary while returning the changed call IDs.
-        let changed = Arc::make_mut(&mut self.tool_history).mark_consumed_with_delta(input, generation);
-        if !changed.is_empty() {
-            self.sync_tool_result_token_budget();
-        }
-        changed
+        Arc::make_mut(&mut self.tool_history).mark_consumed_with_delta(input, generation)
     }
 
     /// Returns raw items in the history.
@@ -1467,7 +1364,6 @@ impl ContextManager {
             &Some(usage.clone()),
             model_context_window,
         );
-        self.sync_tool_result_token_budget();
     }
 
     // These are local items added after the most recent model-emitted item.
@@ -2014,9 +1910,6 @@ impl ContextManager {
                 prompt_provenance,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
-                // Appending items does not re-run the aggregate budget, so the
-                // cached attribution carries forward unchanged.
-                tool_output_budget_drops: entry.prepared.tool_output_budget_drops,
             },
             pending_source_items: None,
             pending_append: Vec::new(),
@@ -2116,14 +2009,6 @@ fn apply_tool_history_projection(
     prepared.fallback_items = fallback_items;
     prepared.unreplaced_fallback_items = unreplaced_fallback_items;
     prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
-    // Ordered to match `Prompt`'s four inputs, so a request attributes only the
-    // representation it actually sends.
-    prepared.tool_output_budget_drops = [
-        projection.items_budget_drops,
-        fallback_projection.items_budget_drops,
-        projection.unreplaced_items_budget_drops,
-        fallback_projection.unreplaced_items_budget_drops,
-    ];
     let metadata = continuation
         .filter(|entry| entry.metadata_matches(&prepared))
         .and_then(|entry| {

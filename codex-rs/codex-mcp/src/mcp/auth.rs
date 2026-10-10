@@ -574,6 +574,19 @@ mod tests {
                 source: McpOAuthScopesSource::Empty,
             }
         );
+
+        // An empty discovery result is not a discovered scope set.
+        assert_eq!(
+            resolve_oauth_scopes(
+                /*explicit_scopes*/ None,
+                /*configured_scopes*/ None,
+                Some(Vec::new()),
+            ),
+            ResolvedMcpOAuthScopes {
+                scopes: Vec::new(),
+                source: McpOAuthScopesSource::Empty,
+            }
+        );
     }
 
     #[test]

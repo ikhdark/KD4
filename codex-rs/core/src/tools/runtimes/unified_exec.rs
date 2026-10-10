@@ -632,7 +632,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(
             keys[0].command,
-            canonicalize_command_for_approval(&request.command_for_approval)
+            vec!["__codex_powershell_script__", "pwsh", "profiles-enabled", "Get-ChildItem"]
         );
         assert_ne!(
             keys[0].command,
@@ -657,6 +657,7 @@ mod tests {
         request.additional_permissions_uri = Some(profile("file:///foreign/b"));
         assert_ne!(first, runtime.approval_keys(&request));
         let reason = unified_exec_approval_reason(Some("reason".into()), request.additional_permissions_uri.as_ref()).unwrap();
+        assert!(reason.starts_with("reason\nAdditional permissions (canonical URI profile): "));
         assert!(reason.contains("file:///foreign/b"));
         assert!(reason.contains(&native));
     }

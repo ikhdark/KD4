@@ -350,6 +350,8 @@ mod tests {
     fn command_input_uses_request_tool_name() {
         let mut request = request_for_tool_use("call-apply-patch");
         request.tool_name = "apply_patch".to_string();
+        // Aliases only select handlers; stdin must keep the canonical name.
+        request.matcher_aliases = vec!["Write".to_string(), "Edit".to_string()];
 
         let input_json = command_input_json(request).expect("serialize command input");
         let input: serde_json::Value =

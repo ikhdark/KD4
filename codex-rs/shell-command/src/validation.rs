@@ -155,7 +155,7 @@ pub fn classify_powershell_script(script: &str) -> ValidationClassification {
 pub fn classify_powershell_script_with_runners(script: &str, runners: &[RepositoryRunner]) -> ValidationClassification {
     // Preserve control-flow information before the PowerShell parser flattens
     // pipelines and command chains into argv leaves.
-    let simple = classify_simple_script(script, 0, runners);
+    let simple = classify_simple_script(script, 0, runners, true);
     if matches!(
         simple,
         ValidationClassification::Validation {
@@ -227,7 +227,7 @@ pub fn combine_validation_classifications(
 
 const MAX_WRAPPER_DEPTH: usize = 4;
 
-fn classify_simple_script(script: &str, depth: usize, runners: &[RepositoryRunner]) -> ValidationClassification {
+fn classify_simple_script(script: &str, depth: usize, runners: &[RepositoryRunner], powershell: bool) -> ValidationClassification {
     if depth > MAX_WRAPPER_DEPTH {
         return ValidationClassification::Opaque;
     }
@@ -238,6 +238,11 @@ fn classify_simple_script(script: &str, depth: usize, runners: &[RepositoryRunne
         .into_iter()
         .filter_map(|command| {
             let command = command.trim();
+            // Unlike a POSIX command group, a bare PowerShell script block is
+            // a value. Its body has not run and cannot establish validation.
+            if powershell && command.starts_with('{') && grouped_command_body(command).is_some() {
+                return Some(ValidationClassification::NonValidation);
+            }
             // A guard such as `if ($LASTEXITCODE -eq 0) { cargo test }` runs
             // the same commands a flat sequence would, so its condition and
             // bodies are classified instead of the `if` keyword.
@@ -247,7 +252,7 @@ fn classify_simple_script(script: &str, depth: usize, runners: &[RepositoryRunne
                 return Some(combine_validation_classifications(
                     parts
                         .into_iter()
-                        .map(|part| classify_simple_script(part, depth + 1, runners)),
+                        .map(|part| classify_simple_script(part, depth + 1, runners, powershell)),
                 ));
             }
             let Some(words) = shlex::split(command) else {
@@ -527,7 +532,7 @@ fn classify_argv_at_depth(
         let Some(script) = args.get(index + 1) else {
             return ValidationClassification::Opaque;
         };
-        return classify_simple_script(script, depth + 1, runners);
+        return classify_simple_script(script, depth + 1, runners, false);
     }
     if matches!(binary.as_str(), "pwsh" | "powershell") {
         let Some(index) = args
@@ -539,7 +544,7 @@ fn classify_argv_at_depth(
         if args.get(index + 1).is_none() {
             return ValidationClassification::Opaque;
         }
-        return classify_simple_script(&args[index + 1..].join(" "), depth + 1, runners);
+        return classify_simple_script(&args[index + 1..].join(" "), depth + 1, runners, true);
     }
     if binary == "cmd" {
         let Some(index) = args
@@ -551,7 +556,7 @@ fn classify_argv_at_depth(
         if args.get(index + 1).is_none() {
             return ValidationClassification::Opaque;
         }
-        return classify_simple_script(&args[index + 1..].join(" "), depth + 1, runners);
+        return classify_simple_script(&args[index + 1..].join(" "), depth + 1, runners, false);
     }
 
     let (operations, has_unclassified_targets) = recognize_operations(&binary, args);
@@ -704,8 +709,7 @@ fn is_shell_assignment(argument: &str) -> bool {
 fn recognize_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperation>, bool) {
     match binary {
         "cargo" => cargo_operations(args),
-        "pytest" => (vec![ValidationOperation::Test], false),
-        "vitest" | "jest" => (
+        "pytest" | "vitest" | "jest" => (
             if args
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
@@ -835,6 +839,12 @@ fn python_operation(args: &[String]) -> Option<ValidationOperation> {
     let mut index = 0;
     while let Some(argument) = args.get(index) {
         if argument == "-m" {
+            args.get(index + 1)?;
+            if args[index + 2..].iter().take_while(|arg| arg.as_str() != "--")
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
+            {
+                return None;
+            }
             return args
                 .get(index + 1)
                 .is_some_and(|module| matches!(module.as_str(), "pytest" | "unittest"))
@@ -991,7 +1001,7 @@ fn exact_selector_operations(selector: &str) -> Vec<ValidationOperation> {
     match selector.to_ascii_lowercase().as_str() {
         "test" | "tests" | "testing" => vec![ValidationOperation::Test],
         "check" | "checks" => vec![ValidationOperation::Check],
-        "lint" | "lints" | "clippy" | "fmt" | "format" => vec![ValidationOperation::Lint],
+        "lint" | "lints" | "clippy" => vec![ValidationOperation::Lint],
         "bench" | "benchmark" | "benchmarks" => vec![ValidationOperation::Bench],
         "fuzz" | "fuzzing" => vec![ValidationOperation::Fuzz],
         _ => Vec::new(),
@@ -1166,7 +1176,7 @@ pub fn classify_script(script: &str) -> ValidationClassification {
 }
 
 pub fn classify_script_with_runners(script: &str, runners: &[RepositoryRunner]) -> ValidationClassification {
-    classify_simple_script(script, 0, runners)
+    classify_simple_script(script, 0, runners, false)
 }
 
 /// Build and inventory commands may compile, but do not establish a test pass.
@@ -1325,11 +1335,23 @@ mod tests {
 
     #[test]
     fn repository_lane_passthrough_preserves_child_classification() {
-        for child in ["test", "check", "clippy"] {
-            assert!(is_validation(&repository_argv("python", &[
-                "-I", "scripts/rust_build_status.py", "run-lane", "--lane", "core-tests",
-                "--", "cargo", child,
-            ])));
+        for (child, operation, mode) in [
+            ("test", ValidationOperation::Test, ValidationExecutionMode::Execution),
+            ("check", ValidationOperation::Check, ValidationExecutionMode::Checking),
+            ("clippy", ValidationOperation::Lint, ValidationExecutionMode::Checking),
+        ] {
+            assert_eq!(
+                repository_argv("python", &[
+                    "-I", "scripts/rust_build_status.py", "run-lane", "--lane", "core-tests",
+                    "--", "cargo", child,
+                ]),
+                ValidationClassification::Validation {
+                    leaves: vec![ValidationCommandDescriptor { operation, mode }],
+                    has_unclassified_targets: false,
+                    exit_code_is_authoritative: true,
+                },
+                "{child}"
+            );
         }
         for args in [
             vec!["scripts/rust_build_status.py", "run-lane", "--lane", "test"],
@@ -1413,7 +1435,7 @@ mod tests {
             (argv("yarn", &["test"]), Test),
             (argv("mvn", &["test", "-Dgroups=unit"]), Test),
             (argv("gradlew", &[":module:test", "--continue"]), Test),
-            (argv("just", &["fmt", "--unstable"]), Lint),
+            (argv("just", &["lint", "--unstable"]), Lint),
             (argv("make", &["tests"]), Test),
             (argv("task", &["check"]), Check),
         ] {
@@ -1627,6 +1649,41 @@ mod tests {
     }
 
     #[test]
+    fn python_test_runner_help_does_not_prove_execution() {
+        for (program, args) in [
+            ("pytest", vec!["--help"]),
+            ("pytest", vec!["-h"]),
+            ("pytest", vec!["--version"]),
+            ("python", vec!["-m", "pytest", "--help"]),
+            ("python", vec!["-m", "unittest", "--help"]),
+            ("python", vec!["-m", "unittest", "discover", "-h"]),
+        ] {
+            let classification = argv(program, &args);
+            assert!(
+                !matches!(classification, ValidationClassification::Validation { ref leaves, .. }
+                    if leaves.iter().any(|leaf| leaf.mode.can_prove_validation())),
+                "help/version must not authenticate executed tests: {program} {args:?}: {classification:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_uninvoked_scriptblock_does_not_prove_execution() {
+        for script in ["{ cargo test }", "({ cargo test })", "{ cargo test }; cargo check"] {
+            for classification in [classify_powershell_script(script), argv("pwsh", &["-Command", script])] {
+                assert!(
+                    !matches!(classification, ValidationClassification::Validation {
+                        ref leaves, exit_code_is_authoritative: true, ..
+                    } if leaves.iter().any(|leaf| leaf.mode.can_prove_validation())),
+                    "a scriptblock value does not execute its body: {script}: {classification:?}"
+                );
+            }
+        }
+        assert!(matches!(argv("bash", &["-lc", "{ cargo test; }"]),
+            ValidationClassification::Validation { exit_code_is_authoritative: true, .. }));
+    }
+
+    #[test]
     fn focused_recipes_own_arguments_without_inventing_checks() {
         let argv = repository_argv;
         for recipe in [
@@ -1653,5 +1710,23 @@ mod tests {
             ValidationClassification::Validation { ref leaves, .. }
             if leaves.iter().map(|leaf| leaf.operation).collect::<Vec<_>>() == vec![ValidationOperation::Lint, ValidationOperation::Test])
         );
+    }
+
+    #[test]
+    fn formatting_recipes_do_not_authenticate_checking_without_check_mode() {
+        assert_eq!(argv("just", &["fmt", "--unstable"]), ValidationClassification::Opaque);
+        for args in [vec!["fmt"], vec!["--justfile", "justfile", "fmt", "--unstable"]] {
+            let classification = repository_argv("just", &args);
+            assert!(
+                !matches!(classification, ValidationClassification::Validation { ref leaves, .. }
+                    if leaves.iter().any(|leaf| leaf.mode.can_prove_validation())),
+                "justfile fmt runs format.py without --check: {args:?}: {classification:?}"
+            );
+        }
+        for recipe in ["fmt-check", "fmt-check-fast"] {
+            let ValidationClassification::Validation { leaves, .. } = repository_argv("just", &[recipe])
+                else { panic!("check-only recipe should remain classified"); };
+            assert!(leaves.iter().all(|leaf| leaf.mode == ValidationExecutionMode::Checking));
+        }
     }
 }

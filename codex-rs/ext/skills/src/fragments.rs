@@ -35,7 +35,7 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned(render_available_skills_body(&[], &self.skill_lines))
+        std::borrow::Cow::Owned(render_available_skills_body(&self.skill_lines))
     }
 }
 

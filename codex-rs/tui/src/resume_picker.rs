@@ -266,7 +266,6 @@ struct PickerPage {
     rows: Vec<Row>,
     next_cursor: Option<PageCursor>,
     num_scanned_files: usize,
-    reached_scan_cap: bool,
 }
 
 #[derive(Clone)]
@@ -713,8 +712,8 @@ struct PickerState {
 
 struct PaginationState {
     next_cursor: Option<PageCursor>,
+    seen_cursors: HashSet<String>,
     num_scanned_files: usize,
-    reached_scan_cap: bool,
     loading: LoadingState,
 }
 
@@ -800,7 +799,6 @@ async fn load_app_server_page(
             .collect(),
         next_cursor: response.next_cursor.map(PageCursor::AppServer),
         num_scanned_files,
-        reached_scan_cap: false,
     })
 }
 
@@ -940,8 +938,8 @@ impl PickerState {
             relative_time_reference: None,
             pagination: PaginationState {
                 next_cursor: None,
+                seen_cursors: HashSet::new(),
                 num_scanned_files: 0,
-                reached_scan_cap: false,
                 loading: LoadingState::Idle,
             },
             all_rows: Vec::new(),
@@ -1390,25 +1388,29 @@ impl PickerState {
 
     fn reset_pagination(&mut self) {
         self.pagination.next_cursor = None;
+        self.pagination.seen_cursors.clear();
         self.pagination.num_scanned_files = 0;
-        self.pagination.reached_scan_cap = false;
         self.pagination.loading = LoadingState::Idle;
         self.frozen_footer_percent = None;
     }
 
     fn ingest_page(&mut self, page: PickerPage) {
-        if let Some(cursor) = page.next_cursor.clone() {
-            self.pagination.next_cursor = Some(cursor);
-        } else {
-            self.pagination.next_cursor = None;
-        }
+        self.pagination.next_cursor = page.next_cursor.and_then(|cursor| {
+            let PageCursor::AppServer(value) = &cursor;
+            if self.pagination.seen_cursors.insert(value.clone()) {
+                Some(cursor)
+            } else {
+                // A repeated cursor cannot advance this listing. Preserve its rows,
+                // but stop search, prefill, and page-down from cycling RPCs forever.
+                self.pending_page_down_target = None;
+                self.search_state = SearchState::Idle;
+                None
+            }
+        });
         self.pagination.num_scanned_files = self
             .pagination
             .num_scanned_files
             .saturating_add(page.num_scanned_files);
-        if page.reached_scan_cap {
-            self.pagination.reached_scan_cap = true;
-        }
 
         let query = self.query.to_lowercase();
         for row in page.rows {
@@ -1497,7 +1499,7 @@ impl PickerState {
             self.search_state = SearchState::Idle;
             return;
         }
-        if self.pagination.reached_scan_cap || self.pagination.next_cursor.is_none() {
+        if self.pagination.next_cursor.is_none() {
             self.search_state = SearchState::Idle;
             return;
         }
@@ -1534,7 +1536,7 @@ impl PickerState {
             self.search_state = SearchState::Idle;
             return;
         }
-        if self.pagination.reached_scan_cap || self.pagination.next_cursor.is_none() {
+        if self.pagination.next_cursor.is_none() {
             self.search_state = SearchState::Idle;
             return;
         }
@@ -3264,13 +3266,6 @@ fn render_empty_state_line(state: &PickerState) -> Line<'static> {
         {
             return vec!["Searching…".italic().dim()].into();
         }
-        if state.pagination.reached_scan_cap {
-            let msg = format!(
-                "Search scanned first {} sessions; more may exist",
-                state.pagination.num_scanned_files
-            );
-            return vec![Span::from(msg).italic().dim()].into();
-        }
         return vec!["No results for your search".italic().dim()].into();
     }
 
@@ -3305,17 +3300,11 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    fn page(
-        rows: Vec<Row>,
-        next_cursor: Option<&str>,
-        num_scanned_files: usize,
-        reached_scan_cap: bool,
-    ) -> PickerPage {
+    fn page(rows: Vec<Row>, next_cursor: Option<&str>, num_scanned_files: usize) -> PickerPage {
         PickerPage {
             rows,
             next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
             num_scanned_files,
-            reached_scan_cap,
         }
     }
 
@@ -3580,7 +3569,6 @@ mod tests {
                 rows,
                 next_cursor: None,
                 num_scanned_files: 1,
-                reached_scan_cap: false,
             });
         }
         assert_eq!(state.all_rows.len(), 2);
@@ -3694,6 +3682,7 @@ mod tests {
             params.cwd,
             Some(ThreadListCwdFilter::One(String::from("/tmp/project")))
         );
+        assert_eq!(params.model_providers, Some(vec![String::from("openai")]));
     }
 
     #[test]
@@ -3822,8 +3811,8 @@ mod tests {
         assert_eq!(created.len(), 1);
         assert!(updated[0].to_string().starts_with("  3h ago"));
         assert!(created[0].to_string().starts_with("  5h ago"));
-        assert!(!updated[0].to_string().contains("created 5h ago"));
-        assert!(!created[0].to_string().contains("updated 3h ago"));
+        assert!(!updated[0].to_string().contains("5h ago"));
+        assert!(!created[0].to_string().contains("3h ago"));
         assert_metadata_order(&updated[0], "⌁ tmp/codex", " main");
         assert_metadata_order(&created[0], "⌁ tmp/codex", " main");
     }
@@ -3998,6 +3987,11 @@ mod tests {
         };
 
         assert!(state.row_matches_filter(&row));
+
+        // Control: a local picker with the same cwd filter drops this row.
+        state.local_filter_cwd =
+            local_picker_cwd_filter(&remote_cwd, /*uses_remote_workspace*/ false);
+        assert!(!state.row_matches_filter(&row));
     }
 
     #[test]
@@ -4344,6 +4338,11 @@ mod tests {
 
         state.scroll_top = 0;
         assert_eq!(picker_footer_percent(&state, /*list_height*/ 6), 0);
+
+        // Five 2-line cards and their separators (15 rows) are scrolled off; ten cards span
+        // 29 rows and 4 content rows stay visible, leaving 25 rows of scroll range.
+        state.scroll_top = 5;
+        assert_eq!(picker_footer_percent(&state, /*list_height*/ 6), 60);
 
         state.scroll_top = state.filtered_rows.len() - 1;
         assert_eq!(picker_footer_percent(&state, /*list_height*/ 6), 100);
@@ -5203,7 +5202,7 @@ session_picker_view = "dense"
     }
 
     #[test]
-    fn dense_session_snapshot_includes_cwd_in_all_filter() {
+    fn dense_session_snapshot_omits_cwd_in_all_filter() {
         assert_snapshot!(
             "resume_picker_dense_all",
             render_dense_row_snapshot(
@@ -5212,28 +5211,9 @@ session_picker_view = "dense"
         );
     }
 
+    // Dense rows are a date and a title only; a narrow width just truncates the title.
     #[test]
-    fn dense_session_snapshot_auto_hides_cwd_when_narrow() {
-        assert_snapshot!(
-            "resume_picker_dense_all_auto_hidden_cwd",
-            render_dense_row_snapshot(
-                /*show_all*/ true, /*filter_cwd*/ None, /*width*/ 100,
-            )
-        );
-    }
-
-    #[test]
-    fn dense_session_snapshot_forces_cwd_when_narrow() {
-        assert_snapshot!(
-            "resume_picker_dense_all_forced_cwd",
-            render_dense_row_snapshot(
-                /*show_all*/ true, /*filter_cwd*/ None, /*width*/ 48,
-            )
-        );
-    }
-
-    #[test]
-    fn dense_session_snapshot_drops_metadata_when_narrow() {
+    fn dense_session_snapshot_truncates_title_when_narrow() {
         assert_snapshot!(
             "resume_picker_dense_narrow",
             render_dense_row_snapshot(
@@ -5658,7 +5638,6 @@ session_picker_view = "dense"
             ],
             Some("2025-01-02T00:00:00Z"),
             /*num_scanned_files*/ 2,
-            /*reached_scan_cap*/ false,
         ));
 
         state.ingest_page(page(
@@ -5668,14 +5647,12 @@ session_picker_view = "dense"
             ],
             Some("2025-01-01T00:00:00Z"),
             /*num_scanned_files*/ 2,
-            /*reached_scan_cap*/ false,
         ));
 
         state.ingest_page(page(
             vec![make_row("/tmp/d.jsonl", "2024-12-31T23:00:00Z", "very old")],
             /*next_cursor*/ None,
             /*num_scanned_files*/ 1,
-            /*reached_scan_cap*/ false,
         ));
 
         let previews: Vec<_> = state
@@ -5717,7 +5694,6 @@ session_picker_view = "dense"
             ],
             Some("2025-01-03T00:00:00Z"),
             /*num_scanned_files*/ 2,
-            /*reached_scan_cap*/ false,
         ));
 
         assert!(recorded_requests.lock().unwrap().is_empty());
@@ -5753,7 +5729,6 @@ session_picker_view = "dense"
             ],
             Some("2025-01-05T00:00:00Z"),
             /*num_scanned_files*/ 4,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 6, /*width*/ 80);
 
@@ -5787,7 +5762,6 @@ session_picker_view = "dense"
             ],
             Some("2025-01-03T00:00:00Z"),
             /*num_scanned_files*/ 2,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 10, /*width*/ 80);
 
@@ -5969,7 +5943,6 @@ session_picker_view = "dense"
         state.reset_pagination();
         state.ingest_page(page(
             items, /*next_cursor*/ None, /*num_scanned_files*/ 20,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 5, /*width*/ 80);
 
@@ -6032,7 +6005,6 @@ session_picker_view = "dense"
         state.reset_pagination();
         state.ingest_page(page(
             items, /*next_cursor*/ None, /*num_scanned_files*/ 20,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 5, /*width*/ 80);
 
@@ -6118,7 +6090,6 @@ session_picker_view = "dense"
             items,
             Some("cursor-1"),
             /*num_scanned_files*/ 10,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 5, /*width*/ 80);
 
@@ -6491,7 +6462,6 @@ session_picker_view = "dense"
         state.reset_pagination();
         state.ingest_page(page(
             items, /*next_cursor*/ None, /*num_scanned_files*/ 3,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 5, /*width*/ 80);
 
@@ -6533,22 +6503,23 @@ session_picker_view = "dense"
         state.reset_pagination();
         state.ingest_page(page(
             items, /*next_cursor*/ None, /*num_scanned_files*/ 10,
-            /*reached_scan_cap*/ false,
         ));
-        state.update_viewport(/*rows*/ 5, /*width*/ 80);
+        // Ten rows fit the "more above" line plus three 2-line cards and their separators,
+        // so the card above the last one is already on screen.
+        state.update_viewport(/*rows*/ 10, /*width*/ 80);
 
         state.selected = state.filtered_rows.len().saturating_sub(1);
         state.ensure_selected_visible();
 
         let initial_top = state.scroll_top;
-        assert_eq!(initial_top, state.filtered_rows.len().saturating_sub(1));
+        assert_eq!(initial_top, 7);
 
         state
             .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
             .await
             .unwrap();
 
-        assert_eq!(state.scroll_top, initial_top.saturating_sub(1));
+        assert_eq!(state.scroll_top, initial_top);
         assert_eq!(state.selected, state.filtered_rows.len().saturating_sub(2));
     }
 
@@ -6575,7 +6546,6 @@ session_picker_view = "dense"
         state.reset_pagination();
         state.ingest_page(page(
             items, /*next_cursor*/ None, /*num_scanned_files*/ 10,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 5, /*width*/ 80);
         state.selected = 8;
@@ -6613,7 +6583,6 @@ session_picker_view = "dense"
         state.reset_pagination();
         state.ingest_page(page(
             items, /*next_cursor*/ None, /*num_scanned_files*/ 5,
-            /*reached_scan_cap*/ false,
         ));
         state.update_viewport(/*rows*/ 5, /*width*/ 80);
 
@@ -6627,7 +6596,7 @@ session_picker_view = "dense"
     }
 
     #[tokio::test]
-    async fn set_query_loads_until_match_and_respects_scan_cap() {
+    async fn set_query_loads_until_match_and_stops_at_the_end_of_the_listing() {
         let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let request_sink = recorded_requests.clone();
         let loader = page_only_loader(move |req: PageLoadRequest| {
@@ -6651,7 +6620,6 @@ session_picker_view = "dense"
             )],
             Some("2025-01-02T00:00:00Z"),
             /*num_scanned_files*/ 1,
-            /*reached_scan_cap*/ false,
         ));
         recorded_requests.lock().unwrap().clear();
 
@@ -6670,7 +6638,6 @@ session_picker_view = "dense"
                     vec![make_row("/tmp/beta.jsonl", "2025-01-02T00:00:00Z", "beta")],
                     Some("2025-01-03T00:00:00Z"),
                     /*num_scanned_files*/ 5,
-                    /*reached_scan_cap*/ false,
                 )),
             })
             .await
@@ -6696,7 +6663,6 @@ session_picker_view = "dense"
                     )],
                     Some("2025-01-04T00:00:00Z"),
                     /*num_scanned_files*/ 7,
-                    /*reached_scan_cap*/ false,
                 )),
             })
             .await
@@ -6721,12 +6687,13 @@ session_picker_view = "dense"
                     Vec::new(),
                     /*next_cursor*/ None,
                     /*num_scanned_files*/ 0,
-                    /*reached_scan_cap*/ false,
                 )),
             })
             .await
             .unwrap();
+        // A stale page is dropped: its missing cursor must not end the active search.
         assert_eq!(recorded_requests.lock().unwrap().len(), 1);
+        assert!(state.search_state.is_active());
 
         state
             .handle_background_event(BackgroundEvent::Page {
@@ -6734,9 +6701,8 @@ session_picker_view = "dense"
                 search_token: active_request.search_token,
                 page: Ok(page(
                     Vec::new(),
-                    Some("cursor-beyond-scan-cap"),
+                    /*next_cursor*/ None,
                     /*num_scanned_files*/ 3,
-                    /*reached_scan_cap*/ true,
                 )),
             })
             .await
@@ -6744,13 +6710,12 @@ session_picker_view = "dense"
 
         assert!(state.filtered_rows.is_empty());
         assert!(!state.search_state.is_active());
-        assert!(state.pagination.reached_scan_cap);
-        assert!(state.pagination.next_cursor.is_some());
+        assert!(state.pagination.next_cursor.is_none());
         assert_eq!(state.pagination.num_scanned_files, 16);
         assert_eq!(recorded_requests.lock().unwrap().len(), 1);
         assert_eq!(
             render_empty_state_line(&state).to_string(),
-            "Search scanned first 16 sessions; more may exist"
+            "No results for your search"
         );
         state.set_query("still missing".to_string());
         assert!(!state.search_state.is_active());
@@ -6781,7 +6746,6 @@ session_picker_view = "dense"
             )],
             Some("2025-01-02T00:00:00Z"),
             /*num_scanned_files*/ 1,
-            /*reached_scan_cap*/ false,
         ));
         state.load_more_if_needed(LoadTrigger::Scroll);
         let request = {
@@ -6807,6 +6771,66 @@ session_picker_view = "dense"
         );
         state.ensure_minimum_rows_for_view(/*minimum_rows*/ 20);
         assert_eq!(recorded_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_page_cursors_stop_search_and_prefill_until_explicit_reload() {
+        for searching in [false, true] {
+            for cursors in [vec!["a", "a"], vec!["a", "b", "a"]] {
+                let requests = Arc::new(Mutex::new(Vec::<PageLoadRequest>::new()));
+                let sink = Arc::clone(&requests);
+                let mut state = PickerState::new(
+                    FrameRequester::test_dummy(),
+                    page_only_loader(move |request| sink.lock().unwrap().push(request)),
+                    ProviderFilter::Any, true, None, SessionPickerAction::Resume,
+                );
+                if searching {
+                    state.query = "missing".to_string();
+                }
+                state.start_initial_load();
+                for (index, cursor) in cursors.iter().enumerate() {
+                    let request = requests.lock().unwrap()[index].clone();
+                    state.handle_background_event(BackgroundEvent::Page {
+                        request_token: request.request_token,
+                        search_token: request.search_token,
+                        page: Ok(page(
+                            vec![make_row("known.jsonl", "2025-01-01T00:00:00Z", "known")],
+                            Some(cursor), 1,
+                        )),
+                    }).await.unwrap();
+                    state.ensure_minimum_rows_for_view(20);
+                }
+                assert_eq!(requests.lock().unwrap().len(), cursors.len(), "a repeated cursor must not schedule another RPC");
+                assert!(!state.pagination.loading.is_pending());
+                assert!(!state.search_state.is_active());
+                assert!(state.pagination.next_cursor.is_none());
+                assert_eq!(state.all_rows.len(), 1, "keep already-loaded sessions");
+                for _ in 0..3 {
+                    state.ensure_minimum_rows_for_view(20);
+                }
+                assert_eq!(requests.lock().unwrap().len(), cursors.len());
+
+                // An explicit sort reload starts a new cursor namespace. The old
+                // cycle must not suppress valid pagination in this new listing.
+                state.toggle_sort_key();
+                let request = requests.lock().unwrap().last().unwrap().clone();
+                state.handle_background_event(BackgroundEvent::Page {
+                    request_token: request.request_token,
+                    search_token: request.search_token,
+                    page: Ok(page(Vec::new(), Some("a"), 0)),
+                }).await.unwrap();
+                state.ensure_minimum_rows_for_view(20);
+                assert_eq!(requests.lock().unwrap().len(), cursors.len() + 2);
+                let request = requests.lock().unwrap().last().unwrap().clone();
+                state.handle_background_event(BackgroundEvent::Page {
+                    request_token: request.request_token,
+                    search_token: request.search_token,
+                    page: Ok(page(vec![make_row("new.jsonl", "2025-01-01T00:00:00Z", "missing match")], None, 1)),
+                }).await.unwrap();
+                assert_eq!(state.filtered_rows[0].preview, "missing match");
+                assert!(!state.pagination.loading.is_pending());
+            }
+        }
     }
 
     #[tokio::test]
@@ -6870,7 +6894,6 @@ session_picker_view = "dense"
             )],
             Some("2025-01-02T00:00:00Z"),
             /*num_scanned_files*/ 1,
-            /*reached_scan_cap*/ false,
         ));
         recorded_requests.lock().unwrap().clear();
 
@@ -6921,7 +6944,6 @@ session_picker_view = "dense"
             ],
             /*next_cursor*/ None,
             /*num_scanned_files*/ 2,
-            /*reached_scan_cap*/ false,
         ));
         state.set_query(String::from("beta"));
 

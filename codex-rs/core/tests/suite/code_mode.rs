@@ -422,7 +422,9 @@ async fn run_code_mode_turn_with_builder(
     )
     .await;
 
-    test.submit_turn(prompt).await?;
+    let completed = test.submit_turn_and_capture_completion(prompt).await?;
+    assert!(completed.error.is_none(), "{completed:?}");
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
     Ok((test, second_mock))
 }
 
@@ -780,7 +782,9 @@ async fn run_code_mode_turn_with_rmcp_config(
     )
     .await;
 
-    test.submit_turn(prompt).await?;
+    let completed = test.submit_turn_and_capture_completion(prompt).await?;
+    assert!(completed.error.is_none(), "{completed:?}");
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
     Ok((test, second_mock))
 }
 
@@ -2675,8 +2679,9 @@ text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "T
     Ok(())
 }
 
-// The outer directive limits output after JavaScript emits it; it does not
-// further change the nested tool's model-visible result text.
+// The outer directive limits output after JavaScript emits it. The nested
+// tool's result already shares that cell budget, so the script emits its own
+// text: echoing the reduced nested output would fit without any outer cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
     require_network!();
@@ -2690,7 +2695,7 @@ const result = await tools.exec_command({
   cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')"
 });
 if (!result.process_exited || result.exit_code !== 0 || result.output_reduced !== true || result.output_complete !== false) throw new Error('nested projection must share the tiny cell budget without losing completion state');
-text(result.result?.selected_text ?? result.output);
+text("abcdefghij".repeat(4));
 "#,
     )
     .await?;
@@ -2703,7 +2708,7 @@ text(result.result?.selected_text ?? result.output);
         codex_utils_output_truncation::approx_token_count(&output) <= 5,
         "{output}"
     );
-    assert!(!output.contains("0123456789012345678901234567890123456789"));
+    assert!(!output.contains(&"abcdefghij".repeat(4)));
 
     assert!(!raw_custom_tool_output_text(&request, "call-1").contains("Script failed"));
     let receipt = output_recovery_receipt(&request, "call-1");
@@ -5313,17 +5318,27 @@ async fn code_mode_can_print_error_mcp_tool_result_fields() -> Result<()> {
     require_network!();
 
     let server = responses::start_mock_server().await;
+    // These arguments satisfy the tool schema, so the call passes argument
+    // preflight and reaches the server, which answers the unparsable data URL
+    // with an MCP error.
     let code = r#"
 try {
-  await resolve_tool("mcp__rmcp.echo")({});
+  await resolve_tool("mcp__rmcp.image_scenario")({
+    scenario: "text_only",
+    data_url: "not-a-data-url",
+  });
   text("unexpected success");
 } catch (error) {
   text(String(error));
 }
 "#;
 
-    let (_test, second_mock) =
-        run_code_mode_turn_with_rmcp(&server, "use exec to call rmcp echo badly", code).await?;
+    let (_test, second_mock) = run_code_mode_turn_with_rmcp(
+        &server,
+        "use exec to call the rmcp image scenario tool badly",
+        code,
+    )
+    .await?;
 
     let req = second_mock.single_request();
     let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
@@ -5332,9 +5347,12 @@ try {
         Some(false),
         "exec rmcp error call failed unexpectedly: {output}"
     );
-    assert!(output.contains("argument preflight failed"), "{output}");
+    assert!(!output.contains("unexpected success"), "{output}");
+    assert!(!output.contains("argument preflight failed"), "{output}");
+    // The rejection carries the MCP result itself: its error flag and content.
+    assert!(output.contains("\"isError\":true"), "{output}");
     assert!(
-        output.contains("\"message\" is a required property"),
+        output.contains("invalid data_url for image_scenario tool"),
         "{output}"
     );
 
@@ -5444,11 +5462,16 @@ async fn code_mode_can_compare_elapsed_time_around_set_timeout() -> Result<()> {
         "measure elapsed time around setTimeout",
         r#"
 const start_ms = Date.now();
-await new Promise((resolve) => setTimeout(resolve, 100));
+let timer_fired = false;
+await new Promise((resolve) => setTimeout(() => {
+  timer_fired = true;
+  resolve();
+}, 100));
 const end_ms = Date.now();
 text(JSON.stringify({
   start_ms,
   end_ms,
+  timer_fired,
   elapsed_ms: end_ms - start_ms,
   waited_long_enough: end_ms - start_ms >= 100,
 }));
@@ -5472,11 +5495,22 @@ text(JSON.stringify({
         .get("elapsed_ms")
         .and_then(Value::as_i64)
         .expect("elapsed_ms should be an integer");
-    assert!(
-        elapsed_ms >= 100,
-        "expected elapsed_ms >= 100, got {elapsed_ms}"
+    let start_ms = compared
+        .get("start_ms")
+        .and_then(Value::as_i64)
+        .expect("start_ms should be an integer");
+    let end_ms = compared
+        .get("end_ms")
+        .and_then(Value::as_i64)
+        .expect("end_ms should be an integer");
+    // Date.now is wall-clock time and can step backwards. Timer deadline
+    // lower bounds are checked against Instant in the timer scheduler tests.
+    assert_eq!(elapsed_ms, end_ms - start_ms);
+    assert_eq!(compared.get("timer_fired"), Some(&Value::Bool(true)));
+    assert_eq!(
+        compared.get("waited_long_enough"),
+        Some(&Value::Bool(elapsed_ms >= 100))
     );
-    assert_eq!(compared.get("waited_long_enough"), Some(&Value::Bool(true)));
 
     Ok(())
 }

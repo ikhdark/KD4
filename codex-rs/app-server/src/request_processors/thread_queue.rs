@@ -771,10 +771,12 @@ mod tests {
         queue
             .reorder(std::slice::from_ref(&third.id))
             .expect("partial reorder");
-        let expected = vec![third.clone(), first, second];
+        let second_id = second.id.clone();
+        let expected = vec![third, first, second];
         assert_eq!(queue.submissions, expected);
-        assert!(queue.reorder(&[third.id.clone(), third.id]).is_err());
-        assert!(queue.reorder(&["unknown".to_string()]).is_err());
+        // Both rejected requests would move `second` to the front if applied.
+        assert!(queue.reorder(&[second_id.clone(), second_id.clone()]).is_err());
+        assert!(queue.reorder(&[second_id, "unknown".to_string()]).is_err());
         assert_eq!(queue.submissions, expected);
     }
 

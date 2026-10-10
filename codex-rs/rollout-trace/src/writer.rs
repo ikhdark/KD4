@@ -248,6 +248,11 @@ mod tests {
                 })?,
                 b"original"
             );
+            // A rejected create adds nothing beside the evidence it found.
+            let entries = std::fs::read_dir(temp.path())?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(entries, vec![std::ffi::OsString::from(name)]);
         }
         Ok(())
     }
@@ -415,6 +420,16 @@ mod tests {
 
         // A terminated malformed record is corruption, not an unfinished append.
         std::fs::write(&log, [&bytes[..cut], b"\n"].concat())?;
+        assert!(replay_bundle(temp.path()).is_err());
+
+        // That holds when the record stops between tokens, where the JSON error
+        // alone still reads as an unexpected end of input.
+        let second_record = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("first record")
+            + 1;
+        std::fs::write(&log, [&bytes[..=second_record], b"\n"].concat())?;
         assert!(replay_bundle(temp.path()).is_err());
         Ok(())
     }

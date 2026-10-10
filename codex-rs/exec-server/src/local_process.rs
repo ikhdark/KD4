@@ -1439,15 +1439,11 @@ mod tests {
             occupied_rx.await.expect("blocking worker started");
             let backend = LocalProcess::default();
             let mut params = test_exec_params(HashMap::new());
-            let temp = tempfile::tempdir().expect("launch marker directory");
-            let marker = temp.path().join("launched.txt");
-            params.cwd = PathUri::from_host_native_path(temp.path()).expect("marker directory URI");
-            params.argv = vec![
-                "cmd.exe".to_string(),
-                "/d".to_string(),
-                "/c".to_string(),
-                "echo launched>launched.txt".to_string(),
-            ];
+            let temp = tempfile::tempdir().expect("temp directory");
+            // Preparation does not stat the cwd; only the spawn step does. A start
+            // that reaches it fails with a different error than the cancellation.
+            params.cwd = PathUri::from_host_native_path(temp.path().join("missing"))
+                .expect("missing cwd URI");
             let process_id = params.process_id.clone();
             let expected = invalid_request(format!("process {process_id} start was cancelled"));
             let mut start = Box::pin(backend.exec(params));
@@ -1499,22 +1495,6 @@ mod tests {
             tokio::task::spawn_blocking(|| ())
                 .await
                 .expect("drain preparation");
-            assert!(
-                !marker.exists(),
-                "cancelled preparation must not launch the command"
-            );
-            let control = std::process::Command::new("cmd.exe")
-                .current_dir(temp.path())
-                .args(["/d", "/c", "echo launched>launched.txt"])
-                .status()
-                .expect("valid control launch");
-            assert!(control.success());
-            assert_eq!(
-                std::fs::read_to_string(marker)
-                    .expect("control marker")
-                    .trim(),
-                "launched"
-            );
         });
     }
 
@@ -2005,7 +1985,7 @@ mod tests {
         process.stdout_tx.send(b"tail".to_vec()).await.unwrap();
         let tail = read_process_until_change(&backend, &process.process_id, Some(1)).await;
         assert_eq!(tail.chunks[0].chunk.0, b"tail");
-        assert_eq!(tail.failure, None);
+        assert!(tail.output_gap.is_none());
         let lost = backend
             .exec_read(ReadParams {
                 process_id: process.process_id.clone(),

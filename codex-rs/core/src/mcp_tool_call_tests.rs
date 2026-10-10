@@ -890,10 +890,12 @@ async fn sampled_mcp_tool_missing_from_live_catalog_skips_before_file_upload() {
         .received_requests()
         .await
         .expect("live Apps server should record requests");
+    // The upload endpoint is `<chatgpt_base_url>/files`, and this fixture's
+    // base URL is the bare server URI.
     assert!(
         live_requests
             .iter()
-            .all(|request| !request.url.path().starts_with("/backend-api/files")),
+            .all(|request| !request.url.path().ends_with("/files")),
         "availability rejection must run before the file-upload flow"
     );
     assert!(drain_terminal_mcp_items(&rx_event, call_id).is_empty());
@@ -908,7 +910,36 @@ async fn mcp_tool_call_rejects_changed_contract_before_upload_or_execution() {
         .await
         .expect("mount Codex Apps MCP fixture");
 
-    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
+    // Make an upload driven by the stale sampled metadata reachable: ChatGPT
+    // auth, an upload endpoint on the scanned server, and a readable file in
+    // the primary environment.
+    let auth_manager = codex_login::AuthManager::from_auth_for_testing(
+        codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
+    Arc::get_mut(&mut session)
+        .expect("test session should be uniquely owned")
+        .services
+        .auth_manager = Arc::clone(&auth_manager);
+    let turn = Arc::get_mut(&mut turn_context).expect("test turn should be uniquely owned");
+    turn.auth_manager = Some(auth_manager);
+    turn.permission_profile = PermissionProfile::Disabled;
+    Arc::make_mut(&mut turn.config).chatgpt_base_url = format!("{}/backend-api", server.uri());
+    let upload_dir = tempdir().expect("create sampled file input directory");
+    let upload_dir_path = codex_utils_absolute_path::AbsolutePathBuf::try_from(upload_dir.path())
+        .expect("sampled file input directory should be absolute");
+    let primary_environment = turn.environments.turn_environments[0].clone();
+    turn.environments.turn_environments[0] = TurnEnvironment::new(
+        primary_environment.environment_id,
+        primary_environment.environment,
+        PathUri::from_abs_path(&upload_dir_path),
+        primary_environment.shell,
+    );
+    std::fs::write(
+        upload_dir_path.join("must-not-upload.txt"),
+        b"must not be uploaded",
+    )
+    .expect("write sampled file input fixture");
     let (step_context, startup_cancellation_token) =
         step_context_with_live_apps(&turn_context, &server.uri()).await;
     let live_tools = step_context.mcp.manager().list_all_tools().await;
@@ -1718,18 +1749,93 @@ fn custom_servers_require_an_identified_authority_for_remembered_approval() {
 
 #[tokio::test]
 async fn remembered_mcp_consent_is_scoped_to_authority_and_contract() {
-    let (session, _) = make_session_and_context().await;
-    let invocation = McpInvocation { server: "docs".into(), tool: "write".into(), arguments: None };
-    let mut metadata = approval_metadata(None, None, None, None, None);
-    let key = session_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto).unwrap();
+    let (mut session, turn_context) = make_session_and_context().await;
+    let manager = host_owned_codex_apps_manager(&session, &turn_context).await;
+    let invocation = McpInvocation {
+        server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        tool: "write".to_string(),
+        arguments: None,
+    };
+    let tool_info = ToolInfo {
+        server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        supports_parallel_tool_calls: false,
+        server_origin: None,
+        callable_name: "write".to_string(),
+        callable_namespace: "mcp__docs".to_string(),
+        namespace_description: None,
+        tool: rmcp::model::Tool::new_with_raw(
+            "write".to_string(),
+            Some("Write a document".into()),
+            Arc::new(rmcp::model::object(serde_json::json!({
+                "type": "object",
+            }))),
+        ),
+        connector_id: Some("docs".to_string()),
+        connector_name: Some("Docs".to_string()),
+        plugin_display_names: Vec::new(),
+    };
+    // Every authority below comes from the runtime derivation, so the hashed
+    // connection, account and tool contract are what scope the consent.
+    let mut metadata =
+        mcp_tool_metadata_from_tool_info(&session, manager.as_ref(), &tool_info).await;
+    let key = session_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto)
+        .expect("a connected server should have an approval authority");
     remember_mcp_tool_approval(&session, key.clone()).await;
     assert!(mcp_tool_approval_is_remembered(&session, &key).await);
-    for changed in ["replacement-endpoint", "other-account", "changed-contract"] {
-        metadata.authority = Some(changed.into());
-        let replacement = session_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto).unwrap();
-        assert_ne!(key.policy_key(), replacement.policy_key());
-        assert!(!mcp_tool_approval_is_remembered(&session, &replacement).await);
+    let unchanged = mcp_tool_metadata_from_tool_info(&session, manager.as_ref(), &tool_info).await;
+    assert_eq!(
+        session_mcp_tool_approval_key(&invocation, Some(&unchanged), AppToolApproval::Auto),
+        Some(key.clone()),
+        "an unchanged authority and contract should keep the remembered consent"
+    );
+
+    let replacement_manager = host_owned_codex_apps_manager(&session, &turn_context).await;
+    let mut changed_schema = tool_info.clone();
+    changed_schema.tool.input_schema = Arc::new(rmcp::model::object(serde_json::json!({
+        "type": "object",
+        "required": ["path"],
+    })));
+    let mut changed_annotations = tool_info.clone();
+    changed_annotations.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
+    let mut replacements = vec![
+        (
+            "replacement-connection",
+            mcp_tool_metadata_from_tool_info(&session, replacement_manager.as_ref(), &tool_info)
+                .await,
+        ),
+        (
+            "changed-input-schema",
+            mcp_tool_metadata_from_tool_info(&session, manager.as_ref(), &changed_schema).await,
+        ),
+        (
+            "changed-annotations",
+            mcp_tool_metadata_from_tool_info(&session, manager.as_ref(), &changed_annotations)
+                .await,
+        ),
+    ];
+    session.services.auth_manager = codex_login::AuthManager::from_auth_for_testing(
+        codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
+    replacements.push((
+        "other-account",
+        mcp_tool_metadata_from_tool_info(&session, manager.as_ref(), &tool_info).await,
+    ));
+    for (changed, replacement) in &replacements {
+        let replacement =
+            session_mcp_tool_approval_key(&invocation, Some(replacement), AppToolApproval::Auto)
+                .unwrap();
+        assert_ne!(key.policy_key(), replacement.policy_key(), "{changed}");
+        assert!(
+            !mcp_tool_approval_is_remembered(&session, &replacement).await,
+            "{changed}"
+        );
     }
+
+    metadata.persistent_authority = true;
+    assert_eq!(
+        persistent_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto),
+        Some(key)
+    );
     metadata.persistent_authority = false;
     assert!(persistent_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto).is_none());
 }
@@ -2820,30 +2926,60 @@ approval_mode = "prompt"
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.config = Arc::new(config);
 
-    let configured_servers = turn_context.config.mcp_servers.get();
-    assert_eq!(
-        configured_mcp_tool_approval_mode(configured_servers, "docs", "read"),
-        Some(AppToolApproval::Approve)
-    );
-    assert_eq!(
-        configured_mcp_tool_approval_mode(configured_servers, "docs", "search"),
-        Some(AppToolApproval::Prompt)
-    );
-    assert_eq!(
-        configured_mcp_tool_approval_mode(configured_servers, "unknown", "search"),
-        None
-    );
+    // Resolve through the connection manager the dispatcher consults. Startup
+    // is cancelled up front: approval modes are config metadata, so no server
+    // has to launch.
+    let mcp_servers = session
+        .services
+        .mcp_manager
+        .effective_servers(&turn_context.config, /*auth*/ None)
+        .await;
+    let startup_cancellation_token = CancellationToken::new();
+    startup_cancellation_token.cancel();
+    let (tx_event, _rx_event) = async_channel::unbounded();
+    let manager = codex_mcp::McpConnectionManager::new(
+        &mcp_servers,
+        turn_context.config.mcp_oauth_credentials_store_mode,
+        turn_context.config.auth_keyring_backend_kind(),
+        HashMap::new(),
+        &turn_context.approval_policy,
+        turn_context.sub_id.clone(),
+        tx_event,
+        startup_cancellation_token,
+        turn_context.permission_profile(),
+        codex_mcp::McpRuntimeContext::new(
+            session.services.turn_environments.environment_manager(),
+            turn_context.cwd().to_path_buf(),
+        ),
+        turn_context.config.codex_home.to_path_buf(),
+        session.services.mcp_manager.codex_apps_tools_cache(),
+        codex_mcp::codex_apps_tools_cache_key(
+            /*auth*/ None,
+            &turn_context.config.chatgpt_base_url,
+            turn_context.config.apps_mcp_product_sku.as_deref(),
+        ),
+        turn_context.config.prefix_mcp_tool_names(),
+        rmcp::model::ElicitationCapability::default(),
+        /*supports_openai_form_elicitation*/ false,
+        codex_mcp::ToolPluginProvenance::default(),
+        /*auth*/ None,
+        /*codex_apps_auth_manager*/ None,
+        /*elicitation_lifecycle*/ None,
+        codex_mcp::ElicitationRequestRouter::default(),
+        /*previous_manager*/ None,
+    )
+    .await;
 
     assert_eq!(
-        custom_mcp_tool_approval_mode(&session, &turn_context, "docs", "read").await,
+        manager.tool_approval_mode("docs", "read"),
         AppToolApproval::Approve
     );
     assert_eq!(
-        custom_mcp_tool_approval_mode(&session, &turn_context, "docs", "search").await,
+        manager.tool_approval_mode("docs", "search"),
         AppToolApproval::Prompt
     );
     assert_eq!(
-        custom_mcp_tool_approval_mode(&session, &turn_context, "unknown", "search").await,
+        manager.tool_approval_mode("unknown", "search"),
         AppToolApproval::Auto
     );
 }

@@ -252,6 +252,47 @@ fn otel_export_routing_policy_routes_user_prompt_log_and_trace_events() {
     assert!(!prompt_trace_attrs.contains_key("prompt"));
     assert!(!prompt_trace_attrs.contains_key("user.email"));
     assert!(!prompt_trace_attrs.contains_key("user.account_id"));
+
+    // Control: without the prompt-logging opt-in the log sink only gets a redaction marker.
+    let redacted_exporter = InMemoryLogExporter::default();
+    let redacted_provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(redacted_exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&redacted_provider)
+            .with_filter(filter_fn(OtelProvider::log_export_filter)),
+    );
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        let manager = SessionTelemetry::new(
+            ThreadId::new(),
+            "gpt-5.1",
+            "gpt-5.1",
+            None,
+            None,
+            Some(TelemetryAuthMode::ApiKey),
+            "codex_exec".to_string(),
+            /*log_user_prompts*/ false,
+            "tty".to_string(),
+            SessionSource::Cli,
+        );
+        manager.user_prompt(&[UserInput::Text {
+            text: "super secret prompt".to_string(),
+            text_elements: Vec::new(),
+        }]);
+    });
+    redacted_provider.force_flush().expect("flush logs");
+    let redacted_logs = redacted_exporter.get_emitted_logs().expect("log export");
+    let redacted_attrs =
+        log_attributes(&find_log_by_event_name(&redacted_logs, "codex.user_prompt").record);
+    assert_eq!(
+        redacted_attrs.get("prompt").map(String::as_str),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        redacted_attrs.get("prompt_length").map(String::as_str),
+        Some("19")
+    );
 }
 
 #[test]

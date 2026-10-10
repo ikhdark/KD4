@@ -110,6 +110,24 @@ fn ignores_scope_text_outside_a_scope_parameter() {
             "header: {header}"
         );
     }
+
+    // Without the insufficient_scope error the result is `None` whatever the
+    // parser does with the scope text, so pin the scope itself as well.
+    let insufficient_scope_cases = [
+        r#"Bearer error="insufficient_scope", error_description="request scope=admin""#,
+        r#"Bearer error="insufficient_scope", resource_scope="admin""#,
+        r#"Bearer error="insufficient_scope", "scope=admin""#,
+    ];
+
+    for header in insufficient_scope_cases {
+        assert_eq!(
+            parse_bearer_insufficient_scope(header),
+            Some(BearerInsufficientScope {
+                required_scope: None,
+            }),
+            "header: {header}"
+        );
+    }
 }
 
 #[test]

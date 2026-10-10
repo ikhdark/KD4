@@ -1,5 +1,6 @@
 use anyhow::Context;
 use base64::Engine;
+use codex_core::RolloutRecorder;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::PermissionProfile;
@@ -8,7 +9,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::TempDirExt;
 use core_test_support::require_network;
@@ -27,30 +27,26 @@ use image::ImageBuffer;
 use image::Rgba;
 use pretty_assertions::assert_eq;
 use std::path::Path;
-use std::time::Duration;
 
-fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let rollout: RolloutLine = match serde_json::from_str(trimmed) {
-            Ok(rollout) => rollout,
-            Err(_) => continue,
-        };
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
-            &rollout.item
+async fn find_user_message_with_image(path: &Path) -> anyhow::Result<Option<ResponseItem>> {
+    // Use the resume reader so private payload references are hydrated and
+    // malformed records still fail this durable-history assertion.
+    let (items, _, parse_errors) = RolloutRecorder::load_rollout_items(path)
+        .await
+        .with_context(|| format!("read rollout file at {}", path.display()))?;
+    assert_eq!(parse_errors, 0, "valid durable rollout records");
+    for rollout in items {
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = &rollout
             && role == "user"
             && content
                 .iter()
                 .any(|span| matches!(span, ContentItem::InputImage { .. }))
-            && let RolloutItem::ResponseItem(item) = rollout.item.clone()
+            && let RolloutItem::ResponseItem(item) = rollout
         {
-            return Some(item);
+            return Ok(Some(item));
         }
     }
-    None
+    Ok(None)
 }
 
 fn extract_image_url(item: &ResponseItem) -> Option<String> {
@@ -61,20 +57,6 @@ fn extract_image_url(item: &ResponseItem) -> Option<String> {
         }),
         _ => None,
     }
-}
-
-async fn read_rollout_text(path: &Path) -> anyhow::Result<String> {
-    for _ in 0..50 {
-        if path.exists()
-            && let Ok(text) = std::fs::read_to_string(path)
-            && !text.trim().is_empty()
-        {
-            return Ok(text);
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    std::fs::read_to_string(path)
-        .with_context(|| format!("read rollout file at {}", path.display()))
 }
 
 fn write_test_png(path: &Path, color: [u8; 4]) -> anyhow::Result<()> {
@@ -153,8 +135,8 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
     wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 
     let rollout_path = codex.rollout_path().expect("rollout path");
-    let rollout_text = read_rollout_text(&rollout_path).await?;
-    let actual = find_user_message_with_image(&rollout_text)
+    let actual = find_user_message_with_image(&rollout_path)
+        .await?
         .expect("expected user message with input image in rollout");
 
     let image_url = extract_image_url(&actual).expect("expected image url in rollout");
@@ -260,8 +242,8 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
     wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
 
     let rollout_path = codex.rollout_path().expect("rollout path");
-    let rollout_text = read_rollout_text(&rollout_path).await?;
-    let actual = find_user_message_with_image(&rollout_text)
+    let actual = find_user_message_with_image(&rollout_path)
+        .await?
         .expect("expected user message with input image in rollout");
     assert_eq!(extract_image_url(&actual).as_deref(), Some(image_url.as_str()));
     let expected = ResponseItem::Message {

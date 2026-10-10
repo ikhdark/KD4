@@ -71,6 +71,11 @@ pub(crate) fn load_cached_directory_connectors_from_disk(
     if cache.schema_version != CONNECTOR_DIRECTORY_DISK_CACHE_SCHEMA_VERSION {
         return CachedConnectorDirectoryDiskLoad::Invalid;
     }
+    if cache.connectors.iter().any(|connector| {
+        connector.id.is_empty() || connector.id.trim() != connector.id
+    }) {
+        return CachedConnectorDirectoryDiskLoad::Invalid;
+    }
 
     CachedConnectorDirectoryDiskLoad::Hit {
         connectors: cache.connectors,

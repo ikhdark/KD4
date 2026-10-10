@@ -194,6 +194,7 @@ fn non_replayable_redirect_is_not_followed_regardless_of_target_scheme() {
 #[test]
 fn redirect_credentials_are_retained_only_for_the_same_origin() {
     for (previous, next, retain_credentials) in [
+        ("https://example.com/start", "https://example.com:443/next", true),
         (
             "https://example.com:8080/start",
             "https://example.com:8080/next",
@@ -220,16 +221,25 @@ fn redirect_credentials_are_retained_only_for_the_same_origin() {
         let mut headers = HeaderMap::from_iter([
             (AUTHORIZATION, HeaderValue::from_static("Bearer secret")),
             (COOKIE, HeaderValue::from_static("session=secret")),
+            (http::header::HOST, HeaderValue::from_static("example.com")),
+            (http::header::PROXY_AUTHORIZATION, HeaderValue::from_static("Basic secret")),
+            (http::header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=private")),
+            (http::header::HeaderName::from_static("cookie2"), HeaderValue::from_static("session=legacy-secret")),
+            (http::header::ACCEPT, HeaderValue::from_static("application/json")),
         ]);
+        let mut expected = headers.clone();
+        if !retain_credentials {
+            expected = HeaderMap::from_iter([(
+                http::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            )]);
+        }
 
         remove_sensitive_headers(&mut headers, &previous, &next);
 
         assert_eq!(
-            (
-                headers.contains_key(AUTHORIZATION),
-                headers.contains_key(COOKIE),
-            ),
-            (retain_credentials, retain_credentials),
+            headers,
+            expected,
             "credential handling for {previous} -> {next}"
         );
     }

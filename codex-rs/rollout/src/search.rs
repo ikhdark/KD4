@@ -496,9 +496,9 @@ fn char_start_before(text: &str, byte_index: usize, chars_before: usize) -> usiz
     text[..byte_index]
         .char_indices()
         .rev()
-        .nth(chars_before)
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
+        .take(chars_before)
+        .last()
+        .map_or(byte_index, |(idx, _)| idx)
 }
 
 fn char_end_after(text: &str, byte_index: usize, chars_after: usize) -> usize {
@@ -558,6 +558,24 @@ mod tests {
         .to_string()
     }
 
+    /// A search with an unspawnable `rg` degrades to the directory scan and
+    /// returns the same matches, so the ripgrep leg must prove ripgrep ran.
+    async fn assert_ripgrep_runs(root: &Path) {
+        let query = RolloutSearchQuery::new("needle").expect("search query");
+        let ripgrep_matches = ripgrep_rollout_paths(
+            Path::new("rg"),
+            root,
+            &query.json_search_term,
+            &query.text_matcher,
+        )
+        .await
+        .expect("run rg");
+        assert!(
+            ripgrep_matches.is_some(),
+            "rg must be on PATH for the ripgrep leg of this test"
+        );
+    }
+
     #[test]
     fn parse_ripgrep_rollout_match_returns_bounded_plain_snippet() {
         let root = Path::new("sessions");
@@ -572,10 +590,11 @@ mod tests {
         let snippet = snippet.expect("conversation snippet");
 
         assert_eq!(parsed_path, root.join(path));
-        assert!(snippet.starts_with("... "));
-        assert!(snippet.ends_with(" ..."));
-        assert!(snippet.contains("needle"));
-        assert!(snippet.chars().count() <= 170, "snippet was {snippet:?}");
+        // 48 characters of context before the match and 96 after it.
+        assert_eq!(
+            snippet,
+            format!("... {}needle{} ...", "a".repeat(48), "b".repeat(96))
+        );
     }
 
     #[test]
@@ -729,6 +748,7 @@ mod tests {
         std::fs::write(root.join(name), &line).unwrap();
         std::fs::write(root.join("notes.jsonl"), &line).unwrap();
         let expected = HashMap::from([(root.join(name), Some("needle".to_string()))]);
+        assert_ripgrep_runs(&root).await;
         let actual = search_rollout_matches(Path::new("rg"), temp.path(), false, "needle")
             .await
             .unwrap();
@@ -776,6 +796,7 @@ mod tests {
         let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
         writeln!(file, "{}", user_rollout_line("2026-01-01T00:00:01Z", "later conversation"))?;
         drop(file);
+        assert_ripgrep_runs(&root).await;
         for (term, expected) in [
             ("metadata-needle", HashMap::from([(path.clone(), None)])),
             ("later conversation", HashMap::from([(path.clone(), Some("later conversation".to_string()))])),

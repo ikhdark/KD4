@@ -82,6 +82,42 @@ mod tests {
     }
 
     #[test]
+    fn explicit_mutations_are_not_hidden_as_exploration() {
+        // Exploration UI shows only a filename/query, not the original command.
+        // An explicit write or subprocess must remain visible as an unknown run.
+        for argv in [
+            vec!["find", ".", "-delete"],
+            vec!["find", ".", "-exec", "touch", "marker", ";"],
+            vec!["sed", "-i", "-n", "1p", "file.txt"],
+            vec!["sed", "-n", "-e", "1p", "-e", "w marker", "file.txt"],
+            vec!["awk", "{system(\"touch marker\")}", "file.txt"],
+            vec!["rg", "--pre", "external-command", "pattern", "file.txt"],
+        ] {
+            let command = vec_str(&argv);
+            let script = shlex_join(&command);
+            for command in [command, vec_str(&["bash", "-lc", &script])] {
+                let parsed = parse_command(&command);
+                assert!(
+                    matches!(parsed.as_slice(), [ParsedCommand::Unknown { .. }]),
+                    "{command:?}: {parsed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fd_subprocesses_are_not_hidden_as_exploration() {
+        // fd's documented -x/-X options execute commands over search results.
+        for option in ["-x", "--exec", "-X", "--exec-batch"] {
+            let command = vec_str(&["fd", ".", option, "touch", "marker"]);
+            let script = shlex_join(&command);
+            for command in [command, vec_str(&["bash", "-lc", &script])] {
+                assert!(matches!(parse_command(&command).as_slice(), [ParsedCommand::Unknown { .. }]), "{command:?}");
+            }
+        }
+    }
+
+    #[test]
     fn review_regression_summaries_preserve_writers_and_uncertain_cwd() {
         for source in [
             "cat input.txt | uniq - output.txt",
@@ -469,8 +505,8 @@ mod tests {
     }
 
     #[test]
-    fn bash_cd_then_bar_is_same_as_bar() {
-        // Ensure a leading `cd` inside bash -lc is dropped when followed by another command.
+    fn bash_cd_then_unknown_command_keeps_full_script() {
+        // An unknown command after `cd` keeps the whole script visible, including the `cd`.
         assert_parsed(
             &shlex_split_safe("bash -lc 'cd foo && bar'"),
             vec![ParsedCommand::Unknown {
@@ -795,7 +831,7 @@ mod tests {
 
     // ---- is_small_formatting_command unit tests ----
     #[test]
-    fn small_formatting_always_true_commands() {
+    fn small_formatting_bare_commands_and_unknown_options() {
         for cmd in ["wc", "tr", "cut", "sort", "uniq", "xargs", "tee", "column"] {
             assert!(is_small_formatting_command(&shlex_split_safe(cmd)));
         }
@@ -946,6 +982,24 @@ mod tests {
                 cmd: inner.to_string(),
             }],
         );
+
+        // After `;` a decoded `printf` would still be an unknown command. In a pipeline it is a
+        // dropped formatter, so only the undecoded backslash escape keeps the script unknown.
+        assert_parsed(
+            &vec_str(&["bash", "-lc", r#"printf "x" | cat ansi-escape/Cargo.toml"#]),
+            vec![ParsedCommand::Read {
+                cmd: "cat ansi-escape/Cargo.toml".to_string(),
+                name: "Cargo.toml".to_string(),
+                path: PathBuf::from("ansi-escape/Cargo.toml"),
+            }],
+        );
+        let escaped = r#"printf "\n" | cat ansi-escape/Cargo.toml"#;
+        assert_parsed(
+            &vec_str(&["bash", "-lc", escaped]),
+            vec![ParsedCommand::Unknown {
+                cmd: escaped.to_string(),
+            }],
+        );
     }
 
     #[test]
@@ -979,8 +1033,8 @@ mod tests {
     }
 
     #[test]
-    fn supports_sed_n_then_nl_as_search() {
-        // Ensure `sed -n '<range>' <file> | nl -ba` is summarized as a search for that file.
+    fn supports_sed_n_then_nl_as_read() {
+        // Ensure `sed -n '<range>' <file> | nl -ba` is summarized as a read of that file.
         let args = shlex_split_safe(
             "sed -n '260,640p' exec/src/event_processor_with_human_output.rs | nl -ba",
         );
@@ -1493,47 +1547,11 @@ pub(crate) fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
     }
 }
 
-fn sed_read_path(args: &[String]) -> Option<String> {
-    let args_no_connector = trim_at_connector(args);
-    if !args_no_connector.iter().any(|arg| arg == "-n") {
-        return None;
-    }
-    let mut has_range_script = false;
-    let mut i = 0;
-    while i < args_no_connector.len() {
-        let arg = &args_no_connector[i];
-        if matches!(arg.as_str(), "-e" | "--expression") {
-            if is_valid_sed_n_arg(args_no_connector.get(i + 1).map(String::as_str)) {
-                has_range_script = true;
-            }
-            i += 2;
-            continue;
-        }
-        if matches!(arg.as_str(), "-f" | "--file") {
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    if !has_range_script {
-        has_range_script = args_no_connector
-            .iter()
-            .any(|arg| !arg.starts_with('-') && is_valid_sed_n_arg(Some(arg)));
-    }
-    if !has_range_script {
-        return None;
-    }
-    let candidates = skip_flag_values(&args_no_connector, &["-e", "-f", "--expression", "--file"]);
-    let non_flags: Vec<String> = candidates
-        .into_iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .cloned()
-        .collect();
-    match non_flags.as_slice() {
-        [] => None,
-        [first, rest @ ..] if is_valid_sed_n_arg(Some(first)) => rest.first().cloned(),
-        [first, ..] => Some(first.clone()),
-    }
+fn sed_read_path(tokens: &[String]) -> Option<String> {
+    let (path, formatter) = tokens.split_last()?;
+    let formatter = formatter.strip_suffix(&["--".to_string()]).unwrap_or(formatter);
+    (formatter.len() >= 3 && !path.starts_with('-') && is_small_sed_formatter(formatter))
+        .then(|| path.clone())
 }
 
 /// Normalize a command by:
@@ -1747,29 +1765,9 @@ fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand {
     }
 }
 
-fn awk_data_file_operand(args: &[String]) -> Option<String> {
-    if args.is_empty() {
-        return None;
-    }
-    let args_no_connector = trim_at_connector(args);
-    let has_script_file = args_no_connector
-        .iter()
-        .any(|arg| arg == "-f" || arg == "--file");
-    let candidates = skip_flag_values(
-        &args_no_connector,
-        &["-F", "-v", "-f", "--field-separator", "--assign", "--file"],
-    );
-    let non_flags: Vec<&String> = candidates
-        .into_iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .collect();
-    if has_script_file {
-        return non_flags.first().cloned().cloned();
-    }
-    if non_flags.len() >= 2 {
-        return Some(non_flags[1].clone());
-    }
-    None
+fn awk_data_file_operand(tokens: &[String]) -> Option<String> {
+    let (path, formatter) = tokens.split_last()?;
+    (!path.starts_with('-') && is_small_awk_formatter(formatter)).then(|| path.clone())
 }
 
 fn cd_target(args: &[String]) -> Option<String> {
@@ -2191,6 +2189,14 @@ fn drop_small_formatting_commands(
 }
 
 fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
+    if let Some(head) = main_cmd.first()
+        && ((head == "find"
+            && !crate::command_safety::is_safe_command::is_known_safe_direct_argv(main_cmd))
+            || (matches!(head.as_str(), "rg" | "rga" | "ripgrep-all")
+                && !crate::command_safety::is_safe_command::is_safe_ripgrep(main_cmd)))
+    {
+        return ParsedCommand::Unknown { cmd: shlex_join(main_cmd) };
+    }
     match main_cmd.split_first() {
         Some((head, tail)) if matches!(head.as_str(), "ls" | "eza" | "exa") => {
             let flags_with_vals: &[&str] = match head.as_str() {
@@ -2309,6 +2315,16 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             },
         },
         Some((head, tail)) if head == "fd" => {
+            if tail.iter().take_while(|arg| arg.as_str() != "--").any(|arg| {
+                matches!(arg.as_str(), "-x" | "--exec" | "-X" | "--exec-batch")
+                    || arg.starts_with("--exec=")
+                    || arg.starts_with("--exec-batch=")
+                    || (arg.starts_with('-')
+                        && !arg.starts_with("--")
+                        && (arg.contains('x') || arg.contains('X')))
+            }) {
+                return ParsedCommand::Unknown { cmd: shlex_join(main_cmd) };
+            }
             let (query, path) = parse_fd_query_and_path(tail);
             if query.is_some() {
                 ParsedCommand::Search {
@@ -2553,8 +2569,8 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 cmd: shlex_join(main_cmd),
             }
         }
-        Some((head, tail)) if head == "awk" => {
-            if let Some(path) = awk_data_file_operand(tail) {
+        Some((head, _)) if head == "awk" => {
+            if let Some(path) = awk_data_file_operand(main_cmd) {
                 let name = short_display_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),
@@ -2584,8 +2600,8 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 }
             }
         }
-        Some((head, tail)) if head == "sed" => {
-            if let Some(path) = sed_read_path(tail) {
+        Some((head, _)) if head == "sed" => {
+            if let Some(path) = sed_read_path(main_cmd) {
                 let name = short_display_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),

@@ -279,6 +279,14 @@ mod tests {
         ] {
             assert!(command_might_be_dangerous(&command), "{command:?}");
         }
+        // Only a force option ahead of `--` is the hazard, not every `rm`.
+        for command in [
+            vec_str(&["rm", "-r", "target"]),
+            vec_str(&["/bin/rm", "--one-file-system", "target"]),
+            vec_str(&["rm", "--", "-f"]),
+        ] {
+            assert!(!command_might_be_dangerous(&command), "{command:?}");
+        }
     }
 
     #[test]

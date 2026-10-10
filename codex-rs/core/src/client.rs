@@ -241,11 +241,6 @@ struct ModelRequestMeasurements {
     history_divergence: Option<HistoryPrefixDivergence>,
     /// Representation selected at dispatch, not inferred from the manifest.
     selected_representation: Option<SelectedInputRepresentation>,
-    /// Drops the aggregate output budget made in the representation this
-    /// request actually sent. Other representations are prepared and discarded,
-    /// so their drops must not be attributed here.
-    tool_output_budget_drop_count: u32,
-    tool_output_budget_dropped_token_count: u64,
 }
 
 /// How this request's input prefix relates to the preceding request's.
@@ -465,8 +460,9 @@ impl ModelRequestMeasurements {
             history_first_divergent_index: self
                 .history_divergence
                 .map(|divergence| divergence.first_divergent_index),
-            tool_output_budget_drop_count: self.tool_output_budget_drop_count,
-            tool_output_budget_dropped_token_count: self.tool_output_budget_dropped_token_count,
+            // No aggregate tool-output budget runs; the fields stay for the wire schema.
+            tool_output_budget_drop_count: 0,
+            tool_output_budget_dropped_token_count: 0,
         }
     }
 
@@ -723,8 +719,6 @@ impl ModelRequestMeasurements {
             changed_request_settings: Vec::new(),
             history_divergence: None,
             selected_representation: None,
-            tool_output_budget_drop_count: 0,
-            tool_output_budget_dropped_token_count: 0,
         })
     }
 
@@ -1200,10 +1194,6 @@ fn measure_responses_request_after_dispatch(
     encoded_request: Option<Bytes>,
     payload_timing: Option<(Arc<TurnTimingState>, ResponseAttemptIdentity)>,
 ) -> tokio::task::JoinHandle<PostDispatchRequestMeasurements> {
-    let selected_budget_drops = prompt.selected_tool_output_budget_drops(
-        selected_representation.stable_context_fallback,
-        selected_representation.tool_history_fallback,
-    );
     let input_reprojected = selected_representation.is_reprojected();
     tokio::spawn(async move {
         let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
@@ -1270,8 +1260,6 @@ fn measure_responses_request_after_dispatch(
                     encoded_request.as_deref().and_then(|encoded| {
                         request_setting_digests(encoded, &blocking_cancellation).ok()
                     });
-                measurements.tool_output_budget_drop_count = selected_budget_drops.count;
-                measurements.tool_output_budget_dropped_token_count = selected_budget_drops.tokens;
                 Ok::<_, serde_json::Error>(measurements)
             })();
             let stable_context_manifest =

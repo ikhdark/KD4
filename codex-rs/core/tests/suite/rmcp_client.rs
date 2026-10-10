@@ -149,6 +149,15 @@ fn user_turn_with_permission_profile(
     }
 }
 
+async fn wait_for_successful_turn(fixture: &TestCodex) {
+    let EventMsg::TurnComplete(completed) = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    }).await else {
+        unreachable!("completion predicate");
+    };
+    assert!(completed.error.is_none(), "{completed:?}");
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum McpCallEvent {
     Begin(String),
@@ -299,7 +308,7 @@ async fn call_structured_tool(
         .expect("structured content")
         .clone();
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(fixture).await;
     Ok(structured_content)
 }
 
@@ -367,7 +376,10 @@ async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()
                     anyhow::ensure!(summary.cancelled.is_empty(), "MCP refresh was cancelled");
                     ready = summary.ready.iter().any(|name| name == server_name);
                 }
-                EventMsg::TurnComplete(_) => completed = true,
+                EventMsg::TurnComplete(event) => {
+                    assert!(event.error.is_none(), "{event:?}");
+                    completed = true;
+                }
                 _ => {}
             }
         }
@@ -562,7 +574,7 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
         .expect("env snapshot inserted");
     assert_eq!(env_value, expected_env_value);
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let search_output = call_mock
         .single_request()
@@ -874,7 +886,7 @@ async fn stdio_mcp_parallel_tool_calls_default_false_runs_serially() -> anyhow::
         "default MCP tool calls should run serially; saw events: {call_events:?}"
     );
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let request = final_mock.single_request();
     for call_id in [first_call_id, second_call_id] {
@@ -972,7 +984,7 @@ async fn stdio_mcp_read_only_tool_calls_run_concurrently_without_server_opt_in()
         ))
         .await?;
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let request = final_mock.single_request();
     for call_id in [first_call_id, second_call_id] {
@@ -1060,7 +1072,7 @@ async fn stdio_mcp_parallel_tool_calls_opt_in_runs_concurrently() -> anyhow::Res
         ))
         .await?;
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let request = final_mock.single_request();
     for call_id in [first_call_id, second_call_id] {
@@ -1195,7 +1207,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
     assert_eq!(entry.get("mimeType"), Some(&json!("image/png")));
     assert_eq!(entry.get("data"), Some(&json!(base64_only)));
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let output_item = final_mock.single_request().function_call_output(call_id);
     assert_eq!(output_item["type"], "function_call_output");
@@ -1297,7 +1309,7 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
             "call the rmcp image_scenario tool",
         ))
         .await?;
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let output_item = final_mock.single_request().function_call_output(call_id);
     assert_eq!(output_item["call_id"], call_id);
@@ -1381,7 +1393,7 @@ async fn stdio_image_responses_preserve_original_detail_metadata() -> anyhow::Re
         ))
         .await?;
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let output_item = final_mock.single_request().function_call_output(call_id);
     let output = output_item["output"]
@@ -1543,7 +1555,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
         matches!(ev, EventMsg::McpToolCallEnd(_))
     })
     .await;
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     let output_item = final_mock.single_request().function_call_output(call_id);
     let output_text = output_item
@@ -1669,7 +1681,7 @@ async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
         .expect("env snapshot inserted");
     assert_eq!(env_value, expected_env_value);
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     server.verify().await;
 
@@ -1762,7 +1774,7 @@ async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Resu
         .expect("structured content");
     assert_eq!(structured["env"], expected_env_value);
 
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
     server.verify().await;
     Ok(())
 }
@@ -1926,7 +1938,7 @@ async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
 
     // Phase 7: verify the scripted model calls were consumed and clean up the
     // placement-aware MCP server.
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     server.verify().await;
 
@@ -2276,7 +2288,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     assert_eq!(env_value, expected_env_value);
 
     // Phase 9: verify the scripted model calls were consumed and clean up.
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn(&fixture).await;
 
     server.verify().await;
 

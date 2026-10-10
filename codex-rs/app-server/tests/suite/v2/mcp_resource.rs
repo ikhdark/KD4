@@ -480,9 +480,12 @@ enabled = false
     )
     .await?;
 
+    // No executor, as in the enabled test: a local executor alone would hide
+    // orchestrator skills whatever the config says.
     let thread_start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("gpt-5.5".to_string()),
+            environments: Some(Vec::new()),
             ..Default::default()
         })
         .await?;

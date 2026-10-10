@@ -4,10 +4,13 @@ use rmcp::ClientHandler;
 use rmcp::RoleClient;
 use rmcp::model::CancelledNotificationParam;
 use rmcp::model::ClientInfo;
+use rmcp::model::ConstString;
 use rmcp::model::CreateElicitationRequestParams;
 use rmcp::model::CreateElicitationResult;
+use rmcp::model::CustomNotification;
 use rmcp::model::LoggingLevel;
 use rmcp::model::LoggingMessageNotificationParam;
+use rmcp::model::ProgressNotificationMethod;
 use rmcp::model::ProgressNotificationParam;
 use rmcp::model::ResourceUpdatedNotificationParam;
 use rmcp::service::NotificationContext;
@@ -110,6 +113,24 @@ impl ClientHandler for LoggingClientHandler {
         info!("MCP server prompt list changed");
     }
 
+    // serde_json's workspace-enabled arbitrary_precision feature keeps rmcp's
+    // untagged notification enum from decoding the float fields of a progress
+    // notification, so one arrives here instead of at `on_progress`.
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        if notification.method != ProgressNotificationMethod::VALUE {
+            return;
+        }
+        match notification.params_as::<ProgressNotificationParam>() {
+            Ok(Some(params)) => self.handle_progress_notification(params).await,
+            Ok(None) => {}
+            Err(err) => warn!("ignoring malformed MCP progress notification: {err}"),
+        }
+    }
+
     fn get_info(&self) -> ClientInfo {
         self.client_info.clone()
     }
@@ -160,25 +181,65 @@ impl ClientHandler for LoggingClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elicitation_client_service::ElicitationClientService;
+    use crate::rmcp_client::ElicitationPauseRegistry;
+    use rmcp::handler::server::ServerHandler;
     use rmcp::model::NumberOrString;
     use rmcp::model::ProgressToken;
-    use std::sync::Mutex;
+    use rmcp::service::RoleServer;
+    use rmcp::service::RunningService;
+    use rmcp::service::serve_client;
+    use rmcp::service::serve_server;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// A server with no behaviour of its own; the tests drive its peer handle.
+    struct SilentServer;
+
+    impl ServerHandler for SilentServer {}
+
+    /// Connects the client service the runtime serves to an in-memory server, so a server
+    /// notification has to cross the transport and the `ClientHandler` dispatch to be seen.
+    async fn connect(
+        send_progress: SendProgress,
+        send_tool_list_changed: SendToolListChanged,
+    ) -> (
+        RunningService<RoleServer, SilentServer>,
+        RunningService<RoleClient, ElicitationClientService>,
+    ) {
+        let client_service = ElicitationClientService::new(
+            ClientInfo::default(),
+            Box::new(|_, _| Box::pin(async move { unreachable!() })),
+            send_progress,
+            send_tool_list_changed,
+            ElicitationPauseRegistry::default(),
+        );
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (server, client) = tokio::join!(
+            serve_server(SilentServer, server_io),
+            serve_client(client_service, client_io)
+        );
+        (
+            server.expect("in-memory server should initialize"),
+            client.expect("in-memory client should initialize"),
+        )
+    }
 
     #[tokio::test]
     async fn progress_notifications_are_forwarded_to_runtime_callback() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let seen_by_callback = Arc::clone(&seen);
-        let handler = LoggingClientHandler::new(
-            ClientInfo::default(),
-            Box::new(|_, _| Box::pin(async move { unreachable!() })),
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressNotificationParam>();
+        let (server, client) = connect(
             Box::new(move |params| {
-                let seen = Arc::clone(&seen_by_callback);
+                let progress_tx = progress_tx.clone();
                 Box::pin(async move {
-                    seen.lock().expect("progress callback lock").push(params);
+                    progress_tx
+                        .send(params)
+                        .expect("progress receiver should stay open");
                 })
             }),
             Box::new(|| Box::pin(async {})),
-        );
+        )
+        .await;
         let params = ProgressNotificationParam {
             progress_token: ProgressToken(NumberOrString::String("item-1".into())),
             progress: 3.0,
@@ -186,35 +247,56 @@ mod tests {
             message: Some("working".to_string()),
         };
 
-        handler.handle_progress_notification(params.clone()).await;
+        server
+            .notify_progress(params.clone())
+            .await
+            .expect("server should send the progress notification");
 
-        assert_eq!(
-            seen.lock().expect("progress callback lock").as_slice(),
-            &[params]
+        let forwarded = tokio::time::timeout(Duration::from_secs(10), progress_rx.recv())
+            .await
+            .expect("progress notification should reach the runtime callback")
+            .expect("progress callback should stay registered");
+        assert_eq!(forwarded, params);
+
+        client.cancel().await.expect("client should shut down");
+        server.cancel().await.expect("server should shut down");
+        assert!(
+            progress_rx.try_recv().is_err(),
+            "one notification is forwarded exactly once"
         );
     }
 
     #[tokio::test]
     async fn tool_list_changed_notifications_are_forwarded_to_runtime_callback() {
-        let notification_count = Arc::new(Mutex::new(0));
-        let notification_count_by_callback = Arc::clone(&notification_count);
-        let handler = LoggingClientHandler::new(
-            ClientInfo::default(),
-            Box::new(|_, _| Box::pin(async move { unreachable!() })),
+        let (tool_list_tx, mut tool_list_rx) = mpsc::unbounded_channel::<()>();
+        let (server, client) = connect(
             Box::new(|_| Box::pin(async {})),
             Box::new(move || {
-                let notification_count = Arc::clone(&notification_count_by_callback);
+                let tool_list_tx = tool_list_tx.clone();
                 Box::pin(async move {
-                    *notification_count.lock().expect("tool-list callback lock") += 1;
+                    tool_list_tx
+                        .send(())
+                        .expect("tool-list receiver should stay open");
                 })
             }),
-        );
+        )
+        .await;
 
-        handler.handle_tool_list_changed_notification().await;
+        server
+            .notify_tool_list_changed()
+            .await
+            .expect("server should send the tool-list notification");
 
-        assert_eq!(
-            *notification_count.lock().expect("tool-list callback lock"),
-            1
+        tokio::time::timeout(Duration::from_secs(10), tool_list_rx.recv())
+            .await
+            .expect("tool-list notification should reach the runtime callback")
+            .expect("tool-list callback should stay registered");
+
+        client.cancel().await.expect("client should shut down");
+        server.cancel().await.expect("server should shut down");
+        assert!(
+            tool_list_rx.try_recv().is_err(),
+            "one notification is forwarded exactly once"
         );
     }
 }

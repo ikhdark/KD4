@@ -136,6 +136,21 @@ mod tests {
                         },
                     ),
                 ),
+                // A project layer may declare hooks but never writes hook state:
+                // its `enabled` must not replace the user's.
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::Project {
+                        dot_codex_folder: test_path_buf("/tmp/project/.codex").abs(),
+                    },
+                    config_with_hook_state(
+                        key,
+                        HookStateToml {
+                            enabled: Some(/*enabled*/ true),
+                            trusted_hash: Some("sha256:project".to_string()),
+                            once_per: None,
+                        },
+                    ),
+                ),
                 ConfigLayerEntry::new(
                     ConfigLayerSource::SessionFlags,
                     config_with_hook_state(

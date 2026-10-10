@@ -72,7 +72,7 @@ async fn file_system_remote_fs_helper_respects_windows_sandbox_write_policy() ->
 
     let readable_file = readonly_dir.join("readable.txt");
     std::fs::write(&readable_file, b"readable")?;
-    let read_result = file_system
+    let mut read_result = file_system
         .read_file(
             &PathUri::from_host_native_path(&readable_file)?,
             Some(&sandbox),
@@ -81,9 +81,16 @@ async fn file_system_remote_fs_helper_respects_windows_sandbox_write_policy() ->
     // Some local Windows hosts cannot safely run the restricted-token backend.
     // Reaching a fail-closed backend error still proves the remote fs helper
     // went through the Windows sandbox launcher; before the wrapper fix this
-    // read would have run unsandboxed.
+    // read would have run unsandboxed. The write policy is then checked with
+    // the elevated backend the other sandboxed tests in this binary use.
     if is_unsupported_restricted_token_host(&read_result) {
-        return Ok(());
+        sandbox = crate::support::read_only_sandbox(readonly_dir.clone());
+        read_result = file_system
+            .read_file(
+                &PathUri::from_host_native_path(&readable_file)?,
+                Some(&sandbox),
+            )
+            .await;
     }
     assert_eq!(read_result?, b"readable");
 

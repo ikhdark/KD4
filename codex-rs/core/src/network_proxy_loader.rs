@@ -56,12 +56,14 @@ async fn build_config_state_with_mtimes(
 ) -> Result<(ConfigState, Vec<LayerMtime>)> {
     let discovered_layers = load_network_config_layers(codex_home).await?;
     #[cfg(test)]
-    tests::after_config_discovery(codex_home);
+    tests::after_config_layers_read(codex_home);
 
     // Capture timestamps before reading the policy that will be published. A write
     // after that read must remain visible to the next reload probe.
     let layer_mtimes = collect_layer_mtimes(&discovered_layers).await?;
     let config_layer_stack = load_network_config_layers(codex_home).await?;
+    #[cfg(test)]
+    tests::after_config_layers_read(codex_home);
     anyhow::ensure!(
         config_layer_paths(&discovered_layers) == config_layer_paths(&config_layer_stack),
         "network configuration layers changed while loading; retry the reload"

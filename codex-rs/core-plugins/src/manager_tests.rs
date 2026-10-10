@@ -147,6 +147,27 @@ fn plugins_config_input_with_requirements(
     )
 }
 
+/// The manager always probes the developer's real home marketplace and cannot be pointed
+/// elsewhere, so listing-error assertions cover only the paths a test owns.
+fn marketplace_errors_under(
+    root: &Path,
+    errors: &[MarketplaceListError],
+) -> Vec<MarketplaceListError> {
+    let root = AbsolutePathBuf::try_from(root).unwrap();
+    errors
+        .iter()
+        .filter(|error| error.path.as_path().starts_with(root.as_path()))
+        .cloned()
+        .collect()
+}
+
+/// A refresh pass is recorded only when discovery is error-free, and discovery includes the
+/// developer's real home marketplace.
+fn real_home_marketplace_discovery_is_clean() -> bool {
+    list_marketplaces_with_home(&[], home_dir().as_deref())
+        .is_ok_and(|outcome| outcome.errors.is_empty())
+}
+
 #[test]
 fn plugins_manager_tracks_auth_mode() {
     let tmp = TempDir::new().unwrap();
@@ -262,6 +283,8 @@ restrict_to_allowed_sources = true
         err,
         MarketplaceError::InvalidMarketplaceFile { .. }
     ));
+    // A malformed manifest reports the same variant before the policy runs.
+    assert!(err.to_string().contains("must be added to config"), "{err}");
 }
 
 #[test]
@@ -2780,6 +2803,17 @@ fn loaded_plugins_cache_invalidation_rejects_stale_load_completion() {
     );
 
     assert_eq!(manager.cached_loaded_plugins(&cache_key), None);
+
+    // The same completion is stored once it carries the current generation.
+    manager.cache_loaded_plugins_if_current(
+        manager.loaded_plugins_cache_generation(),
+        cache_key.clone(),
+        Vec::new(),
+        None,
+        PluginLoadOutcome::default(),
+        PluginSkillSnapshots::for_plugin_load(),
+    );
+    assert_eq!(manager.cached_loaded_plugins(&cache_key), Some(Vec::new()));
 }
 
 #[tokio::test]
@@ -2980,7 +3014,7 @@ async fn install_plugin_restores_previous_cache_when_config_update_fails() {
     .unwrap();
     fs::create_dir_all(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
 
-    PluginsManager::new(tmp.path().to_path_buf())
+    let err = PluginsManager::new(tmp.path().to_path_buf())
         .install_plugin(
             &unrestricted_config_layer_stack(),
             PluginInstallRequest {
@@ -2994,6 +3028,8 @@ async fn install_plugin_restores_previous_cache_when_config_update_fails() {
         .await
         .expect_err("config update should fail");
 
+    // A failure before the cache is replaced would leave the previous files without a rollback.
+    assert!(matches!(err, PluginInstallError::Config(_)), "{err:?}");
     assert_eq!(
         fs::read_to_string(installed_root.join("previous-version-marker")).unwrap(),
         "previous version"
@@ -3082,7 +3118,7 @@ source = {marketplace_root:?}
 }
 
 #[tokio::test]
-async fn install_openai_curated_plugin_uses_short_sha_cache_version() {
+async fn install_openai_curated_plugin_uses_full_sha_cache_version() {
     let tmp = tempfile::tempdir().unwrap();
     let curated_root = curated_plugins_repo_path(tmp.path());
     write_openai_curated_marketplace(&curated_root, &["slack"]);
@@ -3507,11 +3543,13 @@ async fn uninstall_plugin_restores_cache_when_config_update_fails() {
     fs::write(installed_root.join("installed-marker"), "installed").unwrap();
     fs::create_dir_all(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
 
-    PluginsManager::new(tmp.path().to_path_buf())
+    let err = PluginsManager::new(tmp.path().to_path_buf())
         .uninstall_plugin("sample-plugin@debug".to_string())
         .await
         .expect_err("config update should fail");
 
+    // A failure before the cache is staged for removal would leave the files without a rollback.
+    assert!(matches!(err, PluginUninstallError::Config(_)), "{err:?}");
     assert_eq!(
         fs::read_to_string(installed_root.join("installed-marker")).unwrap(),
         "installed"
@@ -3549,8 +3587,14 @@ async fn uninstall_plugin_preserves_config_and_files_when_metadata_is_denied() {
     denied.restore();
 
     assert!(
-        result.is_err(),
-        "metadata failure must not report successful removal"
+        matches!(
+            result,
+            Err(PluginUninstallError::Store(PluginStoreError::Io {
+                context: "failed to inspect plugin cache entry before removal",
+                ..
+            }))
+        ),
+        "metadata failure must not report successful removal: {result:?}"
     );
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
     assert_eq!(
@@ -4139,14 +4183,21 @@ async fn read_plugin_for_config_uses_user_layer_skill_settings_only() {
         &plugin_root.join("skills/sample-search/SKILL.md"),
         "---\nname: sample-search\ndescription: search sample data\n---\n",
     );
+    // An untrusted project contributes an empty layer, which would hide the project rule below.
+    let project_key = Value::String(repo_root.to_string_lossy().into_owned()).to_string();
     write_file(
         &tmp.path().join(CONFIG_TOML_FILE),
-        r#"[features]
+        &format!(
+            r#"[features]
 plugins = true
 
 [plugins."enabled-plugin@debug"]
 enabled = true
-"#,
+
+[projects.{project_key}]
+trust_level = "trusted"
+"#
+        ),
     );
     write_file(
         &repo_root.join(".codex/config.toml"),
@@ -4157,6 +4208,14 @@ enabled = false
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
+    assert!(
+        config
+            .config_layer_stack
+            .effective_config()
+            .get("skills")
+            .is_some(),
+        "the project skill rule should be part of the loaded layer stack"
+    );
     let outcome = PluginsManager::new(tmp.path().to_path_buf())
         .read_plugin_for_config(
             &config,
@@ -4171,6 +4230,15 @@ enabled = false
         .await
         .unwrap();
 
+    assert_eq!(
+        outcome
+            .plugin
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["enabled-plugin:sample-search"]
+    );
     assert!(outcome.plugin.disabled_skill_paths.is_empty());
 }
 
@@ -4644,7 +4712,10 @@ plugins = true
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ false)
         .unwrap();
 
-    assert_eq!(outcome.errors, Vec::new());
+    assert_eq!(
+        marketplace_errors_under(tmp.path(), &outcome.errors),
+        Vec::new()
+    );
     assert_eq!(
         outcome
             .marketplaces
@@ -4706,6 +4777,12 @@ plugins = true
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap()
         .marketplaces;
+    assert!(
+        marketplaces
+            .iter()
+            .all(|marketplace| marketplace.name != OPENAI_CURATED_MARKETPLACE_NAME),
+        "API-key auth should list the API curated manifest instead of the default one"
+    );
     let curated_marketplace = marketplaces
         .into_iter()
         .find(|marketplace| marketplace.name == OPENAI_API_CURATED_MARKETPLACE_NAME)
@@ -4769,7 +4846,10 @@ plugins = true
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap();
 
-    assert_eq!(outcome.errors, Vec::new());
+    assert_eq!(
+        marketplace_errors_under(tmp.path(), &outcome.errors),
+        Vec::new()
+    );
     assert_eq!(
         outcome
             .marketplaces
@@ -5002,70 +5082,6 @@ enabled = true
             .is_installed(&PluginId::parse("sample@debug").unwrap())
     );
     assert_eq!(notifications.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn list_marketplaces_uses_config_when_known_registry_is_malformed() {
-    let tmp = tempfile::tempdir().unwrap();
-    let marketplace_root = marketplace_install_root(tmp.path()).join("debug");
-    let plugin_root = marketplace_root.join("plugins/sample");
-    let registry_path = tmp.path().join(".tmp/known_marketplaces.json");
-
-    write_file(
-        &tmp.path().join(CONFIG_TOML_FILE),
-        r#"[features]
-plugins = true
-
-[marketplaces.debug]
-last_updated = "2026-04-10T12:34:56Z"
-source_type = "git"
-source = "/tmp/debug"
-"#,
-    );
-    fs::create_dir_all(marketplace_root.join(".agents/plugins")).unwrap();
-    fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
-    fs::write(
-        marketplace_root.join(".agents/plugins/marketplace.json"),
-        r#"{
-  "name": "debug",
-  "plugins": [
-    {
-      "name": "sample",
-      "source": {
-        "source": "local",
-        "path": "./plugins/sample"
-      }
-    }
-  ]
-}"#,
-    )
-    .unwrap();
-    fs::write(
-        plugin_root.join(".codex-plugin/plugin.json"),
-        r#"{"name":"sample"}"#,
-    )
-    .unwrap();
-    fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
-    fs::write(registry_path, "{not valid json").unwrap();
-
-    let config = load_config(tmp.path(), tmp.path()).await;
-    let marketplaces = PluginsManager::new(tmp.path().to_path_buf())
-        .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
-        .unwrap()
-        .marketplaces;
-
-    let marketplace = marketplaces
-        .into_iter()
-        .find(|marketplace| {
-            marketplace.path
-                == AbsolutePathBuf::try_from(
-                    marketplace_root.join(".agents/plugins/marketplace.json"),
-                )
-                .unwrap()
-        })
-        .expect("configured marketplace should be discovered");
-
-    assert_eq!(marketplace.plugins[0].id, "sample@debug");
 }
 
 #[tokio::test]
@@ -5935,7 +5951,7 @@ plugins = true
 }
 
 #[test]
-fn refresh_curated_plugin_cache_replaces_existing_local_version_with_short_sha_version() {
+fn refresh_curated_plugin_cache_replaces_existing_local_version_with_full_sha_version() {
     let tmp = tempfile::tempdir().unwrap();
     let curated_root = curated_plugins_repo_path(tmp.path());
     write_openai_curated_marketplace(&curated_root, &["slack"]);
@@ -6811,13 +6827,14 @@ enabled=true"#,
         /*on_effective_plugins_changed*/ None,
     );
     wait();
-    assert!(
+    assert_eq!(
         manager
             .non_curated_cache_refresh_state
             .read()
             .unwrap()
             .last_refreshed
-            .is_some()
+            .is_some(),
+        real_home_marketplace_discovery_is_clean()
     );
     assert_eq!(
         manager.store.active_plugin_version(&plugin_id).as_deref(),
@@ -6910,7 +6927,7 @@ enabled=true"#;
         Some(Arc::clone(&on_effective_plugins_changed)),
     );
     wait_for_non_curated_refresh_idle(&manager).await;
-    assert!(
+    assert_eq!(
         manager
             .non_curated_cache_refresh_state
             .read()
@@ -6919,6 +6936,7 @@ enabled=true"#;
             .as_ref()
             .is_some_and(|request| request.config_layer_stack
                 == ConfigLayerStackIdentity(Arc::clone(&unchanged_config.config_layer_stack))),
+        real_home_marketplace_discovery_is_clean(),
         "the unchanged pass should have run"
     );
     assert_eq!(notifications.load(Ordering::SeqCst), 1);
@@ -6998,7 +7016,10 @@ fn async_marketplace_listing_yields_and_preserves_catalog_results() {
         );
         worker.await.unwrap();
         let outcome = listing.await.unwrap();
-        assert!(outcome.errors.is_empty());
+        assert_eq!(
+            marketplace_errors_under(home.path(), &outcome.errors),
+            Vec::new()
+        );
         // The personal marketplace is discovered from the OS home directory,
         // not from this temporary codex home, so it may also be listed here.
         // The subject is that the curated catalog survives the yield intact.

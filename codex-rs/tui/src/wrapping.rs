@@ -1526,6 +1526,13 @@ them."#
         };
         let ranges = wrap_ranges(text, opts());
         assert!(!ranges.is_empty());
+        // Reconstruction alone also accepts one oversized range. The two-column
+        // indent leaves at most fourteen columns of visible source on each row.
+        for range in &ranges {
+            assert!(range.start < range.end && range.end <= text.len() + 1);
+            let row = text[range.start..range.end - 1].trim_end_matches(' ');
+            assert!(display_width(row) <= 14, "oversized mapped row: {row:?}");
+        }
 
         let mut rebuilt = String::new();
         let mut cursor = 0usize;
@@ -1541,7 +1548,7 @@ them."#
     }
 
     #[test]
-    fn map_owned_wrapped_line_to_range_repro_overconsumes_repeated_prefix_patterns() {
+    fn map_owned_wrapped_line_to_range_does_not_overconsume_repeated_prefix_patterns() {
         let text = "- - foo";
         let opts = textwrap::Options::new(3)
             .initial_indent("- ")
@@ -1584,6 +1591,13 @@ them."#
 
         // wrap_ranges returns cursor-oriented ranges that may overlap by one byte;
         // rebuild with cursor progression to validate full source coverage.
+        // Check the actual display slices too: the consumer removes the sentinel,
+        // not an arbitrary suffix, and each two-column indent leaves ten columns.
+        for range in &ranges {
+            assert!(range.start < range.end && range.end <= text.len() + 1);
+            let row = text[range.start..range.end - 1].trim_end_matches(' ');
+            assert!(display_width(row) <= 10, "oversized mapped row: {row:?}");
+        }
         let mut rebuilt = String::new();
         let mut cursor = 0usize;
         for range in ranges {
@@ -1618,5 +1632,11 @@ them."#
 
         assert_eq!(rebuilt, text);
         assert!(ranges.len() > 1, "expected wrapped ranges, got: {ranges:?}");
+        for (index, range) in ranges.iter().enumerate() {
+            // Non-final pieces need one column for the inserted hyphen. The
+            // source range must not consume that synthetic penalty character.
+            let penalty_width = usize::from(index + 1 < ranges.len());
+            assert!(display_width(&text[range.clone()]) + penalty_width <= 8);
+        }
     }
 }

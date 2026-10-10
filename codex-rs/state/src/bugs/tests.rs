@@ -34,6 +34,153 @@ fn bug_ids_are_zero_padded_without_truncating_large_values() {
 }
 
 #[tokio::test]
+async fn reopen_accepts_equivalent_checkout_line_endings_and_preserves_reports() {
+    for crlf in [false, true] {
+        let home = tempfile::tempdir().expect("temporary SQLite home");
+        let store = BugStore::open(home.path()).await.expect("initial store");
+        let created = store.create(params("preserved report 🐛", "thread-a"))
+            .await.expect("persist report");
+        let migration = &crate::migrations::BUGS_MIGRATOR.migrations[0];
+        let sql = migration.sql.as_str().replace("\r\n", "\n");
+        let sql = if crlf { sql.replace('\n', "\r\n") } else { sql };
+        let checksum = <sha2::Sha384 as sha2::Digest>::digest(sql.as_bytes()).to_vec();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+            .bind(&checksum).execute(&store.pool).await.expect("checkout-equivalent ledger");
+        store.pool.close().await;
+
+        let reopened = BugStore::open(home.path()).await
+            .expect("equivalent checkout must not make existing reports inaccessible");
+        let claim = reopened.claim_by_id(created.id).await.expect("claim").expect("report");
+        assert_eq!(claim.raw_text, "preserved report 🐛");
+        assert_eq!(claim.attempt_count, 1);
+        let persisted_checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version = 1",
+        ).fetch_one(&reopened.pool).await.expect("original ledger checksum");
+        assert_eq!(persisted_checksum, checksum);
+        reopened.pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn reopen_rejects_unrecognized_checksum_without_rewriting_reports_or_ledger() {
+    let home = tempfile::tempdir().expect("temporary SQLite home");
+    let store = BugStore::open(home.path()).await.expect("initial store");
+    let created = store
+        .create(params("preserved despite invalid ledger", "thread-a"))
+        .await
+        .expect("persist report");
+    let checksum = <sha2::Sha384 as sha2::Digest>::digest(b"not the embedded migration").to_vec();
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+        .bind(&checksum)
+        .execute(&store.pool)
+        .await
+        .expect("unrecognized ledger checksum");
+
+    let error = match BugStore::open(home.path()).await {
+        Ok(reopened) => {
+            reopened.pool.close().await;
+            panic!("modified migration must not be accepted");
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.downcast_ref::<sqlx::migrate::MigrateError>(),
+        Some(sqlx::migrate::MigrateError::VersionMismatch(1))
+    ));
+    let persisted_checksum: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
+            .fetch_one(&store.pool)
+            .await
+            .expect("ledger retained");
+    assert_eq!(persisted_checksum, checksum);
+    let claim = store
+        .claim_by_id(created.id)
+        .await
+        .expect("claim retained report")
+        .expect("report retained");
+    assert_eq!(claim.raw_text, "preserved despite invalid ledger");
+    assert_eq!(claim.attempt_count, 1);
+    store.pool.close().await;
+}
+
+#[tokio::test]
+async fn concurrent_fresh_initializers_share_one_migration_and_reports() {
+    let home = tempfile::tempdir().expect("temporary SQLite home");
+    let (first, second) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(BugStore::open(home.path()), BugStore::open(home.path()))
+    })
+    .await
+    .expect("concurrent initialization must finish");
+    let first = first.expect("first initializer");
+    let second = second.expect("second initializer");
+    let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&second.pool)
+        .await
+        .expect("migration ledger");
+    assert_eq!(migration_count, 1);
+    let created = first
+        .create(params("shared report", "thread-a"))
+        .await
+        .expect("persist report");
+    let claim = second
+        .claim_by_id(created.id)
+        .await
+        .expect("claim from independent initializer")
+        .expect("shared report");
+    assert_eq!(claim.raw_text, "shared report");
+    assert_eq!(claim.attempt_count, 1);
+    first.pool.close().await;
+    second.pool.close().await;
+}
+
+#[tokio::test]
+async fn persistent_writer_lock_is_bounded_and_open_recovers_after_release() {
+    use sqlx::Connection;
+
+    let home = tempfile::tempdir().expect("temporary SQLite home");
+    let options = SqliteConnectOptions::new()
+        .filename(home.path().join(BUGS_DB_FILENAME))
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
+    let mut writer = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .expect("blocking connection");
+    sqlx::query("CREATE TABLE sentinel (value TEXT)")
+        .execute(&mut writer)
+        .await
+        .expect("initialize rollback-journal database");
+    sqlx::query("BEGIN EXCLUSIVE")
+        .execute(&mut writer)
+        .await
+        .expect("hold exclusive writer lock");
+    let blocked = tokio::time::timeout(Duration::from_secs(15), BugStore::open(home.path())).await;
+    let rollback = sqlx::query("ROLLBACK").execute(&mut writer).await;
+    let closed = writer.close().await;
+    // Release the blocker even when the bounded-open assertion fails.
+    rollback.expect("release writer lock");
+    closed.expect("close blocking connection");
+    let error = match blocked.expect("persistent contention must not wait indefinitely") {
+        Ok(store) => {
+            store.pool.close().await;
+            panic!("exclusive writer lock must prevent opening the WAL database");
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.downcast_ref::<sqlx::Error>(),
+        Some(sqlx::Error::Database(error)) if error.code().as_deref() == Some("5")
+    ));
+    let store = BugStore::open(home.path()).await.expect("open after release");
+    let created = store
+        .create(params("report after lock release", "thread-a"))
+        .await
+        .expect("persist after release");
+    let claim = store.claim_by_id(created.id).await.expect("claim").expect("report");
+    assert_eq!(claim.raw_text, "report after lock release");
+    store.pool.close().await;
+}
+
+#[tokio::test]
 async fn exact_text_selected_home_and_independent_connection_claim_race() {
     let home = tempfile::tempdir().expect("temporary SQLite home");
     let first_store = BugStore::open(home.path()).await.expect("first store");

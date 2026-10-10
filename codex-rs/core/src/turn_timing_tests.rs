@@ -82,6 +82,7 @@ async fn timing_storage_deadline_preserves_inline_details_and_creation_owner() {
 #[serial_test::serial(command_output_artifact)]
 async fn timing_details_are_recoverable_without_repeating_them_in_the_rollout() {
     use crate::tools::command_output_artifact::ToolOutputSelector;
+    use crate::tools::command_output_artifact::create_raw_output_artifact;
     use crate::tools::command_output_artifact::read_tool_output_selectors;
     let home = tempfile::tempdir().unwrap();
     let call = codex_protocol::protocol::TurnTimingToolCall {
@@ -98,15 +99,36 @@ async fn timing_details_are_recoverable_without_repeating_them_in_the_rollout() 
         tool_calls: vec![call.clone()],
         ..Default::default()
     };
-    let compact = super::retain_turn_timing_details(timing.clone(), home.path(), "thread").await;
-    assert_eq!(compact.inclusive_duration_ms, 456);
-    assert_eq!(compact.tool_calls[0].call_id, call.call_id);
-    assert!(compact.tool_calls[0].lifecycle_events.is_empty());
-    let artifact = read_tool_output_selectors(
-        home.path(), "thread", compact.tool_call_details_artifact_id.as_ref().unwrap(),
-        vec![ToolOutputSelector::JsonPointer { pointer: "/0/lifecycleEvents".into() }],
-    ).await.unwrap();
-    assert_eq!(artifact.results[0].value, Some(serde_json::to_value(&call.lifecycle_events).unwrap()));
+    let observed = super::retain_turn_timing_details(timing.clone(), home.path(), "thread").await;
+    // The public path may legitimately retain everything inline when local
+    // storage exceeds its 100 ms delivery budget. Test successful compaction
+    // independently with a real artifact already ready before that budget starts.
+    let bytes = serde_json::to_vec(&timing.tool_calls).unwrap();
+    let artifact = create_raw_output_artifact(home.path(), "thread", &bytes).await;
+    let ready = tokio::spawn(async move { artifact });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ready artifact task should settle");
+    let compact = super::retain_turn_timing_artifact(timing.clone(), ready).await;
+    assert!(compact.tool_call_details_artifact_id.is_some());
+    for result in [observed, compact] {
+        let Some(id) = result.tool_call_details_artifact_id.as_ref() else {
+            assert_eq!(result, timing, "deadline fallback must preserve all inline data");
+            continue;
+        };
+        assert_eq!(result.inclusive_duration_ms, 456);
+        assert_eq!(result.tool_calls[0].call_id, call.call_id);
+        assert!(result.tool_calls[0].lifecycle_events.is_empty());
+        let artifact = read_tool_output_selectors(
+            home.path(), "thread", id,
+            vec![ToolOutputSelector::JsonPointer { pointer: "/0/lifecycleEvents".into() }],
+        ).await.unwrap();
+        assert_eq!(artifact.results[0].value, Some(serde_json::to_value(&call.lifecycle_events).unwrap()));
+    }
     let not_a_directory = home.path().join("file");
     std::fs::write(&not_a_directory, "occupied").unwrap();
     let fallback = super::retain_turn_timing_details(timing.clone(), &not_a_directory, "thread").await;
@@ -231,76 +253,6 @@ fn timing() -> (Arc<FakeClock>, Arc<TurnTimingState>) {
     let clock = Arc::new(FakeClock::new(0, 0));
     let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
     (clock, state)
-}
-
-#[tokio::test]
-async fn checkout_snapshot_retains_only_pre_dispatch_results() {
-    for result in [Some("checkout-hash".to_string()), None] {
-        let (_clock, state) = timing();
-        state.mark_turn_started();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let captured = result.clone();
-        let task = tokio::spawn(async move {
-            ready_tx.send(()).unwrap();
-            captured
-        });
-        *state.checkout_snapshot.lock().unwrap() =
-            super::CheckoutSnapshotCapture::Pending(tokio_util::task::AbortOnDropHandle::new(task));
-        ready_rx.await.unwrap();
-
-        state.record_model_request_payload("request", "attempt", b"{}");
-        // Later sampling steps and retries must not capture a post-tool checkout.
-        state.start_checkout_snapshot(std::path::Path::new("must-not-be-read"));
-        state.record_model_request_payload("request", "retry", b"{}");
-        assert!(matches!(
-            *state.checkout_snapshot.lock().unwrap(),
-            super::CheckoutSnapshotCapture::Closed
-        ));
-        let timing = state.complete_snapshot().protocol_timing();
-        assert_eq!(timing.checkout_snapshot_sha256, result);
-        let serialized = serde_json::to_value(timing).unwrap();
-        assert_eq!(
-            serialized.get("checkoutSnapshotSha256").is_some(),
-            result.is_some()
-        );
-    }
-}
-
-#[tokio::test]
-async fn checkout_snapshot_cancels_pending_work_without_waiting() {
-    for boundary in ["dispatch", "completion", "drop"] {
-        let (_clock, state) = timing();
-        state.mark_turn_started();
-        let cancelled = tokio_util::sync::CancellationToken::new();
-        let guard = cancelled.clone().drop_guard();
-        let task = tokio::spawn(async move {
-            let _guard = guard;
-            std::future::pending::<Option<String>>().await
-        });
-        *state.checkout_snapshot.lock().unwrap() =
-            super::CheckoutSnapshotCapture::Pending(tokio_util::task::AbortOnDropHandle::new(task));
-        // Starting another sampling step must not replace the in-flight capture.
-        state.start_checkout_snapshot(std::path::Path::new("must-not-be-read"));
-        match boundary {
-            "dispatch" => {
-                state.record_model_request_payload("request", "attempt", b"{}");
-                state.start_checkout_snapshot(std::path::Path::new("must-not-be-read"));
-                assert!(matches!(
-                    *state.checkout_snapshot.lock().unwrap(),
-                    super::CheckoutSnapshotCapture::Closed
-                ));
-                assert!(state.complete_snapshot().checkout_snapshot_sha256.is_none());
-            }
-            "completion" => {
-                assert!(state.complete_snapshot().checkout_snapshot_sha256.is_none());
-            }
-            "drop" => drop(state),
-            _ => unreachable!(),
-        }
-        tokio::time::timeout(Duration::from_secs(1), cancelled.cancelled())
-            .await
-            .expect("pending checkout capture must be cancelled");
-    }
 }
 
 #[test]
@@ -2662,16 +2614,19 @@ fn failure_signature_count_uses_unique_failure_identities() {
 #[test]
 fn zero_requests_and_cancellation_before_request_do_not_count_continuations() {
     let (_clock, state) = timing();
-    let pending = Some(ContinuationCause::PendingInput);
     let profile = state.complete_snapshot().legacy_profile;
     assert_eq!(profile.sampling_request_count, 0);
     assert_eq!(profile.pending_input, 0);
-    assert_eq!(pending, Some(ContinuationCause::PendingInput));
 
     // A completion snapshot is frozen; use a fresh turn to exercise cancellation
     // after start rather than attempting to restart the already completed state.
     let (_clock, state) = timing();
     state.mark_turn_started();
+    // Cancellation drops the preparation guard before any generation takes the
+    // pending continuation cause.
+    let mut preparation = None;
+    state.begin_request_preparation(&mut preparation);
+    drop(preparation);
     let profile = state.complete_snapshot().legacy_profile;
     assert_eq!(profile.sampling_request_count, 0);
     assert_eq!(profile.pending_input, 0);
@@ -3117,16 +3072,23 @@ fn wait_and_tool_output_counters_are_additive() {
 fn optimization_activation_decision_counters_are_additive() {
     let (_clock, state) = timing();
 
+    // Distinct call counts show each recorder accumulates into its own counter.
     state.record_tool_router_reuse();
-    state.record_tool_router_rebuild();
-    state.record_projection_source_dependencies_reuse();
-    state.record_projection_source_dependencies_fallback();
+    for _ in 0..2 {
+        state.record_tool_router_rebuild();
+    }
+    for _ in 0..3 {
+        state.record_projection_source_dependencies_reuse();
+    }
+    for _ in 0..4 {
+        state.record_projection_source_dependencies_fallback();
+    }
 
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.tool_router_reuse_count, 1);
-    assert_eq!(counters.tool_router_rebuild_count, 1);
-    assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
-    assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
+    assert_eq!(counters.tool_router_rebuild_count, 2);
+    assert_eq!(counters.projection_source_dependencies_reuse_count, 3);
+    assert_eq!(counters.projection_source_dependencies_fallback_count, 4);
 }
 
 #[test]
@@ -3742,15 +3704,4 @@ fn overlapping_legacy_guards_do_not_invalidate_modern_model_tool_overlap() {
     assert!(profile.profile_valid);
     assert_eq!(profile.counters.invalid_transition_count, 0);
     assert_eq!(profile.exclusive.model_tool_overlap_ns, 10 * NS_PER_MS);
-}
-#[test]
-fn in_cell_recovery_does_not_attribute_a_model_generation() {
-    let (_clock, state) = timing();
-    state.record_tool_output_recovery_source(0, true);
-    let mut pending = Some(ContinuationCause::ToolResult);
-    state.begin_model_generation(&mut pending, &SessionSource::Cli);
-    let counters = state.complete_snapshot().protocol_timing().counters;
-    assert_eq!(counters.tool_output_recovery_call_count, 1);
-    assert_eq!(counters.tool_output_in_cell_recovery_call_count, 1);
-    assert_eq!(counters.attributable_recovery_generation_count, 0);
 }

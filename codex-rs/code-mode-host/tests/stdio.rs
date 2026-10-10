@@ -305,12 +305,26 @@ async fn first_wait_in_replacement_host_recovers_original_receipt() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(program.clone());
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider.create_session(delegate.clone()).await.unwrap();
-    let mut request = execute_request(r#"store("kept", 1); text("original host receipt");"#);
+    let mut request = ExecuteRequest {
+        enabled_tools: vec![ToolDefinition {
+            name: "echo".to_string(),
+            tool_name: ToolName::plain("echo"),
+            description: "".into(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            default_timeout_ms: None,
+            output_schema: None,
+        }].into(),
+        ..execute_request(
+            r#"await tools.echo({}); store("kept", 1); text("original host receipt");"#,
+        )
+    };
     request.state_path = Some(path.clone());
     request.yield_time_ms = Some(60_000);
     let started = session.execute(request).await.unwrap();
     let id = started.cell_id.clone();
     let original = started.initial_response().await.unwrap();
+    assert_eq!(delegate.invocations.lock().unwrap().len(), 1);
     session.shutdown().await.unwrap();
     drop(session);
     drop(provider);
@@ -320,7 +334,7 @@ async fn first_wait_in_replacement_host_recovers_original_receipt() {
         cell_id: id, yield_time_ms: 1,
         recovery: Some(codex_code_mode::ReceiptRecovery { path, terminal_only: false }),
     }).await.unwrap(), WaitOutcome::LiveCell(original));
-    assert!(delegate.invocations.lock().unwrap().is_empty());
+    assert_eq!(delegate.invocations.lock().unwrap().len(), 1);
     session.shutdown().await.unwrap();
 }
 

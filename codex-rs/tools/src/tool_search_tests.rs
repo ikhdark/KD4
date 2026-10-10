@@ -79,7 +79,17 @@ fn affordance_output_hints_are_bounded_shared_and_retrieval_only() {
     let mut text = String::new();
     append_output_search_text(&tool, &mut text);
     assert!(text.len() <= 2048);
+    assert!(text.contains("field_0063"));
     assert!(!text.contains("field_0064"));
+    // Long names exhaust the byte budget before the field-count limit applies.
+    let properties = (0..64).map(|i| (format!("{}_{i:04}", "k".repeat(100)), serde_json::json!({"type":"string"})))
+        .collect::<serde_json::Map<_, _>>();
+    let tool = ResponsesApiTool { output_schema: Some(serde_json::json!({"properties":properties}).into()), ..tool };
+    let mut text = String::new();
+    append_output_search_text(&tool, &mut text);
+    assert!(text.len() <= 2048);
+    assert!(text.contains("_0008"));
+    assert!(!text.contains("_0009"));
 }
 
 #[test]
@@ -238,8 +248,7 @@ fn schema_search_text_indexes_references_compositions_definitions_and_literals()
     for expected in [
         "#/$defs/requestEnvelope",
         "account_id",
-        "mode",
-        "advanced",
+        "mode advanced",
         "Extension value",
         "One-of branch",
         "All-of branch",

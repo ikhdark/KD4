@@ -3970,6 +3970,42 @@ class RepositoryManifestTest(unittest.TestCase):
                     self.assertNotIn(key, owners, f"duplicate gate test {key}")
                     owners[key] = gate.name
 
+    def test_exact_gate_ids_name_existing_tests(self) -> None:
+        # `check-gates` proves discovery but needs a build. Resolve each ID
+        # statically so a deleted or renamed test cannot leave a gate that can
+        # never report every required test passed.
+        workspace = REPO_ROOT / "codex-rs"
+        with (workspace / "Cargo.toml").open("rb") as source:
+            members = tomllib.load(source)["workspace"]["members"]
+        packages = {}
+        for member in members:
+            with (workspace / member / "Cargo.toml").open("rb") as source:
+                package = tomllib.load(source)
+            packages[package["package"]["name"]] = (workspace / member, package)
+        for gate in self.manifest.gates.values():
+            for step in gate.steps:
+                target = self.manifest.targets[step.target]
+                root, package = packages[target.package]
+                if target.selector_kind == "lib":
+                    binary = root / package.get("lib", {}).get("path", "src/lib.rs")
+                elif target.selector_kind == "test":
+                    binary = root / "tests" / f"{target.selector_value}.rs"
+                else:
+                    binary = root / next(
+                        entry["path"]
+                        for entry in package["bin"]
+                        if entry["name"] == target.selector_value
+                    )
+                for test in step.tests:
+                    module, _, name = test.rpartition("::")
+                    # A parameterized case ID ends in a case segment after its function.
+                    identity = module if name.startswith("_") else test
+                    with self.subTest(gate=gate.name, test=test):
+                        self.assertIsNotNone(
+                            rust_test_runner._rust_test_source(binary, identity, REPO_ROOT),
+                            "gate declares a test that does not exist",
+                        )
+
     def test_prevention_and_capability_gates_preserve_combined_coverage(self):
         preflight = "tools::handlers::command_preflight::command_preflight_tests::"
         headers = "tools::handlers::request_user_input::tests::"
@@ -4688,9 +4724,20 @@ class TestSpeedContractTest(RunnerTestCase):
         ]
         owners = {}
         for source in sources:
-            for module in re.findall(
-                r"\bmod (\w+);", source.read_text(encoding="utf-8")
-            ):
+            prefix = "" if source.name == "mod.rs" else "suite::v2"
+            resolved = rust_test_runner._rust_module_source(source, prefix, root)
+            self.assertIsNotNone(resolved, f"unresolved v2 scope in {source}")
+            scope_source, text = resolved
+            if text is None:
+                text = scope_source.read_text(encoding="utf-8")
+            for (kind, module), declarations in rust_test_runner._rust_scope_items(text).items():
+                if kind != "mod":
+                    continue
+                self.assertEqual(len(declarations), 1, f"ambiguous module {module}")
+                identity = f"{prefix}::{module}" if prefix else module
+                registered = rust_test_runner._rust_module_source(source, identity, root)
+                self.assertIsNotNone(registered, f"unresolved module {module}")
+                self.assertEqual(registered[0], (root / "suite" / "v2" / f"{module}.rs").resolve())
                 self.assertNotIn(module, owners, f"duplicate module {module}")
                 owners[module] = source
             if source.name != "mod.rs":
@@ -4700,9 +4747,18 @@ class TestSpeedContractTest(RunnerTestCase):
         nested = set()
         for module in owners:
             source = root / "suite" / "v2" / f"{module}.rs"
-            for filename in re.findall(
-                r'#\[path = "([^"/]+\.rs)"\]', source.read_text(encoding="utf-8")
-            ):
+            for (kind, name), declarations in rust_test_runner._rust_scope_items(
+                source.read_text(encoding="utf-8")
+            ).items():
+                if kind != "mod":
+                    continue
+                self.assertEqual(len(declarations), 1, f"ambiguous nested module {name}")
+                filename, body = declarations[0]
+                if filename is None or body is not None:
+                    continue
+                registered = rust_test_runner._rust_module_source(source, name, root)
+                self.assertIsNotNone(registered, f"unresolved nested module {name}")
+                self.assertEqual(registered[0], source.with_name(filename).resolve())
                 self.assertTrue(source.with_name(filename).is_file())
                 self.assertNotIn(Path(filename).stem, nested)
                 nested.add(Path(filename).stem)
@@ -4724,6 +4780,35 @@ class TestSpeedContractTest(RunnerTestCase):
                     self.assertEqual(
                         owners[dependency], owner, f"{module} depends on {dependency}"
                     )
+
+    def test_app_server_inventory_rejects_commented_out_registrations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "app-server" / "tests"
+            suite = root / "suite" / "v2"
+            suite.mkdir(parents=True)
+            registration = suite / "mod.rs"
+            leaf = suite / "leaf.rs"
+            leaf.write_text("", encoding="utf-8")
+            with mock.patch.object(rust_test_runner, "CODEX_RS_ROOT", workspace):
+                registration.write_text("mod leaf;\n", encoding="utf-8")
+                self.test_app_server_shards_own_each_v2_module_exactly_once()
+                for declaration in (
+                    "// mod leaf;\n",
+                    "/* mod leaf; */\n",
+                    'const TEXT: &str = "mod leaf;";\n',
+                ):
+                    with self.subTest(declaration=declaration):
+                        registration.write_text(declaration, encoding="utf-8")
+                        with self.assertRaises(AssertionError):
+                            self.test_app_server_shards_own_each_v2_module_exactly_once()
+                registration.write_text("mod leaf;\n", encoding="utf-8")
+                (suite / "child.rs").write_text("", encoding="utf-8")
+                leaf.write_text('#[path = "child.rs"] mod child;\n', encoding="utf-8")
+                self.test_app_server_shards_own_each_v2_module_exactly_once()
+                leaf.write_text('// #[path = "child.rs"] mod child;\n', encoding="utf-8")
+                with self.assertRaises(AssertionError):
+                    self.test_app_server_shards_own_each_v2_module_exactly_once()
 
     def test_slow_boundaries_remain_in_an_explicit_gate(self):
         manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)

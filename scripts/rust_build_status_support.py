@@ -570,13 +570,17 @@ def target_optimize_report(
 
 
 def warn_bytes_from_gib(warn_gib: float) -> int:
-    return int(warn_gib * BYTES_PER_GIB)
+    # Scale as integers: a valid finite GiB value can exceed float range
+    # after conversion to bytes. Preserve truncation toward zero.
+    numerator, denominator = warn_gib.as_integer_ratio()
+    byte_count = abs(numerator) * BYTES_PER_GIB // denominator
+    return -byte_count if numerator < 0 else byte_count
 
 
 def bytes_from_gib(gib: float | None) -> int | None:
     if gib is None:
         return None
-    return int(gib * BYTES_PER_GIB)
+    return warn_bytes_from_gib(gib)
 
 
 def max_lane_bytes_from_args(args: argparse.Namespace) -> int | None:

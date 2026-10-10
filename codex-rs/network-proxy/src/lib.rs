@@ -61,10 +61,7 @@ pub use proxy::NetworkProxyHandle;
 pub use proxy::PROXY_ACTIVE_ENV_KEY;
 pub use proxy::PROXY_ENV_KEYS;
 
-pub use proxy::PROXY_URL_ENV_KEYS;
 pub use proxy::PreparedManagedNetwork;
-pub use proxy::has_proxy_url_env_vars;
-pub use proxy::proxy_url_env_value;
 pub use runtime::BlockedRequest;
 pub use runtime::BlockedRequestArgs;
 pub use runtime::BlockedRequestObserver;

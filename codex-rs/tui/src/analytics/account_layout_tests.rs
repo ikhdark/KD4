@@ -165,6 +165,8 @@ async fn account_pending_and_error_do_not_start_reports() {
         FrameRequester::test_dummy(),
     );
     screen(&mut view, /*width*/ 80, /*height*/ 24);
+    // Without a connection every history stays unavailable, so check the start flag as well.
+    assert!(!view.reports_started);
     assert!(
         view.sections
             .0
@@ -176,6 +178,7 @@ async fn account_pending_and_error_do_not_start_reports() {
     tokio::task::yield_now().await;
     let error = screen(&mut view, /*width*/ 80, /*height*/ 24);
     assert!(error.contains("Sign in again"));
+    assert!(!view.reports_started);
     assert!(
         view.sections
             .0

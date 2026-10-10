@@ -197,10 +197,15 @@ mod tests {
             .append_items_ordered(std::slice::from_ref(&durable))
             .await
             .expect("append durable item");
+        // The immediately flushed append is a separate LiveThread branch from the ordered one.
+        live_thread
+            .append_items(std::slice::from_ref(&durable))
+            .await
+            .expect("append durable item with an immediate barrier");
 
         let calls = store.calls().await;
         assert_eq!(
-            calls.append_borrowed_item_batches, 1,
+            calls.append_borrowed_item_batches, 2,
             "durable appends must use the borrowed already-filtered store API"
         );
         assert_eq!(
@@ -212,6 +217,7 @@ mod tests {
             "no rollout item may be copied into an owned request batch"
         );
         assert_eq!(calls.append_items_ordered, 1);
+        assert_eq!(calls.append_items, 2);
     }
 
     #[tokio::test]

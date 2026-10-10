@@ -1616,10 +1616,10 @@ impl TestAppServer {
 
     fn message_request_id(message: &JSONRPCMessage) -> Option<&RequestId> {
         match message {
-            JSONRPCMessage::Request(request) => Some(&request.id),
             JSONRPCMessage::Response(response) => Some(&response.id),
             JSONRPCMessage::Error(err) => Some(&err.id),
-            JSONRPCMessage::Notification(_) => None,
+            // Peer-initiated requests have an independent ID namespace.
+            JSONRPCMessage::Request(_) | JSONRPCMessage::Notification(_) => None,
         }
     }
 }
@@ -1828,6 +1828,69 @@ impl Drop for TestAppServer {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn response_wait_preserves_server_requests_with_colliding_ids() -> anyhow::Result<()> {
+        for is_error in [false, true] {
+            let request = serde_json::json!({
+                "id": 7,
+                "method": "test/serverRequest",
+                "params": {"marker": "preserve"}
+            });
+            let reply = if is_error {
+                serde_json::json!({"id": 7, "error": {"code": -32000, "message": "expected error"}})
+            } else {
+                serde_json::json!({"id": 7, "result": {"marker": "response"}})
+            };
+            // Server requests and client requests have independent ID spaces.
+            // Exercise actual stdio dispatch, with the colliding request first.
+            #[cfg(unix)]
+            let (program, script) = (
+                Path::new("/bin/sh"),
+                format!("printf '%s\\n' '{request}' '{reply}'"),
+            );
+            #[cfg(windows)]
+            let (program, script) = (
+                Path::new("powershell.exe"),
+                format!("[Console]::WriteLine('{request}'); [Console]::WriteLine('{reply}')"),
+            );
+            #[cfg(unix)]
+            let args = ["-c", script.as_str()];
+            #[cfg(windows)]
+            let args = ["-NoProfile", "-NonInteractive", "-Command", script.as_str()];
+            let mut server = TestAppServer::builder()
+                .without_auto_env()
+                .with_plugin_startup_tasks()
+                .with_program(program)
+                .with_args(&args)
+                .build()
+                .await?;
+            if is_error {
+                let error = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    server.read_stream_until_error_message(RequestId::Integer(7)),
+                )
+                .await??;
+                assert_eq!(error.error.code, -32000);
+                assert_eq!(error.error.message, "expected error");
+            } else {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    server.read_stream_until_response_message(RequestId::Integer(7)),
+                )
+                .await??;
+                assert_eq!(response.result, serde_json::json!({"marker": "response"}));
+            }
+            assert_eq!(server.pending_messages.len(), 1);
+            let JSONRPCMessage::Request(preserved) = server.read_next_message().await? else {
+                anyhow::bail!("colliding server request must remain buffered");
+            };
+            assert_eq!(preserved.id, RequestId::Integer(7));
+            assert_eq!(preserved.method, "test/serverRequest");
+            assert_eq!(preserved.params, Some(serde_json::json!({"marker": "preserve"})));
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn interrupt_cleanup_requires_matching_thread_and_turn() -> anyhow::Result<()> {

@@ -593,7 +593,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let unrelated = r#"{"method":"tools/list"}"#;
+        // Contains `initialize` as a substring, so only an exact method match lets it through.
+        let unrelated = r#"{"method":"notifications/initialized"}"#;
         let response = client
             .post(format!("{base}/mcp"))
             .body(unrelated)

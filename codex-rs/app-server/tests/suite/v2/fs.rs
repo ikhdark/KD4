@@ -113,10 +113,20 @@ async fn fs_get_metadata_returns_file_size_and_timestamps() -> Result<()> {
             modified_at_ms: stat.modified_at_ms,
         }
     );
-    let modified = std::fs::metadata(&file_path)?.modified()?;
+    let metadata = std::fs::metadata(&file_path)?;
     assert_eq!(
         stat.modified_at_ms as u128,
-        modified.duration_since(std::time::UNIX_EPOCH)?.as_millis()
+        metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+    );
+    assert_eq!(
+        stat.created_at_ms as u128,
+        metadata
+            .created()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
     );
 
     Ok(())
@@ -137,10 +147,28 @@ async fn fs_methods_return_error_when_local_environment_is_disabled() -> Result<
 
     let read_id = mcp
         .send_fs_read_file_request(codex_app_server_protocol::FsReadFileParams {
-            path: absolute_path(absolute_file),
+            path: absolute_path(absolute_file.clone()),
         })
         .await?;
     expect_error_message(&mut mcp, read_id, "local filesystem is not configured").await?;
+
+    let write_id = mcp
+        .send_fs_write_file_request(FsWriteFileParams {
+            path: absolute_path(absolute_file),
+            data_base64: STANDARD.encode("data"),
+        })
+        .await?;
+    expect_error_message(&mut mcp, write_id, "local filesystem is not configured").await?;
+
+    // The watcher does not go through the environment's filesystem, so it is
+    // rejected by its own check.
+    let watch_id = mcp
+        .send_fs_watch_request(codex_app_server_protocol::FsWatchParams {
+            watch_id: "watch-disabled".to_string(),
+            path: absolute_path(codex_home.path().to_path_buf()),
+        })
+        .await?;
+    expect_error_message(&mut mcp, watch_id, "local filesystem is not configured").await?;
 
     Ok(())
 }

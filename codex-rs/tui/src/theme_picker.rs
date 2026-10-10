@@ -485,6 +485,7 @@ mod tests {
         assert_eq!(params.side_content_width, SideContentWidth::Half);
         assert_eq!(params.side_content_min_width, WIDE_PREVIEW_MIN_WIDTH);
         assert!(params.stacked_side_content.is_some());
+        assert!(params.is_searchable);
         assert!(!params.items.is_empty());
         assert!(
             params.items.iter().all(|item| item.search_value.as_deref() == Some(item.name.as_str())),
@@ -586,8 +587,11 @@ mod tests {
 
         let subtitle = theme_picker_subtitle(Some(&codex_home), Some(200));
 
-        assert!(subtitle.contains("~"));
-        assert!(subtitle.contains("directory"));
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            subtitle,
+            format!("Custom .tmTheme files can be added to the ~{sep}.codex{sep}themes directory.")
+        );
     }
 
     #[test]
@@ -606,6 +610,15 @@ mod tests {
         let subtitle =
             theme_picker_subtitle(/*codex_home*/ None, /*terminal_width*/ None);
         assert_eq!(subtitle, PREVIEW_FALLBACK_SUBTITLE);
+
+        // A codex home outside the home directory has no `~` form. The width is large
+        // enough that only the missing tilde can cause the fallback.
+        let home = dirs::home_dir().expect("home directory should be available");
+        let outside_home = home.with_file_name("codex-theme-picker-outside-home");
+        assert_eq!(
+            theme_picker_subtitle(Some(&outside_home), Some(1000)),
+            PREVIEW_FALLBACK_SUBTITLE
+        );
     }
 
     #[test]
@@ -616,6 +629,14 @@ mod tests {
         let subtitle = theme_picker_subtitle(Some(&codex_home), Some(94));
 
         assert_eq!(subtitle, PREVIEW_FALLBACK_SUBTITLE);
+
+        // One column narrower the side panel no longer fits, so the 68-column
+        // subtitle gets the full stacked content width.
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            theme_picker_subtitle(Some(&codex_home), Some(93)),
+            format!("Custom .tmTheme files can be added to the ~{sep}.codex{sep}themes directory.")
+        );
     }
 
     #[test]

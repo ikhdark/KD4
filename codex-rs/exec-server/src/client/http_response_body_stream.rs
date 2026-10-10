@@ -315,18 +315,6 @@ impl Inner {
             .remove(request_id)
     }
 
-    #[cfg(test)]
-    async fn record_http_body_stream_failure(&self, request_id: &str, message: String) {
-        let mut state = self.http_body_streams.lock().await;
-        // An abandonment may already have removed this route while delivery was in flight.
-        let Some(tx) = state.streams.remove(request_id) else {
-            return;
-        };
-        if !tx.is_closed() {
-            state.terminals.insert(request_id.to_string(), Err(message));
-        }
-    }
-
     /// Consumer abandonment clears both routing and any undelivered failure atomically.
     pub(super) async fn abandon_http_body_stream(&self, request_id: &str) {
         let active = {
@@ -486,49 +474,64 @@ mod tests {
     }
 
     #[test]
-    fn dropping_overflowed_stream_outside_runtime_clears_failure() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let inner = inner();
-        let stream = runtime.block_on(async {
-            let stream = register(&inner).await;
-            inner
-                .handle_http_body_delta_notification(delta(1, false, None))
-                .await
-                .expect("first delta");
-            inner
-                .handle_http_body_delta_notification(delta(2, false, None))
-                .await
-                .expect("overflow delta");
-            assert_eq!(
-                inner
-                    .http_body_streams
-                    .lock()
-                    .await
-                    .terminals
-                    .get("test")
-                    .and_then(|terminal| terminal.as_ref().err().map(String::as_str)),
-                Some("body delta channel filled before delivery")
-            );
-            stream
-        });
-        drop(stream);
-        runtime.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !inner.http_body_streams.lock().await.terminals.is_empty() {
-                    tokio::task::yield_now().await;
+    fn dropping_stream_outside_runtime_clears_queued_terminal() {
+        for overflow in [true, false] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let inner = inner();
+            let stream = runtime.block_on(async {
+                let stream = register(&inner).await;
+                if overflow {
+                    inner
+                        .handle_http_body_delta_notification(delta(1, false, None))
+                        .await
+                        .expect("first delta");
+                    inner
+                        .handle_http_body_delta_notification(delta(2, false, None))
+                        .await
+                        .expect("overflow delta");
+                } else {
+                    // EOF that the consumer never reads.
+                    inner
+                        .handle_http_body_delta_notification(delta(1, true, None))
+                        .await
+                        .expect("terminal delta");
                 }
-            })
-            .await
-            .expect("drop cleanup must run on owning runtime");
-            inner
-                .record_http_body_stream_failure("test", "late failure".into())
-                .await;
-            assert!(inner.http_body_streams.lock().await.terminals.is_empty());
-            assert!(inner.http_body_streams.lock().await.streams.is_empty());
-        });
+                assert_eq!(
+                    inner
+                        .http_body_streams
+                        .lock()
+                        .await
+                        .terminals
+                        .get("test")
+                        .map(|terminal| terminal.as_ref().err().map(String::as_str)),
+                    Some(overflow.then_some("body delta channel filled before delivery"))
+                );
+                stream
+            });
+            drop(stream);
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !inner.http_body_streams.lock().await.terminals.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("drop cleanup must run on owning runtime");
+                // Late delivery for the abandoned route must not record a terminal again.
+                inner
+                    .handle_http_body_delta_notification(delta(3, true, Some("late failure")))
+                    .await
+                    .expect("late delta");
+                inner
+                    .fail_all_http_body_streams("late failure".into())
+                    .await;
+                assert!(inner.http_body_streams.lock().await.terminals.is_empty());
+                assert!(inner.http_body_streams.lock().await.streams.is_empty());
+            });
+        }
     }
 
     #[tokio::test]

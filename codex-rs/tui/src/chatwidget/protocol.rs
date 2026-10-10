@@ -274,6 +274,7 @@ impl ChatWidget {
                     }
                 } else {
                     self.last_non_retry_error = None;
+                    self.flush_answer_stream_with_separator();
                     self.finalize_turn();
                     self.request_redraw();
                     self.maybe_send_next_queued_input();

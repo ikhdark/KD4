@@ -185,6 +185,22 @@ mod tests {
         assert!(install_downloaded_spritesheet(b"corrupt image", &destination).is_err());
         assert_eq!(fs::read(&destination).unwrap(), original);
 
+        // A decodable image with the wrong geometry must be rejected too.
+        let wrong_size = image::RgbaImage::new(1, 1);
+        let mut wrong_size_bytes = std::io::Cursor::new(Vec::new());
+        wrong_size
+            .write_to(&mut wrong_size_bytes, image::ImageFormat::WebP)
+            .unwrap();
+        let error =
+            install_downloaded_spritesheet(wrong_size_bytes.get_ref(), &destination).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid downloaded pet spritesheet dimensions"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), original);
+
         let replacement = image::RgbaImage::from_pixel(
             catalog::SPRITESHEET_WIDTH,
             catalog::SPRITESHEET_HEIGHT,

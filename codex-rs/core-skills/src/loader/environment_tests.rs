@@ -31,6 +31,10 @@ async fn reports_optional_metadata_failures_without_dropping_environment_skill()
             "dependencies:\n  tools:\n    - type: mcp\n",
             "dependencies.tools.value: value is missing",
         ),
+        (
+            "dependencies:\n  tools:\n    - value: missing-type\n",
+            "dependencies.tools.type: value is missing",
+        ),
     ] {
         fs::write(&metadata_path, content).unwrap();
         let outcome = load_environment_skills_from_root(LOCAL_FS.as_ref(), &root_uri, None).await;

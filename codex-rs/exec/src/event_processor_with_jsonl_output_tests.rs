@@ -43,6 +43,24 @@ fn progress_is_correlated_bounded_and_does_not_replace_the_terminal_item() {
     }
     assert_eq!(processor.completed_item_id("call"), id);
     assert!(processor.raw_to_exec_item_id.is_empty());
+    // Once the item is terminal, late progress has no started item to correlate with.
+    for late in [
+        ServerNotification::CommandExecutionOutputDelta(
+            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                thread_id: "thread".into(), turn_id: "turn".into(), item_id: "call".into(),
+                delta: "late".into(), stream: None, decoding_lossy: None,
+            },
+        ),
+        ServerNotification::McpToolCallProgress(
+            codex_app_server_protocol::McpToolCallProgressNotification {
+                thread_id: "thread".into(), turn_id: "turn".into(), item_id: "call".into(),
+                message: "late".into(), progress: None, total: None,
+            },
+        ),
+    ] {
+        assert!(processor.collect_thread_events(late).events.is_empty());
+    }
+    assert!(processor.raw_to_exec_item_id.is_empty());
 }
 
 #[test]
@@ -289,6 +307,11 @@ fn stdout_failure_is_returned_without_overwriting_last_message() {
     let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
     processor.output = Box::new(BrokenPipe);
     processor.process_server_notification(agent_completion("final", "new answer"));
+    // Only a completed turn arms the last-message write; the failed delivery must still win.
+    assert_eq!(
+        processor.process_server_notification(crate::tests::recovery_completion()),
+        CodexStatus::InitiateShutdown
+    );
     let error = processor
         .print_final_output()
         .expect_err("write error must propagate");
@@ -396,7 +419,15 @@ fn output_last_message_write_failure_is_returned() {
             },
         },
     ));
-    assert!(EventProcessor::print_final_output(&mut processor).is_err());
+    let error = EventProcessor::print_final_output(&mut processor)
+        .expect_err("a directory target cannot be written");
+    assert!(
+        error.to_string().starts_with(&format!(
+            "failed to write last message file {}: ",
+            tempdir.path().display()
+        )),
+        "{error}"
+    );
 }
 
 #[test]

@@ -1217,8 +1217,6 @@ async fn confirmed_performance_artifact_filesystem_operations_use_blocking_pool(
         ("attach", true),
         ("raw_create", false),
         ("raw_create", true),
-        ("raw_append", false),
-        ("raw_append", true),
         ("raw_replace", false),
         ("raw_replace", true),
         ("raw_stream", false),
@@ -1227,7 +1225,7 @@ async fn confirmed_performance_artifact_filesystem_operations_use_blocking_pool(
         let canonical = CanonicalToolResult::text("retained canonical output\n");
         let initial_output = match operation_kind {
             "attach" => Some(canonical.bytes.as_slice()),
-            "raw_append" | "raw_stream" => Some(b"retained ".as_slice()),
+            "raw_stream" => Some(b"retained ".as_slice()),
             "raw_replace" => Some(b"obsolete output\n".as_slice()),
             _ => None,
         };
@@ -1281,13 +1279,6 @@ async fn confirmed_performance_artifact_filesystem_operations_use_blocking_pool(
             }
             let artifact = match operation_kind {
                 "raw_create" => create_raw_output_artifact(&home, "thread", &canonical.bytes).await,
-                "raw_append" => {
-                    append_raw_output_artifact(
-                        existing.as_ref().expect("existing raw artifact"),
-                        b"canonical output\n",
-                    )
-                    .await
-                }
                 "raw_replace" => {
                     replace_raw_output_artifact(
                         existing.as_ref().expect("existing raw artifact"),
@@ -3344,23 +3335,38 @@ async fn every_indexed_mutation_publisher_rejects_a_stale_generation() {
     };
     let root = temp.path().join("tool-output");
 
-    for mutation in [
-        LogicalRetentionMutation::Create,
-        LogicalRetentionMutation::AppendReplace,
-        LogicalRetentionMutation::Protection,
-        LogicalRetentionMutation::ProtectionReconcile,
+    // The mutation label only feeds diagnostics after the stale check, so the
+    // cases are the publishers themselves.
+    for publisher in [
+        "known record",
+        "streaming size",
+        "streaming abandonment",
+        "observed path",
     ] {
         let stale = capture_retention_token(path.parent().expect("artifact directory"));
         assert_eq!(
             force_retention_reconciliation_for_test(&root).await,
             RetentionModeKind::Indexed
         );
-        let record = artifact_retention_record(path)
-            .await
-            .expect("artifact metadata")
-            .expect("artifact record");
-        publish_known_record(&stale, record, mutation);
-        assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Dirty);
+        match publisher {
+            "known record" => {
+                let record = artifact_retention_record(path)
+                    .await
+                    .expect("artifact metadata")
+                    .expect("artifact record");
+                publish_known_record(&stale, record, LogicalRetentionMutation::AppendReplace);
+            }
+            "streaming size" => {
+                publish_streaming_size(&stale, path, 0, std::time::SystemTime::UNIX_EPOCH, false);
+            }
+            "streaming abandonment" => publish_streaming_abandonment(&stale),
+            _ => publish_observed_path_blocking(&stale, path),
+        }
+        assert_eq!(
+            retention_mode_for_test(&root),
+            RetentionModeKind::Dirty,
+            "{publisher}"
+        );
         assert_eq!(
             force_retention_reconciliation_for_test(&root).await,
             RetentionModeKind::Indexed

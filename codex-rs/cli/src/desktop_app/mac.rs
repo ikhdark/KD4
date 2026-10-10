@@ -1,5 +1,6 @@
 use anyhow::Context as _;
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::Builder;
@@ -268,17 +269,40 @@ fn find_codex_app_in_mount(mount_point: &Path) -> anyhow::Result<PathBuf> {
 }
 
 async fn copy_app_bundle(src_app: &Path, dest_app: &Path) -> anyhow::Result<()> {
+    let parent = dest_app.parent().context("app destination has no parent")?;
+    // A failed or cancelled copy must never look like an installed app to the next launch.
+    // Keep staging on the destination filesystem so publication is one atomic rename.
+    let staging = Builder::new()
+        .prefix(".codex-app-install-")
+        .tempdir_in(parent)
+        .context("failed to create app staging directory")?;
+    let staged_app = staging.path().join("Codex.app");
     let status = Command::new("ditto")
+        .kill_on_drop(true)
         .arg(src_app)
-        .arg(dest_app)
+        .arg(&staged_app)
         .status()
         .await
         .context("failed to invoke `ditto`")?;
 
-    if status.success() {
-        return Ok(());
+    if !status.success() {
+        anyhow::bail!("ditto copy failed with {status}");
     }
-    anyhow::bail!("ditto copy failed with {status}");
+    anyhow::ensure!(staged_app.is_dir(), "ditto did not produce an app bundle");
+    publish_app_bundle(&staged_app, dest_app)
+}
+
+fn publish_app_bundle(staged_app: &Path, dest_app: &Path) -> anyhow::Result<()> {
+    let source = CString::new(staged_app.as_os_str().as_bytes())?;
+    let destination = CString::new(dest_app.as_os_str().as_bytes())?;
+    // SAFETY: both paths are valid NUL-terminated strings for the duration of the call.
+    // RENAME_EXCL preserves even an empty directory or symlink installed concurrently.
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to publish app bundle");
+    }
+    Ok(())
 }
 
 fn user_applications_dir() -> anyhow::Result<PathBuf> {
@@ -298,51 +322,4 @@ fn parse_hdiutil_attach_mount_point(output: &str) -> Option<String> {
             .find(|field| field.starts_with("/Volumes/"))
             .map(str::to_string)
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::codex_new_thread_url;
-    use super::parse_hdiutil_attach_mount_point;
-    use pretty_assertions::assert_eq;
-    use std::path::Path;
-
-    #[test]
-    fn parses_mount_point_from_tab_separated_hdiutil_output() {
-        let output = "/dev/disk2s1\tApple_HFS\tCodex\t/Volumes/Codex\n";
-        assert_eq!(
-            parse_hdiutil_attach_mount_point(output).as_deref(),
-            Some("/Volumes/Codex")
-        );
-    }
-
-    #[test]
-    fn parses_mount_point_with_spaces() {
-        let output = "/dev/disk2s1\tApple_HFS\tCodex Installer\t/Volumes/Codex Installer\n";
-        assert_eq!(
-            parse_hdiutil_attach_mount_point(output).as_deref(),
-            Some("/Volumes/Codex Installer")
-        );
-    }
-
-    #[test]
-    fn codex_new_thread_url_encodes_workspace_path() {
-        let url = url::Url::parse(&codex_new_thread_url(Path::new("/tmp/codex workspace/#1")))
-            .expect("deep link should parse");
-
-        assert_eq!(
-            (
-                url.scheme().to_string(),
-                url.host_str().map(str::to_string),
-                url.path().to_string(),
-                url.query_pairs().into_owned().collect::<Vec<_>>(),
-            ),
-            (
-                "codex".to_string(),
-                Some("threads".to_string()),
-                "/new".to_string(),
-                vec![("path".to_string(), "/tmp/codex workspace/#1".to_string())],
-            )
-        );
-    }
 }

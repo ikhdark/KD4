@@ -280,10 +280,13 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
     Ok(())
 }
 
-/// What this tests: dropping a body stream with a queued terminal frame removes
-/// the old route while the next stream gets a fresh generated id.
+/// What this tests: a terminal frame that arrives before the header response
+/// still yields the headers, and after that stream is dropped unread the next
+/// stream gets a fresh generated id. Removal of the queued terminal is not
+/// visible here; `dropping_stream_outside_runtime_clears_queued_terminal` covers it.
 #[tokio::test]
-async fn http_response_body_stream_drops_queued_terminal_before_next_generated_id() -> Result<()> {
+async fn http_response_body_stream_accepts_terminal_before_headers_then_next_generated_id()
+-> Result<()> {
     // Phase 1: send terminal EOF before the header response so the public body
     // stream starts with EOF already queued but unread.
     let server = spawn_scripted_exec_server(|mut peer| async move {

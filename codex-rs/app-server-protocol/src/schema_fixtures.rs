@@ -415,17 +415,24 @@ mod tests {
             std::fs::create_dir(dir.path().join(label))?;
             std::fs::write(dir.path().join(label).join("previous"), "keep me")?;
         }
-        let result = write_schema_fixtures_with_options(
+        let error = write_schema_fixtures_with_options(
             dir.path(),
             Some(&dir.path().join("missing-prettier")),
             SchemaFixtureOptions::default(),
+        )
+        .unwrap_err();
+        // The formatter runs after TypeScript generation, so output is staged when it fails.
+        assert!(
+            error.to_string().contains("Failed to invoke Prettier"),
+            "unexpected error: {error:#}"
         );
-        assert!(result.is_err());
         for label in ["typescript", "json"] {
             assert_eq!(
                 std::fs::read_to_string(dir.path().join(label).join("previous"))?,
                 "keep me"
             );
+            // Nothing may be published into an owned subtree after a failure.
+            assert_eq!(std::fs::read_dir(dir.path().join(label))?.count(), 1);
         }
         assert_eq!(std::fs::read_dir(dir.path())?.count(), 2);
         Ok(())

@@ -1466,6 +1466,35 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertFalse((self.root / "escape.txt").exists())
         self.assertEqual((self.root / "dest" / "payload.txt").read_bytes(), b"payload")
 
+    def test_nested_marker_named_payload_is_preserved_and_verified(self) -> None:
+        # Only the root .complete belongs to the cache. A nested filename is
+        # ordinary archived package data, not authority to skip its contents.
+        for mode in ("copy", "hardlink", "auto"):
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                root.mkdir()
+                source = root / "package.tar.gz"
+                with tarfile.open(source, "w:gz") as archive:
+                    member = tarfile.TarInfo("resources/.complete")
+                    member.size = len(b"payload")
+                    archive.addfile(member, io.BytesIO(b"payload"))
+                cached = archives.cached_codex_package_archive(source, "target", root / "cache")
+                stage.materialize_cached_tree(cached, root / "vendor", mode)
+                self.assertEqual((root / "vendor/resources/.complete").read_bytes(), b"payload")
+                self.assertFalse((root / "vendor/.complete").exists())
+                artifact = stage.WorkflowArtifact("target", source.stat().st_size, 1, "a" * 64)
+                workflow = root / "workflow"
+                (workflow / "resources").mkdir(parents=True)
+                (workflow / "resources/.complete").write_bytes(b"payload")
+                stage.write_complete_marker(workflow, artifact)
+                self.assertTrue(stage.artifact_is_complete(workflow, artifact))
+                (workflow / "resources/.complete").write_bytes(b"changed")
+                self.assertFalse(stage.artifact_is_complete(workflow, artifact))
+                (cached / "resources/.complete").write_bytes(b"changed")
+                self.assertFalse(archives.extracted_cache_is_complete(
+                    cached, cached / ".complete", archives.file_sha256(source)
+                ))
+
     def test_cached_tree_materialization_skips_marker(self) -> None:
         cached_dir = self.root / "cached"
         nested_dir = cached_dir / "nested"

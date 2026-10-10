@@ -964,5 +964,26 @@ mod tests {
             .expect("support check should succeed");
 
         assert!(supported);
+
+        // A server that publishes no OAuth metadata must be reported as
+        // unsupported rather than as an error or a blanket `true`.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let app: Router = Router::new();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+        let plain_server = TestServer {
+            url: format!("http://{address}/mcp"),
+            handle,
+        };
+
+        let supported = supports_oauth_login(&plain_server.url)
+            .await
+            .expect("support check should succeed");
+
+        assert!(!supported);
     }
 }

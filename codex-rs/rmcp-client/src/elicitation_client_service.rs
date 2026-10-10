@@ -240,6 +240,36 @@ mod tests {
                 "persist": ["session", "always"],
             })))))
         );
+
+        // A context that carried only the progress token leaves the request untouched.
+        assert_eq!(
+            restore_context_meta(
+                Elicitation::Mcp(form_request(/*meta*/ None)),
+                meta(json!({ "progressToken": "progress-token" })),
+            ),
+            Elicitation::Mcp(form_request(/*meta*/ None))
+        );
+
+        // RMCP lifts `_meta` out of custom request params too, so `openai/form`
+        // metadata only reaches the elicitation through this restore.
+        assert_eq!(
+            restore_context_meta(
+                Elicitation::OpenAiForm {
+                    meta: None,
+                    message: "Select a template".to_string(),
+                    requested_schema: json!({ "type": "object" }),
+                },
+                meta(json!({
+                    "progressToken": "progress-token",
+                    "persist": ["session", "always"],
+                })),
+            ),
+            Elicitation::OpenAiForm {
+                meta: Some(json!({ "persist": ["session", "always"] })),
+                message: "Select a template".to_string(),
+                requested_schema: json!({ "type": "object" }),
+            }
+        );
     }
 
     #[test]

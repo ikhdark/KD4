@@ -22,17 +22,22 @@ fn turn_interrupt_requires_matching_live_target_or_running_startup_race() {
 
 #[test]
 fn turn_start_rejects_an_active_turn_and_directs_the_client_to_steer() {
-    let error = validate_turn_start_target(Some("turn-active"), /*is_running*/ true)
-        .expect_err("turn/start must not submit input to an active turn");
+    // A projected active turn is enough on its own, whatever core reports.
+    for is_running in [true, false] {
+        let error = validate_turn_start_target(Some("turn-active"), is_running)
+            .expect_err("turn/start must not submit input to an active turn");
 
-    assert!(error.message.contains("turn/steer"));
-    assert_eq!(
-        error.data,
-        Some(serde_json::json!({
-            "reason": "activeTurnInProgress",
-            "turnId": "turn-active",
-        }))
-    );
+        assert!(error.message.contains("turn/steer"));
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "reason": "activeTurnInProgress",
+                "turnId": "turn-active",
+            }))
+        );
+    }
+    validate_turn_start_target(None, /*is_running*/ false)
+        .expect("an idle thread accepts turn/start");
 
     let error = validate_turn_start_target(None, /*is_running*/ true)
         .expect_err("turn/start must reject the core-running projection race");

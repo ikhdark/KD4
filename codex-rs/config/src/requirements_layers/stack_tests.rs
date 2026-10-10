@@ -1235,6 +1235,15 @@ deny_read = [{path:?}]
 "#
         ))
     );
+
+    // Stripping an empty deny_read must also prune its now-empty parent tables.
+    let composed = compose(vec![layer(
+        "req_empty",
+        "Empty",
+        "[permissions.filesystem]\ndeny_read = []",
+    )])
+    .expect("compose requirements");
+    assert_eq!(composed, None);
 }
 
 #[test]

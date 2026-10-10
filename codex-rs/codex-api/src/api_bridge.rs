@@ -75,7 +75,14 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     } else {
                         CodexErr::InvalidRequest(body_text)
                     }
-                } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+                } else if status == http::StatusCode::INTERNAL_SERVER_ERROR
+                    // Upgrade rejections retain their normalized ws(s) URL. Keep them
+                    // transport-class so exhausted WebSocket retries can fall back to HTTP;
+                    // HTTP responses and established-stream errors remain provider-class.
+                    && !url.as_deref().is_some_and(|url| {
+                        url.starts_with("ws://") || url.starts_with("wss://")
+                    })
+                {
                     CodexErr::InternalServerError { retry_after }
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
                     if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {

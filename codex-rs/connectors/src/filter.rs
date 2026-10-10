@@ -98,13 +98,17 @@ mod tests {
                 named_app("connector_68df038e0ba48191908c8434991bbac2", "Gmail"),
                 named_app("connector_other", "Other"),
             ],
-            &[AppInfo {
-                is_accessible: true,
-                ..named_app(
-                    "connector_2128aebfecb84f64a069897515042a44",
-                    "Google Calendar",
-                )
-            }],
+            &[
+                AppInfo {
+                    is_accessible: true,
+                    ..named_app(
+                        "connector_2128aebfecb84f64a069897515042a44",
+                        "Google Calendar",
+                    )
+                },
+                // Listed but not accessible, so it still counts as uninstalled.
+                named_app("connector_68df038e0ba48191908c8434991bbac2", "Gmail"),
+            ],
             &HashSet::from([
                 "connector_2128aebfecb84f64a069897515042a44".to_string(),
                 "connector_68df038e0ba48191908c8434991bbac2".to_string(),

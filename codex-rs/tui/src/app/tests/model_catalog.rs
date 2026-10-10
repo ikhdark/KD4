@@ -65,8 +65,9 @@ fn model_migration_prompt_supports_configured_upgrades_and_rejects_self_target()
     assert!(should_show_model_migration_prompt(
         "gpt-5.4", "gpt-5.5", &seen, &presets
     ));
+    // Other presets upgrade to gpt-5.5, so only the self-target guard rejects this pair.
     assert!(!should_show_model_migration_prompt(
-        "gpt-5.4", "gpt-5.4", &seen, &presets
+        "gpt-5.5", "gpt-5.5", &seen, &presets
     ));
 }
 
@@ -320,16 +321,18 @@ fn model_migration_prompt_respects_seen_mapping_and_self_target() {
         &seen,
         &all_model_presets()
     ));
-    seen.insert("gpt-5.2".to_string(), "gpt-5.4".to_string());
-    assert!(!should_show_model_migration_prompt(
-        "gpt-5.2",
-        "gpt-5.4",
+    // The acknowledgement is keyed by the source model: another model with the same target
+    // still prompts.
+    assert!(should_show_model_migration_prompt(
+        "gpt-5.6-luna",
+        "gpt-6-luna",
         &seen,
         &all_model_presets()
     ));
+    // Catalog presets upgrade to gpt-6-sol, so only the self-target guard rejects this pair.
     assert!(!should_show_model_migration_prompt(
-        "gpt-5.4",
-        "gpt-5.4",
+        "gpt-6-sol",
+        "gpt-6-sol",
         &seen,
         &all_model_presets()
     ));
@@ -400,20 +403,27 @@ fn model_migration_prompt_skips_when_target_missing_or_hidden() {
 
     assert!(target_preset_for_upgrade(&available, "missing-target").is_none());
 
-    let mut with_hidden_target = all_model_presets();
+    // gpt-5.2 upgrades to gpt-5.5 here, so only the hidden target suppresses the prompt.
+    let mut with_hidden_target = model_presets_with_test_upgrades();
+    assert!(should_show_model_migration_prompt(
+        "gpt-5.2",
+        "gpt-5.5",
+        &BTreeMap::new(),
+        &with_hidden_target,
+    ));
     let target = with_hidden_target
         .iter_mut()
-        .find(|preset| preset.model == "gpt-5.4")
+        .find(|preset| preset.model == "gpt-5.5")
         .expect("target preset present");
     target.show_in_picker = false;
 
     assert!(!should_show_model_migration_prompt(
         "gpt-5.2",
-        "gpt-5.4",
+        "gpt-5.5",
         &BTreeMap::new(),
         &with_hidden_target,
     ));
-    assert!(target_preset_for_upgrade(&with_hidden_target, "gpt-5.4").is_none());
+    assert!(target_preset_for_upgrade(&with_hidden_target, "gpt-5.5").is_none());
 }
 
 #[tokio::test]

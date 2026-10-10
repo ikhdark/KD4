@@ -102,16 +102,8 @@ fn bundled_local_policy_models_match_prompt_policy_registration() {
         .iter()
         .map(|model| model.slug.as_str())
         .filter(|slug| {
-            matches!(
-                *slug,
-                "gpt-6-astra"
-                    | "gpt-6-sol"
-                    | "gpt-6-luna"
-                    | "gpt-5.5"
-                    | "gpt-5.4"
-                    | "gpt-5.4-mini"
-                    | "gpt-5.2"
-            ) || slug.starts_with("gpt-5.6-")
+            crate::prompt_resolver::resolve_prompt(slug, None).source
+                == crate::prompt_resolver::PromptSource::LocalModelPolicy
         })
         .collect::<BTreeSet<_>>();
     let registered_slugs = BUNDLED_LOCAL_POLICY_SLUGS

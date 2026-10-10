@@ -1191,6 +1191,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn highlight_guardrails_accept_exact_limits() {
+        // The documented limits reject inputs that exceed the budget, not
+        // inputs exactly at it. Keep the other two dimensions below their caps.
+        let cases = [
+            ("bytes", format!("{}\n", "x".repeat(4095)).repeat(128)),
+            ("lines", "x\n".repeat(10_000)),
+            ("line bytes", "x".repeat(4096)),
+        ];
+        for (dimension, code) in cases {
+            let spans = highlight_code_to_styled_spans(&code, "rust")
+                .unwrap_or_else(|| panic!("exact {dimension} limit must remain highlightable"));
+            let lines: Vec<Line<'static>> = spans.into_iter().map(Line::from).collect();
+            assert_eq!(reconstructed(&lines), code.trim_end_matches('\n'));
+        }
+    }
+
 
 
 
@@ -1250,13 +1267,29 @@ mod tests {
             );
         }
         // Patched aliases that two-face cannot resolve on its own.
-        for alias in [
-            "csharp", "c-sharp", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX", "golang", "python3",
-            "shell",
+        for (alias, language) in [
+            ("csharp", "c#"),
+            ("c-sharp", "c#"),
+            ("cppm", "cpp"),
+            ("CPPM", "cpp"),
+            ("cxxm", "cpp"),
+            ("CxXm", "cpp"),
+            ("ixx", "cpp"),
+            ("IXX", "cpp"),
+            ("golang", "go"),
+            ("python3", "python"),
+            ("shell", "bash"),
         ] {
             assert!(
                 find_syntax(alias).is_some(),
                 "find_syntax({alias:?}) returned None — patched alias broken"
+            );
+            let alias_syntax = find_syntax(alias).expect("alias should resolve");
+            let language_syntax = find_syntax(language).expect("language should resolve");
+            assert_eq!(
+                (&alias_syntax.name, alias_syntax.scope),
+                (&language_syntax.name, language_syntax.scope),
+                "alias {alias:?} must resolve to the {language:?} grammar",
             );
         }
     }
@@ -1501,7 +1534,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let themes_dir = dir.path().join("themes");
         std::fs::create_dir(&themes_dir).unwrap();
-        write_minimal_tmtheme(&themes_dir.join("zzz-custom.tmTheme"));
+        // An uppercase name that byte ordering would place before every
+        // lowercase name, so a case-sensitive sort fails the literal below.
+        write_minimal_tmtheme(&themes_dir.join("Zzz-custom.tmTheme"));
         write_minimal_tmtheme(&themes_dir.join("Aaa-custom.tmTheme"));
         write_minimal_tmtheme(&themes_dir.join("mmm-custom.tmTheme"));
 
@@ -1512,7 +1547,7 @@ mod tests {
             .collect();
 
         let custom: Vec<_> = entries.iter().filter(|entry| entry.is_custom).map(|entry| entry.name.as_str()).collect();
-        assert_eq!(custom, vec!["Aaa-custom", "mmm-custom", "zzz-custom"]);
+        assert_eq!(custom, vec!["Aaa-custom", "mmm-custom", "Zzz-custom"]);
         assert_eq!(entries.iter().filter(|entry| !entry.is_custom).count(), BUILTIN_THEME_NAMES.len());
         let mut expected = actual.clone();
         expected.sort_by_cached_key(|entry| (entry.1.to_ascii_lowercase(), entry.1.clone()));

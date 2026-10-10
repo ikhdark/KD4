@@ -32,12 +32,14 @@ mod tests {
     #[test]
     fn converts_nested_override_values() {
         assert_eq!(
-            json_to_toml(json!({"outer": [true, 1, null]})),
+            json_to_toml(json!({"outer": [true, 1, 1.5, "text", null]})),
             TomlValue::Table(toml::Table::from_iter([(
                 "outer".to_string(),
                 TomlValue::Array(vec![
                     TomlValue::Boolean(true),
                     TomlValue::Integer(1),
+                    TomlValue::Float(1.5),
+                    TomlValue::String("text".to_string()),
                     TomlValue::String(String::new()),
                 ]),
             )]))

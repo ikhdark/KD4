@@ -183,12 +183,34 @@ fn matcher_identity_rejects_unknown_fields() {
     for contents in [
         r#"
 [identity]
+command = { executable = "company-cli", args = [] }
+"#,
+        r#"
+[identity]
+url = { match = "prefix", value = "https://mcp.example.com/" }
+"#,
+    ] {
+        toml::from_str::<McpServerRequirement>(contents)
+            .expect("matcher identities without unknown fields are the accepted control");
+    }
+    for contents in [
+        r#"
+[identity]
 unknown = "value"
 command = { executable = "company-cli", args = [] }
 "#,
         r#"
 [identity]
 command = { executable = "company-cli", args = [], unknown = "value" }
+"#,
+        r#"
+[identity]
+unknown = "value"
+url = { match = "prefix", value = "https://mcp.example.com/" }
+"#,
+        r#"
+[identity]
+url = { match = "prefix", value = "https://mcp.example.com/", unknown = "value" }
 "#,
     ] {
         toml::from_str::<McpServerRequirement>(contents)
@@ -223,6 +245,11 @@ fn mixed_transport_identities_are_never_silently_accepted() {
             "'https://example.com/mcp'",
             "{ match = 'prefix', value = 'https://' }",
         ] {
+            // Each identity is accepted alone, so only the mix can cause the rejection.
+            for single in [format!("command = {command}"), format!("url = {url}")] {
+                toml::from_str::<McpServerRequirement>(&format!("[identity]\n{single}"))
+                    .expect("a single transport identity is the accepted control");
+            }
             let input = format!("[identity]\ncommand = {command}\nurl = {url}");
             assert!(
                 toml::from_str::<McpServerRequirement>(&input).is_err(),

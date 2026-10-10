@@ -80,7 +80,12 @@ impl CliProgressReporter {
                 let (sum_total, sum_completed) = self
                     .totals_by_digest
                     .values()
-                    .fold((0u64, 0u64), |acc, (t, c)| (acc.0 + *t, acc.1 + *c));
+                    .try_fold((0u64, 0u64), |acc, (t, c)| {
+                        Some((acc.0.checked_add(*t)?, acc.1.checked_add(*c)?))
+                    })
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "model pull progress exceeds u64")
+                    })?;
                 if sum_total > 0 {
                     if !self.printed_header {
                         let gb = (sum_total as f64) / (1024.0 * 1024.0 * 1024.0);
@@ -122,6 +127,35 @@ impl CliProgressReporter {
                 out.write_all(b"\n")?;
                 out.flush()
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_totals_do_not_panic_when_layer_counts_overflow() {
+        for (total, completed) in [(u64::MAX, 0), (1, u64::MAX)] {
+            let mut reporter = CliProgressReporter::new();
+            reporter
+                .on_event(&PullEvent::ChunkProgress {
+                    digest: "first".to_string(),
+                    total: Some(total),
+                    completed: Some(completed),
+                })
+                .expect("one layer's counts fit the progress representation");
+            // The peer controls these counts. An unrepresentable aggregate is rejected as
+            // invalid data; it must neither crash the CLI nor wrap into a bogus total.
+            let error = reporter
+                .on_event(&PullEvent::ChunkProgress {
+                    digest: "second".to_string(),
+                    total: Some(1),
+                    completed: Some(1),
+                })
+                .expect_err("an aggregate beyond u64 must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
     }
 }

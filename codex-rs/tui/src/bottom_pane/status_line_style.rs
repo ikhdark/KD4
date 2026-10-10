@@ -270,7 +270,10 @@ mod tests {
     #[test]
     fn pull_request_number_uses_link_style() {
         let line = status_line_from_segments_with_resolver(
-            [(StatusLineItem::PullRequestNumber, "PR #20252".to_string())],
+            [
+                (StatusLineItem::PullRequestNumber, "PR #20252".to_string()),
+                (StatusLineItem::GitBranch, "main".to_string()),
+            ],
             /*use_theme_colors*/ false,
             |_| None,
         )
@@ -280,6 +283,12 @@ mod tests {
         assert!(line.spans[0].style.add_modifier.contains(Modifier::DIM));
         assert!(
             line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert!(
+            !line.spans[2]
                 .style
                 .add_modifier
                 .contains(Modifier::UNDERLINED)

@@ -70,7 +70,11 @@ async fn submit_text_turn(
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let event = wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = event else {
+        unreachable!("predicate only accepts terminal completion");
+    };
+    assert_eq!(completed.error, None);
     Ok(())
 }
 
@@ -102,7 +106,9 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
     assert_eq!(permissions.len(), 1);
     assert!(permissions[0].contains("catalog user approval instructions"));
     assert!(permissions[0].contains("Filesystem sandboxing defines"));
-    assert!(!permissions[0].contains("How to request escalation"));
+    // Headings of the built-in on-request texts the catalog message replaces.
+    assert!(!permissions[0].contains("## Requesting escalation"));
+    assert!(!permissions[0].contains("# Permission Requests"));
     Ok(())
 }
 
@@ -225,7 +231,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     assert_eq!(permissions_1.len(), 1);
     assert_eq!(permissions_2.len(), 1);
     assert_ne!(permissions_2[0], permissions_1[0]);
-    assert!(permissions_2[0].contains("never"));
+    assert!(permissions_2[0].contains("Approval policy is `never`."));
 
     Ok(())
 }
@@ -450,7 +456,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
 
     let permissions = permissions_texts(&req3.single_request());
     assert_eq!(permissions.len(), 1);
-    assert!(permissions[0].contains("never"));
+    assert!(permissions[0].contains("Approval policy is `never`."));
 
     Ok(())
 }
@@ -533,7 +539,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
 
     let permissions_base = permissions_texts(&req2.single_request());
     assert_eq!(permissions_base.len(), 1);
-    assert!(permissions_base[0].contains("never"));
+    assert!(permissions_base[0].contains("Approval policy is `never`."));
     initial.codex.flush_rollout().await?;
 
     builder = builder.with_config(|config| {

@@ -1017,19 +1017,24 @@ async fn pairing_reenrollment(retry_not_found: bool) {
             .server_id,
         "srv_e_refreshed"
     );
+    let persisted = state_db
+        .get_remote_control_enrollment(
+            &remote_control_target.websocket_url,
+            "account_id",
+            /*app_server_client_name*/ None,
+        )
+        .await
+        .expect("refreshed enrollment should load")
+        .expect("refreshed enrollment should exist");
+    // The stale row already carried the preference; only the ids prove the replacement was saved.
     assert_eq!(
-        state_db
-            .get_remote_control_enrollment(
-                &remote_control_target.websocket_url,
-                "account_id",
-                /*app_server_client_name*/ None,
-            )
-            .await
-            .expect("refreshed enrollment should load")
-            .expect("refreshed enrollment should exist")
-            .remote_control_enabled,
-        Some(true)
+        (
+            persisted.server_id.as_str(),
+            persisted.environment_id.as_str()
+        ),
+        ("srv_e_refreshed", "env_refreshed")
     );
+    assert_eq!(persisted.remote_control_enabled, Some(true));
 }
 
 #[tokio::test]
@@ -1119,6 +1124,11 @@ async fn invalid_pairing_status_does_not_load_or_enroll() {
         .await
         .expect_err("missing code should fail before enrollment");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    // The missing enrollment is rejected with the same kind, so pin the validation message.
+    assert_eq!(
+        err.to_string(),
+        "remote control pairing status requires pairingCode or manualPairingCode"
+    );
     assert!(handle.current_enrollment.snapshot().is_none());
     timeout(Duration::from_millis(100), listener.accept())
         .await

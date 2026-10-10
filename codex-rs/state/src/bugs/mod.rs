@@ -5,11 +5,12 @@
 use crate::BUGS_DB_FILENAME;
 use crate::migrations::migrate_tolerating_concurrent_initializers;
 use crate::migrations::runtime_bugs_migrator;
+use crate::migrations::runtime_migrator_for_pool;
+use crate::runtime::connect_sqlite_pool_with_retry;
 use anyhow::Context;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::sqlite::SqlitePoolOptions;
 use std::path::Path;
 use std::time::Duration;
 
@@ -92,13 +93,11 @@ impl BugStore {
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(5))
             .disable_statement_logging();
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(options)
-            .await?;
+        let pool = connect_sqlite_pool_with_retry(options, 4, std::time::Instant::now()).await?;
         let pool_ref = &pool;
         migrate_tolerating_concurrent_initializers(pool_ref, move || async move {
-            runtime_bugs_migrator()
+            runtime_migrator_for_pool(pool_ref, &runtime_bugs_migrator())
+                .await?
                 .run(pool_ref)
                 .await
                 .map_err(anyhow::Error::from)

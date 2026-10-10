@@ -441,6 +441,19 @@ mod tests {
         let base = manifest(&["a", "b"]);
         let target = manifest(&["a", "c"]);
         let (added, removed) = compute_delta(&base, &target).unwrap();
+        // Control: the uncorrupted delta applies, so every rejection below is
+        // caused by its corruption.
+        let mut control = ToolManifestDictionary::default();
+        control.encode("base".into(), base.clone()).unwrap();
+        control
+            .apply(&ToolManifestItem::delta(
+                "target".into(),
+                "base".into(),
+                added.clone(),
+                removed.clone(),
+            ))
+            .unwrap();
+        assert_eq!(control.manifest("target"), Some(&target));
         for corruption in 0..7 {
             let mut added = added.clone();
             let mut removed = removed.clone();
@@ -507,6 +520,11 @@ mod tests {
         writer
             .encode("known".to_string(), original.clone())
             .expect("valid manifest");
+        // Move the current definition away so the reference has to select it again.
+        writer
+            .encode("other".to_string(), manifest(&["write"]))
+            .expect("valid manifest");
+        assert_eq!(writer.current_hash(), Some("other"));
 
         let reference = writer
             .encode_item(&ToolManifestItem::reference("known".to_string()))

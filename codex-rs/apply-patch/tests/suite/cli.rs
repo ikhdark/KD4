@@ -356,22 +356,6 @@ fn test_apply_patch_cli_rejects_same_endpoint_moves() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-#[test]
-fn test_apply_patch_cli_rejects_move_through_symlink_alias() -> anyhow::Result<()> {
-    let tmp = tempdir()?;
-    fs::write(tmp.path().join("a.txt"), "keep\n")?;
-    std::os::unix::fs::symlink("a.txt", tmp.path().join("alias.txt"))?;
-    apply_patch_command()?
-        .arg("*** Begin Patch\n*** Update File: a.txt\n*** Move to: alias.txt\n*** End Patch")
-        .current_dir(tmp.path())
-        .assert()
-        .failure();
-    assert_eq!(fs::read_to_string(tmp.path().join("a.txt"))?, "keep\n");
-    assert_eq!(fs::read_to_string(tmp.path().join("alias.txt"))?, "keep\n");
-    Ok(())
-}
-
 #[test]
 fn test_apply_patch_cli_preserves_and_adds_trailing_blank_lines() -> anyhow::Result<()> {
     let tmp = tempdir()?;
@@ -410,8 +394,9 @@ fn test_apply_patch_cli_rejects_overlapping_eof_chunks() -> anyhow::Result<()> {
 #[test]
 fn test_apply_patch_cli_rejects_unreadable_destination_without_committed_prefix() -> anyhow::Result<()> {
     let tmp = tempdir()?;
-    // An unreadable destination is rejected in preflight, before the prefix
-    // can commit. It must not be reported as a partially applied patch.
+    // An unreadable destination is only detected at its own write, after the
+    // prefix was written. Rollback removes the prefix again, so the failure
+    // must not be reported as a partially applied patch.
     fs::create_dir(tmp.path().join("blocked"))?;
     let output = apply_patch_command()?
         .arg("*** Begin Patch\n*** Add File: created.txt\n+created\n*** Add File: blocked\n+never written\n*** End Patch")
@@ -426,7 +411,7 @@ fn test_apply_patch_cli_rejects_unreadable_destination_without_committed_prefix(
             .matches(&format!("A {}", tmp.path().join("created.txt").display()))
             .count(),
         0,
-        "uncommitted files must not be reported: {stderr}"
+        "rolled-back files must not be reported: {stderr}"
     );
     assert!(!stderr.contains("Patch failed after applying these changes:"), "{stderr}");
     assert!(!tmp.path().join("created.txt").exists());

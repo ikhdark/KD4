@@ -43,3 +43,47 @@ impl ToolExecutor<ToolInvocation> for NewContextWindowHandler {
 }
 
 impl CoreToolRuntime for NewContextWindowHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ResponseInputItem;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn handler_requests_a_new_window_before_acknowledging() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        assert!(!session.new_context_window_requested().await);
+        let payload = ToolPayload::Function {
+            arguments: "{}".into(),
+        };
+        let output = NewContextWindowHandler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(Arc::new(turn)),
+                cancellation_token: Default::default(),
+                tracker: Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "new-window".into(),
+                tool_name: ToolName::plain(NEW_CONTEXT_WINDOW_TOOL_NAME),
+                source: crate::tools::router::ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .expect("new context request succeeds");
+        assert!(session.new_context_window_requested().await);
+        let ResponseInputItem::FunctionCallOutput { call_id, output } =
+            output.to_response_item("new-window", &payload)
+        else {
+            panic!("expected function output");
+        };
+        assert_eq!(call_id, "new-window");
+        assert_eq!(output.success, Some(true));
+        assert_eq!(
+            output.body.to_text().as_deref(),
+            Some("A new context window will start without summarizing conversation history.")
+        );
+    }
+}

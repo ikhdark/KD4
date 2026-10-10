@@ -73,6 +73,11 @@ def test_private_goal_operation_coalesces_runtime_continuations(tmp_path) -> Non
             requests = harness.responses.wait_for_requests(3)
 
     lifecycle = [event.method for event in events if event.method.startswith("turn/")]
+    # These fixture events necessarily carry routing IDs; filtering out None
+    # below must not turn missing lifecycle/item routing metadata into success.
+    for event in events:
+        if event.method in {"turn/started", "turn/completed", "item/completed"}:
+            assert notification_turn_id(event.payload) == turn_id
     routed_ids = [
         routed_id
         for event in events

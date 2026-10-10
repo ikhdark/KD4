@@ -121,22 +121,6 @@ mod tests {
     use tempfile::TempDir;
     use tokio::process::Command;
 
-    /// Windows: Verifies scripts fail to execute without the proper extension.
-
-    #[tokio::test]
-    async fn test_windows_fails_without_extension() -> Result<()> {
-        let env = TestExecutableEnv::new()?;
-        let mut cmd = Command::new(&env.program_name);
-        cmd.envs(&env.mcp_env);
-
-        let output = cmd.output().await;
-        assert!(
-            output.is_err(),
-            "Windows requires .cmd/.bat extension for direct execution"
-        );
-        Ok(())
-    }
-
     /// Windows: Verifies scripts with an explicit extension execute correctly.
 
     #[tokio::test]

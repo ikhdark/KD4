@@ -49,6 +49,7 @@ pub use crate::auth::storage::AuthDotJson;
 pub use crate::auth::storage::AuthKeyringBackendKind;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
+use crate::auth::storage::with_ephemeral_auth_entry;
 use crate::auth::util::try_parse_error_message;
 use crate::default_client::create_client;
 use crate::default_client::create_default_auth_client;
@@ -237,6 +238,12 @@ pub type ExternalAuthFuture<'a, T> = Pin<Box<dyn Future<Output = std::io::Result
 enum ExternalAuthSource {
     Configured(Arc<dyn ExternalAuth>),
     Runtime(Arc<dyn ExternalAuth>),
+}
+
+#[derive(Default)]
+struct ExternalAuthState {
+    source: Option<ExternalAuthSource>,
+    generation: Arc<()>,
 }
 
 impl ExternalAuthSource {
@@ -1983,7 +1990,7 @@ pub struct AuthManager {
     refresh_lock: Semaphore,
     agent_identity_lock: Semaphore,
     agent_identity_bootstrap_cooldown: Mutex<AgentIdentityBootstrapCooldown>,
-    external_auth: RwLock<Option<ExternalAuthSource>>,
+    external_auth: RwLock<ExternalAuthState>,
     auth_route_config: AuthRouteConfig,
 }
 
@@ -2114,7 +2121,7 @@ impl AuthManager {
             refresh_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(None),
+            external_auth: RwLock::new(ExternalAuthState::default()),
             auth_route_config,
         }
     }
@@ -2142,7 +2149,7 @@ impl AuthManager {
             refresh_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(None),
+            external_auth: RwLock::new(ExternalAuthState::default()),
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
         })
     }
@@ -2169,7 +2176,7 @@ impl AuthManager {
             refresh_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(None),
+            external_auth: RwLock::new(ExternalAuthState::default()),
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
         })
     }
@@ -2204,7 +2211,7 @@ impl AuthManager {
             refresh_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(None),
+            external_auth: RwLock::new(ExternalAuthState::default()),
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
         })
     }
@@ -2229,9 +2236,10 @@ impl AuthManager {
             refresh_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(Some(ExternalAuthSource::Runtime(Arc::new(
-                BearerTokenRefresher::new(config),
-            )))),
+            external_auth: RwLock::new(ExternalAuthState {
+                source: Some(ExternalAuthSource::Runtime(Arc::new(BearerTokenRefresher::new(config)))),
+                generation: Arc::new(()),
+            }),
             // External bearer auth refreshes by running the provider's command and never makes
             // auth-owned HTTP requests, so this route is intentionally inert.
             auth_route_config: AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
@@ -2349,8 +2357,12 @@ impl AuthManager {
     /// Reloads auth from the active source. Returns whether the auth value changed.
     pub async fn reload(&self) -> bool {
         tracing::info!("Reloading auth");
-        let new_auth = self.load_auth().await;
-        self.set_cached_auth(new_auth)
+        let Some((generation, source)) = self.external_auth_snapshot() else {
+            return false;
+        };
+        let new_auth = self.load_auth(source.as_ref()).await;
+        self.with_current_external_auth(&generation, || self.set_cached_auth(new_auth))
+            .unwrap_or(false)
     }
 
     async fn reload_if_account_id_matches(
@@ -2365,7 +2377,10 @@ impl AuthManager {
             }
         };
 
-        let new_auth = self.load_auth().await;
+        let Some((generation, source)) = self.external_auth_snapshot() else {
+            return ReloadOutcome::Skipped;
+        };
+        let new_auth = self.load_auth(source.as_ref()).await;
         let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
 
         if new_account_id.as_deref() != Some(expected_account_id) {
@@ -2377,15 +2392,17 @@ impl AuthManager {
         }
 
         tracing::info!("Reloading auth for account {expected_account_id}");
-        let cached_before_reload = self.auth_cached();
-        let auth_changed =
-            !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
-        self.set_cached_auth(new_auth);
-        if auth_changed {
-            ReloadOutcome::ReloadedChanged
-        } else {
-            ReloadOutcome::ReloadedNoChange
-        }
+        self.with_current_external_auth(&generation, || {
+            let cached_before_reload = self.auth_cached();
+            let auth_changed =
+                !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
+            self.set_cached_auth(new_auth);
+            if auth_changed {
+                ReloadOutcome::ReloadedChanged
+            } else {
+                ReloadOutcome::ReloadedNoChange
+            }
+        }).unwrap_or(ReloadOutcome::Skipped)
     }
 
     fn auths_equal_for_refresh(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool {
@@ -2441,8 +2458,8 @@ impl AuthManager {
         }
     }
 
-    async fn load_auth(&self) -> Option<CodexAuth> {
-        if let Some(source) = self.external_auth_source() {
+    async fn load_auth(&self, source: Option<&ExternalAuthSource>) -> Option<CodexAuth> {
+        if let Some(source) = source {
             let cached_auth = self.auth_cached();
             if !source.is_runtime()
                 && cached_auth
@@ -2451,7 +2468,7 @@ impl AuthManager {
             {
                 return cached_auth;
             }
-            return match self.resolve_external_auth(&source).await {
+            return match self.resolve_external_auth(source).await {
                 Ok(auth) => Some(auth),
                 Err(err) => {
                     tracing::error!("Failed to resolve external auth: {err}");
@@ -2531,16 +2548,18 @@ impl AuthManager {
             RefreshTokenError::Transient(std::io::Error::other("external auth lock is poisoned"))
         })?;
         if matches!(
-            source_slot.as_ref(),
+            source_slot.source.as_ref(),
             Some(ExternalAuthSource::Configured(_))
         ) {
             return Err(permanent_external_auth_error(
                 "configuration-backed external auth cannot be replaced at runtime",
             ));
         }
-        *source_slot = Some(external_auth_source.clone());
+        source_slot.source = Some(external_auth_source.clone());
+        source_slot.generation = Arc::new(());
+        let generation = Arc::clone(&source_slot.generation);
         drop(source_slot);
-        self.commit_external_auth(auth, &external_auth_source)
+        self.commit_external_auth(auth, &external_auth_source, &generation)
     }
 
     /// Installs an external auth source selected from process configuration at startup.
@@ -2563,22 +2582,25 @@ impl AuthManager {
             .external_auth
             .write()
             .map_err(|_| permanent_external_auth_error("external auth lock is poisoned"))?;
-        if source.is_some() {
+        if source.source.is_some() {
             return Err(permanent_external_auth_error(
                 "external auth is already configured",
             ));
         }
-        *source = Some(external_auth_source.clone());
+        source.source = Some(external_auth_source.clone());
+        source.generation = Arc::new(());
+        let generation = Arc::clone(&source.generation);
         drop(source);
-        self.commit_external_auth(auth, &external_auth_source)
+        self.commit_external_auth(auth, &external_auth_source, &generation)
     }
 
     /// Clears only auth installed through the runtime API. Configured auth is immutable.
     pub fn clear_external_auth(&self) {
         if let Ok(mut external_auth) = self.external_auth.write()
-            && matches!(external_auth.as_ref(), Some(ExternalAuthSource::Runtime(_)))
+            && matches!(external_auth.source.as_ref(), Some(ExternalAuthSource::Runtime(_)))
         {
-            external_auth.take();
+            external_auth.source.take();
+            external_auth.generation = Arc::new(());
             self.set_cached_auth(/*new_auth*/ None);
         }
     }
@@ -2624,7 +2646,7 @@ impl AuthManager {
 
     pub fn has_configured_external_auth(&self) -> bool {
         self.external_auth.read().ok().is_some_and(|source| {
-            matches!(source.as_ref(), Some(ExternalAuthSource::Configured(_)))
+            matches!(source.source.as_ref(), Some(ExternalAuthSource::Configured(_)))
         })
     }
 
@@ -2687,10 +2709,31 @@ impl AuthManager {
     }
 
     fn external_auth_source(&self) -> Option<ExternalAuthSource> {
+        self.external_auth_snapshot().and_then(|(_, source)| source)
+    }
+
+    fn external_auth_snapshot(&self) -> Option<(Arc<()>, Option<ExternalAuthSource>)> {
         self.external_auth
             .read()
             .ok()
-            .and_then(|external_auth| external_auth.clone())
+            .map(|state| (Arc::clone(&state.generation), state.source.clone()))
+    }
+
+    /// The callback must touch memory only: never wait on a provider or storage under this lock.
+    fn with_current_external_auth<T>(
+        &self,
+        generation: &Arc<()>,
+        action: impl FnOnce() -> T,
+    ) -> std::io::Result<T> {
+        let state = self.external_auth.read()
+            .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
+        if !Arc::ptr_eq(&state.generation, generation) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "external auth source changed while credentials were loading",
+            ));
+        }
+        Ok(action())
     }
 
     fn has_external_api_key_auth(&self) -> bool {
@@ -2835,15 +2878,35 @@ impl AuthManager {
     /// unauthenticated state.
     pub async fn logout(&self) -> std::io::Result<bool> {
         self.ensure_logout_allowed()?;
-        let removed = logout_all_stores(
-            &self.codex_home,
-            self.auth_credentials_store_mode,
-            self.keyring_backend_kind,
-        )?;
-        // Always reload to clear any cached auth (even if file absent).
-        self.clear_external_auth();
+        // Do not hold auth or process-local storage locks during filesystem/keyring operations.
+        // A managed-store failure leaves the active provider and cache unchanged.
+        let removed_managed = if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+            false
+        } else {
+            logout(&self.codex_home, self.auth_credentials_store_mode, self.keyring_backend_kind)?
+        };
+        let removed_ephemeral = with_ephemeral_auth_entry(&self.codex_home, |entry| {
+            let mut state = self.external_auth.write()
+                .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
+            if matches!(state.source.as_ref(), Some(ExternalAuthSource::Configured(_))) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "configuration-backed external auth cannot be logged out",
+                ));
+            }
+            state.source = None;
+            state.generation = Arc::new(());
+            self.set_cached_auth(None);
+            Ok(match entry {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    entry.remove();
+                    true
+                }
+                std::collections::hash_map::Entry::Vacant(_) => false,
+            })
+        })?;
         self.reload().await;
-        Ok(removed)
+        Ok(removed_managed || removed_ephemeral)
     }
 
     pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
@@ -2855,15 +2918,7 @@ impl AuthManager {
         {
             tracing::warn!("failed to revoke auth tokens during logout: {err}");
         }
-        let result = logout_all_stores(
-            &self.codex_home,
-            self.auth_credentials_store_mode,
-            self.keyring_backend_kind,
-        )?;
-        // Always reload to clear any cached auth (even if file absent).
-        self.clear_external_auth();
-        self.reload().await;
-        Ok(result)
+        self.logout().await
     }
 
     fn ensure_logout_allowed(&self) -> std::io::Result<()> {
@@ -2919,7 +2974,7 @@ impl AuthManager {
         &self,
         reason: ExternalAuthRefreshReason,
     ) -> Result<(), RefreshTokenError> {
-        let Some(source) = self.external_auth_source() else {
+        let Some((generation, Some(source))) = self.external_auth_snapshot() else {
             return Err(RefreshTokenError::Transient(std::io::Error::other(
                 "external auth is not configured",
             )));
@@ -2939,7 +2994,7 @@ impl AuthManager {
             .await
             .map_err(|error| source.classify_provider_error(error))?;
         self.validate_external_auth(&refreshed, &source)?;
-        self.commit_external_auth(refreshed, &source)?;
+        self.commit_external_auth(refreshed, &source, &generation)?;
         Ok(())
     }
 
@@ -2947,6 +3002,7 @@ impl AuthManager {
         &self,
         auth: CodexAuth,
         source: &ExternalAuthSource,
+        generation: &Arc<()>,
     ) -> Result<(), RefreshTokenError> {
         if source.is_runtime() && auth.is_external_chatgpt_tokens() {
             let auth_dot_json = auth.get_current_auth_json().ok_or_else(|| {
@@ -2956,17 +3012,18 @@ impl AuthManager {
             })?;
             // App/connectors paths still construct independent AuthManagers from Config. Mirror
             // external ChatGPT auth into the process-local store so those managers see it too.
-            save_auth(
-                &self.codex_home,
-                &auth_dot_json,
-                AuthCredentialsStoreMode::Ephemeral,
-                AuthKeyringBackendKind::default(),
-            )
-            .map_err(RefreshTokenError::Transient)?;
+            // Lock order is ephemeral store -> source -> cache. Canonicalization and the
+            // store-lock wait happen before the source lock, so clearing a source stays cheap.
+            return with_ephemeral_auth_entry(&self.codex_home, |entry| {
+                self.with_current_external_auth(generation, || {
+                    entry.insert_entry(auth_dot_json);
+                    self.set_cached_auth(Some(auth));
+                })
+            }).map_err(RefreshTokenError::Transient);
         }
-
-        self.set_cached_auth(Some(auth));
-        Ok(())
+        self.with_current_external_auth(generation, || {
+            self.set_cached_auth(Some(auth));
+        }).map_err(RefreshTokenError::Transient)
     }
 
     fn validate_external_auth(

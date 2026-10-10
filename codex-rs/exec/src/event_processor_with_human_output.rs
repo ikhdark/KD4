@@ -508,8 +508,8 @@ fn reasoning_text(
 
 fn blended_total(usage: &ThreadTokenUsage) -> i64 {
     let cached_input = usage.total.cached_input_tokens.max(0);
-    let non_cached_input = (usage.total.input_tokens - cached_input).max(0);
-    (non_cached_input + usage.total.output_tokens.max(0)).max(0)
+    let non_cached_input = usage.total.input_tokens.saturating_sub(cached_input).max(0);
+    non_cached_input.saturating_add(usage.total.output_tokens.max(0))
 }
 
 fn should_print_final_message_to_stdout(

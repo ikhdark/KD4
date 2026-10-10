@@ -201,14 +201,19 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::TurnComplete(turn_complete_event) => {
-            // All per-thread requests are bound to a turn, so abort them.
-            outgoing.abort_pending_server_requests().await;
+            let (is_current, turn_failed) = {
+                let state = thread_state.lock().await;
+                (state.is_current_summary_turn(&event_turn_id),
+                    turn_complete_event.error.is_some()
+                        || state.turn_summary_for(&event_turn_id).is_some_and(|summary| summary.last_error.is_some()))
+            };
+            if is_current {
+                outgoing.abort_pending_server_requests().await;
+                thread_watch_manager
+                    .note_turn_completed(&conversation_id.to_string(), turn_failed)
+                    .await;
+            }
             respond_to_pending_interrupts(&thread_state, &outgoing, &event_turn_id).await;
-            let turn_failed = turn_complete_event.error.is_some()
-                || thread_state.lock().await.turn_summary.last_error.is_some();
-            thread_watch_manager
-                .note_turn_completed(&conversation_id.to_string(), turn_failed)
-                .await;
             handle_turn_complete(
                 conversation_id,
                 event_turn_id,
@@ -738,9 +743,11 @@ pub(crate) async fn apply_bespoke_event_handling(
             if !ev.affects_turn_status() {
                 return;
             }
-            thread_watch_manager
-                .note_system_error(&conversation_id.to_string())
-                .await;
+            if thread_state.lock().await.is_current_summary_turn(&event_turn_id) {
+                thread_watch_manager
+                    .note_system_error(&conversation_id.to_string())
+                    .await;
+            }
 
             let turn_error = TurnError {
                 message: ev.message,
@@ -783,9 +790,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 CoreTurnItem::CommandExecution(item) => thread_state
                     .lock()
                     .await
-                    .turn_summary
-                    .command_execution_started
-                    .insert(item.id.clone()),
+                    .turn_summary_for_mut(&event.turn_id)
+                    .is_none_or(|summary| summary.command_execution_started.insert(item.id.clone())),
                 _ => true,
             };
             let dynamic_tool_call_params = match &event.item {
@@ -826,6 +832,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &thread_manager,
                 &thread_watch_manager,
                 &thread_state,
+                &event.turn_id,
                 &event.item,
             )
             .await;
@@ -888,13 +895,13 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         // If this is a TurnAborted, reply to any pending interrupt requests.
         EventMsg::TurnAborted(turn_aborted_event) => {
-            // All per-thread requests are bound to a turn, so abort them.
-            outgoing.abort_pending_server_requests().await;
+            if thread_state.lock().await.is_current_summary_turn(&event_turn_id) {
+                outgoing.abort_pending_server_requests().await;
+                thread_watch_manager
+                    .note_turn_aborted(&conversation_id.to_string(), &turn_aborted_event.reason)
+                    .await;
+            }
             respond_to_pending_interrupts(&thread_state, &outgoing, &event_turn_id).await;
-
-            thread_watch_manager
-                .note_turn_aborted(&conversation_id.to_string(), &turn_aborted_event.reason)
-                .await;
             handle_turn_interrupted(
                 conversation_id,
                 event_turn_id,
@@ -1118,16 +1125,18 @@ async fn apply_canonical_item_completed_side_effects(
     thread_manager: &Arc<ThreadManager>,
     thread_watch_manager: &ThreadWatchManager,
     thread_state: &Arc<Mutex<ThreadState>>,
+    turn_id: &str,
     item: &CoreTurnItem,
 ) {
     match item {
         CoreTurnItem::CommandExecution(item) => {
-            thread_state
+            if let Some(summary) = thread_state
                 .lock()
                 .await
-                .turn_summary
-                .command_execution_started
-                .remove(&item.id);
+                .turn_summary_for_mut(turn_id)
+            {
+                summary.command_execution_started.remove(&item.id);
+            }
         }
         CoreTurnItem::SubAgentActivity(activity)
             if activity.kind == SubAgentActivityKind::Interrupted =>
@@ -1175,9 +1184,8 @@ async fn start_command_execution_item(
     let first_start = {
         let mut state = thread_state.lock().await;
         state
-            .turn_summary
-            .command_execution_started
-            .insert(item_id.clone())
+            .turn_summary_for_mut(&turn_id)
+            .is_none_or(|summary| summary.command_execution_started.insert(item_id.clone()))
     };
     if first_start {
         let notification = ItemStartedNotification {
@@ -1228,9 +1236,8 @@ async fn complete_command_execution_item(
     let should_emit = thread_state
         .lock()
         .await
-        .turn_summary
-        .command_execution_started
-        .remove(&item_id);
+        .turn_summary_for_mut(&turn_id)
+        .is_some_and(|summary| summary.command_execution_started.remove(&item_id));
     if !should_emit {
         return;
     }
@@ -1282,11 +1289,11 @@ async fn maybe_emit_raw_response_item_completed(
 }
 
 async fn find_and_remove_turn_summary(
-    _conversation_id: ThreadId,
+    turn_id: &str,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) -> TurnSummary {
     let mut state = thread_state.lock().await;
-    std::mem::take(&mut state.turn_summary)
+    state.take_turn_summary(turn_id)
 }
 
 async fn handle_turn_complete(
@@ -1296,7 +1303,7 @@ async fn handle_turn_complete(
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
+    let turn_summary = find_and_remove_turn_summary(&event_turn_id, thread_state).await;
 
     let embedded_error = turn_complete_event.error.as_ref().map(|error| TurnError {
         message: error.message.clone(),
@@ -1334,7 +1341,7 @@ async fn handle_turn_interrupted(
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
+    let turn_summary = find_and_remove_turn_summary(&event_turn_id, thread_state).await;
     let internal_error = matches!(turn_aborted_event.reason,
         codex_protocol::protocol::TurnAbortReason::InternalError
         | codex_protocol::protocol::TurnAbortReason::ProcessLost);
@@ -1451,12 +1458,14 @@ async fn handle_token_count_event(
 }
 
 async fn handle_error(
-    _conversation_id: ThreadId,
+    turn_id: &str,
     error: TurnError,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
     let mut state = thread_state.lock().await;
-    state.turn_summary.last_error = Some(error);
+    if let Some(summary) = state.turn_summary_for_mut(turn_id) {
+        summary.last_error = Some(error);
+    }
 }
 
 async fn handle_error_notification(
@@ -1466,7 +1475,7 @@ async fn handle_error_notification(
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
-    handle_error(conversation_id, error.clone(), thread_state).await;
+    handle_error(event_turn_id, error.clone(), thread_state).await;
     outgoing
         .send_server_notification(ServerNotification::Error(ErrorNotification {
             error,
@@ -1916,9 +1925,8 @@ async fn on_command_execution_request_approval_response(
         if approval_id.is_some() {
             let state = thread_state.lock().await;
             state
-                .turn_summary
-                .command_execution_started
-                .contains(&item_id)
+                .turn_summary_for(&event_turn_id)
+                .is_some_and(|summary| summary.command_execution_started.contains(&item_id))
         } else {
             false
         }
@@ -2687,11 +2695,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_error_records_message() -> Result<()> {
-        let conversation_id = ThreadId::new();
         let thread_state = new_thread_state();
 
         handle_error(
-            conversation_id,
+            "turn-1",
             TurnError {
                 message: "boom".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
@@ -2701,7 +2708,7 @@ mod tests {
         )
         .await;
 
-        let turn_summary = find_and_remove_turn_summary(conversation_id, &thread_state).await;
+        let turn_summary = find_and_remove_turn_summary("turn-1", &thread_state).await;
         assert_eq!(
             turn_summary.last_error,
             Some(TurnError {
@@ -2725,7 +2732,12 @@ mod tests {
         let conversation = Arc::clone(&test.codex);
         let thread_manager = Arc::clone(&test.thread_manager);
         let host_cwd = test.config.cwd.clone();
-        let foreign_cwd: PathUri = "file:///remote/workspace".parse()?;
+        let (foreign_uri, foreign_display) = if cfg!(windows) {
+            ("file:///remote/workspace", "/remote/workspace")
+        } else {
+            ("file:///C:/remote/workspace", r"C:\remote\workspace")
+        };
+        let foreign_cwd: PathUri = foreign_uri.parse()?;
         assert!(foreign_cwd.to_abs_path().is_err());
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let sender = Arc::new(OutgoingMessageSender::new(
@@ -2744,7 +2756,7 @@ mod tests {
         ] {
             let command = "cat notes.txt";
             let expected_cwd = if case == "foreign" {
-                "/remote/workspace".to_string()
+                foreign_display.to_string()
             } else {
                 host_cwd.to_string_lossy().into_owned()
             };
@@ -3219,7 +3231,7 @@ mod tests {
         let event_turn_id = "interrupt1".to_string();
         let thread_state = new_thread_state();
         handle_error(
-            conversation_id,
+            &event_turn_id,
             TurnError {
                 message: "oops".to_string(),
                 codex_error_info: None,
@@ -3273,7 +3285,7 @@ mod tests {
             codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
             additional_details: None,
         };
-        handle_error(conversation_id, expected_error.clone(), &thread_state).await;
+        handle_error(&event_turn_id, expected_error.clone(), &thread_state).await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             tx,
@@ -3317,7 +3329,7 @@ mod tests {
         let event_turn_id = "complete_err1".to_string();
         let thread_state = new_thread_state();
         handle_error(
-            conversation_id,
+            &event_turn_id,
             TurnError {
                 message: "bad".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::Other),
@@ -3714,7 +3726,7 @@ mod tests {
         // Turn 1 on conversation A
         let a_turn1 = "a_turn1".to_string();
         handle_error(
-            conversation_a,
+            &a_turn1,
             TurnError {
                 message: "a1".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::BadRequest),
@@ -3726,7 +3738,7 @@ mod tests {
         // Turn 1 on conversation B
         let b_turn1 = "b_turn1".to_string();
         handle_error(
-            conversation_b,
+            &b_turn1,
             TurnError {
                 message: "b1".to_string(),
                 codex_error_info: None,

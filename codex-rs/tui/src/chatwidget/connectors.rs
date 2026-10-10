@@ -17,6 +17,7 @@ pub(super) struct ConnectorsState {
     pub(super) cache: ConnectorsCacheState,
     pub(super) partial_snapshot: Option<ConnectorsSnapshot>,
     pub(super) prefetch_in_flight: bool,
+    pub(super) pending_request_id: Option<uuid::Uuid>,
     pub(super) force_refetch_pending: bool,
 }
 
@@ -31,8 +32,27 @@ impl ChatWidget {
 
     fn queue_connectors_refresh(&mut self, force_refetch: bool) {
         if self.begin_connectors_refresh(force_refetch) {
-            self.app_event_tx
-                .send(AppEvent::FetchConnectorsList { force_refetch });
+            let request_id = uuid::Uuid::new_v4();
+            self.connectors.pending_request_id = Some(request_id);
+            self.app_event_tx.send(AppEvent::FetchConnectorsList {
+                force_refetch,
+                request_id,
+            });
+        }
+    }
+
+    pub(crate) fn accepts_connectors_request(&self, request_id: uuid::Uuid) -> bool {
+        self.connectors.pending_request_id == Some(request_id)
+    }
+
+    pub(crate) fn on_connectors_response(
+        &mut self,
+        request_id: uuid::Uuid,
+        result: Result<ConnectorsSnapshot, String>,
+        is_final: bool,
+    ) {
+        if self.accepts_connectors_request(request_id) {
+            self.on_connectors_loaded(result, is_final);
         }
     }
 
@@ -297,6 +317,7 @@ impl ChatWidget {
         let mut trigger_pending_force_refetch = false;
         if is_final {
             self.connectors.prefetch_in_flight = false;
+            self.connectors.pending_request_id = None;
             if self.connectors.force_refetch_pending {
                 self.connectors.force_refetch_pending = false;
                 trigger_pending_force_refetch = true;

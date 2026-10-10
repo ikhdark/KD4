@@ -260,8 +260,9 @@ mod tests {
         let McpServerTransportConfig::Stdio { cwd, .. } = &mut remote_stdio.transport else {
             unreachable!("stdio helper should build stdio transport");
         };
+        // POSIX is the foreign convention here; `/opt/plugins/demo` is not host-absolute.
         *cwd = Some(
-            PathUri::parse("file:///C:/plugins/demo")
+            PathUri::parse("file:///opt/plugins/demo")
                 .expect("foreign cwd URI")
                 .into(),
         );

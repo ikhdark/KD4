@@ -2000,7 +2000,10 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
+            .any(|text| {
+                text.contains("<personality_spec>")
+                    && text.contains("You optimize for team morale and being a supportive teammate as much as code quality.")
+            }),
         "expected personality update message in developer input, got {developer_texts:?}"
     );
 
@@ -2117,7 +2120,10 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     assert!(
         second_developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
+            .any(|text| {
+                text.contains("<personality_spec>")
+                    && text.contains("You optimize for team morale and being a supportive teammate as much as code quality.")
+            }),
         "expected personality update message in second request, got {second_developer_texts:?}"
     );
 
@@ -2704,6 +2710,28 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
     assert_eq!(command, expected_command);
     assert_eq!(status, CommandExecutionStatus::InProgress);
 
+    // The started item is emitted before the sandbox decision; only the
+    // completed item shows that the new policy admitted the command.
+    let admitted_command = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification =
+                serde_json::from_value(notification.params.expect("item/completed params"))?;
+            if let ThreadItem::CommandExecution {
+                status, exit_code, ..
+            } = completed.item
+            {
+                assert_eq!(status, CommandExecutionStatus::Completed);
+                assert_eq!(exit_code, Some(0));
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await?;
+    admitted_command?;
+
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -2719,7 +2747,11 @@ async fn turn_start_resolves_sticky_thread_local_environment_and_turn_overrides(
     let codex_home = tmp.path().join("codex_home");
     std::fs::create_dir(&codex_home)?;
     let workspace = tmp.path().join("workspace");
-    std::fs::create_dir(&workspace)?;
+    // Each selection level gets its own directory so the model request shows which one won.
+    let sticky_cwd = workspace.join("sticky");
+    let turn_cwd = workspace.join("turn");
+    std::fs::create_dir_all(&sticky_cwd)?;
+    std::fs::create_dir(&turn_cwd)?;
 
     let server = create_mock_responses_server_repeating_assistant("done").await;
     create_config_toml(&codex_home, &server.uri(), "never", &BTreeMap::default())?;
@@ -2746,29 +2778,44 @@ url = "ws://127.0.0.1:1"
             name: "sticky_unset_turn_unset",
             sticky: None,
             turn: None,
+            model_visible_cwd: Some("workspace"),
         },
         EnvironmentSelectionCase {
             name: "sticky_empty_turn_unset",
             sticky: Some(&[]),
             turn: None,
+            model_visible_cwd: None,
         },
         EnvironmentSelectionCase {
             name: "sticky_local_turn_unset",
             sticky: Some(&["local"]),
             turn: None,
+            model_visible_cwd: Some("sticky"),
         },
         EnvironmentSelectionCase {
             name: "sticky_local_turn_empty",
             sticky: Some(&["local"]),
             turn: Some(&[]),
+            model_visible_cwd: None,
         },
         EnvironmentSelectionCase {
             name: "sticky_empty_turn_local",
             sticky: Some(&[]),
             turn: Some(&["local"]),
+            model_visible_cwd: Some("turn"),
         },
     ] {
-        run_environment_selection_case(&mut mcp, &workspace, case).await?;
+        run_environment_selection_case(
+            &mut mcp,
+            &server,
+            EnvironmentSelectionDirs {
+                thread: &workspace,
+                sticky: &sticky_cwd,
+                turn: &turn_cwd,
+            },
+            case,
+        )
+        .await?;
     }
 
     Ok(())
@@ -2778,18 +2825,28 @@ struct EnvironmentSelectionCase {
     name: &'static str,
     sticky: Option<&'static [&'static str]>,
     turn: Option<&'static [&'static str]>,
+    /// Directory name of the local environment cwd the model is told about, if any.
+    model_visible_cwd: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct EnvironmentSelectionDirs<'a> {
+    thread: &'a Path,
+    sticky: &'a Path,
+    turn: &'a Path,
 }
 
 async fn run_environment_selection_case(
     mcp: &mut TestAppServer,
-    workspace: &Path,
+    server: &wiremock::MockServer,
+    dirs: EnvironmentSelectionDirs<'_>,
     case: EnvironmentSelectionCase,
 ) -> Result<()> {
     let thread_req = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            cwd: Some(workspace.to_string_lossy().into_owned()),
-            environments: environment_params(case.sticky, workspace),
+            cwd: Some(dirs.thread.to_string_lossy().into_owned()),
+            environments: environment_params(case.sticky, dirs.sticky),
             ..Default::default()
         })
         .await?;
@@ -2808,8 +2865,8 @@ async fn run_environment_selection_case(
                 text: format!("run {}", case.name),
                 text_elements: Vec::new(),
             }],
-            environments: environment_params(case.turn, workspace),
-            cwd: Some(workspace.to_path_buf()),
+            // No turn cwd: it would replace the sticky selection with the manager defaults.
+            environments: environment_params(case.turn, dirs.turn),
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
@@ -2850,10 +2907,54 @@ async fn run_environment_selection_case(
         case.name
     );
 
+    let marker = format!("run {}", case.name);
+    let model_request = server
+        .received_requests()
+        .await
+        .context("failed to fetch received requests")?
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .filter_map(|request| request.body_json::<Value>().ok())
+        .find(|body| body.to_string().contains(&marker))
+        .with_context(|| format!("{}: expected a model request", case.name))?;
+    assert_eq!(
+        model_visible_environment_cwds(&model_request)
+            .with_context(|| format!("{}: {model_request}", case.name))?,
+        case.model_visible_cwd
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>(),
+        "{}",
+        case.name
+    );
+
     mcp.clear_message_buffer();
 
     Ok(())
 }
+
+/// Directory names of the `<cwd>` entries in the last environment context of a model request.
+fn model_visible_environment_cwds(
+    model_request: &Value,
+) -> Result<std::collections::BTreeSet<String>> {
+    let environment_context = model_request["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["role"] == "user")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter_map(|content| content["text"].as_str())
+        .filter(|text| text.starts_with("<environment_context>"))
+        .next_back()
+        .context("environment context should be model visible")?;
+    Ok(environment_context
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("<cwd>")?.strip_suffix("</cwd>"))
+        .filter_map(|cwd| Path::new(cwd).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect())
+}
+
 
 fn environment_params(ids: Option<&[&str]>, cwd: &Path) -> Option<Vec<TurnEnvironmentParams>> {
     ids.map(|ids| {

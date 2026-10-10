@@ -316,16 +316,17 @@ async fn suspended_root_waits_for_job_assignment_before_running() -> anyhow::Res
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos()
     ));
-    let marker_literal = marker.to_string_lossy().replace('\'', "''");
     let managed = ManagedRootProcess::reserve()?;
-    let mut command = std::process::Command::new("powershell.exe");
+    // cmd.exe writes the marker within milliseconds of running. A shell that needs longer than
+    // the wait below to start would leave the marker absent whether or not it was suspended.
+    let script = format!("type nul > \"{}\"", marker.display());
+    let mut command = std::process::Command::new("cmd.exe");
+    crate::configure_windows_command_args(
+        &mut command,
+        std::ffi::OsStr::new("cmd.exe"),
+        &["/D", "/C", script.as_str()],
+    );
     command
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("[IO.File]::WriteAllText('{marker_literal}', 'ran')"),
-        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

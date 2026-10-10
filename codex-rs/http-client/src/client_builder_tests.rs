@@ -38,12 +38,14 @@ fn exclusive_tls_roots_select_explicit_root_policy() {
 
     let invalid_der = b"-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n";
     assert!(
-        HttpClientBuilder::new()
-            .tls_certs_only_pem(invalid_der)
-            .expect("well-formed PEM is parsed before DER validation")
-            .build_direct()
-            .is_err(),
-        "invalid DER must fail client construction"
+        matches!(
+            HttpClientBuilder::new()
+                .tls_certs_only_pem(invalid_der)
+                .expect("well-formed PEM is parsed before DER validation")
+                .build_direct(),
+            Err(BuildCustomCaTransportError::BuildClientWithExplicitRoots(_))
+        ),
+        "invalid DER must fail client construction as an explicit-root error"
     );
 
     let ca_pem = include_bytes!("../tests/fixtures/test-ca.pem");
@@ -61,6 +63,16 @@ fn exclusive_tls_roots_select_explicit_root_policy() {
             });
         assert!(client.is_ok());
     }
+
+    let client = HttpClientBuilder::new().build_with_transport_default_proxy_using(
+        |builder, custom_ca_policy| {
+            assert_eq!(custom_ca_policy, CustomCaPolicy::HonorProcessEnvironment);
+            builder
+                .build()
+                .map_err(BuildCustomCaTransportError::BuildClientWithSystemRoots)
+        },
+    );
+    assert!(client.is_ok());
 }
 
 #[tokio::test]

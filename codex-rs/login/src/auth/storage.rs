@@ -382,7 +382,14 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
                 let message =
                     format!("failed to write OAuth tokens to encrypted auth storage: {err}");
                 warn!("{message}");
-                std::io::Error::other(message)
+                let kind = if err.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    error.kind() == std::io::ErrorKind::WouldBlock
+                }) {
+                    std::io::ErrorKind::WouldBlock
+                } else {
+                    std::io::ErrorKind::Other
+                };
+                std::io::Error::new(kind, message)
             })?;
         if let Err(err) = delete_file_if_exists(&self.codex_home) {
             warn!("failed to remove CLI auth fallback file: {err}");
@@ -443,6 +450,9 @@ impl AuthStorageBackend for AutoAuthStorage {
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
         match self.keyring_storage.save(auth) {
             Ok(()) => Ok(()),
+            // Contention is not backend unavailability: a fallback would hide
+            // the new credential behind the existing encrypted value.
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(err),
             Err(err) => {
                 warn!("failed to save auth to keyring, falling back to file storage: {err}");
                 self.file_storage.save(auth)
@@ -460,6 +470,17 @@ impl AuthStorageBackend for AutoAuthStorage {
 static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthDotJson>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_EPHEMERAL_STORE_LOCK: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn notify_before_next_ephemeral_store_lock(sender: std::sync::mpsc::Sender<()>) {
+    BEFORE_EPHEMERAL_STORE_LOCK.with(|slot| slot.replace(Some(sender)));
+}
+
 #[derive(Clone, Debug)]
 struct EphemeralAuthStorage {
     codex_home: PathBuf,
@@ -475,6 +496,12 @@ impl EphemeralAuthStorage {
         F: FnOnce(&mut HashMap<String, AuthDotJson>, String) -> std::io::Result<T>,
     {
         let key = compute_store_key(&self.codex_home)?;
+        #[cfg(test)]
+        BEFORE_EPHEMERAL_STORE_LOCK.with(|slot| {
+            if let Some(sender) = slot.borrow_mut().take() {
+                let _ = sender.send(());
+            }
+        });
         let mut store = EPHEMERAL_AUTH_STORE
             .lock()
             .map_err(|_| std::io::Error::other("failed to lock ephemeral auth storage"))?;
@@ -497,6 +524,15 @@ impl AuthStorageBackend for EphemeralAuthStorage {
     fn delete(&self) -> std::io::Result<bool> {
         self.with_store(|store, key| Ok(store.remove(&key).is_some()))
     }
+}
+
+/// Prepare the store key and acquire the store before entering a caller's short memory transaction.
+pub(super) fn with_ephemeral_auth_entry<T>(
+    codex_home: &Path,
+    action: impl FnOnce(std::collections::hash_map::Entry<'_, String, AuthDotJson>) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    EphemeralAuthStorage::new(codex_home.to_path_buf())
+        .with_store(|store, key| action(store.entry(key)))
 }
 
 pub(super) fn create_auth_storage(

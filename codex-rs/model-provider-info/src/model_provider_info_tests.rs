@@ -152,6 +152,8 @@ fn test_auth_mode_selects_base_url_unless_explicitly_configured() {
         (Some(AuthMode::Chatgpt), CHATGPT_CODEX_BASE_URL),
         (Some(AuthMode::ChatgptAuthTokens), CHATGPT_CODEX_BASE_URL),
         (Some(AuthMode::AgentIdentity), CHATGPT_CODEX_BASE_URL),
+        (Some(AuthMode::ApiKey), "https://api.openai.com/v1"),
+        (Some(AuthMode::BedrockApiKey), "https://api.openai.com/v1"),
         (None, "https://api.openai.com/v1"),
     ] {
         let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)

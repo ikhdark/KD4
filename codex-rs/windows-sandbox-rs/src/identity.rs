@@ -410,7 +410,10 @@ mod tests {
                 &env_map,
                 SandboxNetworkIdentity::Offline,
             ),
-            marker.offline_proxy_settings()
+            crate::setup::OfflineProxySettings {
+                proxy_ports: vec![7890],
+                allow_local_binding: true,
+            }
         );
         assert_eq!(
             desired_offline_proxy_settings(

@@ -753,7 +753,8 @@ mod resource_cache_tests {
             );
             assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
             if fail_first {
-                assert!(first.is_err() && second.is_err());
+                assert_eq!(first.err(), Some(SkillProviderError::new("temporary")));
+                assert_eq!(second.err(), Some(SkillProviderError::new("temporary")));
                 assert_eq!(
                     state
                         .read_skill(&providers, request("resource"))

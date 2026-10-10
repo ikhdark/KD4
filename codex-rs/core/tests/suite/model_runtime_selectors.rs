@@ -131,7 +131,7 @@ async fn response_for_remote_model(
     submit_thread_settings(
         &test.codex,
         ThreadSettingsOverrides {
-            model: Some(model_slug),
+            model: Some(model_slug.clone()),
             ..Default::default()
         },
     )
@@ -154,13 +154,18 @@ async fn response_for_remote_model(
             .await
         {
             EventMsg::Warning(warning) => warnings.push(warning.message),
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
+                break;
+            }
             _ => {}
         }
     }
 
+    let body = response_mock.single_request().body_json();
+    assert_eq!(body["model"], model_slug);
     Ok(RemoteModelResponse {
-        body: response_mock.single_request().body_json(),
+        body,
         warnings,
     })
 }
@@ -195,7 +200,9 @@ async fn astra_default_completes_a_turn_with_its_bundled_runtime_settings() -> R
         .build(&server)
         .await?;
     assert_eq!(test.session_configured.model, "gpt-6-astra");
-    test.submit_turn("Say done.").await?;
+    let completed = test.submit_turn_and_capture_completion("Say done.").await?;
+    assert_eq!(completed.error, None);
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
     let body = response_mock.single_request().body_json();
     assert_eq!(body["model"], "gpt-6-astra");
     // With no override, the bundled model catalog supplies the reasoning default.
@@ -371,7 +378,10 @@ async fn unsupported_code_mode_warning_is_emitted_each_turn() -> Result<()> {
                 {
                     warning_count += 1;
                 }
-                EventMsg::TurnComplete(_) => break,
+                EventMsg::TurnComplete(completed) => {
+                    assert_eq!(completed.error, None);
+                    break;
+                }
                 _ => {}
             }
         }
@@ -379,7 +389,11 @@ async fn unsupported_code_mode_warning_is_emitted_each_turn() -> Result<()> {
     }
 
     assert_eq!(warning_counts, vec![1, 1]);
-    assert_eq!(response_mock.requests().len(), 2);
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.body_json()["model"], model_slug);
+    }
 
     Ok(())
 }
@@ -491,12 +505,17 @@ async fn remote_multi_agent_selector_uses_model_selected_before_first_turn() -> 
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event_with_timeout(
+    let completed = wait_for_event_with_timeout(
         &test.codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
         REMOTE_SELECTOR_EVENT_TIMEOUT,
     )
     .await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!();
+    };
+    assert_eq!(completed.error, None);
+    assert_eq!(response_mock.single_request().body_json()["model"], CHILD_MODEL);
 
     assert_eq!(
         (

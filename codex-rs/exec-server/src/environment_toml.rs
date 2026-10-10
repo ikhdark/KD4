@@ -58,12 +58,12 @@ struct TomlEnvironmentProvider {
 impl TomlEnvironmentProvider {
     #[cfg(test)]
     fn new(config: EnvironmentsToml) -> Result<Self, ExecServerError> {
-        Self::new_with_config_dir(config, /*config_dir*/ None)
+        Self::new_with_config_dir(config, Path::new("codex-home"))
     }
 
     fn new_with_config_dir(
         config: EnvironmentsToml,
-        config_dir: Option<&Path>,
+        config_dir: &Path,
     ) -> Result<Self, ExecServerError> {
         let EnvironmentsToml {
             default,
@@ -121,7 +121,7 @@ impl EnvironmentProvider for TomlEnvironmentProvider {
 
 fn parse_environment_toml(
     item: EnvironmentToml,
-    config_dir: Option<&Path>,
+    config_dir: &Path,
 ) -> Result<(String, ExecServerTransportParams), ExecServerError> {
     let EnvironmentToml {
         id,
@@ -165,13 +165,13 @@ fn parse_environment_toml(
                     "environment `{id}` program cannot be empty"
                 )));
             }
-            let cwd = normalize_stdio_cwd(&id, cwd, config_dir)?;
             ExecServerTransportParams::StdioCommand {
                 command: StdioExecServerCommand {
                     program,
                     args: args.unwrap_or_default(),
                     env: env.unwrap_or_default(),
-                    cwd,
+                    // A relative cwd is resolved against the config directory.
+                    cwd: cwd.map(|cwd| config_dir.join(cwd)),
                 },
                 initialize_timeout,
             }
@@ -184,25 +184,6 @@ fn parse_environment_toml(
     };
 
     Ok((id, transport_params))
-}
-
-fn normalize_stdio_cwd(
-    id: &str,
-    cwd: Option<PathBuf>,
-    config_dir: Option<&Path>,
-) -> Result<Option<PathBuf>, ExecServerError> {
-    let Some(cwd) = cwd else {
-        return Ok(None);
-    };
-    if cwd.is_absolute() {
-        return Ok(Some(cwd));
-    }
-    let Some(config_dir) = config_dir else {
-        return Err(ExecServerError::Protocol(format!(
-            "environment `{id}` cwd must be absolute"
-        )));
-    };
-    Ok(Some(config_dir.join(cwd)))
 }
 
 pub(crate) fn environment_provider_from_codex_home(
@@ -221,7 +202,7 @@ pub(crate) fn environment_provider_from_codex_home(
     let environments = load_environments_toml(&path)?;
     Ok(Box::new(TomlEnvironmentProvider::new_with_config_dir(
         environments,
-        Some(codex_home),
+        codex_home,
     )?))
 }
 
@@ -576,7 +557,7 @@ mod tests {
                     ..Default::default()
                 }],
             },
-            Some(config_dir.path()),
+            config_dir.path(),
         )
         .expect("provider");
 
@@ -654,26 +635,6 @@ mod tests {
             }
         );
         assert_eq!(*initialize_timeout, Duration::from_secs(56));
-    }
-
-    #[test]
-    fn toml_provider_rejects_relative_stdio_cwd_without_config_dir() {
-        let err = TomlEnvironmentProvider::new(EnvironmentsToml {
-            default: None,
-            include_local: None,
-            environments: vec![EnvironmentToml {
-                id: "ssh-dev".to_string(),
-                program: Some("ssh".to_string()),
-                cwd: Some(PathBuf::from("workspace")),
-                ..Default::default()
-            }],
-        })
-        .expect_err("relative cwd without config dir should fail");
-
-        assert_eq!(
-            err.to_string(),
-            "exec-server protocol error: environment `ssh-dev` cwd must be absolute"
-        );
     }
 
     #[test]

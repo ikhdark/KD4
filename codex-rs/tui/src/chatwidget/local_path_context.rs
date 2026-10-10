@@ -240,8 +240,11 @@ fn path_tokens(text: &str) -> Vec<String> {
 }
 
 fn push_token(tokens: &mut Vec<String>, current: &mut String, was_quoted: bool) {
-    let token =
-        current.trim_matches(|ch| matches!(ch, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'));
+    let token = if was_quoted {
+        current.as_str()
+    } else {
+        current.trim_matches(|ch| matches!(ch, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'))
+    };
     // Paths must be quoted or have a separator or filename extension. Bare prose
     // and punctuation (especially ".") must not select the working directory.
     if !token.is_empty()
@@ -300,6 +303,8 @@ fn render_directory(
     let max_output = max_output.saturating_sub(CONTEXT_OMISSION.len());
     let (entries, inventory_omitted) = directory_entries(root);
     let mut output = String::new();
+    // Ancestors stay in root-to-target order, like file selections; nested directories are
+    // strict descendants, so they follow in inventory order without duplicating an ancestor.
     let mut instructions = applicable_agent_files(root, discovery);
     instructions.extend(
         entries
@@ -307,8 +312,6 @@ fn render_directory(
             .filter(|entry| entry.file_type.is_dir())
             .filter_map(|entry| instruction_file_in(&entry.path, discovery)),
     );
-    instructions.sort();
-    instructions.dedup();
     append_instruction_files(&mut output, instructions, instructions_seen, max_output / 2);
 
     append_bounded(&mut output, "[directory inventory]\n", max_output);
@@ -571,6 +574,7 @@ fn append_bounded(output: &mut String, value: &str, max_output: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::PathBufExt;
 
     fn default_discovery(root: &Path) -> InstructionDiscovery<'_> {
         InstructionDiscovery {
@@ -591,6 +595,27 @@ mod tests {
         );
         assert_eq!(contexts.len(), 1);
         assert!(contexts[0].1.contains("selected contents"));
+    }
+
+    #[test]
+    fn quoted_paths_preserve_filename_punctuation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in ["(report).txt", "[report].txt", "{report}.txt", "report.txt;", "report.txt,"] {
+            let selected = temp.path().join(name);
+            fs::write(&selected, "SELECTED_CONTENT").expect("write file");
+            for quote in ['\'', '"'] {
+                for path in [name.to_string(), selected.to_string_lossy().into_owned()] {
+                    let contexts = collect_with_discovery(
+                        &format!("inspect {quote}{path}{quote}"),
+                        temp.path(),
+                        &default_discovery(temp.path()),
+                    );
+                    assert_eq!(contexts.len(), 1, "quoted path: {path}");
+                    assert_eq!(contexts[0].0, selected, "quoted path: {path}");
+                    assert!(contexts[0].1.contains("SELECTED_CONTENT"), "{contexts:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -801,15 +826,17 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::create_dir(temp.path().join(".git")).expect("create git marker");
         let cwd = temp.path().join("one");
-        let selected = temp.path().join("two").join("nested");
+        // ".two" sorts before "AGENTS.md", so ordering instruction paths lexicographically would
+        // put the sibling's instructions ahead of the root's.
+        let sibling = temp.path().join(".two");
+        let selected = sibling.join("nested");
+        let descendant = selected.join("deep");
         fs::create_dir_all(&cwd).expect("create cwd");
-        fs::create_dir_all(&selected).expect("create selected");
+        fs::create_dir_all(&descendant).expect("create selected");
         fs::write(temp.path().join("AGENTS.md"), "root instructions").expect("write root agents");
-        fs::write(
-            temp.path().join("two").join("AGENTS.md"),
-            "sibling instructions",
-        )
-        .expect("write sibling agents");
+        fs::write(sibling.join("AGENTS.md"), "sibling instructions").expect("write sibling agents");
+        fs::write(descendant.join("AGENTS.md"), "descendant instructions")
+            .expect("write descendant agents");
 
         let contexts = collect_with_discovery(
             selected.to_str().expect("utf8 path"),
@@ -817,8 +844,10 @@ mod tests {
             &default_discovery(temp.path()),
         );
         let content = &contexts[0].1;
-        assert!(content.contains("root instructions"));
-        assert!(content.contains("sibling instructions"));
+        let position = |body: &str| content.find(body).expect(body);
+        assert!(position("root instructions") < position("sibling instructions"));
+        assert!(position("sibling instructions") < position("descendant instructions"));
+        assert!(position("descendant instructions") < position("[directory inventory]"));
     }
 
     #[test]
@@ -830,6 +859,8 @@ mod tests {
         fs::create_dir_all(&cwd).expect("create cwd");
         fs::create_dir_all(selected.parent().expect("selected parent")).expect("create selected");
         fs::write(&selected, "fn selected() {}").expect("write selected");
+        fs::write(temp.path().join("AGENTS.md"), "outside root instructions")
+            .expect("write outside instructions");
         fs::write(project_root.join("AGENTS.md"), "shadowed instructions")
             .expect("write default instructions");
         fs::write(
@@ -853,7 +884,68 @@ mod tests {
         assert!(content.contains("root override instructions"));
         assert!(content.contains("fallback instructions"));
         assert!(!content.contains("shadowed instructions"));
+        assert!(!content.contains("outside root instructions"));
     }
+
+    #[tokio::test]
+    async fn collect_takes_project_root_and_fallback_filenames_from_config() {
+        let codex_home = tempfile::tempdir().expect("codex home");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("workspace");
+        let cwd = project_root.join("one");
+        let selected = project_root.join("two").join("file.rs");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        fs::create_dir_all(selected.parent().expect("selected parent")).expect("create selected");
+        fs::write(&selected, "fn selected() {}").expect("write selected");
+        fs::write(project_root.join("AGENTS.md"), "root instructions")
+            .expect("write root instructions");
+        fs::write(
+            selected.parent().expect("selected parent").join("TEAM.md"),
+            "fallback instructions",
+        )
+        .expect("write fallback instructions");
+
+        let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+            codex_home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .expect("config");
+        config.cwd = cwd.abs();
+        config.project_doc_fallback_filenames =
+            vec!["TEAM.md".to_string(), "AGENTS.md".to_string(), String::new()];
+        assert_eq!(
+            project_doc_candidate_filenames(&config),
+            vec!["AGENTS.override.md", "AGENTS.md", "TEAM.md"]
+        );
+
+        let stack_discovered_from = |discovery_cwd: &Path| {
+            codex_config::ConfigLayerStack::default().with_project_discovery(
+                codex_config::ProjectDiscoveryContext::new(
+                    discovery_cwd.to_path_buf().abs(),
+                    project_root.abs(),
+                    vec![".git".to_string()],
+                    /*git_checkout_root*/ None,
+                    /*git_trust_root*/ None,
+                    codex_exec_server::LOCAL_FS.as_ref(),
+                ),
+            )
+        };
+        let text = selected.to_str().expect("utf8 path");
+
+        config.config_layer_stack = stack_discovered_from(&cwd).into();
+        let content = collect(text, &config).remove(0).1;
+        assert!(content.contains("root instructions"));
+        assert!(content.contains("fallback instructions"));
+
+        // A discovery captured for another cwd must not choose the root: the config cwd does,
+        // and the selected sibling lies outside it.
+        config.config_layer_stack = stack_discovered_from(&project_root).into();
+        let content = collect(text, &config).remove(0).1;
+        assert!(!content.contains("root instructions"));
+        assert!(content.contains("fallback instructions"));
+    }
+
     #[test]
     fn parent_components_do_not_load_sibling_instructions() {
         let temp = tempfile::tempdir().expect("tempdir");

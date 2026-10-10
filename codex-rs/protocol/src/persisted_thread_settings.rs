@@ -455,6 +455,13 @@ mod tests {
             settings.model_provider_id.as_deref(),
             Some("provider-history-model")
         );
+        assert_eq!(
+            settings
+                .environments
+                .as_ref()
+                .map(|environments| &environments.legacy_fallback_cwd),
+            Some(&absolute_path("history-cwd"))
+        );
     }
 
     #[test]

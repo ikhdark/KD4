@@ -413,6 +413,35 @@ class SessionDiagnosticsTest(unittest.TestCase):
             self.assertIsNone(metrics["usefulCheckpoints"])
             self.assertEqual(metrics["checkpointAttempts"], 2)
 
+    def test_rg_no_match_is_not_a_failed_command_in_session_metrics(self):
+        for command, result, failed in (
+            ('rg "needle|other" src', {"exit_code": 1, "output": ""}, 0),
+            ('"C:\\tools\\rg.exe" needle src', {"exit_code": 1}, 0),
+            ("rg needle src", "Process exited with code 1", 0),
+            ("rg needle missing", {"exit_code": 2, "stderr": "missing"}, 1),
+            ("rg needle src; python fail.py", {"exit_code": 1}, 1),
+            ("rg needle src", {"exit_code": 1, "stderr": "error"}, 1),
+            ("rg needle src", "Exit code: 1\nerror", 1),
+        ):
+            with self.subTest(command=command, result=result), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "rollout.jsonl"
+                source.write_text("\n".join([
+                    _meta(str(root)),
+                    _event({"type": "task_started", "turn_id": "t"}),
+                    _response({"type": "function_call", "call_id": "c",
+                               "name": "functions.exec_command",
+                               "arguments": json.dumps({"cmd": command})},
+                              "2026-08-17T00:00:00Z"),
+                    _response({"type": "function_call_output", "call_id": "c",
+                               "output": json.dumps(result) if isinstance(result, dict) else result},
+                              "2026-08-17T00:00:01Z"),
+                    _event({"type": "task_complete", "turn_id": "t", "timing": _timing()}),
+                ]), encoding="utf-8")
+                report = audit.analyze_session_path(source, root)
+                self.assertEqual(report["perTurn"][0]["diagnostics"]["metrics"]["failedCommands"], failed)
+                self.assertEqual(report["sessionDiagnostics"]["metrics"]["failedCommands"]["total"], failed)
+
     def test_successful_code_mode_wrapper_is_not_zero_failed_commands(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

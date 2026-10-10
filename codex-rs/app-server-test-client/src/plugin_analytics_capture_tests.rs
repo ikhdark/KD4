@@ -30,6 +30,23 @@ fn rejects_missing_and_wrong_metadata_types() {
             .unwrap_err();
         assert!(error.to_string().contains(field), "{error}");
     }
+    // A null value is not an absent key: remove each field as well.
+    for field in [
+        "has_skills",
+        "mcp_server_count",
+        "connector_ids",
+        "product_client_id",
+    ] {
+        let mut installed = mutation_event("codex_plugin_installed");
+        installed["event_params"]
+            .as_object_mut()
+            .expect("event params should be an object")
+            .remove(field);
+        let uninstalled = mutation_event("codex_plugin_uninstalled");
+        let error = validate_mutation_events(vec![installed, uninstalled], expected_identity())
+            .unwrap_err();
+        assert!(error.to_string().contains(field), "{error}");
+    }
 }
 
 #[test]

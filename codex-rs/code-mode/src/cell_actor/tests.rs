@@ -209,12 +209,13 @@ async fn unexpected_runtime_thread_exit_is_reported_to_the_session_owner() {
             .expect("runtime failure"),
         "code-mode V8 runtime thread ended unexpectedly"
     );
-    assert!(
-        harness
-            .initial_event_rx
-            .await
-            .expect("initial event")
-            .is_ok()
+    assert_eq!(
+        harness.initial_event_rx.await.expect("initial event"),
+        Ok(CellEvent::Completed {
+            content_items: Vec::new(),
+            error_text: Some("exec runtime ended unexpectedly".to_string()),
+            output_loss: None,
+        })
     );
     harness.task.await.expect("cell task");
 }

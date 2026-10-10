@@ -563,6 +563,32 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertNotIn(" of output tokens", rendered)
         self.assertIn("visible output (byte shares): prose=100%", rendered)
 
+    def test_cost_fit_uses_measured_output_not_imputed_zero(self):
+        timing = _timing()
+        timing["modelRequests"] = [
+            {"generationIndex": index, "modelStreamWaitNs": output * 100_000_000,
+             "tokenUsage": {"inputTokens": 100, "cachedInputTokens": 0,
+                            "visibleOutputTokens": output, "reasoningTokens": 0}}
+            for index, output in enumerate((0, 10, 20))
+        ]
+        timing["counters"].update(modelRequestCount=4, logicalGenerationCount=4)
+        for usage in (None, {"visibleOutputTokens": 3}, {"reasoningTokens": 3}):
+            with self.subTest(usage=usage):
+                incomplete = {"generationIndex": 3, "modelStreamWaitNs": 99_000_000_000}
+                if usage is not None:
+                    incomplete["tokenUsage"] = usage
+                changed = dict(timing, modelRequests=[*timing["modelRequests"], incomplete])
+                report = self.audit_commands([], timing=changed)
+                # Observed points (0,0), (10,1), (20,2) seconds define this line.
+                # The 99-second request has no measured total output token count.
+                self.assertEqual(report["requestCostModel"], {
+                    "requests": 3, "fixedSeconds": 0.0,
+                    "perOutputTokenMs": 100.0, "correlation": 1.0,
+                })
+        timing["modelRequests"] = timing["modelRequests"][:2] + [incomplete]
+        timing["counters"].update(modelRequestCount=3, logicalGenerationCount=3)
+        self.assertIsNone(self.audit_commands([], timing=timing)["requestCostModel"])
+
     def test_unmeasured_residual_and_honest_continuation_metrics(self) -> None:
         timing = _timing()
         timing["counters"]["residualDeterministicGenerationCount"] = None
@@ -1777,6 +1803,29 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                     self.assertEqual(record["roundTripNs"], 7)
                     self.assertEqual(record["status"], "running")
                     self.assertEqual(record["timingConfidence"], "low")
+                    self.assertNotIn("detailedTimingMatch", record)
+                    self.assertNotIn("timingSource", record)
+
+    def test_detailed_timing_does_not_fallback_across_conflicting_execution_ids(self):
+        for count in (1, 2):
+            with self.subTest(count=count):
+                records = [
+                    {"turnId": "turn", "callId": "call", "executionId": f"observed-{index}",
+                     "roundTripNs": 7, "status": "running", "timingConfidence": "low"}
+                    for index in range(count)
+                ]
+                calls = [
+                    {"_turnId": "turn", "callId": "call", "executionId": f"other-{index}",
+                     "acceptedAtMs": 0, "outputModelVisibleAtMs": 10,
+                     "processSpawnedAtMs": 1, "processExitedAtMs": 2, "outcome": "success"}
+                    for index in range(count)
+                ]
+                stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+                self.assertEqual(stats, {"ambiguousGroups": 1, "ambiguousRecords": count})
+                for record in records:
+                    self.assertTrue(record["detailedTimingAmbiguous"])
+                    self.assertEqual((record["roundTripNs"], record["status"], record["timingConfidence"]),
+                                     (7, "running", "low"))
                     self.assertNotIn("detailedTimingMatch", record)
                     self.assertNotIn("timingSource", record)
 

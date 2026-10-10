@@ -40,6 +40,40 @@ async fn bound_listener_path_is_stale_socket_path() {
 }
 
 #[tokio::test]
+async fn links_to_socket_paths_are_not_stale_socket_paths() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = temp_dir.path().join("socket");
+    let link_path = temp_dir.path().join("socket-link");
+    let listener = tokio::time::timeout(Duration::from_secs(10), UnixListener::bind(&socket_path))
+        .await
+        .expect("bind deadline")
+        .expect("bind socket");
+    std::os::windows::fs::symlink_file(&socket_path, &link_path).expect("link to socket");
+
+    assert!(is_stale_socket_path(&socket_path).await.expect("socket path check"));
+    assert!(
+        !is_stale_socket_path(&link_path)
+            .await
+            .expect("link path check"),
+        "classification must inspect the link, not its socket target"
+    );
+
+    drop(listener);
+    std::fs::remove_file(&socket_path).expect("remove socket rendezvous file");
+    assert!(
+        !is_stale_socket_path(&link_path)
+            .await
+            .expect("dangling link path check")
+    );
+    assert!(
+        std::fs::symlink_metadata(&link_path)
+            .expect("link remains")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[tokio::test]
 async fn non_socket_paths_are_not_stale_socket_paths() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let file_path = temp_dir.path().join("regular");

@@ -332,3 +332,104 @@ fn unsendable_server_message_is_an_error() {
         std::io::ErrorKind::InvalidData
     );
 }
+
+#[test]
+fn splits_server_messages_when_chunk_sizes_plateau() {
+    let message = OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+        ConfigWarningNotification {
+            summary: "x".repeat(1024),
+            details: None,
+            path: None,
+            range: None,
+        },
+    ));
+    let raw = serde_json::to_vec(&message).expect("message should serialize");
+    let max_count = super::segment::REMOTE_CONTROL_SEGMENT_COUNT_MAX;
+    assert!(raw.len() > max_count);
+    let mut witness = ServerEnvelope {
+        event: ServerEvent::ServerMessageChunk {
+            segment_id: max_count - 1,
+            segment_count: max_count,
+            message_size_bytes: raw.len(),
+            message_chunk_base64: String::new(),
+        },
+        client_id: ClientId(String::new()),
+        stream_id: StreamId("stream-1".to_string()),
+        seq_id: 9,
+    };
+    // Reserve 16 base64 bytes: independently demonstrate a legal partition
+    // into 12-byte chunks, even with nearly frame-sized routing metadata.
+    let metadata_size = serde_json::to_vec(&witness).expect("metadata should serialize").len();
+    witness.client_id = ClientId("x".repeat(REMOTE_CONTROL_SEGMENT_MAX_BYTES - metadata_size - 16));
+    let count = raw.len().div_ceil(12);
+    assert!(count <= max_count);
+    for (segment_id, chunk) in raw.chunks(12).enumerate() {
+        witness.event = ServerEvent::ServerMessageChunk {
+            segment_id,
+            segment_count: count,
+            message_size_bytes: raw.len(),
+            message_chunk_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
+        };
+        assert!(serde_json::to_vec(&witness).expect("witness should serialize").len()
+            <= REMOTE_CONTROL_SEGMENT_MAX_BYTES);
+    }
+
+    let segments = split_server_envelope_for_transport(ServerEnvelope {
+        event: ServerEvent::ServerMessage { message: Box::new(message) },
+        ..witness.clone()
+    }).expect("a demonstrated legal partition must not be skipped");
+    assert!(segments.len() <= max_count);
+    let mut reconstructed = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        assert_eq!(segment.client_id, witness.client_id);
+        assert_eq!(segment.stream_id, witness.stream_id);
+        assert_eq!(segment.seq_id, witness.seq_id);
+        assert!(serde_json::to_vec(segment).expect("segment should serialize").len()
+            <= REMOTE_CONTROL_SEGMENT_MAX_BYTES);
+        let ServerEvent::ServerMessageChunk {
+            segment_id, segment_count, message_size_bytes, message_chunk_base64,
+        } = &segment.event else {
+            panic!("oversized envelope must be segmented");
+        };
+        assert_eq!(*segment_id, index);
+        assert_eq!(*segment_count, segments.len());
+        assert_eq!(*message_size_bytes, raw.len());
+        reconstructed.extend(base64::engine::general_purpose::STANDARD
+            .decode(message_chunk_base64).expect("valid base64"));
+    }
+    assert_eq!(reconstructed, raw);
+}
+
+#[test]
+fn segmentation_rejects_exhausted_count_budget() {
+    let message = OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+        ConfigWarningNotification {
+            summary: "x".repeat(16 * 1024),
+            details: None,
+            path: None,
+            range: None,
+        },
+    ));
+    let raw_size = serde_json::to_vec(&message).expect("message should serialize").len();
+    let mut envelope = ServerEnvelope {
+        event: ServerEvent::ServerMessageChunk {
+            segment_id: 0,
+            segment_count: 1,
+            message_size_bytes: raw_size,
+            message_chunk_base64: String::new(),
+        },
+        client_id: ClientId(String::new()),
+        stream_id: StreamId("stream".into()),
+        seq_id: 1,
+    };
+    // Even the smallest possible routing metadata leaves only 16 base64
+    // bytes (12 raw bytes) per frame. No partition within 1024 frames can fit.
+    let metadata_size = serde_json::to_vec(&envelope).unwrap().len();
+    envelope.client_id = ClientId("x".repeat(REMOTE_CONTROL_SEGMENT_MAX_BYTES - metadata_size - 16));
+    assert!(raw_size > 12 * super::segment::REMOTE_CONTROL_SEGMENT_COUNT_MAX);
+    envelope.event = ServerEvent::ServerMessage { message: Box::new(message) };
+    let error = split_server_envelope_for_transport(envelope)
+        .expect_err("exhausting the finite count budget must fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("segment count exceeds maximum"));
+}

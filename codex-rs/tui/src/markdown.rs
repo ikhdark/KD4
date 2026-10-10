@@ -86,7 +86,7 @@ pub(crate) fn render_markdown_agent_with_links_and_cwd(
 /// markdown so `pulldown-cmark` parses the tables natively.
 ///
 /// Fences whose info string is not `md` or `markdown` are passed through unchanged.  Markdown
-/// fences that do *not* contain a table (detected by checking for a header row + delimiter row)
+/// fences that do *not* contain a table (confirmed by the markdown parser)
 /// are also passed through so that non-table markdown inside a fence still renders as a code
 /// block.
 ///
@@ -190,7 +190,13 @@ fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
                 && !table_detect::is_table_delimiter_line(previous)
                 && table_detect::is_table_delimiter_line(trimmed)
             {
-                return true;
+                return pulldown_cmark::Parser::new_ext(
+                    content,
+                    pulldown_cmark::Options::ENABLE_TABLES,
+                )
+                .any(|event| {
+                    matches!(event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_)))
+                });
             }
 
             previous_line = Some(trimmed);
@@ -414,6 +420,25 @@ mod tests {
         let src = "```markdown\n| A | B |\nnot a delimiter row\n| --- | --- |\n# Heading\n```\n";
         let normalized = unwrap_markdown_fences(src);
         assert_eq!(normalized, src);
+    }
+
+    #[test]
+    fn unwrap_markdown_fences_keeps_non_tables_and_unclosed_fences() {
+        for body in [
+            "| A | B |\n| --- |\n",
+            "    | A | B |\n    | --- | --- |\n",
+            "~~~rust\n| A | B |\n| --- | --- |\n~~~\n",
+        ] {
+            assert!(
+                !pulldown_cmark::Parser::new_ext(body, pulldown_cmark::Options::ENABLE_TABLES)
+                    .any(|event| matches!(event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))))
+            );
+            let source = format!("```markdown\n{body}```\n");
+            assert_eq!(unwrap_markdown_fences(&source), source);
+        }
+
+        let unclosed = "```markdown\n| A | B |\n| --- | --- |\n";
+        assert_eq!(unwrap_markdown_fences(unclosed), unclosed);
     }
 
     #[test]

@@ -56,26 +56,28 @@ async fn try_init_waits_for_concurrent_startup_backfill() -> anyhow::Result<()> 
             .await?;
     let claimed = runtime.try_claim_backfill(/*lease_seconds*/ 60).await?;
     assert!(claimed);
-    let runtime_for_completion = runtime.clone();
-    let complete_backfill = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        runtime_for_completion
-            .mark_backfill_complete(/*last_watermark*/ None)
-            .await
-    });
 
     // Completion is observed by the next database poll; a short interval keeps
     // the production wait bound without spending the one-second cadence.
-    let initialized = try_init_with_roots_and_backfill_lease(
+    let mut init = Box::pin(try_init_with_roots_and_backfill_lease(
         home.path().to_path_buf(),
         home.path().to_path_buf(),
         "test-provider".to_string(),
         /*backfill_lease_seconds*/ 60,
         STARTUP_BACKFILL_WAIT_TIMEOUT,
         /*poll_interval*/ std::time::Duration::from_millis(10),
-    )
-    .await?;
-    complete_backfill.await??;
+    ));
+    // The other worker still holds its claim, so init must not have returned yet.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), init.as_mut())
+            .await
+            .is_err(),
+        "init must keep waiting while another worker's backfill is running"
+    );
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+    let initialized = init.await?;
     assert_eq!(
         initialized.get_backfill_state().await?.status,
         codex_state::BackfillStatus::Complete

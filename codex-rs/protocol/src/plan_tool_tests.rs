@@ -13,6 +13,21 @@ fn update_plan_rejects_multiple_in_progress_items() {
     .expect_err("multiple active items should fail");
 
     assert!(err.to_string().contains("at most one in_progress"));
+
+    let args = serde_json::from_value::<UpdatePlanArgs>(json!({
+        "plan": [
+            {"step": "one", "status": "in_progress"},
+            {"step": "two", "status": "pending"}
+        ]
+    }))
+    .expect("a single active item should deserialize");
+    assert_eq!(
+        args.plan
+            .iter()
+            .map(|item| item.status)
+            .collect::<Vec<_>>(),
+        vec![StepStatus::InProgress, StepStatus::Pending]
+    );
 }
 
 #[test]

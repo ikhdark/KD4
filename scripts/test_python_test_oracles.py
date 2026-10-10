@@ -431,6 +431,92 @@ class Cases(unittest.TestCase):
             "boundary_reachability_unknown", {u["reason"] for u in real["unknown"]}
         )
 
+    def test_unexecuted_control_flow_does_not_discharge_mocked_boundary(self):
+        bodies = (
+            "    if not enabled: return None\n    return subprocess.run(['tool'])\n",
+            "    for _ in range(int(enabled)):\n        subprocess.run(['tool'])\n",
+            "    while enabled:\n        return subprocess.run(['tool'])\n",
+            "    return subprocess.run(['tool']) if enabled else None\n",
+            "    return enabled and subprocess.run(['tool'])\n",
+            "    return [subprocess.run(['tool']) for _ in range(int(enabled))]\n",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                # Every disabled call above avoids subprocess.run by Python's
+                # control-flow rules. A direct call alone is not real coverage.
+                report = analyze({
+                    "product.py": "import subprocess\ndef run(enabled):\n" + body,
+                    "test_product.py": """
+import unittest
+from unittest.mock import patch
+from product import run
+class Cases(unittest.TestCase):
+    @patch("product.subprocess.run")
+    def test_fake(self, mocked):
+        run(True)
+        mocked.assert_called_once()
+    def test_disabled(self): self.assertFalse(run(False))
+""",
+                })
+                self.assertTrue(report["parse_complete"])
+                findings = [row for row in report["diagnostics"]
+                            if row["reason"] == "external_boundary_only_mocked"]
+                self.assertEqual(len(findings), 1)
+                self.assertIn("test_product.Cases.test_disabled",
+                              findings[0]["unknown_reaching_tests"])
+
+    def test_unexecuted_test_call_is_not_real_boundary_coverage(self):
+        for body in (
+            "        if False: run()\n",
+            "        for _ in (): run()\n",
+            "        return\n        run()\n",
+            "        False and run()\n",
+        ):
+            with self.subTest(body=body):
+                report = analyze({
+                    "product.py": "import subprocess\ndef run(): return subprocess.run(['tool'])\n",
+                    "test_product.py": """
+import unittest
+from unittest.mock import patch
+from product import run
+class Cases(unittest.TestCase):
+    @patch("product.subprocess.run")
+    def test_fake(self, mocked):
+        run()
+        mocked.assert_called_once()
+    def test_disabled(self):
+""" + body,
+                })
+                self.assertTrue(report["parse_complete"])
+                self.assertIn("external_boundary_only_mocked",
+                              {row["reason"] for row in report["diagnostics"]})
+
+    def test_deferred_function_bodies_are_not_direct_boundary_coverage(self):
+        for producer, execute in (
+            ("def run(): yield subprocess.run(['tool'])", "next(run())"),
+            ("async def run(): return subprocess.run(['tool'])", "asyncio.run(run())"),
+        ):
+            with self.subTest(producer=producer):
+                report = analyze({
+                    "product.py": "import subprocess\n" + producer,
+                    "test_product.py": f"""
+import asyncio, unittest
+from unittest.mock import patch
+from product import run
+class Cases(unittest.TestCase):
+    @patch("product.subprocess.run")
+    def test_fake(self, mocked):
+        {execute}
+        mocked.assert_called_once()
+    def test_create_only(self):
+        deferred = run()
+        deferred.close()
+""",
+                })
+                self.assertTrue(report["parse_complete"])
+                self.assertIn("external_boundary_only_mocked",
+                              {row["reason"] for row in report["diagnostics"]})
+
     def test_dynamic_loader_and_dispatch_are_explicit_unknowns(self):
         report = analyze(
             {

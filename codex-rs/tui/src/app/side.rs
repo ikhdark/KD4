@@ -15,7 +15,6 @@ use codex_app_server_protocol::ThreadErrorReason;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
-const SIDE_RENAME_BLOCK_MESSAGE: &str = "Side conversations are ephemeral and cannot be renamed.";
 const SIDE_MAIN_THREAD_UNAVAILABLE_MESSAGE: &str =
     "'/side' is unavailable until the main thread is ready.";
 const SIDE_NO_STARTED_CONVERSATION_MESSAGE: &str = concat!(
@@ -113,12 +112,18 @@ mod tests {
 
     #[test]
     fn side_start_error_message_explains_missing_first_prompt() {
-        let err = thread_error_report(ThreadErrorReason::NotMaterialized, "localized message");
+        for reason in [
+            ThreadErrorReason::NotMaterialized,
+            ThreadErrorReason::NotFound,
+        ] {
+            let err = thread_error_report(reason, "localized message");
 
-        assert_eq!(
-            App::side_start_error_message(&err),
-            "'/side' is unavailable until the current conversation has started. Send a message first, then try /side again."
-        );
+            assert_eq!(
+                App::side_start_error_message(&err),
+                "'/side' is unavailable until the current conversation has started. Send a message first, then try /side again.",
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]
@@ -128,6 +133,14 @@ mod tests {
         assert_eq!(
             App::side_start_error_message(&err),
             "Failed to start side conversation: transport disconnected"
+        );
+
+        // A classified reason that does not mean "no conversation yet" keeps the server's wording.
+        let err = thread_error_report(ThreadErrorReason::NotLoaded, "localized message");
+
+        assert_eq!(
+            App::side_start_error_message(&err),
+            r#"Failed to start side conversation: thread/fork failed: localized message (code -32600), data: {"reason":"notLoaded"}"#
         );
     }
 
@@ -150,10 +163,9 @@ mod tests {
         let developer_instructions =
             App::side_developer_instructions(Some("Existing developer policy."));
 
-        assert!(developer_instructions.contains("Existing developer policy."));
-        assert!(
-            developer_instructions.contains("You are in a side conversation, not the main thread.")
-        );
+        assert!(developer_instructions.starts_with(
+            "Existing developer policy.\n\nYou are in a side conversation, not the main thread."
+        ));
         assert!(
             developer_instructions.contains("Sub-agents are off-limits in this side conversation.")
         );
@@ -225,7 +237,6 @@ impl App {
         let clear_side_ui = |chat_widget: &mut crate::chatwidget::ChatWidget| {
             chat_widget.set_side_conversation_context_label(/*label*/ None);
             chat_widget.set_side_conversation_active(/*active*/ false);
-            chat_widget.clear_thread_rename_block();
             chat_widget.set_interrupted_turn_notice_mode(InterruptedTurnNoticeMode::Default);
         };
         let Some(active_thread_id) = self.current_displayed_thread_id() else {
@@ -241,8 +252,6 @@ impl App {
             return;
         };
 
-        self.chat_widget
-            .set_thread_rename_block_message(SIDE_RENAME_BLOCK_MESSAGE);
         self.chat_widget
             .set_side_conversation_active(/*active*/ true);
         self.chat_widget

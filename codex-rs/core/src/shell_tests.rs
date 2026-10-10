@@ -148,20 +148,40 @@ fn unix_style_shells_derive_exact_script_arguments() {
 
 #[test]
 fn remote_environment_shells_preserve_reported_type_and_path() {
-    for name in ["bash", "zsh", "sh"] {
-        let path = format!("/remote/bin/{name}");
+    // Only these shells pass remote environment validation. The paths exist on
+    // the remote host alone, so local detection must not replace them.
+    for (name, path, shell_type, flags) in [
+        (
+            "pwsh",
+            r"R:\remote\PowerShell\7\pwsh.exe",
+            ShellType::PowerShell,
+            vec!["-NoProfile", "-NonInteractive", "-Command"],
+        ),
+        (
+            "powershell",
+            r"R:\remote\WindowsPowerShell\v1.0\powershell.exe",
+            ShellType::PowerShell,
+            vec!["-NoProfile", "-NonInteractive", "-Command"],
+        ),
+        (
+            "cmd",
+            r"R:\remote\System32\cmd.exe",
+            ShellType::Cmd,
+            vec!["/d", "/c"],
+        ),
+    ] {
         let shell = Shell::from_environment_shell_info(ShellInfo {
             name: name.to_string(),
-            path: path.clone(),
+            path: path.to_string(),
         })
         .expect("reported remote shell must be selected");
-        assert_eq!(shell.name(), name);
-        assert_eq!(shell.shell_path, PathBuf::from(&path));
+        assert_eq!(shell.shell_type, shell_type);
+        assert_eq!(shell.shell_path, PathBuf::from(path));
         assert_eq!(
             shell
                 .derive_exec_args("printf remote", /*use_login_shell*/ false)
                 .expect("remote shell args"),
-            vec![path, "-c".to_string(), "printf remote".to_string()]
+            [vec![path], flags, vec!["printf remote"]].concat()
         );
     }
 }

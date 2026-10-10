@@ -18,9 +18,15 @@ if (-not (Test-Path -LiteralPath $root -PathType Container)) {
     exit 0
 }
 try {
-    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
-    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        exit 0
+    # A normal leaf below a junction still redirects deletion outside the
+    # selected tree. Match the lane entrypoint's ancestor validation.
+    $component = $root
+    while (-not [string]::IsNullOrEmpty($component)) {
+        $rootItem = Get-Item -LiteralPath $component -Force -ErrorAction Stop
+        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            exit 0
+        }
+        $component = [IO.Path]::GetDirectoryName($component)
     }
 }
 catch {

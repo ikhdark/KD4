@@ -63,6 +63,70 @@ fn test_writable_roots_constraint() {
     ));
 }
 
+#[tokio::test]
+async fn move_requires_both_source_and_destination_within_writable_roots() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("workspace");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::write(cwd.join("inside.txt"), "before\n").unwrap();
+    std::fs::write(tmp.path().join("outside.txt"), "before\n").unwrap();
+    let cwd_uri = PathUri::from_host_native_path(&cwd).unwrap();
+    let profile = PermissionProfile::workspace_write_with(
+        &[],
+        NetworkSandboxPolicy::Restricted,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    let policy = profile.file_system_sandbox_policy();
+    for (source, destination, allowed) in [
+        ("inside.txt", "renamed.txt", true),
+        ("inside.txt", "../renamed.txt", false),
+        ("../outside.txt", "renamed.txt", false),
+    ] {
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {source}\n*** Move to: {destination}\n@@\n-before\n+after\n*** End Patch"
+        );
+        let action = match codex_apply_patch::maybe_parse_apply_patch_verified(
+            &["apply_patch".to_string(), patch],
+            &cwd_uri,
+            codex_exec_server::LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        {
+            codex_apply_patch::MaybeApplyPatchVerified::Body(action) => action,
+            other => panic!("expected verified move: {other:?}"),
+        };
+        assert_eq!(
+            is_write_patch_constrained_to_writable_paths(&action, &policy, &cwd_uri),
+            allowed,
+            "{source} -> {destination}"
+        );
+        let expected = if allowed {
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::WindowsRestrictedToken,
+                user_explicitly_approved: false,
+            }
+        } else {
+            SafetyCheck::Reject {
+                reason: PATCH_REJECTED_OUTSIDE_PROJECT_REASON.to_string(),
+            }
+        };
+        assert_eq!(
+            assess_patch_safety(
+                &action,
+                AskForApproval::Never,
+                &profile,
+                &policy,
+                &cwd_uri,
+                WindowsSandboxLevel::RestrictedToken,
+            ),
+            expected,
+            "{source} -> {destination}"
+        );
+    }
+}
+
 #[test]
 fn external_sandbox_auto_approves_in_on_request() {
     let tmp = TempDir::new().unwrap();

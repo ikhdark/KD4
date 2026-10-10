@@ -2,20 +2,26 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::app_server_json_shutdown_event;
-use app_test_support::create_exec_command_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::to_response;
 use app_test_support::write_mock_responses_config_toml;
+use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SandboxPolicy;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_features::Feature;
 use core_test_support::require_network;
+use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -53,7 +59,20 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     require_network!();
 
     let server = create_mock_responses_server_sequence(vec![
-        create_exec_command_sse_response("exec-call-1")?,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call(
+                "exec-call-1",
+                "exec_command",
+                &json!({
+                    "program": "cmd.exe",
+                    "args": ["/d", "/c", "echo timing-failure-sentinel& exit /b 7"],
+                    "yield_time_ms": 10000,
+                })
+                .to_string(),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
         create_final_assistant_message_sse_response("done")?,
     ])
     .await;
@@ -91,6 +110,7 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     let turn_start_id = app_server
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
             input: vec![UserInput::Text {
                 text: "run a command".to_string(),
                 text_elements: Vec::new(),
@@ -105,11 +125,48 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     .await??;
     let TurnStartResponse { turn } = to_response(turn_start_response)?;
 
-    timeout(
+    // A failed tool log must reflect the deliberate nonzero command, not a
+    // missing executable, sandbox rejection, or dispatch error.
+    timeout(READ_TIMEOUT, async {
+        loop {
+            let notification = app_server
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification = serde_json::from_value(
+                notification.params.context("item/completed params")?,
+            )?;
+            if let ThreadItem::CommandExecution {
+                id,
+                status,
+                exit_code,
+                aggregated_output,
+                ..
+            } = completed.item
+            {
+                assert_eq!(id, "exec-call-1");
+                assert_eq!(status, CommandExecutionStatus::Failed);
+                assert_eq!(exit_code, Some(7));
+                assert_eq!(
+                    aggregated_output.as_deref().map(str::trim),
+                    Some("timing-failure-sentinel")
+                );
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    let completion = timeout(
         READ_TIMEOUT,
         app_server.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    let completed: TurnCompletedNotification =
+        serde_json::from_value(completion.params.context("turn/completed params")?)?;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.id, turn.id);
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+    assert_eq!(completed.turn.error, None);
 
     let mut tool_call = app_server
         .wait_for_json_log_event("codex.tool_call")

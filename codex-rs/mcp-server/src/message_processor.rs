@@ -1154,12 +1154,14 @@ mod tests {
     async fn tool_task_shutdown_drops_resources_held_by_in_flight_tasks() {
         let tool_tasks = ToolTasks::default();
         let (resource_tx, mut resource_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         tool_tasks.spawn(async move {
             let _resource_tx = resource_tx;
+            started_tx.send(()).expect("startup observer remains live");
             std::future::pending::<()>().await;
         });
 
-        tokio::task::yield_now().await;
+        started_rx.await.expect("the task must enter before shutdown");
         tool_tasks.shutdown().await;
 
         assert_eq!(resource_rx.recv().await, None);

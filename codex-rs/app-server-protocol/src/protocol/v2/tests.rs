@@ -351,14 +351,14 @@ fn collab_agent_state_preserves_authoritative_surfaced_result() {
 
     assert_eq!(
         CollabAgentState::from(CoreAgentStatus::CompletedWithSurface {
-            last_agent_message: None,
+            last_agent_message: Some("done".to_string()),
             surfaced_result: surfaced_result.clone(),
         }),
         CollabAgentState {
             status: CollabAgentStatus::Completed,
-            message: None,
+            message: Some("done".to_string()),
             surfaced_result: Some(surfaced_result),
-            last_agent_message: None,
+            last_agent_message: Some("done".to_string()),
         }
     );
 }
@@ -417,6 +417,28 @@ fn external_agent_config_plugins_details_round_trip() {
                 ..Default::default()
             }),
         }
+    );
+    assert_eq!(
+        serde_json::to_value(&item).expect("plugins migration item should serialize"),
+        json!({
+            "itemType": "PLUGINS",
+            "description": "Install supported plugins from Claude settings",
+            "cwd": absolute_path_string("repo"),
+            "details": {
+                "plugins": [
+                    {
+                        "marketplaceName": "team-marketplace",
+                        "pluginNames": ["asana"]
+                    }
+                ],
+                "skills": [],
+                "sessions": [],
+                "mcpServers": [],
+                "hooks": [],
+                "subagents": [],
+                "commands": []
+            }
+        })
     );
 }
 
@@ -716,13 +738,99 @@ fn additional_file_system_permissions_populates_entries_for_legacy_roots() {
 
 #[test]
 fn additional_file_system_permissions_rejects_zero_glob_scan_depth() {
-    serde_json::from_value::<AdditionalFileSystemPermissions>(json!({
-        "read": null,
-        "write": null,
-        "globScanMaxDepth": 0,
-        "entries": [],
-    }))
-    .expect_err("zero glob scan depth should fail deserialization");
+    let payload = |depth: usize| {
+        json!({
+            "read": null,
+            "write": null,
+            "globScanMaxDepth": depth,
+            "entries": [],
+        })
+    };
+
+    // The same payload with a non-zero depth must parse, so the rejection below
+    // is attributable to the zero depth alone.
+    let accepted = serde_json::from_value::<AdditionalFileSystemPermissions>(payload(1))
+        .expect("non-zero glob scan depth should deserialize");
+    assert_eq!(accepted.glob_scan_max_depth, NonZeroUsize::new(1));
+
+    serde_json::from_value::<AdditionalFileSystemPermissions>(payload(0))
+        .expect_err("zero glob scan depth should fail deserialization");
+}
+
+#[test]
+fn canonical_permission_entries_override_legacy_roots_even_when_empty() {
+    // `entries` is authoritative. Falling back when it is empty would silently
+    // restore grants that a client explicitly removed.
+    for entries in [
+        Vec::new(),
+        vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Deny,
+        }],
+    ] {
+        let permissions = AdditionalFileSystemPermissions {
+            read: Some(vec![absolute_path("stale-read").into()]),
+            write: Some(vec![absolute_path("stale-write").into()]),
+            glob_scan_max_depth: NonZeroUsize::new(3),
+            entries: Some(entries.clone()),
+        };
+        let expected_entries = if entries.is_empty() {
+            Vec::new()
+        } else {
+            vec![CoreFileSystemSandboxEntry {
+                path: CoreFileSystemPath::Special {
+                    value: CoreFileSystemSpecialPath::Root,
+                },
+                access: CoreFileSystemAccessMode::Deny,
+            }]
+        };
+        let native = CoreFileSystemPermissions::try_from(permissions.clone())
+            .expect("canonical native permissions");
+        assert_eq!(native.entries, expected_entries);
+        assert_eq!(native.glob_scan_max_depth, NonZeroUsize::new(3));
+
+        let granted = GrantedPermissionProfile {
+            network: None,
+            file_system: Some(permissions),
+        }
+        .into_core_with_cwd(&PathUri::parse("file:///thread/workspace").unwrap())
+        .expect("canonical URI permissions")
+        .file_system
+        .unwrap();
+        assert_eq!(granted.entries.len(), entries.len());
+        if let Some(entry) = granted.entries.first() {
+            assert_eq!(entry.access, CoreFileSystemAccessMode::Deny);
+            assert_eq!(entry.path, CoreFileSystemPath::Special {
+                value: CoreFileSystemSpecialPath::Root,
+            });
+        }
+        assert_eq!(granted.glob_scan_max_depth, NonZeroUsize::new(3));
+    }
+}
+
+#[test]
+fn permission_grants_resolve_relative_paths_against_selected_environment_cwd() {
+    let cwd = PathUri::parse("file:///selected-environment/workspace").unwrap();
+    for file_system in [
+        json!({"read": ["data/input.txt"], "write": null}),
+        json!({"read": null, "write": null, "entries": [{
+            "path": {"type": "path", "path": "data/input.txt"}, "access": "read"
+        }]}),
+    ] {
+        let profile: GrantedPermissionProfile = serde_json::from_value(json!({
+            "fileSystem": file_system,
+        })).unwrap();
+        let resolved = profile.into_core_with_cwd(&cwd).unwrap().file_system.unwrap();
+        assert_eq!(resolved.entries, vec![CoreFileSystemSandboxEntry {
+            path: CoreFileSystemPath::Path {
+                path: PathUri::parse("file:///selected-environment/workspace/data/input.txt")
+                    .unwrap(),
+            },
+            access: CoreFileSystemAccessMode::Read,
+        }]);
+    }
 }
 
 #[test]
@@ -1494,9 +1602,14 @@ fn terminal_size_wrappers_share_the_canonical_payload() {
 
     assert_eq!(command.into_inner(), canonical);
     assert_eq!(process.into_inner(), canonical);
+    let expected = json!({"rows": 48, "cols": 132});
     assert_eq!(
         serde_json::to_value(command).expect("serialize command terminal size"),
-        serde_json::to_value(process).expect("serialize process terminal size")
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(process).expect("serialize process terminal size"),
+        expected
     );
 }
 
@@ -2020,16 +2133,20 @@ fn mcp_server_elicitation_request_from_core_form_request() {
     })
     .expect("form request should convert");
 
-    let expected_schema: McpElicitationSchema = serde_json::from_value(json!({
-        "type": "object",
-        "properties": {
-            "confirmed": {
-                "type": "boolean",
-            }
-        },
-        "required": ["confirmed"],
-    }))
-    .expect("expected schema should deserialize");
+    let expected_schema = McpElicitationSchema {
+        schema_uri: None,
+        type_: McpElicitationObjectType::Object,
+        properties: BTreeMap::from([(
+            "confirmed".to_string(),
+            McpElicitationPrimitiveSchema::Boolean(McpElicitationBooleanSchema {
+                type_: McpElicitationBooleanType::Boolean,
+                title: None,
+                description: None,
+                default: None,
+            }),
+        )]),
+        required: Some(vec!["confirmed".to_string()]),
+    };
 
     assert_eq!(
         request,
@@ -2187,7 +2304,7 @@ fn mcp_server_elicitation_request_rejects_null_core_form_schema() {
 
 #[test]
 fn mcp_server_elicitation_request_rejects_invalid_core_form_schema() {
-    let result = McpServerElicitationRequest::try_from(CoreElicitationRequest::Form {
+    let err = McpServerElicitationRequest::try_from(CoreElicitationRequest::Form {
         meta: None,
         message: "Allow this request?".to_string(),
         requested_schema: json!({
@@ -2198,9 +2315,15 @@ fn mcp_server_elicitation_request_rejects_invalid_core_form_schema() {
                 }
             },
         }),
-    });
+    })
+    .expect_err("form schema with an object-typed property should be rejected");
 
-    assert!(result.is_err());
+    // The enclosing schema is well-formed; the rejection must come from the
+    // unsupported property schema.
+    assert!(
+        err.to_string().contains("McpElicitationPrimitiveSchema"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -3252,10 +3375,15 @@ fn skills_extra_roots_set_params_serialization_uses_extra_roots() {
 
 #[test]
 fn skills_extra_roots_set_params_rejects_relative_roots() {
-    let result = serde_json::from_value::<SkillsExtraRootsSetParams>(json!({
+    let err = serde_json::from_value::<SkillsExtraRootsSetParams>(json!({
         "extraRoots": ["relative/path"],
-    }));
-    assert!(result.is_err());
+    }))
+    .expect_err("relative extra roots should fail deserialization");
+    assert!(
+        err.to_string()
+            .contains("AbsolutePathBuf deserialized without a base path"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -4111,8 +4239,15 @@ fn thread_lifecycle_responses_default_missing_optional_fields() {
     assert_eq!(resume.active_permission_profile, None);
     assert_eq!(resume.initial_turns_page, None);
     assert_eq!(fork.active_permission_profile, None);
+    // The source must be foreign to the test host; a host-native path would also survive a
+    // conversion that wrongly applied host path rules.
+    let (raw_foreign_source, raw_foreign_source_uri) = if cfg!(windows) {
+        ("/workspace/AGENTS.md", "file:///workspace/AGENTS.md")
+    } else {
+        (r"C:\workspace\AGENTS.md", "file:///C:/workspace/AGENTS.md")
+    };
     let foreign_source: LegacyAppPathString =
-        serde_json::from_value(json!(r"C:\workspace\AGENTS.md")).expect("foreign source");
+        serde_json::from_value(json!(raw_foreign_source)).expect("foreign source");
     let mut response_with_foreign_source = response;
     response_with_foreign_source["instructionSources"] = json!([foreign_source.as_str()]);
     let start: ThreadStartResponse = serde_json::from_value(response_with_foreign_source.clone())
@@ -4124,8 +4259,7 @@ fn thread_lifecycle_responses_default_missing_optional_fields() {
     assert_eq!(start.instruction_sources, vec![foreign_source.clone()]);
     assert_eq!(resume.instruction_sources, vec![foreign_source.clone()]);
     assert_eq!(fork.instruction_sources, vec![foreign_source]);
-    let foreign_source_uri =
-        PathUri::parse("file:///C:/workspace/AGENTS.md").expect("foreign source URI");
+    let foreign_source_uri = PathUri::parse(raw_foreign_source_uri).expect("foreign source URI");
     assert_eq!(
         start.instruction_source_path_uris(),
         vec![foreign_source_uri.clone()]
@@ -4364,13 +4498,14 @@ fn turn_start_params_round_trip_environments() {
         Some("turn/start.environments")
     );
 
+    // Compare against the raw spelling: `cwd` itself went through the serde path under test.
     let serialized = serde_json::to_value(&params).expect("params should serialize");
     assert_eq!(
         serialized.get("environments"),
         Some(&json!([
             {
                 "environmentId": "local",
-                "cwd": cwd
+                "cwd": raw_cwd
             }
         ]))
     );

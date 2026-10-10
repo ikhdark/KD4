@@ -266,6 +266,64 @@ async fn repairs_recency_migration_that_was_applied_as_version_38() {
 }
 
 #[tokio::test]
+async fn recency_repair_accepts_both_checkout_line_endings_without_rewriting_checksums() {
+    for line_endings in [MigrationLineEndings::Lf, MigrationLineEndings::Crlf] {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should open");
+        let recency = STATE_MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 39)
+            .expect("recency migration");
+        let mut migrations = migrator_through(37).migrations.into_owned();
+        migrations.push(Migration::new(
+            38,
+            recency.description.clone(),
+            recency.migration_type,
+            recency.sql.clone(),
+            recency.no_tx,
+        ));
+        migrator_with_line_endings(&Migrator::with_migrations(migrations), line_endings)
+            .run(&pool)
+            .await
+            .expect("legacy checkout migration history");
+        let mut expected_ledger = migration_ledger(&pool).await;
+        let legacy_row = expected_ledger.last_mut().expect("legacy recency row");
+        assert_eq!(legacy_row.0, 38);
+        // Only the version changes; recorded checksum and application metadata
+        // belong to the original checkout and must remain byte-for-byte intact.
+        legacy_row.0 = 39;
+
+        // Match open_sqlite: normalize the pending checksum before repairing
+        // the legacy version, then run this same compatible migrator.
+        let compatible = runtime_migrator_for_pool(&pool, &runtime_state_migrator())
+            .await
+            .expect("infer the checkout convention before legacy repair");
+        repair_legacy_recency_migration_version(&pool, &compatible)
+            .await
+            .expect("equivalent LF and CRLF migrations should repair");
+        assert_eq!(migration_ledger(&pool).await, expected_ledger, "{line_endings:?}");
+
+        compatible
+            .run(&pool)
+            .await
+            .expect("remaining migrations should apply");
+        assert!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'external_agent_config_imports'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .expect("current migration 38 schema")
+            .is_some()
+        );
+    }
+}
+
+#[tokio::test]
 async fn runtime_migrator_preserves_the_complete_crlf_ledger() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

@@ -7,7 +7,7 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn network_approval_context_requires_ask_from_decider() {
-    let payload = NetworkPolicyDecisionPayload {
+    let mut payload = NetworkPolicyDecisionPayload {
         decision: NetworkPolicyDecision::Deny,
         source: NetworkDecisionSource::Decider,
         protocol: Some(NetworkApprovalProtocol::Https),
@@ -17,6 +17,23 @@ fn network_approval_context_requires_ask_from_decider() {
     };
 
     assert_eq!(network_approval_context_from_payload(&payload), None);
+    payload.decision = NetworkPolicyDecision::Ask;
+    for source in [
+        NetworkDecisionSource::BaselinePolicy,
+        NetworkDecisionSource::ModeGuard,
+        NetworkDecisionSource::ProxyState,
+    ] {
+        payload.source = source;
+        assert_eq!(network_approval_context_from_payload(&payload), None, "{source:?}");
+    }
+    payload.source = NetworkDecisionSource::Decider;
+    assert_eq!(
+        network_approval_context_from_payload(&payload),
+        Some(NetworkApprovalContext {
+            host: "example.com".to_string(),
+            protocol: NetworkApprovalProtocol::Https,
+        })
+    );
 }
 
 #[test]

@@ -363,6 +363,42 @@ async fn wait_for_status_change_wakes_on_job_commit_and_honors_runtime_deadline(
     assert_eq!(Instant::now() - started_at, Duration::from_millis(40));
 }
 
+#[tokio::test(start_paused = true)]
+async fn wait_for_status_change_handles_maximum_persisted_runtime_deadline() {
+    // The largest persisted positive timeout must not disable wakeups.
+    // Instant's representable range is platform-specific, not part of this contract.
+    let seconds = i64::MAX as u64;
+    assert_eq!(normalize_max_runtime_seconds(Some(seconds)).unwrap(), Some(seconds));
+    let runtime_timeout = Duration::from_secs(seconds);
+    for wake in ["job", "cancel", "reconcile"] {
+        let (jobs_tx, mut jobs) = tokio::sync::watch::channel(0);
+        let (_capacity_tx, mut capacity) = tokio::sync::watch::channel(0);
+        let (_status_tx, status_rx) = tokio::sync::watch::channel(AgentStatus::Running);
+        let cancellation = CancellationToken::new();
+        let started_at = Instant::now();
+        let active = HashMap::from([(ThreadId::new(), ActiveJobItem {
+            item_id: "long-runtime".into(), started_at, status_rx: Some(status_rx),
+        })]);
+        let wait = wait_for_status_change(
+            &active, &mut jobs, &mut capacity, &cancellation, runtime_timeout,
+        );
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        match wake {
+            "job" => { jobs_tx.send_replace(1); }
+            "cancel" => cancellation.cancel(),
+            "reconcile" => {},
+            _ => unreachable!(),
+        }
+        wait.await;
+        assert_eq!(
+            Instant::now() - started_at,
+            if wake == "reconcile" { Duration::from_secs(5) } else { Duration::ZERO },
+            "{wake} wakeup must not wait for the maximum persisted deadline",
+        );
+    }
+}
+
 #[tokio::test]
 async fn atomic_csv_write_replaces_existing_destination() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
@@ -382,18 +418,25 @@ async fn atomic_csv_write_replaces_existing_destination() {
 #[tokio::test]
 async fn atomic_csv_write_failure_leaves_no_partial_destination() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
-    let output_path = tempdir.path().join("x".repeat(300));
+    // An occupied directory resolves normally, so the failure is the rename of
+    // the staged temporary file rather than path resolution.
+    let output_path = tempdir.path().join("output.csv");
+    std::fs::create_dir(&output_path).expect("occupy destination with a directory");
+    std::fs::write(output_path.join("kept"), "old contents").expect("seed destination");
 
     write_job_csv_atomically(output_path.clone(), "partial csv contents".to_string())
         .await
-        .expect_err("overlong destination name should fail publication");
+        .expect_err("a directory destination should fail publication");
 
-    assert!(!output_path.exists());
+    assert_eq!(
+        std::fs::read_to_string(output_path.join("kept")).expect("read kept entry"),
+        "old contents"
+    );
     assert_eq!(
         std::fs::read_dir(tempdir.path())
             .expect("read tempdir")
             .count(),
-        0,
+        1,
         "failed publication should remove its temporary file"
     );
 }
@@ -467,9 +510,30 @@ async fn durability_regression_restart_reconciles_and_exports_partial_csv() {
     let csv = tokio::fs::read_to_string(job.output_csv_path.as_str())
         .await
         .expect("read reconciled partial csv");
-    assert!(csv.contains("completed"));
-    assert!(csv.contains("kept"));
-    assert!(csv.contains(codex_state::StateRuntime::AGENT_JOB_RESTART_ERROR));
+    let mut reader = csv::Reader::from_reader(csv.as_bytes());
+    assert_eq!(
+        reader.headers().expect("CSV headers"),
+        &csv::StringRecord::from(vec![
+            "value", "job_id", "item_id", "row_index", "source_id", "status",
+            "attempt_count", "last_error", "result_json", "reported_at", "completed_at",
+        ])
+    );
+    let rows = reader.records().collect::<Result<Vec<_>, _>>().expect("CSV records");
+    assert_eq!(rows.len(), 2, "restart export must preserve both input rows");
+    assert_eq!(
+        rows[0].iter().take(9).collect::<Vec<_>>(),
+        vec!["row-0", job.id.as_str(), "item-0", "0", "", "completed", "1", "", r#"{"result":"kept"}"#]
+    );
+    assert_eq!(
+        rows[1].iter().take(9).collect::<Vec<_>>(),
+        vec!["row-1", job.id.as_str(), "item-1", "1", "", "failed", "0",
+            codex_state::StateRuntime::AGENT_JOB_RESTART_ERROR, ""]
+    );
+    chrono::DateTime::parse_from_rfc3339(&rows[0][9]).expect("completed item report time");
+    assert_eq!(&rows[1][9], "", "unreported item must not acquire a report time");
+    for row in &rows {
+        chrono::DateTime::parse_from_rfc3339(&row[10]).expect("terminal item completion time");
+    }
 }
 
 #[tokio::test]
@@ -520,7 +584,19 @@ async fn runner_settles_non_limit_spawn_failure_without_retrying() {
 #[tokio::test]
 async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
     let (_tempdir, db, job) = create_running_job(/*item_count*/ 1).await;
-    let assigned_thread_id = ThreadId::new();
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = crate::ThreadManager::with_models_provider_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        turn.config.model_provider.clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    // A live worker survives restart recovery, so only cancellation can settle its item.
+    let assigned_thread_id = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("start worker thread")
+        .thread_id;
     assert!(
         db.mark_agent_job_item_running_with_thread(
             job.id.as_str(),
@@ -529,13 +605,6 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
         )
         .await
         .expect("bind running job item")
-    );
-    let (mut session, turn, _events) =
-        crate::session::tests::make_session_and_context_with_rx().await;
-    let manager = crate::ThreadManager::with_models_provider_for_tests(
-        codex_login::CodexAuth::from_api_key("dummy"),
-        turn.config.model_provider.clone(),
-        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     Arc::get_mut(&mut session)
         .expect("unique session")
@@ -570,12 +639,25 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
         .expect("load cancelled job")
         .expect("cancelled job should exist");
     assert_eq!(stored_job.status, codex_state::AgentJobStatus::Cancelled);
+    let item = db
+        .get_agent_job_item(job.id.as_str(), "item-0")
+        .await
+        .expect("load cancelled item")
+        .expect("cancelled item should exist");
+    assert_eq!(item.status, codex_state::AgentJobItemStatus::Failed);
+    assert_eq!(
+        item.last_error.as_deref(),
+        Some("job cancelled before worker completion")
+    );
     let progress = db
         .get_agent_job_progress(job.id.as_str())
         .await
         .expect("load cancelled job progress");
     assert_eq!(progress.running_items, 0);
     assert_eq!(progress.failed_items, 1);
+    assert!(manager.captured_ops().into_iter().any(|(thread_id, op)| {
+        thread_id == assigned_thread_id && matches!(op, codex_protocol::protocol::Op::Shutdown)
+    }));
     assert!(
         tokio::fs::try_exists(&job.output_csv_path)
             .await

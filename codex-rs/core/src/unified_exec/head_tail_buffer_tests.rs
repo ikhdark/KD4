@@ -45,6 +45,32 @@ fn utf8_projection_carries_every_byte_of_a_multibyte_character() {
 }
 
 #[test]
+fn utf8_projection_preserves_raw_bytes_and_only_defers_incomplete_suffix() {
+    let mut buffer = HeadTailBuffer::default();
+    // The invalid FF byte is producer evidence, not a replacement character.
+    // Only the incomplete euro sign may be carried to the next open poll;
+    // closure must flush even an incomplete suffix before the process retires.
+    for (chunk, closed, expected, range, has_carry) in [
+        (b"ready:\xff\xe2".as_slice(), false, b"ready:\xff".as_slice(), 0..7, true),
+        (b"".as_slice(), false, b"".as_slice(), 7..7, true),
+        (b"\x82\xac!".as_slice(), false, b"\xe2\x82\xac!".as_slice(), 7..11, false),
+        (b"\xe2\x82".as_slice(), false, b"".as_slice(), 11..11, true),
+        (b"".as_slice(), true, b"\xe2\x82".as_slice(), 11..13, false),
+    ] {
+        buffer.push_chunk(chunk);
+        buffer.collect_pending_output();
+        let projected = buffer.projected_pending_output(closed, &[]);
+        assert_eq!(projected.0, expected);
+        let ranges = projected.1.as_ref().unwrap();
+        assert_eq!(ranges.range, range);
+        assert_eq!(ranges.gap, None);
+        assert_eq!(projected, buffer.projected_pending_output(closed, &[]));
+        buffer.acknowledge_pending_output();
+        assert_eq!(buffer.has_unreported_output(), has_carry);
+    }
+}
+
+#[test]
 fn pending_reports_keep_absolute_chunk_and_gap_coordinates() {
     let mut source = HeadTailBuffer::new(8);
     source.push_chunk(b"first\r\n");
@@ -146,18 +172,22 @@ fn draining_resets_bytes_but_preserves_cumulative_loss_accounting() {
     buf.push_chunk(b"ab");
     buf.record_lagged_chunks(3);
 
-    let drained = buf.drain_chunks();
-    assert_eq!(drained, vec![b"01234".to_vec(), b"789ab".to_vec()]);
+    // The runtime drain moves the bytes and the unreported loss into the
+    // report; only the cumulative counts stay behind on the source.
+    let mut drained = HeadTailBuffer::default();
+    assert!(buf.drain_into(&mut drained));
+    assert_eq!(
+        drained.snapshot_chunks(),
+        vec![b"01234".to_vec(), b"789ab".to_vec()]
+    );
+    assert_eq!(drained.omitted_bytes(), 2);
+    assert_eq!(drained.lagged_chunks(), 3);
 
     assert_eq!(buf.retained_bytes(), 0);
     assert_eq!(buf.omitted_bytes(), 2);
-    assert_eq!(buf.take_unreported_omitted_bytes(), 2);
     assert_eq!(buf.take_unreported_omitted_bytes(), 0);
-    assert_eq!(buf.omitted_bytes(), 2);
     assert_eq!(buf.lagged_chunks(), 3);
-    assert_eq!(buf.take_unreported_lagged_chunks(), 3);
     assert_eq!(buf.take_unreported_lagged_chunks(), 0);
-    assert_eq!(buf.lagged_chunks(), 3);
     assert_eq!(buf.to_bytes(), b"".to_vec());
     buf.push_chunk(b"ABCDEFGHIJKL");
     assert_eq!(buf.to_bytes(), b"ABCDEHIJKL");

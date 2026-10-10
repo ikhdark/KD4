@@ -238,8 +238,8 @@ mod tests {
         );
         cell.questions[0].is_secret = true;
         assert_eq!(
-            cell.raw_lines().last().unwrap().to_string(),
-            "answer: ******"
+            cell.raw_lines().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["Questions 1/1 answered", "Enter a value", "answer: ******"]
         );
         assert_eq!(
             cell.display_lines(80).iter().map(ToString::to_string).collect::<Vec<_>>(),

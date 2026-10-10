@@ -1432,10 +1432,18 @@ connectors = true
     let marketplace_path =
         AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
 
+    // The app-server does not read OPENAI_API_KEY; only stored auth makes this
+    // an API-key session rather than an unauthenticated one.
+    codex_login::login_with_api_key(
+        codex_home.path(),
+        "test-api-key",
+        AuthCredentialsStoreMode::File,
+        codex_login::AuthKeyringBackendKind::default(),
+    )?;
+
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", Some("test-api-key"))])
         .build()
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;

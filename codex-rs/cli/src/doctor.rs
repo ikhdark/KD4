@@ -3797,6 +3797,18 @@ mod tests {
             check.summary,
             "OpenAI auth is not required for the active model provider"
         );
+
+        // Providers that do require OpenAI auth fall through to stored-credential checks.
+        assert!(
+            provider_specific_auth_check(
+                /*requires_openai_auth*/ true,
+                /*provider_env_key*/ None,
+                /*provider_env_key_instructions*/ None,
+                Vec::new(),
+                |_| false,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3819,6 +3831,22 @@ mod tests {
             check.remediation,
             Some("Set PROVIDER_API_KEY before running Codex.".to_string())
         );
+
+        let check = provider_specific_auth_check(
+            /*requires_openai_auth*/ false,
+            Some("PROVIDER_API_KEY"),
+            Some("Set PROVIDER_API_KEY before running Codex."),
+            Vec::new(),
+            |name| name == "PROVIDER_API_KEY",
+        )
+        .expect("non-OpenAI provider should produce a provider-specific check");
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(
+            check.summary,
+            "auth is provided by the active model provider"
+        );
+        assert_eq!(check.remediation, None);
     }
 
     #[test]
@@ -4487,7 +4515,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_dumb_terminal() {
+    fn terminal_check_fails_for_dumb_terminal() {
         let mut inputs = terminal_inputs();
         inputs.info.name = TerminalName::Dumb;
         inputs.info.term = Some("dumb".to_string());
@@ -4562,7 +4590,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_unreadable_terminfo_path() {
+    fn terminal_check_fails_for_unreadable_terminfo_path() {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let missing = tempdir.path().join("missing-terminfo");
         let mut inputs = terminal_inputs();

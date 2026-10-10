@@ -89,3 +89,23 @@ impl HookToolName {
         &self.matcher_aliases
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_aliases_do_not_replace_canonical_payload_names() {
+        for (identity, canonical, aliases) in [
+            (HookToolName::new("functions.echo"), "functions.echo", vec![]),
+            (HookToolName::apply_patch(), "apply_patch", vec!["Write", "Edit"]),
+            (HookToolName::spawn_agent(), "spawn_agent", vec!["Agent"]),
+            (HookToolName::bash(), "Bash", vec![]),
+            (HookToolName::shell_command(), "Bash", vec!["shell_command"]),
+            (HookToolName::exec_command(), "Bash", vec!["exec_command"]),
+        ] {
+            assert_eq!(identity.name(), canonical);
+            assert_eq!(identity.matcher_aliases(), aliases);
+        }
+    }
+}

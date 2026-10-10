@@ -90,21 +90,47 @@ fn read_only_text_turn_with_personality(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn personality_does_not_mutate_base_instructions_without_template() {
-    let codex_home = TempDir::new().expect("create temp dir");
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config
-        .features
-        .enable(Feature::Personality)
-        .expect("test config should allow feature update");
-    config.personality = Some(Personality::Friendly);
+async fn personality_does_not_mutate_base_instructions_without_template() -> anyhow::Result<()> {
+    require_network!();
 
-    let mut model_info = codex_core::test_support::construct_model_info_offline("gpt-5.4", &config);
-    model_info.model_messages = None;
-    assert_eq!(
-        model_info.get_model_instructions(config.personality),
-        model_info.base_instructions
+    let server = start_mock_server().await;
+    let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config
+            .features
+            .enable(Feature::Personality)
+            .expect("test config should allow feature update");
+        config.personality = Some(Personality::Friendly);
+    });
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(read_only_text_turn(
+            &test,
+            "hello",
+            test.session_configured.model.clone(),
+            test.config.permissions.approval_policy.value(),
+        ))
+        .await?;
+
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    // The catalog entry has no template, so the request must carry the model's
+    // base instructions untouched while the personality travels separately.
+    let model_info =
+        codex_core::test_support::construct_model_info_offline("gpt-5.4", &test.config);
+    assert_eq!(model_info.model_messages, None);
+    let request = resp_mock.single_request();
+    assert_eq!(request.instructions_text(), model_info.base_instructions);
+    assert!(
+        request
+            .message_input_texts("developer")
+            .iter()
+            .any(|text| text.contains("<personality_spec>")),
+        "the friendly personality must be active for this turn"
     );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -116,9 +142,14 @@ async fn base_instructions_override_disables_personality_template() {
         .enable(Feature::Personality)
         .expect("test config should allow feature update");
     config.personality = Some(Personality::Friendly);
+    let templated = codex_core::test_support::construct_model_info_offline(
+        "exp-codex-personality",
+        &config,
+    );
+    assert!(templated.get_model_instructions(config.personality).contains(LOCAL_FRIENDLY_TEMPLATE));
     config.base_instructions = Some("override instructions".to_string());
 
-    let model_info = codex_core::test_support::construct_model_info_offline("gpt-5.4", &config);
+    let model_info = codex_core::test_support::construct_model_info_offline("exp-codex-personality", &config);
 
     assert_eq!(model_info.base_instructions, "override instructions");
     assert_eq!(
@@ -160,7 +191,7 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
     core_test_support::wait_for_event_envelope_with_timeout(
         &test.codex,
         |ev| ev.id == submission_id && matches!(ev.msg, EventMsg::TurnComplete(_)),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
     )
     .await;
 
@@ -414,7 +445,7 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_personality_same_value_reinjects_update_message() -> anyhow::Result<()> {
+async fn user_turn_personality_same_value_preserves_single_active_instruction() -> anyhow::Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
@@ -467,17 +498,26 @@ async fn user_turn_personality_same_value_reinjects_update_message() -> anyhow::
 
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 2, "expected two requests");
+    let initial_personality = requests[0].message_input_texts("developer")
+        .into_iter()
+        .filter(|text| text.contains("<personality_spec>"))
+        .collect::<Vec<_>>();
+    assert_eq!(initial_personality.len(), 1);
+    assert!(initial_personality[0].contains(LOCAL_PRAGMATIC_TEMPLATE));
     let request = requests
         .last()
         .expect("expected second request after personality override");
 
     let developer_texts = request.message_input_texts("developer");
-    let personality_text = developer_texts
-        .iter()
-        .find(|text| text.contains("<personality_spec>"));
+    let personality_texts = developer_texts.iter()
+        .filter(|text| text.contains("<personality_spec>"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(personality_texts, initial_personality);
+    let personality_text = personality_texts.first();
     assert!(
         personality_text.is_some_and(|text| text.contains(LOCAL_PRAGMATIC_TEMPLATE)),
-        "expected the unchanged personality to be reinjected, got {personality_text:?}"
+        "expected the unchanged personality to remain active, got {personality_text:?}"
     );
 
     Ok(())
@@ -489,11 +529,21 @@ async fn instructions_uses_base_if_feature_disabled() -> anyhow::Result<()> {
     let mut config = load_default_config_for_test(&codex_home).await;
     config
         .features
-        .disable(Feature::Personality)
+        .enable(Feature::Personality)
         .expect("test config should allow feature update");
     config.personality = Some(Personality::Friendly);
 
-    let model_info = codex_core::test_support::construct_model_info_offline("gpt-5.4", &config);
+    let templated = codex_core::test_support::construct_model_info_offline(
+        "exp-codex-personality",
+        &config,
+    );
+    assert!(templated.get_model_instructions(config.personality).contains(LOCAL_FRIENDLY_TEMPLATE));
+    config.features.disable(Feature::Personality)
+        .expect("test config should allow feature update");
+    let model_info = codex_core::test_support::construct_model_info_offline(
+        "exp-codex-personality",
+        &config,
+    );
     assert_eq!(
         model_info.get_model_instructions(config.personality),
         model_info.base_instructions
@@ -822,10 +872,19 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
 
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 2, "expected two requests");
+    let initial_personality = requests[0].message_input_texts("developer");
+    assert!(initial_personality.iter().any(|text| {
+        text.contains("<personality_spec>") && text.contains(remote_pragmatic_message)
+    }));
     let request = requests
         .last()
         .expect("expected personality update request");
     let developer_texts = request.message_input_texts("developer");
+    assert_eq!(developer_texts.iter()
+        .filter(|text| text.contains("<personality_spec>")).count(), 1);
+    assert!(!developer_texts.iter().any(|text| {
+        text.contains("<personality_spec>") && text.contains(remote_pragmatic_message)
+    }));
     let personality_text = developer_texts
         .iter()
         .find(|text| text.contains(remote_friendly_message))

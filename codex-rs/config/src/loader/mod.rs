@@ -1786,8 +1786,10 @@ foo = "xyzzy"
 
     #[test]
     fn windows_system_files_use_the_program_data_codex_directory() {
-        let program_data = windows_program_data_dir_from_known_folder()
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS));
+        // `%ProgramData%` names the same folder without using the known-folder lookup under test.
+        let program_data = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS));
         for (path, filename) in [
             (windows_system_requirements_toml_file(), "requirements.toml"),
             (windows_system_config_toml_file(), "config.toml"),

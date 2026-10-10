@@ -1467,10 +1467,16 @@ Run codex doctor without --summary for detailed diagnostics.
 
         let rendered = render_human_report(&report, summary_no_color_unicode_options());
 
-        let threads_line = rendered
+        // Stop at the blank line that ends the group, so a row under a later group or
+        // under Other does not count.
+        let environment = rendered
             .split_once("Environment\n")
             .expect("Environment section")
             .1
+            .split_once("\n\n")
+            .expect("end of Environment section")
+            .0;
+        let threads_line = environment
             .lines()
             .find(|line| line.contains("threads"))
             .expect("threads row should be rendered");

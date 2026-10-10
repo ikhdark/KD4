@@ -285,6 +285,10 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         serde_json::json!(expected_instructions),
     );
     assert_tool_names(&body1, &expected_tools_names);
+    assert_eq!(
+        body0["tools"], body1["tools"],
+        "unchanged turns must preserve complete tool schemas, not only names"
+    );
 
     Ok(())
 }
@@ -362,6 +366,10 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
 
     let body2 = req2.single_request().body_json();
     let input2 = body2["input"].as_array().expect("input array");
+    assert_eq!(
+        input2.len(), input1.len() + 1,
+        "only the new user message should extend the unchanged prefix"
+    );
     assert_eq_without_metadata(
         serde_json::Value::Array(input2[..input1.len()].to_vec()),
         serde_json::Value::Array(input1.to_vec()),
@@ -454,6 +462,8 @@ async fn overrides_turn_context_preserve_history_and_update_cache_routing() -> a
     let body1 = request1.body_json();
     let body2 = request2.body_json();
     // Permission changes alter schemas without changing thread cache routing.
+    assert_eq!(body2["reasoning"]["effort"], "high");
+    assert_eq!(body2["reasoning"]["summary"], "detailed");
     assert_ne!(body1["tools"], body2["tools"]);
     assert_eq!(
         body1["prompt_cache_key"],
@@ -588,9 +598,13 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
         .flatten()
         .filter(|text| text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG))
         .collect();
-    assert!(
-        !env_texts.is_empty(),
-        "expected environment context to be emitted: {env_texts:?}"
+    assert_eq!(
+        env_texts.len(), 1,
+        "expected exactly one environment context: {env_texts:?}"
+    );
+    assert_eq!(
+        environment_contexts(&body).len(), 1,
+        "environment context must have the user role"
     );
     assert!(
         env_texts
@@ -622,10 +636,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
                 .is_some()
         })
         .count();
-    assert!(
-        env_count >= 1,
-        "environment context should appear at least once, found {env_count}"
-    );
+    assert_eq!(env_count, 1, "environment context should appear exactly once");
 
     let permissions_texts: Vec<&str> = input
         .iter()
@@ -649,18 +660,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
         "permissions message should reflect overridden approval policy: {permissions_texts:?}"
     );
 
-    let user_texts: Vec<&str> = input
-        .iter()
-        .filter_map(|msg| {
-            msg["content"].as_array().map(|content| {
-                content
-                    .iter()
-                    .filter_map(|item| item["text"].as_str())
-                    .collect::<Vec<_>>()
-            })
-        })
-        .flatten()
-        .collect();
+    let user_texts = message_texts(&body, "user");
     assert!(
         user_texts.contains(&"first message"),
         "expected user message text, got {user_texts:?}"
@@ -746,6 +746,7 @@ async fn per_turn_overrides_preserve_history_and_update_cache_routing() -> anyho
     let body2 = request2.body_json();
 
     // Model changes retain the thread's cache routing identity.
+    assert_eq!(body2["model"], "o3");
     assert_ne!(body1["model"], body2["model"]);
     assert_eq!(
         body1["prompt_cache_key"],
@@ -897,6 +898,10 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
 
     let input1 = body1["input"].as_array().expect("first input array");
     let input2 = body2["input"].as_array().expect("second input array");
+    assert_eq!(
+        input2.len(), input1.len() + 1,
+        "unchanged overrides must not add trailing context or duplicate input"
+    );
     assert_eq_without_metadata(
         serde_json::Value::Array(input2[..input1.len()].to_vec()),
         serde_json::Value::Array(input1.clone()),
@@ -1008,6 +1013,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     let body2 = request2.body_json();
 
     let initial_env = environment_contexts(&body1);
+    assert_eq!(body2["model"], "o3");
     assert_eq!(initial_env.len(), 1);
     assert_default_env_context(initial_env[0], &default_cwd.to_string_lossy());
     assert!(
@@ -1040,6 +1046,8 @@ async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
     require_network!();
 
     let server = start_mock_server().await;
+    let reasoning_one = ev_reasoning_item("rs_reasoning_1", &["summary one"], &["plaintext one"]);
+    let reasoning_two = ev_reasoning_item("rs_reasoning_2", &["summary two"], &["plaintext two"]);
     let plan_args = serde_json::json!({
         "explanation": "reasoning projection integration test",
         "plan": [{"step": "complete tool follow-up", "status": "in_progress"}],
@@ -1050,13 +1058,13 @@ async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
         vec![
             sse(vec![
                 ev_response_created("response-1"),
-                ev_reasoning_item("rs_reasoning_1", &["summary one"], &["plaintext one"]),
+                reasoning_one.clone(),
                 ev_function_call("plan-call", "update_plan", &plan_args),
                 ev_completed("response-1"),
             ]),
             sse(vec![
                 ev_response_created("response-2"),
-                ev_reasoning_item("rs_reasoning_2", &["summary two"], &["plaintext two"]),
+                reasoning_two.clone(),
                 ev_assistant_message("message-2", "tool follow-up complete"),
                 ev_completed("response-2"),
             ]),
@@ -1093,6 +1101,10 @@ async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
         "plaintext one"
     );
     assert!(request_2_reasoning[0]["encrypted_content"].is_string());
+    assert_eq!(
+        request_2_reasoning[0]["encrypted_content"],
+        reasoning_one["item"]["encrypted_content"]
+    );
     assert!(
         requests[1]
             .inputs_of_type("function_call_output")
@@ -1107,18 +1119,28 @@ async fn reasoning_is_preserved_across_instructions_and_persisted_in_rollout()
     assert_eq!(request_3_reasoning[1]["summary"][0]["text"], "summary two");
     assert_eq!(request_3_reasoning[1]["content"][0]["text"], "plaintext two");
     assert!(request_3_reasoning[1]["encrypted_content"].is_string());
+    assert_eq!(
+        request_3_reasoning[1]["encrypted_content"],
+        reasoning_two["item"]["encrypted_content"]
+    );
 
     test.codex.flush_rollout().await?;
     let persisted_reasoning = persisted_reasoning_items(&rollout_path).await;
     assert_eq!(persisted_reasoning.len(), 2);
-    for (item, expected_summary, expected_plaintext) in [
-        (&persisted_reasoning[0], "summary one", "plaintext one"),
-        (&persisted_reasoning[1], "summary two", "plaintext two"),
+    for (item, expected_summary, expected_plaintext, expected) in [
+        (
+            &persisted_reasoning[0], "summary one", "plaintext one", &reasoning_one["item"],
+        ),
+        (
+            &persisted_reasoning[1], "summary two", "plaintext two", &reasoning_two["item"],
+        ),
     ] {
         let item = serde_json::to_value(item)?;
         assert_eq!(item["summary"][0]["text"], expected_summary);
         assert_eq!(item["content"][0]["text"], expected_plaintext);
         assert!(item["encrypted_content"].is_string());
+        assert_eq!(item["id"], expected["id"]);
+        assert_eq!(item["encrypted_content"], expected["encrypted_content"]);
     }
 
     Ok(())

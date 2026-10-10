@@ -70,6 +70,196 @@ fn import_success(
     }
 }
 
+fn assert_import_waits_for_config_transaction(mcp: bool) {
+    let (root, external_agent_home, codex_home) = fixture_paths();
+    fs::create_dir_all(&external_agent_home).expect("create external home");
+    fs::create_dir_all(&codex_home).expect("create codex home");
+    fs::write(
+        external_agent_home.join("settings.json"),
+        r#"{"env":{"IMPORTED":"yes"}}"#,
+    )
+    .expect("write settings");
+    fs::write(
+        root.path().join(".mcp.json"),
+        r#"{"mcpServers":{"docs":{"command":"docs-server"}}}"#,
+    )
+    .expect("write MCP config");
+    let config_path = codex_home.join("config.toml");
+    fs::write(&config_path, "model = \"before\"\n").expect("write initial config");
+    let lock = codex_file_system::acquire_atomic_write_lock(&config_path)
+        .expect("hold a competing config transaction");
+    let mut service = service_for_paths(external_agent_home, codex_home);
+    // `import()` always installs a token, which selects the polling lock wait.
+    service.import_cancellation = Some(tokio_util::sync::CancellationToken::new());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal import start");
+        let result = if mcp {
+            service.import_mcp_server_config(None).map(|_| ())
+        } else {
+            service.import_config(None).map(|_| ())
+        };
+        done_tx.send(result).expect("send import result");
+    });
+    let timeout = std::time::Duration::from_secs(5);
+    started_rx.recv_timeout(timeout).expect("import starts");
+    let early_result = done_rx.recv_timeout(std::time::Duration::from_millis(250));
+    // Publish the competing transaction before releasing its lock. Import must
+    // read and merge this version, not a snapshot from before acquiring the lock.
+    fs::write(&config_path, "model = \"concurrent\"\n").expect("commit competing config");
+    drop(lock);
+    let waited_for_lock = matches!(early_result, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    let result = match early_result {
+        Ok(result) => result,
+        Err(_) => done_rx.recv_timeout(timeout).expect("import finishes after unlock"),
+    };
+    worker.join().expect("import worker finishes");
+    result.expect("import succeeds");
+    let config: TomlValue = toml::from_str(&fs::read_to_string(config_path).expect("read config"))
+        .expect("parse config");
+    assert!(
+        waited_for_lock,
+        "import bypassed the active config transaction"
+    );
+    assert_eq!(config["model"].as_str(), Some("concurrent"));
+    if mcp {
+        assert_eq!(
+            config["mcp_servers"]["docs"]["command"].as_str(),
+            Some("docs-server")
+        );
+    } else {
+        assert_eq!(
+            config["shell_environment_policy"]["set"]["IMPORTED"].as_str(),
+            Some("yes")
+        );
+    }
+}
+
+#[test]
+fn config_import_waits_for_transaction_and_preserves_concurrent_update() {
+    assert_import_waits_for_config_transaction(false);
+}
+
+#[test]
+fn mcp_import_waits_for_transaction_and_preserves_concurrent_update() {
+    assert_import_waits_for_config_transaction(true);
+}
+
+#[test]
+fn cancelled_import_waiting_for_config_lock_does_not_hold_runtime_open() {
+    for mcp in [false, true] {
+        let (root, external_agent_home, codex_home) = fixture_paths();
+        fs::create_dir_all(&external_agent_home).expect("external home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::write(external_agent_home.join("settings.json"), r#"{"env":{"IMPORTED":"yes"}}"#)
+            .expect("settings");
+        fs::write(root.path().join(".mcp.json"), r#"{"mcpServers":{"docs":{"command":"docs-server"}}}"#)
+            .expect("MCP settings");
+        let config_path = codex_home.join("config.toml");
+        let original = "model = \"before\"\n";
+        fs::write(&config_path, original).expect("config");
+        let lock = codex_file_system::acquire_atomic_write_lock(&config_path).expect("competing lock");
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (abort_tx, abort_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let mut service = service_for_paths(external_agent_home, codex_home);
+        service.config_lock_attempted = Some(attempted_tx);
+        let runtime_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1).enable_all().build().expect("private runtime");
+            runtime.block_on(async move {
+                let task = tokio::spawn(async move {
+                    service.import(vec![ExternalAgentConfigMigrationItem {
+                        item_type: if mcp { ExternalAgentConfigMigrationItemType::McpServerConfig }
+                            else { ExternalAgentConfigMigrationItemType::Config },
+                        description: "cancel before config lock admission".to_string(),
+                        cwd: None, details: None,
+                    }]).await
+                });
+                let _ = abort_tx.send(task.abort_handle());
+                let _ = task.await;
+            });
+            // Match the real binary's normal Tokio runtime destruction. A
+            // blocking import that ignores cancellation prevents this return.
+            drop(runtime);
+            let _ = exited_tx.send(());
+        });
+        let timeout = std::time::Duration::from_secs(5);
+        let abort = abort_rx.recv_timeout(timeout);
+        let attempted = attempted_rx.recv_timeout(timeout);
+        if let Ok(abort) = &abort {
+            abort.abort();
+        }
+        let exited_before_unlock = exited_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+        // Release resources before every assertion, including the RED path.
+        drop(lock);
+        let joined = runtime_thread.join();
+        assert!(abort.is_ok(), "service task started");
+        assert!(attempted.is_ok(), "real import reached config lock admission");
+        assert!(joined.is_ok(), "runtime thread completed after releasing the lock");
+        assert!(exited_before_unlock, "cancelled import held runtime open; mcp={mcp}");
+        assert_eq!(fs::read_to_string(&config_path).expect("config after cancellation"), original);
+    }
+}
+
+#[test]
+fn cancelled_import_finishes_admitted_transaction_but_skips_the_next_item() {
+    for mcp_first in [false, true] {
+        let (root, external_agent_home, codex_home) = fixture_paths();
+        fs::create_dir_all(&external_agent_home).expect("external home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::write(external_agent_home.join("settings.json"), r#"{"env":{"IMPORTED":"yes"}}"#).expect("settings");
+        fs::write(root.path().join(".mcp.json"), r#"{"mcpServers":{"docs":{"command":"docs-server"}}}"#).expect("MCP settings");
+        let config_path = codex_home.join("config.toml");
+        fs::write(&config_path, "model = \"before\"\n").expect("config");
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (abort_tx, abort_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let mut service = service_for_paths(external_agent_home, codex_home);
+        service.config_lock_admitted = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            ConfigLockAdmissionTestControl { reached: admitted_tx, release: release_rx },
+        ))));
+        let runtime_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
+                .enable_all().build().expect("private runtime");
+            runtime.block_on(async move {
+                let task = tokio::spawn(async move {
+                    service.import([mcp_first, !mcp_first].into_iter().map(|mcp| {
+                        ExternalAgentConfigMigrationItem {
+                            item_type: if mcp { ExternalAgentConfigMigrationItemType::McpServerConfig }
+                                else { ExternalAgentConfigMigrationItemType::Config },
+                            description: "admission cancellation boundary".to_string(), cwd: None, details: None,
+                        }
+                    }).collect()).await
+                });
+                let _ = abort_tx.send(task.abort_handle());
+                let _ = task.await;
+                let _ = cancelled_tx.send(());
+            });
+            drop(runtime);
+        });
+        let timeout = std::time::Duration::from_secs(5);
+        let abort = abort_rx.recv_timeout(timeout);
+        let admitted = admitted_rx.recv_timeout(timeout);
+        // The transaction must hold the exact shared OS lock until publication.
+        let locked = codex_file_system::try_acquire_atomic_write_lock(&config_path)
+            .map(|lock| lock.is_none());
+        if let Ok(abort) = &abort { abort.abort(); }
+        let cancelled = cancelled_rx.recv_timeout(timeout);
+        let released = release_tx.send(());
+        let joined = runtime_thread.join();
+        assert!(abort.is_ok() && admitted.is_ok() && cancelled.is_ok() && released.is_ok());
+        assert!(joined.is_ok());
+        assert!(locked.expect("probe shared lock"));
+        let config: TomlValue = toml::from_str(&fs::read_to_string(&config_path).expect("config")).expect("TOML");
+        assert_eq!(config["model"].as_str(), Some("before"));
+        assert_eq!(config.get("mcp_servers").is_some(), mcp_first);
+        assert_eq!(config.get("shell_environment_policy").is_some(), !mcp_first);
+    }
+}
+
 #[tokio::test]
 async fn detect_home_lists_config_skills_and_agents_md() {
     let (_root, external_agent_home, codex_home) = fixture_paths();
@@ -2353,6 +2543,10 @@ async fn import_plugins_requires_source_marketplace_details() {
         "formatter@other-tools",
         /*error_type*/ None,
     );
+    assert_eq!(
+        outcome.raw_errors[0].message,
+        "external agent plugin marketplace source was not found: other-tools"
+    );
 }
 
 #[tokio::test]
@@ -2392,6 +2586,12 @@ async fn import_plugins_defers_marketplace_source_validation_to_add_marketplace(
         "plugin_import",
         "formatter@acme-tools",
         /*error_type*/ None,
+    );
+    // The same outcome shape is produced when the source is rejected up front.
+    let message = &outcome.raw_errors[0].message;
+    assert!(
+        message.contains("failed to resolve local marketplace source path"),
+        "error did not come from add_marketplace: {message}"
     );
 }
 

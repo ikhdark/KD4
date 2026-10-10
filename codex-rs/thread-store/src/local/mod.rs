@@ -1188,8 +1188,10 @@ mod tests {
             .await
             .expect("live rollout path");
 
+        // Only an ordered append stays buffered; a plain append flushes and applies its
+        // metadata before shutdown is ever called.
         live_thread
-            .append_items(&[RolloutItem::EventMsg(EventMsg::TokenCount(
+            .append_items_ordered(&[RolloutItem::EventMsg(EventMsg::TokenCount(
                 codex_protocol::protocol::TokenCountEvent {
                     info: None,
                     rate_limits: None,
@@ -1197,6 +1199,20 @@ mod tests {
             ))])
             .await
             .expect("append metadata-only item");
+        assert!(
+            !tokio::fs::try_exists(rollout_path.as_path())
+                .await
+                .expect("rollout path should be checkable"),
+            "the appended item must still be buffered when shutdown starts"
+        );
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("sqlite metadata read"),
+            None,
+            "buffered metadata must wait for the shutdown barrier"
+        );
         live_thread.shutdown().await.expect("shutdown thread");
 
         assert!(

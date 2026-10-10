@@ -852,12 +852,18 @@ terminal_resize_reflow_max_rows = 9000
         let current_cwd = app.config.cwd.clone();
         let next_cwd_tmp = tempdir()?;
         let next_cwd = next_cwd_tmp.path().to_path_buf();
+        let expected_error = format!("Failed to rebuild config for cwd {}", next_cwd.display());
 
         let result = app
             .rebuild_config_for_resume_or_fallback(&current_cwd, next_cwd)
             .await;
 
-        assert!(result.is_err());
+        assert_eq!(
+            result
+                .expect_err("a changed cwd must not fall back to the current config")
+                .to_string(),
+            expected_error
+        );
         Ok(())
     }
 

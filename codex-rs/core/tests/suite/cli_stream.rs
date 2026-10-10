@@ -164,7 +164,13 @@ async fn responses_mode_stream_cli_does_not_attempt_oauth_refresh_for_personal_a
         .await;
     let home = TempDir::new().unwrap();
 
-    let cmd = personal_access_token_exec_command(&server, &home);
+    let mut cmd = personal_access_token_exec_command(&server, &home);
+    // Without this a refresh attempt would go to the real endpoint and the
+    // zero-request expectation above could never be violated.
+    cmd.env(
+        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        format!("{}/oauth/token", server.uri()),
+    );
     let output = run_cli_command(cmd).await.expect("CLI completes");
 
     assert!(!output.status.success());
@@ -330,10 +336,7 @@ async fn exec_cli_applies_model_instructions_file() {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    assert!(
-        instructions.contains(marker),
-        "instructions did not contain custom marker; got: {instructions}"
-    );
+    assert_eq!(instructions, marker, "custom instructions replace the built-in text");
 }
 
 /// Verify that `codex exec --profile ...` preserves the active user config
@@ -401,10 +404,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    assert!(
-        instructions.contains(marker),
-        "instructions did not contain profile marker; got: {instructions}"
-    );
+    assert_eq!(instructions, marker, "profile instructions replace the built-in text");
 }
 
 
@@ -517,33 +517,33 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         Some("session_meta")
     );
     let payload = meta.get("payload").expect("Missing payload in meta line");
-    assert!(payload.get("id").is_some(), "SessionMeta missing id");
-    assert!(
-        payload.get("timestamp").is_some(),
-        "SessionMeta missing timestamp"
-    );
+    let session_id = payload["id"].as_str().expect("SessionMeta id is a string");
+    Uuid::parse_str(session_id).expect("SessionMeta id is a UUID");
+    chrono::DateTime::parse_from_rfc3339(
+        payload["timestamp"].as_str().expect("SessionMeta timestamp is a string"),
+    )
+    .expect("SessionMeta timestamp is RFC3339");
 
-    let mut found_message = false;
+    let mut matching_messages = 0;
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(item) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
+        let item: serde_json::Value =
+            serde_json::from_str(line).expect("every session record is valid JSON");
         if item.get("type").and_then(|t| t.as_str()) == Some("response_item")
             && let Some(payload) = item.get("payload")
             && payload.get("type").and_then(|t| t.as_str()) == Some("message")
-            && let Some(c) = payload.get("content")
-            && c.to_string().contains(&marker)
+            && payload.get("role").and_then(|t| t.as_str()) == Some("user")
+            && let Some(c) = payload.get("content").and_then(|c| c.as_array())
+            && c.iter().any(|part| part["type"] == "input_text" && part["text"] == prompt)
         {
-            found_message = true;
-            break;
+            matching_messages += 1;
         }
     }
-    assert!(
-        found_message,
-        "No message found in session file containing the marker"
+    assert_eq!(
+        matching_messages, 1,
+        "the original user prompt must be persisted exactly once"
     );
 
     // Second run: resume should update the existing file.
@@ -574,7 +574,23 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         String::from_utf8_lossy(&output2.stdout),
         String::from_utf8_lossy(&output2.stderr),
     );
-    assert_eq!(resp_mock.requests().len(), 2);
+    let requests = resp_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let resumed_user_texts = requests[1].message_input_texts("user");
+    for expected in [&prompt, &prompt2] {
+        assert_eq!(
+            resumed_user_texts.iter().filter(|text| *text == expected).count(),
+            1,
+            "resumed request must contain each user prompt exactly once"
+        );
+    }
+    let resumed_input = requests[1].input();
+    assert_eq!(resumed_input.iter().filter(|item| {
+        item["type"] == "message" && item["role"] == "assistant"
+            && item["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| part["text"] == "fixture hello")
+            })
+    }).count(), 1, "resume must replay the first assistant response");
 
     // Find the new session file containing the resumed marker.
     let marker2_clone = marker2.clone();
@@ -596,6 +612,11 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     );
 
     let resumed_content = std::fs::read_to_string(&resumed_path)?;
+    assert!(resumed_content.starts_with(&content), "resume must append without rewriting prior records");
+    let (_, resumed_id, parse_errors) =
+        codex_rollout::RolloutRecorder::load_rollout_items(&resumed_path).await?;
+    assert_eq!(parse_errors, 0, "all persisted records must decode through the real loader");
+    assert_eq!(resumed_id.expect("resumed thread id").to_string(), session_id);
     assert!(
         resumed_content.contains(&marker),
         "resumed file missing original marker"

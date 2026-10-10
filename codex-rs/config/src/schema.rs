@@ -200,6 +200,10 @@ mod tests {
             .as_str()
             .expect("background terminal timeout description");
 
-        assert!(description.contains("Default: `60000` (1 minute)."));
+        // The effective default is core's DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS (300_000).
+        assert!(
+            description.contains("Default: `300000` (5 minutes)."),
+            "{description}"
+        );
     }
 }

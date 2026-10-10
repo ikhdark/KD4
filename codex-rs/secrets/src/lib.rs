@@ -223,6 +223,37 @@ mod tests {
     }
 
     #[test]
+    fn manager_lists_persisted_environment_ids_containing_slashes() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let keyring = Arc::new(MockKeyringStore::default());
+        let manager = SecretsManager::new_with_keyring_store(
+            codex_home.path().to_path_buf(),
+            SecretsBackendKind::Local,
+            keyring.clone(),
+        );
+        let scope = SecretScope::environment("team/project")?;
+        let name = SecretName::new("API_TOKEN")?;
+        manager.set(&scope, &name, "scoped-token")?;
+
+        let reopened = SecretsManager::new_with_keyring_store(
+            codex_home.path().to_path_buf(),
+            SecretsBackendKind::Local,
+            keyring,
+        );
+        assert_eq!(reopened.get(&scope, &name)?, Some("scoped-token".to_string()));
+        let expected = vec![SecretListEntry {
+            scope: scope.clone(),
+            name: name.clone(),
+        }];
+        assert_eq!(reopened.list(None)?, expected);
+        assert_eq!(reopened.list(Some(&scope))?, expected);
+        assert!(reopened.list(Some(&SecretScope::Global))?.is_empty());
+        assert!(reopened.delete(&scope, &name)?);
+        assert!(reopened.list(None)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn manager_round_trips_local_backend() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());

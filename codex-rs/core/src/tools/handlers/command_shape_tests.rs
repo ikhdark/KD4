@@ -496,6 +496,27 @@ fn failure_advisory_respects_the_active_powershell_script_mode() {
 
     assert!(advisory.contains("Measure-Object expects property names"));
     assert!(advisory.contains("ForEach-Object"));
+
+    // Only the parameter-binding hint depends on the mode: it recommends
+    // script_body, which a script_body caller is already using.
+    let binding_failure = "A positional parameter cannot be found that accepts argument 'extra'. FullyQualifiedErrorId : PositionalParameterNotFound";
+    assert_eq!(
+        powershell_script_failure_advisory(
+            Some(ShellType::PowerShell),
+            Some(1),
+            true,
+            binding_failure,
+        ),
+        None
+    );
+    let binding_advisory = powershell_script_failure_advisory(
+        Some(ShellType::PowerShell),
+        Some(1),
+        false,
+        binding_failure,
+    )
+    .expect("command mode should get a parameter binding hint");
+    assert!(binding_advisory.contains("check PowerShell parameter binding"));
 }
 
 #[test]

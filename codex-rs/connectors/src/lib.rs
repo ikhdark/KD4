@@ -375,7 +375,11 @@ where
 
 fn merge_directory_apps(apps: Vec<DirectoryApp>) -> Vec<DirectoryApp> {
     let mut merged: HashMap<String, DirectoryApp> = HashMap::new();
-    for app in apps {
+    for mut app in apps {
+        let Some(id) = normalize_connector_value(Some(&app.id)) else {
+            continue;
+        };
+        app.id = id;
         if let Some(existing) = merged.get_mut(&app.id) {
             merge_directory_app(existing, app);
         } else {
@@ -1045,7 +1049,7 @@ mod tests {
         let (first, second) = tokio::join!(first, second);
         let first = first?;
         let mut expected = directory_app_to_app_info(app("alpha", "Alpha"));
-        expected.install_url = Some(connector_install_url("Alpha", "alpha"));
+        expected.install_url = Some("https://chatgpt.com/apps/alpha/alpha".to_string());
         assert_eq!(first, vec![expected.clone()]);
         assert_eq!(second?, vec![expected.clone()]);
         clear_directory_memory_cache();
@@ -1315,6 +1319,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn directory_ids_are_canonicalized_before_merging_and_caching() -> anyhow::Result<()> {
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let home = TempDir::new()?;
+        let context = cache_context(&home, "canonical-directory-ids", false);
+        let connectors = list_all_connectors_with_options(context.clone(), true, |_| async {
+            Ok(DirectoryListResponse {
+                apps: vec![
+                    app(" calendar ", "Calendar"),
+                    DirectoryApp {
+                        description: Some("Merged details".to_string()),
+                        ..app("calendar", "")
+                    },
+                    app(" \t ", "Invalid ID"),
+                ],
+                next_token: None,
+            })
+        })
+        .await?;
+        let mut expected = directory_app_to_app_info(app("calendar", "Calendar"));
+        expected.description = Some("Merged details".to_string());
+        expected.install_url = Some("https://chatgpt.com/apps/calendar/calendar".to_string());
+        assert_eq!(connectors, vec![expected.clone()]);
+        clear_directory_memory_cache();
+        assert_eq!(cached_directory_connectors(&context), Some(vec![expected.clone()]));
+
+        // Older cache files may predate canonical IDs. Reject them rather than
+        // resurrecting invalid IDs without the directory merge metadata.
+        for id in [" calendar ", " \t "] {
+            let mut legacy = expected.clone();
+            legacy.id = id.to_string();
+            directory_cache::write_cached_directory_connectors_to_disk(&context, &[legacy]);
+            clear_directory_memory_cache();
+            assert_eq!(cached_directory_connectors(&context), None);
+            assert!(context.cache_path().exists(), "invalid caches are not deleted");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "test serializes access to the shared connector cache for its full duration"
@@ -1325,9 +1368,10 @@ mod tests {
         let codex_home = TempDir::new()?;
         let cache_context = cache_context(&codex_home, "overlap", true);
         let workspace_started = Arc::new(tokio::sync::Notify::new());
+        let directory_started = Arc::new(tokio::sync::Notify::new());
 
-        // The directory page completes only after the workspace request is polled,
-        // so a serialized refresh cannot finish; the timeout only bounds that regression.
+        // Each page completes only after the other request is polled, so a refresh
+        // serialized in either order cannot finish; the timeout only bounds that regression.
         let connectors = tokio::time::timeout(
             Duration::from_secs(1),
             list_all_connectors_with_options(
@@ -1335,14 +1379,17 @@ mod tests {
                 /*force_refetch*/ true,
                 move |path| {
                     let workspace_started = Arc::clone(&workspace_started);
+                    let directory_started = Arc::clone(&directory_started);
                     async move {
                         if path.starts_with("/connectors/directory/list_workspace") {
                             workspace_started.notify_one();
+                            directory_started.notified().await;
                             Ok(DirectoryListResponse {
                                 apps: vec![app("workspace", "Workspace")],
                                 next_token: None,
                             })
                         } else {
+                            directory_started.notify_one();
                             workspace_started.notified().await;
                             Ok(DirectoryListResponse {
                                 apps: vec![app("directory", "Directory")],
@@ -1354,7 +1401,7 @@ mod tests {
             ),
         )
         .await
-        .expect("workspace request should start while the directory request is pending")?;
+        .expect("workspace and directory requests should both start before either completes")?;
 
         assert_eq!(
             connectors
@@ -1398,7 +1445,7 @@ mod tests {
             },
         )
         .await;
-        assert!(first.is_err());
+        assert_eq!(first.unwrap_err().to_string(), "transient workspace failure");
 
         let second_workspace_calls = Arc::clone(&workspace_calls);
         let second = list_all_connectors_with_options(
@@ -1470,7 +1517,7 @@ mod tests {
             },
         )
         .await;
-        assert!(refresh.is_err());
+        assert_eq!(refresh.unwrap_err().to_string(), "transient workspace failure");
 
         let cached = list_all_connectors_with_options(
             cache_context,
@@ -1523,10 +1570,7 @@ mod tests {
 
         clear_directory_memory_cache();
         let mut cached_expected = directory_app_to_app_info(app("alpha", "Alpha"));
-        cached_expected.install_url = Some(connector_install_url(
-            &cached_expected.name,
-            &cached_expected.id,
-        ));
+        cached_expected.install_url = Some("https://chatgpt.com/apps/alpha/alpha".to_string());
         assert_eq!(
             cached_directory_connectors(&cache_context),
             Some(vec![cached_expected])
@@ -1550,7 +1594,7 @@ mod tests {
         .await?;
 
         let mut expected = directory_app_to_app_info(app("beta", "Beta"));
-        expected.install_url = Some(connector_install_url(&expected.name, &expected.id));
+        expected.install_url = Some("https://chatgpt.com/apps/beta/beta".to_string());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(refreshed, vec![expected]);
         Ok(())
@@ -1576,6 +1620,16 @@ mod tests {
 
         assert_eq!(cached_directory_connectors(&cache_context), None);
         assert!(cache_path.exists());
+
+        // The same payload with the current version is served, so the version was the cause.
+        std::fs::write(
+            &cache_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": directory_cache::CONNECTOR_DIRECTORY_DISK_CACHE_SCHEMA_VERSION,
+                "connectors": [],
+            }))?,
+        )?;
+        assert_eq!(cached_directory_connectors(&cache_context), Some(Vec::new()));
         Ok(())
     }
 

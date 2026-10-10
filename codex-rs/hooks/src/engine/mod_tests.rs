@@ -995,6 +995,58 @@ fn config_with_hook_state(key: &str, enabled: bool) -> TomlValue {
     .expect("config TOML should deserialize")
 }
 
+#[tokio::test]
+async fn user_once_per_state_cannot_suppress_managed_hook_dispatches() {
+    let temp = tempdir().expect("create temp dir");
+    let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).expect("absolute root");
+    let managed_path = root.join("managed_config.toml");
+    let user_path = root.join("config.toml");
+    let stack_with_state = |state: serde_json::Value| {
+        ConfigLayerStack::new(
+            vec![
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::User {
+                        file: user_path.clone(),
+                        profile: None,
+                    },
+                    serde_json::from_value(serde_json::json!({"hooks": {"state": state}}))
+                        .expect("user hook state"),
+                ),
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                        file: managed_path.clone(),
+                    },
+                    config_with_pre_tool_use_hook("exit 0"),
+                ),
+            ],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect("config layer stack")
+    };
+    let initial = stack_with_state(serde_json::json!({}));
+    let discovered = super::discovery::discover_handlers(
+        Some(&initial), Vec::new(), Vec::new(), false,
+    );
+    let entry = &discovered.hook_entries[0];
+    assert!(entry.is_managed);
+    let stack = stack_with_state(serde_json::json!({
+        (entry.key.clone()): {"once_per": "session"}
+    }));
+    let engine = ClaudeHooksEngine::new(
+        true, false, Some(&stack), Vec::new(), Vec::new(),
+        CommandShell { program: String::new(), args: Vec::new() },
+    );
+    let session_id = ThreadId::new();
+    // Like user `enabled = false`, a user-supplied run limit must not disable
+    // a managed policy handler on later matching tool calls.
+    for turn in ["turn-1", "turn-2"] {
+        let outcome = engine.run_pre_tool_use(scoped_request(session_id, turn, "tool")).await;
+        assert_eq!(outcome.hook_events.len(), 1, "managed handler must run in {turn}");
+        assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Completed);
+    }
+}
+
 fn config_with_pre_tool_use_hook_and_states<const N: usize>(
     command: &str,
     disabled_keys: [&str; N],
@@ -1031,7 +1083,6 @@ fn config_with_pre_tool_use_hook(command: &str) -> TomlValue {
     .expect("config TOML should deserialize")
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn cancelling_registered_hook_terminates_descendants() {
     use std::time::Duration;
@@ -1039,15 +1090,40 @@ async fn cancelling_registered_hook_terminates_descendants() {
     let temp = tempdir().expect("create temp dir");
     let config_path =
         AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
+    #[cfg(windows)]
+    let (command, shell_program, shell_args) = {
+        let escaped = temp.path().join("escaped");
+        let escaped = escaped.to_string_lossy().replace('\'', "''");
+        let child_script = temp.path().join("child.ps1");
+        fs::write(
+            &child_script,
+            format!("Start-Sleep -Seconds 60; Set-Content -LiteralPath '{escaped}' -Value escaped"),
+        )
+        .expect("write child script");
+        let child_script = child_script.to_string_lossy().replace('\'', "''");
+        (
+            // The rename publishes the PID whole, so the poll below never
+            // parses a partially written file.
+            format!(
+                "$child = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile -NonInteractive -File \"{child_script}\"'; Set-Content -Encoding ascii started.tmp $child.Id; Rename-Item started.tmp started; Start-Sleep -Seconds 60"
+            ),
+            "powershell.exe",
+            vec!["-NoProfile".to_string(), "-Command".to_string()],
+        )
+    };
+    #[cfg(not(windows))]
+    let (command, shell_program, shell_args) = (
+        "(sleep 2; printf escaped > escaped) & printf '%s' $! > started; sleep 60".to_string(),
+        "/bin/sh",
+        vec!["-c".to_string()],
+    );
     let stack = ConfigLayerStack::new(
         vec![ConfigLayerEntry::new(
             ConfigLayerSource::User {
                 file: config_path,
                 profile: None,
             },
-            config_with_pre_tool_use_hook(
-                "(sleep 2; printf escaped > escaped) & printf '%s' $! > started; sleep 60",
-            ),
+            config_with_pre_tool_use_hook(&command),
         )],
         ConfigRequirements::default(),
         ConfigRequirementsToml::default(),
@@ -1057,8 +1133,8 @@ async fn cancelling_registered_hook_terminates_descendants() {
         feature_enabled: true,
         bypass_hook_trust: true,
         config_layer_stack: Some(stack),
-        shell_program: Some("/bin/sh".to_string()),
-        shell_args: vec!["-c".to_string()],
+        shell_program: Some(shell_program.to_string()),
+        shell_args,
         ..Default::default()
     });
     let mut run = Box::pin(hooks.run_pre_tool_use(PreToolUseRequest {

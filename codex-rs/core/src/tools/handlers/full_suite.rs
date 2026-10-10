@@ -15,7 +15,7 @@ pub(crate) struct FullSuiteBudget(AtomicBool);
 impl FullSuiteBudget {
     pub(crate) fn admit(&self, full_suite: bool) -> Result<(), String> {
         if full_suite && self.0.swap(true, Ordering::Relaxed) {
-            return Err("Full-suite launch blocked: this user turn already admitted its one full Rust suite attempt. Failure, cancellation, source edits and force_fresh do not reset the allowance. Resume a live run or run focused tests; another full suite requires a new user turn.".into());
+            return Err("Full-suite launch blocked: this user turn already admitted its one full Rust suite attempt. Failure, cancellation, source edits and force_fresh do not reset the allowance. Resume a live run or run focused tests; another full suite requires explicit user permission.".into());
         }
         Ok(())
     }
@@ -400,25 +400,25 @@ mod tests {
         budget
             .admit(check_command(&words("cargo test --no-fail-fast"), None, 0).unwrap())
             .unwrap();
-        assert!(
-            budget
-                .admit(
-                    check_command(
-                        &words("just core-test core_lib --all --no-fail-fast"),
-                        None,
-                        0
-                    )
-                    .unwrap()
+        let denial = budget
+            .admit(
+                check_command(
+                    &words("just core-test core_lib --all --no-fail-fast"),
+                    None,
+                    0,
                 )
-                .is_err()
-        );
+                .unwrap(),
+            )
+            .expect_err("a second full suite must be denied");
+        assert!(denial.contains("explicit user permission"), "{denial}");
+        assert!(!denial.contains("requires a new user turn"), "{denial}");
         assert!(
             budget.admit(false).is_ok(),
             "focused followups must remain possible"
         );
         assert!(
             FullSuiteBudget::default().admit(true).is_ok(),
-            "a new user turn gets a new allowance"
+            "a distinct runtime budget starts unused; this does not establish task-wide permission"
         );
     }
 

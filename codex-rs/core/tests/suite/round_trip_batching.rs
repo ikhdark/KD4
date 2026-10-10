@@ -381,6 +381,8 @@ async fn identical_parallel_tool_calls_reach_immediate_continuation() -> anyhow:
     let completion = test
         .submit_turn_and_capture_completion("run the three independent checks")
         .await?;
+    assert_eq!(completion.error, None);
+    assert_eq!(completion.last_agent_message.as_deref(), Some("done"));
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
@@ -515,6 +517,8 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
     let completion = test
         .submit_turn_and_capture_completion("diagnose the failure, then select validation")
         .await?;
+    assert_eq!(completion.error, None);
+    assert_eq!(completion.last_agent_message.as_deref(), Some("done"));
 
     let requests = requests_for_sequence(&responses);
     let timing = completion.timing.expect("turn timing");

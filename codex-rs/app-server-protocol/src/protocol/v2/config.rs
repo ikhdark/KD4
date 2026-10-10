@@ -97,55 +97,6 @@ pub enum ConfigLayerSource {
     LegacyManagedConfigTomlFromMdm,
 }
 
-impl ConfigLayerSource {
-    /// A settings from a layer with a higher precedence will override a setting
-    /// from a layer with a lower precedence.
-    pub fn precedence(&self) -> i16 {
-        match self {
-            ConfigLayerSource::Mdm { .. } => 0,
-            ConfigLayerSource::System { .. } => 10,
-            ConfigLayerSource::EnterpriseManaged { .. } => 15,
-            ConfigLayerSource::User { profile, .. } => {
-                if profile.is_some() {
-                    21
-                } else {
-                    20
-                }
-            }
-            ConfigLayerSource::Project { .. } => 25,
-            ConfigLayerSource::SessionFlags => 30,
-            ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. } => 40,
-            ConfigLayerSource::LegacyManagedConfigTomlFromMdm => 50,
-        }
-    }
-}
-
-#[cfg(test)]
-mod precedence_tests {
-    use super::ConfigLayerSource;
-    use codex_utils_absolute_path::test_support::PathBufExt;
-    use codex_utils_absolute_path::test_support::test_path_buf;
-
-    #[test]
-    fn precedence_preserves_order_between_distinct_project_layers() {
-        let first = ConfigLayerSource::Project {
-            dot_codex_folder: test_path_buf("/z/.codex").abs(),
-        };
-        let second = ConfigLayerSource::Project {
-            dot_codex_folder: test_path_buf("/a/.codex").abs(),
-        };
-        assert_ne!(first, second);
-        assert_eq!(first.precedence(), second.precedence());
-        let mut layers = vec![
-            ConfigLayerSource::SessionFlags,
-            first.clone(),
-            second.clone(),
-        ];
-        layers.sort_by_key(ConfigLayerSource::precedence);
-        assert_eq!(layers, vec![first, second, ConfigLayerSource::SessionFlags]);
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]

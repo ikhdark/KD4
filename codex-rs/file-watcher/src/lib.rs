@@ -1242,7 +1242,12 @@ impl FileWatcher {
         #[cfg(test)]
         let mut actual_watch_path_resolution_count = 0;
 
-        for (subscriber_id, subscriber) in &mut state.subscribers {
+        let WatchState {
+            subscribers,
+            path_ref_counts,
+            ..
+        } = &mut *state;
+        for (subscriber_id, subscriber) in subscribers {
             let mut changed_paths = BTreeSet::new();
             let mut rescan_required = false;
             for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths {
@@ -1290,7 +1295,28 @@ impl FileWatcher {
                         })
                         .clone()
                 };
+                // A Windows timestamp report for a directory above a stable
+                // watch says only that the directory's entries changed. While
+                // that directory is itself watched, the entry leading to this
+                // watch reports its own creation, removal, or rename, and the
+                // resolution above has already caught a retargeted link.
+                let unmoved_stable_watch =
+                    subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
+                        && subscriber_watch_state.actual == new_actual
+                        && subscriber_watch_state.matched == new_matched;
                 for event_path in &relevant_paths {
+                    if unmoved_stable_watch
+                        && changes.root_metadata_paths.contains(*event_path)
+                        && path_ref_counts.contains_key(*event_path)
+                        && (is_strict_descendant(&subscriber_watch_state.matched.path, event_path)
+                            || is_strict_descendant(
+                                &subscriber_watch.requested.path,
+                                event_path,
+                            ))
+                        && event_path.is_dir()
+                    {
+                        continue;
+                    }
                     let changed_path = changed_path_for_event(
                         subscriber_watch,
                         subscriber_watch_state,

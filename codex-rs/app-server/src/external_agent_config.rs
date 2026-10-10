@@ -178,11 +178,22 @@ pub(crate) struct ExternalAgentConfigMigrationItem {
     pub details: Option<MigrationDetails>,
 }
 
+#[cfg(test)]
+struct ConfigLockAdmissionTestControl {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ExternalAgentConfigService {
     codex_home: PathBuf,
     external_agent_home: PathBuf,
     analytics_events_client: Option<AnalyticsEventsClient>,
+    import_cancellation: Option<tokio_util::sync::CancellationToken>,
+    #[cfg(test)]
+    config_lock_attempted: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    config_lock_admitted: Option<std::sync::Arc<std::sync::Mutex<Option<ConfigLockAdmissionTestControl>>>>,
 }
 
 impl ExternalAgentConfigService {
@@ -192,6 +203,11 @@ impl ExternalAgentConfigService {
             codex_home,
             external_agent_home,
             analytics_events_client: Some(analytics_events_client),
+            import_cancellation: None,
+            #[cfg(test)]
+            config_lock_attempted: None,
+            #[cfg(test)]
+            config_lock_admitted: None,
         }
     }
 
@@ -201,6 +217,9 @@ impl ExternalAgentConfigService {
             codex_home,
             external_agent_home,
             analytics_events_client: None,
+            import_cancellation: None,
+            config_lock_attempted: None,
+            config_lock_admitted: None,
         }
     }
 
@@ -265,7 +284,12 @@ impl ExternalAgentConfigService {
         &self,
         migration_items: Vec<ExternalAgentConfigMigrationItem>,
     ) -> ExternalAgentConfigImportOutcome {
-        let service = self.clone();
+        let mut service = self.clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        // An owned RPC may survive disconnect, but dropping this service future
+        // during shutdown must release a worker still waiting for lock admission.
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        service.import_cancellation = Some(cancellation);
         let runtime = tokio::runtime::Handle::current();
         let worker_items = migration_items.clone();
         match tokio::task::spawn_blocking(move || {
@@ -298,6 +322,9 @@ impl ExternalAgentConfigService {
     ) -> ExternalAgentConfigImportOutcome {
         let mut outcome = ExternalAgentConfigImportOutcome::default();
         for migration_item in migration_items {
+            if self.import_cancellation.as_ref().is_some_and(|token| token.is_cancelled()) {
+                break;
+            }
             let item_type = migration_item.item_type;
             let description = migration_item.description.clone();
             let cwd_for_log = migration_item.cwd.clone();
@@ -1199,6 +1226,35 @@ impl ExternalAgentConfigService {
         import_sources
     }
 
+    fn acquire_config_write_lock(&self, path: &Path) -> io::Result<codex_file_system::AtomicWriteLock> {
+        #[cfg(test)]
+        if let Some(attempted) = &self.config_lock_attempted {
+            let _ = attempted.send(());
+        }
+        let Some(cancellation) = &self.import_cancellation else {
+            return codex_file_system::acquire_atomic_write_lock(path);
+        };
+        let lock = loop {
+            if cancellation.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "config import cancelled before lock admission"));
+            }
+            if let Some(lock) = codex_file_system::try_acquire_atomic_write_lock(path)? {
+                // Admission is the cancellation boundary: the complete
+                // read/merge/write transaction retains this lock until return.
+                break lock;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        #[cfg(test)]
+        if let Some(control) = &self.config_lock_admitted
+            && let Some(control) = control.lock().unwrap().take()
+        {
+            let _ = control.reached.send(());
+            control.release.recv_timeout(std::time::Duration::from_secs(5)).expect("release admitted transaction");
+        }
+        Ok(lock)
+    }
+
     fn import_config(&self, cwd: Option<&Path>) -> io::Result<Option<(String, String)>> {
         let repo_root = find_repo_root(cwd)?;
         let (source_settings, target_config) = if let Some(repo_root) = repo_root.as_ref() {
@@ -1226,6 +1282,7 @@ impl ExternalAgentConfigService {
             return Err(invalid_data_error("config target path has no parent"));
         };
         fs::create_dir_all(target_parent)?;
+        let _lock = self.acquire_config_write_lock(&target_config)?;
         if !target_config.exists() {
             write_toml_file(&target_config, &migrated)?;
             return Ok(Some((
@@ -1286,6 +1343,7 @@ impl ExternalAgentConfigService {
             return Err(invalid_data_error("config target path has no parent"));
         };
         fs::create_dir_all(target_parent)?;
+        let _lock = self.acquire_config_write_lock(&target_config)?;
         if !target_config.exists() {
             let migrated_server_names = migrated_mcp_server_names(&migrated);
             write_toml_file(&target_config, &migrated)?;

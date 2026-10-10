@@ -497,21 +497,6 @@ ON CONFLICT(child_thread_id) DO NOTHING
             .await
     }
 
-    /// List direct children of `parent_thread_id` using persisted spawn edges.
-    pub async fn list_threads_by_parent(
-        &self,
-        page_size: usize,
-        parent_thread_id: ThreadId,
-        filters: ThreadFilterOptions<'_>,
-    ) -> anyhow::Result<crate::ThreadsPage> {
-        self.list_threads_by_relation(
-            page_size,
-            crate::ThreadRelationFilter::DirectChildrenOf(parent_thread_id),
-            filters,
-        )
-        .await
-    }
-
     /// List threads matching a persisted spawn-graph relationship.
     pub async fn list_threads_by_relation(
         &self,
@@ -614,34 +599,6 @@ ON CONFLICT(child_thread_id) DO NOTHING
             .await
     }
 
-    /// Commit an explicit project assignment with the other metadata fields.
-    /// Rollout reconciliation uses upsert_thread and must never overwrite this assignment.
-    pub async fn upsert_thread_with_project(
-        &self,
-        metadata: &crate::ThreadMetadata,
-        project_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(id) = project_id {
-            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = ?")
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await?;
-            anyhow::ensure!(exists != 0, "project not found: {id}");
-        }
-        self.upsert_thread_on_connection(&mut tx, metadata, true)
-            .await?;
-        sqlx::query("UPDATE threads SET project_id = ? WHERE id = ?")
-            .bind(project_id)
-            .bind(metadata.id.to_string())
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
-            .await?;
-        Ok(())
-    }
-
     /// Apply a metadata patch to the current row under the SQLite writer
     /// reservation. The fallback is used only if no row exists at admission.
     pub async fn patch_thread_metadata(
@@ -683,99 +640,6 @@ ON CONFLICT(child_thread_id) DO NOTHING
     ) -> anyhow::Result<()> {
         self.upsert_thread_with_timestamps(metadata, /*allocate_timestamps*/ false)
             .await
-    }
-
-    pub async fn insert_thread_if_absent(
-        &self,
-        metadata: &crate::ThreadMetadata,
-    ) -> anyhow::Result<bool> {
-        let updated_at = self.allocate_thread_updated_at(metadata.updated_at)?;
-        let recency_at = self.allocate_thread_recency_at(metadata.recency_at)?;
-        let preview = metadata_preview(metadata);
-        let result = sqlx::query(
-            r#"
-INSERT INTO threads (
-    id,
-    rollout_path,
-    created_at,
-    updated_at,
-    recency_at,
-    created_at_ms,
-    updated_at_ms,
-    recency_at_ms,
-    source,
-    history_mode,
-    thread_source,
-    agent_nickname,
-    agent_role,
-    agent_path,
-    model_provider,
-    model,
-    reasoning_effort,
-    cwd,
-    cli_version,
-    title,
-    preview,
-    sandbox_policy,
-    approval_mode,
-    tokens_used,
-    first_user_message,
-    archived,
-    archived_at,
-    git_sha,
-    git_branch,
-    git_origin_url,
-    project_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO NOTHING
-            "#,
-        )
-        .bind(metadata.id.to_string())
-        .bind(metadata.rollout_path.display().to_string())
-        .bind(datetime_to_epoch_seconds(metadata.created_at))
-        .bind(datetime_to_epoch_seconds(updated_at))
-        .bind(datetime_to_epoch_seconds(recency_at))
-        .bind(datetime_to_epoch_millis(metadata.created_at))
-        .bind(datetime_to_epoch_millis(updated_at))
-        .bind(datetime_to_epoch_millis(recency_at))
-        .bind(metadata.source.as_str())
-        .bind(metadata.history_mode.as_str())
-        .bind(
-            metadata
-                .thread_source
-                .as_ref()
-                .map(codex_protocol::protocol::ThreadSource::as_str),
-        )
-        .bind(metadata.agent_nickname.as_deref())
-        .bind(metadata.agent_role.as_deref())
-        .bind(metadata.agent_path.as_deref())
-        .bind(metadata.model_provider.as_str())
-        .bind(metadata.model.as_deref())
-        .bind(
-            metadata
-                .reasoning_effort
-                .as_ref()
-                .map(crate::extract::enum_to_string),
-        )
-        .bind(metadata.cwd.display().to_string())
-        .bind(metadata.cli_version.as_str())
-        .bind(metadata.title.as_str())
-        .bind(preview)
-        .bind(metadata.sandbox_policy.as_str())
-        .bind(metadata.approval_mode.as_str())
-        .bind(metadata.tokens_used)
-        .bind(metadata.first_user_message.as_deref().unwrap_or_default())
-        .bind(metadata.archived_at.is_some())
-        .bind(metadata.archived_at.map(datetime_to_epoch_seconds))
-        .bind(metadata.git_sha.as_deref())
-        .bind(metadata.git_branch.as_deref())
-        .bind(metadata.git_origin_url.as_deref())
-        .bind(metadata.project_id.as_deref())
-        .execute(self.pool.as_ref())
-        .await?;
-        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
-            .await?;
-        Ok(result.rows_affected() > 0)
     }
 
     pub async fn update_thread_title(
@@ -893,35 +757,6 @@ fn allocate_thread_timestamp(
 }
 
 impl StateRuntime {
-    pub async fn update_thread_git_info(
-        &self,
-        thread_id: ThreadId,
-        git_sha: Option<Option<&str>>,
-        git_branch: Option<Option<&str>>,
-        git_origin_url: Option<Option<&str>>,
-    ) -> anyhow::Result<bool> {
-        let result = sqlx::query(
-            r#"
-UPDATE threads
-SET
-    git_sha = CASE WHEN ? THEN ? ELSE git_sha END,
-    git_branch = CASE WHEN ? THEN ? ELSE git_branch END,
-    git_origin_url = CASE WHEN ? THEN ? ELSE git_origin_url END
-WHERE id = ?
-            "#,
-        )
-        .bind(git_sha.is_some())
-        .bind(git_sha.flatten())
-        .bind(git_branch.is_some())
-        .bind(git_branch.flatten())
-        .bind(git_origin_url.is_some())
-        .bind(git_origin_url.flatten())
-        .bind(thread_id.to_string())
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     async fn upsert_thread_with_timestamps(
         &self,
         metadata: &crate::ThreadMetadata,
@@ -1817,7 +1652,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_metadata_diff_reports_history_source_and_recency_changes() -> Result<()> {
+    async fn history_mode_thread_source_and_recency_persist_without_touching_other_fields()
+    -> Result<()> {
         let home = tempfile::tempdir()?;
         let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
         let thread_id = ThreadId::new();
@@ -1842,11 +1678,16 @@ mod tests {
             .get_thread(thread_id)
             .await?
             .expect("updated metadata");
+        assert!(after.recency_at > before.recency_at);
         assert_eq!(
-            before.diff_fields(&after),
-            vec!["recency_at", "history_mode", "thread_source"]
+            after,
+            crate::ThreadMetadata {
+                recency_at: after.recency_at,
+                history_mode: ThreadHistoryMode::Paginated,
+                thread_source: Some(codex_protocol::protocol::ThreadSource::User),
+                ..before
+            }
         );
-        assert!(after.diff_fields(&after).is_empty());
         Ok(())
     }
 
@@ -2556,13 +2397,17 @@ END
             search_term: None,
         };
         let first_page = runtime
-            .list_threads_by_parent(/*page_size*/ 1, parent_id, filters(None))
+            .list_threads_by_relation(
+                /*page_size*/ 1,
+                crate::ThreadRelationFilter::DirectChildrenOf(parent_id),
+                filters(None),
+            )
             .await
             .expect("first page should succeed");
         let second_page = runtime
-            .list_threads_by_parent(
+            .list_threads_by_relation(
                 /*page_size*/ 1,
-                parent_id,
+                crate::ThreadRelationFilter::DirectChildrenOf(parent_id),
                 filters(first_page.next_anchor.as_ref()),
             )
             .await
@@ -2847,117 +2692,7 @@ END
     }
 
     #[tokio::test]
-    async fn update_thread_git_info_preserves_newer_non_git_metadata() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize");
-        let thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000789").expect("valid thread id");
-        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-
-        runtime
-            .upsert_thread(&metadata)
-            .await
-            .expect("initial upsert should succeed");
-
-        let updated_at = datetime_to_epoch_millis(
-            DateTime::<Utc>::from_timestamp(1_700_000_100, 0).expect("timestamp"),
-        );
-        sqlx::query(
-            "UPDATE threads SET updated_at = ?, updated_at_ms = ?, tokens_used = ?, first_user_message = ?, preview = ? WHERE id = ?",
-        )
-        .bind(updated_at / 1000)
-        .bind(updated_at)
-        .bind(123_i64)
-        .bind("newer preview")
-        .bind("newer preview")
-        .bind(thread_id.to_string())
-        .execute(runtime.pool.as_ref())
-        .await
-        .expect("concurrent metadata write should succeed");
-
-        let updated = runtime
-            .update_thread_git_info(
-                thread_id,
-                Some(Some("abc123")),
-                Some(Some("feature/branch")),
-                Some(Some("git@example.com:openai/codex.git")),
-            )
-            .await
-            .expect("git info update should succeed");
-        assert!(updated, "git info update should touch the thread row");
-
-        let persisted = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("thread should load")
-            .expect("thread should exist");
-        assert_eq!(persisted.tokens_used, 123);
-        assert_eq!(
-            persisted.first_user_message.as_deref(),
-            Some("newer preview")
-        );
-        assert_eq!(persisted.preview.as_deref(), Some("newer preview"));
-        assert_eq!(datetime_to_epoch_millis(persisted.updated_at), updated_at);
-        assert_eq!(persisted.git_sha.as_deref(), Some("abc123"));
-        assert_eq!(persisted.git_branch.as_deref(), Some("feature/branch"));
-        assert_eq!(
-            persisted.git_origin_url.as_deref(),
-            Some("git@example.com:openai/codex.git")
-        );
-    }
-
-    #[tokio::test]
-    async fn insert_thread_if_absent_preserves_existing_metadata() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize");
-        let thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000791").expect("valid thread id");
-
-        let mut existing = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-        existing.tokens_used = 123;
-        existing.first_user_message = Some("newer preview".to_string());
-        existing.preview = Some("newer preview".to_string());
-        existing.updated_at = DateTime::<Utc>::from_timestamp(1_700_000_100, 0).expect("timestamp");
-        runtime
-            .upsert_thread(&existing)
-            .await
-            .expect("initial upsert should succeed");
-
-        let mut fallback = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-        fallback.tokens_used = 0;
-        fallback.first_user_message = None;
-        fallback.preview = None;
-        fallback.updated_at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp");
-
-        let inserted = runtime
-            .insert_thread_if_absent(&fallback)
-            .await
-            .expect("insert should succeed");
-        assert!(!inserted, "existing rows should not be overwritten");
-
-        let persisted = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("thread should load")
-            .expect("thread should exist");
-        assert_eq!(persisted.tokens_used, 123);
-        assert_eq!(
-            persisted.first_user_message.as_deref(),
-            Some("newer preview")
-        );
-        assert_eq!(persisted.preview.as_deref(), Some("newer preview"));
-        assert_eq!(
-            datetime_to_epoch_millis(persisted.updated_at),
-            datetime_to_epoch_millis(existing.updated_at)
-        );
-    }
-
-    #[tokio::test]
-    async fn update_thread_git_info_can_clear_fields() {
+    async fn patch_thread_metadata_can_clear_git_fields() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
             .await
@@ -2974,11 +2709,17 @@ END
             .await
             .expect("initial upsert should succeed");
 
-        let updated = runtime
-            .update_thread_git_info(thread_id, Some(None), Some(None), Some(None))
+        // The upsert inside the patch keeps stored Git fields, so clearing
+        // them depends on the patch's own explicit write.
+        let patched = runtime
+            .patch_thread_metadata(&metadata, |current| {
+                current.git_sha = None;
+                current.git_branch = None;
+                current.git_origin_url = None;
+                Ok(())
+            })
             .await
             .expect("git info clear should succeed");
-        assert!(updated, "git info clear should touch the thread row");
 
         let persisted = runtime
             .get_thread(thread_id)
@@ -2988,6 +2729,7 @@ END
         assert_eq!(persisted.git_sha, None);
         assert_eq!(persisted.git_branch, None);
         assert_eq!(persisted.git_origin_url, None);
+        assert_eq!(patched, persisted);
     }
 
     #[tokio::test]
@@ -3356,7 +3098,12 @@ END
             .insert_thread_spawn_edge_if_absent(other_parent, child)
             .await?;
         assert_eq!(
-            runtime.list_thread_spawn_children(other_parent).await?,
+            runtime
+                .list_thread_spawn_children_with_status(
+                    other_parent,
+                    DirectionalThreadSpawnEdgeStatus::Open
+                )
+                .await?,
             vec![child]
         );
         runtime.close().await;

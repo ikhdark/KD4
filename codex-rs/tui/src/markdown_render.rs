@@ -73,7 +73,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
@@ -802,11 +802,6 @@ where
         self.list_item_start_line_counts.push(self.text.len());
         self.pending_marker_line = true;
         let depth = self.list_indices.len();
-        let is_ordered = self
-            .list_indices
-            .last()
-            .map(Option::is_some)
-            .unwrap_or(false);
         let width = depth * 4 - 3;
         let marker = if let Some(last_index) = self.list_indices.last_mut() {
             match last_index {
@@ -828,7 +823,9 @@ where
         let indent_prefix = if depth == 0 {
             Vec::new()
         } else {
-            let indent_len = if is_ordered { width + 2 } else { width + 1 };
+            let indent_len = marker
+                .as_ref()
+                .map_or(0, |spans| spans.iter().map(Span::width).sum());
             vec![Span::from(" ".repeat(indent_len))]
         };
         self.indent_stack.push(IndentContext::new(
@@ -1572,7 +1569,7 @@ where
                         out.push_span(Span::raw(std::mem::take(current_text)), destination);
                     }
                 };
-                for ch in text.chars() {
+                for grapheme in text.graphemes(true) {
                     let destination = line
                         .hyperlinks
                         .iter()
@@ -1582,12 +1579,12 @@ where
                         flush(&mut out, &mut current_text, current_destination);
                         current_destination = destination;
                     }
-                    if ch == '|' {
+                    if grapheme == "|" {
                         current_text.push_str("\\|");
                     } else {
-                        current_text.push(ch);
+                        current_text.push_str(grapheme);
                     }
-                    column += UnicodeWidthChar::width(ch).unwrap_or(/*default*/ 0);
+                    column += UnicodeWidthStr::width(grapheme);
                 }
                 flush(&mut out, &mut current_text, current_destination);
             }
@@ -2382,6 +2379,17 @@ mod tests {
 
 
     #[test]
+    fn multi_digit_ordered_items_align_wrapped_content() {
+        for (markdown, expected) in [
+            ("10. alpha beta", vec!["10. alpha", "    beta"]),
+            ("100. alpha beta", vec!["100. alpha", "     beta"]),
+        ] {
+            let rendered = render_markdown_text_with_width(markdown, Some(12));
+            assert_eq!(lines_to_strings(&rendered), expected, "{markdown}");
+        }
+    }
+
+    #[test]
     fn does_not_wrap_code_blocks() {
         let markdown = "````\nfn main() { println!(\"hi from a long line\"); }\n````";
         let rendered = render_markdown_text_with_width(markdown, Some(10));
@@ -2407,19 +2415,14 @@ mod tests {
         // CommonMark info strings like "rust,no_run" or "rust title=demo"
         // contain metadata after the language token.  The language must be
         // extracted (first word / comma-separated token) so highlighting works.
+        let plain_rust = render_markdown_text("```rust\nfn main() {}\n```\n");
+        assert!(plain_rust.lines.iter().flat_map(|line| &line.spans).any(|span| span.style.fg.is_some()));
         for info in &["rust,no_run", "rust no_run", "rust title=\"demo\""] {
             let markdown = format!("```{info}\nfn main() {{}}\n```\n");
             let rendered = render_markdown_text(&markdown);
             assert_eq!(lines_to_strings(&rendered), ["fn main() {}"]);
-            let has_rgb = rendered.lines.iter().any(|line| {
-                line.spans
-                    .iter()
-                    .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
-            });
-            assert!(
-                has_rgb,
-                "info string \"{info}\" should still produce syntax highlighting"
-            );
+            // Metadata must select the same Rust syntax under RGB and ANSI themes.
+            assert_eq!(rendered, plain_rust, "info string {info:?}");
         }
     }
 
@@ -2803,6 +2806,36 @@ mod tests {
         assert!(!destinations.contains(&code_url));
         assert!(!destinations.contains(&"https://shown.example"));
     }
+
+    #[test]
+    fn pipe_table_fallback_preserves_grapheme_link_columns() {
+        let destination = "https://example.com/reference";
+        for inline in [
+            format!("👩‍💻 [x]({destination})"),
+            format!("[👩‍💻]({destination})"),
+        ] {
+            let plain = render_markdown_lines_with_width_and_cwd(&inline, None, None);
+            assert_eq!(plain.len(), 1);
+            assert!(!plain[0].hyperlinks.is_empty());
+            // Inspect the fallback row before the outer renderer wraps it to the viewport.
+            let first = Writer::<std::iter::Empty<(Event<'static>, Range<usize>)>>::row_to_pipe_line(
+                &[TableCell { lines: plain.clone() }],
+            );
+            assert_eq!(first.line.to_string(), format!("| {} |", plain[0].line));
+            let expected = plain[0]
+                .hyperlinks
+                .iter()
+                .cloned()
+                .map(|mut link| {
+                    link.columns = link.columns.start + 2..link.columns.end + 2;
+                    link
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(first.hyperlinks, expected, "{inline}");
+            assert_eq!(first.width(), first.line.to_string().width());
+        }
+    }
+
     #[test]
     fn explicit_html_cells_remain_in_the_table() {
         for text in ["<div>value</div>", "HTML block:"] {
@@ -2822,24 +2855,39 @@ mod tests {
 
     #[test]
     fn batched_width_allocation_matches_greedy_priorities_and_ties() {
-        let metrics = W::collect_table_column_metrics(
+        let compact = W::collect_table_column_metrics(
             &[make_cell("ID"), make_cell("Name"), make_cell("Description")],
             &[],
             3,
         );
+        // Header-only metrics are all Compact and only exercise ties; mixed kinds
+        // make the allocator cross priority classes.
+        let mixed = [
+            TableColumnKind::Narrative,
+            TableColumnKind::TokenHeavy,
+            TableColumnKind::Compact,
+        ]
+        .map(|kind| TableColumnMetrics {
+            max_width: 1000,
+            header_token_width: 2,
+            body_token_width: 2,
+            kind,
+        });
         let floors = [3, 5, 3];
-        for widths in [[1000, 1000, 900], [6, 9, 7], [3, 5, 3]] {
-            for budget in [11, 12, 15, 100, 3000] {
-                let mut expected = widths;
-                while expected.iter().sum::<usize>() > budget {
-                    let Some(i) = W::next_column_to_shrink(&expected, &floors, &metrics) else {
-                        break;
-                    };
-                    expected[i] -= 1;
+        for metrics in [compact.as_slice(), mixed.as_slice()] {
+            for widths in [[1000, 1000, 900], [6, 9, 7], [3, 5, 3]] {
+                for budget in [11, 12, 15, 100, 3000] {
+                    let mut expected = widths;
+                    while expected.iter().sum::<usize>() > budget {
+                        let Some(i) = W::next_column_to_shrink(&expected, &floors, metrics) else {
+                            break;
+                        };
+                        expected[i] -= 1;
+                    }
+                    let mut actual = widths;
+                    W::shrink_columns(&mut actual, &floors, metrics, budget);
+                    assert_eq!(actual, expected);
                 }
-                let mut actual = widths;
-                W::shrink_columns(&mut actual, &floors, &metrics, budget);
-                assert_eq!(actual, expected);
             }
         }
     }

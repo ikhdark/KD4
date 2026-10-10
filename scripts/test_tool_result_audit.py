@@ -114,6 +114,12 @@ class ToolResultAuditTest(unittest.TestCase):
 
         report = execution_context_audit(records)
         self.assertEqual([turn["turn_id"] for turn in report["turns"]], ["first", "second"])
+        # Derive ownership from the fixture, not the report being checked: the
+        # per-request expectations below otherwise accept misassigned outputs.
+        self.assertEqual(
+            [output["turn_id"] for output in report["tool_outputs"]],
+            [None, *(["first"] * 40), *(["second"] * 40), "open"],
+        )
         self.assertEqual(
             [(output["record"], output["bytes"]) for output in report["tool_outputs"]],
             [(line, len(row["payload"]["output"].encode())) for line, row, _ in records

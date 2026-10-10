@@ -47,6 +47,34 @@ class AtomicJsonTest(unittest.TestCase):
             self.assertEqual(output.read_bytes(), b"winner")
             self.assertEqual(list(Path(directory).iterdir()), [output])
 
+    def test_immutable_publication_checks_concurrent_winner_bytes(self):
+        link = os.link
+        for winner, candidate in (
+            (b"", b""),
+            (b"same", b"same"),
+            (b"winner", b"loser"),
+            (b"winner", b""),
+        ):
+            with (
+                self.subTest(winner=winner, candidate=candidate),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                output = Path(directory) / "report"
+
+                def race(source, destination):
+                    destination.write_bytes(winner)
+                    link(source, destination)
+
+                with mock.patch.object(atomic_json.os, "link", side_effect=race) as publish:
+                    if winner == candidate:
+                        atomic_json.write_bytes_atomic(output, candidate, immutable=True)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "immutable delivery artifact was modified"):
+                            atomic_json.write_bytes_atomic(output, candidate, immutable=True)
+                publish.assert_called_once()
+                self.assertEqual(output.read_bytes(), winner)
+                self.assertEqual(list(Path(directory).iterdir()), [output])
+
     def test_stream_output_uses_bounded_reads_and_keeps_source_open(self):
         payload = b"captured bytes\n" * 100_000
 

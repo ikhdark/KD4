@@ -73,7 +73,8 @@ describe("Codex", () => {
     try {
       const thread = client.startThread();
       await thread.run("first input");
-      await thread.run("second input");
+      const result = await thread.run("second input");
+      expect(result.finalResponse).toBe("Second response");
 
       // Check second request continues the same thread
       expect(requests).toHaveLength(2);
@@ -124,10 +125,14 @@ describe("Codex", () => {
       expect(resumedThread.id).toBe(originalThread.id);
       expect(result.finalResponse).toBe("Second response");
 
-      expect(requests.length).toBeGreaterThanOrEqual(2);
+      expect(requests).toHaveLength(2);
       const secondRequest = requests[1];
       expect(secondRequest).toBeDefined();
       const payload = secondRequest!.json;
+      expect(payload.input.at(-1)).toEqual(expect.objectContaining({
+        role: "user",
+        content: [{ type: "input_text", text: "second input" }],
+      }));
 
       const assistantEntry = payload.input.find(
         (entry: { role: string }) => entry.role === "assistant",

@@ -295,6 +295,18 @@ mod tests {
             None
         );
         assert_eq!(get_shell_by_model_provided_path(&PathBuf::from("sh")), None);
+
+        // Control: an existing Windows shell path is accepted exactly as provided.
+        let cmd = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("cmd.exe");
+        assert_eq!(
+            get_shell_by_model_provided_path(&cmd),
+            Some(DetectedShell {
+                shell_type: ShellType::Cmd,
+                shell_path: cmd,
+            })
+        );
     }
 
     #[test]
@@ -324,6 +336,13 @@ mod tests {
         assert_eq!(
             select_powershell_host(|| Some(provided.clone()), || Some(pwsh), || None),
             Some(provided)
+        );
+        // The resolver itself must pass an existing explicit path ahead of
+        // any installed host.
+        let explicit = std::env::current_exe().expect("test executable");
+        assert_eq!(
+            get_shell(ShellType::PowerShell, Some(&explicit)).map(|shell| shell.shell_path),
+            Some(explicit)
         );
         assert_eq!(
             powershell_host_kind("C:/Program Files/PowerShell/7/pwsh.exe"),

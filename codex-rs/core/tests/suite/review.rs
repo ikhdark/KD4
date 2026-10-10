@@ -194,7 +194,10 @@ async fn review_op_emits_lifecycle_and_review_output() {
     };
     assert_eq!(expected, review);
     wait_for_event(&codex, |ev| match ev {
-        EventMsg::TurnComplete(event) => event.turn_id == review_turn_id,
+        EventMsg::TurnComplete(event) if event.turn_id == review_turn_id => {
+            assert_eq!(event.error, None);
+            true
+        }
         _ => false,
     })
     .await;
@@ -403,10 +406,13 @@ async fn review_op_with_plain_text_reports_invalid_result() {
 
     let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
     let error = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
-    match error {
-        EventMsg::Error(error) => assert!(error.message.contains("not a clean review verdict")),
+    let error = match error {
+        EventMsg::Error(error) => {
+            assert!(error.message.contains("not a clean review verdict"));
+            error
+        }
         other => panic!("expected Error(..), got {other:?}"),
-    }
+    };
     let closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
     let review = match closed {
         EventMsg::ExitedReviewMode(ev) => ev.review_output,
@@ -416,7 +422,7 @@ async fn review_op_with_plain_text_reports_invalid_result() {
     assert_eq!(review, None);
     let complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     match complete {
-        EventMsg::TurnComplete(complete) => assert!(complete.error.is_some()),
+        EventMsg::TurnComplete(complete) => assert_eq!(complete.error, Some(error)),
         other => panic!("expected TurnComplete(..), got {other:?}"),
     }
 
@@ -544,7 +550,10 @@ async fn review_emits_one_rendered_agent_message_on_structured_output() {
     let mut saw_exited = false;
     let mut agent_messages = Vec::new();
     wait_for_event(&codex, |event| match event {
-        EventMsg::TurnComplete(_) => true,
+        EventMsg::TurnComplete(completed) => {
+            assert_eq!(completed.error, None);
+            true
+        }
         EventMsg::AgentMessage(message) => {
             agent_messages.push(message.message.clone());
             false
@@ -905,9 +914,16 @@ async fn review_history_surfaces_in_parent_session() {
         )
     })
     .await;
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnComplete(completed) => {
+            assert_eq!(completed.error, None);
+            true
+        }
+        _ => false,
+    })
+    .await;
 
-    // 2) Continue in the parent session; request input must not include any review items.
+    // 2) Continue in the parent session; retain the completed review result.
     let followup = "back to parent".to_string();
     codex
         .submit(Op::UserInput {
@@ -922,11 +938,18 @@ async fn review_history_surfaces_in_parent_session() {
         })
         .await
         .unwrap();
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnComplete(completed) => {
+            assert_eq!(completed.error, None);
+            true
+        }
+        _ => false,
+    })
+    .await;
 
     // Inspect the second request (parent turn) input contents.
     // Parent turns include session initial messages (user_instructions, environment_context).
-    // Critically, no messages from the review thread should appear.
+    // The rendered review result must appear exactly once.
     let requests = request_log.requests();
     assert_eq!(requests.len(), 2);
     for request in &requests {

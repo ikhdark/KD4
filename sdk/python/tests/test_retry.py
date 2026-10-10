@@ -112,6 +112,31 @@ def test_retry_stops_at_attempt_limit(monkeypatch: pytest.MonkeyPatch, max_attem
     assert sleeps == ([] if max_attempts == 1 else [0.25, 0.5])
 
 
+@pytest.mark.parametrize("completed_at", [0.5, 1.0, 1.5])
+def test_retry_rejects_results_at_or_after_deadline(
+    monkeypatch: pytest.MonkeyPatch, completed_at: float
+) -> None:
+    # One wall-clock budget includes the callable, not only retry sleeps.
+    clock = [0.0]
+    result = object()
+    attempts = 0
+
+    def complete() -> object:
+        nonlocal attempts
+        attempts += 1
+        clock[0] = completed_at
+        return result
+
+    monkeypatch.setattr("openai_codex.retry.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("openai_codex.retry.time.sleep", lambda _: pytest.fail("unexpected retry"))
+    if completed_at < 1.0:
+        assert retry_on_overload(complete, timeout_s=1) is result
+    else:
+        with pytest.raises(TimeoutError, match="deadline"):
+            retry_on_overload(complete, timeout_s=1)
+    assert attempts == 1
+
+
 @pytest.mark.parametrize(
     ("message", "extra_data"),
     [

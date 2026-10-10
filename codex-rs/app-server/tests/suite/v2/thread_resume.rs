@@ -636,7 +636,7 @@ async fn first_turn_persists_complete_initial_thread_settings_for_cold_resume() 
 }
 
 #[tokio::test]
-async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
+async fn thread_goal_get_rejects_ephemeral_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -1470,11 +1470,41 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
         anyhow::bail!("expected thread goal update notification");
     };
     assert_eq!(notification.goal.status, ThreadGoalStatus::Paused);
+
+    // The goal runtime reacts to the idle thread only after that snapshot. A
+    // second resume is served once the first has finished, so its response
+    // marks the point from which a continuation would have been started.
+    let barrier_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(barrier_id)),
+    )
+    .await??;
     assert!(
-        !mcp.pending_notification_methods()
-            .iter()
-            .any(|method| method == "turn/started"),
+        timeout(
+            std::time::Duration::from_millis(500),
+            mcp.read_stream_until_notification_message("turn/started"),
+        )
+        .await
+        .is_err(),
         "paused goal should not continue after thread resume"
+    );
+    let model_requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count();
+    assert_eq!(
+        model_requests, 1,
+        "only the materializing turn may reach the model"
     );
 
     Ok(())
@@ -3073,14 +3103,14 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
         responses::ev_assistant_message("msg-1", "Done"),
         responses::ev_completed("resp-1"),
     ]);
-    let second_response = responses::sse_response(responses::sse(vec![
-        responses::ev_response_created("resp-2"),
-        responses::ev_assistant_message("msg-2", "Done"),
-        responses::ev_completed("resp-2"),
-    ]))
-    .set_delay(std::time::Duration::from_millis(500));
-    let _first_response_mock = responses::mount_sse_once(&server, first_body).await;
-    let _second_response_mock = responses::mount_response_once(&server, second_response).await;
+    let _responses = responses::mount_sse_sequence(
+        &server,
+        vec![
+            first_body,
+            app_test_support::create_request_user_input_sse_response("keep-active")?,
+        ],
+    )
+    .await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
@@ -3092,6 +3122,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
 
     let start_id = primary
         .send_thread_start_request_with_auto_env(ThreadStartParams {
+            approval_policy: Some(codex_app_server_protocol::AskForApproval::OnRequest),
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -3135,6 +3166,14 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
             }],
+            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                mode: codex_protocol::config_types::ModeKind::Plan,
+                settings: codex_protocol::config_types::Settings {
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
             ..Default::default()
         })
         .await?;
@@ -3151,6 +3190,17 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+
+    // Keep the turn active independently of scheduler or machine speed.
+    let pending_input = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_request_message(),
+    )
+    .await??;
+    assert!(matches!(
+        pending_input,
+        ServerRequest::ToolRequestUserInput { .. }
+    ));
 
     let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
@@ -3380,19 +3430,19 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
 #[tokio::test]
 async fn thread_resume_rejects_overrides_that_cannot_apply_to_a_running_thread() -> Result<()> {
     let server = responses::start_mock_server().await;
-    let first_response = responses::sse_response(responses::sse(vec![
+    let first_response = responses::sse(vec![
         responses::ev_response_created("resp-1"),
         responses::ev_assistant_message("msg-1", "Done"),
         responses::ev_completed("resp-1"),
-    ]));
-    let second_response = responses::sse_response(responses::sse(vec![
-        responses::ev_response_created("resp-2"),
-        responses::ev_assistant_message("msg-2", "Done"),
-        responses::ev_completed("resp-2"),
-    ]))
-    .set_delay(std::time::Duration::from_millis(500));
-    let _response_mock =
-        responses::mount_response_sequence(&server, vec![first_response, second_response]).await;
+    ]);
+    let _responses = responses::mount_sse_sequence(
+        &server,
+        vec![
+            first_response,
+            app_test_support::create_request_user_input_sse_response("keep-active")?,
+        ],
+    )
+    .await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
@@ -3404,6 +3454,7 @@ async fn thread_resume_rejects_overrides_that_cannot_apply_to_a_running_thread()
 
     let start_id = primary
         .send_thread_start_request_with_auto_env(ThreadStartParams {
+            approval_policy: Some(codex_app_server_protocol::AskForApproval::OnRequest),
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -3446,6 +3497,14 @@ async fn thread_resume_rejects_overrides_that_cannot_apply_to_a_running_thread()
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
             }],
+            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                mode: codex_protocol::config_types::ModeKind::Plan,
+                settings: codex_protocol::config_types::Settings {
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
             ..Default::default()
         })
         .await?;
@@ -3461,6 +3520,17 @@ async fn thread_resume_rejects_overrides_that_cannot_apply_to_a_running_thread()
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+
+    // Keep the turn active independently of scheduler or machine speed.
+    let pending_input = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_request_message(),
+    )
+    .await??;
+    assert!(matches!(
+        pending_input,
+        ServerRequest::ToolRequestUserInput { .. }
+    ));
 
     let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
@@ -3494,13 +3564,10 @@ async fn thread_resume_rejects_overrides_that_cannot_apply_to_a_running_thread()
     assert!(resume_err.error.message.contains("model requested="));
     assert!(resume_err.error.message.contains("cwd requested="));
 
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
     assert_eq!(running_turn.status, TurnStatus::InProgress);
+    primary
+        .interrupt_turn_and_wait_for_aborted(thread.id, running_turn.id, DEFAULT_READ_TIMEOUT)
+        .await?;
 
     Ok(())
 }
@@ -4251,10 +4318,13 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
     .await??;
     let ThreadResumeResponse {
         thread: resumed,
+        model,
         model_provider,
         ..
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
     assert!(!resumed.id.is_empty());
+    // The provider override equals the configured default; the model does not.
+    assert_eq!(model, "mock-model");
     assert_eq!(model_provider, "mock_provider");
     assert_eq!(resumed.preview, history_text);
     assert_eq!(resumed.status, ThreadStatus::Idle);
@@ -4368,6 +4438,23 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
+    // Own the model's personality inputs rather than depending on whichever
+    // metadata happens to be bundled for this slug.
+    let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.4");
+    model.model_messages = Some(codex_protocol::openai_models::ModelMessages {
+        token_budget: None,
+        instructions_template: Some(format!(
+            "{{{{ personality }}}}\n\n{}",
+            CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT
+        )),
+        instructions_variables: Some(codex_protocol::openai_models::ModelInstructionsVariables {
+            personality_default: Some(String::new()),
+            personality_friendly: Some("resume-friendly-sentinel".to_string()),
+            personality_pragmatic: Some("resume-pragmatic-sentinel".to_string()),
+        }),
+        approvals: None,
+    });
+    app_test_support::write_models_cache_with_models(codex_home.path(), vec![model])?;
 
     let mut primary = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -4463,7 +4550,9 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
+            .any(|text| {
+                text.contains("<personality_spec>") && text.contains("resume-friendly-sentinel")
+            }),
         "expected a personality update message in developer input, got {developer_texts:?}"
     );
     let instructions_text = request.instructions_text();

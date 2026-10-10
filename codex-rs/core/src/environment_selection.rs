@@ -1023,6 +1023,19 @@ url = "ws://127.0.0.1:8765"
         };
         assert_eq!(replacement.selection, selection);
         assert!(!failed_resolution.ptr_eq(&replacement.resolution));
+        let server = tokio::spawn(serve_environment_info(listener));
+        let resolved = timeout(Duration::from_secs(5), replacement.wait_until_ready())
+            .await
+            .expect("replacement should finish starting")
+            .expect("replacement should resolve successfully");
+        assert_eq!(resolved.selection(), selection);
+        assert!(Arc::ptr_eq(
+            &resolved.environment,
+            &manager
+                .get_environment(REMOTE_ENVIRONMENT_ID)
+                .expect("replacement remains registered"),
+        ));
+        server.await.expect("replacement server task");
     }
 
     #[tokio::test]

@@ -3563,6 +3563,7 @@ mod tests {
         let bad_state = TextAreaState { scroll: 999 };
         let (x1, y1) = t.cursor_pos(area).unwrap();
         let (x2, y2) = t.cursor_pos_with_state(area, bad_state).unwrap();
+        assert_eq!((x1, y1), (5, 5));
         assert_eq!((x2, y2), (x1, y1));
 
         // Case 2: Cursor below the current window — y should be clamped to the

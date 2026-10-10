@@ -236,6 +236,57 @@ fn auto_load_secrets_lock_failure_does_not_fall_back_to_file() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn auto_save_home_secrets_contention_does_not_fall_back_to_file() -> Result<()> {
+    let env = TempCodexHome::new();
+    let keyring_store = MockKeyringStore::default();
+    let original = sample_tokens();
+    save_oauth_tokens_with_keyring(
+        &keyring_store,
+        env.path(),
+        AuthKeyringBackendKind::Secrets,
+        &original.server_name,
+        &original,
+    )?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(env.path().join("secrets/.lock"))?;
+    lock.try_lock()?;
+    let mut updated = original.clone();
+    updated.token_response.0.set_access_token(AccessToken::new("updated-token".into()));
+
+    let result = save_oauth_tokens_with_keyring_with_fallback_to_file(
+        &keyring_store,
+        env.path(),
+        AuthKeyringBackendKind::Secrets,
+        &updated.server_name,
+        &updated,
+    );
+    drop(lock);
+    let error = result.expect_err("home-wide secrets contention must abort Auto persistence");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
+    assert!(!fallback_file_path(env.path()).exists());
+    let loaded = load_oauth_tokens_from_keyring(
+        &keyring_store, env.path(), AuthKeyringBackendKind::Secrets,
+        &original.server_name, &original.url,
+    )?.expect("original credential must remain authoritative");
+    assert_tokens_match_without_expiry(&loaded, &original);
+    save_oauth_tokens_with_keyring_with_fallback_to_file(
+        &keyring_store, env.path(), AuthKeyringBackendKind::Secrets,
+        &updated.server_name, &updated,
+    )?;
+    let loaded = load_oauth_tokens_from_keyring(
+        &keyring_store, env.path(), AuthKeyringBackendKind::Secrets,
+        &updated.server_name, &updated.url,
+    )?.expect("released lock must permit the updated credential");
+    assert_tokens_match_without_expiry(&loaded, &updated);
+    Ok(())
+}
+
 struct LockContentionSubscriber {
     contended_tx: mpsc::Sender<()>,
 }

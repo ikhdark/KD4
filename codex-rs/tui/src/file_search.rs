@@ -184,8 +184,13 @@ mod tests {
         }
         reporter.send_snapshot(&file_search::FileSearchSnapshot::default());
         assert!(rx.try_recv().is_err(), "cleared queries must not publish");
+        // Restore a publishable query so only the dropped manager suppresses the event.
+        manager.state.lock().unwrap().latest_query = "current".to_string();
         drop(manager);
-        reporter.send_snapshot(&file_search::FileSearchSnapshot::default());
+        reporter.send_snapshot(&file_search::FileSearchSnapshot {
+            query: "current".to_string(),
+            ..Default::default()
+        });
         assert!(rx.try_recv().is_err(), "dropped managers must not publish");
     }
 

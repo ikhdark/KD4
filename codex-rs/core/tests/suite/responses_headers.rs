@@ -472,6 +472,18 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
             .expect("second request should include turn metadata"),
     )
     .expect("second metadata should be valid json");
+    // Workspace enrichment may finish between requests. Each compatibility
+    // header must still agree with that request's canonical metadata snapshot.
+    for (request, header_metadata) in requests.iter().zip([&first_parsed, &second_parsed]) {
+        let body = request.body_json();
+        let canonical: serde_json::Value = serde_json::from_str(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("canonical turn metadata must be in the request body"),
+        )
+        .expect("canonical metadata should be valid JSON");
+        assert_eq!(&canonical, header_metadata);
+    }
 
     let first_turn_id = first_parsed
         .get("turn_id")

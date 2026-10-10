@@ -760,7 +760,9 @@ async fn run_command(params: RunCommandParams) {
     } = params;
     let mut control_rx = control_rx;
     let mut control_open = true;
-    let expiration = expiration.wait_with_outcome();
+    let expiration = expiration
+        .with_cancellation(connection_cancellation.clone())
+        .wait_with_outcome();
     tokio::pin!(expiration);
     let SpawnedProcess {
         session,
@@ -1208,7 +1210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_fallback_joins_queued_and_rejected_chunks_before_utf8_conversion() {
+    async fn undelivered_output_is_split_between_the_relay_and_the_collector() {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
@@ -1248,14 +1250,102 @@ mod tests {
             .expect("collector finishes without delivery");
         assert_eq!(local_tail, vec![0x82, 0xac, b'!', b'?']);
         drop(relay);
-        let mut undelivered = delivery_handle.await.expect("relay finishes");
+        let undelivered = delivery_handle.await.expect("relay finishes");
         assert_eq!(undelivered.stdout, vec![0xe2]);
-        undelivered.append_tail(UndeliveredOutput {
-            stdout: local_tail,
-            stderr: Vec::new(),
-        });
-        assert_eq!(bytes_to_string_smart(&undelivered.stdout), "€!?");
         assert!(undelivered.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_stream_delivery_returns_the_output_decoded_as_one_suffix() {
+        // The first fragment is too large to be coalesced with its successor and
+        // exactly fills the relay's byte budget; the second can never fit that
+        // budget. The euro sign therefore straddles the relay-owned bytes and the
+        // collector's tail however the tasks are scheduled.
+        let mut first = vec![b'a'; OUTPUT_CHUNK_SIZE_HINT - 1];
+        first.push(0xe2);
+        let mut second = vec![0x82, 0xac];
+        second.resize(OUTPUT_CHUNK_SIZE_HINT + 8, b'b');
+        let expected_stdout = format!(
+            "{}€{}",
+            "a".repeat(first.len() - 1),
+            "b".repeat(second.len() - 2)
+        );
+        // One byte past the cap, which the response must not carry.
+        second.push(b'x');
+        let output_bytes_cap = first.len() + second.len() - 1;
+        let process_id = "p".repeat(
+            OUTPUT_DELIVERY_MAX_QUEUED_BYTES
+                - OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES
+                - STANDARD.encode(&first).len(),
+        );
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (stdout_tx, stdout_rx) = mpsc::channel(2);
+        let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
+        drop(stderr_tx);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let spawned = spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: stdout_rx.into(),
+            stderr_rx: Some(stderr_rx.into()),
+            exit_rx,
+            terminator: Some(Box::new(|| Ok(()))),
+            writer_handle: None,
+            resizer: None,
+        });
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (_write_tx, write_rx) = mpsc::channel(1);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
+        // A closed connection rejects every delta, so the response carries all output.
+        let connection_cancellation = CancellationToken::new();
+        connection_cancellation.cancel();
+        let run_handle = tokio::spawn(run_command(RunCommandParams {
+            outgoing: Arc::new(OutgoingMessageSender::new(
+                outgoing_tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            )),
+            request_id: ConnectionRequestId {
+                connection_id: ConnectionId(32),
+                request_id: codex_app_server_protocol::RequestId::Integer(32),
+            },
+            process_id: Some(process_id),
+            spawned,
+            control_rx,
+            write_rx,
+            stream_stdin: false,
+            stream_stdout_stderr: true,
+            expiration: ExecExpiration::Cancellation(CancellationToken::new()),
+            output_bytes_cap: Some(output_bytes_cap),
+            connection_cancellation,
+            terminal_cleanup: None,
+        }));
+        stdout_tx.send(first).await.expect("first fragment");
+        stdout_tx.send(second).await.expect("second fragment");
+        drop(stdout_tx);
+        exit_tx.send(0).expect("publish driver exit");
+        timeout(Duration::from_secs(5), run_handle)
+            .await
+            .expect("run command did not finish")
+            .expect("run command task panicked");
+
+        let envelope = outgoing_rx.recv().await.expect("terminal response");
+        let OutgoingEnvelope::ToConnection {
+            message: OutgoingMessage::Response(response),
+            ..
+        } = envelope
+        else {
+            panic!("expected the command/exec response");
+        };
+        let response: CommandExecResponse =
+            serde_json::from_value(response.result).expect("typed command/exec response");
+        // Not `assert_eq!`: a mismatch would diff two 128KiB single-line strings.
+        assert!(
+            response.stdout == expected_stdout,
+            "stdout must be the relay-owned bytes followed by the collector tail, decoded once \
+             ({} bytes, expected {})",
+            response.stdout.len(),
+            expected_stdout.len()
+        );
+        assert_eq!(response.stderr, "");
     }
 
     fn windows_sandbox_exec_request() -> ExecRequest {

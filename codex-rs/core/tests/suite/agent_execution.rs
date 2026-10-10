@@ -2,9 +2,15 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_features::Feature;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
@@ -12,6 +18,8 @@ use core_test_support::responses::request_has_last_message_input_text;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::time::Duration;
@@ -138,11 +146,32 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     .await;
     let first_followup = mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| has_function_call_output(request, "first-call"),
+        |request: &wiremock::Request| {
+            has_function_call_output(request, "first-call")
+                && !has_function_call_output(request, "hold-parent")
+        },
         sse(vec![
             ev_response_created("first-followup-response"),
-            ev_assistant_message("first-followup-message", "spawned"),
+            ev_function_call("hold-parent", "request_user_input", &json!({
+                "questions": [{
+                    "id": "release", "header": "Continue", "question": "Release the parent?",
+                    "options": [
+                        {"label": "Yes", "description": "Finish this turn."},
+                        {"label": "No", "description": "Keep waiting."}
+                    ]
+                }]
+            }).to_string()),
             ev_completed("first-followup-response"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "hold-parent"),
+        sse(vec![
+            ev_response_created("parent-finish"),
+            ev_assistant_message("first-followup-message", "spawned"),
+            ev_completed("parent-finish"),
         ]),
     )
     .await;
@@ -157,9 +186,26 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
             .enable(Feature::MultiAgentV2)
             .expect("test config should allow feature update");
         config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+        config.features.enable(Feature::DefaultModeRequestUserInput)
+            .expect("enable the parent lifetime barrier");
     });
     let test = builder.build(&server).await?;
-    test.submit_turn(FIRST_PROMPT).await?;
+    test.codex.submit(Op::UserInput {
+        items: vec![UserInput::Text {
+            text: FIRST_PROMPT.to_string(), text_elements: Vec::new(),
+        }],
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
+    }).await?;
+    // Keep the root's execution slot occupied until the child's admission has
+    // been observed. An immediate parent completion races the nested spawn.
+    let question = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RequestUserInput(question) => Some(question.clone()),
+        _ => None,
+    }).await;
+    assert_eq!(question.call_id, "hold-parent");
 
     let second_output = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -200,6 +246,27 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
         "collab spawn failed: agent thread limit reached"
     );
     assert_eq!(test.thread_manager.list_thread_ids().await.len(), 2);
+
+    test.codex.submit(Op::UserInputAnswer {
+        id: question.turn_id.clone(),
+        call_id: Some(question.call_id),
+        response: RequestUserInputResponse {
+            disposition: None,
+            answers: [("release".to_string(), RequestUserInputAnswer {
+                answers: vec!["Yes".to_string()],
+            })].into_iter().collect(),
+            interrupted: false,
+        },
+    }).await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::TurnComplete(completed) => {
+            assert_eq!(completed.turn_id, question.turn_id);
+            assert_eq!(completed.error, None);
+            assert_eq!(completed.last_agent_message.as_deref(), Some("spawned"));
+            true
+        }
+        _ => false,
+    }).await;
 
     Ok(())
 }
@@ -312,7 +379,7 @@ for (let attempt = 0; attempt < 256; attempt++) {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(45),
-            test.submit_turn("Run the four independent agents"),
+            test.submit_turn_and_capture_completion("Run the four independent agents"),
         ).await;
         let completion_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut terminal_results = std::collections::BTreeMap::new();
@@ -325,8 +392,13 @@ for (let attempt = 0; attempt < 256; attempt++) {
         let cleanup_started = std::time::Instant::now();
         let shutdown = test.thread_manager.shutdown_all_threads_bounded(Duration::from_secs(5)).await;
         let cleanup_ms = cleanup_started.elapsed().as_secs_f64() * 1000.0;
-        outcome.context("batch timed out")??;
+        let completed = outcome.context("batch timed out")??;
+        assert_eq!(completed.error, None);
+        assert_eq!(completed.last_agent_message.as_deref(), Some("All four results collected"));
         let request = finish.single_request();
+        let (_, success) = request.custom_tool_call_output_content_and_success("batch")
+            .expect("batch output");
+        assert_ne!(success, Some(false), "the batch cell must succeed");
         let output = request.custom_tool_call_output("batch").to_string();
         anyhow::ensure!(shutdown.timed_out.is_empty() && shutdown.submit_failed.is_empty(), "{shutdown:?}");
         anyhow::ensure!(shutdown.completed.len() == 5, "lost or duplicated child: {shutdown:?}; batch output: {output}");
@@ -382,6 +454,9 @@ async fn code_mode_only_discovers_spawns_and_receives_from_real_subagent() -> Re
         call_id: &str,
     ) -> String {
         let output = request.custom_tool_call_output(call_id);
+        let (_, success) = request.custom_tool_call_output_content_and_success(call_id)
+            .expect("probe output");
+        assert_ne!(success, Some(false), "the probe cell must succeed");
         match &output["output"] {
             serde_json::Value::String(text) => text.clone(),
             serde_json::Value::Array(items) => items
@@ -496,12 +571,14 @@ text("list-proof:" + JSON.stringify(listed));
         });
     let test = builder.build(&server).await?;
     let outcome: Result<()> = async {
-        tokio::time::timeout(
+        let completed = tokio::time::timeout(
             Duration::from_secs(30),
-            test.submit_turn("Use a subagent for the runtime probe"),
+            test.submit_turn_and_capture_completion("Use a subagent for the runtime probe"),
         )
         .await
         .context("parent agent lifecycle timed out")??;
+        assert_eq!(completed.error, None);
+        assert_eq!(completed.last_agent_message.as_deref(), Some("probe complete"));
         let first_request = initial.single_request().body_json();
         anyhow::ensure!(
             first_request["tools"]

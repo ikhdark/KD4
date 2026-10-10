@@ -248,6 +248,7 @@ impl ChatWidget {
             arguments,
             result,
             error,
+            status,
             duration_ms,
             ..
         } = item
@@ -267,7 +268,7 @@ impl ChatWidget {
                 Ok(codex_protocol::mcp::CallToolResult {
                     content: result.content,
                     structured_content: result.structured_content,
-                    is_error: Some(false),
+                    is_error: Some(status == codex_app_server_protocol::McpToolCallStatus::Failed),
                     meta: None,
                 })
             }

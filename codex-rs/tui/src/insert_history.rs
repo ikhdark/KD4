@@ -7,6 +7,7 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 
+use crate::live_wrap::terminal_row_ranges;
 use crate::render::line_utils::line_into_static;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::decorate_spans;
@@ -42,6 +43,14 @@ use ratatui::text::Span;
 pub enum HistoryLineWrapPolicy {
     PreWrap,
     Terminal,
+}
+
+pub(crate) fn terminal_row_count(line: &Line<'_>, width: usize) -> usize {
+    match line.spans.as_slice() {
+        [] => 1,
+        [span] => terminal_row_ranges(&span.content, width).count(),
+        _ => terminal_row_ranges(&line.to_string(), width).count(),
+    }
 }
 
 /// Insert `lines` above the viewport using the terminal's backend writer
@@ -127,7 +136,7 @@ where
         };
         wrapped_rows += line_wrapped
             .iter()
-            .map(|wrapped_line| wrapped_line.width().max(1).div_ceil(wrap_width))
+            .map(|wrapped_line| terminal_row_count(&wrapped_line.line, wrap_width))
             .sum::<usize>();
         wrapped.extend(line_wrapped);
     }
@@ -194,7 +203,7 @@ where
                 scroll_bottom.saturating_sub(cursor_row),
             )?;
             cursor_row = cursor_row
-                .saturating_add(line.width().max(1).div_ceil(wrap_width) - 1)
+                .saturating_add(terminal_row_count(&line.line, wrap_width) - 1)
                 .min(scroll_bottom);
         }
 
@@ -242,7 +251,7 @@ fn write_history_line<W: Write>(
     wrap_width: usize,
     reachable_rows_below: usize,
 ) -> io::Result<()> {
-    let physical_rows = line.width().max(1).div_ceil(wrap_width);
+    let physical_rows = terminal_row_count(&line.line, wrap_width);
     let rows_to_clear = physical_rows.saturating_sub(1).min(reachable_rows_below);
     if rows_to_clear > 0 {
         queue!(writer, SavePosition)?;
@@ -930,6 +939,25 @@ mod tests {
     }
 
     #[test]
+    fn vt100_terminal_wrap_policy_counts_wide_glyph_rows() {
+        let mut term = crate::custom_terminal::Terminal::with_options(VT100Backend::new(3, 8))
+            .expect("terminal");
+        term.set_viewport_area(Rect::new(0, 7, 3, 1));
+        insert_history_lines_with_wrap_policy(
+            &mut term,
+            vec![Line::from("界語漢字")],
+            HistoryLineWrapPolicy::Terminal,
+        )
+        .expect("insert wide raw history");
+
+        let rows: Vec<String> = term.backend().vt100().screen().rows(0, 3).collect();
+        for glyph in ["界", "語", "漢", "字"] {
+            assert!(rows.iter().any(|row| row.trim_end() == glyph), "{rows:?}");
+        }
+        assert_eq!(term.visible_history_rows(), 4);
+    }
+
+    #[test]
     fn vt100_terminal_wrap_policy_does_not_pre_wrap_long_paragraph() {
         let width: u16 = 20;
         let height: u16 = 8;
@@ -956,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn vt100_unwrapped_url_like_clears_continuation_rows() {
+    fn vt100_unwrapped_url_like_tail_continues_alone_on_next_row() {
         let width: u16 = 20;
         let height: u16 = 10;
         let backend = VT100Backend::new(width, height);
@@ -985,13 +1013,12 @@ mod tests {
         );
         let continuation_row = rows[first_row + 1].trim_end();
 
-        assert!(
-            continuation_row.contains("/v1/short") || continuation_row.contains("short"),
-            "expected continuation row to contain wrapped URL-like tail, got: {continuation_row:?}"
-        );
-        assert!(
-            !continuation_row.contains('X'),
-            "expected continuation row to be cleared before writing wrapped URL-like content, got: {continuation_row:?}"
+        // The line is written on the last scroll-region row, so the terminal wraps the token
+        // onto a freshly scrolled row: this pins the unsplit token and that row's content, not
+        // the explicit continuation-row clear in `write_history_line`.
+        assert_eq!(
+            continuation_row, "/v1/short",
+            "expected only the URL-like tail on the continuation row, rows: {rows:?}"
         );
     }
 
@@ -1024,9 +1051,10 @@ mod tests {
             .position(|row| row.contains("• https://example.test/api"))
             .unwrap_or_else(|| panic!("expected URL first row in screen rows: {rows:?}"));
 
-        assert!(
-            url_row <= prompt_row + 2,
-            "expected URL content to appear immediately after prompt (allowing at most one spacer row), got prompt_row={prompt_row}, url_row={url_row}, rows={rows:?}",
+        assert_eq!(
+            url_row,
+            prompt_row + 1,
+            "expected URL content on the row immediately after the prompt, rows={rows:?}",
         );
     }
 }

@@ -1,5 +1,3 @@
-use crate::config::edit::ConfigEdit;
-use crate::config::edit::ConfigEditsBuilder;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
@@ -981,7 +979,7 @@ pub struct Config {
     pub code_mode: CodeModeConfig,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
-    /// Default: `60000` (1 minute).
+    /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: u64,
 
     /// Settings specific to the task-path-based multi-agent tool surface.
@@ -1990,22 +1988,6 @@ pub fn set_project_trust_level(
     ConfigEditsBuilder::new(codex_home)
         .set_project_trust_level(project_path, trust_level)
         .apply_blocking()
-}
-
-/// Save the default OSS provider preference to config.toml
-pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::Result<()> {
-    codex_config::config_toml::validate_oss_provider(provider)?;
-    use toml_edit::value;
-
-    let edits = [ConfigEdit::SetPath {
-        segments: vec!["oss_provider".to_string()],
-        value: value(provider),
-    }];
-
-    ConfigEditsBuilder::new(codex_home)
-        .with_edits(edits)
-        .apply_blocking()
-        .map_err(|err| std::io::Error::other(format!("failed to persist config.toml: {err}")))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

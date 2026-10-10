@@ -605,10 +605,11 @@ async fn unknown_plan_exposes_no_credit_breakdowns() {
     let (_home, live) = live(&server, "unknown").await;
     live.session().await.unwrap();
     assert!(live.credit_groups().is_empty());
-    assert!(
+    assert_eq!(
         live.history(Report::Credits, /*days*/ 7, Grouping::Surface)
             .await
-            .is_err()
+            .unwrap_err(),
+        "This credit breakdown is not supported for this account type."
     );
     assert!(report_requests(&server).await.is_empty());
 }

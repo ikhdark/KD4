@@ -398,6 +398,8 @@ async fn start_cell_reports_when_initial_response_is_enqueued() {
         started,
         active_cell_permit,
     );
+    // Let the forwarding task park on the unresolved response before checking the signal.
+    tokio::task::yield_now().await;
     assert_eq!(initial_response_sent.try_recv(), Err(TryRecvError::Empty));
 
     response_tx
@@ -411,7 +413,7 @@ async fn start_cell_reports_when_initial_response_is_enqueued() {
     initial_response_sent
         .await
         .expect("initial response completion");
-    outgoing_rx.recv().await.expect("initial response frame");
+    outgoing_rx.try_recv().expect("initial response frame");
     assert_eq!(active_cell_permits.available_permits(), 0);
 
     peer.close_cell(session_id("session-1"), cell_id);

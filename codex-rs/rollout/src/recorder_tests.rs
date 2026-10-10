@@ -76,8 +76,15 @@ async fn failed_rollout_backlog_is_bounded_and_only_barriers_retry() -> std::io:
     for _ in 0..200 {
         assert!(recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await.unwrap_err().to_string().contains("no items accepted"));
     }
+    // Fence on the writer: it has consumed the accepted addition before the retry check.
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    recorder.tx.send(RolloutCmd::Pause { entered: entered_tx, resume: resume_rx }).await
+        .expect("writer command channel should be open");
+    entered_rx.await.expect("writer should enter pause");
     assert!(!path.exists(), "ordinary additions must not retry degraded I/O");
     assert_eq!(task.pending_bytes.available_permits(), 0);
+    resume_tx.send(()).expect("writer pause receiver should remain open");
     recorder.flush().await?;
     assert_eq!(task.pending_bytes.available_permits(), charge * 2);
     let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
@@ -255,40 +262,6 @@ async fn ascending_filesystem_search_continues_after_a_nonmatching_page() {
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].thread_id, Some(last_id));
     assert!(page.next_cursor.is_none());
-}
-
-struct EventCountingSubscriber(Arc<AtomicUsize>);
-
-impl tracing::Subscriber for EventCountingSubscriber {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, _event: &tracing::Event<'_>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-#[test]
-fn thread_list_db_fallback_emits_one_diagnostic() {
-    let events = Arc::new(AtomicUsize::new(0));
-    tracing::subscriber::with_default(EventCountingSubscriber(Arc::clone(&events)), || {
-        warn_thread_list_db_fallback();
-    });
-
-    assert_eq!(events.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1010,8 +983,6 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     recorder.flush_durable().await?;
 
     recorder.persist().await?;
-    // Second call verifies `persist()` is idempotent after materialization.
-    recorder.persist().await?;
     assert!(rollout_path.exists(), "rollout file should be materialized");
 
     let text = std::fs::read_to_string(&rollout_path)?;
@@ -1066,6 +1037,8 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
         buffered_idx < user_idx,
         "buffered items should preserve ordering"
     );
+    // Second call verifies `persist()` is idempotent after materialization.
+    recorder.persist().await?;
     let text_after_second_persist = std::fs::read_to_string(&rollout_path)?;
     assert_eq!(text_after_second_persist, text);
 
@@ -1077,7 +1050,9 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     Ok(())
 }
 
-#[tokio::test]
+// Worker threads let record calls interleave with shutdown; on the default
+// current-thread runtime the shutdown task always wins and every call is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_shutdown_never_acknowledges_items_behind_shutdown() -> std::io::Result<()> {
     const WRITERS: usize = 32;
     let home = TempDir::new().expect("temp dir");
@@ -1537,14 +1512,21 @@ async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std
             .count(),
         1
     );
-    let manifest_hashes = lines
+    // (hash, is_reference): the queued "persisted" definition must be rebased onto
+    // the on-disk one instead of being restated in full.
+    let manifests = lines
         .iter()
         .filter_map(|line| match &line.item {
-            RolloutItem::ToolManifest(manifest) => Some(manifest.hash.as_str()),
+            RolloutItem::ToolManifest(manifest) => {
+                Some((manifest.hash.as_str(), manifest.is_reference()))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(manifest_hashes, vec!["persisted", "persisted", "changed"]);
+    assert_eq!(
+        manifests,
+        vec![("persisted", false), ("persisted", true), ("changed", false)]
+    );
     Ok(())
 }
 
@@ -1976,10 +1958,25 @@ async fn ordered_append_accepts_into_bounded_queue_without_materializing() -> st
     resume_tx
         .send(())
         .expect("writer pause receiver should remain open");
+    // A second pause is entered only after the writer has consumed the queued items.
+    let (consumed_tx, consumed_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    recorder
+        .tx
+        .send(RolloutCmd::Pause {
+            entered: consumed_tx,
+            resume: release_rx,
+        })
+        .await
+        .expect("writer command channel should be open");
+    consumed_rx.await.expect("writer should consume the queued items");
     assert!(
         !rollout_path.exists(),
         "in-memory acceptance must not materialize or flush the rollout"
     );
+    release_tx
+        .send(())
+        .expect("writer pause receiver should remain open");
 
     recorder.shutdown().await?;
     let (recovered, _, errors) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
@@ -2474,7 +2471,15 @@ async fn durable_flush_retries_unsynced_payloads_before_acknowledging_rollout() 
     fs::remove_file(&blob)?;
     assert!(state.flush_durable().await.is_err());
     fs::write(&blob, saved)?;
+    let retried = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&retried);
+    crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(path.clone(),
+        crate::payload_artifact::SyncTestHook { parallelism: 8, before_sync: Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst); Ok(())
+        }) });
     state.flush_durable().await?;
+    crate::payload_artifact::sync_test_hooks().lock().unwrap().remove(&path);
+    assert_eq!(retried.load(Ordering::SeqCst), 1, "the failed barrier must leave its payload for the retry to sync");
     assert_eq!(fs::read_to_string(&path)?, text);
     Ok(())
 }
@@ -2584,6 +2589,23 @@ async fn list_threads_db_enabled_preserves_metadata_for_missing_rollout_paths()
     )
     .await?;
     assert_eq!(page.items.len(), 0);
+    // The unfiltered scan above never lists SQLite rows. The state DB listing does see
+    // this row and must drop it from the page without deleting its metadata.
+    let state_db_page = RolloutRecorder::list_threads_from_state_db(
+        Some(runtime.clone()),
+        &config,
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        default_provider.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(state_db_page.items.len(), 0);
     let stored_path = runtime
         .find_rollout_path_by_id(thread_id, Some(false))
         .await

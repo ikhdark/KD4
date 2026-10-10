@@ -202,7 +202,8 @@ mod tests {
 
         assert!(!state.schedule_debounced(/*target_width*/ None));
         assert!(
-            state.pending_until().expect("pending reflow") > before_reschedule,
+            state.pending_until().expect("pending reflow")
+                >= before_reschedule + TRANSCRIPT_REFLOW_DEBOUNCE,
             "a resize after the old deadline should start a fresh quiet period"
         );
     }

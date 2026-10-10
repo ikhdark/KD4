@@ -28,10 +28,8 @@ use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_reasoning_item_added;
 use core_test_support::responses::ev_response_created;
 use core_test_support::streaming_sse::StreamingSseChunk;
-use core_test_support::streaming_sse::StreamingSseServer;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::TestCodexThread;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -96,6 +94,19 @@ fn function_call_output_text<'a>(body: &'a Value, call_id: &str) -> Option<&'a s
         .as_str()
 }
 
+fn normalized_preserved_tool_output(output: Option<&str>) -> String {
+    let output = output.expect("preserved tool output");
+    let output = output.replace("\r\n", "\n");
+    let (wall_time, stdout) = output
+        .strip_prefix("Exit code: 0\nWall time: ")
+        .and_then(|output| output.split_once(" seconds\nOutput:\n"))
+        .expect("preserved shell command must execute successfully");
+    let wall_time = wall_time.parse::<f64>().expect("shell wall time");
+    assert!(wall_time.is_finite() && wall_time >= 0.0);
+    assert_eq!(stdout, "preserved tool call\n");
+    "Exit code: 0\nWall time: <DURATION> seconds\nOutput:\npreserved tool call\n".to_string()
+}
+
 fn assert_interrupted_sleep_output(output: Option<&str>) {
     let Some(output) = output else {
         panic!("sleep output missing");
@@ -106,9 +117,12 @@ fn assert_interrupted_sleep_output(output: Option<&str>) {
     else {
         panic!("sleep output should include wall time");
     };
+    let wall_time = wall_time
+        .parse::<f64>()
+        .expect("sleep wall time should be a number");
     assert!(
-        wall_time.parse::<f64>().is_ok(),
-        "sleep wall time should be a number"
+        wall_time.is_finite() && wall_time >= 0.0,
+        "sleep wall time should be a finite, nonnegative duration"
     );
 }
 
@@ -131,15 +145,6 @@ fn response_completed_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
         chunk(ev_response_created(response_id)),
         chunk(ev_completed(response_id)),
     ]
-}
-
-async fn build_codex(server: &StreamingSseServer) -> TestCodexThread {
-    test_codex()
-        .with_model("gpt-5.4")
-        .build_with_streaming_server(server)
-        .await
-        .expect("build streaming Codex test session")
-        .codex
 }
 
 async fn submit_user_input(codex: &CodexThread, text: &str) {
@@ -311,6 +316,7 @@ async fn wait_for_sleep_item_completed(codex: &CodexThread, call_id: &str, durat
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
     const SPAWN_CALL_ID: &str = "spawn-call";
+    const INITIAL_WAIT_CALL_ID: &str = "accepted-call";
     const WAIT_CALL_ID: &str = "wait-call";
     const INITIAL_PROMPT: &str = "spawn an agent, then wait for it";
     const CHILD_TASK: &str = "remain active until the parent stops waiting";
@@ -362,18 +368,41 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
         move |request: &wiremock::Request| {
             serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
                 let body = body.to_string();
-                body.contains(SPAWN_CALL_ID) && !body.contains(WAIT_CALL_ID)
+                body.contains(SPAWN_CALL_ID) && !body.contains(INITIAL_WAIT_CALL_ID)
             })
         },
         responses::sse(vec![
             ev_response_created("resp-2"),
+            ev_function_call_with_namespace(
+                INITIAL_WAIT_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "wait_agent",
+                "{}",
+            ),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    // Drain the spawn's accepted event before waiting for steering. ItemStarted
+    // precedes the durable-backlog check, so steering the first wait races with
+    // that legitimate immediate wake.
+    let accepted_follow_up_mock = responses::mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                let body = body.to_string();
+                body.contains(INITIAL_WAIT_CALL_ID) && !body.contains(WAIT_CALL_ID)
+            })
+        },
+        responses::sse(vec![
+            ev_response_created("resp-wait"),
             ev_function_call_with_namespace(
                 WAIT_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
                 "wait_agent",
                 "{}",
             ),
-            ev_completed("resp-2"),
+            ev_completed("resp-wait"),
         ]),
     )
     .await;
@@ -463,7 +492,16 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
     assert_eq!(wait_output["nudged_assignment_ids"], json!([]));
     assert_eq!(wait_output["truncated_count"], json!(0));
     assert!(wait_output.get("cursor").is_some_and(Value::is_string));
-    let typed_deltas = wait_output["typed_deltas"]
+    assert_eq!(wait_output["typed_deltas"], json!([]));
+
+    let accepted_output = accepted_follow_up_mock
+        .single_request()
+        .function_call_output_text(INITIAL_WAIT_CALL_ID)
+        .expect("initial wait_agent output");
+    let accepted_output =
+        serde_json::from_str::<Value>(&accepted_output).expect("parse initial wait_agent output");
+    assert_eq!(accepted_output["timed_out"], json!(false));
+    let typed_deltas = accepted_output["typed_deltas"]
         .as_array()
         .expect("typed deltas array");
     assert_eq!(typed_deltas.len(), 1);
@@ -604,10 +642,16 @@ fn assert_two_responses_input_snapshot(snapshot_name: &str, requests: &[Vec<u8>]
         .as_array()
         .expect("first request input")
         .clone();
-    let second_items = second["input"]
+    let mut second_items = second["input"]
         .as_array()
         .expect("second request input")
         .clone();
+    for item in &mut second_items {
+        if item["type"] == "function_call_output" && item["call_id"] == "call-preserved" {
+            // Assert real execution before redacting only duration and newline style.
+            item["output"] = json!(normalized_preserved_tool_output(item["output"].as_str()));
+        }
+    }
     let snapshot = context_snapshot::format_labeled_items_snapshot(
         "/responses POST bodies (input only, redacted like other suite snapshots)",
         &[
@@ -722,7 +766,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         .send(())
         .expect("first response is still waiting for completion");
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
@@ -764,11 +808,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item(
             gate_reasoning_done_rx,
             vec![
                 ev_reasoning_item("reason-1", &["thinking"], &[]),
-                ev_function_call(
-                    "call-preserved",
-                    "shell",
-                    r#"{"kind":"script","command":"echo preserved tool call"}"#,
-                ),
+                responses::ev_shell_command_call("call-preserved", "echo 'preserved tool call'"),
                 ev_message_item_added("msg-stale", ""),
                 ev_output_text_delta("stale final"),
                 ev_message_item_done("msg-stale", "stale final"),
@@ -780,9 +820,15 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item(
     let (server, _completions) =
         start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
 
-    let codex = build_codex(&server).await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build streaming Codex test session");
+    let codex = &test.codex;
 
-    submit_user_input(&codex, "first prompt").await;
+    // Scheduling is under test, not interactive shell approval.
+    submit_danger_full_access_user_turn(&test, "first prompt").await;
 
     wait_for_reasoning_item_started(&codex).await;
 
@@ -797,7 +843,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item(
     let first: Value = from_slice(&requests[0]).expect("parse first request");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
     assert!(function_call_output_text(&first, "call-preserved").is_none());
-    assert!(function_call_output_text(&second, "call-preserved").is_some());
+    normalized_preserved_tool_output(function_call_output_text(&second, "call-preserved"));
     assert_eq!(
         agent_message_input_texts(&second)
             .iter()
@@ -806,6 +852,8 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item(
         1
     );
 
+    codex.submit(Op::Shutdown).await.expect("shutdown session");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.shutdown().await;
 }
 
@@ -830,11 +878,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
                         "phase": "commentary",
                     }
                 }),
-                ev_function_call(
-                    "call-preserved",
-                    "shell",
-                    r#"{"kind":"script","command":"echo preserved tool call"}"#,
-                ),
+                responses::ev_shell_command_call("call-preserved", "echo 'preserved tool call'"),
                 ev_message_item_added("msg-stale", ""),
                 ev_output_text_delta("stale final"),
                 ev_message_item_done("msg-stale", "stale final"),
@@ -846,9 +890,15 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
     let (server, _completions) =
         start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
 
-    let codex = build_codex(&server).await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build streaming Codex test session");
+    let codex = &test.codex;
 
-    submit_user_input(&codex, "first prompt").await;
+    // Scheduling is under test, not interactive shell approval.
+    submit_danger_full_access_user_turn(&test, "first prompt").await;
 
     wait_for_event(&codex, |event| {
         matches!(
@@ -872,7 +922,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
     let first: Value = from_slice(&requests[0]).expect("parse first request");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
     assert!(function_call_output_text(&first, "call-preserved").is_none());
-    assert!(function_call_output_text(&second, "call-preserved").is_some());
+    normalized_preserved_tool_output(function_call_output_text(&second, "call-preserved"));
     assert_eq!(
         agent_message_input_texts(&second)
             .iter()
@@ -881,6 +931,8 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
         1
     );
 
+    codex.submit(Op::Shutdown).await.expect("shutdown session");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.shutdown().await;
 }
 
@@ -895,11 +947,7 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
             gate_reasoning_done_rx,
             vec![
                 ev_reasoning_item("reason-1", &["thinking"], &[]),
-                ev_function_call(
-                    "call-preserved",
-                    "shell",
-                    r#"{"kind":"script","command":"echo preserved tool call"}"#,
-                ),
+                responses::ev_shell_command_call("call-preserved", "echo 'preserved tool call'"),
                 ev_message_item_added("msg-1", ""),
                 ev_output_text_delta("first answer"),
                 ev_message_item_done("msg-1", "first answer"),
@@ -911,7 +959,7 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
     let (server, _completions) =
         start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
 
-    let codex = test_codex()
+    let test = test_codex()
         .with_model("gpt-5.4")
         .with_config(|config| {
             config
@@ -921,10 +969,11 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
         })
         .build_with_streaming_server(&server)
         .await
-        .expect("build Codex test session")
-        .codex;
+        .expect("build Codex test session");
+    let codex = &test.codex;
 
-    submit_user_input(&codex, "first prompt").await;
+    // Scheduling is under test, not interactive shell approval.
+    submit_danger_full_access_user_turn(&test, "first prompt").await;
 
     wait_for_reasoning_item_started(&codex).await;
 
@@ -942,6 +991,8 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
         &requests,
     );
 
+    codex.submit(Op::Shutdown).await.expect("shutdown session");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.shutdown().await;
 }
 
@@ -1109,11 +1160,13 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
     );
 
     let steered_user_texts = message_input_texts(&steered_body, "user");
-    assert!(
+    assert_eq!(
         steered_user_texts
             .iter()
-            .any(|text| text == "second prompt"),
-        "steered input should follow compaction without an empty resume request when the model was already done"
+            .filter(|text| *text == "second prompt")
+            .count(),
+        1,
+        "steered input should follow compaction exactly once without an empty resume request when the model was already done"
     );
 
     server.shutdown().await;
@@ -1195,12 +1248,20 @@ async fn steered_user_input_arrives_when_tool_output_triggers_compact_before_nex
     steer_user_input(&codex, "second prompt").await;
     let _ = gate_first_completed_tx.send(());
 
-    core_test_support::wait_for_event_with_timeout(
+    let EventMsg::TurnComplete(completed) = core_test_support::wait_for_event_with_timeout(
         &codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
         tokio::time::Duration::from_secs(10),
     )
-    .await;
+    .await
+    else {
+        unreachable!("predicate requires terminal completion");
+    };
+    assert_eq!(completed.error, None);
+    assert_eq!(
+        completed.last_agent_message.as_deref(),
+        Some("processed steered prompt")
+    );
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 3);

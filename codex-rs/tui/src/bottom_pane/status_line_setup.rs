@@ -417,6 +417,8 @@ mod tests {
             (StatusLineItem::ModelName, "model", &["model-name"][..]),
             (StatusLineItem::Reasoning, "reasoning", &[][..]),
             (StatusLineItem::Status, "run-state", &["status"][..]),
+            (StatusLineItem::ApprovalMode, "approval-mode", &["approval"][..]),
+            (StatusLineItem::SessionId, "thread-id", &["session-id"][..]),
             (StatusLineItem::PullRequestNumber, "pull-request-number", &[][..]),
             (StatusLineItem::BranchChanges, "branch-changes", &[][..]),
             (StatusLineItem::TaskProgress, "task-progress", &[][..]),

@@ -63,6 +63,15 @@ fn switches_to_bounded_storage_after_the_byte_budget_and_preserves_split_crlf() 
             split.lines().collect::<Vec<_>>(),
             contiguous.lines().collect::<Vec<_>>()
         );
+        // Only the CRLF terminator is consumed; an earlier lone CR stays in the line.
+        assert_eq!(
+            split
+                .lines()
+                .next()
+                .expect("completed line")
+                .ends_with('\r'),
+            carriage_returns == "\r\r"
+        );
     }
 }
 
@@ -89,22 +98,45 @@ fn truncated_ansi_sequence_does_not_hide_the_retained_tail() {
 }
 
 #[test]
+fn complete_csi_sequences_do_not_gain_visible_terminators_when_truncated() {
+    // CSI final bytes include punctuation, not just alphabetic characters.
+    for final_byte in ['@', '~'] {
+        let head = format!(
+            "{}\x1b[1{final_byte}",
+            "x".repeat(LIVE_COMMAND_OUTPUT_LINE_HEAD_BYTES - 4)
+        );
+        let mut output = LiveCommandOutput::default();
+        output.push_str(&format!("{head}{}tail", "y".repeat(20_000)));
+        let line = output.lines().next().expect("truncated preview");
+
+        assert!(line.contains("bytes omitted"));
+        assert!(line.ends_with("tail"));
+        // The complete source escape needs no synthetic final character before
+        // the reset; appending 'm' here would insert visible text in the output.
+        assert!(line.starts_with(&format!("{head}\x1b[0m... ")));
+    }
+}
+
+#[test]
 fn bounds_long_no_newline_output_and_preserves_utf8_head_and_tail() {
     let mut output = LiveCommandOutput::default();
-    let chunk = "🦀".repeat(1024);
+    // Both byte cuts must land inside a character, or the boundary handling goes untested.
+    assert_ne!(LIVE_COMMAND_OUTPUT_LINE_HEAD_BYTES % "界".len(), 0);
+    assert_ne!(LIVE_COMMAND_OUTPUT_LINE_TAIL_BYTES % "界".len(), 0);
+    let chunk = "界".repeat(1024);
     for _ in 0..600 {
         output.push_str(&chunk);
     }
 
     let line = output.lines().next().expect("partial line");
     let retained_bytes = LIVE_COMMAND_OUTPUT_LINE_HEAD_BYTES + LIVE_COMMAND_OUTPUT_LINE_TAIL_BYTES
-        - LIVE_COMMAND_OUTPUT_LINE_HEAD_BYTES % "🦀".len()
-        - LIVE_COMMAND_OUTPUT_LINE_TAIL_BYTES % "🦀".len();
+        - LIVE_COMMAND_OUTPUT_LINE_HEAD_BYTES % "界".len()
+        - LIVE_COMMAND_OUTPUT_LINE_TAIL_BYTES % "界".len();
 
     assert_eq!(output.total_lines(), 1);
     assert_eq!(output.retained_lines(), 1);
-    assert!(line.starts_with("🦀🦀🦀"));
-    assert!(line.ends_with("🦀🦀🦀"));
+    assert!(line.starts_with("界界界"));
+    assert!(line.ends_with("界界界"));
     assert!(line.contains(&format!(
         "... {} bytes omitted ...",
         600 * chunk.len() - retained_bytes

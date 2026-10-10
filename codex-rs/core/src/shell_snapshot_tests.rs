@@ -1523,6 +1523,7 @@ async fn local_snapshot_overflow_terminates_a_still_running_shell() -> Result<()
     let shell =
         crate::shell::get_shell(ShellType::PowerShell, None).context("PowerShell installed")?;
     let root = tempdir()?;
+    let events = observe_next_snapshot_process();
     let script = format!(
         "[Console]::Out.Write([string]::new([char]'x', {})); Start-Sleep -Seconds 60",
         SNAPSHOT_OUTPUT_LIMIT_BYTES + 8192
@@ -1546,6 +1547,15 @@ async fn local_snapshot_overflow_terminates_a_still_running_shell() -> Result<()
             .to_string()
             .contains("exceeded")
     );
+    let pid = {
+        let events = events.lock().expect("snapshot observer lock");
+        match events.as_slice() {
+            [SnapshotProcessEvent::Queued, SnapshotProcessEvent::Spawned(Some(created)), SnapshotProcessEvent::Resumed(resumed)]
+                if created == resumed => *created,
+            events => panic!("overflow must come from the actual running snapshot child: {events:?}"),
+        }
+    };
+    codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2)).await?;
     Ok(())
 }
 

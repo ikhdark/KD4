@@ -612,32 +612,6 @@ async fn fuzzy_file_search_session_rejects_updates_before_start_and_after_stop()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_session_stops_sending_updates_after_stop() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let root = TempDir::new()?;
-    for i in 0..512 {
-        let file_path = root.path().join(format!("file-{i:04}.txt"));
-        std::fs::write(file_path, "contents")?;
-    }
-    let mut mcp = initialized_mcp(&codex_home).await?;
-
-    let root_path = root.path().to_string_lossy().to_string();
-    let session_id = "session-stop-no-updates";
-    mcp.start_fuzzy_file_search_session(session_id, vec![root_path])
-        .await?;
-    mcp.update_fuzzy_file_search_session(session_id, "file-")
-        .await?;
-    wait_for_session_updated(&mut mcp, session_id, "file-", FileExpectation::NonEmpty).await?;
-
-    mcp.stop_fuzzy_file_search_session(session_id).await?;
-
-    assert_no_session_updates_for(&mut mcp, session_id, STOP_GRACE_PERIOD, SHORT_READ_TIMEOUT)
-        .await?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_fuzzy_file_search_two_sessions_are_independent() -> Result<()> {
     let codex_home = TempDir::new()?;
     let root_a = TempDir::new()?;

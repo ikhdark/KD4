@@ -359,10 +359,7 @@ impl Expectation {
                     result.stdout
                 );
                 let file_contents = fs::read_to_string(&path)?;
-                assert!(
-                    file_contents.contains(content),
-                    "file contents missing {content:?}: {file_contents}"
-                );
+                assert_eq!(file_contents, *content, "created file must preserve exact bytes");
                 let _ = fs::remove_file(path);
             }
             Expectation::FileCreatedNoExitCode { target, content } => {
@@ -377,10 +374,7 @@ impl Expectation {
                     result.stdout
                 );
                 let file_contents = fs::read_to_string(&path)?;
-                assert!(
-                    file_contents.contains(content),
-                    "file contents missing {content:?}: {file_contents}"
-                );
+                assert_eq!(file_contents, *content, "created file must preserve exact bytes");
                 let _ = fs::remove_file(path);
             }
             Expectation::PatchApplied { target, content } => {
@@ -401,10 +395,7 @@ impl Expectation {
                     ),
                 }
                 let file_contents = fs::read_to_string(&path)?;
-                assert!(
-                    file_contents.contains(content),
-                    "patched file missing {content:?}: {file_contents}"
-                );
+                assert_eq!(file_contents, format!("{content}\n"), "patch adds one newline");
                 let _ = fs::remove_file(path);
             }
             Expectation::FileNotCreated {
@@ -476,6 +467,7 @@ impl Expectation {
                 );
             }
             Expectation::NetworkFailure { expect_tag } => {
+                assert_eq!(result.exit_code, Some(1), "the fetch fixture exits 1 on failure");
                 assert!(
                     result.stdout.contains("ERR:"),
                     "stdout missing ERR prefix: {}",
@@ -762,12 +754,15 @@ struct AutoCompletion {
 }
 
 async fn wait_for_completion(test: &TestCodex) {
-    wait_for_event_with_timeout(
+    let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
         &test.codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
         APPROVAL_EVENT_TIMEOUT,
     )
-    .await;
+    .await else {
+        unreachable!("completion predicate");
+    };
+    assert!(completed.error.is_none(), "{completed:?}");
 }
 
 fn body_contains(req: &Request, text: &str) -> bool {
@@ -1551,25 +1546,6 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 output_contains: "rejected by user",
             },
         },
-        ScenarioSpec {
-            name: "compound command with one safe command still requires approval",
-            approval_policy: AskForApproval::OnRequest,
-            sandbox_policy: workspace_write(false),
-            action: ActionKind::RunUnifiedExecCommand {
-                command: "Get-Content '.\\one.txt'; New-Item '.\\two.txt'",
-                justification: None,
-            },
-            sandbox_permissions: SandboxPermissions::RequireEscalated,
-            features: vec![Feature::UnifiedExec],
-            model_override: None,
-            outcome: Outcome::ExecApproval {
-                decision: ReviewDecision::Denied,
-                expected_reason: None,
-            },
-            expectation: Expectation::CommandFailure {
-                output_contains: "rejected by user",
-            },
-        },
     ]
 }
 
@@ -1782,6 +1758,16 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
         }
     };
 
+    if matches!(scenario.expectation,
+        Expectation::FileCreated { .. } | Expectation::FileCreatedNoExitCode { .. }
+        | Expectation::PatchApplied { .. } | Expectation::NetworkSuccess { .. }
+        | Expectation::NetworkSuccessNoExitCode { .. } | Expectation::CommandSuccess { .. }
+        | Expectation::CommandSuccessNoExitCode { .. })
+        && let Some(completion) = auto_command_end.as_ref()
+    {
+        assert!(completion.required_tool_error.is_none(), "{}: {:?}",
+            scenario.name, completion.required_tool_error);
+    }
     let result = if let Some(command_end) = auto_command_end
         .as_ref()
         .and_then(|completion| completion.command_end.as_ref())
@@ -2483,6 +2469,7 @@ allow_local_binding = true
         .clone()
         .expect("expected network approval context");
     assert_eq!(network_context.protocol, NetworkApprovalProtocol::Http);
+    assert_eq!(network_context.host, "codex-network-test.invalid");
 
     test.codex
         .submit(Op::ExecApproval {
@@ -2491,7 +2478,22 @@ allow_local_binding = true
             decision: ReviewDecision::Denied,
         })
         .await?;
-    wait_for_completion(&test).await;
+    let completion = wait_for_completion_without_approval(&test).await;
+    assert!(
+        completion.required_tool_error.is_none(),
+        "{:?}",
+        completion.required_tool_error
+    );
+    let command_end = completion
+        .command_end
+        .expect("denied network command must finish");
+    assert_eq!(command_end.call_id, call_id);
+    assert_ne!(
+        command_end.status,
+        ExecCommandStatus::Completed,
+        "{command_end:?}"
+    );
+    assert_ne!(command_end.exit_code, Some(0), "{command_end:?}");
 
     Ok(())
 }

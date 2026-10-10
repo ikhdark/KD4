@@ -582,6 +582,7 @@ mod tests {
     fn rejects_command_and_process_substitutions_and_expansions() {
         assert!(parse_seq("echo $(pwd)").is_none());
         assert!(parse_seq("echo `pwd`").is_none());
+        assert!(parse_seq("cat <(pwd)").is_none());
         assert!(parse_seq("echo $HOME").is_none());
         assert!(parse_seq("echo \"hi $USER\"").is_none());
     }
@@ -675,6 +676,19 @@ mod tests {
             "python3 <<'PY'\nprint('hello')\nPY\necho done".to_string(),
         ];
         assert_eq!(parse_shell_lc_single_command_prefix(&command), None);
+
+        // The grammar can nest a command chained on the heredoc line inside the
+        // redirect, where it is not a second top-level statement.
+        for script in [
+            "cat <<'EOF' && rm -rf /\ndata\nEOF",
+            "cat <<'EOF' | sh\ndata\nEOF",
+        ] {
+            assert_eq!(
+                parse_shell_lc_single_command_prefix(&["bash".into(), "-lc".into(), script.into()]),
+                None,
+                "{script}"
+            );
+        }
     }
 
     #[test]
@@ -718,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_shell_lc_single_command_prefix_rejects_herestring_with_chaining() {
+    fn parse_shell_lc_single_command_prefix_rejects_file_redirect_with_chaining() {
         let command = vec![
             "bash".to_string(),
             "-lc".to_string(),

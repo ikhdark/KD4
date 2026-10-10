@@ -978,22 +978,30 @@ pub(crate) fn format_additional_permissions_rule(
         parts.push("network".to_string());
     }
     if let Some(file_system) = additional_permissions.file_system.as_ref() {
-        let reads = format_file_system_entry_paths(
-            file_system
-                .entries
-                .iter()
-                .flatten()
-                .filter(|entry| entry.access == FileSystemAccessMode::Read),
+        let reads = file_system.entries.as_ref().map_or_else(
+            || {
+                file_system.read.iter().flatten()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            |entries| format_file_system_entry_paths(
+                entries.iter().filter(|entry| entry.access == FileSystemAccessMode::Read),
+            ),
         );
         if !reads.is_empty() {
             parts.push(format!("read {reads}"));
         }
-        let writes = format_file_system_entry_paths(
-            file_system
-                .entries
-                .iter()
-                .flatten()
-                .filter(|entry| entry.access == FileSystemAccessMode::Write),
+        let writes = file_system.entries.as_ref().map_or_else(
+            || {
+                file_system.write.iter().flatten()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            |entries| format_file_system_entry_paths(
+                entries.iter().filter(|entry| entry.access == FileSystemAccessMode::Write),
+            ),
         );
         if !writes.is_empty() {
             parts.push(format!("write {writes}"));
@@ -1659,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn network_deny_forever_shortcut_is_not_bound() {
+    fn network_deny_shortcut_is_unbound_when_deny_decision_is_not_offered() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
@@ -1695,6 +1703,10 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "unexpected approval event emitted for hidden network deny shortcut"
+        );
+        assert!(
+            !view.is_complete(),
+            "an unbound shortcut must leave the request pending"
         );
     }
 
@@ -1848,6 +1860,39 @@ mod tests {
                 "Yes, grant these permissions for this session".to_string(),
                 "No, continue without permissions".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn additional_permissions_rule_preserves_legacy_roots_and_entries_precedence() {
+        let mut permissions: AdditionalPermissionProfile = serde_json::from_value(
+            serde_json::json!({
+                "fileSystem": {
+                    "read": ["/legacy/read"],
+                    "write": ["/legacy/write"]
+                }
+            }),
+        )
+        .expect("legacy API permissions");
+
+        // The API retains legacy roots when entries is absent, including for exec approvals.
+        assert_eq!(
+            format_additional_permissions_rule(&permissions),
+            Some("read `/legacy/read`; write `/legacy/write`".to_string())
+        );
+
+        // An explicit entries list replaces legacy roots, even when it is empty.
+        permissions.file_system.as_mut().unwrap().entries = Some(Vec::new());
+        assert_eq!(format_additional_permissions_rule(&permissions), None);
+        permissions.file_system.as_mut().unwrap().entries = Some(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+        }]);
+        assert_eq!(
+            format_additional_permissions_rule(&permissions),
+            Some("read `:root`".to_string())
         );
     }
 

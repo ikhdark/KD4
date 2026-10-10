@@ -1190,6 +1190,116 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
         );
     }
 
+    #[tokio::test]
+    async fn register_agent_task_decrypts_encrypted_response_aliases() {
+        let server = wiremock::MockServer::start().await;
+        let client = codex_http_client::HttpClientBuilder::new()
+            .build_direct()
+            .expect("HTTP client");
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let private_key = signing_key.to_pkcs8_der().expect("test private key");
+        let private_key_base64 = BASE64_STANDARD.encode(private_key.as_bytes());
+        // Encrypt with the public-key conversion, independently of the private
+        // conversion under test. Both must identify the same recipient.
+        let recipient = crypto_box::PublicKey::from(
+            signing_key.verifying_key().to_montgomery().to_bytes(),
+        );
+        let task_id = "registered-task-雪";
+        let ciphertext = recipient
+            .seal(&mut crypto_box::aead::OsRng, task_id.as_bytes())
+            .expect("seal task ID");
+        for field in ["encrypted_task_id", "encryptedTaskId"] {
+            server.reset().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/agent/runtime/task/register"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ field: BASE64_STANDARD.encode(&ciphertext) }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                register_agent_task(
+                    &client,
+                    &server.uri(),
+                    AgentIdentityKey {
+                        agent_runtime_id: "runtime",
+                        private_key_pkcs8_base64: &private_key_base64,
+                    },
+                )
+                .await
+                .expect("encrypted task registration"),
+                task_id,
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_task_response_reads_plain_task_id_aliases_and_rejects_missing_id() {
+        let key = AgentIdentityKey {
+            agent_runtime_id: "runtime",
+            private_key_pkcs8_base64: "unused: no encrypted id is decrypted",
+        };
+        for field in ["task_id", "taskId"] {
+            let response: RegisterTaskResponse =
+                serde_json::from_value(serde_json::json!({ field: "registered-task" }))
+                    .expect("response should parse");
+            assert_eq!(
+                task_id_from_register_task_response(key, response).expect("plain task id"),
+                "registered-task",
+                "{field}"
+            );
+        }
+        let response: RegisterTaskResponse =
+            serde_json::from_value(serde_json::json!({})).expect("empty response should parse");
+        assert_eq!(
+            task_id_from_register_task_response(key, response)
+                .expect_err("missing task id must fail")
+                .to_string(),
+            "agent task registration response omitted task id"
+        );
+    }
+
+    #[test]
+    fn decrypt_task_id_response_rejects_invalid_payloads() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let private_key = signing_key.to_pkcs8_der().expect("test private key");
+        let private_key_base64 = BASE64_STANDARD.encode(private_key.as_bytes());
+        let key = AgentIdentityKey {
+            agent_runtime_id: "runtime",
+            private_key_pkcs8_base64: &private_key_base64,
+        };
+        let recipient = crypto_box::PublicKey::from(
+            signing_key.verifying_key().to_montgomery().to_bytes(),
+        );
+        let invalid_utf8 = recipient
+            .seal(&mut crypto_box::aead::OsRng, &[0xff])
+            .expect("seal invalid UTF-8");
+        let mut corrupted = recipient
+            .seal(&mut crypto_box::aead::OsRng, b"task-id")
+            .expect("seal task ID");
+        *corrupted.last_mut().expect("ciphertext authentication tag") ^= 1;
+        for (ciphertext, expected) in [
+            ("not base64!".to_string(), "encrypted task id is not valid base64"),
+            (
+                BASE64_STANDARD.encode(corrupted),
+                "failed to decrypt encrypted task id",
+            ),
+            (
+                BASE64_STANDARD.encode(invalid_utf8),
+                "decrypted task id is not valid UTF-8",
+            ),
+        ] {
+            assert_eq!(
+                decrypt_task_id_response(key, &ciphertext)
+                    .expect_err("invalid task response must fail")
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn retryable_registration_error_classifies_status_through_context() {
         for (status, retryable) in [

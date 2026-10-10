@@ -16,7 +16,6 @@ pub use metadata::CodeModeToolKind;
 pub use metadata::EnabledToolMetadata;
 pub use metadata::ToolDefinition;
 pub use metadata::augment_tool_definition;
-pub use metadata::enabled_tool_metadata;
 pub use metadata::is_code_mode_nested_tool;
 pub use metadata::normalize_code_mode_identifier;
 pub use metadata::render_code_mode_sample;

@@ -680,9 +680,10 @@ mod tests {
         assert_eq!(event.target, AUDIT_TARGET);
         assert!(event.target.starts_with("codex_otel."));
         assert_eq!(
-            event.field("network.policy.scope"),
-            Some(POLICY_SCOPE_DOMAIN)
+            event.field("event.name"),
+            Some("codex.network_proxy.policy_decision")
         );
+        assert_eq!(event.field("network.policy.scope"), Some("domain"));
         assert_eq!(event.field("network.policy.decision"), Some("allow"));
         assert_eq!(event.field("network.policy.source"), Some("decider"));
         assert_eq!(

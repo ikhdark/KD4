@@ -105,6 +105,31 @@ fn child_alias_setup() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn helper_dispatch_takes_precedence_over_discovery() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("must-not-exist");
+    let output = Command::new(std::env::current_exe()?)
+        .args([
+            "--codex-run-as-apply-patch",
+            "*** Begin Patch\n*** End Patch",
+            "--list",
+        ])
+        .env(HOME, &home)
+        .env_remove(FAIL)
+        .output()?;
+    // --list is a helper argument here, not a request to list Rust tests. The
+    // helper's one-patch CLI must reject the extra argument without alias setup.
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("accepts exactly one argument"),
+        "{output:?}"
+    );
+    assert!(output.stdout.is_empty(), "must not list tests: {output:?}");
+    assert!(!home.exists(), "helper dispatch must not create aliases");
+    Ok(())
+}
+
+#[test]
 fn discovery_does_not_create_an_alias_home() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let home = dir.path().join("must-not-exist");

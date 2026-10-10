@@ -253,6 +253,14 @@ unsafe fn path_mask_allows_with_scope(
 }
 
 pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+    dacl_has_write_deny_for_sid_with_coverage(p_dacl, psid, false)
+}
+
+unsafe fn dacl_has_write_deny_for_sid_with_coverage(
+    p_dacl: *mut ACL,
+    psid: *mut c_void,
+    require_complete: bool,
+) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -274,6 +282,14 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
         | GENERIC_WRITE_MASK
         | DELETE
         | FILE_DELETE_CHILD;
+    let required_mask = FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    let mut denied = 0;
     for i in 0..info.AceCount {
         let mut p_ace: *mut c_void = std::ptr::null_mut();
         if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
@@ -290,11 +306,16 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
         let base = p_ace as usize;
         let sid_ptr =
             (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
-        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_write_mask) != 0 {
-            return true;
+        if EqualSid(sid_ptr, psid) != 0 {
+            if !require_complete && (ace.Mask & deny_write_mask) != 0 {
+                return true;
+            }
+            let mut mask = ace.Mask;
+            MapGenericMask(&mut mask, &mapping);
+            denied |= mask;
         }
     }
-    false
+    require_complete && (denied & required_mask) == required_mask
 }
 
 pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
@@ -509,7 +530,9 @@ impl DenyAceKind {
     unsafe fn already_present(self, p_dacl: *mut ACL, psid: *mut c_void) -> bool {
         match self {
             Self::Read => dacl_has_read_deny_for_sid(p_dacl, psid),
-            Self::Write => dacl_has_write_deny_for_sid(p_dacl, psid),
+            // A partial write deny is useful diagnostic evidence, but does not
+            // establish the full boundary installed by add_deny_write_ace.
+            Self::Write => dacl_has_write_deny_for_sid_with_coverage(p_dacl, psid, true),
         }
     }
 }
@@ -746,5 +769,70 @@ pub(crate) mod native_deny_write_test {
             FAILURE.with(|failure| failure.replace(Some((path.to_path_buf(), stage, code))));
         let _restore = Restore(previous);
         f()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_write_denies_are_completed_before_admission() -> Result<()> {
+        for partial_mask in [DELETE, FILE_WRITE_DATA] {
+            let home = tempfile::tempdir()?;
+            let workspace = tempfile::tempdir()?;
+            let path = workspace.path().join("protected");
+            std::fs::write(&path, b"preserved contents")?;
+            let principal = crate::cap::load_or_create_cap_sids(home.path())?.readonly;
+            let sid = crate::token::LocalSid::from_string(&principal)?;
+            // SAFETY: sid owns the valid SID throughout these synchronous calls. Each descriptor
+            // owns the ACE storage until its last use and is then freed exactly once.
+            unsafe {
+                assert!(add_deny_write_ace(&path, sid.as_ptr())?);
+                let (dacl, descriptor) = fetch_dacl_handle(&path)?;
+                let mut narrowed = false;
+                for index in 0..u32::from((*dacl).AceCount) {
+                    let mut entry = std::ptr::null_mut();
+                    assert_ne!(GetAce(dacl, index, &mut entry), 0);
+                    let ace = &mut *entry.cast::<ACCESS_DENIED_ACE>();
+                    if ace.Header.AceType == ACCESS_DENIED_ACE_TYPE
+                        && EqualSid(std::ptr::addr_of_mut!(ace.SidStart).cast(), sid.as_ptr()) != 0
+                    {
+                        // A native policy editor may leave only one of the required restrictions.
+                        ace.Mask = partial_mask;
+                        narrowed = true;
+                    }
+                }
+                assert!(narrowed);
+                let code = SetNamedSecurityInfoW(
+                    to_wide(&path).as_ptr().cast_mut(), 1, DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(), std::ptr::null_mut(), dacl, std::ptr::null_mut(),
+                );
+                LocalFree(descriptor);
+                assert_eq!(code, ERROR_SUCCESS);
+
+                assert!(
+                    add_deny_write_ace(&path, sid.as_ptr())?,
+                    "partial deny {partial_mask:#x} must not satisfy the complete write boundary"
+                );
+                let (dacl, descriptor) = fetch_dacl_handle(&path)?;
+                let mut denied = 0;
+                for index in 0..u32::from((*dacl).AceCount) {
+                    let mut entry = std::ptr::null_mut();
+                    assert_ne!(GetAce(dacl, index, &mut entry), 0);
+                    let ace = &*entry.cast::<ACCESS_DENIED_ACE>();
+                    if ace.Header.AceType == ACCESS_DENIED_ACE_TYPE
+                        && EqualSid(std::ptr::addr_of!(ace.SidStart).cast_mut().cast(), sid.as_ptr()) != 0
+                    {
+                        denied |= ace.Mask;
+                    }
+                }
+                LocalFree(descriptor);
+                let required = FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+                assert_eq!(denied & required, required);
+                assert!(!add_deny_write_ace(&path, sid.as_ptr())?, "complete deny is idempotent");
+            }
+            assert_eq!(std::fs::read(&path)?, b"preserved contents");
+        }
+        Ok(())
     }
 }

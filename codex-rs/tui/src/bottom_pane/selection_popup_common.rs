@@ -8,7 +8,7 @@ use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::Widget;
 use std::borrow::Cow;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::key_hint::KeyBinding;
@@ -444,21 +444,25 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
 
     let mut name_spans: Vec<Span> = Vec::new();
     let mut used_width = 0usize;
-    let mut truncated = false;
+    let truncated = row.name.width() > name_limit;
+    let text_limit = name_limit.saturating_sub(usize::from(truncated));
     let mut run_start = 0;
     let mut run_bold = false;
     let mut end = 0;
     let mut matches = row.match_indices.iter().flatten().copied().peekable();
-    for (char_idx, (byte_idx, ch)) in row.name.char_indices().enumerate() {
-        let next_width = used_width.saturating_add(UnicodeWidthChar::width(ch).unwrap_or(0));
-        if next_width > name_limit {
-            truncated = true;
+    let mut char_idx = 0;
+    for (byte_idx, grapheme) in row.name.grapheme_indices(true) {
+        let next_width = used_width.saturating_add(grapheme.width());
+        if next_width > text_limit {
             break;
         }
-        let bold = matches.peek() == Some(&char_idx);
-        if bold {
+        let next_char_idx = char_idx + grapheme.chars().count();
+        let mut bold = false;
+        while matches.peek().is_some_and(|index| *index < next_char_idx) {
+            bold |= matches.peek().is_some_and(|index| *index >= char_idx);
             matches.next();
         }
+        char_idx = next_char_idx;
         if byte_idx > run_start && bold != run_bold {
             let span = Span::from(row.name[run_start..byte_idx].to_string());
             name_spans.push(if run_bold { span.bold() } else { span });
@@ -466,7 +470,7 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
         }
         run_bold = bold;
         used_width = next_width;
-        end = byte_idx + ch.len_utf8();
+        end = byte_idx + grapheme.len();
     }
     if end > run_start {
         let span = Span::from(row.name[run_start..end].to_string());
@@ -874,6 +878,26 @@ mod tests {
             build_full_line(&row, desc_col).to_string(),
             "Alpha (x)  Description"
         );
+    }
+
+    #[test]
+    fn truncated_names_preserve_graphemes_and_description_gap() {
+        for (name, expected_name) in [
+            ("abcdef", "ab…"),
+            ("👩‍💻abcd", "👩‍💻…"),
+            ("e\u{301}abcd", "e\u{301}a…"),
+        ] {
+            let row = GenericDisplayRow {
+                name: name.to_string(),
+                description: Some("description".to_string()),
+                ..Default::default()
+            };
+            // Five columns before the description leave three for the name,
+            // including the ellipsis, and two separating spaces.
+            let line = build_full_line(&row, 5);
+            assert_eq!(line.to_string(), format!("{expected_name}  description"));
+            assert_eq!(line.width(), 5 + "description".len());
+        }
     }
 
     #[test]

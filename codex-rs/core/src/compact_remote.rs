@@ -513,21 +513,6 @@ fn tool_receipt_identity(item: &ResponseItem) -> Option<(ToolReceiptKind, ToolRe
     }
 }
 
-#[cfg(test)]
-pub(crate) fn trim_function_call_history_to_fit_context_window(
-    history: &mut ContextManager,
-    turn_context: &TurnContext,
-    base_instructions: &BaseInstructions,
-) -> (usize, i64) {
-    trim_function_call_history_to_fit_context_window_for_prompt(
-        history,
-        turn_context,
-        base_instructions,
-        None,
-        0,
-    )
-}
-
 pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
     history: &mut ContextManager,
     turn_context: &TurnContext,

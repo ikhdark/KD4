@@ -16,6 +16,7 @@ fn evidence_salience_compiler_summary_keeps_cargo_owner() {
         assert_eq!(value["diagnostics"][0]["package_id"], owner);
         assert_eq!(value["diagnostics"][0]["target"]["name"], owner);
         assert_eq!(value["diagnostics"][0]["target"]["kind"], serde_json::json!(["lib"]));
+        assert_eq!(value["diagnostics"][0]["target"]["src_path"], format!("/workspace/{owner}/src/lib.rs"));
         assert!(value["diagnostics"][0]["target"].get("doc").is_none());
         summaries.push(projected);
     }
@@ -40,10 +41,12 @@ fn evidence_salience_macro_compaction_keeps_invocation_and_definition_chain() {
     let item = &value["diagnostics"][0];
     let span = &item["diagnostic"]["spans"][0];
     assert_eq!(span["suggested_replacement"], "value.into()");
-    assert_eq!(span["expansion"]["span"]["file_name"], "app.rs");
-    assert_eq!(span["expansion"]["span"]["line_start"], 44);
-    assert_eq!(span["expansion"]["def_site_span"]["file_name"], "macro.rs");
-    assert_eq!(span["expansion"]["span"]["expansion"]["span"]["file_name"], "inner.rs");
+    assert_eq!(span["expansion"], serde_json::json!({
+        "macro_decl_name":"outer!", "span":{"file_name":"app.rs", "line_start":44,
+            "expansion":{
+                "macro_decl_name":"inner!", "span":{"file_name":"inner.rs", "line_start":9},
+                "def_site_span":{"file_name":"inner_macro.rs", "line_start":2}}},
+        "def_site_span":{"file_name":"macro.rs", "line_start":17}}));
     assert!(span["expansion"]["span"].get("text").is_none());
     assert_eq!(item["details_omitted"], true);
     assert_eq!(item["recovery_selector"], serde_json::json!({"kind":"bytes", "start":0, "end":raw.len()}));
@@ -454,6 +457,13 @@ fn unified_exec_compiler_streams_do_not_replay_prior_poll_output() {
     Arc::make_mut(output.process_output.as_mut().unwrap()).streams_are_exact = true;
     output.raw_output = b"last poll only\n".to_vec();
     assert_eq!(output.code_mode_result(&payload)["output"], "last poll only\n");
+    // A chunk under the budget is returned before the stream check runs. Only
+    // an over-budget chunk shows that the cumulative streams are not replayed.
+    output.raw_output = "last poll only\n".repeat(1_000).into_bytes();
+    let over_budget = output.code_mode_result(&payload)["output"].as_str().unwrap().to_string();
+    assert!(over_budget.contains("last poll only"), "{over_budget}");
+    assert!(!over_budget.contains("compiler_diagnostics"), "{over_budget}");
+    assert!(!over_budget.contains("unified stdout failure"), "{over_budget}");
     output.raw_output.clear();
     assert_eq!(output.code_mode_result(&payload)["output"], "");
 }
@@ -975,7 +985,9 @@ fn selected_errors_do_not_spend_the_final_status_quota() {
         .collect::<Vec<_>>();
     for index in 0..8 {
         lines[50 + index * 10] = format!("suite {index} passed; KEEP_STATUS_{index}");
-        lines[300 + index * 10] = format!("compiler error: KEEP_ERROR_{index}");
+        // `error:` lines are status lines as well as diagnostics, so only the
+        // already-selected check keeps them out of the eight status slots.
+        lines[300 + index * 10] = format!("error: KEEP_ERROR_{index}");
     }
     for line in &mut lines[500..520] {
         *line = "let summary: String = source_text;".to_string();
@@ -1193,8 +1205,10 @@ fn nextest_failures_and_summary_survive_a_passing_test_flood() {
     let mut lines = (0..900)
         .map(|index| format!("PASS [0.001s] crate test_{index}"))
         .collect::<Vec<_>>();
+    // Keep the two failure forms outside each other's context window so each
+    // survives only through its own recognition rule.
+    lines[300] = "TRY 2 FAIL [0.003s] codex_core parser::tests::retry_error".to_string();
     lines[450] = "FAIL [0.003s] codex_core parser::tests::keeps_error".to_string();
-    lines[451] = "TRY 2 FAIL [0.003s] codex_core parser::tests::retry_error".to_string();
     lines[500] = "Summary [1.234s] 900 tests run: 898 passed, 2 failed".to_string();
     let output = lines.join("\n");
     let summary = summarize_shell_output_for_model(
@@ -1294,11 +1308,15 @@ fn powershell_read_pipelines_use_ordered_truncation() {
         .collect::<Vec<_>>();
     lines[150] = "// error: this comment is source text, not a diagnostic".to_string();
     let output = lines.join("\n");
+    // A label-leading line passes the flat "no diagnostic label" gate, so only
+    // the read classification keeps this output out of a ranked summary. The
+    // last loop proves a non-read command over the same text is summarized.
+    lines[150] = "error: this line of source text starts with a diagnostic label".to_string();
+    let labelled_output = lines.join("\n");
 
     for command in [
         "Get-Content src/lib.rs | Select-Object -Skip 10 -First 500; rg -n 'fn ' src",
         "$s = Get-Content src/lib.rs; $s[10..40]; git diff --stat",
-        "foreach ($p in @('a','b')) { if (Test-Path $p) { Get-Content -Raw $p } }",
         "Get-ChildItem src -Recurse -File | Where-Object { $_.Name -match 'test' } | Select-Object FullName",
         // Quoted alternations are patterns, not pipelines.
         "Get-Content src/plan.rs -TotalCount 220; rg -n 'fn |clone|parallel|cache' src/jobs.rs",
@@ -1308,7 +1326,12 @@ fn powershell_read_pipelines_use_ordered_truncation() {
         "$r.passes | ForEach-Object { [pscustomobject]@{pass=$_.Name;seconds=[math]::Round($_.micros/1e6,2)} } | Sort-Object seconds | Format-Table -Wrap",
     ] {
         assert_eq!(
-            summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400))),
+            summarize_shell_output_for_model(
+                &labelled_output,
+                0,
+                false,
+                options(Some(command), Some(400))
+            ),
             None,
             "{command}"
         );
@@ -1327,7 +1350,12 @@ fn powershell_read_pipelines_use_ordered_truncation() {
     ] {
         assert!(!is_read_only_command(command), "{command}");
         assert_eq!(
-            summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400))),
+            summarize_shell_output_for_model(
+                &labelled_output,
+                0,
+                false,
+                options(Some(command), Some(400))
+            ),
             None,
             "{command}"
         );
@@ -1345,7 +1373,34 @@ fn powershell_read_pipelines_use_ordered_truncation() {
                 .is_none(),
             "{command}"
         );
+        // Positive control for the loops above: without a read segment the
+        // label-leading output is ranked, so their `None` is the read gate.
+        assert!(
+            summarize_shell_output_for_model(
+                &labelled_output,
+                0,
+                false,
+                options(Some(command), Some(400))
+            )
+            .is_some(),
+            "{command}"
+        );
     }
+
+    // Control flow around a reader is still a read. Checked last so a failure
+    // here leaves every shape above verified.
+    let control_flow_read =
+        "foreach ($p in @('a','b')) { if (Test-Path $p) { Get-Content -Raw $p } }";
+    assert_eq!(
+        summarize_shell_output_for_model(
+            &labelled_output,
+            0,
+            false,
+            options(Some(control_flow_read), Some(400))
+        ),
+        None,
+        "{control_flow_read}"
+    );
 }
 
 #[test]

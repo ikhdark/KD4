@@ -397,6 +397,7 @@ pub(crate) enum AppEvent {
 
     /// Result of prefetching connectors.
     ConnectorsLoaded {
+        request_id: uuid::Uuid,
         result: Result<ConnectorsSnapshot, String>,
         is_final: bool,
     },
@@ -469,6 +470,7 @@ pub(crate) enum AppEvent {
     /// Fetch app connector state from the app server after the widget accepts a refresh request.
     FetchConnectorsList {
         force_refetch: bool,
+        request_id: uuid::Uuid,
     },
 
     /// Fetch plugin marketplace state for the provided working directory.

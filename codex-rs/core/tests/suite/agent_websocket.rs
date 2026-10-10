@@ -445,7 +445,9 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     // The transport chain is the contract under test. Disable sandbox enforcement so a
     // policy rejection cannot terminalize the required shell tool before its output is sent.
-    test.submit_turn("run the echo command").await?;
+    let completed = test.submit_turn_and_capture_completion("run the echo command").await?;
+    assert_eq!(completed.error, None);
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 3);
@@ -490,6 +492,11 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
         output_item.get("call_id").and_then(Value::as_str),
         Some(call_id)
     );
+    let body: codex_protocol::models::FunctionCallOutputBody =
+        serde_json::from_value(output_item["output"].clone())?;
+    let text = body.to_text().expect("text shell output");
+    assert!(text.contains("Exit code: 0"), "{text}");
+    assert_eq!(text.split_once("Output:\n").expect("shell output envelope").1.trim(), "websocket");
 
     let handshake = server.single_handshake();
     assert_eq!(

@@ -401,7 +401,15 @@ async fn status_worker_does_not_block_input_and_off_rejects_stale_result() {
     .expect("worker completion");
     assert_eq!(completed_id, id);
     chat.handle_ide_command_args("off");
+    while rx.try_recv().is_ok() {}
     chat.on_ide_context_completed(completed_id, result);
+    // An accepted status result always reports through a history cell.
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, AppEvent::InsertHistoryCell(_)),
+            "stale status result must not be reported"
+        );
+    }
     assert!(!chat.ide_context.is_enabled());
     assert_eq!(chat.bottom_pane.composer_text(), "x");
     assert_no_turn(&mut op_rx);

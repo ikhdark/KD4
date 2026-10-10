@@ -450,6 +450,11 @@ mod tests {
 
         set_modified(&destination, source_time + std::time::Duration::from_secs(2));
         assert!(destination_is_fresh(&source, &destination).expect("fresh metadata"));
+
+        // A newer destination of a different size is still stale.
+        fs::write(&destination, b"different-size").expect("rewrite destination");
+        set_modified(&destination, source_time + std::time::Duration::from_secs(2));
+        assert!(!destination_is_fresh(&source, &destination).expect("size mismatch"));
     }
 
 
@@ -772,9 +777,19 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let source = tmp.path().join("source.exe");
         fs::write(&source, b"runner-v1").expect("write source");
+        // Pin the mtime so the dev-build suffix is known: 9 bytes, 1_700_000_000 s = 0x6553f100.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .expect("open source for timestamps")
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            ))
+            .expect("set source timestamp");
         let suffix = helper_version_suffix(&source).expect("suffix");
 
         if env!("CARGO_PKG_VERSION") == DEV_BUILD_VERSION_SENTINEL {
+            assert_eq!(suffix, "9-6553f100");
             assert_eq!(suffix, dev_build_suffix(&source).expect("dev build suffix"));
         } else {
             assert_eq!(suffix, env!("CARGO_PKG_VERSION"));

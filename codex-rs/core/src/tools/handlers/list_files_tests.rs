@@ -34,6 +34,39 @@ async fn invocation(root: &std::path::Path, arguments: serde_json::Value) -> Too
     }
 }
 
+fn assert_listing_entries(
+    root: &std::path::Path,
+    output: &serde_json::Value,
+    expected: &[(&str, &str)],
+) {
+    let mut actual = output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().unwrap().to_owned(),
+                entry["kind"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = expected
+        .iter()
+        .map(|(path, kind)| {
+            (
+                PathUri::from_host_native_path(root.join(path))
+                    .unwrap()
+                    .as_str()
+                    .to_owned(),
+                (*kind).to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
 #[tokio::test]
 async fn registered_listing_tracks_directory_evidence_and_bounds_traversal() {
     use crate::tool_history::SourceDependencyV1;
@@ -107,9 +140,17 @@ async fn registered_listing_tracks_directory_evidence_and_bounds_traversal() {
                 true
             ),]))
         );
-        if expected_count == 3 {
-            assert!(output.to_string().contains("file.txt"));
-            assert!(!output.to_string().contains("secret.txt"));
+        // Entry-limited batches need not contain the globally first names.
+        // All other cases have an exact fixture-derived path/kind inventory.
+        if extra.get("max_entries").is_none() {
+            let mut expected = vec![(".hidden", "directory"), ("src", "directory")];
+            if extra["max_depth"] != json!(0) {
+                expected.push(("src/file.txt", "file"));
+            }
+            if extra["include_hidden"] == true {
+                expected.push((".hidden/secret.txt", "file"));
+            }
+            assert_listing_entries(root.path(), &output, &expected);
         }
     }
 }
@@ -129,6 +170,7 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
     let validator = jsonschema::validator_for(&schema).unwrap();
     for arguments in [
         json!({"path": ".", "max_entries": 0}),
+        json!({"path": ".", "max_directories": 0}),
         json!({"path": ".", "max_depth": -1}),
         json!({"path": ".", "typo": true}),
     ] {
@@ -140,9 +182,11 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
                 .is_err()
         );
     }
-    for (arguments, expected_depth, expected_entries) in [
-        (json!({"path": ".", "max_entries": 50_001}), 8, MAX_ENTRIES),
-        (json!({"path": ".", "max_depth": 65}), MAX_DEPTH, 2000),
+    // These limits are the public tool contract, not implementation constants.
+    for (arguments, expected_depth, expected_entries, expected_directories) in [
+        (json!({"path": ".", "max_entries": 50_001}), 8, 50_000, 10_000),
+        (json!({"path": ".", "max_depth": 65}), 64, 2000, 2000),
+        (json!({"path": ".", "max_directories": 10_001}), 8, 2000, 10_000),
     ] {
         assert!(validator.is_valid(&arguments));
         let call = invocation(root.path(), arguments).await;
@@ -152,6 +196,7 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
         assert_eq!(output["limits_clamped"], true);
         assert_eq!(output["effective_walk_options"]["max_depth"], expected_depth);
         assert_eq!(output["effective_walk_options"]["max_entries"], expected_entries);
+        assert_eq!(output["effective_walk_options"]["max_directories"], expected_directories);
     }
     assert!(
         ListFilesHandler
@@ -201,9 +246,29 @@ async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode()
     for name in ["src/keep.rs", "src/drop.rs", "src/readme.txt", "target/build.rs", ".hidden/secret.rs"] {
         std::fs::write(root.path().join(name), "content").unwrap();
     }
-    for (extra, expected_files) in [
-        (json!({"include":["*.rs"],"exclude":["drop*"],"exclude_directories":["target"],"include_hidden":true}), 2),
-        (json!({"include_hidden":true}), 5),
+    for (extra, expected_entries) in [
+        (
+            json!({"include":["*.rs"],"exclude":["drop*"],"exclude_directories":["target"],"include_hidden":true}),
+            vec![
+                (".hidden", "directory"),
+                (".hidden/secret.rs", "file"),
+                ("src", "directory"),
+                ("src/keep.rs", "file"),
+            ],
+        ),
+        (
+            json!({"include_hidden":true}),
+            vec![
+                (".hidden", "directory"),
+                (".hidden/secret.rs", "file"),
+                ("src", "directory"),
+                ("src/drop.rs", "file"),
+                ("src/keep.rs", "file"),
+                ("src/readme.txt", "file"),
+                ("target", "directory"),
+                ("target/build.rs", "file"),
+            ],
+        ),
     ] {
         let mut args = json!({"path":"."});
         args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -212,12 +277,7 @@ async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode()
         let result = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
         assert_eq!(result["complete"], true);
         assert_eq!(result["effective_walk_options"]["max_response_bytes"], codex_exec_server::MAX_WALK_RESPONSE_BYTES);
-        let files = result["entries"].as_array().unwrap().iter().filter(|entry| entry["kind"] == "file").collect::<Vec<_>>();
-        assert_eq!(files.len(), expected_files);
-        if expected_files == 2 {
-            assert!(files.iter().any(|entry| entry["path"].as_str().unwrap().ends_with("keep.rs")));
-            assert!(files.iter().any(|entry| entry["path"].as_str().unwrap().ends_with("secret.rs")));
-        }
+        assert_listing_entries(root.path(), &result, &expected_entries);
     }
     let call = invocation(root.path(), json!({"path":".","max_directories":1})).await;
     let payload = call.payload.clone();
@@ -284,7 +344,7 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
                 "fs/walk" => {
                     walks.push(message["params"].clone());
                     let mut result = json!({"entries": [{"path": response_file, "kind": "file"}],
-                           "errors": [{"path": response_cwd, "message": "permission denied for a descendant"}], "truncated": true});
+                           "errors": [{"path": response_cwd, "message": "permission denied for a descendant"}], "truncated": walks.len() != 1});
                     if walks.len() == 2 {
                         result["appliedFilters"] = message["params"]["options"]["filters"].clone();
                     }
@@ -339,6 +399,8 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
     };
     let filtered = ListFilesHandler.handle(call(filtered_payload.clone())).await.unwrap().code_mode_result(&filtered_payload);
     assert_eq!(filtered["complete"], false);
+    assert_eq!(filtered["truncated"], true);
+    assert_eq!(filtered["errors"], output["errors"]);
     let incompatible = ListFilesHandler.handle(call(filtered_payload)).await.err().unwrap().to_string();
     assert!(incompatible.contains("did not apply requested walk filters"));
     stop_tx.send(()).unwrap();
@@ -350,7 +412,9 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
     assert_eq!(walks[0]["options"]["followDirectorySymlinks"], false);
     assert_eq!(output["entries"][0]["path"], json!(remote_file));
     assert_eq!(output["complete"], false);
-    assert_eq!(output["truncated"], true);
+    // Descendant errors alone must prevent a complete result even if no
+    // traversal budget was exhausted. The filtered call above covers both.
+    assert_eq!(output["truncated"], false);
     assert_eq!(
         output["errors"][0]["message"],
         "permission denied for a descendant"

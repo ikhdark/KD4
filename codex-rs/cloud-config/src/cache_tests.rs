@@ -140,19 +140,32 @@ async fn load_reports_missing_and_malformed_cache_files() {
 async fn load_rejects_tampered_payload() {
     let codex_home = tempdir().expect("tempdir");
     let cache = create_test_cache(codex_home.path());
-    let mut cache_file = signed_cache_file(valid_signed_payload());
-    cache_file
-        .signed_payload
-        .bundle
-        .requirements_toml
-        .enterprise_managed[0]
-        .contents = "allowed_approval_policies = [\"on-request\"]".to_string();
-    write_cache_file(&cache, &cache_file);
+    for field in ["requirements", "config", "user", "account", "expiry", "version"] {
+        let mut cache_file = signed_cache_file(valid_signed_payload());
+        let payload = &mut cache_file.signed_payload;
+        match field {
+            "requirements" => {
+                payload.bundle.requirements_toml.enterprise_managed[0].contents =
+                    "allowed_approval_policies = [\"on-request\"]".to_string();
+            }
+            "config" => {
+                payload.bundle.config_toml.enterprise_managed[0].contents =
+                    "model = \"different\"".to_string();
+            }
+            "user" => payload.chatgpt_user_id = Some("user-99999".to_string()),
+            "account" => payload.account_id = Some("account-99999".to_string()),
+            "expiry" => payload.expires_at += ChronoDuration::hours(1),
+            "version" => payload.version += 1,
+            _ => unreachable!(),
+        }
+        write_cache_file(&cache, &cache_file);
 
-    assert_eq!(
-        cache.load(Some("user-12345"), Some("account-12345")).await,
-        Err(CacheLoadStatus::CacheSignatureInvalid)
-    );
+        assert_eq!(
+            cache.load(Some("user-12345"), Some("account-12345")).await,
+            Err(CacheLoadStatus::CacheSignatureInvalid),
+            "unsigned mutation of {field} must be rejected"
+        );
+    }
 }
 
 #[tokio::test]

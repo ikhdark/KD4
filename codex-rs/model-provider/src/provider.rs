@@ -640,6 +640,81 @@ mod tests {
             model_provider_cache_identity("custom", &first, None),
             model_provider_cache_identity("custom", &second, None)
         );
+
+        let baseline = model_provider_cache_identity("custom", &second, None);
+        for (field, changed) in [
+            (
+                "name",
+                ModelProviderInfo {
+                    name: "Other".to_string(),
+                    ..second.clone()
+                },
+            ),
+            (
+                "query_params",
+                ModelProviderInfo {
+                    query_params: Some(std::collections::HashMap::from([
+                        ("region".to_string(), "us".to_string()),
+                        ("tenant".to_string(), "two".to_string()),
+                    ])),
+                    ..second.clone()
+                },
+            ),
+            (
+                "env_key",
+                ModelProviderInfo {
+                    env_key: Some("CODEX_TEST_PROVIDER_CACHE_KEY".to_string()),
+                    ..second.clone()
+                },
+            ),
+            (
+                "env_http_headers",
+                ModelProviderInfo {
+                    env_http_headers: Some(std::collections::HashMap::from([(
+                        "X-Env-Route".to_string(),
+                        "CODEX_TEST_PROVIDER_CACHE_HEADER".to_string(),
+                    )])),
+                    ..second.clone()
+                },
+            ),
+            (
+                "experimental_bearer_token",
+                ModelProviderInfo {
+                    experimental_bearer_token: Some("provider-token".to_string()),
+                    ..second.clone()
+                },
+            ),
+            (
+                "auth",
+                ModelProviderInfo {
+                    auth: provider_info_with_command_auth().auth,
+                    ..second.clone()
+                },
+            ),
+            (
+                "requires_openai_auth",
+                ModelProviderInfo {
+                    requires_openai_auth: !second.requires_openai_auth,
+                    ..second.clone()
+                },
+            ),
+            (
+                "aws",
+                ModelProviderInfo {
+                    aws: Some(ModelProviderAwsAuthInfo {
+                        profile: Some("profile".to_string()),
+                        region: None,
+                    }),
+                    ..second.clone()
+                },
+            ),
+        ] {
+            assert_ne!(
+                model_provider_cache_identity("custom", &changed, None),
+                baseline,
+                "a different {field} must select a different cache identity"
+            );
+        }
     }
 
     #[test]
@@ -829,6 +904,30 @@ mod tests {
         })
     }
 
+    async fn agent_identity_auth() -> CodexAuth {
+        let key_material =
+            codex_agent_identity::generate_agent_key_material().expect("generate key material");
+        CodexAuth::AgentIdentity(
+            codex_login::auth::AgentIdentityAuth::from_record(
+                codex_login::auth::AgentIdentityAuthRecord {
+                    issuer_origin: Some("https://auth.openai.com/api/accounts".into()),
+                    agent_runtime_id: "agent-runtime-1".to_string(),
+                    agent_private_key: key_material.private_key_pkcs8_base64,
+                    account_id: "account-1".to_string(),
+                    chatgpt_user_id: "user-1".to_string(),
+                    email: Some("agent@example.com".to_string()),
+                    plan_type: PlanType::Plus,
+                    chatgpt_account_is_fedramp: false,
+                    task_id: Some("task-run-1".to_string()),
+                },
+                "https://auth.openai.com/api/accounts",
+                &codex_login::test_support::transport_default_auth_route_config(),
+            )
+            .await
+            .expect("agent identity auth record should include task id"),
+        )
+    }
+
     struct CountingExternalAuth {
         auth: CodexAuth,
         resolves: Arc<AtomicUsize>,
@@ -950,6 +1049,31 @@ mod tests {
             .expect("auth should resolve");
 
         assert!(auth.auth.to_auth_headers().is_empty());
+
+        // Without credentials both paths are unauthenticated. Only an agent identity shows
+        // whether the scope was used: the scoped path attaches its task telemetry.
+        let agent_identity = agent_identity_auth().await;
+        for (info, uses_scope) in [
+            (
+                create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses),
+                false,
+            ),
+            (ModelProviderInfo::create_openai_provider(/*base_url*/ None), true),
+        ] {
+            let auth = create_model_provider(
+                info,
+                Some(AuthManager::from_auth_for_testing(agent_identity.clone())),
+            )
+            .api_auth_for_scope(ProviderAuthScope {
+                agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
+                session_source: SessionSource::Cli,
+                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+            })
+            .await
+            .expect("auth should resolve");
+
+            assert_eq!(auth.agent_identity_telemetry.is_some(), uses_scope);
+        }
     }
 
     #[test]

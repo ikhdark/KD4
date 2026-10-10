@@ -1133,6 +1133,14 @@ approval_policy = "never"
         assert!(rendered.contains("hooks:"));
         assert!(rendered.contains("handlers=1"));
         assert!(rendered.contains(&format!("(source: {requirements_source})")));
+        assert!(
+            rendered.contains(&format!(
+                "  - hooks: managed_dir=C:\\enterprise\\hooks, \
+                 windows_managed_dir=C:\\enterprise\\hooks, handlers=1 \
+                 (source: {requirements_source})"
+            )),
+            "{rendered}"
+        );
     }
 
     #[test]

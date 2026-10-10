@@ -1343,12 +1343,6 @@ impl LoadedAgentsMd {
     /// Versioned identity for repository instructions used by model-input
     /// projection. This includes scope and ordered provenance so a move or
     /// environment change remains semantic even when rendered bytes match.
-    #[cfg(test)]
-    pub(crate) fn stable_context_identity(&self, active_cwd: &PathUri) -> [u8; 32] {
-        let rendered = self.text();
-        self.stable_context_identity_for_rendered(active_cwd, &rendered)
-    }
-
     pub(crate) fn stable_context_bundle(
         &self,
         active_cwd: &PathUri,
@@ -1367,36 +1361,6 @@ impl LoadedAgentsMd {
             reused: false,
             semantic_replacement: false,
         }
-    }
-
-    #[cfg(test)]
-    fn stable_context_identity_for_rendered(
-        &self,
-        active_cwd: &PathUri,
-        rendered: &str,
-    ) -> [u8; 32] {
-        stable_context_identity_from_structure(
-            self.stable_context_structure_key(active_cwd),
-            Sha256::digest(rendered.as_bytes()).into(),
-        )
-    }
-
-    #[cfg(test)]
-    fn stable_context_structure_key(&self, active_cwd: &PathUri) -> [u8; 32] {
-        let user_instructions_hash = self
-            .user_instructions
-            .as_ref()
-            .map(|instructions| Sha256::digest(instructions.text.as_bytes()).into());
-        let entry_hashes = self
-            .entries
-            .iter()
-            .map(|entry| Sha256::digest(entry.contents.as_bytes()).into())
-            .collect::<Vec<_>>();
-        self.stable_context_structure_key_with_body_hashes(
-            active_cwd,
-            user_instructions_hash.as_ref(),
-            &entry_hashes,
-        )
     }
 
     fn stable_context_structure_key_with_body_hashes(

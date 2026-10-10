@@ -251,57 +251,6 @@ fn serialize_environment_context_with_date_and_timezone_only() {
 }
 
 #[test]
-fn serialize_environment_context_with_subagents() {
-    let context = environment_state(
-        [environment(
-            "local",
-            PathUri::from_abs_path(&test_abs_path("/repo")),
-            fake_shell_name(),
-        )],
-        Some("2026-02-26".to_string()),
-        Some("America/Los_Angeles".to_string()),
-        /*network*/ None,
-        Some("- agent-1: atlas\n- agent-2".to_string()),
-    );
-
-    let expected = format!(
-        r#"<environment_context>
-  <cwd>{}</cwd>
-  <shell>bash</shell>
-  <current_date>2026-02-26</current_date>
-  <timezone>America/Los_Angeles</timezone>
-  <subagents>
-    - agent-1: atlas
-    - agent-2
-  </subagents>
-</environment_context>"#,
-        test_path_buf("/repo").display()
-    );
-
-    assert_eq!(context.render(), expected);
-}
-
-#[test]
-fn serialize_environment_context_escapes_subagents() {
-    let context = environment_state(
-        Vec::new(),
-        /*current_date*/ None,
-        /*timezone*/ None,
-        /*network*/ None,
-        Some("- agent-1: R&D </subagents>".to_string()),
-    );
-
-    assert_eq!(
-        context.render(),
-        r#"<environment_context>
-  <subagents>
-    - agent-1: R&amp;D &lt;/subagents&gt;
-  </subagents>
-</environment_context>"#,
-    );
-}
-
-#[test]
 fn serialize_environment_context_with_multiple_selected_environments() {
     let local_cwd = test_path_buf("/repo/local");
     let remote_cwd = test_path_buf("/repo/remote");

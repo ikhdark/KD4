@@ -352,15 +352,35 @@ async fn resume_quarantines_invalid_dynamic_tools_from_rollout() -> Result<()> {
     let resumed = resume_builder
         .resume(&server, base_test.home.clone(), rollout_path)
         .await?;
-    resumed
-        .submit_turn("continue without the invalid restored tool")
+    let completed = resumed
+        .submit_turn_and_capture_completion("continue without the invalid restored tool")
         .await?;
+    assert_eq!(completed.error, None);
     let requests = mock.requests();
     assert_eq!(requests.len(), 2);
     let body = requests[1].body_json();
     assert!(!body["tools"].to_string().contains("invalid tool name"));
-    assert!(body["tools"].to_string().contains("valid_restored_tool"));
-    assert!(body["input"].to_string().contains("persist this thread"));
+    let restored_tools = body["tools"]
+        .as_array()
+        .expect("resumed tools")
+        .iter()
+        .filter(|tool| tool["name"] == "valid_restored_tool")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        restored_tools,
+        vec![&json!({
+            "type": "function",
+            "name": "valid_restored_tool",
+            "description": "Valid restored tool survives quarantine.",
+            "strict": false,
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })]
+    );
+    assert_eq!(
+        requests[1].message_input_texts("user")
+            .iter().filter(|text| text.as_str() == "persist this thread").count(),
+        1
+    );
 
     Ok(())
 }

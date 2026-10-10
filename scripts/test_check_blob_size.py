@@ -323,6 +323,23 @@ class CheckBlobSizeTest(unittest.TestCase):
         self.assertIn("| Path | Size | Status |", summary)
         self.assertNotIn("| Kind |", summary)
 
+    def test_step_summary_keeps_newline_paths_in_one_table_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            summary_path = Path(temp_dir) / "summary.md"
+            blob = ChangedBlob("docs/a\n| forged |\rb.txt", 20, False, False)
+            with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary_path)}):
+                check_blob_size.write_step_summary(
+                    10, [blob], [blob], include_kind=True
+                )
+            summary = summary_path.read_text(encoding="utf-8")
+
+        rows = [line for line in summary.splitlines() if line.startswith("|")]
+        self.assertEqual(len(rows), 3)  # Header, separator, and one blob.
+        self.assertIn(
+            "<code>docs/a&#10;&#124; forged &#124;&#13;b.txt</code>", rows[2]
+        )
+        self.assertTrue(rows[2].endswith("| blocked |"))
+
 
 if __name__ == "__main__":
     unittest.main()

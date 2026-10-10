@@ -114,17 +114,21 @@ mod tests {
     async fn open_url_treats_powershell_metacharacters_as_data() {
         let temp = tempfile::tempdir().expect("temp directory");
         let marker = temp.path().join("injected.txt");
-        let target = format!(
-            "missing-installer.exe; New-Item -ItemType File -Path '{}'; #",
-            marker.display()
-        );
-        open_url(&target)
-            .await
-            .expect_err("literal target must fail to open");
-        assert!(
-            !marker.exists(),
-            "URL contents must not execute as PowerShell"
-        );
+        let create_marker = format!("New-Item -ItemType File -Path '{}'", marker.display());
+        // Spliced into the `try { ... }` command, the `; ... #` form only causes a parse error;
+        // the subexpression form would still run there.
+        for target in [
+            format!("missing-installer.exe; {create_marker}; #"),
+            format!("missing-installer.exe$({create_marker})"),
+        ] {
+            open_url(&target)
+                .await
+                .expect_err("literal target must fail to open");
+            assert!(
+                !marker.exists(),
+                "URL contents must not execute as PowerShell"
+            );
+        }
     }
 
     #[test]

@@ -118,6 +118,37 @@ fn local_plugin_completion_requires_requested_connectors() {
         &requested_connectors,
         Some(&[]),
     ));
+
+    let DiscoverableTool::Connector(connector) =
+        connector_tool("connector_calendar", "Google Calendar")
+    else {
+        panic!("expected connector fixture");
+    };
+    for (id, accessible, expected) in [
+        ("connector_calendar", true, true),
+        ("connector_calendar", false, false),
+        ("connector_unrelated", true, false),
+    ] {
+        let mut candidate = connector.as_ref().clone();
+        candidate.id = id.to_string();
+        candidate.is_accessible = accessible;
+        assert_eq!(
+            verified_local_plugin_install_completed(
+                true,
+                true,
+                &requested_connectors,
+                Some(std::slice::from_ref(&candidate)),
+            ),
+            expected,
+            "id={id}, accessible={accessible}",
+        );
+        assert!(!verified_local_plugin_install_completed(
+            true,
+            true,
+            &["connector_calendar".to_string(), "connector_mail".to_string()],
+            Some(std::slice::from_ref(&candidate)),
+        ));
+    }
 }
 
 #[test]

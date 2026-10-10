@@ -116,6 +116,17 @@ pub(super) fn build_turns_with_token_usage_replay(
         if is_persisted_rollout_item(item, ThreadHistoryMode::Legacy) {
             token_usage_replay.observe_rollout_item(&builder, item);
             builder.handle_rollout_item(item);
+            if matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)))
+                && token_usage_replay.turn_owner.as_ref().is_some_and(|owner| {
+                    owner.position.is_some_and(|position| {
+                        builder.active_turn_position().is_none_or(|last| position > last)
+                    })
+                })
+            {
+                // A removed turn's position may be reused by a later turn.
+                // Invalidate before that happens rather than relabeling its usage.
+                token_usage_replay = TokenUsageReplay::default();
+            }
         }
     }
 
@@ -178,6 +189,42 @@ mod tests {
         ))];
         let (turns, replay) = build_turns_with_token_usage_replay(&items);
         assert!(replay.into_snapshot(&turns).is_none());
+    }
+
+    #[test]
+    fn rollback_does_not_reassign_usage_to_a_replacement_turn() {
+        let mut items = token_usage_history();
+        // A rollback marker is persisted separately from any recomputed count.
+        // The replacement turn must not inherit usage owned by the removed turn.
+        items.insert(
+            3,
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+            )),
+        );
+        let (turns, replay) = build_turns_with_token_usage_replay(&items);
+        assert_eq!(turns.len(), 1);
+        assert!(replay.into_snapshot(&turns).is_none());
+    }
+
+    #[test]
+    fn rollback_preserves_retained_usage_and_accepts_a_fresh_replacement_count() {
+        let rollback = RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        ));
+        let mut retained = token_usage_history();
+        retained.push(rollback.clone());
+        let (turns, replay) = build_turns_with_token_usage_replay(&retained);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(replay.into_snapshot(&turns).expect("A remains").turn_id, turns[0].id);
+
+        let mut replaced = token_usage_history();
+        replaced.insert(3, rollback);
+        let fresh = replaced[2].clone();
+        replaced.push(fresh);
+        let (turns, replay) = build_turns_with_token_usage_replay(&replaced);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(replay.into_snapshot(&turns).expect("fresh B count").turn_id, turns[0].id);
     }
 
     fn token_usage_history() -> Vec<RolloutItem> {

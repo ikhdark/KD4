@@ -87,6 +87,8 @@ mod tests {
             ("argument with space", "\"argument with space\""),
             ("say \"hello\"", "\"say \\\"hello\\\"\""),
             ("C:\\path with space\\", "\"C:\\path with space\\\\\""),
+            // n backslashes before a quote become 2n + 1 before the escaped quote.
+            ("a\\\"b", "\"a\\\\\\\"b\""),
         ] {
             assert_eq!(quote_windows_arg(argument), expected);
         }

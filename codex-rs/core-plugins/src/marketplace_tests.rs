@@ -2216,6 +2216,27 @@ fn find_installable_marketplace_plugin_rejects_disallowed_product() {
         err.to_string(),
         "plugin `chatgpt-plugin` is not available for install in marketplace `codex-curated`"
     );
+
+    // A product list restricts installs to its members; it does not disable the plugin.
+    let resolved = find_installable_marketplace_plugin(
+        &AbsolutePathBuf::try_from(repo_root.join(".agents/plugins/marketplace.json")).unwrap(),
+        "chatgpt-plugin",
+        Some(Product::Chatgpt),
+    )
+    .unwrap();
+    assert_eq!(resolved.plugin_id.as_key(), "chatgpt-plugin@codex-curated");
+
+    // A caller without a product cannot satisfy a product list.
+    let err = find_installable_marketplace_plugin(
+        &AbsolutePathBuf::try_from(repo_root.join(".agents/plugins/marketplace.json")).unwrap(),
+        "chatgpt-plugin",
+        /*restriction_product*/ None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "plugin `chatgpt-plugin` is not available for install in marketplace `codex-curated`"
+    );
 }
 
 #[test]

@@ -1287,6 +1287,36 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
+    fn persisted_settings_override_mask_uses_parsed_rpc_paths() {
+        for (model, windows, permissions) in [
+            ("model", "windows.sandbox", "permissions.workspace"),
+            ("\"model\"", "\"windows\".sandbox", "\"permissions\".workspace"),
+            ("'model'", "windows.'sandbox'", "permissions.'workspace'"),
+        ] {
+            let overrides = HashMap::from([
+                (model.to_string(), json!("requested-model")),
+                (windows.to_string(), json!("elevated")),
+                (permissions.to_string(), json!({})),
+            ]);
+            let mask = persisted_settings_override_mask(
+                Some(&overrides),
+                &ConfigOverrides::default(),
+            );
+            assert!(mask.model, "model override {model} must survive reconstruction");
+            assert!(mask.windows_sandbox_level, "sandbox override {windows} must survive reconstruction");
+            assert!(mask.permission_profile);
+            assert!(mask.active_permission_profile);
+            assert!(mask.profile_workspace_roots);
+            assert!(mask.sandbox_policy);
+            assert!(!mask.model_provider_id);
+        }
+        // A quoted dot is part of one literal key, not a nested permissions path.
+        let overrides = HashMap::from([("\"permissions.workspace\"".to_string(), json!({}))]);
+        let mask = persisted_settings_override_mask(Some(&overrides), &ConfigOverrides::default());
+        assert!(!mask.permission_profile);
+    }
+
+    #[test]
     fn nested_windows_override_masks_persisted_windows_sandbox() {
         let request_overrides = HashMap::from([(
             "windows".to_string(),
@@ -1862,6 +1892,23 @@ mod elicitation_lease_tests {
         fixture.acquire(lease(unsubscribed, 11)).await?;
         let remaining_lease = lease(remaining, 20);
         fixture.acquire(remaining_lease.clone()).await?;
+        // The unsubscribing connection also holds a lease on another thread.
+        let other = ElicitationLeaseFixture::new().await?;
+        assert!(
+            fixture
+                .state
+                .try_add_connection_to_thread(other.thread_id, unsubscribed)
+                .await
+        );
+        let other_thread_lease = lease(unsubscribed, 30);
+        fixture
+            .state
+            .acquire_out_of_band_elicitation_lease(
+                other.thread_id,
+                other_thread_lease.clone(),
+                &other.thread,
+            )
+            .await?;
 
         assert!(
             fixture
@@ -1880,6 +1927,15 @@ mod elicitation_lease_tests {
                 .await,
             Some(0)
         );
+        assert_eq!(other.thread.active_out_of_band_elicitation_lease_count(), 1);
+        assert_eq!(
+            fixture
+                .state
+                .release_out_of_band_elicitation_lease(other.thread_id, &other_thread_lease)
+                .await,
+            Some(0)
+        );
+        other.shutdown().await?;
         fixture.shutdown().await
     }
 

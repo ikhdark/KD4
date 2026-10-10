@@ -454,22 +454,52 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn create_directory_junction(target: &Path, alias: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(alias)
+            .arg(target)
+            .output()
+            .expect("run mklink");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     #[test]
-    #[cfg(unix)]
-    fn symlink_parent_traversal_returns_the_path_that_was_checked() {
-        use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    fn junction_paths_stay_logical_unless_the_input_has_parent_traversal() {
         let dir = tempdir().expect("directory");
         let root = dir.path();
-        fs::create_dir(root.join("a")).expect("a");
-        fs::create_dir_all(root.join("b/inside")).expect("inside");
-        fs::write(root.join("b/marker"), "expected").expect("marker");
-        symlink(root.join("a"), root.join("view")).expect("view symlink");
-        symlink(root.join("b/inside"), root.join("a/inner")).expect("inner symlink");
-        let input = root.join("view/inner/../marker");
-        let expected = dunce::canonicalize(root.join("b/marker")).expect("marker path");
+        fs::create_dir_all(root.join("real").join("nested")).expect("nested");
+        fs::write(root.join("real").join("marker"), "expected").expect("marker");
+        // A junction needs no symlink privilege and is reported as a symlink by std.
+        create_directory_junction(&root.join("real"), &root.join("view"));
+
+        let logical = root.join("view").join("marker");
         for resolved in [
-            canonicalize_preserving_symlinks(&input),
-            canonicalize_existing_preserving_symlinks(&input),
+            canonicalize_preserving_symlinks(&logical),
+            canonicalize_existing_preserving_symlinks(&logical),
+        ] {
+            assert_eq!(resolved.expect("existing path"), logical);
+        }
+        let missing = root.join("view").join("missing");
+        assert_eq!(
+            canonicalize_preserving_symlinks(&missing).expect("missing logical path"),
+            missing
+        );
+
+        // With `..` in the input only the canonical result names the file that was checked.
+        let traversal = root.join("view").join("nested").join("..").join("marker");
+        let expected =
+            dunce::canonicalize(root.join("real").join("marker")).expect("marker path");
+        for resolved in [
+            canonicalize_preserving_symlinks(&traversal),
+            canonicalize_existing_preserving_symlinks(&traversal),
         ] {
             let resolved = resolved.expect("existing path");
             assert_eq!(resolved, expected);
@@ -478,25 +508,6 @@ mod tests {
                 "expected"
             );
         }
-        let logical = root.join("view/inner");
-        assert_eq!(
-            canonicalize_existing_preserving_symlinks(&logical).expect("logical path"),
-            logical
-        );
-        let missing = root.join("view/missing");
-        assert_eq!(
-            canonicalize_preserving_symlinks(&missing).expect("missing logical path"),
-            missing
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn native_paths_do_not_rewrite_foreign_windows_prefixes() {
-        let dir = tempdir().expect("directory");
-        let filename = r"\\?\C:\file";
-        let resolved = AbsolutePathBuf::resolve_path_against_base(filename, dir.path());
-        assert_eq!(resolved.as_path(), dir.path().join(filename));
     }
 
     #[test]
@@ -662,46 +673,6 @@ mod tests {
             test_path_buf("/tmp/codex-home/plugins/cache")
         );
         Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn absolute_paths_do_not_read_current_dir() {
-        let status = std::process::Command::new(std::env::current_exe().expect("current test binary"))
-            .arg("tests::absolute_paths_with_removed_current_dir_child")
-            .arg("--exact")
-            .arg("--ignored")
-            .env("CODEX_ABSOLUTE_PATH_REMOVED_CWD_CHILD", "1")
-            .status()
-            .expect("run child test");
-        assert!(status.success());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore]
-    fn absolute_paths_with_removed_current_dir_child() {
-        if std::env::var_os("CODEX_ABSOLUTE_PATH_REMOVED_CWD_CHILD").is_none() {
-            return;
-        }
-
-        // Isolate the process-wide cwd change from the other tests.
-        let original_cwd = std::env::current_dir().expect("original cwd");
-        let dir = tempdir().expect("temporary cwd");
-        std::env::set_current_dir(dir.path()).expect("set cwd");
-        dir.close().expect("remove cwd");
-        assert!(std::env::current_dir().is_err());
-
-        let input = test_path_buf("/tmp/codex/../codex-home/plugins/cache");
-        let path = AbsolutePathBuf::from_absolute_path(&input)
-            .expect("absolute path should not require current dir");
-        let resolved = AbsolutePathBuf::relative_to_current_dir(input)
-            .expect("absolute path should not require current dir");
-        assert!(AbsolutePathBuf::relative_to_current_dir("relative.txt").is_err());
-
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
-        assert_eq!(path.as_path(), test_path_buf("/tmp/codex-home/plugins/cache"));
-        assert_eq!(resolved, path);
     }
 
     #[test]

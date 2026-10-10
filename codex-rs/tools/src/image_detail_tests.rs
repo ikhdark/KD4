@@ -42,29 +42,11 @@ fn model_info() -> ModelInfo {
 }
 
 #[test]
-fn output_detail_respects_model_capability_without_changing_other_details() {
+fn can_request_original_image_detail_follows_model_capability() {
     for supports_original in [false, true] {
         let mut model = model_info();
         model.supports_image_detail_original = supports_original;
         assert_eq!(can_request_original_image_detail(&model), supports_original);
-        for detail in [
-            None,
-            Some(ImageDetail::Original),
-            Some(ImageDetail::Auto),
-            Some(ImageDetail::Low),
-            Some(ImageDetail::High),
-        ] {
-            let expected = if !supports_original && detail == Some(ImageDetail::Original) {
-                None
-            } else {
-                detail
-            };
-            assert_eq!(
-                normalize_output_image_detail(&model, detail),
-                expected,
-                "supports_original={supports_original}, detail={detail:?}"
-            );
-        }
     }
 }
 

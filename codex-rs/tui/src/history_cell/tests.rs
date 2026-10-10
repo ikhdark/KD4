@@ -1405,6 +1405,32 @@ fn session_header_indicates_full_access_mode() {
             .iter()
             .any(|span| span.content == "permissions: Full Access")
     }));
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80));
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("permissions: Full Access")),
+        "{rendered:?}"
+    );
+
+    // Control: a restricted session must not show a permissions row at all.
+    let restricted = SessionHeaderHistoryCell::new(
+        "gpt-5".to_string(),
+        /*reasoning_effort*/ None,
+        /*show_fast_status*/ false,
+        test_path_buf("/tmp/project").abs().to_path_buf(),
+        "test",
+    );
+    for lines in [
+        restricted.raw_lines(),
+        restricted.display_lines(/*width*/ 80),
+    ] {
+        let rendered = render_lines(&lines);
+        assert!(
+            !rendered.iter().any(|line| line.contains("permissions")),
+            "{rendered:?}"
+        );
+    }
 }
 
 #[test]
@@ -1448,8 +1474,9 @@ fn session_header_directory_front_truncates_long_segment() {
 }
 
 #[test]
-fn coalesces_sequential_reads_within_one_call() {
-    // Build one exec cell with a Search followed by two Reads
+fn mixed_search_and_read_call_lists_each_read_on_its_own_row() {
+    // Reads share one row only when a call parses to nothing but reads. A call that also
+    // searches keeps one row per parsed command.
     let call_id = "c1".to_string();
     let mut cell = ExecCell::new(
         ExecCall {
@@ -1479,12 +1506,14 @@ fn coalesces_sequential_reads_within_one_call() {
         },
         /*animations_enabled*/ true,
     );
-    // Mark call complete so markers are ✓
     cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
 
     let lines = cell.display_lines(/*width*/ 80);
     let rendered = render_lines(&lines).join("\n");
-    insta::assert_snapshot!(rendered);
+    assert_eq!(
+        rendered,
+        "• Explored\n  └ Search shimmer_spans\n    Read shimmer.rs\n    Read status_indicator_widget.rs"
+    );
 }
 
 #[test]
@@ -1578,7 +1607,7 @@ fn coalesced_reads_dedupe_names() {
 }
 
 #[test]
-fn multiline_command_wraps_with_extra_indent_on_subsequent_lines() {
+fn multiline_command_wraps_later_lines_under_pipe_gutter() {
     // Create a completed exec cell with a multiline command
     let cmd = "set -o pipefail\ncargo test -p codex-tui --quiet".to_string();
     let call_id = "c1".to_string();
@@ -1597,11 +1626,14 @@ fn multiline_command_wraps_with_extra_indent_on_subsequent_lines() {
     // Mark call complete so it renders as "Ran"
     cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
 
-    // Small width to keep the wrapped continuation-indent path covered.
+    // Small width so the second command line itself wraps onto another gutter row.
     let width: u16 = 28;
     let lines = cell.display_lines(width);
     let rendered = render_lines(&lines).join("\n");
-    insta::assert_snapshot!(rendered);
+    assert_eq!(
+        rendered,
+        "• Ran set -o pipefail\n  │ cargo test -p codex-tui\n  │ --quiet\n  └ (no output)"
+    );
 }
 
 #[test]
@@ -1627,7 +1659,7 @@ fn single_line_command_compact_when_fits() {
 }
 
 #[test]
-fn single_line_command_wraps_with_four_space_continuation() {
+fn single_line_command_wraps_under_pipe_gutter() {
     let call_id = "c1".to_string();
     let long = "a_very_long_token_without_spaces_to_force_wrapping".to_string();
     let mut cell = ExecCell::new(
@@ -1645,11 +1677,14 @@ fn single_line_command_wraps_with_four_space_continuation() {
     cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
     let lines = cell.display_lines(/*width*/ 24);
     let rendered = render_lines(&lines).join("\n");
-    insta::assert_snapshot!(rendered);
+    assert_eq!(
+        rendered,
+        "• Ran a_very_long_token_\n  │ without_spaces_to_\n  │ force_wrapping\n  └ (no output)"
+    );
 }
 
 #[test]
-fn multiline_command_without_wrap_uses_branch_then_eight_spaces() {
+fn multiline_command_without_wrap_puts_second_line_under_pipe_gutter() {
     let call_id = "c1".to_string();
     let cmd = "echo one\necho two".to_string();
     let mut cell = ExecCell::new(
@@ -1667,7 +1702,7 @@ fn multiline_command_without_wrap_uses_branch_then_eight_spaces() {
     cell.complete_call(&call_id, CommandOutput::default(), Duration::from_millis(1));
     let lines = cell.display_lines(/*width*/ 80);
     let rendered = render_lines(&lines).join("\n");
-    insta::assert_snapshot!(rendered);
+    assert_eq!(rendered, "• Ran echo one\n  │ echo two\n  └ (no output)");
 }
 
 #[test]
@@ -1826,6 +1861,8 @@ fn user_history_cell_summarizes_inline_data_urls() {
 
     assert!(rendered.contains("[Image #1]"));
     assert!(rendered.contains("describe inline image"));
+    assert!(!rendered.contains("data:"), "{rendered:?}");
+    assert!(!rendered.contains("aGVsbG8="), "{rendered:?}");
 }
 
 #[test]
@@ -2088,8 +2125,8 @@ fn reasoning_summary_height_matches_wrapped_rendering_for_url_like_content() {
         .line_count(width) as u16;
     assert_eq!(wrapped_height, expected_wrapped_height);
     assert!(
-        wrapped_height >= logical_height,
-        "expected wrapped height to be at least logical line count ({logical_height}), got {wrapped_height}"
+        wrapped_height > logical_height,
+        "expected wrapped height to exceed logical line count ({logical_height}), got {wrapped_height}"
     );
 
     let wrapped_transcript_height = cell.desired_transcript_height(width);

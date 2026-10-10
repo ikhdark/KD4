@@ -924,12 +924,15 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
 
     let server = start_mock_server().await;
 
+    // Forks retain final answers, not commentary or messages with an unknown phase.
+    let mut seed_message = ev_assistant_message("msg-seed-1", "seeded");
+    seed_message["item"]["phase"] = json!("final_answer");
     let seed_turn = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, TURN_0_FORK_PROMPT),
         sse(vec![
             ev_response_created("resp-seed-1"),
-            ev_assistant_message("msg-seed-1", "seeded"),
+            seed_message,
             ev_completed("resp-seed-1"),
         ]),
     )
@@ -987,16 +990,24 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Collab)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .disable(Feature::MultiAgentV2)
-            .expect("test config should allow feature update");
-    });
+    // A single-model catalog keeps this focused on normal fork sampling rather
+    // than model-migration compaction or changing built-in child defaults.
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.5", |info| {
+            info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+        })
+        .with_config(|config| {
+            config.model_catalog.as_mut().expect("test catalog").models
+                .retain(|model| model.slug == "gpt-5.5");
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .disable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn(TURN_0_FORK_PROMPT).await?;
@@ -1049,6 +1060,26 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
             .await;
     };
     assert!(body_contains(&child_request, TURN_0_FORK_PROMPT));
+    let child_body: Value = serde_json::from_slice(&child_request.body)?;
+    assert_eq!(
+        child_body["input"]
+            .as_array()
+            .expect("child input")
+            .iter()
+            .filter(|item| item["type"] == "message" && item["role"] == "user")
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .filter(|span| span["type"] == "input_text" && span["text"] == CHILD_PROMPT)
+            .count(),
+        1,
+        "the actual child generation must receive its own task exactly once"
+    );
+    assert!(child_body["input"].as_array().expect("child input").iter().any(|item| {
+        item["role"] == "assistant"
+            && item["content"].as_array().is_some_and(|content| {
+                content.iter().any(|part| part["text"] == "seeded")
+            })
+    }));
     assert!(!body_contains(&child_request, SPAWN_CALL_ID));
 
     Ok(())
@@ -1600,6 +1631,19 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
     uuid::Uuid::parse_str(assignment["assignment_id"].as_str().expect("assignment ID"))?;
     let (attempt, actual_payload) = receipt.split_once("\nPayload:\n").expect("payload boundary");
     uuid::Uuid::parse_str(attempt)?;
+    let capsule = child_request
+        .requests()
+        .into_iter()
+        .flat_map(|request| request.message_input_texts("user"))
+        .filter_map(|text| {
+            text.strip_prefix(TASK_CAPSULE_OPEN_TAG)
+                .and_then(|body| body.strip_suffix(TASK_CAPSULE_CLOSE_TAG))
+                .map(|body| serde_json::from_str::<Value>(body).expect("task capsule JSON"))
+        })
+        .find(|capsule| capsule["objective"] == CHILD_PROMPT)
+        .expect("spawned child's task capsule");
+    assert_eq!(assignment["assignment_id"], capsule["assignment_id"]);
+    assert_eq!(Some(attempt), capsule["attempt_id"].as_str());
     assert_eq!(actual_payload, payload);
     let notification = text.to_string();
     assert_eq!(

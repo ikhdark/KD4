@@ -171,10 +171,16 @@ fn normalize_request_user_input_args_clamps_out_of_range_auto_resolution_ms() {
         question: "Proceed?".to_string(),
         is_other: false,
         is_secret: false,
-        options: Some(vec![RequestUserInputQuestionOption {
-            label: "Yes (Recommended)".to_string(),
-            description: "Continue.".to_string(),
-        }]),
+        options: Some(vec![
+            RequestUserInputQuestionOption {
+                label: "Yes (Recommended)".to_string(),
+                description: "Continue.".to_string(),
+            },
+            RequestUserInputQuestionOption {
+                label: "No".to_string(),
+                description: "Stop.".to_string(),
+            },
+        ]),
     };
     for (input, expected) in [
         (None, None),
@@ -184,11 +190,14 @@ fn normalize_request_user_input_args_clamps_out_of_range_auto_resolution_ms() {
         (Some(MAX_AUTO_RESOLUTION_MS), Some(MAX_AUTO_RESOLUTION_MS)),
         (Some(MAX_AUTO_RESOLUTION_MS + 1), Some(MAX_AUTO_RESOLUTION_MS)),
     ] {
+        // Normalization receives protocol-valid questions from the handler.
+        // Round-trip the fixture so impossible choice counts cannot pass here.
+        let args = serde_json::from_value(serde_json::to_value(RequestUserInputArgs {
+            questions: vec![question.clone()],
+            auto_resolution_ms: input,
+        }).unwrap()).expect("normalization fixture must pass protocol validation");
         assert_eq!(
-            normalize_request_user_input_args(RequestUserInputArgs {
-                questions: vec![question.clone()],
-                auto_resolution_ms: input,
-            }),
+            normalize_request_user_input_args(args),
             Ok(RequestUserInputArgs {
                 questions: vec![RequestUserInputQuestion {
                     is_other: true,

@@ -273,5 +273,39 @@ mod tests {
                 .iter()
                 .any(|detail| detail.starts_with("update action: "))
         );
+
+        // The ambient context above depends on where the test binary lives, so pin the
+        // reported action per install method.
+        let update_action = |method: InstallMethod| {
+            updates_check_from_inputs(
+                &config,
+                &InstallContext {
+                    method,
+                    package_layout: None,
+                },
+                None,
+                "1.0.0",
+                Some(Err("offline".to_string())),
+            )
+            .details
+            .into_iter()
+            .find(|detail| detail.starts_with("update action: "))
+            .expect("update action detail")
+        };
+        assert_eq!(
+            update_action(InstallMethod::Other),
+            "update action: manual or unknown"
+        );
+        let standalone = update_action(InstallMethod::Standalone {
+            release_dir: codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+                codex_home.path(),
+            )
+            .expect("absolute release dir"),
+            resources_dir: None,
+        });
+        assert!(
+            standalone.starts_with("update action: powershell -ExecutionPolicy Bypass -c "),
+            "{standalone}"
+        );
     }
 }

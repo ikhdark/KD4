@@ -632,7 +632,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn execution_observation_has_no_control_plane_deadline() {
-        let (command_tx, _commands) = mpsc::channel(1);
+        let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
             command_tx,
@@ -641,14 +641,31 @@ mod tests {
             failure: Arc::new(std::sync::Mutex::new(None)),
             cancellation: CancellationToken::new(),
         };
-        let (response_tx, response_rx) = oneshot::channel();
-        let result = connection.receive(response_rx);
-        tokio::pin!(result);
-        assert!(futures::poll!(&mut result).is_pending());
+        let cell_id = CellId::new("1".to_string());
+        let wait = connection.wait(
+            RemoteSession {
+                id: codex_code_mode_protocol::host::SessionId::new("long-cell").unwrap(),
+                generation: 1,
+            },
+            WaitRequest { cell_id: cell_id.clone(), yield_time_ms: 0, recovery: None },
+        );
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        let DriverCommand::Wait { response_tx, .. } = commands.recv().await.unwrap() else {
+            panic!("expected wait command");
+        };
         tokio::time::advance(SHUTDOWN_SESSION_TIMEOUT * 2).await;
-        assert!(futures::poll!(&mut result).is_pending());
-        response_tx.send(Ok(42)).unwrap();
-        assert_eq!(result.await, Ok(42));
+        assert!(futures::poll!(&mut wait).is_pending());
+        assert!(connection.is_alive());
+        assert!(!connection.cancellation.is_cancelled());
+        let outcome = || {
+            WaitOutcome::LiveCell(codex_code_mode_protocol::RuntimeResponse::Yielded {
+                cell_id: cell_id.clone(),
+                content_items: Vec::new(),
+            })
+        };
+        response_tx.send(Ok(outcome())).unwrap();
+        assert_eq!(wait.await, Ok(outcome()));
         assert!(connection.is_alive());
     }
 }

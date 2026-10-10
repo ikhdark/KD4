@@ -562,17 +562,26 @@ mod tests {
 
     #[test]
     fn collab_resume_end_maps_to_item_completed_resume_agent() {
-        for (status, call_status, state_status, message) in [
+        for (status, call_status, state_status, message, last_agent_message) in [
             (
                 codex_protocol::protocol::AgentStatus::NotFound,
                 CollabAgentToolCallStatus::Failed,
                 CollabAgentStatus::NotFound,
+                None,
+                None,
+            ),
+            (
+                codex_protocol::protocol::AgentStatus::Errored("boom".into()),
+                CollabAgentToolCallStatus::Failed,
+                CollabAgentStatus::Errored,
+                Some("boom".to_string()),
                 None,
             ),
             (
                 codex_protocol::protocol::AgentStatus::Completed(Some("implemented".into())),
                 CollabAgentToolCallStatus::Completed,
                 CollabAgentStatus::Completed,
+                Some("implemented".to_string()),
                 Some("implemented".to_string()),
             ),
         ] {
@@ -606,9 +615,9 @@ mod tests {
                         reasoning_effort: None,
                         agents_states: [(receiver_id, CollabAgentState {
                             status: state_status,
-                            message: message.clone(),
+                            message,
                             surfaced_result: None,
-                            last_agent_message: message,
+                            last_agent_message,
                         })].into_iter().collect(),
                     },
                 },

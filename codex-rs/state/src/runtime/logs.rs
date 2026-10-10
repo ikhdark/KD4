@@ -199,17 +199,12 @@ impl StateRuntime {
         Arc::clone(&self.log_retention_test_control)
     }
 
-    pub async fn insert_log(&self, entry: &LogEntry) -> anyhow::Result<()> {
-        self.insert_logs(std::slice::from_ref(entry)).await
-    }
-
-    /// Insert a batch of log entries into the logs table.
-    pub async fn insert_logs(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
+    /// Test harness for the sequence `log_db` runs in production: insert with
+    /// deferred retention, then prune the partitions the batch touched.
+    #[cfg(test)]
+    pub(crate) async fn insert_logs(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
         let scope = self.insert_logs_deferred_retention(entries).await?;
-        if let Err(_err) = self.prune_log_retention(scope).await {
-            self.record_log_retention_event("cleanup_failed");
-        }
-        Ok(())
+        self.prune_log_retention(scope).await
     }
 
     pub(crate) async fn insert_logs_deferred_retention(
@@ -777,11 +772,6 @@ WHERE cumulative_estimated_bytes <=
         }
 
         Ok(ordered_bytes)
-    }
-
-    /// Query per-thread feedback logs, capped to the per-thread SQLite retention budget.
-    pub async fn query_feedback_logs(&self, thread_id: &str) -> anyhow::Result<Vec<u8>> {
-        self.query_feedback_logs_for_threads(&[thread_id]).await
     }
 
     /// Return the max log id matching optional filters.
@@ -2149,7 +2139,7 @@ mod tests {
             .expect("insert test logs");
 
         let bytes = runtime
-            .query_feedback_logs("thread-1")
+            .query_feedback_logs_for_threads(&["thread-1"])
             .await
             .expect("query feedback logs");
 
@@ -2209,7 +2199,7 @@ mod tests {
         assert_eq!(log_row_count(&logs_db_path(&codex_home)).await, 2,
             "query bound must be tested before retention deletes the oversized row");
         let bytes = runtime
-            .query_feedback_logs("thread-oversized")
+            .query_feedback_logs_for_threads(&["thread-oversized"])
             .await
             .expect("query feedback logs");
 
@@ -2284,7 +2274,7 @@ mod tests {
             .expect("insert test logs");
 
         let bytes = runtime
-            .query_feedback_logs("thread-1")
+            .query_feedback_logs_for_threads(&["thread-1"])
             .await
             .expect("query feedback logs");
 
@@ -2382,7 +2372,7 @@ mod tests {
             .expect("insert test logs");
 
         let bytes = runtime
-            .query_feedback_logs("thread-1")
+            .query_feedback_logs_for_threads(&["thread-1"])
             .await
             .expect("query feedback logs");
 
@@ -2476,7 +2466,7 @@ mod tests {
             .expect("insert test logs");
 
         let bytes = runtime
-            .query_feedback_logs("thread-1")
+            .query_feedback_logs_for_threads(&["thread-1"])
             .await
             .expect("query feedback logs");
         let logs = String::from_utf8(bytes).expect("valid utf-8");

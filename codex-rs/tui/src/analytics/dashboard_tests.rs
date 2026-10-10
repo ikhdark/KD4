@@ -44,7 +44,6 @@ fn dashboard_cards_align_and_keep_stable_summary_heights() {
                 .any(|line| line.contains(left) && line.contains(right))
         );
     }
-    assert!(!wide.contains("Coverage from"));
     let before = view.dashboard_lines(/*width*/ 140, /*height*/ 56);
     press(&mut view, KeyCode::Left);
     view.sections[Section::Plugins].history = Load::Error("Access denied for this report.".into());

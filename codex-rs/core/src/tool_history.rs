@@ -31,70 +31,9 @@ const RECEIPT_VERSION: u8 = 2;
 const LEGACY_RECEIPT_VERSION: u8 = 1;
 pub(crate) const TOOL_SEARCH_RECEIPT_VERSION: u8 = 2;
 const RECEIPT_MAX_TOKENS: usize = 256;
-// Structured receipts repeat routing fields in the ToolSearchOutput envelope.
-// Bound that complete representation separately and charge its actual cost to admission.
-const TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS: usize = 384;
 const RECEIPT_DIGEST_TARGET_TOKENS: usize = 96;
-// Aggregate raw tool-result tokens kept model-visible before consumed results
-// are compacted to receipts. A 10k budget compacted a 5k-token read after one
-// generation, so the model re-ran identical reads instead of reusing evidence;
-// Keep a bounded working set of source and validation evidence across an
-// investigation. The complete prompt still obeys the model context limit.
-const DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 75_000;
-
-#[cfg(test)]
-thread_local! {
-    static MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-
-pub(crate) fn model_visible_tool_result_token_budget() -> usize {
-    #[cfg(test)]
-    if let Some(budget) = MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(std::cell::Cell::get)
-    {
-        return budget;
-    }
-    DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
-}
-
-/// Retain a useful working set without scaling replay cost indefinitely with
-/// larger model windows. Small windows still reserve half for other context.
-pub(crate) fn model_visible_tool_result_token_budget_for_context_window(
-    context_window: Option<i64>,
-) -> usize {
-    context_window
-        .and_then(|window| usize::try_from(window).ok())
-        .filter(|window| *window > 0)
-        .map_or_else(model_visible_tool_result_token_budget, |window| {
-            (window / 2).min(model_visible_tool_result_token_budget())
-        })
-}
-
-/// Restores the previous test budget when dropped.
-#[cfg(test)]
-pub(crate) struct ModelVisibleToolResultTokenBudgetOverride(Option<usize>);
-
-#[cfg(test)]
-impl Drop for ModelVisibleToolResultTokenBudgetOverride {
-    fn drop(&mut self) {
-        MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(|cell| cell.set(self.0));
-    }
-}
-
-/// Pressure fixtures are sized against a small budget so admission, receipt,
-/// and drop paths stay exercised regardless of the production default.
-#[cfg(test)]
-pub(crate) fn override_model_visible_tool_result_token_budget_for_test(
-    budget: usize,
-) -> ModelVisibleToolResultTokenBudgetOverride {
-    ModelVisibleToolResultTokenBudgetOverride(
-        MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(|cell| cell.replace(Some(budget))),
-    )
-}
-
 pub(crate) const COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET: usize = 2_000;
 const COMPACTION_ARTIFACT_PIN_MAX_ITEMS: usize = 32;
-const UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS: usize = 16;
 const MINIMUM_RAW_TOKENS: u64 = 256;
 const MINIMUM_SAVED_TOKENS: u64 = 64;
 const MINIMUM_RELATIVE_SAVINGS_PERCENT: u64 = 25;
@@ -391,12 +330,6 @@ impl ToolHistoryCandidate {
         )
     }
 
-    fn admission_receipt(&self) -> Option<(&str, &str, u64)> {
-        self.render_receipt(
-            /*require_consumed*/ false, /*require_savings*/ false,
-        )
-    }
-
     fn render_receipt(
         &self,
         require_consumed: bool,
@@ -649,15 +582,9 @@ pub(crate) struct ToolHistorySubstitution {
     pub(crate) substituted_output_sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ToolOutputBudgetDrops {
-    pub(crate) count: u32,
-    pub(crate) tokens: u64,
-}
-
 /// The projection sent in the previous sampling request of the current turn,
 /// keyed by the prepared (pre-projection) items it was computed from. Later
-/// requests in the turn extend it instead of re-budgeting it; see
+/// requests in the turn extend it instead of recomputing it; see
 /// [`ToolHistoryState::project_continuation_with_workspace_cache`].
 #[derive(Clone, Debug)]
 pub(crate) struct SamplingProjectionAnchor {
@@ -670,15 +597,6 @@ pub(crate) struct ToolHistoryProjection {
     pub(crate) items: Arc<[ResponseItem]>,
     pub(crate) unreplaced_items: Arc<[ResponseItem]>,
     pub(crate) substitutions: Arc<[ToolHistorySubstitution]>,
-    /// Drops the aggregate output budget made in `items`.
-    ///
-    /// Recorded per representation because the budget runs over several
-    /// candidate projections and only one of them is sent. Summing the
-    /// invocations would overcount, and would implicate drops in a
-    /// representation the model never saw.
-    pub(crate) items_budget_drops: ToolOutputBudgetDrops,
-    /// The same accounting for `unreplaced_items`.
-    pub(crate) unreplaced_items_budget_drops: ToolOutputBudgetDrops,
 }
 
 #[derive(Clone, Debug)]
@@ -695,25 +613,6 @@ impl ProjectedResponseItems {
         match self {
             Self::Shared(_) => unreachable!("shared projection should have been materialized"),
             Self::Owned(items) => items,
-        }
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(&ResponseItem) -> bool) {
-        if let Self::Owned(items) = self {
-            items.retain(keep);
-        } else if let Some(first_removed) = self.iter().position(|item| !keep(item)) {
-            // Preserve the shared allocation when nothing changes, and do not
-            // evaluate a stateful predicate again for the prefix already visited.
-            let mut index = 0;
-            self.make_owned().retain(|item| {
-                let retain = match index.cmp(&first_removed) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => false,
-                    std::cmp::Ordering::Greater => keep(item),
-                };
-                index += 1;
-                retain
-            });
         }
     }
 
@@ -781,14 +680,6 @@ pub(crate) struct ToolHistoryState {
     artifact_directory_members: BTreeMap<String, BTreeSet<String>>,
     #[serde(skip)]
     artifact_call_ids: BTreeMap<String, String>,
-    /// Derived from the active model context window by the owning history;
-    /// not part of the persisted ledger.
-    #[serde(skip)]
-    model_visible_tool_result_token_budget: Option<usize>,
-    /// Cost of textual tool outputs actually sent in the last completed request,
-    /// not payloads retained only behind recovery receipts. Unknown after replay.
-    #[serde(skip)]
-    last_visible_tool_output_tokens: Option<usize>,
     /// Derived, bounded to calls in the latest projection, and shared by history snapshots.
     #[serde(skip)]
     workspace_projection_cache: Arc<std::sync::Mutex<BTreeMap<String, WorkspaceProjectionEntry>>>,
@@ -827,7 +718,6 @@ struct WorkspaceProjectionKey {
     origin_call: Option<(String, String)>,
     recovery: bool,
     output_sha256: String,
-    include_historical_payloads: bool,
 }
 
 #[derive(Debug)]
@@ -851,11 +741,20 @@ impl WorkspaceEvidenceObservation {
             .and_then(serde_json::Value::as_str).filter(|value| value.len() <= 256);
         let same_root = self.revision.as_ref().and_then(|identity| identity.repository_root.as_ref())
             .is_some_and(|root| workspace_identity.and_then(|identity| identity.repository_root.as_ref()) == Some(root));
+        // The list is bounded, so name the dependencies that changed before the others.
+        let changed = git_workspace.map(|cache| self.source_path_observations.iter()
+            .filter(|path| cache.source_path_freshness(path) == SourceFreshness::Changed)
+            .map(SourcePathChangeObservation::source_dependency).collect::<BTreeSet<_>>())
+            .unwrap_or_default();
         let mut bytes = 0;
-        let paths = self.source_dependencies.iter().take(8).filter_map(|dependency| {
-            let freshness = git_workspace.and_then(|cache| self.source_path_observations.iter()
-                .find(|path| path.source_dependency() == *dependency)
-                .map(|path| cache.source_path_freshness(path))).unwrap_or(SourceFreshness::Unknown);
+        let paths = self.source_dependencies.iter().filter(|dependency| changed.contains(*dependency))
+            .chain(self.source_dependencies.iter().filter(|dependency| !changed.contains(*dependency)))
+            .take(8).filter_map(|dependency| {
+            let freshness = if changed.contains(dependency) { Some(SourceFreshness::Changed) } else {
+                git_workspace.and_then(|cache| self.source_path_observations.iter()
+                    .find(|path| path.source_dependency() == *dependency)
+                    .map(|path| cache.source_path_freshness(path)))
+            }.unwrap_or(SourceFreshness::Unknown);
             let freshness = match freshness {
                 SourceFreshness::Changed => SourceFreshness::Changed,
                 SourceFreshness::Current if self.source_dependencies_current && same_root => SourceFreshness::Current,
@@ -882,9 +781,10 @@ impl WorkspaceEvidenceObservation {
                 .as_ref()
                 .is_none_or(|identity| !identity.unavailable)
             && if self.source_path_observations.is_empty() {
-                // Repository identity alone cannot establish freshness when
-                // the observation's dependency scope was never captured.
-                !self.source_dependencies.is_empty()
+                // A live cache must verify dependency watches, including for
+                // legacy ledgers whose recorded scope may be incomplete.
+                // Keep identity-only callers conservative for unknown scopes.
+                git_workspace.is_none() && !self.source_dependencies.is_empty()
                     && self.revision.is_some() && self.revision.as_ref() == workspace_identity
             } else {
                 // A Git-visible digest can stay unchanged when an ignored input
@@ -1795,67 +1695,6 @@ impl ToolHistoryState {
         changed
     }
 
-    pub(crate) fn configured_model_visible_tool_result_token_budget(&self) -> Option<usize> {
-        self.model_visible_tool_result_token_budget
-    }
-
-    pub(crate) fn task_sensitive_tool_result_budget(
-        &self,
-        window: i64,
-        prompt_tokens: usize,
-        generation_room: usize,
-    ) -> usize {
-        let baseline = model_visible_tool_result_token_budget_for_context_window(Some(window));
-        let Ok(window) = usize::try_from(window) else { return baseline };
-        if window == 0 {
-            return baseline;
-        }
-        // The last realized prompt includes instructions and other non-tool
-        // context. Reserve that space and observed generation demand before
-        // allocating evidence, independently of model-declared plan status.
-        let non_tool_tokens = prompt_tokens.saturating_sub(self.last_visible_tool_output_tokens.unwrap_or(0));
-        let reserve = non_tool_tokens
-            .saturating_add(generation_room.min(window / 4))
-            .max(window / 4);
-        let ceiling = window.saturating_sub(reserve).min(model_visible_tool_result_token_budget());
-        let active_evidence = self.candidates.values().filter(|candidate| {
-            candidate.consumed_by_generation.is_none()
-                // Consumption can release full-text priority without asserting
-                // resolution. Keep an exact diagnostic receipt instead.
-                || (!candidate.successful && (!candidate.complete || !candidate.projection_eligible))
-                || (candidate.source_dependencies_current
-                    && self.reuse_priority(&candidate.call_id, 0) == 0)
-        }).map(|candidate| {
-            let tokens = usize::try_from(candidate.derived.bounded_model_output_tokens)
-                .unwrap_or(usize::MAX);
-            // Frequently recovered, expensive evidence deserves more working
-            // room than a cheap consumed success. This is budgeting, not proof.
-            if self.reuse_priority(&candidate.call_id, 0) == 0 {
-                tokens.saturating_add(
-                    usize::try_from(candidate.original_tokens).unwrap_or(usize::MAX).min(tokens),
-                )
-            } else {
-                tokens
-            }
-        }).fold(0usize, usize::saturating_add);
-        baseline.max(active_evidence).min(ceiling)
-    }
-
-    pub(crate) fn set_model_visible_tool_result_token_budget(&mut self, budget: Option<usize>) {
-        self.model_visible_tool_result_token_budget = budget;
-    }
-
-    fn tool_result_token_budget(&self) -> usize {
-        #[cfg(test)]
-        if let Some(budget) =
-            MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET_OVERRIDE.with(std::cell::Cell::get)
-        {
-            return budget;
-        }
-        self.model_visible_tool_result_token_budget
-            .unwrap_or(DEFAULT_MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET)
-    }
-
     pub(crate) fn register_workspace_evidence(
         &mut self,
         observation: WorkspaceEvidenceObservation,
@@ -1905,23 +1744,6 @@ impl ToolHistoryState {
     }
 
     #[cfg(test)]
-    pub(crate) fn consumed_outputs_for_tool(&self, tool_identity: &str) -> Vec<(String, String)> {
-        self.candidates
-            .values()
-            .filter(|candidate| {
-                candidate.tool_identity == tool_identity
-                    && candidate.consumed_by_generation.is_some()
-            })
-            .map(|candidate| {
-                (
-                    candidate.call_id.clone(),
-                    candidate.bounded_model_output.clone(),
-                )
-            })
-            .collect()
-    }
-
-    #[cfg(test)]
     pub(crate) fn mark_consumed(
         &mut self,
         input: &[ResponseItem],
@@ -1938,18 +1760,9 @@ impl ToolHistoryState {
         if !self.consumption_turns.contains(&generation.turn_id) {
             self.consumption_turns.push(generation.turn_id.clone());
         }
-        let mut visible_tokens = 0usize;
         let exposed = input
             .iter()
             .filter_map(canonical_textual_output_identity)
-            .inspect(|(_, text)| {
-                // Byte length is already available here. Do not tokenize every
-                // retained output again on the generation-completion path.
-                visible_tokens = visible_tokens.saturating_add(
-                    usize::try_from(codex_utils_string::approx_tokens_from_byte_count(text.len()))
-                        .unwrap_or(usize::MAX),
-                );
-            })
             .filter(|(call_id, _)| {
                 self.candidates.get(*call_id).map_or_else(
                     || !self.untracked_consumption.contains_key(*call_id),
@@ -1958,7 +1771,6 @@ impl ToolHistoryState {
             })
             .map(|(call_id, text)| (call_id, sha256(text.as_bytes())))
             .collect::<BTreeMap<_, _>>();
-        self.last_visible_tool_output_tokens = Some(visible_tokens);
         let mut changed_call_ids = BTreeSet::new();
         for call_id in exposed.keys() {
             if !self.candidates.contains_key(*call_id) {
@@ -2009,6 +1821,7 @@ impl ToolHistoryState {
         changed
     }
 
+    #[cfg(test)]
     fn output_was_consumed(&self, call_id: &str) -> bool {
         if matches!(self.exposed_representations.get(call_id),
             Some(ExposedRepresentation::Compact { .. } | ExposedRepresentation::Omitted))
@@ -2028,30 +1841,6 @@ impl ToolHistoryState {
                 .is_some_and(|candidate| candidate.consumed_by_generation.is_some())
     }
 
-    /// Test entry point for explicit compaction without workspace checks.
-    #[cfg(test)]
-    pub(crate) fn project(&self, items: Arc<[ResponseItem]>) -> ToolHistoryProjection {
-        self.project_inner(items, None, None)
-    }
-
-    pub(crate) fn project_with_workspace_identity(
-        &self,
-        items: Arc<[ResponseItem]>,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-    ) -> ToolHistoryProjection {
-        self.project_inner(items, Some(workspace_identity), None)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn project_with_workspace_cache(
-        &self,
-        items: Arc<[ResponseItem]>,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-        git_workspace: &GitWorkspaceCache,
-    ) -> ToolHistoryProjection {
-        self.project_inner(items, Some(workspace_identity), Some(git_workspace))
-    }
-
     pub(crate) fn project_workspace_freshness_with_cache(
         &self,
         items: Arc<[ResponseItem]>,
@@ -2068,9 +1857,6 @@ impl ToolHistoryState {
             items: Arc::clone(&projected),
             unreplaced_items: projected,
             substitutions: Arc::from([]),
-            // This path applies no aggregate output budget.
-            items_budget_drops: ToolOutputBudgetDrops::default(),
-            unreplaced_items_budget_drops: ToolOutputBudgetDrops::default(),
         }
     }
 
@@ -2153,7 +1939,6 @@ impl ToolHistoryState {
             &mut checked,
             workspace_identity,
             Some(git_workspace),
-            /*include_historical_payloads*/ false,
         );
         let checked = checked.into_shared();
         let workspace_unchanged = Arc::ptr_eq(canonical, &checked);
@@ -2204,27 +1989,11 @@ impl ToolHistoryState {
             // Identity belongs to the invalidated observation, not to every
             // subsequent revision of an unrelated file. Avoid repeating notices.
             if let Some(fields) = notice.as_object_mut() {
-                fields.remove("current_revision");
-                fields.remove("historical_output");
-                fields.remove("historical_digest");
                 fields.remove("if_rerun_unavailable");
                 if let Some(serde_json::Value::Object(rerun)) = fields.get_mut("rerun") {
                     rerun.remove("instruction");
                     if rerun.is_empty() {
                         fields.remove("rerun");
-                    }
-                }
-                // Source text and process receipts remain in their original
-                // tool messages. Do not repeat untrusted output as developer
-                // instructions merely because another nested read went stale.
-                fields.remove("nested_commands");
-                if let Some(serde_json::Value::Array(results)) =
-                    fields.get_mut("current_nested_results")
-                {
-                    for result in results {
-                        if let Some(result) = result.as_object_mut() {
-                            result.remove("output");
-                        }
                     }
                 }
             }
@@ -2356,10 +2125,6 @@ impl ToolHistoryState {
             items,
             unreplaced_items,
             substitutions: Arc::clone(&anchor.projection.substitutions),
-            // No budget ran, so the attribution of the anchored request carries
-            // forward unchanged, as it does for cached prepared-history appends.
-            items_budget_drops: anchor.projection.items_budget_drops,
-            unreplaced_items_budget_drops: anchor.projection.unreplaced_items_budget_drops,
         })
     }
 
@@ -2405,945 +2170,14 @@ impl ToolHistoryState {
         })
     }
 
-    fn project_inner(
-        &self,
-        items: Arc<[ResponseItem]>,
-        workspace_identity: Option<Option<&WorkspaceEvidenceIdentity>>,
-        git_workspace: Option<&GitWorkspaceCache>,
-    ) -> ToolHistoryProjection {
-        let mut projected = ProjectedResponseItems::Shared(items);
-        let resolutions = FailureResolutionIndex::default();
-        let retired = projected
-            .iter()
-            .filter_map(phase_checkpoint_ids)
-            .flatten()
-            .collect::<BTreeSet<_>>();
-        if let Some(workspace_identity) = workspace_identity {
-            self.invalidate_stale_workspace_evidence(
-                &mut projected,
-                workspace_identity,
-                git_workspace,
-                /*include_historical_payloads*/ true,
-            );
-        }
-        let tool_search_arguments = projected
-            .iter()
-            .filter_map(|item| match item {
-                ResponseItem::ToolSearchCall {
-                    call_id: Some(call_id),
-                    arguments,
-                    ..
-                } => Some((call_id.clone(), arguments.clone())),
-                _ => None,
-            })
-            .collect::<BTreeMap<_, _>>();
-        let exposed_output_sha256 = projected
-            .iter()
-            // Only registered candidates participate in substitution/supersession.
-            // Leave unrelated outputs untouched without copying and hashing them.
-            .filter(|item| {
-                item_call_id(item).is_some_and(|call_id| self.candidates.contains_key(call_id))
-            })
-            .filter_map(canonical_textual_output_identity)
-            .map(|(call_id, output)| (call_id.to_string(), sha256(output.as_bytes())))
-            .collect::<BTreeMap<_, _>>();
-        let mut latest_supersession = BTreeMap::<String, String>::new();
-        let mut superseded_call_ids = BTreeSet::new();
-        for item in projected.iter() {
-            let Some((call_id, _output)) = canonical_textual_output_identity(item) else {
-                continue;
-            };
-            let Some(candidate) = self.candidates.get(call_id) else {
-                continue;
-            };
-            if exposed_output_sha256.get(call_id)
-                != Some(&candidate.derived.bounded_model_output_sha256)
-            {
-                continue;
-            }
-            let Some(identity) = candidate.supersession_identity.as_ref() else {
-                continue;
-            };
-            if !action_bound_supersession_identity(identity) {
-                continue;
-            }
-            if let Some(previous_call_id) =
-                latest_supersession.insert(identity.clone(), call_id.to_string())
-                && self
-                    .candidates
-                    .get(&previous_call_id)
-                    .is_some_and(|previous| previous.consumed_by_generation.is_some())
-            {
-                superseded_call_ids.insert(previous_call_id);
-            }
-        }
-        if !superseded_call_ids.is_empty() {
-            projected.retain(|item| {
-                item_call_id(item).is_none_or(|call_id| !superseded_call_ids.contains(call_id))
-            });
-        }
-
-        #[derive(Debug)]
-        struct AdmissionCandidate {
-            priority: u8,
-            item_index: std::cmp::Reverse<usize>,
-            call_id: String,
-            structured_tokens: Option<usize>,
-            non_text_tokens: usize,
-        }
-
-        let mut admission_candidates = projected
-            .iter()
-            .enumerate()
-            .filter_map(|(item_index, item)| {
-                let (call_id, output) = canonical_textual_output_identity(item)?;
-                let candidate = self.candidates.get(call_id)?;
-                (exposed_output_sha256.get(call_id)
-                    == Some(&candidate.derived.bounded_model_output_sha256))
-                .then(|| AdmissionCandidate {
-                    priority: self.reuse_priority(call_id, admission_priority(candidate, &output)
-                        + if self.output_was_consumed(call_id) {
-                            3
-                        } else {
-                            0
-                        }),
-                    item_index: std::cmp::Reverse(item_index),
-                    call_id: call_id.to_string(),
-                    structured_tokens: None,
-                    // Legacy ledgers omitted this cost. The current response body
-                    // still proves whether image/encrypted payload must be charged.
-                    non_text_tokens: candidate.preserved_non_text_tokens.map_or_else(
-                        || non_text_output_token_cost(item),
-                        |tokens| usize::try_from(tokens).unwrap_or(usize::MAX),
-                    ),
-                })
-            })
-            .collect::<Vec<_>>();
-        admission_candidates.extend(projected.iter().enumerate().filter_map(
-            |(item_index, item)| {
-                let ResponseItem::ToolSearchOutput {
-                    call_id: Some(call_id),
-                    status,
-                    tools,
-                    ..
-                } = item
-                else {
-                    return None;
-                };
-                let serialized = serde_json::to_string(item).ok()?;
-                Some(AdmissionCandidate {
-                    priority: self.reuse_priority(call_id, tool_search_admission_priority(status, tools)),
-                    item_index: std::cmp::Reverse(item_index),
-                    call_id: call_id.clone(),
-                    structured_tokens: Some(approx_token_count(&serialized)),
-                    non_text_tokens: 0,
-                })
-            },
-        ));
-        admission_candidates.sort_unstable_by(|left, right| {
-            (&left.priority, &left.item_index, &left.call_id).cmp(&(
-                &right.priority,
-                &right.item_index,
-                &right.call_id,
-            ))
-        });
-
-        // Seeing a result once does not make its source or contract details
-        // dispensable to later generations. Compact consumed results only
-        // when the existing aggregate tool-result budget is under pressure.
-        let raw_results_fit = admission_candidates
-            .iter()
-            .filter_map(|candidate| {
-                candidate.structured_tokens.or_else(|| {
-                    let tracked = self.candidates.get(&candidate.call_id)?;
-                    Some(
-                        usize::try_from(tracked.derived.bounded_model_output_tokens)
-                            .unwrap_or(usize::MAX)
-                            .saturating_add(candidate.non_text_tokens),
-                    )
-                })
-            })
-            .fold(0usize, usize::saturating_add)
-            <= self.tool_result_token_budget();
-        let newest_unconsumed_non_text_item = admission_candidates
-            .iter()
-            .filter(|admission| {
-                self.candidates
-                    .get(&admission.call_id)
-                    .is_some_and(|candidate| {
-                        admission.non_text_tokens > 0 && candidate.consumed_by_generation.is_none()
-                    })
-            })
-            .map(|admission| admission.item_index.0)
-            .max();
-
-        // Both projections can reuse the same immutable recovery handle. Render
-        // it once under pressure; when all raw results fit, no pin is needed.
-        let artifact_pins = if raw_results_fit && retired.is_empty() {
-            BTreeMap::new()
-        } else {
-            admission_candidates
-                .iter()
-                .filter(|admission| admission.non_text_tokens == 0)
-                .filter_map(|admission| {
-                    let pin = self.candidates.get(&admission.call_id)?.artifact_pin()?;
-                    Some((admission.call_id.clone(), pin))
-                })
-                .collect::<BTreeMap<_, _>>()
-        };
-
-        #[derive(Debug)]
-        enum AdmissionRepresentation {
-            Raw,
-            Receipt { receipt_id: String, text: String },
-            ArtifactPin { text: String },
-            StructuredReceipt { item: ResponseItem },
-            Drop,
-        }
-        #[derive(Debug)]
-        struct AdmissionDecision {
-            representation: AdmissionRepresentation,
-            retain_raw_fallback: bool,
-        }
-
-        // Protect the cheapest recoverable form of later candidates before a
-        // higher-priority raw result spends the shared budget. This keeps Drop
-        // as the fallback for genuine aggregate pressure, not single-result
-        // monopolization.
-        let cheapest_receiptable_representation_tokens =
-            |admission_candidate: &AdmissionCandidate| -> usize {
-                if raw_results_fit {
-                    return 0;
-                }
-                let item_index = admission_candidate.item_index.0;
-                if let Some(raw_tokens) = admission_candidate.structured_tokens {
-                    return projected
-                        .get(item_index)
-                        .and_then(|item| {
-                            tool_search_receipt_item(
-                                item,
-                                tool_search_arguments.get(&admission_candidate.call_id),
-                            )
-                        })
-                        .map(|(_, receipt_tokens)| raw_tokens.min(receipt_tokens))
-                        .filter(|tokens| *tokens <= self.tool_result_token_budget())
-                        .unwrap_or(0);
-                }
-
-                let Some((_, output)) = projected
-                    .get(item_index)
-                    .and_then(canonical_textual_output_identity)
-                else {
-                    return 0;
-                };
-                let Some(candidate) = self.candidates.get(&admission_candidate.call_id) else {
-                    return 0;
-                };
-                let non_text_tokens = admission_candidate.non_text_tokens;
-                let raw_tokens = approx_token_count(&output).saturating_add(non_text_tokens);
-                let receipt_tokens = candidate
-                    .admission_receipt()
-                    .map(|(_, _, receipt_tokens)| {
-                        let receipt_tokens = usize::try_from(receipt_tokens)
-                            .unwrap_or(usize::MAX)
-                            .saturating_add(non_text_tokens);
-                        raw_tokens.min(receipt_tokens)
-                    })
-                    .filter(|tokens| *tokens <= self.tool_result_token_budget());
-                let pin_tokens = artifact_pins
-                    .get(&admission_candidate.call_id)
-                    .map(|(_, tokens)| *tokens)
-                    .filter(|tokens| *tokens <= self.tool_result_token_budget());
-                [Some(raw_tokens), receipt_tokens, pin_tokens]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                    .unwrap_or(0)
-            };
-        let reservations = admission_candidates
-            .iter()
-            .map(cheapest_receiptable_representation_tokens)
-            .collect::<Vec<_>>();
-        // The transport fallback cannot use projection receipts. Reserve its
-        // raw-or-pin costs separately so raw output cannot consume another
-        // result's recovery handle.
-        let fallback_reservations = admission_candidates
-            .iter()
-            .map(|admission| {
-                if raw_results_fit || admission.structured_tokens.is_some() {
-                    // Structured results have no exact artifact fallback. Retain
-                    // their raw forms by priority after protecting artifact handles.
-                    return 0;
-                }
-                let Some((_, output)) = projected
-                    .get(admission.item_index.0)
-                    .and_then(canonical_textual_output_identity)
-                else {
-                    return 0;
-                };
-                let raw_tokens =
-                    approx_token_count(&output).saturating_add(admission.non_text_tokens);
-                let pin_tokens = artifact_pins
-                    .get(&admission.call_id)
-                    .map(|(_, tokens)| *tokens);
-                pin_tokens.map_or(raw_tokens, |tokens| tokens.min(raw_tokens))
-            })
-            .collect::<Vec<_>>();
-        let mut reserved_fallback_tokens = fallback_reservations
-            .iter()
-            .copied()
-            .fold(0usize, usize::saturating_add);
-        let mut reserved_competing_tokens = reservations
-            .iter()
-            .copied()
-            .fold(0usize, usize::saturating_add);
-        let mut decisions = BTreeMap::<String, AdmissionDecision>::new();
-        let mut remaining_tokens = self.tool_result_token_budget();
-        let mut remaining_fallback_tokens = self.tool_result_token_budget();
-        // Reserve minimum representations only when all of them can fit. Otherwise
-        // low-priority candidates would starve the active failures sorted first.
-        if reserved_competing_tokens > remaining_tokens {
-            reserved_competing_tokens = 0;
-        }
-        if reserved_fallback_tokens > remaining_fallback_tokens {
-            reserved_fallback_tokens = 0;
-        }
-        for ((admission_candidate, reservation), fallback_reservation) in admission_candidates
-            .into_iter()
-            .zip(reservations)
-            .zip(fallback_reservations)
-        {
-            reserved_competing_tokens = reserved_competing_tokens.saturating_sub(reservation);
-            reserved_fallback_tokens =
-                reserved_fallback_tokens.saturating_sub(fallback_reservation);
-            let available_fallback_tokens =
-                remaining_fallback_tokens.saturating_sub(reserved_fallback_tokens);
-            let remaining_raw_tokens = remaining_tokens.saturating_sub(reserved_competing_tokens);
-            let item_index = admission_candidate.item_index.0;
-            let call_id = admission_candidate.call_id;
-            if let Some(raw_tokens) = admission_candidate.structured_tokens {
-                let (representation, retain_raw_fallback) = if raw_tokens <= remaining_raw_tokens {
-                    remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
-                    let retain_raw = raw_tokens <= available_fallback_tokens;
-                    if retain_raw {
-                        remaining_fallback_tokens =
-                            remaining_fallback_tokens.saturating_sub(raw_tokens);
-                    }
-                    (AdmissionRepresentation::Raw, retain_raw)
-                } else if let Some((item, receipt_tokens)) =
-                    projected.get(item_index).and_then(|item| {
-                        tool_search_receipt_item(item, tool_search_arguments.get(&call_id))
-                    })
-                    && receipt_tokens <= remaining_tokens
-                {
-                    remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
-                    let retain_raw = raw_tokens <= available_fallback_tokens;
-                    if retain_raw {
-                        remaining_fallback_tokens =
-                            remaining_fallback_tokens.saturating_sub(raw_tokens);
-                    }
-                    (
-                        AdmissionRepresentation::StructuredReceipt { item },
-                        retain_raw,
-                    )
-                } else {
-                    (AdmissionRepresentation::Drop, false)
-                };
-                decisions.insert(
-                    call_id,
-                    AdmissionDecision {
-                        representation,
-                        retain_raw_fallback,
-                    },
-                );
-                continue;
-            }
-            let Some((_, output)) = projected
-                .get(item_index)
-                .and_then(canonical_textual_output_identity)
-            else {
-                continue;
-            };
-            let Some(candidate) = self.candidates.get(&call_id) else {
-                continue;
-            };
-            let non_text_tokens = admission_candidate.non_text_tokens;
-            let raw_tokens = approx_token_count(&output).saturating_add(non_text_tokens);
-            let admission_receipt =
-                candidate
-                    .admission_receipt()
-                    .map(|(receipt_id, text, receipt_tokens)| {
-                        let tokens = usize::try_from(receipt_tokens)
-                            .unwrap_or(usize::MAX)
-                            .saturating_add(non_text_tokens);
-                        (receipt_id, text, tokens)
-                    });
-            let artifact_pin = artifact_pins.get(&call_id);
-
-            // A newly returned image cannot be represented by a text receipt.
-            // Preserve the newest such result through its first exposure, even
-            // when its encoded size alone exceeds the shared history budget.
-            let preserve_newest_non_text = Some(item_index) == newest_unconsumed_non_text_item;
-            let mut decision = if retired.contains(&call_id)
-                && (candidate.successful || self.failure_resolution(candidate, &resolutions).is_some())
-                && candidate.consumed_by_generation.is_some()
-                && let Some((text, tokens)) = artifact_pin
-                && *tokens <= remaining_tokens
-                && non_text_tokens == 0
-            {
-                remaining_tokens = remaining_tokens.saturating_sub(*tokens);
-                AdmissionDecision {
-                    representation: AdmissionRepresentation::ArtifactPin { text: text.clone() },
-                    retain_raw_fallback: false,
-                }
-            } else if raw_tokens <= remaining_raw_tokens || preserve_newest_non_text {
-                remaining_tokens = remaining_tokens.saturating_sub(raw_tokens);
-                AdmissionDecision {
-                    representation: AdmissionRepresentation::Raw,
-                    retain_raw_fallback: false,
-                }
-            } else if let Some((receipt_id, text, receipt_tokens)) = admission_receipt
-                && receipt_tokens <= remaining_tokens
-                // A richer receipt must not spend another result's recovery reserve
-                // when this result has a cheaper exact artifact handle.
-                && (receipt_tokens <= remaining_raw_tokens
-                    || artifact_pin
-                        .is_none_or(|(_, pin_tokens)| *pin_tokens >= receipt_tokens))
-            {
-                remaining_tokens = remaining_tokens.saturating_sub(receipt_tokens);
-                AdmissionDecision {
-                    representation: AdmissionRepresentation::Receipt {
-                        receipt_id: receipt_id.to_string(),
-                        text: text.to_string(),
-                    },
-                    retain_raw_fallback: false,
-                }
-            } else if let Some((text, pin_tokens)) = artifact_pin
-                && *pin_tokens <= remaining_tokens
-            {
-                // Recovery handles still consume context. Evict lower-priority pairs when
-                // even their handles no longer fit; canonical outputs remain in the rollout.
-                remaining_tokens = remaining_tokens.saturating_sub(*pin_tokens);
-                AdmissionDecision {
-                    representation: AdmissionRepresentation::ArtifactPin { text: text.clone() },
-                    retain_raw_fallback: false,
-                }
-            } else if !self.output_was_consumed(&call_id)
-                && let Some((text, _)) = artifact_pin
-            {
-                // Let the final budget owner compact/admit unread outcomes and
-                // report explicit overflow if even their receipts cannot fit.
-                AdmissionDecision {
-                    representation: AdmissionRepresentation::ArtifactPin { text: text.clone() },
-                    retain_raw_fallback: false,
-                }
-            } else {
-                AdmissionDecision {
-                    representation: AdmissionRepresentation::Drop,
-                    retain_raw_fallback: false,
-                }
-            };
-            if !matches!(decision.representation, AdmissionRepresentation::Drop) {
-                decision.retain_raw_fallback =
-                    raw_tokens <= available_fallback_tokens || non_text_tokens > 0;
-                let fallback_tokens = if decision.retain_raw_fallback {
-                    raw_tokens
-                } else {
-                    artifact_pin.map_or(raw_tokens, |(_, tokens)| *tokens)
-                };
-                remaining_fallback_tokens =
-                    remaining_fallback_tokens.saturating_sub(fallback_tokens);
-            }
-            decisions.insert(call_id, decision);
-        }
-
-        let unread_outputs = projected
-            .iter()
-            .filter_map(output_call_id)
-            .filter(|id| !self.output_was_consumed(id))
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>();
-        let mut unreplaced_projected = projected.clone();
-        unreplaced_projected.retain(|item| {
-            item_call_id(item).is_none_or(|call_id| {
-                decisions.get(call_id).is_none_or(|decision| {
-                    decision.retain_raw_fallback
-                        || (artifact_pins.contains_key(call_id)
-                            && matches!(
-                                &decision.representation,
-                                AdmissionRepresentation::Raw
-                                    | AdmissionRepresentation::Receipt { .. }
-                                    | AdmissionRepresentation::ArtifactPin { .. }
-                            ))
-                })
-            })
-        });
-        projected.retain(|item| {
-            item_call_id(item).is_none_or(|call_id| {
-                decisions.get(call_id).is_none_or(|decision| {
-                    !matches!(&decision.representation, AdmissionRepresentation::Drop)
-                })
-            })
-        });
-
-        if decisions.values().any(|decision| {
-            matches!(
-                &decision.representation,
-                AdmissionRepresentation::StructuredReceipt { .. }
-            )
-        }) {
-            for item in projected.make_owned().iter_mut() {
-                let call_id = match item {
-                    ResponseItem::ToolSearchCall {
-                        call_id: Some(call_id),
-                        ..
-                    }
-                    | ResponseItem::ToolSearchOutput {
-                        call_id: Some(call_id),
-                        ..
-                    } => call_id,
-                    _ => continue,
-                };
-                let Some(AdmissionDecision {
-                    representation:
-                        AdmissionRepresentation::StructuredReceipt { item: receipt_item },
-                    ..
-                }) = decisions.get(call_id)
-                else {
-                    continue;
-                };
-                match item {
-                    ResponseItem::ToolSearchOutput { .. } => *item = receipt_item.clone(),
-                    ResponseItem::ToolSearchCall { arguments, .. } => {
-                        let ResponseItem::ToolSearchOutput { tools, .. } = receipt_item else {
-                            continue;
-                        };
-                        let Some(receipt_arguments) = tools
-                            .first()
-                            .and_then(|value| value.get("receipt"))
-                            .and_then(|value| value.get("arguments"))
-                        else {
-                            continue;
-                        };
-                        *arguments = receipt_arguments.clone();
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut substitutions = Vec::new();
-        if decisions.values().any(|decision| {
-            matches!(
-                &decision.representation,
-                AdmissionRepresentation::Receipt { .. }
-                    | AdmissionRepresentation::ArtifactPin { .. }
-            )
-        }) {
-            for (item_index, item) in projected.make_owned().iter_mut().enumerate() {
-                let Some((call_id, body)) = textual_output_body_mut(item) else {
-                    continue;
-                };
-                let Some(_output) = canonical_model_visible_output_text(body) else {
-                    continue;
-                };
-                let Some(candidate) = self.candidates.get(call_id) else {
-                    continue;
-                };
-                let bounded_output_sha256 = candidate.derived.bounded_model_output_sha256.clone();
-                if exposed_output_sha256.get(call_id) != Some(&bounded_output_sha256) {
-                    continue;
-                }
-                let Some(decision) = decisions.get(call_id) else {
-                    continue;
-                };
-                let (text, receipt_id) = match &decision.representation {
-                    AdmissionRepresentation::Receipt { receipt_id, text } => {
-                        (text, Some(receipt_id))
-                    }
-                    AdmissionRepresentation::ArtifactPin { text } => (text, None),
-                    _ => continue,
-                };
-                let substituted_output_sha256 = sha256(text.as_bytes());
-                replace_model_visible_output_text(body, text.clone());
-                if let Some(receipt_id) = receipt_id {
-                    substitutions.push(ToolHistorySubstitution {
-                        item_index,
-                        call_id: call_id.to_string(),
-                        bounded_output_sha256,
-                        receipt_id: receipt_id.clone(),
-                        substituted_output_sha256,
-                    });
-                }
-            }
-        }
-        if decisions.values().any(|decision| {
-            !decision.retain_raw_fallback
-                && matches!(
-                    &decision.representation,
-                    AdmissionRepresentation::Raw
-                        | AdmissionRepresentation::Receipt { .. }
-                        | AdmissionRepresentation::ArtifactPin { .. }
-                )
-        }) {
-            for item in unreplaced_projected.make_owned().iter_mut() {
-                let Some((call_id, body)) = textual_output_body_mut(item) else {
-                    continue;
-                };
-                let Some(candidate) = self.candidates.get(call_id) else {
-                    continue;
-                };
-                if exposed_output_sha256.get(call_id)
-                    != Some(&candidate.derived.bounded_model_output_sha256)
-                {
-                    continue;
-                }
-                let Some(decision) = decisions.get(call_id) else {
-                    continue;
-                };
-                if decision.retain_raw_fallback
-                    || !matches!(
-                        &decision.representation,
-                        AdmissionRepresentation::Raw
-                            | AdmissionRepresentation::Receipt { .. }
-                            | AdmissionRepresentation::ArtifactPin { .. }
-                    )
-                {
-                    continue;
-                }
-                let Some((text, _)) = artifact_pins.get(call_id) else {
-                    continue;
-                };
-                replace_model_visible_output_text(body, text.clone());
-            }
-        }
-        // Admission can remove a pair before aggregate enforcement sees it.
-        // Those unread omissions need the same explicit notice in both forms.
-        for items in [&mut projected, &mut unreplaced_projected] {
-            let retained = items
-                .iter()
-                .filter_map(output_call_id)
-                .collect::<BTreeSet<_>>();
-            let unread_drops = unread_outputs
-                .iter()
-                .map(String::as_str)
-                .filter(|id| !retained.contains(id))
-                .collect::<Vec<_>>();
-            self.append_unread_overflow_notice(items, &unread_drops);
-        }
-        let items_budget_drops = self.enforce_tool_result_budget(&mut projected);
-        let unreplaced_items_budget_drops =
-            self.enforce_tool_result_budget(&mut unreplaced_projected);
-        let retained_indices = projected
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| output_call_id(item).map(|call_id| (call_id, index)))
-            .collect::<BTreeMap<_, _>>();
-        substitutions.retain_mut(|substitution| {
-            if let Some(index) = retained_indices.get(substitution.call_id.as_str()) {
-                substitution.item_index = *index;
-                canonical_textual_output_identity(&projected[*index]).is_some_and(|(_, output)| {
-                    sha256(output.as_bytes()) == substitution.substituted_output_sha256
-                })
-            } else {
-                false
-            }
-        });
-        ToolHistoryProjection {
-            items: projected.into_shared(),
-            unreplaced_items: unreplaced_projected.into_shared(),
-            substitutions: Arc::from(substitutions),
-            items_budget_drops,
-            unreplaced_items_budget_drops,
-        }
-    }
-
-    /// Omitted pairs are removed whole, so name them; a count alone leaves
-    /// recovery guessing which outcomes are missing.
-    fn append_unread_overflow_notice(
-        &self,
-        items: &mut ProjectedResponseItems,
-        unread_drops: &[&str],
-    ) {
-        if unread_drops.is_empty() {
-            return;
-        }
-        // Each notice is bounded, but never silently discard the identities
-        // after the first page. These are lifecycle/recovery controls rather
-        // than spillable tool prose and are excluded from the prose budget.
-        for (page, unread_page) in unread_drops
-            .chunks(UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS)
-            .enumerate()
-        {
-            let omitted = unread_page
-                .iter()
-                .map(|call_id| {
-                    let mut entry = serde_json::json!({ "call_id": call_id });
-                    if let Some(candidate) = self.candidates.get(*call_id)
-                        && candidate.complete
-                        && candidate.projection_eligible
-                    {
-                        entry["artifact_id"] = candidate.artifact_id.clone().into();
-                    }
-                    entry
-                })
-                .collect::<Vec<_>>();
-            let count = unread_drops.len();
-            let offset = page * UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS;
-            let page = page + 1;
-            let pages = count.div_ceil(UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS);
-            let omitted = serde_json::Value::from(omitted);
-            items.make_owned().push(ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![codex_protocol::models::ContentItem::InputText { text: format!(
-                    "Tool result budget overflow: {count} unread outcomes are unresolved. Manifest page {page}/{pages}, offset {offset}: {omitted}. Recover each artifact_id with read_tool_output; an entry without artifact_id has no complete retained artifact. Do not infer success or repeat state-changing operations because their results are absent."
-                ) }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            });
-        }
-    }
-
-    fn reuse_priority(&self, call_id: &str, safety_priority: u8) -> u8 {
-        // Reuse breaks ties only. It must never displace failures, live controls,
-        // or newly returned evidence from their existing admission class.
-        // Prefer only the recovered detail, never its potentially huge source
-        // or enclosing mixed-purpose batch. Once retired/compacted, that hint
-        // must not pull the old detail back into the working set.
-        let recovered = self.recovered_call_ids.contains(call_id)
-            && !self.recovered_ranges.contains_key(call_id)
-            && !self.artifact_call_ids.values().any(|origin| origin == call_id)
-            && !matches!(self.exposed_representations.get(call_id),
-                Some(ExposedRepresentation::Compact { .. } | ExposedRepresentation::Omitted))
-            && self.candidates.get(call_id).and_then(|candidate| candidate.consumed_by_generation.as_ref())
-                .or_else(|| self.untracked_consumption.get(call_id)).is_none_or(|generation|
-                self.consumption_turns.last() == Some(&generation.turn_id));
-        safety_priority * 2 + u8::from(!recovered)
-    }
-
-    /// Apply the same ceiling to replayed receipts and to the transport's raw fallback.
-    /// Admission alone cannot bound those forms: their hashes may differ from the original
-    /// output, and many individually small recovery pins can exceed the aggregate budget.
-    fn enforce_tool_result_budget(
-        &self,
-        items: &mut ProjectedResponseItems,
-    ) -> ToolOutputBudgetDrops {
-        let mut candidates = Vec::new();
-        let mut newest_unconsumed_image = None;
-        for (index, item) in items.iter().enumerate() {
-            if let Some((call_id, output)) = canonical_textual_output_identity(item) {
-                let candidate = self.candidates.get(call_id);
-                let non_text_tokens = non_text_output_token_cost(item);
-                if non_text_tokens > 0 && !self.output_was_consumed(call_id) {
-                    newest_unconsumed_image = Some(call_id.to_string());
-                }
-                // Dispatch failures and running-process receipts can lack a saved artifact.
-                // They still occupy the model prompt and must share its output budget.
-                // Already-observed detail must not evict a newly returned
-                // outcome or continuation handle before its first exposure.
-                let priority = candidate.map_or_else(
-                    || {
-                        if response_item_output_success(item) == Some(false) {
-                            0
-                        } else {
-                            2
-                        }
-                    },
-                    |candidate| admission_priority(candidate, &output),
-                ) + if self.output_was_consumed(call_id) {
-                    3
-                } else {
-                    0
-                };
-                candidates.push((
-                    self.reuse_priority(call_id, priority),
-                    std::cmp::Reverse(index),
-                    call_id.to_string(),
-                    approx_token_count(&output).saturating_add(non_text_tokens),
-                ));
-            } else if let ResponseItem::ToolSearchOutput {
-                call_id: Some(call_id),
-                status,
-                tools,
-                ..
-            } = item
-                && let Ok(serialized) = serde_json::to_string(item)
-            {
-                candidates.push((
-                    self.reuse_priority(call_id, tool_search_admission_priority(status, tools)),
-                    std::cmp::Reverse(index),
-                    call_id.clone(),
-                    approx_token_count(&serialized),
-                ));
-            }
-        }
-        if candidates
-            .iter()
-            .map(|(_, _, _, cost)| *cost)
-            .fold(0usize, usize::saturating_add)
-            <= self.tool_result_token_budget()
-        {
-            return ToolOutputBudgetDrops::default();
-        }
-        candidates.sort();
-        // This final pass also sees untracked outputs and replayed receipts,
-        // which the earlier admission pass cannot reserve. Protect their
-        // cheapest representations before spending the budget on raw detail.
-        let receipts = candidates
-            .iter()
-            .map(|(_, index, call_id, cost)| {
-                self.tool_result_budget_receipt(&items[index.0], call_id)
-                    .filter(|(_, receipt_cost)| receipt_cost < cost)
-            })
-            .collect::<Vec<_>>();
-        let minimum_costs = candidates
-            .iter()
-            .zip(&receipts)
-            .map(|((_, _, _, cost), receipt)| receipt.as_ref().map_or(*cost, |(_, cost)| *cost))
-            .collect::<Vec<_>>();
-        let minimum_total = minimum_costs
-            .iter()
-            .copied()
-            .fold(0usize, usize::saturating_add);
-        // If even the compact forms cannot coexist, retain the existing
-        // priority-based eviction policy rather than starving newest outcomes.
-        let mut reserved =
-            (minimum_total <= self.tool_result_token_budget()).then_some(minimum_total);
-        let mut remaining = self.tool_result_token_budget();
-        let mut dropped = BTreeSet::new();
-        let mut dropped_tokens = 0_u64;
-        for (((_, index, call_id, mut cost), receipt), minimum_cost) in
-            candidates.into_iter().zip(receipts).zip(minimum_costs)
-        {
-            if let Some(reserved) = reserved.as_mut() {
-                *reserved = reserved.saturating_sub(minimum_cost);
-            }
-            let available = remaining.saturating_sub(reserved.unwrap_or(0));
-            let has_controls = canonical_textual_output_identity(&items[index.0])
-                .and_then(|(_, output)| tool_output_controls(&output))
-                .is_some_and(|controls| tool_controls_need_continuation(&controls));
-            if cost > available && newest_unconsumed_image.as_ref() != Some(&call_id)
-                && let Some((receipt, receipt_cost)) = receipt
-                && (receipt_cost <= available || has_controls)
-                && let Some((_, body)) =
-                    textual_output_body_mut(&mut items.make_owned()[index.0])
-            {
-                replace_model_visible_output_text(body, receipt);
-                cost = receipt_cost;
-            }
-            if cost <= remaining || has_controls || newest_unconsumed_image.as_ref() == Some(&call_id) {
-                remaining = remaining.saturating_sub(cost);
-            } else {
-                dropped_tokens = dropped_tokens.saturating_add(cost as u64);
-                dropped.insert(call_id);
-            }
-        }
-        // Remove complete pairs so transport normalization cannot restore orphaned calls.
-        items.retain(|item| item_call_id(item).is_none_or(|id| !dropped.contains(id)));
-        let unread_drops = dropped
-            .iter()
-            .map(String::as_str)
-            .filter(|id| !self.output_was_consumed(id))
-            .collect::<Vec<_>>();
-        self.append_unread_overflow_notice(items, &unread_drops);
-        ToolOutputBudgetDrops {
-            count: u32::try_from(dropped.len()).unwrap_or(u32::MAX),
-            tokens: dropped_tokens,
-        }
-    }
-
-    fn tool_result_budget_receipt(
-        &self,
-        item: &ResponseItem,
-        call_id: &str,
-    ) -> Option<(String, usize)> {
-        if non_text_output_token_cost(item) != 0 {
-            return None;
-        }
-        let candidate = self.candidates.get(call_id);
-        let controls = canonical_textual_output_identity(item)
-            .and_then(|(_, output)| tool_output_controls(&output));
-        let (receipt, receipt_cost) = candidate
-            .and_then(ToolHistoryCandidate::artifact_pin)
-            .or_else(|| {
-                if controls.is_none() && candidate.is_some_and(|candidate| candidate.consumed_by_generation.is_some()) {
-                    return None;
-                }
-                let (_, output) = canonical_textual_output_identity(item)?;
-                let recovery = serde_json::from_str::<serde_json::Value>(&output).ok()
-                    .filter(|value| value["artifact_id"].is_string() && value["results"].is_array())
-                    .map(|value| serde_json::json!({
-                        "artifact_id": value["artifact_id"],
-                        "canonical_sha256": value["canonical_sha256"],
-                        "selectors": value["results"].as_array().into_iter().flatten()
-                            .filter_map(|result| result.get("selector").cloned()).collect::<Vec<_>>(),
-                    }));
-                let mut receipt = serde_json::json!({
-                    "kind": if self.output_was_consumed(call_id) {
-                        "observed_tool_outcome"
-                    } else {
-                        "unconsumed_tool_outcome"
-                    },
-                    "call_id": call_id,
-                    "successful": response_item_output_success(item),
-                    "digest": truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS),
-                    "output_omitted": true
-                });
-                if let Some(recovery) = recovery {
-                    receipt["recovery"] = recovery;
-                }
-                let receipt = receipt.to_string();
-                let cost = approx_token_count(&receipt);
-                Some((receipt, cost))
-            })?;
-        // Controls are an executable contract, not diagnostic prose. This also
-        // protects candidate-backed pins, not only the untracked fallback.
-        let (receipt, receipt_cost) = if let Some(controls) = controls {
-            let mut value = serde_json::from_str::<serde_json::Value>(&receipt).ok()?;
-            value["control"] = controls;
-            let receipt = value.to_string();
-            let cost = approx_token_count(&receipt);
-            (receipt, cost)
-        } else { (receipt, receipt_cost) };
-        let notice = canonical_textual_output_identity(item)
-            .and_then(|(_, text)| serde_json::from_str::<serde_json::Value>(&text).ok());
-        if let Some(notice) = notice.filter(|notice| notice["stale_workspace_evidence"] == true)
-            && let Ok(mut compact) = serde_json::from_str::<serde_json::Value>(&receipt)
-        {
-            // Budgeting runs after freshness projection. A historical artifact
-            // pin must not erase that warning, including its token cost.
-            for key in [
-                "qualification",
-                "historical_authenticity",
-                "stale_workspace_evidence",
-                "workspace_evidence_freshness",
-                "valid_for_current_workspace",
-                "reason_code",
-                "rerun",
-            ] {
-                if let Some(value) = notice.get(key) {
-                    compact[key] = value.clone();
-                }
-            }
-            let receipt = compact.to_string();
-            let cost = approx_token_count(&receipt);
-            Some((receipt, cost))
-        } else {
-            Some((receipt, receipt_cost))
-        }
-    }
-
     fn invalidate_stale_workspace_evidence(
         &self,
         items: &mut ProjectedResponseItems,
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: Option<&GitWorkspaceCache>,
-        include_historical_payloads: bool,
     ) {
-        // Sampling keeps the original tool messages and only appends notices.
-        // Do not copy, tokenize, serialize and reparse payloads that its consumer
-        // immediately removes. Replacement projections still need those bytes.
+        // The caller keeps the original tool messages and only appends notices,
+        // so a notice never copies the payload it qualifies.
         let requirements = self.workspace_evidence_requirements(items);
         let calls = items.iter().filter_map(|item| match item {
             ResponseItem::FunctionCall { name, arguments, call_id, .. }
@@ -3388,7 +2222,6 @@ impl ToolHistoryState {
                         origin_call: calls.get(origin_call_id).cloned(),
                         recovery: calls.get(call_id).is_some_and(|(name, _)| name == "read_tool_output"),
                         output_sha256: sha256(output.as_bytes()),
-                        include_historical_payloads,
                     };
                     if let Some(entry) = cache.get_mut(call_id).filter(|entry| entry.key == key) {
                         #[cfg(test)]
@@ -3490,9 +2323,6 @@ impl ToolHistoryState {
                                 "call_id": result.observation.call_id,
                                 "workspace_evidence_freshness": "current",
                             });
-                            if include_historical_payloads {
-                                row["output"] = serde_json::json!(result.output);
-                            }
                             if index < 8 {
                                 let scope = result.observation.dependency_notice(&result.output, workspace_identity, git_workspace);
                                 current_scope_bytes += scope.to_string().len();
@@ -3528,9 +2358,6 @@ impl ToolHistoryState {
                     "observed_revision": observation.and_then(|observation| observation.revision.as_ref()),
                     "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                 });
-                if include_historical_payloads {
-                    notice["current_revision"] = serde_json::json!(workspace_identity);
-                }
                 // Preserve useful history only when its captured bytes are
                 // verified. A missing observation or output mismatch cannot
                 // authenticate even a historical summary.
@@ -3558,17 +2385,9 @@ impl ToolHistoryState {
                         notice["stale_nested_results"] = scopes.into();
                     }
                 }
-                if include_historical_payloads && origin_call_id == call_id && observation.is_some() && output_matches {
-                    notice["historical_digest"] = serde_json::json!(
-                        truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS)
-                    );
-                }
                 if response_item_output_success(item) == Some(false)
                     || observation.is_some_and(|observation| !observation.successful)
                 {
-                    if include_historical_payloads {
-                        notice["historical_output"] = serde_json::json!(output);
-                    }
                     notice["failure_applicability"] = serde_json::json!(
                         "The captured failure is preserved exactly; its current applicability is unverified. This does not establish that the failure was resolved or remains a current blocker."
                     );
@@ -3593,9 +2412,6 @@ impl ToolHistoryState {
                     // this bounded excerpt. Freshness controls current proof, not access
                     // to historical bytes requested explicitly by the model.
                     notice["historical_authenticity"] = serde_json::json!("authenticated");
-                    if include_historical_payloads {
-                        notice["historical_output"] = serde_json::json!(output);
-                    }
                 }
                 if let Some((name, arguments)) = items.iter().find_map(|item| match item {
                     ResponseItem::FunctionCall {
@@ -3620,16 +2436,6 @@ impl ToolHistoryState {
                 }
                 if !current_nested_results.is_empty() {
                     notice["current_nested_results"] = current_nested_results.into();
-                }
-                // Invalidating source evidence must not erase process controls
-                // or artifact recovery. These are historical command receipts,
-                // not claims that the old workspace evidence is still current.
-                if include_historical_payloads
-                    && let Some((_, receipt)) = output
-                    .rsplit_once("Nested command states (independent of script completion):\n")
-                    && let Ok(states) = serde_json::from_str::<Vec<serde_json::Value>>(receipt)
-                {
-                    notice["nested_commands"] = states.into();
                 }
                 Some(notice)
             };
@@ -4031,52 +2837,6 @@ impl ToolHistoryState {
         });
         self.recovered_ranges.retain(|call_id, _| retrievable_calls.contains(call_id));
     }
-}
-
-fn tool_controls_need_continuation(controls: &serde_json::Value) -> bool {
-    let live = |state: &serde_json::Value| {
-        state["process_exited"] == false || state["execution_state"] == "running"
-            || state["session_id"].as_u64().is_some()
-            || state["pending_deferred_completions"].as_array().is_some_and(|pending| !pending.is_empty())
-    };
-    live(&controls["command"])
-        || controls["nested_commands"].as_array().is_some_and(|states| states.iter().any(live))
-        || controls["legacy"].as_array().is_some_and(|lines| lines.iter().any(|line|
-            line.as_str().is_some_and(|line| line.contains("running") || line.contains("pending_deferred_completions"))))
-}
-
-fn tool_output_controls(output: &str) -> Option<serde_json::Value> {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
-        if let Some(control) = value.get("control") {
-            return Some(control.clone());
-        }
-        let mut controls = serde_json::Map::new();
-        if let Some(command) = crate::tools::code_mode::command_result_state(&value) {
-            controls.insert("command".into(), command);
-        }
-        for pointer in ["/nested_commands", "/essential/nested_commands", "/result/essential/nested_commands"] {
-            if let Some(states) = value.pointer(pointer) {
-                controls.insert("nested_commands".into(), states.clone());
-            }
-        }
-        if !controls.is_empty() { return Some(controls.into()); }
-    }
-    let mut controls = serde_json::Map::new();
-    let prose = if let Some((prefix, states)) = output.rsplit_once("Nested command states (independent of script completion):\n")
-        && let Ok(states) = serde_json::from_str::<serde_json::Value>(states.trim())
-    {
-        controls.insert("nested_commands".into(), states);
-        prefix
-    } else { output };
-    // Legacy text has no typed envelope. Keep entire control lines; never cut
-    // a capability or continuation embedded in a long single-line record.
-    let lines = prose.lines().filter(|line| {
-        line.contains("session ID") || line.contains("Session ID")
-            || line.contains("session_id") || line.contains("Exit code")
-            || line.contains("cell ID") || line.contains("pending_deferred_completions")
-    }).collect::<Vec<_>>();
-    if !lines.is_empty() { controls.insert("legacy".into(), serde_json::json!(lines)); }
-    (!controls.is_empty()).then(|| controls.into())
 }
 
 fn read_tool_output_artifact_id(arguments: &str) -> Option<String> {
@@ -4707,9 +3467,6 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         internal_artifact_origins,
         artifact_directory_members: state.artifact_directory_members,
         artifact_call_ids: BTreeMap::new(),
-        model_visible_tool_result_token_budget: state.model_visible_tool_result_token_budget,
-        // The fork has not sent a request with these reminted representations.
-        last_visible_tool_output_tokens: None,
         workspace_projection_cache: Arc::default(),
     };
     reminted_state.rebuild_artifact_index();
@@ -5522,162 +4279,6 @@ fn receipt_id_for(
     )
 }
 
-fn admission_priority(candidate: &ToolHistoryCandidate, output: &str) -> u8 {
-    if !candidate.successful && candidate.consumed_by_generation.is_some()
-        && candidate.complete && candidate.projection_eligible
-    {
-        // Historical diagnostics remain recoverable; a corrected invocation
-        // need not be an exact retry to make room for current evidence.
-        2
-    } else if !candidate.successful {
-        0
-    } else if candidate.semantic_class.contains("validation") || matches!(
-        candidate.semantic_class.as_str(),
-        "tool_failure" | "tool_timeout"
-    ) || output.contains("\"outcome\":\"failure\"")
-        || output.contains("\"outcome\":\"timeout\"")
-        || output.contains("\"outcome\":\"timed_out\"")
-    {
-        1
-    } else {
-        2
-    }
-}
-
-fn tool_search_admission_priority(status: &str, tools: &[serde_json::Value]) -> u8 {
-    if status != "completed" || tools.is_empty() {
-        1
-    } else {
-        2
-    }
-}
-
-pub(crate) fn tool_search_receipt_item(
-    item: &ResponseItem,
-    arguments: Option<&serde_json::Value>,
-) -> Option<(ResponseItem, usize)> {
-    let ResponseItem::ToolSearchOutput {
-        call_id: Some(call_id),
-        status,
-        execution,
-        tools,
-        omitted_result_count,
-        id,
-        internal_chat_message_metadata_passthrough,
-    } = item
-    else {
-        return None;
-    };
-    // A receipt describes the original result set, not a new one-element search.
-    // Share authentication with remote compaction and preserve its exact semantics.
-    if tools.len() == 1 && tools[0]["type"] == "tool_search_receipt" {
-        let receipt: ToolSearchReceiptV1 = serde_json::from_value(tools[0]["receipt"].clone()).ok()?;
-        if !receipt.is_valid(call_id, status, execution)
-            || receipt.omitted_result_count != *omitted_result_count
-        {
-            return None;
-        }
-        let tokens = approx_token_count(&serde_json::to_string(item).ok()?);
-        return (tokens <= TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS).then(|| (item.clone(), tokens));
-    }
-    let serialized_tools = serde_json::to_vec(tools).ok()?;
-    let result_set_sha256 = sha256(&serialized_tools);
-    let mut ordered_tool_identities = tools
-        .iter()
-        .filter_map(tool_search_result_identity)
-        .collect::<Vec<_>>();
-    let total_identity_count = ordered_tool_identities.len();
-    ordered_tool_identities.truncate(RECEIPT_MAX_TOKENS);
-    let mut arguments = compact_tool_search_arguments(arguments);
-
-    let mut receipt_item = ResponseItem::ToolSearchOutput {
-        id: id.clone(),
-        call_id: Some(call_id.clone()),
-        status: status.clone(),
-        execution: execution.clone(),
-        tools: Vec::new(),
-        omitted_result_count: *omitted_result_count,
-        internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
-            .clone(),
-    };
-    // Search for the largest fitting prefix instead of serializing every prefix.
-    let mut lower = 0;
-    let mut upper = ordered_tool_identities.len();
-    let mut retained = upper;
-    let mut best = None;
-    loop {
-        let complete = status == "completed" && omitted_result_count.unwrap_or(0) == 0;
-        let omitted_identity_count = total_identity_count.saturating_sub(retained);
-        let receipt = ToolSearchReceiptV1 {
-            version: TOOL_SEARCH_RECEIPT_VERSION,
-            receipt_id: tool_search_receipt_id(
-                call_id,
-                status,
-                execution,
-                &arguments,
-                &result_set_sha256,
-                tools.len(),
-                *omitted_result_count,
-                complete,
-                omitted_identity_count,
-                &ordered_tool_identities[..retained],
-            ),
-            call_id: call_id.clone(),
-            status: status.clone(),
-            execution: execution.clone(),
-            arguments: arguments.clone(),
-            result_set_sha256: result_set_sha256.clone(),
-            result_count: tools.len(),
-            omitted_result_count: *omitted_result_count,
-            complete,
-            omitted_identity_count,
-            ordered_tool_identities: ordered_tool_identities[..retained].to_vec(),
-        };
-        let receipt_tokens = approx_token_count(&serde_json::to_string(&receipt).ok()?);
-        let receipt_value = serde_json::json!({
-            "type": "tool_search_receipt",
-            "receipt": receipt,
-        });
-        let ResponseItem::ToolSearchOutput { tools, .. } = &mut receipt_item else {
-            return None;
-        };
-        *tools = vec![receipt_value];
-        let serialized = serde_json::to_string(&receipt_item).ok()?;
-        let tokens = approx_token_count(&serialized);
-        if receipt_tokens <= RECEIPT_MAX_TOKENS && tokens <= TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS
-        {
-            if retained == upper {
-                return Some((receipt_item, tokens));
-            }
-            best = Some((receipt_item.clone(), tokens));
-            lower = retained + 1;
-        } else if retained > 0 {
-            upper = retained - 1;
-        } else {
-            // Even an empty prefix does not fit; only argument previews can shrink.
-            upper = 0;
-        }
-        if lower > upper {
-            return best;
-        }
-        if retained > 0 || best.is_some() {
-            retained = lower + (upper - lower) / 2;
-            continue;
-        }
-        // Per-field preview limits do not bound their combined receipt. Drop
-        // the largest remaining preview while retaining its exact input hash.
-        let compact = arguments.as_object_mut()?;
-        let (key, serialized) = ["query", "namespace", "limit", "cursor"]
-            .into_iter()
-            .filter_map(|key| compact.get(key).map(|value| (key, value.to_string())))
-            .max_by_key(|(_, serialized)| serialized.len())?;
-        compact.remove(key)?;
-        compact
-            .entry(format!("{key}_sha256"))
-            .or_insert_with(|| serde_json::Value::String(sha256(serialized.as_bytes())));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 #[expect(
     clippy::expect_used,
@@ -5705,75 +4306,6 @@ pub(crate) fn tool_search_receipt_id(
         "tsr2-{}",
         &sha256(&semantic_identity)[..16]
     )
-}
-
-fn compact_tool_search_arguments(arguments: Option<&serde_json::Value>) -> serde_json::Value {
-    let Some(arguments) = arguments else {
-        return serde_json::Value::Null;
-    };
-    let mut compact = serde_json::Map::new();
-    for key in ["query", "namespace", "limit", "cursor"] {
-        let Some(value) = arguments.get(key) else {
-            continue;
-        };
-        let serialized = value.to_string();
-        if approx_token_count(&serialized) > RECEIPT_DIGEST_TARGET_TOKENS {
-            let bounded = value.as_str().map(|text| {
-                serde_json::Value::String(truncate_text_to_token_ceiling(
-                    text,
-                    RECEIPT_DIGEST_TARGET_TOKENS,
-                ))
-            });
-            compact.insert(
-                key.to_string(),
-                bounded.unwrap_or_else(|| {
-                    serde_json::json!({
-                        "value_sha256": sha256(serialized.as_bytes())
-                    })
-                }),
-            );
-            compact.insert(
-                format!("{key}_sha256"),
-                serde_json::Value::String(sha256(serialized.as_bytes())),
-            );
-        } else {
-            compact.insert(key.to_string(), value.clone());
-        }
-    }
-    if compact.is_empty() {
-        serde_json::json!({"arguments_sha256": sha256(arguments.to_string().as_bytes())})
-    } else {
-        serde_json::Value::Object(compact)
-    }
-}
-
-fn tool_search_result_identity(tool: &serde_json::Value) -> Option<String> {
-    let name = tool
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            tool.pointer("/function/name")
-                .and_then(serde_json::Value::as_str)
-        })?;
-    let namespace = tool
-        .get("namespace")
-        .and_then(serde_json::Value::as_str)
-        .filter(|namespace| !namespace.is_empty());
-    Some(match namespace {
-        Some(namespace) => format!("{namespace}.{name}"),
-        None => name.to_string(),
-    })
-}
-
-#[cfg(test)]
-fn tool_search_receipt(item: &ResponseItem) -> Option<ToolSearchReceiptV1> {
-    let ResponseItem::ToolSearchOutput { tools, .. } = item else {
-        return None;
-    };
-    let value = tools.first()?;
-    (value.get("type")?.as_str()? == "tool_search_receipt")
-        .then(|| serde_json::from_value(value.get("receipt")?.clone()).ok())
-        .flatten()
 }
 
 pub(crate) fn item_call_id(item: &ResponseItem) -> Option<&str> {
@@ -6119,6 +4651,14 @@ fn cargo_test_dependencies(
     arguments: &serde_json::Value,
     cwd: &Path,
 ) -> BTreeSet<SourceDependencyV1> {
+    if arguments.get("cargo_args").and_then(serde_json::Value::as_array)
+        .is_some_and(|args| args.iter().filter_map(serde_json::Value::as_str)
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--config" || arg.starts_with("--config=")))
+    {
+        // CLI configuration may replace sources outside the discovered graph.
+        return BTreeSet::new();
+    }
     let package = arguments
         .get("package")
         .and_then(serde_json::Value::as_str)
@@ -6151,15 +4691,18 @@ fn cargo_test_dependencies(
         SourceDependencyV1::new(&workspace.path.join("Cargo.toml"), false),
         SourceDependencyV1::new(&workspace.path.join("Cargo.lock"), false),
     ]);
-    // Cargo and rustup discover configuration from the invocation directory's
-    // ancestors. Track absent files too, so creating one invalidates old proof.
+    // Cargo also loads configuration from its home, which need not be an
+    // ancestor of cwd. Relative CARGO_HOME values are relative to the invocation.
+    let cargo_home = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty())
+        .map(|path| cwd.join(path))
+        .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")));
+    let Some(config_dependencies) = cargo_configuration_dependencies(cwd, cargo_home.as_deref()) else {
+        return BTreeSet::new();
+    };
+    dependencies.extend(config_dependencies);
+    // Track absent rustup files too, so creating one invalidates old proof.
     for directory in cwd.ancestors() {
-        for input in [
-            ".cargo/config",
-            ".cargo/config.toml",
-            "rust-toolchain",
-            "rust-toolchain.toml",
-        ] {
+        for input in ["rust-toolchain", "rust-toolchain.toml"] {
             dependencies.insert(SourceDependencyV1::new(&directory.join(input), false));
         }
     }
@@ -6175,6 +4718,45 @@ fn cargo_test_dependencies(
         return BTreeSet::new();
     }
     dependencies
+}
+
+fn cargo_configuration_dependencies(
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+) -> Option<BTreeSet<SourceDependencyV1>> {
+    let cargo_home = cargo_home?;
+    let directories = cwd.ancestors().map(|directory| directory.join(".cargo"))
+        .chain([cargo_home.to_path_buf()]).collect::<BTreeSet<_>>();
+    let mut dependencies = BTreeSet::new();
+    for directory in directories {
+        for input in ["config", "config.toml"] {
+            let path = directory.join(input);
+            dependencies.insert(SourceDependencyV1::new(&path, false));
+            match std::fs::read_to_string(&path) {
+                Ok(source) => {
+                    let config = toml::from_str::<toml::Value>(&source).ok()?;
+                    if cargo_has_local_source_overrides(&config) { return None; }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+    }
+    Some(dependencies)
+}
+
+/// A declaration is not Cargo's resolved graph. Local replacements can add
+/// external inputs even when the selected package declares a registry source.
+fn cargo_has_local_source_overrides(value: &toml::Value) -> bool {
+    value.get("paths").is_some_and(|paths|
+        paths.as_array().is_none_or(|paths| !paths.is_empty()))
+        || value.get("patch").and_then(toml::Value::as_table).into_iter()
+            .flat_map(|sources| sources.values()).filter_map(toml::Value::as_table)
+            .flat_map(|dependencies| dependencies.values())
+            .any(|dependency| dependency.get("path").is_some())
+        || value.get("replace").and_then(toml::Value::as_table).into_iter()
+            .flat_map(|dependencies| dependencies.values())
+            .any(|dependency| dependency.get("path").is_some())
 }
 
 fn cargo_test_package_from_args(arguments: &serde_json::Value) -> Option<String> {
@@ -6315,7 +4897,7 @@ fn cargo_workspace_graph_with_manifest_cache(
     let root_parsed = root_manifest
         .as_ref()
         .and_then(|manifest| manifest.parsed.as_ref());
-    graph.complete = root_parsed.is_some();
+    graph.complete = root_parsed.is_some_and(|root| !cargo_has_local_source_overrides(root));
     if let Some(workspace) = root_parsed.and_then(|parsed| parsed.get("workspace")) {
         if let Some(members) = workspace.get("members").and_then(toml::Value::as_array) {
             for member in members {
@@ -6820,8 +5402,8 @@ fn cargo_argv_dependencies(args: &[String], cwd: &Path) -> BTreeSet<SourceDepend
     let end = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
     let args = &args[..end];
     // Do not assign the invocation cwd's graph to a relocated Cargo run.
-    if args.iter().any(|arg| matches!(arg.as_str(), "-C" | "--manifest-path" | "--workspace" | "--all" | "--exclude")
-        || arg.starts_with("-C") || arg.starts_with("--manifest-path=") || arg.starts_with("--exclude="))
+    if args.iter().any(|arg| matches!(arg.as_str(), "-C" | "--manifest-path" | "--workspace" | "--all" | "--exclude" | "--config")
+        || arg.starts_with("-C") || arg.starts_with("--manifest-path=") || arg.starts_with("--exclude=") || arg.starts_with("--config="))
     { return BTreeSet::new(); }
     let mut packages = BTreeSet::new();
     let mut index = 0;
@@ -6860,19 +5442,54 @@ fn runner_source_dependencies(
     if runner.receipt_runner.as_deref() != Some("rust_test_runner") { return None; }
     let (root, _) = runner.path_context.as_ref()?;
     let operation = args.iter().position(|arg| matches!(arg.as_str(), "run-target" | "run-gate"))?;
-    let name = args.get(operation + 1)?;
+    let single_target = args[operation] == "run-target";
+    let mut names = BTreeSet::new();
+    let mut selection = args[operation + 1..].iter();
+    let mut positional_only = false;
+    while let Some(argument) = selection.next() {
+        if !positional_only && argument == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !positional_only && argument.starts_with('-') {
+            let (option, inline) = argument.split_once('=').map_or((argument.as_str(), None),
+                |(option, value)| (option, Some(value)));
+            match option {
+                "--no-fail-fast" if inline.is_none() => continue,
+                "--all" if single_target && inline.is_none() => continue,
+                "--profile" | "--command-timeout-seconds" | "--target-dir" | "--success-output" => {
+                    let value = inline.or_else(|| selection.next().map(String::as_str))?;
+                    if value.is_empty() || value.starts_with('-') { return None; }
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        names.insert(argument.as_str());
+        // run-target owns one name; its remainder is passed to the test filter
+        // parser and must not be mistaken for another selection or operation.
+        if single_target { break; }
+    }
+    if names.is_empty() { return None; }
     let manifest = args[..operation].windows(2).find(|pair| pair[0] == "--manifest")
         .map(|pair| cwd.join(&pair[1]))
         .or_else(|| args[..operation].iter().find_map(|arg| arg.strip_prefix("--manifest=").map(|path| cwd.join(path))))
         .unwrap_or_else(|| root.join("codex-rs/.config/kd4-rust-tests.toml"));
     let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&manifest).ok()?).ok()?;
-    let targets = if args[operation] == "run-target" { vec![name.as_str()] } else {
-        parsed.get("gates")?.get(name)?.get("steps")?.as_array()?.iter()
-            .map(|step| step.get("target")?.as_str()).collect::<Option<Vec<_>>>()?
-    };
+    let mut targets = BTreeSet::new();
+    for name in names {
+        if single_target { targets.insert(name); }
+        else {
+            for step in parsed.get("gates")?.get(name)?.get("steps")?.as_array()? {
+                targets.insert(step.get("target")?.as_str()?);
+            }
+        }
+    }
+    let packages = targets.into_iter().map(|target|
+        parsed.get("targets")?.get(target)?.get("package")?.as_str())
+        .collect::<Option<BTreeSet<_>>>()?;
     let mut dependencies = BTreeSet::new();
-    for target in targets {
-        let package = parsed.get("targets")?.get(target)?.get("package")?.as_str()?;
+    for package in packages {
         let scope = cargo_test_dependencies(&serde_json::json!({"package": package}), &root.join("codex-rs"));
         if scope.is_empty() { return Some(BTreeSet::new()); }
         dependencies.extend(scope);
@@ -7328,4 +5945,4 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 #[path = "tool_history_tests.rs"]
-mod tests;
+pub(crate) mod tests;

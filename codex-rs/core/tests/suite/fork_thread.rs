@@ -159,9 +159,10 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
 
     let mut builder = test_codex();
     let test = builder.build(&server).await.expect("create conversation");
-    test.submit_turn("persist source history")
+    let completed = test.submit_turn_and_capture_completion("persist source history")
         .await
         .expect("complete source turn");
+    assert_eq!(completed.error, None);
     test.codex.ensure_rollout_materialized().await;
     test.codex
         .flush_rollout()
@@ -223,6 +224,18 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
         _ => None,
     }).expect("fork session metadata");
     assert!(tools.is_empty(), "invalid capability must be quarantined: {tools:?}");
+    let user_messages = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::UserMessage(message)) => Some(message.message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_messages,
+        vec!["persist source history"],
+        "quarantining a capability must not discard its thread's history"
+    );
 }
 
 #[test]

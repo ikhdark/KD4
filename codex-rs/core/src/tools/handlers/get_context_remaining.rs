@@ -54,39 +54,69 @@ mod tests {
 
     #[tokio::test]
     async fn direct_and_code_mode_results_obey_the_same_schema() {
-        let (session, turn) = crate::session::tests::make_session_and_context().await;
-        let payload = ToolPayload::Function {
-            arguments: "{}".into(),
-        };
-        let output = GetContextRemainingHandler
-            .handle(ToolInvocation {
-                session: Arc::new(session),
-                step_context: crate::session::step_context::StepContext::for_test(Arc::new(turn)),
-                cancellation_token: Default::default(),
-                tracker: Arc::new(tokio::sync::Mutex::new(
-                    crate::turn_diff_tracker::TurnDiffTracker::new(),
-                )),
-                call_id: "remaining".into(),
-                tool_name: ToolName::plain(GET_CONTEXT_REMAINING_TOOL_NAME),
-                source: crate::tools::router::ToolCallSource::Direct,
-                payload: payload.clone(),
-            })
-            .await
-            .unwrap();
-        let ResponseInputItem::FunctionCallOutput { output: direct, .. } =
-            output.to_response_item("remaining", &payload)
-        else {
-            panic!("expected function output");
-        };
-        let FunctionCallOutputBody::Text(text) = direct.body else {
-            panic!("expected structured JSON text, not rendered content fragments");
-        };
-        let direct: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(direct, output.code_mode_result(&payload));
-        let ToolSpec::Function(spec) = GetContextRemainingHandler.spec() else {
-            panic!("expected function spec");
-        };
-        let validator = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
-        assert!(validator.is_valid(&direct), "{direct}");
+        // Remaining means the smaller of the configured soft budget and physical
+        // context capacity, less usage, clamped at zero; absent limits yield null.
+        for (context_window, soft_limit, effective_percent, used, expected) in [
+            (Some(1_000), Some(800), 100, 100, Some(700)),
+            (Some(1_000), Some(800), 100, 900, Some(0)),
+            (Some(1_000), Some(800), 50, 100, Some(400)),
+            (None, None, 100, 100, None),
+        ] {
+            let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+            let config = Arc::make_mut(&mut turn.config);
+            config.model_auto_compact_token_limit_scope =
+                codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+            config.features.enable(codex_features::Feature::TokenBudget).unwrap();
+            turn.model_info.context_window = context_window;
+            turn.model_info.max_context_window = None;
+            turn.model_info.auto_compact_token_limit = soft_limit;
+            turn.model_info.effective_context_window_percent = effective_percent;
+            assert!(session.clone_history().await.raw_items().is_empty());
+            session.lock_history_state_for_test().await.set_token_info(Some(
+                codex_protocol::protocol::TokenUsageInfo {
+                    total_token_usage: Default::default(),
+                    last_token_usage: codex_protocol::protocol::TokenUsage {
+                        input_tokens: used,
+                        total_tokens: used,
+                        ..Default::default()
+                    },
+                    model_context_window: context_window,
+                },
+            ));
+            let payload = ToolPayload::Function {
+                arguments: "{}".into(),
+            };
+            let output = GetContextRemainingHandler
+                .handle(ToolInvocation {
+                    session: Arc::new(session),
+                    step_context: crate::session::step_context::StepContext::for_test(Arc::new(turn)),
+                    cancellation_token: Default::default(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(
+                        crate::turn_diff_tracker::TurnDiffTracker::new(),
+                    )),
+                    call_id: "remaining".into(),
+                    tool_name: ToolName::plain(GET_CONTEXT_REMAINING_TOOL_NAME),
+                    source: crate::tools::router::ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+                .unwrap();
+            let ResponseInputItem::FunctionCallOutput { output: direct, .. } =
+                output.to_response_item("remaining", &payload)
+            else {
+                panic!("expected function output");
+            };
+            let FunctionCallOutputBody::Text(text) = direct.body else {
+                panic!("expected structured JSON text, not rendered content fragments");
+            };
+            let direct: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(direct, json!({"tokens_left": expected}));
+            assert_eq!(direct, output.code_mode_result(&payload));
+            let ToolSpec::Function(spec) = GetContextRemainingHandler.spec() else {
+                panic!("expected function spec");
+            };
+            let validator = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+            assert!(validator.is_valid(&direct), "{direct}");
+        }
     }
 }

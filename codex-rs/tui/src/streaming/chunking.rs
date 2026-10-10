@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn severe_backlog_uses_faster_paced_batches() {
+    fn severe_backlog_in_catch_up_drains_whole_queue() {
         let mut policy = AdaptiveChunkingPolicy::default();
         let now = Instant::now();
         let _ = policy.decide(snapshot(/*queued_lines*/ 9, /*oldest_age_ms*/ 10), now);
@@ -379,6 +379,25 @@ mod tests {
         );
         assert_eq!(decision.mode, ChunkingMode::Smooth);
         assert_eq!(decision.drain_plan, DrainPlan::Single);
+    }
+
+    #[test]
+    fn renewed_pressure_restarts_exit_hold_and_reset_clears_cooldown() {
+        let mut policy = AdaptiveChunkingPolicy::default();
+        let t0 = Instant::now();
+        policy.decide(snapshot(8, 0), t0);
+        policy.decide(snapshot(2, 40), t0 + Duration::from_millis(10));
+        policy.decide(snapshot(3, 40), t0 + Duration::from_millis(100));
+        policy.decide(snapshot(2, 40), t0 + Duration::from_millis(200));
+        assert_eq!(policy.decide(snapshot(2, 40), t0 + Duration::from_millis(449)).mode, ChunkingMode::CatchUp);
+        assert_eq!(policy.decide(snapshot(2, 40), t0 + Duration::from_millis(450)).mode, ChunkingMode::Smooth);
+        assert_eq!(policy.decide(snapshot(8, 0), t0 + Duration::from_millis(451)).mode, ChunkingMode::Smooth);
+        policy.reset();
+        assert_eq!(policy.decide(snapshot(8, 0), t0 + Duration::from_millis(452)), ChunkingDecision {
+            mode: ChunkingMode::CatchUp,
+            entered_catch_up: true,
+            drain_plan: DrainPlan::Batch(8),
+        });
     }
 
     #[test]

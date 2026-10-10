@@ -188,7 +188,6 @@ use super::footer::footer_display_width;
 use super::footer::footer_height;
 use super::footer::footer_hint_items_width;
 use super::footer::footer_line_width;
-use super::footer::inset_footer_hint_area;
 use super::footer::max_left_width_for_right;
 use super::footer::passive_footer_status_line;
 use super::footer::render_context_right;
@@ -526,7 +525,6 @@ impl ChatComposer {
                 mode: FooterMode::ComposerEmpty,
                 hint_override: None,
                 plan_mode_nudge_visible: false,
-                flash: None,
                 context_window_percent: None,
                 context_window_used_tokens: None,
                 collaboration_mode_indicator: None,
@@ -1213,11 +1211,6 @@ impl ChatComposer {
             .take_remote_image_urls(&mut self.draft.textarea);
         self.sync_popups();
         urls
-    }
-
-    #[cfg(test)]
-    pub(crate) fn show_footer_flash(&mut self, line: Line<'static>, duration: Duration) {
-        self.footer.show_flash(line, duration);
     }
 
     /// Replace the entire composer content with `text` and reset cursor.
@@ -3371,9 +3364,6 @@ impl ChatComposer {
     }
 
     fn custom_footer_height(&self) -> Option<u16> {
-        if self.footer.flash_visible() {
-            return Some(1);
-        }
         self.footer
             .hint_override
             .as_ref()
@@ -3711,7 +3701,6 @@ impl ChatComposer {
         self.footer.mode = FooterMode::ComposerEmpty;
         self.footer.hint_override = Some(Vec::new());
         self.footer.plan_mode_nudge_visible = false;
-        self.footer.flash = None;
     }
 
     pub fn set_task_running(&mut self, running: bool) {
@@ -4047,13 +4036,7 @@ impl ChatComposer {
                         self.footer.collaboration_mode_indicator
                     };
                     let active_footer_hint_override = self.footer.hint_override.as_ref();
-                    let mut left_width = if self.footer.flash_visible() {
-                        self.footer
-                            .flash
-                            .as_ref()
-                            .map(|flash| footer_display_width(flash.line.width()))
-                            .unwrap_or(0)
-                    } else if let Some(items) = active_footer_hint_override {
+                    let mut left_width = if let Some(items) = active_footer_hint_override {
                         footer_hint_items_width(items)
                     } else if status_line_active {
                         truncated_status_line
@@ -4105,8 +4088,7 @@ impl ChatComposer {
                     }
                     let can_show_left_and_context =
                         can_show_left_with_context(hint_rect, left_width, right_width);
-                    let has_override =
-                        self.footer.flash_visible() || active_footer_hint_override.is_some();
+                    let has_override = active_footer_hint_override.is_some();
                     let single_line_layout = if has_override || status_line_active {
                         None
                     } else {
@@ -4178,10 +4160,6 @@ impl ChatComposer {
                                 render_footer_line(hint_rect, buf, line);
                             }
                             SummaryLeft::None => {}
-                        }
-                    } else if self.footer.flash_visible() {
-                        if let Some(flash) = self.footer.flash.as_ref() {
-                            Widget::render(&flash.line, inset_footer_hint_area(hint_rect), buf);
                         }
                     } else if let Some(items) = active_footer_hint_override {
                         render_footer_hint_items(hint_rect, buf, items);
@@ -4413,31 +4391,15 @@ mod tests {
             "",
             "expected blank spacing row above hints but saw: {spacing_row:?}",
         );
+
+        // An empty draft leaves that row blank whatever the layout, so pin the padding itself:
+        // the textarea must stop at least one row above the hint row.
+        let [_, _, textarea_rect, hint_rect] = composer.layout_areas(area);
+        assert!(
+            textarea_rect.bottom() < hint_rect.y,
+            "textarea {textarea_rect:?} must not touch hint row {hint_rect:?}",
+        );
     }
-
-    #[test]
-    fn footer_flash_overrides_hint_until_it_expires() {
-        let (mut composer, _rx) = new_test_composer();
-        composer.set_footer_hint_override(Some(vec![("K".to_string(), "label".to_string())]));
-        composer.show_footer_flash(Line::from("FLASH"), Duration::from_secs(10));
-
-        for expired in [false, true] {
-            if expired {
-                composer.footer.flash.as_mut().unwrap().expires_at =
-                    Instant::now() - Duration::from_secs(1);
-            }
-            let area = Rect::new(0, 0, 60, 6);
-            let mut buf = Buffer::empty(area);
-            composer.render(area, &mut buf);
-            let bottom_row: String = (0..area.width)
-                .map(|x| buf[(x, area.height - 1)].symbol())
-                .collect();
-            assert_eq!(bottom_row.contains("FLASH"), !expired, "{bottom_row:?}");
-            assert_eq!(bottom_row.contains("K label"), expired, "{bottom_row:?}");
-        }
-    }
-
-
 
     fn snapshot_composer_state_with_width<F>(
         name: &str,
@@ -6315,6 +6277,12 @@ mod tests {
                 Some("file".to_string()),
                 "@ token after tab",
             ),
+            (
+                "test\n@file",
+                6,
+                Some("file".to_string()),
+                "@ token after newline",
+            ),
         ];
 
         for (input, cursor_pos, expected, description) in test_cases {
@@ -7029,6 +6997,24 @@ mod tests {
         let (result, _) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(result, InputResult::Command(SlashCommand::Diff)));
+
+        // A bare command is dispatched before the burst is consulted. Inline args skip that
+        // shortcut, so only the slash-context bypass keeps Enter from becoming a burst newline.
+        let (mut composer, _rx) = new_test_composer();
+        let input = "/review fix this";
+        composer.draft.textarea.set_text_clearing_elements(input);
+        composer.draft.textarea.set_cursor(input.len());
+        composer
+            .draft
+            .paste_burst
+            .begin_with_retro_grabbed(String::new(), Instant::now());
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            result,
+            InputResult::CommandWithArgs(SlashCommand::Review, "fix this".to_string(), Vec::new())
+        );
     }
 
     /// Behavior: if a burst is buffering text and the user presses a non-char key, flush the
@@ -7067,8 +7053,8 @@ mod tests {
         assert!(!composer.is_in_paste_burst());
     }
 
-    /// Behavior: enabling `disable_paste_burst` flushes any held first character (flicker
-    /// suppression) and then inserts subsequent chars immediately without creating burst state.
+    /// Behavior: enabling Vim mode flushes any held first character (flicker suppression) into
+    /// the draft instead of dropping it, and leaves no burst state behind.
     #[test]
     fn enabling_vim_flushes_held_input() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
@@ -7571,6 +7557,8 @@ mod tests {
                 composer.set_text_content("describe these".to_string(), Vec::new(), Vec::new());
                 composer.draft.textarea.set_cursor(/*pos*/ 0);
                 let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                // The text snapshot equals the unselected one, so pin the selection itself.
+                assert_eq!(composer.attachments.selected_remote_image_index, Some(1));
             },
         );
 
@@ -7588,8 +7576,34 @@ mod tests {
                 let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
                 let _ =
                     composer.handle_key_event(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+                // Either deletion leaves a single `[Image #1]` row, so pin which image survived.
+                assert_eq!(
+                    composer.remote_image_urls(),
+                    vec!["https://example.com/two.png".to_string()]
+                );
             },
         );
+
+        // Text snapshots drop styles, so check the selected row's highlight on the cells.
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_remote_image_urls(vec![
+            "https://example.com/one.png".to_string(),
+            "https://example.com/two.png".to_string(),
+        ]);
+        composer.set_text_content("describe these".to_string(), Vec::new(), Vec::new());
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = Buffer::empty(area);
+        composer.render(area, &mut buf);
+        for (row, selected) in [(1u16, false), (2u16, true)] {
+            let cell = &buf[(LIVE_PREFIX_COLS, row)];
+            assert_eq!(cell.symbol(), "[", "row {row}");
+            assert_eq!(
+                cell.modifier.contains(Modifier::REVERSED),
+                selected,
+                "row {row}"
+            );
+        }
     }
 
     #[test]
@@ -7971,6 +7985,18 @@ mod tests {
 
         assert_eq!(InputResult::None, result);
         assert_eq!("explain the change\n", composer.draft.textarea.text());
+
+        // The remapped key must take over, or a remap that drops submit entirely would pass.
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            result,
+            InputResult::Submitted {
+                text: "explain the change".to_string(),
+                text_elements: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -8004,6 +8030,20 @@ mod tests {
 
         assert_eq!(InputResult::None, result);
         assert_eq!("queue me", composer.draft.textarea.text());
+
+        // The remapped key must take over, or a remap that drops queueing entirely would pass.
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            result,
+            InputResult::Queued {
+                text: "queue me".to_string(),
+                text_elements: Vec::new(),
+                action: QueuedInputAction::Plain,
+                pending_pastes: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -9292,6 +9332,14 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
+
+        // Without a recallable entry history navigation is off for every draft, so there would
+        // be nothing to fall back from.
+        type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { .. }));
+
         composer
             .draft
             .textarea
@@ -9436,7 +9484,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_normal_history_navigation_from_start_of_bang_command_recalls_older_entry() {
+    fn vim_normal_history_navigation_from_end_of_bang_command_recalls_older_entry() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(
@@ -9493,6 +9541,12 @@ mod tests {
         composer.set_text_content(text, text_elements, vec![path.clone()]);
 
         assert_eq!(composer.local_image_paths(), vec![path]);
+        // Paths are attached unconditionally; the element rebuilt from the bare byte range is
+        // what keeps the image bound to its label.
+        assert_eq!(
+            composer.draft.textarea.element_payloads(),
+            vec![placeholder]
+        );
     }
 
     #[test]
@@ -10675,6 +10729,11 @@ mod tests {
             format!("{placeholder} extra {placeholder}")
         );
         assert_eq!(composer.attachments.local_images.len(), 1);
+        // One attached image backs one element; the surplus occurrence stays plain text.
+        assert_eq!(
+            composer.draft.textarea.element_payloads(),
+            vec![placeholder]
+        );
     }
 
 

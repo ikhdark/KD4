@@ -568,7 +568,7 @@ fn truncated_checkpoint_claims_are_explicitly_non_standalone() {
 }
 
 #[test]
-fn collect_unresolved_user_messages_keeps_only_tail_after_model_output() {
+fn task_compaction_keeps_user_requests_on_both_sides_of_model_output() {
     let items = vec![
         user_message("consumed request"),
         ResponseItem::Message {
@@ -583,11 +583,16 @@ fn collect_unresolved_user_messages_keeps_only_tail_after_model_output() {
         user_message("unresolved exact constraint"),
     ];
 
-    let collected = collect_unresolved_user_messages(&items);
+    // A model-generated boundary means the request was observed, not that
+    // the requested work was completed.
+    let collected = collect_user_messages(&task_compaction_items(&items));
 
     assert_eq!(
         collected,
-        vec![compacted_user_message("unresolved exact constraint")]
+        vec![
+            compacted_user_message("consumed request"),
+            compacted_user_message("unresolved exact constraint"),
+        ]
     );
 }
 
@@ -673,7 +678,8 @@ fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
     );
     assert_eq!(history.len(), 3);
     assert_eq!(history[1], items[1]);
-    assert!(!format!("{history:?}").contains("private\\original.png"));
+    // No backslash in the needle: Debug output escapes the path separators.
+    assert!(!format!("{history:?}").contains("original.png"));
 }
 
 #[test]
@@ -948,7 +954,7 @@ fn legacy_apply_patch_warning_does_not_swallow_interposed_user_instructions() {
         collect_user_messages(&items),
         vec![compacted_user_message(text)]
     );
-    assert_eq!(build_unresolved_user_history(&items).0, items);
+    assert_eq!(build_local_task_input_checkpoint(&items).0, items);
 }
 
 #[test]
@@ -968,7 +974,7 @@ fn unresolved_tail_preserves_turn_stamped_warning_shaped_input() {
     }];
 
     let collected = collect_user_messages(&items);
-    let (unresolved_history, _) = build_unresolved_user_history(&items);
+    let (unresolved_history, ..) = build_local_task_input_checkpoint(&items);
 
     assert_eq!(
         vec![CompactedUserMessage {
@@ -1024,7 +1030,7 @@ fn collect_user_messages_preserves_warning_questions_and_mixed_content() {
             expected_mixed
         ],
     );
-    let (unresolved, _) = build_unresolved_user_history(&items);
+    let (unresolved, ..) = build_local_task_input_checkpoint(&items);
     assert_eq!(unresolved, items[1..]);
 }
 
@@ -1392,6 +1398,9 @@ fn inline_heading_mentions_do_not_trigger_structured_summary_budgeting() {
         "detail ".repeat(1_000)
     );
 
+    // This summary fits the budget, so both paths return it unchanged; the
+    // section check is what shows the inline mention is not a heading.
+    assert!(!has_compaction_section(&summary));
     let truncated = truncate_compaction_summary(&summary, COMPACT_TASK_STATE_MAX_TOKENS);
 
     assert!(truncated.contains("END-SENTINEL"));
@@ -1441,14 +1450,14 @@ fn unresolved_agent_messages_survive_compaction_as_native_items() {
         unresolved_agent.clone(),
     ];
 
-    assert_eq!(
-        collect_unresolved_agent_messages(&items),
-        vec![unresolved_agent.clone()]
-    );
-    let (history, _) = build_unresolved_user_history(&items);
+    let (history, ..) = build_local_task_input_checkpoint(&items);
     assert_eq!(
         history,
-        vec![user_message("unresolved request"), unresolved_agent]
+        vec![
+            user_message("consumed request"),
+            user_message("unresolved request"),
+            unresolved_agent,
+        ]
     );
 }
 
@@ -1469,7 +1478,7 @@ fn unresolved_user_and_agent_messages_keep_their_original_order() {
         user_message("newer user constraint"),
     ];
 
-    let (history, _) = build_unresolved_user_history(&items);
+    let (history, ..) = build_local_task_input_checkpoint(&items);
 
     assert_eq!(
         history,
@@ -1484,7 +1493,7 @@ fn summary_reuse_is_disabled_when_post_summary_user_tail_is_truncated() {
         user_message(&"unresolved constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
     ];
 
-    let (_, _, _, omitted_user_text, _) = build_bounded_unresolved_input_history(&items);
+    let (_, _, _, omitted_user_text, _) = build_local_task_input_checkpoint(&items);
 
     assert!(omitted_user_text);
     assert!(!can_reuse_previous_summary(&items, omitted_user_text));
@@ -1506,7 +1515,7 @@ fn unresolved_text_omission_reports_stable_provenance_and_exact_counts() {
         }),
     }];
 
-    let (history, _, _, omitted_user_text, _) = build_bounded_unresolved_input_history(&items);
+    let (history, _, _, omitted_user_text, _) = build_local_task_input_checkpoint(&items);
     let receipt = history
         .iter()
         .filter_map(|item| match item {
@@ -1555,7 +1564,7 @@ fn over_truncation_moderate_unresolved_user_text_is_retained_without_a_retry() {
     assert!(approx_token_count(&text) < COMPACT_USER_MESSAGE_MAX_TOKENS);
 
     let (history, _, _, omitted_user_text, _) =
-        build_bounded_unresolved_input_history(&[user_message(&text)]);
+        build_local_task_input_checkpoint(&[user_message(&text)]);
     let rendered = serde_json::to_string(&history).expect("history serializes");
 
     assert!(!omitted_user_text);
@@ -1574,10 +1583,11 @@ fn over_truncation_large_unresolved_text_gets_exact_artifact_recovery_payload() 
         " trailing constraint".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS)
     );
     let items = vec![user_message(&text)];
-    let (_, _, _, omitted_user_text, omitted_text) = build_bounded_unresolved_input_history(&items);
+    let (_, _, _, omitted_user_text, omitted_text) = build_local_task_input_checkpoint(&items);
 
     assert!(omitted_user_text);
-    let canonical = compaction_text_recovery_canonical(&items, omitted_text)
+    let canonical = omitted_text
+        .then(|| compaction_text_recovery_for_items(task_compaction_items(&items)))
         .expect("omitted unresolved text must get a canonical recovery payload");
     let recovered: serde_json::Value = serde_json::from_slice(&canonical.bytes).unwrap();
     assert_eq!(recovered["items"], serde_json::to_value(&items).unwrap());
@@ -1604,7 +1614,7 @@ fn bounded_agent_history_emits_text_omission_receipt() {
     ];
 
     let (history, _, _, omitted_user_text, omitted_text) =
-        build_bounded_unresolved_input_history(&items);
+        build_local_task_input_checkpoint(&items);
     let rendered = serde_json::to_string(&history).expect("history serializes");
 
     assert!(rendered.contains(COMPACT_TEXT_OMISSION_MARKER));
@@ -1624,11 +1634,15 @@ fn bounded_agent_history_emits_text_omission_receipt() {
     assert_eq!(receipt["role"], "agent");
     assert!(receipt["omitted_tokens"].as_u64().unwrap() > 0);
     assert!(!omitted_user_text);
-    let canonical = compaction_text_recovery_canonical(&items, omitted_text)
+    let canonical = omitted_text
+        .then(|| compaction_text_recovery_for_items(task_compaction_items(&items)))
         .expect("agent text omissions also need exact recovery");
+    let recovery = canonical.value.as_ref().unwrap();
+    assert_eq!(recovery["items"], json!(items));
+    // The receipt must point at the exact agent text inside that payload.
     assert_eq!(
-        canonical.value.as_ref().unwrap()["items"],
-        json!([items[1]])
+        recovery.pointer(receipt["recovery_selector"]["pointer"].as_str().unwrap()),
+        Some(&json!(items[1]))
     );
 }
 
@@ -1697,9 +1711,9 @@ fn unresolved_tool_output_survives_local_compaction_as_typed_receipt() {
     };
     let items = vec![user_message("request"), call.clone(), output.clone()];
 
-    let (history, _, _, _, _) = build_bounded_unresolved_input_history(&items);
+    let (history, _, _, _, _) = build_local_task_input_checkpoint(&items);
 
-    assert_eq!(history, vec![call, output]);
+    assert_eq!(history, vec![user_message("request"), call, output]);
     assert_eq!(compaction_summary_items(&items), vec![user_message("request")]);
 }
 
@@ -1721,8 +1735,11 @@ fn compaction_summary_excludes_unread_tail_but_keeps_consumed_evidence() {
     items.extend([call("pending-a"), call("pending-b"), output("pending-a"),
         output("pending-b"), user_message("new constraint"), agent_message("unread agent result")]);
     assert_eq!(compaction_summary_items(&items), consumed);
-    let (retained, _, _, _, _) = build_bounded_unresolved_input_history(&items);
-    assert_eq!(retained, items[consumed.len()..]);
+    // The request stays with the unread tail: a model-generated boundary
+    // means it was observed, not that the work was completed.
+    let (retained, _, _, _, _) = build_local_task_input_checkpoint(&items);
+    assert_eq!(retained[0], items[0]);
+    assert_eq!(retained[1..], items[consumed.len()..]);
     assert!(compaction_summary_items(&[user_message("first request")]).is_empty());
     let summary = compaction_summary_item(format!("{SUMMARY_PREFIX}\nprevious handoff"));
     assert_eq!(compaction_summary_items(&[summary.clone(), user_message("new request")]),
@@ -1730,8 +1747,9 @@ fn compaction_summary_excludes_unread_tail_but_keeps_consumed_evidence() {
 
     let mut history = crate::context_manager::ContextManager::new();
     history.replace(compaction_summary_items(&items));
-    let prompt = history.for_compaction_prompt_with_completed_tool_projection(
+    let prompt = history.for_local_compaction_prompt(
         &codex_protocol::openai_models::default_input_modalities(), None,
+        &crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests(),
     );
     let serialized = serde_json::to_string(&prompt).unwrap();
     assert!(!serialized.contains("pending-a"));
@@ -1938,7 +1956,7 @@ fn user_text_with_summary_prefix_does_not_spoof_checkpoint() {
         user_message(&prefixed_user_text),
         user_message("next request"),
     ];
-    let (unresolved_history, _) = build_unresolved_user_history(&items);
+    let (unresolved_history, ..) = build_local_task_input_checkpoint(&items);
 
     assert_eq!(latest_summary_message(&items), None);
     assert!(!history_after_latest_summary_is_user_only(&items));
@@ -2053,7 +2071,7 @@ fn unresolved_history_reports_exact_image_omissions() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }];
-        let (history, retained) = build_unresolved_user_history(&items);
+        let (history, retained, _) = build_task_input_checkpoint(&items);
         assert_eq!(retained, total.min(MAX_RETAINED_USER_IMAGES));
         let notices: Vec<_> = history
             .iter()
@@ -2357,7 +2375,7 @@ fn compaction_omission_metadata_has_a_fixed_budget() {
     let items = (0..5000)
         .map(|_| user_message("unresolved constraint "))
         .collect::<Vec<_>>();
-    let (bounded, _, _, omitted, omitted_text) = build_bounded_unresolved_input_history(&items);
+    let (bounded, _, _, omitted, omitted_text) = build_local_task_input_checkpoint(&items);
     assert!(omitted);
     let receipts = bounded
         .iter()
@@ -2379,7 +2397,8 @@ fn compaction_omission_metadata_has_a_fixed_budget() {
             .sum::<usize>()
             < 1200
     );
-    let canonical = compaction_text_recovery_canonical(&items, omitted_text).unwrap();
+    let canonical = omitted_text
+        .then(|| compaction_text_recovery_for_items(task_compaction_items(&items))).unwrap();
     assert_eq!(
         canonical.value.as_ref().unwrap()["items"]
             .as_array()
@@ -2472,7 +2491,7 @@ async fn compaction_recovery_failure_keeps_unresolved_text() {
         .await
         .unwrap();
     let history = session.clone_history().await;
-    let (_, _, _, omitted, _) = build_bounded_unresolved_input_history(history.raw_items());
+    let (_, _, _, omitted, _) = build_local_task_input_checkpoint(history.raw_items());
     assert!(omitted);
     // Block the artifact directory with a file, forcing the real storage path to fail.
     std::fs::create_dir_all(&turn.config.codex_home).unwrap();
@@ -2767,4 +2786,74 @@ fn survivability_literal_markers_are_data_but_structural_truncation_is_rejected(
             assert!(validate_generated_compaction_summary(None, &format!("{checkpoint}\n{marker}")).is_err());
         }
     }
+}
+#[tokio::test]
+async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Result<()> {
+    use core_test_support::responses;
+    core_test_support::require_network!();
+    let server = responses::start_mock_server().await;
+    let home = tempfile::tempdir()?;
+    let (session, mut turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test-key"), Vec::new(), home.path(), |config| {
+                config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                config.model_provider.supports_websockets = false;
+            },
+        ).await;
+    let turn = Arc::get_mut(&mut turn).expect("uniquely owned test turn");
+    // Compaction is a sampling request: stale turn settings must not bypass
+    // the current preference, FastMode gate, or the selected model's support.
+    Arc::make_mut(&mut turn.config).service_tier = Some("priority".into());
+    let metadata = turn.turn_metadata_state.to_responses_metadata(
+        session.installation_id.clone(), session.current_window_id().await,
+        CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
+            CompactionTrigger::Manual, CompactionReason::UserRequested,
+            CompactionImplementation::Responses, CompactionPhase::StandaloneTurn,
+        )),
+    );
+    for (fast, supported, configured, expected) in [
+        (true, true, Some("priority"), Some("priority")),
+        (false, true, Some("priority"), None),
+        (true, false, Some("priority"), None),
+        (true, false, Some("default"), None),
+        // Explicit null retains the no-tier sentinel internally, but the
+        // sentinel is not a catalog tier and is omitted from the wire request.
+        (true, true, None, None),
+    ] {
+        Arc::make_mut(&mut turn.config).features.set_enabled(codex_features::Feature::FastMode, fast)?;
+        turn.model_info.service_tiers = if supported {
+            vec![codex_protocol::openai_models::ModelServiceTier {
+                id: "priority".into(), name: "Priority".into(), description: "Priority".into(),
+            }]
+        } else { Vec::new() };
+        session.update_settings(crate::session::SessionSettingsUpdate {
+            service_tier: Some(configured.map(str::to_string)), ..Default::default()
+        }).await?;
+        if configured.is_none() {
+            assert_eq!(
+                crate::session::turn::service_tier_for_sampling(&session, turn).await.as_deref(),
+                Some(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+                "explicit null must retain the no-tier preference before wire projection",
+            );
+        }
+        let log = responses::mount_sse_once(&server, responses::sse(vec![
+            responses::ev_assistant_message("summary", "summary"), responses::ev_completed("compacted"),
+        ])).await;
+        let mut client = session.services.model_client.new_session();
+        drain_to_completed(&session, turn, &mut client, &metadata, &Prompt::default(),
+            &CancellationToken::new()).await?;
+        assert_eq!(log.single_request().body_json().get("service_tier").and_then(serde_json::Value::as_str), expected,
+            "fast={fast}, supported={supported}, configured={configured:?}");
+    }
+    // The newly sampled preference must not make cancellation wait for a
+    // contended session state lock (for example during slow persistence).
+    let _state = session.lock_history_state_for_test().await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let mut client = session.services.model_client.new_session();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1),
+        drain_to_completed(&session, turn, &mut client, &metadata, &Prompt::default(), &cancellation),
+    ).await.expect("cancellation must not wait for the state lock");
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    Ok(())
 }

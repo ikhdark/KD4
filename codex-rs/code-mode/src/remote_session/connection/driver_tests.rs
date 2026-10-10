@@ -206,49 +206,29 @@ struct RecordingDelegate {
 
 struct PanickingDelegate;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn continuous_events_do_not_starve_termination_commands() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     harness.open(session.clone(), Arc::new(RecordingDelegate::default())).await;
     let _cell = harness.start_cell(session.clone(), 2, "1").await;
-    let stop = CancellationToken::new();
-    let traffic_started = std::time::Instant::now();
-    let traffic = tokio::spawn({
-        let events = harness.event_tx.clone();
-        let stop = stop.clone();
-        async move {
-            let mut count = 0;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = stop.cancelled() => return count,
-                    sent = events.send(DriverEvent::RequestCancelled(RequestId::new(999_999))) => {
-                        if sent.is_err() { return count; }
-                        count += 1;
-                    }
-                }
-            }
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let started = std::time::Instant::now();
+    // Fill the event queue before the driver runs again and end it with a
+    // failure. An event-first driver reaches the failure before it reads the
+    // command and never frames it; the fair selector reads the command first
+    // except with probability (1/3)^16.
+    for _ in 0..15 {
+        harness.event_tx.try_send(DriverEvent::RequestCancelled(RequestId::new(999_999))).unwrap();
+    }
+    harness.event_tx.try_send(DriverEvent::Failed("probe".to_string())).unwrap();
     let (response_tx, _response_rx) = oneshot::channel();
-    harness.command_tx.send(DriverCommand::Terminate { session, cell_id: CellId::new("1".to_string()), response_tx }).await.unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv()).await;
-    let latency = started.elapsed();
-    stop.cancel();
-    let events = traffic.await.unwrap();
-    let events_per_second = events as f64 / traffic_started.elapsed().as_secs_f64();
-    eprintln!("terminate dispatch latency={latency:?}; ordinary events={events}; events/s={events_per_second:.0}");
-    let frame = frame.unwrap().unwrap();
+    harness.command_tx.try_send(DriverCommand::Terminate { session, cell_id: CellId::new("1".to_string()), response_tx }).unwrap();
+    let frame = harness.outgoing_rx.recv().await.expect("terminate frame before the queued failure");
     let mut bytes = Vec::new();
     FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
     let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
     assert!(matches!(message, ClientToHost::Request {
         id, request: HostRequest::Terminate { cell_id, .. },
     } if id == RequestId::new(3) && cell_id.as_str() == "1"));
-    assert!(events > 0);
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -562,33 +542,17 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
 async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    let (delegate, mut events_rx, release) = HeldDelegate::new();
+    harness.open(session.clone(), delegate).await;
     let _started = harness
         .start_cell(session.clone(), /*request_id*/ 2, "1")
         .await;
     let request_id = DelegateRequestId::new(/*value*/ 7);
-    harness
-        .event_tx
-        .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
-            id: request_id,
-            session_id: session.id.clone(),
-            request: DelegateRequest::InvokeTool {
-                invocation: WireNestedToolCall {
-                    cell_id: CellId::new("1".to_string()).into(),
-                    parent_tool_call_id: None,
-                    runtime_tool_call_id: "tool-1".to_string(),
-                    tool_name: ToolName::plain("slow").into(),
-                    tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
-                    input: None,
-                    deadline_shared_monotonic_nanos: None,
-                    remaining_ms_at_send: None,
-                    buffered_output_bytes: 0,
-                },
-            },
-        }))
-        .await
-        .expect("delegate request");
+    harness.start_tool_delegate(&session, request_id).await;
+    assert_eq!(
+        next_held_delegate_event(&mut events_rx).await,
+        HeldDelegateEvent::Started
+    );
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
@@ -596,29 +560,30 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
         ))
         .await
         .expect("delegate cancel");
-    tokio::task::yield_now().await;
-    assert!(matches!(
-        harness.outgoing_rx.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
-    harness
-        .event_tx
-        .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
-            id: request_id,
-            session_id: session.id,
-            request: DelegateRequest::Notify {
-                call_id: "notify-reused".to_string(),
-                cell_id: CellId::new("1".to_string()).into(),
-                text: "duplicate".to_string(),
-            },
-        }))
-        .await
-        .expect("reused delegate request");
+    // The cancel alone reaches the delegate; no cell closure revokes the call.
+    assert_eq!(
+        next_held_delegate_event(&mut events_rx).await,
+        HeldDelegateEvent::Cancelled
+    );
+    // The delegate still produces a result after the cancel. Any completion it
+    // reported is queued ahead of the reused ID on the same event FIFO.
+    release.cancel();
+    assert_eq!(
+        next_held_delegate_event(&mut events_rx).await,
+        HeldDelegateEvent::Finished
+    );
+    // Reuse the ID for another tool call: an admitted duplicate would report Started.
+    harness.start_tool_delegate(&session, request_id).await;
     tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
-    assert_eq!(delegate.invocations.load(Ordering::Relaxed), 1);
-    assert_eq!(delegate.notifications.load(Ordering::Relaxed), 0);
+    assert!(
+        harness.outgoing_rx.try_recv().is_err(),
+        "a cancelled delegate call must not answer the host"
+    );
+    while let Ok(event) = events_rx.try_recv() {
+        assert_ne!(event, HeldDelegateEvent::Started);
+    }
 }
 
 #[tokio::test]
@@ -801,7 +766,8 @@ async fn shutdown_closes_cell_without_waiting_for_delegate_cleanup() {
 async fn admitted_delegate_responses_survive_a_stalled_host_reader() {
     // The host admits this many pending delegate requests across its cells.
     const CELLS: usize = 2;
-    const CALLS_PER_CELL: usize = 100;
+    const CALLS_PER_CELL: usize =
+        codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS / CELLS;
 
     let mut harness = DriverHarness::start();
     let session = remote_session();
@@ -1205,6 +1171,13 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
 
 #[tokio::test]
 async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
+    async fn next_message(harness: &mut DriverHarness) -> ClientToHost {
+        let frame = harness.outgoing_rx.recv().await.expect("outgoing frame");
+        let mut bytes = Vec::new();
+        FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
+        FramedReader::new(bytes.as_slice()).read().await.unwrap().unwrap()
+    }
+
     let mut harness = DriverHarness::start();
     let session = remote_session();
     harness
@@ -1229,7 +1202,17 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         })
         .await
         .expect("first wait command");
-    harness.outgoing_rx.recv().await.expect("first wait frame");
+    assert_eq!(next_message(&mut harness).await, ClientToHost::Request {
+        id: RequestId::new(3),
+        request: HostRequest::Wait {
+            session_id: session.id.clone(),
+            request: WaitRequest {
+                recovery: None,
+                cell_id: CellId::new("1".to_string()),
+                yield_time_ms: 60_000,
+            }.into(),
+        },
+    });
     first_cancellation.cancel();
     drop(first_rx);
 
@@ -1237,7 +1220,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
     harness
         .command_tx
         .send(DriverCommand::Wait {
-            session,
+            session: session.clone(),
             request: WaitRequest {
                 recovery: None,
                 cell_id: CellId::new("1".to_string()),
@@ -1248,11 +1231,24 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         })
         .await
         .expect("second wait command");
-    harness
-        .outgoing_rx
-        .recv()
-        .await
-        .expect("cancel request frame");
+    assert_eq!(next_message(&mut harness).await, ClientToHost::CancelRequest {
+        id: RequestId::new(3),
+    });
+    // A cancellation watcher can win before the replacement command is read.
+    // This local rejection is queued after that command on the same FIFO, so
+    // an empty outgoing queue now proves deferral rather than a scheduling gap.
+    let (barrier_tx, barrier_rx) = oneshot::channel();
+    harness.command_tx.send(DriverCommand::OpenSession {
+        session: session.clone(),
+        delegate: Arc::new(RecordingDelegate::default()),
+        cleanup: SessionCleanup::new(),
+        caller_cancellation: CancellationToken::new(),
+        response_tx: barrier_tx,
+    }).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), barrier_rx).await.unwrap().unwrap(),
+        Err("code-mode session session-1 is already open".to_string()),
+    );
     assert!(matches!(
         harness.outgoing_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -1268,7 +1264,17 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         }))
         .await
         .expect("cancelled wait response");
-    harness.outgoing_rx.recv().await.expect("second wait frame");
+    assert_eq!(next_message(&mut harness).await, ClientToHost::Request {
+        id: RequestId::new(4),
+        request: HostRequest::Wait {
+            session_id: session.id.clone(),
+            request: WaitRequest {
+                recovery: None,
+                cell_id: CellId::new("1".to_string()),
+                yield_time_ms: 1,
+            }.into(),
+        },
+    });
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::Response {
@@ -1294,6 +1300,8 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
             }
         ))
     );
+    harness.cancellation.cancel();
+    (&mut harness.driver_task).await.unwrap();
 }
 
 #[tokio::test]

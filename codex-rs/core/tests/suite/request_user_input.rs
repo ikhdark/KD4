@@ -43,9 +43,10 @@ fn call_output(req: &ResponsesRequest, call_id: &str) -> String {
         Some(call_id),
         "mismatched call_id in function_call_output"
     );
-    let (content_opt, _success) = req
+    let (content_opt, success) = req
         .function_call_output_content_and_success(call_id)
         .expect("function_call_output present");
+    assert_ne!(success, Some(false), "answered input must not report tool failure");
     content_opt.expect("function_call_output content present")
 }
 
@@ -106,7 +107,7 @@ async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow
         ]),
     )
     .await;
-    responses::mount_sse_once(
+    let follow_up = responses::mount_sse_once(
         &server,
         sse(vec![
             ev_assistant_message("msg-active", "done"),
@@ -169,7 +170,7 @@ async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow
     );
     test.codex
         .submit(Op::UserInputAnswer {
-            id: request.turn_id,
+            id: request.turn_id.clone(),
             call_id: Some(request.call_id),
             response: RequestUserInputResponse { disposition: None,
                 answers,
@@ -177,10 +178,26 @@ async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow
             },
         })
         .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::TurnComplete(completed) => {
+            assert_eq!(completed.turn_id, request.turn_id);
+            assert_eq!(completed.error, None);
+            assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
+            true
+        }
+        _ => false,
     })
     .await;
+
+    let follow_up = follow_up.single_request();
+    let user_messages = follow_up.message_input_texts("user");
+    assert!(user_messages.iter().any(|text| text == "start the active turn"));
+    assert!(!user_messages.iter().any(|text| text.contains("this must not become steering input")));
+    let answer: Value = serde_json::from_str(&call_output(&follow_up, call_id))?;
+    assert_eq!(answer, json!({
+        "answers": {"confirm_path": {"answers": ["yes"]}},
+        "interrupted": false
+    }));
 
     Ok(())
 }
@@ -324,7 +341,16 @@ async fn request_user_input_round_trip_for_mode(
         .await?;
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TokenCount(_))).await;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnComplete(completed) => {
+            assert_eq!(completed.turn_id, request.turn_id);
+            assert_eq!(completed.error, None);
+            assert_eq!(completed.last_agent_message.as_deref(), Some("thanks"));
+            true
+        }
+        _ => false,
+    })
+    .await;
 
     let req = second_mock.single_request();
     let output_text = call_output(&req, call_id);

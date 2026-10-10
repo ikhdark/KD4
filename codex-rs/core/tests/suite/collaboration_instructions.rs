@@ -120,7 +120,13 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let dev_texts = developer_texts(&req2.single_request().input());
+    let request = req2.single_request();
+    let user_texts = request.message_input_texts("user");
+    for prompt in ["hello 1", "hello 2"] {
+        assert_eq!(user_texts.iter().filter(|text| text.as_str() == prompt).count(), 1);
+    }
+    let dev_texts = developer_texts(&request.input());
+    assert!(dev_texts.iter().any(|text| text.contains("<permissions instructions>")));
     let active_xml = collab_xml(active_instructions);
     assert_eq!(count_messages_containing(&dev_texts, &active_xml), 0);
     assert_eq!(
@@ -427,6 +433,7 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
 async fn clearing_collaboration_mode_instructions_removes_stable_slot() -> Result<()> {
     assert_clearing_collaboration_instructions_emits_reset(None).await?;
     assert_clearing_collaboration_instructions_emits_reset(Some("")).await?;
+    assert_clearing_collaboration_instructions_emits_reset(Some(" \n\t\u{2003}")).await?;
     Ok(())
 }
 
@@ -435,7 +442,7 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(
+    let req1 = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -471,6 +478,14 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        count_messages_containing(
+            &developer_texts(&req1.single_request().input()),
+            &collab_xml(collab_text),
+        ),
+        1,
+        "the instructions must be active before the transition"
+    );
 
     core_test_support::submit_thread_settings(
         &test.codex,
@@ -508,7 +523,7 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
     require_network!();
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(
+    let req1 = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -548,6 +563,14 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        count_messages_containing(
+            &developer_texts(&req1.single_request().input()),
+            &collab_xml(default_text),
+        ),
+        1,
+        "the instructions must be active before the transition"
+    );
 
     core_test_support::submit_thread_settings(
         &test.codex,
@@ -591,7 +614,7 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
-    let _req1 = mount_sse_once(
+    let req1 = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -635,6 +658,14 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        count_messages_containing(
+            &developer_texts(&req1.single_request().input()),
+            &collab_xml(collab_text),
+        ),
+        1,
+        "the instructions must be active before the transition"
+    );
 
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed
@@ -706,8 +737,8 @@ async fn empty_collaboration_instructions_are_ignored() -> Result<()> {
 
     let input = req.single_request().input();
     let dev_texts = developer_texts(&input);
-    let collab_text = collab_xml("");
-    assert_eq!(count_messages_containing(&dev_texts, &collab_text), 0);
+    assert!(dev_texts.iter().any(|text| text.contains("<permissions instructions>")));
+    assert_eq!(count_messages_containing(&dev_texts, COLLABORATION_MODE_OPEN_TAG), 0);
 
     Ok(())
 }

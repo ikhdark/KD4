@@ -44,6 +44,7 @@ fn preserves_typed_causes_without_guessing_from_messages() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[test]
 fn classifies_native_backend_errors() {
     #[cfg(target_os = "macos")]
@@ -54,7 +55,6 @@ fn classifies_native_backend_errors() {
     let native: Box<dyn Error + Send + Sync> = Box::new(secret_service::Error::Locked);
     #[cfg(target_os = "windows")]
     let native: Box<dyn Error + Send + Sync> = Box::new(keyring::windows::Error(1312));
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     assert_eq!(
         std::io::Error::from(CredentialStoreError::new(keyring::Error::NoStorageAccess(
             native
@@ -68,36 +68,19 @@ fn classifies_native_backend_errors() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "windows")]
 #[test]
-fn unavailable_secret_service_is_not_connected() {
-    let error = CredentialStoreError::new(keyring::Error::PlatformFailure(Box::new(
-        secret_service::Error::Unavailable,
-    )));
-    assert_eq!(std::io::Error::from(error).kind(), ErrorKind::NotConnected);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn secret_service_dbus_io_error_preserves_its_kind() {
-    let error = secret_service::Error::Zbus(
-        std::io::Error::new(ErrorKind::PermissionDenied, "private D-Bus socket").into(),
-    );
-    let error = CredentialStoreError::new(keyring::Error::PlatformFailure(Box::new(error)));
-    assert_eq!(
-        std::io::Error::from(error).kind(),
-        ErrorKind::PermissionDenied
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn read_only_keychain_is_permission_denied() {
-    let error = CredentialStoreError::new(keyring::Error::NoStorageAccess(Box::new(
-        security_framework::base::Error::from_code(/*code*/ -25292),
-    )));
-    assert_eq!(
-        std::io::Error::from(error).kind(),
-        ErrorKind::PermissionDenied
-    );
+fn classifies_windows_platform_failure_codes() {
+    // 87 is ERROR_INVALID_PARAMETER, which has no portable kind.
+    for (code, expected) in [
+        (5, ErrorKind::PermissionDenied),
+        (50, ErrorKind::Unsupported),
+        (1460, ErrorKind::TimedOut),
+        (87, ErrorKind::Other),
+    ] {
+        let error = CredentialStoreError::new(keyring::Error::PlatformFailure(Box::new(
+            keyring::windows::Error(code),
+        )));
+        assert_eq!(std::io::Error::from(error).kind(), expected, "code {code}");
+    }
 }

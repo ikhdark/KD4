@@ -481,6 +481,23 @@ async fn startup_windows_sandbox_prompt_blocks_disallowed_unelevated_fallback() 
 #[tokio::test]
 async fn windows_sandbox_required_enable_prompt_reopens_on_cancel_when_unelevated_allowed() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let preset = builtin_approval_presets()
+        .into_iter()
+        .find(|preset| preset.id == "auto")
+        .expect("auto preset");
+
+    // Control: without a requirement, cancelling an offered fallback only closes the prompt.
+    chat.open_windows_sandbox_enable_prompt_with_legacy_compatibility(
+        preset.clone(),
+        /*profile_selection*/ None,
+        /*legacy_is_compatible*/ true,
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::OpenWindowsSandboxEnablePrompt { .. })),
+        "an optional sandbox prompt must not reopen on cancel"
+    );
 
     chat.config.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Elevated);
     chat.config.config_layer_stack = windows_sandbox_requirements_stack(vec![
@@ -488,12 +505,13 @@ async fn windows_sandbox_required_enable_prompt_reopens_on_cancel_when_unelevate
         WindowsSandboxModeToml::Unelevated,
     ])
     .into();
-    let preset = builtin_approval_presets()
-        .into_iter()
-        .find(|preset| preset.id == "auto")
-        .expect("auto preset");
 
-    chat.open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
+    // Pin the host probe so only the required elevated mode can force the reopen.
+    chat.open_windows_sandbox_enable_prompt_with_legacy_compatibility(
+        preset,
+        /*profile_selection*/ None,
+        /*legacy_is_compatible*/ true,
+    );
     chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     assert!(matches!(

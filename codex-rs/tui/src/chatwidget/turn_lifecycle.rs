@@ -198,7 +198,7 @@ impl Drop for PowerRequest {
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn external_sleep_inhibitor_command(
     target_os: &str,
 ) -> Option<(&'static str, &'static [&'static str])> {
@@ -312,18 +312,5 @@ mod tests {
 
         assert!(state.agent_turn_running);
         assert!(state.sleep_inhibitor.is_turn_running());
-    }
-
-    #[test]
-    fn external_sleep_inhibitor_commands_are_platform_specific() {
-        assert_eq!(
-            external_sleep_inhibitor_command("linux"),
-            Some(("systemd-inhibit", &["--what=idle", "--mode=block", "--who=codex"][..]))
-        );
-        assert_eq!(
-            external_sleep_inhibitor_command("macos"),
-            Some(("caffeinate", &["-i"][..]))
-        );
-        assert_eq!(external_sleep_inhibitor_command("windows"), None);
     }
 }

@@ -103,6 +103,26 @@ fn filters_are_bounded_and_invalid_scope_fails_before_enumeration() {
 }
 
 #[test]
+fn filter_pattern_budget_is_shared_across_fields_and_counts_utf8_bytes() {
+    let mut filters = WalkFilters {
+        include: vec!["*.rs".into(); 32],
+        exclude: vec!["test_*".into(); 31],
+        exclude_directories: vec!["target".into()],
+    };
+    filters.validate().expect("64 total patterns are permitted");
+    filters.exclude_directories.push("vendor".into());
+    assert_eq!(filters.validate().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+
+    filters = WalkFilters {
+        include: vec!["界".repeat(85)],
+        ..Default::default()
+    };
+    filters.validate().expect("255 UTF-8 bytes are permitted");
+    filters.include[0].push('界');
+    assert_eq!(filters.validate().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
 fn response_byte_cutoff_reports_its_effective_bound() {
     let fs = TestFileSystem {
         batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
@@ -263,20 +283,95 @@ impl ExecutorFileSystem for TestFileSystem {
                 self.limits.lock().unwrap().push((path.clone(), limit));
                 return Ok(batch);
             }
-            let batch = self.read_directory_bounded(path, limit, sandbox).await?;
-            Ok(ReadDirectoryOutcome {
-                entries: batch
-                    .entries
-                    .into_iter()
-                    .map(|entry| WalkDirectoryEntry {
-                        file_name: entry.file_name,
-                        metadata: None,
-                    })
-                    .collect(),
-                entries_examined: batch.entries_examined,
-                limit_reached: batch.limit_reached,
-            })
+            // Most backends inherit the trait's default adapter; run that one over
+            // `batches` instead of restating it here.
+            let adapter = DefaultWalkAdapter(self);
+            adapter
+                .read_directory_bounded_for_walk(path, limit, sandbox)
+                .await
         })
+    }
+}
+
+/// View of the fixture that does not override `read_directory_bounded_for_walk`.
+struct DefaultWalkAdapter<'fs>(&'fs TestFileSystem);
+
+impl ExecutorFileSystem for DefaultWalkAdapter<'_> {
+    fn canonicalize<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, PathUri> {
+        panic!("unexpected canonicalize through the default walk adapter")
+    }
+    fn read_file<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<u8>> {
+        panic!("unexpected file read through the default walk adapter")
+    }
+    fn read_file_stream<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        panic!("unexpected stream read through the default walk adapter")
+    }
+    fn write_file<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: Vec<u8>,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        panic!("unexpected write through the default walk adapter")
+    }
+    fn create_directory<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: CreateDirectoryOptions,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        panic!("unexpected mkdir through the default walk adapter")
+    }
+    fn remove<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: RemoveOptions,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        panic!("unexpected remove through the default walk adapter")
+    }
+    fn copy<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: &'a PathUri,
+        _: CopyOptions,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        panic!("unexpected copy through the default walk adapter")
+    }
+    fn get_metadata<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
+        panic!("unexpected metadata probe through the default walk adapter")
+    }
+    fn read_directory<'a>(
+        &'a self,
+        _: &'a PathUri,
+        _: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
+        panic!("unbounded directory read")
+    }
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        limit: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome> {
+        self.0.read_directory_bounded(path, limit, sandbox)
     }
 }
 
@@ -479,6 +574,49 @@ fn walk_reports_depth_truncation_without_reading_beyond_limit() {
         ]
     );
     assert_eq!(*fs.limits.lock().unwrap(), [(root(), 20)]);
+    assert_eq!(outcome.unexplored, vec![WalkStop {
+        path: root().join("dir").unwrap(),
+        reason: "depth_limit".into(),
+        effective_limit: 0,
+        partially_examined: false,
+    }]);
+}
+
+#[test]
+fn walk_directory_budget_includes_root_and_preserves_unvisited_frontier() {
+    let fs = TestFileSystem {
+        batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+            entries: vec![entry("dir"), entry("file")],
+            entries_examined: 2,
+            limit_reached: false,
+        }])),
+        ..Default::default()
+    };
+    let mut opts = options(20);
+    opts.max_directories = 1;
+    let outcome = block_on(fs.walk(&root(), opts, None)).unwrap();
+    assert!(outcome.truncated);
+    assert!(outcome.errors.is_empty());
+    assert_eq!(outcome.entries, vec![
+        WalkEntry { path: root().join("dir").unwrap(), kind: WalkEntryKind::Directory },
+        WalkEntry { path: root().join("file").unwrap(), kind: WalkEntryKind::File },
+    ]);
+    assert_eq!(outcome.unexplored, vec![WalkStop {
+        path: root().join("dir").unwrap(),
+        reason: "directory_limit".into(),
+        effective_limit: 1,
+        partially_examined: false,
+    }]);
+    assert_eq!(*fs.limits.lock().unwrap(), [(root(), 20)]);
+}
+
+#[test]
+fn confined_read_default_fails_closed_without_opening_streams() {
+    let fs = TestFileSystem::default();
+    let path = root().join("file").unwrap();
+    let error = block_on(fs.read_file_bounded_confined(&path, &root(), 10, None))
+        .expect_err("a backend without confinement must not use the unconfined fallback");
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
 #[test]

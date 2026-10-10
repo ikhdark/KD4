@@ -11,8 +11,8 @@
 //! from the finalized source.
 //!
 //! The row cap is enforced while rendering from `HistoryCell` source, not after writing to the
-//! terminal. Initial resume replay uses the same display-line buffering contract so large sessions
-//! do not write more retained rows than resize replay would later be willing to rebuild.
+//! terminal. Initial resume replay renders its tail through the same path so large sessions do not
+//! write more retained rows than resize replay would later be willing to rebuild.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -20,12 +20,15 @@ use std::time::Instant;
 
 use color_eyre::eyre::Result;
 use ratatui::text::Line;
+use unicode_width::UnicodeWidthStr;
 
 use super::App;
 use super::InitialHistoryReplayBuffer;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
 use crate::insert_history::HistoryLineWrapPolicy;
+use crate::insert_history::terminal_row_count;
+use crate::live_wrap::terminal_row_ranges;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::transcript_reflow::TRANSCRIPT_REFLOW_DEBOUNCE;
 use crate::tui;
@@ -33,6 +36,48 @@ use crate::tui;
 struct ReflowCellDisplay {
     lines: Vec<HyperlinkLine>,
     is_stream_continuation: bool,
+}
+
+/// Trim terminal-wrapped rows without inserting hard newlines into raw output.
+fn retain_terminal_row_tail(lines: &mut Vec<HyperlinkLine>, width: usize, max_rows: usize) {
+    let mut remaining = max_rows;
+    let mut start = lines.len();
+    while start > 0 && remaining > 0 {
+        start -= 1;
+        let rows = terminal_row_count(&lines[start].line, width);
+        if rows <= remaining {
+            remaining -= rows;
+            continue;
+        }
+
+        let line = &mut lines[start];
+        let text = line.line.to_string();
+        let skip_bytes = terminal_row_ranges(&text, width)
+            .nth(rows - remaining)
+            .expect("retained terminal row exists")
+            .start;
+        let columns = text[..skip_bytes].width();
+        let mut bytes_left = skip_bytes;
+        line.line.spans.retain_mut(|span| {
+            if bytes_left >= span.content.len() {
+                bytes_left -= span.content.len();
+                false
+            } else {
+                if bytes_left > 0 {
+                    span.content = span.content[bytes_left..].to_owned().into();
+                    bytes_left = 0;
+                }
+                true
+            }
+        });
+        line.hyperlinks.retain_mut(|link| {
+            link.columns = link.columns.start.saturating_sub(columns)
+                ..link.columns.end.saturating_sub(columns);
+            !link.columns.is_empty()
+        });
+        break;
+    }
+    lines.drain(..start);
 }
 
 /// Rendered transcript lines ready to be replayed into terminal scrollback.
@@ -108,10 +153,12 @@ impl App {
         }
     }
 
-    /// Start retaining initial resume replay rows before they are written to scrollback.
+    /// Start deferring initial resume replay rows before they are written to scrollback.
     ///
     /// Resume replay can insert thousands of already-finalized history cells before the first draw.
-    /// Buffering here lets the same row cap used by resize rebuilds apply to the startup write.
+    /// With a row cap, the replayed cells are rendered once from the transcript tail when the
+    /// replay ends, so the startup write obeys the same cap as a resize rebuild; without one, each
+    /// cell is written as it arrives.
     /// Starting this buffer while an overlay owns rendering would split transcript ownership, so
     /// overlay replay continues through the normal deferred-history path.
     pub(super) fn begin_initial_history_replay_buffer(&mut self) {
@@ -119,7 +166,6 @@ impl App {
             self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
                 render_from_transcript_tail: self.resize_reflow_max_rows().is_some(),
                 transcript_start: self.transcript_cells.len(),
-                ..Default::default()
             });
         }
     }
@@ -132,46 +178,36 @@ impl App {
     pub(super) fn begin_thread_switch_history_replay_buffer(&mut self) {
         if self.resize_reflow_max_rows().is_some() && self.overlay.is_none() {
             self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
-                retained_lines: VecDeque::new(),
                 render_from_transcript_tail: true,
                 transcript_start: self.transcript_cells.len(),
             });
         }
     }
 
-    /// Flush retained initial resume replay rows into terminal scrollback.
+    /// Write the row-capped tail of the replayed transcript into terminal scrollback.
     ///
-    /// The buffer stores display lines, not cells, because the cap is measured in terminal rows.
-    /// This mirrors terminal scrollback behavior and avoids making startup replay cheaper or more
-    /// expensive than a later resize rebuild of the same transcript.
+    /// The tail is rendered from source cells by the resize-reflow renderer, so startup replay
+    /// writes exactly the rows a later resize rebuild of the same transcript would keep.
     pub(super) fn finish_initial_history_replay_buffer(&mut self, tui: &mut tui::Tui) {
         let Some(buffer) = self.initial_history_replay_buffer.take() else {
             return;
         };
-
-        if buffer.retained_lines.is_empty() {
-            if buffer.render_from_transcript_tail {
-                let width = self
-                    .chat_widget
-                    .history_wrap_width(tui.terminal.last_known_screen_size.width);
-                let reflowed_lines = self
-                    .render_transcript_suffix_for_reflow(width, buffer.transcript_start)
-                    .lines;
-                if !reflowed_lines.is_empty() {
-                    tui.insert_history_hyperlink_lines_with_wrap_policy(
-                        reflowed_lines,
-                        self.history_line_wrap_policy(),
-                    );
-                }
-            }
+        if !buffer.render_from_transcript_tail {
             return;
         }
 
-        let retained_lines = buffer.retained_lines.into_iter().collect::<Vec<_>>();
-        tui.insert_history_hyperlink_lines_with_wrap_policy(
-            retained_lines,
-            self.history_line_wrap_policy(),
-        );
+        let width = self
+            .chat_widget
+            .history_wrap_width(tui.terminal.last_known_screen_size.width);
+        let reflowed_lines = self
+            .render_transcript_suffix_for_reflow(width, buffer.transcript_start)
+            .lines;
+        if !reflowed_lines.is_empty() {
+            tui.insert_history_hyperlink_lines_with_wrap_policy(
+                reflowed_lines,
+                self.history_line_wrap_policy(),
+            );
+        }
     }
 
     pub(super) fn insert_history_cell_lines_with_initial_replay_buffer(
@@ -188,25 +224,7 @@ impl App {
             return;
         }
 
-        let display = self.display_lines_for_history_insert(cell, width);
-
-        if display.is_empty() {
-            return;
-        }
-
-        let max_rows = self.resize_reflow_max_rows();
-        if let Some(buffer) = &mut self.initial_history_replay_buffer {
-            if let Some(max_rows) = max_rows {
-                Self::buffer_initial_history_replay_display_lines(buffer, display, max_rows);
-            } else if self.overlay.is_some() {
-                self.deferred_history_lines.extend(display);
-            } else {
-                tui.insert_history_hyperlink_lines_with_wrap_policy(
-                    display,
-                    self.history_line_wrap_policy(),
-                );
-            }
-        }
+        self.insert_history_cell_lines(tui, cell, width);
     }
 
     pub(crate) fn history_line_wrap_policy(&self) -> HistoryLineWrapPolicy {
@@ -214,22 +232,6 @@ impl App {
             HistoryLineWrapPolicy::Terminal
         } else {
             HistoryLineWrapPolicy::PreWrap
-        }
-    }
-
-    /// Retain only the newest rendered rows for initial resume replay.
-    ///
-    /// The oldest rows are dropped first because terminal scrollback caps preserve the tail of the
-    /// transcript. Keeping this policy local to display lines is important: trimming source cells
-    /// here would make copy, transcript overlay, and future replay paths disagree about history.
-    pub(super) fn buffer_initial_history_replay_display_lines(
-        buffer: &mut InitialHistoryReplayBuffer,
-        display: Vec<HyperlinkLine>,
-        max_rows: usize,
-    ) {
-        buffer.retained_lines.extend(display);
-        while buffer.retained_lines.len() > max_rows {
-            buffer.retained_lines.pop_front();
         }
     }
 
@@ -478,6 +480,8 @@ impl App {
         first_cell: usize,
     ) -> ReflowRenderResult {
         let row_cap = self.resize_reflow_max_rows();
+        let terminal_wrap = self.chat_widget.raw_output_mode();
+        let wrap_width = usize::from(width.max(1));
         let mut cell_displays = VecDeque::new();
         let mut rendered_rows = 0usize;
         let mut start = self.transcript_cells.len();
@@ -487,7 +491,11 @@ impl App {
             let cell = self.transcript_cells[start].clone();
             let lines = cell
                 .display_hyperlink_lines_for_mode(width, self.chat_widget.history_render_mode());
-            rendered_rows += lines.len();
+            rendered_rows += if terminal_wrap {
+                lines.iter().map(|line| terminal_row_count(&line.line, wrap_width)).sum::<usize>()
+            } else {
+                lines.len()
+            };
             cell_displays.push_front(ReflowCellDisplay {
                 lines,
                 is_stream_continuation: cell.is_stream_continuation(),
@@ -526,11 +534,13 @@ impl App {
             }
             reflowed_lines.extend(display.lines);
         }
-        if let Some(max_rows) = row_cap
-            && reflowed_lines.len() > max_rows
-        {
-            let trimmed_line_count = reflowed_lines.len() - max_rows;
-            reflowed_lines = reflowed_lines.split_off(trimmed_line_count);
+        if let Some(max_rows) = row_cap {
+            if terminal_wrap {
+                retain_terminal_row_tail(&mut reflowed_lines, wrap_width, max_rows);
+            } else if reflowed_lines.len() > max_rows {
+                let trimmed_line_count = reflowed_lines.len() - max_rows;
+                reflowed_lines = reflowed_lines.split_off(trimmed_line_count);
+            }
         }
         self.has_emitted_history_lines = has_emitted_history_lines || !reflowed_lines.is_empty();
 
@@ -551,5 +561,66 @@ impl App {
                 < self.transcript_cells.len()
             || trailing_run_start::<history_cell::ProposedPlanStreamCell>(&self.transcript_cells)
                 < self.transcript_cells.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal_hyperlinks::TerminalHyperlink;
+    use ratatui::style::Stylize;
+    use ratatui::text::Span;
+
+    #[test]
+    fn raw_row_cap_preserves_wide_boundaries_and_hard_lines() {
+        let mut lines = vec![HyperlinkLine {
+            line: Line::from(vec![Span::raw("界語"), Span::raw("漢字").bold()]),
+            hyperlinks: vec![TerminalHyperlink {
+                columns: 2..8,
+                destination: "https://example.com/".to_string(),
+            }],
+        }];
+        retain_terminal_row_tail(&mut lines, 3, 2);
+        assert_eq!(lines[0].line.to_string(), "漢字");
+        assert_eq!(lines[0].line.spans, vec![Span::raw("漢字").bold()]);
+        assert_eq!(lines[0].hyperlinks[0].columns, 0..4);
+
+        let mut lines = vec![HyperlinkLine::new(Line::from(vec![
+            Span::raw("a👩"), Span::raw("‍💻b").bold(),
+        ]))];
+        retain_terminal_row_tail(&mut lines, 3, 1);
+        assert_eq!(lines[0].line.spans, vec![Span::raw("b").bold()]);
+
+        for (width, source, expected) in [
+            (2, vec!["old", "ab", "cd"], vec!["ab", "cd"]),
+            (0, vec!["old", "e\u{301}xy"], vec!["xy"]),
+            (1, vec!["old", "界語漢"], vec!["語漢"]),
+        ] {
+            let mut lines = source.into_iter().map(HyperlinkLine::from).collect();
+            retain_terminal_row_tail(&mut lines, width, 2);
+            assert_eq!(lines.iter().map(|line| line.line.to_string()).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn raw_row_cap_preserves_graphemes_styles_and_hyperlinks() {
+        let source = HyperlinkLine {
+            line: Line::from(vec![Span::raw("abcd"), Span::raw("👩‍💻e\u{301}xyz").bold()]).cyan(),
+            hyperlinks: vec![TerminalHyperlink {
+                columns: 4..10,
+                destination: "https://example.com/".to_string(),
+            }],
+        };
+        let mut lines = vec![HyperlinkLine::from("old"), source.clone(), HyperlinkLine::from("last")];
+        retain_terminal_row_tail(&mut lines, 4, 3);
+        assert_eq!(lines.iter().map(|line| line.line.to_string()).collect::<Vec<_>>(), vec!["👩‍💻e\u{301}xyz", "last"]);
+        assert_eq!(lines[0].line.style, source.line.style);
+        assert_eq!(lines[0].line.spans[0].style, source.line.spans[1].style);
+        assert_eq!(lines[0].hyperlinks, vec![TerminalHyperlink {
+            columns: 0..6,
+            destination: "https://example.com/".to_string(),
+        }]);
+        retain_terminal_row_tail(&mut lines, 4, 0);
+        assert!(lines.is_empty());
     }
 }

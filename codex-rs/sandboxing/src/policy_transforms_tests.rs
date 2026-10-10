@@ -291,7 +291,7 @@ fn normalize_additional_permissions_drops_empty_nested_profiles() {
 }
 
 #[test]
-fn intersect_permission_profiles_preserves_explicit_empty_requested_reads() {
+fn intersect_permission_profiles_keeps_fully_granted_write_root() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let path = AbsolutePathBuf::from_absolute_path(
         canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
@@ -334,7 +334,7 @@ fn intersect_permission_profiles_drops_ungranted_nonempty_path_requests() {
 }
 
 #[test]
-fn intersect_permission_profiles_drops_explicit_empty_reads_without_grant() {
+fn intersect_permission_profiles_drops_ungranted_write_root() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let path = AbsolutePathBuf::from_absolute_path(
         canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
@@ -758,7 +758,7 @@ fn intersect_permission_profiles_drops_broader_cwd_grant_for_requested_child_pat
 }
 
 #[test]
-fn intersect_permission_profiles_uses_granted_glob_scan_depth() {
+fn intersect_permission_profiles_keeps_the_deeper_glob_scan_depth() {
     let cwd = std::env::current_dir().expect("current dir");
     let root_write = FileSystemSandboxEntry {
         path: FileSystemPath::Special {
@@ -779,7 +779,19 @@ fn intersect_permission_profiles_uses_granted_glob_scan_depth() {
         }),
         ..Default::default()
     };
-    for depth in [std::num::NonZeroUsize::new(4), None] {
+    // The requested bound is 2: a deeper or unbounded grant widens the scan,
+    // and a shallower grant must not shrink it.
+    for (depth, expected_depth) in [
+        (
+            std::num::NonZeroUsize::new(4),
+            std::num::NonZeroUsize::new(4),
+        ),
+        (None, None),
+        (
+            std::num::NonZeroUsize::new(1),
+            std::num::NonZeroUsize::new(2),
+        ),
+    ] {
         let granted = PermissionProfile {
             file_system: Some(FileSystemPermissions {
                 entries: vec![root_write.clone(), deny_env_files.clone()],
@@ -806,7 +818,7 @@ fn intersect_permission_profiles_uses_granted_glob_scan_depth() {
                             access: FileSystemAccessMode::Deny,
                         },
                     ],
-                    glob_scan_max_depth: depth,
+                    glob_scan_max_depth: expected_depth,
                 }),
                 ..Default::default()
             }

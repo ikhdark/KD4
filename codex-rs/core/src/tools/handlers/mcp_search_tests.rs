@@ -55,6 +55,10 @@ fn registered_contract_override_is_not_replaced_by_shared_mcp_spec() {
     let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
     tool.name = "overridden".to_string();
     tool.parameters = codex_tools::JsonSchema::string(Some("Override input".to_string()));
+    let mut expected_namespace = namespace.clone();
+    let ResponsesApiNamespaceTool::Function(expected_tool) = &mut expected_namespace.tools[0];
+    expected_tool.defer_loading = Some(true);
+    expected_tool.output_schema = None;
     let registered = ToolSpec::Namespace(namespace);
     let info = handler.search_info_for_registered_spec(&registered).unwrap();
     assert_eq!(info.entry.callable_title, None);
@@ -62,7 +66,7 @@ fn registered_contract_override_is_not_replaced_by_shared_mcp_spec() {
     assert_eq!(info.entry.tool_names, vec!["overridden"]);
     assert_eq!(
         info.entry.to_loadable_spec(),
-        ToolSearchInfo::from_tool_spec(&registered, None).unwrap().entry.to_loadable_spec()
+        LoadableToolSpec::Namespace(expected_namespace)
     );
 }
 

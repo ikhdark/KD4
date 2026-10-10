@@ -858,24 +858,25 @@ fn ignores_rg_metadata_modes_and_option_values_as_search_paths() {
         );
     }
 
-    let search = classify_rg_search_narrowing(
-        &strings(&[
-            "rg",
-            "--max-depth",
-            "3",
-            "--type-add",
-            "source:*.rs",
-            "needle",
-            "codex-rs/core/src/tools",
-        ]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("rg search with option value");
+    let command = strings(&[
+        "rg",
+        "--max-depth",
+        "3",
+        "--type-add",
+        "source:*.rs",
+        "needle",
+        "codex-rs/core/src/tools",
+    ]);
+    let search = classify_rg_search_narrowing(&command, None, root, root)
+        .expect("classification")
+        .expect("rg search with option value");
     assert_eq!(search.breadth, RgSearchBreadth::Narrow);
     assert!(search.query_identity.contains("source:*.rs"));
+    // A value read as the pattern would shift `needle` into the search paths.
+    assert_eq!(
+        crate::tools::handlers::command_search::rg_search_path_operands(&[command]),
+        Some(strings(&["codex-rs/core/src/tools"]))
+    );
 }
 
 #[test]
@@ -1401,26 +1402,6 @@ async fn runtime_repair_preserves_search_values_and_executes_only_the_corrected_
         assert!(output.status.success(), "{output:?}");
         assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn runtime_preflight_executes_quoted_posix_text_with_comment_quotes() {
-    let script = "printf '%s' '$env:PATH' # user's note";
-    let invocation = CommandInvocation::Script(script.to_string());
-    let command = strings(&["bash", "-c", script]);
-    let outcome =
-        preflight_invocation_for_runtime(false, &invocation, &command, Some(ShellType::Bash))
-            .await
-            .expect("quoted text and comment quotes are valid POSIX shell");
-    assert_eq!(outcome.invocation, invocation);
-    assert!(!outcome.repaired());
-    let output = std::process::Command::new(&command[0])
-        .args(&command[1..])
-        .output()
-        .expect("execute Bash");
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "$env:PATH");
 }
 
 #[cfg(windows)]

@@ -83,14 +83,6 @@ impl FileMatch {
     }
 }
 
-/// Returns the final path component for a matched path, falling back to the full path.
-pub fn file_name_from_path(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
-}
-
 #[derive(Debug)]
 pub struct FileSearchResults {
     pub matches: Vec<FileMatch>,
@@ -927,12 +919,6 @@ mod tests {
     }
 
     #[test]
-    fn file_name_from_path_uses_basename_or_full_path_fallback() {
-        assert_eq!(file_name_from_path("foo/bar.txt"), "bar.txt");
-        assert_eq!(file_name_from_path(""), "");
-    }
-
-    #[test]
     fn nucleo_notifications_are_coalesced_before_queueing() {
         let (work_tx, work_rx) = unbounded();
         let notify_queued = Arc::new(AtomicBool::new(false));
@@ -1362,11 +1348,12 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(inside.join("inside-target.txt"), "inside").unwrap();
         fs::write(outside.join("outside-target.txt"), "outside").unwrap();
-        if !try_symlink_directory(&inside, &workspace.join("inside-link"))
-            || !try_symlink_directory(&outside, &workspace.join("outside-link"))
-        {
-            return;
-        }
+        // Skipping here would report a pass without ever walking a link.
+        assert!(
+            try_symlink_directory(&inside, &workspace.join("inside-link"))
+                && try_symlink_directory(&outside, &workspace.join("outside-link")),
+            "create directory symlinks; enable Developer Mode or run the test elevated"
+        );
 
         let inside_results = run(
             "inside-target",

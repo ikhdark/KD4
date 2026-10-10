@@ -360,12 +360,10 @@ mod pasted_paths_tests {
 
     #[test]
     fn normalize_unc_windows_path() {
-        let input = r"\\\\server\\share\\folder\\file.jpg";
+        // Raw string: exactly two leading backslashes, as a real UNC path is pasted.
+        let input = r"\\server\share\folder\file.jpg";
         let result = normalize_pasted_path(input).expect("should accept UNC windows path");
-        assert_eq!(
-            result,
-            PathBuf::from(r"\\\\server\\share\\folder\\file.jpg")
-        );
+        assert_eq!(result, PathBuf::from(r"\\server\share\folder\file.jpg"));
     }
 
     #[test]

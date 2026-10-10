@@ -1749,6 +1749,14 @@ async fn thread_list_default_sorts_by_created_at() -> Result<()> {
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
+    // Update times run opposite to creation times, so the two orders differ.
+    for (prefix, id, mtime) in [
+        ("2025-01-02T12-00-00", &id_a, "2025-01-03T00:00:00Z"),
+        ("2025-01-01T13-00-00", &id_b, "2025-01-04T00:00:00Z"),
+        ("2025-01-01T12-00-00", &id_c, "2025-01-05T00:00:00Z"),
+    ] {
+        set_rollout_mtime(rollout_path(codex_home.path(), prefix, id).as_path(), mtime)?;
+    }
 
     let mut mcp = init_mcp(codex_home.path()).await?;
 
@@ -1852,8 +1860,10 @@ async fn thread_list_sort_recency_at_uses_state_db_order_with_provider_filter() 
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
+    // The thread that is last by creation and by update time gets the newest
+    // recency, so neither of those orders can produce the expected one.
     set_rollout_mtime(
-        rollout_path(codex_home.path(), "2025-01-01T10-00-00", &id_old).as_path(),
+        rollout_path(codex_home.path(), "2025-01-01T11-00-00", &id_new).as_path(),
         "2025-01-03T00:00:00Z",
     )?;
 
@@ -1885,7 +1895,7 @@ async fn thread_list_sort_recency_at_uses_state_db_order_with_provider_filter() 
     .await?;
     state_db
         .touch_thread_recency_at(
-            ThreadId::from_string(&id_new)?,
+            ThreadId::from_string(&id_old)?,
             DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("timestamp"),
         )
         .await?;
@@ -1906,7 +1916,7 @@ async fn thread_list_sort_recency_at_uses_state_db_order_with_provider_filter() 
         data.iter()
             .map(|thread| thread.id.as_str())
             .collect::<Vec<_>>(),
-        vec![id_new.as_str(), id_old.as_str()]
+        vec![id_old.as_str(), id_new.as_str()]
     );
     assert!(data.iter().all(|thread| thread.recency_at.is_some()));
 

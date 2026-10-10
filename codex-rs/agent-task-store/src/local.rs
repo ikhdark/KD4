@@ -417,6 +417,11 @@ impl LocalAgentTaskStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn wake_revision(&self) -> u64 {
+        *self.wake_revision.borrow()
+    }
+
+    #[cfg(test)]
     pub(crate) fn durable_wake_poll_count(&self) -> u64 {
         self.durable_wake_poller.poll_progress.borrow().1
     }

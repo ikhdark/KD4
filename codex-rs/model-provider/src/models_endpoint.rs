@@ -672,13 +672,14 @@ mod tests {
     #[tokio::test]
     async fn model_transport_pool_is_keyed_by_factory_and_resolves_exact_url() {
         let build_count = Arc::new(AtomicUsize::new(0));
+        let observed_request = Arc::new(Mutex::new(None));
         let endpoint = OpenAiModelsEndpoint {
             model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
                 inner: RouteAwareModelsTransportBuilder::default(),
-                observed_request: Arc::new(Mutex::new(None)),
+                observed_request: Arc::clone(&observed_request),
                 build_count: Arc::clone(&build_count),
             }),
         };
@@ -713,6 +714,15 @@ mod tests {
             )
             .await
             .expect("changed policy should rebuild the transport");
+        assert_eq!(
+            *observed_request
+                .lock()
+                .expect("observed request lock should not be poisoned"),
+            Some((
+                OutboundProxyPolicy::RespectSystemProxy,
+                "https://example.com/models?a=1".to_string(),
+            ))
+        );
         endpoint
             .transport_for(
                 default_factory,
@@ -722,6 +732,15 @@ mod tests {
             .expect("changed factory should rebuild the pool");
 
         assert_eq!(build_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *observed_request
+                .lock()
+                .expect("observed request lock should not be poisoned"),
+            Some((
+                OutboundProxyPolicy::ReqwestDefault,
+                "https://example.com/models?a=2".to_string(),
+            ))
+        );
     }
 
     #[tokio::test]

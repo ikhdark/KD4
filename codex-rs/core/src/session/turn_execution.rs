@@ -861,13 +861,6 @@ impl SamplingRequestSignalState {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ExecutedValidationSummary {
-    pub(crate) count: u32,
-    pub(crate) duration_ms: u64,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct PendingOwnerDrainedContinuation {
     pub(crate) preserved_content: Vec<Value>,
@@ -2095,140 +2088,6 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .saw_validation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn executed_validation_summary(&self) -> ExecutedValidationSummary {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let executed_validation_count = state
-            .validation_ordinals
-            .iter()
-            .filter(|ordinal| {
-                state.outcomes.iter().any(|outcome| {
-                    outcome.ordinal == **ordinal
-                        && outcome.kind != SamplingToolOutcomeKind::Skipped
-                        && !outcome.failure_diagnosis_reused
-                        && !state.replayed_ordinals.contains(ordinal)
-                })
-            })
-            .count();
-        let count = u32::try_from(executed_validation_count).unwrap_or(u32::MAX);
-        let completed_outcome_count = state
-            .outcomes
-            .iter()
-            .filter(|outcome| {
-                !outcome.failure_diagnosis_reused
-                    && !state.replayed_ordinals.contains(&outcome.ordinal)
-            })
-            .count();
-        let duration_is_validation_only = state.child_runtime_sample_count
-            == executed_validation_count
-            && completed_outcome_count
-                == executed_validation_count.saturating_add(state.direct_code_mode_exec_count);
-
-        let keyed_duration = state.child_runtime_by_call.iter()
-            .filter(|(call_id, _)| state.call_ordinals.get(*call_id).is_some_and(|ordinal| {
-                state.validation_ordinals.contains(ordinal)
-                    && !state.replayed_ordinals.contains(ordinal)
-                    && state.outcomes.iter().any(|outcome| outcome.ordinal == *ordinal
-                        && outcome.kind != SamplingToolOutcomeKind::Skipped
-                        && !outcome.failure_diagnosis_reused)
-            }))
-            .fold(0_u64, |total, (_, duration)| total.saturating_add(*duration));
-        ExecutedValidationSummary {
-            count,
-            // Legacy unkeyed fixtures remain conservative. Production samples
-            // are keyed, so unrelated reads cannot inflate validation duration.
-            duration_ms: if !state.child_runtime_by_call.is_empty() {
-                keyed_duration
-            } else if duration_is_validation_only {
-                state.child_runtime_ms
-            } else {
-                0
-            },
-        }
-    }
-
-    /// Whether the request's latest validation proof survived every later
-    /// observation. Probes the live validation, final-verification and
-    /// test-execution classification that gates successful replay.
-    #[cfg(test)]
-    fn fresh_successful_validation(&self) -> bool {
-        let allocated_ordinal_count = self.next_ordinal.load(Ordering::Acquire);
-        let Ok(allocated_count) = usize::try_from(allocated_ordinal_count) else {
-            return false;
-        };
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(latest_validation_ordinal) = state.validation_proof_ordinals.last().copied()
-        else {
-            return false;
-        };
-        let outcome_ordinals = state
-            .outcomes
-            .iter()
-            .map(|outcome| outcome.ordinal)
-            .collect::<BTreeSet<_>>();
-        let terminal_observation_is_valid = state
-            .outcomes
-            .iter()
-            .filter(|outcome| outcome.ordinal > latest_validation_ordinal)
-            .all(|outcome| {
-                if state.final_verification_ordinals.contains(&outcome.ordinal) {
-                    return true;
-                }
-                if state
-                    .structured_actions
-                    .get(&outcome.ordinal)
-                    .is_some_and(|action| {
-                        matches!(
-                            action.class,
-                            StructuredActionClass::BroadSource
-                                | StructuredActionClass::PreciseSource
-                        )
-                    })
-                {
-                    return true;
-                }
-                // Completing an existing plan is bookkeeping, not another
-                // workspace observation that requires repeating the tests.
-                outcome
-                    .plan
-                    .as_ref()
-                    .is_some_and(|plan| !plan.plan.is_empty() && !plan_is_unfinished(plan))
-            });
-        !(state.outcomes.len() != allocated_count
-            || outcome_ordinals.len() != allocated_count
-            || !(0..allocated_ordinal_count).all(|ordinal| outcome_ordinals.contains(&ordinal))
-            || !terminal_observation_is_valid
-            || state
-                .outcomes
-                .iter()
-                .any(|outcome| outcome.kind != SamplingToolOutcomeKind::Success)
-            || state.outcomes.iter().any(|outcome| {
-                state.test_validation_ordinals.contains(&outcome.ordinal) && !outcome.tests_executed
-            })
-            || state.saw_canonical_artifact_requirement
-            || state.saw_coordination
-            || state.suppressed_blocked_wait
-            || !state.authoritative_wait_observations.is_empty()
-            || state
-                .validation_proof_ordinals
-                .iter()
-                .any(|ordinal| !outcome_ordinals.contains(ordinal))
-            || state
-                .mutation_ordinals
-                .range((
-                    std::ops::Bound::Excluded(latest_validation_ordinal),
-                    std::ops::Bound::Unbounded,
-                ))
-                .next()
-                .is_some())
     }
 
     fn generation_purpose(
@@ -4532,15 +4391,6 @@ impl TurnExecutionControl {
 }
 
 #[cfg(test)]
-fn plan_is_unfinished(plan: &UpdatePlanArgs) -> bool {
-    !plan.plan.is_empty()
-        && plan
-            .plan
-            .iter()
-            .any(|item| item.status != StepStatus::Completed)
-}
-
-#[cfg(test)]
 mod tests {
     #[tokio::test]
     async fn verified10_cold_replay_requires_new_watch_and_rejects_mutation() {
@@ -5200,7 +5050,6 @@ mod tests {
         );
         let response = runner_tool_response("reused-validation", "Ran 1 test in 0.01s\n\nOK\n");
         collector.record_replayed_response_result(registration.ordinal, &response);
-        assert_eq!(collector.executed_validation_summary().count, 0);
         assert!(
             !control
                 .observe_progress(&baselines, &collector, &settled(0))
@@ -5225,7 +5074,6 @@ mod tests {
             &response,
             false,
         );
-        assert_eq!(executed.executed_validation_summary().count, 1);
         assert!(
             control
                 .observe_progress(&baselines, &executed, &settled(0))
@@ -5325,6 +5173,19 @@ mod tests {
             assert_eq!(
                 control.evaluate_convergence(&baseline, &first, &settled_state),
                 SamplingConvergenceDecision::default()
+            );
+            // These tools never opt in to failure reuse, so the registration
+            // below cannot be suppressed either way. The gate is what the
+            // retryable flag controls.
+            assert!(!first.state.lock().unwrap().outcomes[0].failure_is_terminal);
+            assert!(
+                control
+                    .dispatch_ledger
+                    .lock()
+                    .unwrap()
+                    .repeated_failure_gate
+                    .is_none(),
+                "retryable {tool_name} failure must not arm suppression"
             );
             let retry = control.collector(&baseline);
             assert!(
@@ -5462,76 +5323,6 @@ mod tests {
     }
 
     #[test]
-    fn executed_validation_summary_requires_a_completed_non_skipped_result() {
-        let control = TurnExecutionControl::new();
-        let baselines = control.baselines(0);
-
-        let registered_only = control.collector(&baselines);
-        registered_only.register_deterministic_tool_call(
-            &ToolName::plain("exec_command"),
-            &ToolPayload::Function {
-                arguments: r#"{"cmd":"cargo test -p codex-core focused"}"#.to_string(),
-            },
-            "registered-only",
-        );
-        registered_only.record_child_runtime(25);
-        assert_eq!(
-            registered_only.executed_validation_summary(),
-            ExecutedValidationSummary::default()
-        );
-
-        let skipped =
-            recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Skipped);
-        skipped.record_child_runtime(50);
-        assert_eq!(
-            skipped.executed_validation_summary(),
-            ExecutedValidationSummary::default()
-        );
-
-        let completed =
-            recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
-        completed.record_child_runtime(125);
-        assert_eq!(
-            completed.executed_validation_summary(),
-            ExecutedValidationSummary {
-                count: 1,
-                duration_ms: 125,
-            }
-        );
-
-        let mixed = control.collector(&baselines);
-        record_invocation_result(
-            &mixed,
-            ToolName::plain("read_tool_output"),
-            ToolPayload::Function {
-                arguments: r#"{"artifact_id":"artifact-1"}"#.to_string(),
-            },
-            "read-call",
-            ToolOutputOutcome::Success,
-        );
-        mixed.record_child_runtime_for_call("read-call", 10);
-        record_invocation_result(
-            &mixed,
-            ToolName::plain("exec_command"),
-            ToolPayload::Function {
-                arguments: r#"{"cmd":"cargo test -p codex-core focused"}"#.to_string(),
-            },
-            "mixed-validation",
-            ToolOutputOutcome::Success,
-        );
-        mixed.record_child_runtime_for_call("mixed-validation", 100);
-        mixed.record_child_runtime_for_call("mixed-validation", 100);
-        assert_eq!(
-            mixed.executed_validation_summary(),
-            ExecutedValidationSummary {
-                count: 1,
-                duration_ms: 100,
-            },
-            "only the validation call contributes, even if its timing is observed twice"
-        );
-    }
-
-    #[test]
     fn registered_semantics_classify_aliases_and_reject_name_spoofing() {
         use crate::tools::registry::CommandArgumentFormat;
         use crate::tools::registry::ToolSemanticCapabilities;
@@ -5555,9 +5346,12 @@ mod tests {
             ToolPayload::Function { arguments: r#"{"cmd":"cargo check -p codex-core"}"#.into() },
             "not-a-command-runtime", ToolOutputOutcome::Success,
         );
-        assert_eq!(collector.executed_validation_summary(), ExecutedValidationSummary {
-            count: 1, duration_ms: 25,
-        });
+        {
+            // Only the alias with command semantics is classified as validation.
+            let state = collector.state.lock().unwrap();
+            assert_eq!(state.validation_ordinals.len(), 1);
+            assert_eq!(state.child_runtime_by_call.get("alias-check"), Some(&25));
+        }
         let edit = ToolName::plain("custom_editor");
         collector.register_runtime_semantics(&edit, ToolSemanticCapabilities {
             mutation: true, coordination: true, command: None,
@@ -5580,7 +5374,7 @@ mod tests {
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &collector, &settled_state);
 
-        assert!(collector.fresh_successful_validation());
+        assert_eq!(control.validated_mutation_revision, Some(0));
         let decision = control.evaluate_convergence(&baselines, &collector, &settled_state);
         assert_eq!(
             decision.continuation,
@@ -5655,14 +5449,15 @@ mod tests {
             control.settle(&baselines, &collector, &settled_state);
 
             assert_eq!(
-                collector.executed_validation_summary(),
-                ExecutedValidationSummary {
-                    count: 1,
-                    duration_ms: 25
-                },
+                collector.state.lock().unwrap().validation_ordinals.len(),
+                1,
                 "{tool}: {arguments}"
             );
-            assert!(collector.fresh_successful_validation());
+            assert_eq!(
+                control.validated_mutation_revision,
+                Some(0),
+                "{tool}: {arguments}"
+            );
             let decision = control.evaluate_convergence(&baselines, &collector, &settled_state);
             assert_eq!(
                 decision.continuation,
@@ -5753,7 +5548,7 @@ mod tests {
                     }
                     control.settle(&baselines, &collector, &settled(0));
                     assert!(
-                        !collector.fresh_successful_validation(),
+                        control.validated_mutation_revision.is_none(),
                         "{arguments}; nested={nested}"
                     );
                     let next = control.collector(&control.baselines(0));
@@ -5775,6 +5570,9 @@ mod tests {
 
     #[test]
     fn metadata_cannot_turn_non_validation_commands_into_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let dependencies = BTreeSet::from([SourceDependencyV1::new(&root.path().join("src"), true)]);
+        let tool = ToolName::plain("exec_command");
         for command in [
             "git status --short",
             "echo 'python -m unittest -q'",
@@ -5785,22 +5583,35 @@ mod tests {
             let baselines = control.baselines(0);
             let settled_state = settled(0);
             let collector = control.collector(&baselines);
-            record_invocation_result(
-                &collector,
-                ToolName::plain("exec_command"),
-                ToolPayload::Function {
-                    arguments: json!({
-                        "cmd": command,
-                        "validation": {"covered_paths": ["src"]},
-                    })
-                    .to_string(),
-                },
-                "not-validation",
-                ToolOutputOutcome::Success,
+            let payload = ToolPayload::Function {
+                arguments: json!({
+                    "cmd": command,
+                    "validation": {"covered_paths": ["src"]},
+                })
+                .to_string(),
+            };
+            // The dispatcher attaches attribution before recording. Known
+            // dependencies let a declared path become a scope that settlement
+            // would admit as proof.
+            let signal = validation_scope_signal(
+                &tool, &payload, None, Some(&dependencies), root.path(), "local",
+            );
+            let ordinal = collector
+                .register_deterministic_tool_call(&tool, &payload, "not-validation")
+                .ordinal;
+            collector.record_response_result(
+                ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                signal,
+                &successful_tool_response("not-validation", r#"{"status":"complete"}"#),
+                false,
             );
             control.settle(&baselines, &collector, &settled_state);
-            assert_eq!(collector.executed_validation_summary().count, 0);
-            assert!(!collector.fresh_successful_validation(), "{command}");
+            assert!(
+                collector.state.lock().unwrap().validation_ordinals.is_empty(),
+                "{command}"
+            );
+            assert!(control.validated_mutation_revision.is_none(), "{command}");
         }
     }
 
@@ -5833,8 +5644,8 @@ mod tests {
             });
             control.settle(&baselines, &collector, &settled_state);
             assert_eq!(
-                collector.fresh_successful_validation(),
-                outcome == ToolOutputOutcome::Success,
+                control.validated_mutation_revision,
+                (outcome == ToolOutputOutcome::Success).then_some(0),
                 "{outcome:?}"
             );
         }
@@ -5850,7 +5661,7 @@ mod tests {
             let collector = recorded_validation_collector(&control, &baselines, outcome);
             control.settle(&baselines, &collector, &settled_state);
 
-            assert!(!collector.fresh_successful_validation());
+            assert!(control.validated_mutation_revision.is_none());
         }
 
         let mut control = TurnExecutionControl::new();
@@ -5864,12 +5675,12 @@ mod tests {
             "incomplete-validation",
         );
         control.settle(&baselines, &collector, &settled_state);
-        assert!(!collector.fresh_successful_validation());
+        assert!(control.validated_mutation_revision.is_none());
     }
 
     #[test]
     fn final_diff_status_observation_requires_exact_git_executable() {
-        for (program, preserves_validation) in [
+        for (program, final_verification) in [
             ("git", true),
             ("git.exe", true),
             ("GIT.EXE", true),
@@ -5893,11 +5704,9 @@ mod tests {
                 "final-diff-status",
                 ToolOutputOutcome::Success,
             );
-            let settled_state = settled(0);
-            control.settle(&baselines, &collector, &settled_state);
             assert_eq!(
-                collector.fresh_successful_validation(),
-                preserves_validation,
+                collector.state.lock().unwrap().final_verification_ordinals.len(),
+                usize::from(final_verification),
                 "executable: {program}"
             );
         }
@@ -5948,7 +5757,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_final_observations_do_not_preserve_validation_proof() {
+    fn unsafe_final_observations_are_not_classified_as_final_verification() {
         {
             let extra_payload = ToolPayload::Function {
                 arguments:
@@ -5974,10 +5783,12 @@ mod tests {
                 "extra-final-observation",
                 ToolOutputOutcome::Success,
             );
-            let settled_state = settled(0);
-            control.settle(&baselines, &collector, &settled_state);
 
-            assert!(!collector.fresh_successful_validation());
+            // Only the exact read-only pair counts as a final verification.
+            assert_eq!(
+                collector.state.lock().unwrap().final_verification_ordinals.len(),
+                1
+            );
         }
         assert!(!final_diff_status_script_is_read_only(
             "git diff --check | Out-File result.txt; git status --short"
@@ -6008,7 +5819,8 @@ mod tests {
             ToolOutputOutcome::Success,
         );
         control.settle(&recovery_baselines, &recovered, &settled(0));
-        assert!(recovered.fresh_successful_validation());
+        assert_eq!(control.validated_mutation_revision, Some(0));
+        assert!(control.failed_validation_checks.is_empty());
         assert_eq!(
             control
                 .evaluate_convergence(&recovery_baselines, &recovered, &settled(0))
@@ -6515,7 +6327,7 @@ mod tests {
             recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
         control.settle(&baselines, &collector, &settled_state);
 
-        assert!(collector.fresh_successful_validation());
+        assert_eq!(control.validated_mutation_revision, Some(0));
         assert_eq!(
             control
                 .evaluate_convergence(&baselines, &collector, &settled_state)
@@ -6549,8 +6361,12 @@ mod tests {
             let collector =
                 recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
             let settled_state = settled(revision);
-            assert!(collector.fresh_successful_validation(), "{scenario}");
             control.settle(&baselines, &collector, &settled_state);
+            assert_eq!(
+                control.validated_mutation_revision,
+                Some(revision),
+                "{scenario}"
+            );
             if scenario == "new input" {
                 control.input_revision += 1;
             }
@@ -6891,7 +6707,9 @@ mod tests {
 
     #[test]
     fn completion_gaps_are_reported_without_automatic_repair_directives() {
-        for mode in ["explicit", "native-text", "native-receipt"] {
+        // A native receipt always designates its text: the owner-result
+        // constructor rejects a receipt-only report before an observation exists.
+        for mode in ["explicit", "native-text"] {
             let mut control = TurnExecutionControl::new();
             let before = control.baselines(0);
             let validation = recorded_validation_collector(&control, &before, ToolOutputOutcome::Success);
@@ -6908,8 +6726,9 @@ mod tests {
                 }
                 collector
             } else {
-                let message = (mode == "native-text").then_some("verified answer");
-                let collector = authoritative_wait_collector(&control, &baselines, "native", false, message);
+                let collector = authoritative_wait_collector(
+                    &control, &baselines, "native", false, Some("verified answer"),
+                );
                 {
                     let mut state = collector.state.lock().unwrap();
                     state.authoritative_wait_observations[0].result.adapter = "agent_job_report".into();
@@ -6918,14 +6737,10 @@ mod tests {
                 collector
             };
             let stale = control.evaluate_convergence(&baselines, &receipt, &settled(1));
-            let expected = if mode == "native-receipt" {
-                ContinuationDisposition::TerminalCompletionRequired
-            } else {
-                ContinuationDisposition::SurfaceExistingResult
-            };
+            let expected = ContinuationDisposition::SurfaceExistingResult;
             assert!(!control.completion_gaps(1).is_empty());
             assert_eq!(stale.continuation, expected);
-            assert!(!stale.directive.as_deref().unwrap_or_default().contains("Completion preflight"));
+            assert_eq!(stale.directive, None, "{mode}");
             let failed = recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Failure);
             control.settle(&baselines, &failed, &settled(1));
             assert_eq!(control.evaluate_convergence(&baselines, &receipt, &settled(1)).continuation,
@@ -6933,13 +6748,8 @@ mod tests {
             assert!(!control.completion_gaps(1).is_empty());
             let passed = recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
             control.settle(&baselines, &passed, &settled(1));
-            let expected = if mode == "native-receipt" {
-                ContinuationDisposition::TerminalCompletionRequired
-            } else {
-                ContinuationDisposition::SurfaceExistingResult
-            };
             assert_eq!(control.evaluate_convergence(&baselines, &receipt, &settled(1)).continuation,
-                expected, "fresh evidence surfaces or synthesizes from the existing receipt");
+                expected, "fresh evidence surfaces the existing receipt");
             settle_plan(&mut control, plan(&[StepStatus::Pending]));
             let pending = control.baselines(1);
             assert_eq!(control.evaluate_convergence(&pending, &receipt, &settled(1)).continuation,
@@ -7925,9 +7735,18 @@ mod tests {
             failure_fingerprint: "prior.poll.failure".to_string(),
         });
 
+        // Take the contract from the real handler: a write_stdin runtime that
+        // opted in to failure reuse would hit the gate installed above.
+        use crate::tools::registry::CoreToolRuntime;
+        let reuse = crate::tools::handlers::WriteStdinHandler::default().terminal_failure_reuse();
         assert!(
             collector
-                .register_deterministic_tool_call(&tool_name, &payload, "poll-again")
+                .register_deterministic_tool_call_with_reuse(
+                    &tool_name,
+                    &payload,
+                    "poll-again",
+                    reuse,
+                )
                 .suppressed_failure
                 .is_none(),
             "a live process can recover without changing the poll arguments"
@@ -8815,9 +8634,14 @@ mod tests {
             let baselines = control.baselines(0);
             let collector = control.collector(&baselines);
             let tool = ToolName::plain("exec_command");
-            let payload = validation_proof_payload();
+            // A replayable read with retention dependencies, so a failure
+            // stored as a success would actually seed a replay.
+            let payload = ToolPayload::Function {
+                arguments: r#"{"cmd":"cat src/lib.rs"}"#.to_string(),
+            };
             let registration =
                 collector.register_deterministic_tool_call(&tool, &payload, "failed");
+            record_test_replay_dependencies(&collector, registration.ordinal);
             collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
@@ -8831,12 +8655,17 @@ mod tests {
                 false,
             );
             assert_eq!(collector.snapshot()[0].kind, expected, "{signal_name}");
+            {
+                let state = collector.state.lock().unwrap();
+                assert!(state.successful_replay_evidence.contains_key(&registration.ordinal));
+                assert!(state.successful_replay_responses.is_empty(), "{signal_name}");
+            }
             control.settle(&baselines, &collector, &settled(0));
-            assert_ne!(
+            assert_eq!(
                 control
                     .evaluate_convergence(&baselines, &collector, &settled(0))
                     .continuation,
-                ContinuationDisposition::TerminalCompletionRequired,
+                ContinuationDisposition::ModelRequired,
                 "{signal_name}",
             );
             let retry = control.collector(&control.baselines(0));
@@ -8844,7 +8673,8 @@ mod tests {
                 retry
                     .register_deterministic_tool_call(&tool, &payload, "retry")
                     .replayed_success
-                    .is_none()
+                    .is_none(),
+                "{signal_name}"
             );
         }
     }
@@ -9027,16 +8857,28 @@ mod tests {
             "mutation-before-validation",
             ToolOutputOutcome::Success,
         );
-        record_invocation_result(
-            &collector,
-            ToolName::plain("exec_command"),
-            validation_proof_payload(),
-            "validation-after-mutation",
-            ToolOutputOutcome::Success,
+        // The dispatcher stamps a validation with the revision it executed at;
+        // call order inside one request is not the freshness proof.
+        let ordinal = collector
+            .register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &validation_proof_payload(),
+                "validation-after-mutation",
+            )
+            .ordinal;
+        let mut signal = test_execution_signal();
+        signal["validation_mutation_revision"] = json!(1);
+        collector.record_response_result(
+            ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(signal),
+            &runner_tool_response("validation-after-mutation", "Ran 1 test in 0.001s\nOK"),
+            false,
         );
         let mutation_settled = settled(1);
         validated_after_mutation.settle(&baselines, &collector, &mutation_settled);
-        assert!(collector.fresh_successful_validation());
+        assert_eq!(validated_after_mutation.validated_mutation_revision, Some(1));
+        assert!(validated_after_mutation.completion_gaps(1).is_empty());
         assert_eq!(
             validated_after_mutation
                 .evaluate_convergence(&baselines, &collector, &mutation_settled)
@@ -9069,7 +8911,13 @@ mod tests {
         );
         let mutation_settled = settled(1);
         mutated_after_validation.settle(&baselines, &collector, &mutation_settled);
-        assert!(!collector.fresh_successful_validation());
+        assert_eq!(mutated_after_validation.validated_mutation_revision, Some(0));
+        assert!(
+            mutated_after_validation
+                .completion_gaps(1)
+                .iter()
+                .any(|gap| gap.contains("workspace changed"))
+        );
 
         let mut observed_after_validation = TurnExecutionControl::new();
         settle_plan(
@@ -9093,7 +8941,8 @@ mod tests {
         );
         let settled_state = settled(0);
         observed_after_validation.settle(&baselines, &collector, &settled_state);
-        assert!(collector.fresh_successful_validation());
+        assert_eq!(observed_after_validation.validated_mutation_revision, Some(0));
+        assert!(observed_after_validation.completion_gaps(0).is_empty());
         assert_eq!(
             observed_after_validation
                 .evaluate_convergence(&baselines, &collector, &settled_state)
@@ -9896,7 +9745,12 @@ mod tests {
                 );
             }
             control.settle(&baselines, &collector, &settled(0));
-            assert!(collector.fresh_successful_validation(), "{commands:?}");
+            assert_eq!(
+                control.validated_mutation_revision,
+                Some(0),
+                "{commands:?}"
+            );
+            assert!(control.completion_gaps(0).is_empty(), "{commands:?}");
             assert_eq!(
                 control
                     .evaluate_convergence(&baselines, &collector, &settled(0))

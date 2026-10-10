@@ -179,7 +179,7 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_archive_move_failure_preserves_loaded_thread() -> Result<()> {
+async fn thread_archive_move_failure_leaves_thread_resumable() -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
 
     let server = create_mock_responses_server_repeating_assistant("Done").await;
@@ -232,6 +232,19 @@ async fn thread_archive_move_failure_preserves_loaded_thread() -> Result<()> {
     // Archive must quiesce the writer before moving its rollout. A failed
     // move leaves the durable thread active and resumable, not a live writer.
     drop(_rollout_lock);
+    let loaded_id = mcp
+        .send_thread_loaded_list_request(codex_app_server_protocol::ThreadLoadedListParams::default())
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(loaded_id)),
+    )
+    .await??;
+    let loaded: codex_app_server_protocol::ThreadLoadedListResponse = to_response(response)?;
+    assert!(
+        !loaded.data.contains(&thread.id),
+        "the thread was unloaded before the move was attempted"
+    );
     let resume_id = mcp.send_thread_resume_request(ThreadResumeParams {
         thread_id: thread.id.clone(),
         ..Default::default()

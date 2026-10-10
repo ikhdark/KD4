@@ -33,14 +33,31 @@ pub const PROTECTED_METADATA_PATH_NAMES: &[&str] = &[
 
 /// Returns true when a path basename is one of the protected workspace metadata names.
 pub fn is_protected_metadata_name(name: &OsStr) -> bool {
-    PROTECTED_METADATA_PATH_NAMES
-        .iter()
-        .any(|metadata_name| name == OsStr::new(metadata_name))
+    metadata_path_name(name).is_some()
 }
 
 pub fn is_protected_metadata_directory_name(name: &OsStr) -> bool {
-    name == OsStr::new(PROTECTED_METADATA_AGENTS_PATH_NAME)
-        || name == OsStr::new(PROTECTED_METADATA_CODEX_PATH_NAME)
+    path_component_matches(name, OsStr::new(PROTECTED_METADATA_AGENTS_PATH_NAME))
+        || path_component_matches(name, OsStr::new(PROTECTED_METADATA_CODEX_PATH_NAME))
+}
+
+pub(crate) fn path_component_matches(left: &OsStr, right: &OsStr) -> bool {
+    if cfg!(windows) {
+        left.as_encoded_bytes().eq_ignore_ascii_case(right.as_encoded_bytes())
+    } else {
+        left == right
+    }
+}
+
+/// Denial checks must also cover Windows case aliases of not-yet-created paths.
+/// Compare complete components, not string prefixes; do not broaden write grants.
+pub(crate) fn path_is_within_denied_root(path: &Path, root: &Path) -> bool {
+    let mut components = path.components();
+    root.components().all(|root_component| {
+        components.next().is_some_and(|component| {
+            path_component_matches(component.as_os_str(), root_component.as_os_str())
+        })
+    })
 }
 
 /// Returns the protected workspace metadata name when an agent write to `path`
@@ -341,7 +358,7 @@ impl ReadDenyMatcher {
         if self.denied_candidates.iter().any(|denied_candidates| {
             path_candidates.iter().any(|candidate| {
                 denied_candidates.iter().any(|denied_candidate| {
-                    candidate == denied_candidate || candidate.starts_with(denied_candidate)
+                    path_is_within_denied_root(candidate, denied_candidate)
                 })
             })
         }) {
@@ -1747,7 +1764,7 @@ fn metadata_path_name(name: &OsStr) -> Option<&'static str> {
     PROTECTED_METADATA_PATH_NAMES
         .iter()
         .copied()
-        .find(|metadata_name| name == OsStr::new(metadata_name))
+        .find(|metadata_name| path_component_matches(name, OsStr::new(metadata_name)))
 }
 
 fn metadata_child_of_writable_root(
@@ -1913,6 +1930,7 @@ mod tests {
 
     #[test]
     fn workspace_write_ignores_legacy_slash_tmp_setting_on_windows() {
+        let mut projections = Vec::new();
         for exclude_slash_tmp in [false, true] {
             let legacy = SandboxPolicy::WorkspaceWrite {
                 writable_roots: Vec::new(),
@@ -1937,7 +1955,10 @@ mod tests {
                     )
                 }));
             }
+            projections.push((profile_policy, runtime_policy));
         }
+        // The flag changes nothing at all, not merely the `:slash_tmp` entry.
+        assert_eq!(projections[0], projections[1]);
     }
 
     #[test]
@@ -2071,6 +2092,65 @@ mod tests {
         assert!(!writable_roots[0].is_path_writable(&dot_git_config));
         assert!(!writable_roots[0].is_path_writable(&dot_agents_config));
         assert!(!writable_roots[0].is_path_writable(&dot_codex_config));
+
+        // Ordinary children stay writable, so the denials above are specific to metadata.
+        assert!(
+            file_system_policy
+                .can_write_path_with_cwd(&cwd.path().join("src").join("main.rs"), cwd.path())
+        );
+        assert!(writable_roots[0].is_path_writable(writable_roots[0].root.join("src").as_path()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_write_checks_reject_case_aliases_for_missing_children() {
+        let cwd = TempDir::new().expect("tempdir");
+        let root = AbsolutePathBuf::from_absolute_path(cwd.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path { path: root },
+            access: FileSystemAccessMode::Write,
+        }]);
+        for name in PROTECTED_METADATA_PATH_NAMES {
+            std::fs::create_dir(cwd.path().join(name)).expect("create protected directory");
+            let alias = cwd.path().join(name.to_ascii_uppercase());
+            assert!(alias.is_dir(), "the alias addresses the protected directory");
+            let target = alias.join("new-file");
+            assert!(!target.exists());
+            assert_eq!(
+                forbidden_agent_metadata_write(&target, cwd.path(), &policy),
+                Some(*name),
+            );
+            assert!(!policy.can_write_path_with_cwd(&target, cwd.path()));
+            assert!(is_protected_metadata_name(alias.file_name().unwrap()));
+            assert!(policy.get_writable_roots_with_cwd(cwd.path()).iter()
+                .all(|root| !root.is_path_writable(&target)));
+            assert!(policy.can_write_path_with_cwd(
+                &cwd.path().join(format!("{name}-unrelated")).join("new-file"), cwd.path(),
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_deny_matcher_rejects_case_aliases_for_missing_children() {
+        let cwd = TempDir::new().expect("tempdir");
+        let denied = cwd.path().join("private");
+        std::fs::create_dir(&denied).expect("create denied directory");
+        let alias = cwd.path().join("PRIVATE");
+        assert!(alias.is_dir(), "the alias addresses the denied directory");
+        let target = alias.join("not-created-yet.txt");
+        assert!(!target.exists());
+        let policy = deny_policy(&denied);
+        let matcher = ReadDenyMatcher::new(&policy, cwd.path()).expect("deny matcher");
+        assert!(matcher.is_read_denied(&target));
+        assert!(!matcher.is_read_denied(&cwd.path().join("PRIVATE-sibling/file")));
+        let writable = WritableRoot {
+            root: AbsolutePathBuf::from_absolute_path(cwd.path()).unwrap(),
+            read_only_subpaths: vec![AbsolutePathBuf::from_absolute_path(&denied).unwrap()],
+            protected_metadata_names: Vec::new(),
+        };
+        assert!(!writable.is_path_writable(&target));
+        assert!(writable.is_path_writable(&cwd.path().join("PRIVATE-sibling/file")));
     }
 
     #[test]
@@ -2229,6 +2309,38 @@ mod tests {
             legacy_workspace_write
                 .needs_direct_runtime_enforcement(NetworkSandboxPolicy::Restricted, cwd.path(),),
             "metadata-name protections must stay in the direct enforcement path even when legacy concrete read-only paths match"
+        );
+
+        // Both policies above are already classified by their missing metadata paths. With
+        // the metadata directories present the legacy bridge represents workspace-write
+        // exactly, so only the nested carveout decides.
+        let canonical_cwd = canonicalize_preserving_symlinks(cwd.path()).expect("canonicalize cwd");
+        for name in [".git", ".agents"] {
+            std::fs::create_dir(canonical_cwd.join(name)).expect("create metadata directory");
+        }
+        let legacy_policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        };
+        let representable =
+            legacy_runtime_file_system_policy_for_cwd(&legacy_policy, &canonical_cwd);
+        assert!(
+            !representable
+                .needs_direct_runtime_enforcement(NetworkSandboxPolicy::Restricted, &canonical_cwd),
+            "a policy the legacy bridge represents exactly needs no direct enforcement"
+        );
+        let mut carved = representable;
+        carved.entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::resolve_path_against_base("docs", &canonical_cwd),
+            },
+            access: FileSystemAccessMode::Read,
+        });
+        assert!(
+            carved.needs_direct_runtime_enforcement(NetworkSandboxPolicy::Restricted, &canonical_cwd),
+            "the nested read-only carveout is the only difference from the legacy projection"
         );
     }
 
@@ -2424,6 +2536,22 @@ mod tests {
             .with_additional_readable_roots(cwd.path(), std::slice::from_ref(&cwd_root));
 
         assert_eq!(actual, policy);
+
+        // Control: a root outside the existing grant is appended, so the skip is not a no-op.
+        let outside_dir = TempDir::new().expect("outside tempdir");
+        let outside =
+            AbsolutePathBuf::from_absolute_path(outside_dir.path()).expect("absolute outside");
+        let mut expected = policy.clone();
+        expected.entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: outside.clone(),
+            },
+            access: FileSystemAccessMode::Read,
+        });
+        assert_eq!(
+            policy.with_additional_readable_roots(cwd.path(), std::slice::from_ref(&outside)),
+            expected
+        );
     }
 
     #[test]
@@ -2784,6 +2912,12 @@ mod tests {
 
         assert!(is_read_denied(&literal, &policy, temp.path()));
         assert!(is_read_denied(&other, &policy, temp.path()));
+        // A malformed pattern fails closed and denies every path, so prove one stays readable.
+        assert!(!is_read_denied(
+            &temp.path().join("notes.md"),
+            &policy,
+            temp.path()
+        ));
     }
 
     #[test]
@@ -2799,6 +2933,12 @@ mod tests {
         ));
 
         assert!(is_read_denied(&denied, &policy, temp.path()));
+        // `?` is exactly one character; a fail-closed matcher would deny this path too.
+        assert!(!is_read_denied(
+            &temp.path().join("private").join("secret12.txt"),
+            &policy,
+            temp.path()
+        ));
     }
 
     #[test]

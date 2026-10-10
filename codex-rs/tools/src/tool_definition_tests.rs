@@ -29,15 +29,3 @@ fn renamed_overrides_name_only() {
         }
     );
 }
-
-#[test]
-fn into_deferred_drops_output_schema_and_sets_defer_loading() {
-    assert_eq!(
-        tool_definition().into_deferred(),
-        ToolDefinition {
-            output_schema: None,
-            defer_loading: true,
-            ..tool_definition()
-        }
-    );
-}

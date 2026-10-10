@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
@@ -24,6 +25,8 @@ use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
+use codex_app_server_protocol::McpServerStartupState;
+use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
@@ -169,8 +172,8 @@ async fn mcp_server_openai_form_elicitation_round_trip() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn openai_form_capability_follows_the_turn_starting_connection() -> Result<()> {
-    let (responses_server, response_mock, apps_server_url, apps_server_handle) =
-        start_elicitation_services(ElicitationScenario::OpenAiForm).await?;
+    let (responses_server, response_mock, apps_server_url, apps_server_handle, openai_form_advertised) =
+        start_elicitation_services(ElicitationScenario::OpenAiForm, /*warmup_turns*/ 2).await?;
     let codex_home = TempDir::new()?;
     write_config_toml(codex_home.path(), &responses_server.uri(), &apps_server_url)?;
     write_chatgpt_auth(
@@ -183,17 +186,17 @@ async fn openai_form_capability_follows_the_turn_starting_connection() -> Result
     )?;
 
     let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
-    let mut supported_client = connect_websocket(bind_addr).await?;
+    let mut unsupported_client = connect_websocket(bind_addr).await?;
     initialize_websocket_client(
-        &mut supported_client,
+        &mut unsupported_client,
         /*id*/ 1,
-        "supported-client",
-        /*supports_openai_form_elicitation*/ true,
+        "unsupported-client",
+        /*supports_openai_form_elicitation*/ false,
     )
     .await?;
 
     send_request(
-        &mut supported_client,
+        &mut unsupported_client,
         "thread/start",
         /*id*/ 2,
         Some(serde_json::to_value(ThreadStartParams {
@@ -203,10 +206,10 @@ async fn openai_form_capability_follows_the_turn_starting_connection() -> Result
     )
     .await?;
     let ThreadStartResponse { thread, .. } =
-        to_response(read_response_for_id(&mut supported_client, /*id*/ 2).await?)?;
+        to_response(read_response_for_id(&mut unsupported_client, /*id*/ 2).await?)?;
 
     send_request(
-        &mut supported_client,
+        &mut unsupported_client,
         "turn/start",
         /*id*/ 3,
         Some(serde_json::to_value(TurnStartParams {
@@ -221,24 +224,33 @@ async fn openai_form_capability_follows_the_turn_starting_connection() -> Result
     )
     .await?;
     let _: TurnStartResponse =
-        to_response(read_response_for_id(&mut supported_client, /*id*/ 3).await?)?;
+        to_response(read_response_for_id(&mut unsupported_client, /*id*/ 3).await?)?;
     let _: TurnCompletedNotification = serde_json::from_value(
-        read_notification_for_method(&mut supported_client, "turn/completed")
+        read_notification_for_method(&mut unsupported_client, "turn/completed")
             .await?
             .params
             .expect("turn/completed params"),
     )?;
+    let advertised_before_supported_turn = openai_form_advertised
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(
+        !advertised_before_supported_turn.is_empty()
+            && !advertised_before_supported_turn.contains(&true),
+        "the thread must start without the capability: {advertised_before_supported_turn:?}"
+    );
 
-    let mut unsupported_client = connect_websocket(bind_addr).await?;
+    let mut supported_client = connect_websocket(bind_addr).await?;
     initialize_websocket_client(
-        &mut unsupported_client,
+        &mut supported_client,
         /*id*/ 4,
-        "unsupported-client",
-        /*supports_openai_form_elicitation*/ false,
+        "supported-client",
+        /*supports_openai_form_elicitation*/ true,
     )
     .await?;
     send_request(
-        &mut unsupported_client,
+        &mut supported_client,
         "thread/resume",
         /*id*/ 5,
         Some(serde_json::to_value(ThreadResumeParams {
@@ -247,12 +259,61 @@ async fn openai_form_capability_follows_the_turn_starting_connection() -> Result
         })?),
     )
     .await?;
-    let _ = read_response_for_id(&mut unsupported_client, /*id*/ 5).await?;
+    let _ = read_response_for_id(&mut supported_client, /*id*/ 5).await?;
 
+    // The capability change reconnects the MCP servers without blocking the turn, so wait for
+    // both the turn and the reconnected apps server before using its tools.
     send_request(
         &mut supported_client,
         "turn/start",
         /*id*/ 6,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Refresh connectors.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        let mut turn_completed = false;
+        let mut apps_reconnected = false;
+        while !turn_completed || !apps_reconnected {
+            let JSONRPCMessage::Notification(notification) =
+                read_jsonrpc_message(&mut supported_client).await?
+            else {
+                continue;
+            };
+            match notification.method.as_str() {
+                "turn/completed" => turn_completed = true,
+                "mcpServer/startupStatus/updated" => {
+                    let update: McpServerStatusUpdatedNotification = serde_json::from_value(
+                        notification.params.expect("MCP startup status params"),
+                    )?;
+                    apps_reconnected |= update.name == "codex_apps"
+                        && update.status == McpServerStartupState::Ready
+                        && openai_form_advertised
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains(&true);
+                }
+                _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("codex_apps did not reconnect with openai/form after the capability change")
+    })??;
+
+    send_request(
+        &mut supported_client,
+        "turn/start",
+        /*id*/ 7,
         Some(serde_json::to_value(TurnStartParams {
             thread_id: thread.id.clone(),
             input: vec![V2UserInput::Text {
@@ -265,7 +326,7 @@ async fn openai_form_capability_follows_the_turn_starting_connection() -> Result
     )
     .await?;
     let TurnStartResponse { turn } =
-        to_response(read_response_for_id(&mut supported_client, /*id*/ 6).await?)?;
+        to_response(read_response_for_id(&mut supported_client, /*id*/ 7).await?)?;
 
     let (request_id, params) = loop {
         let JSONRPCMessage::Request(request) = read_jsonrpc_message(&mut supported_client).await?
@@ -322,7 +383,7 @@ async fn openai_form_capability_follows_the_turn_starting_connection() -> Result
     assert_eq!(completed.thread_id, thread.id);
     assert_eq!(completed.turn.id, turn.id);
     assert_eq!(completed.turn.status, TurnStatus::Completed);
-    assert_eq!(response_mock.requests().len(), 3);
+    assert_eq!(response_mock.requests().len(), 4);
 
     process.kill().await?;
     apps_server_handle.abort();
@@ -360,41 +421,53 @@ async fn initialize_websocket_client(
 
 async fn start_elicitation_services(
     scenario: ElicitationScenario,
-) -> Result<(wiremock::MockServer, ResponseMock, String, JoinHandle<()>)> {
+    warmup_turns: usize,
+) -> Result<(
+    wiremock::MockServer,
+    ResponseMock,
+    String,
+    JoinHandle<()>,
+    OpenAiFormAdvertisements,
+)> {
     let responses_server = responses::start_mock_server().await;
     let tool_call_arguments = serde_json::to_string(&json!({}))?;
-    let response_mock = responses::mount_sse_sequence(
-        &responses_server,
-        vec![
+    let mut sse_responses = (0..warmup_turns)
+        .map(|turn| {
+            let response_id = format!("resp-warmup-{turn}");
             responses::sse(vec![
-                responses::ev_response_created("resp-0"),
-                responses::ev_assistant_message("msg-0", "Warmup"),
-                responses::ev_completed("resp-0"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-1"),
-                responses::ev_function_call_with_namespace(
-                    TOOL_CALL_ID,
-                    TOOL_NAMESPACE,
-                    CALLABLE_TOOL_NAME,
-                    &tool_call_arguments,
-                ),
-                responses::ev_completed("resp-1"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-2"),
-                responses::ev_assistant_message("msg-1", "Done"),
-                responses::ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-    let (apps_server_url, apps_server_handle) = start_apps_server(scenario).await?;
+                responses::ev_response_created(&response_id),
+                responses::ev_assistant_message(&format!("msg-warmup-{turn}"), "Warmup"),
+                responses::ev_completed(&response_id),
+            ])
+        })
+        .collect::<Vec<_>>();
+    sse_responses.extend([
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                TOOL_CALL_ID,
+                TOOL_NAMESPACE,
+                CALLABLE_TOOL_NAME,
+                &tool_call_arguments,
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_assistant_message("msg-1", "Done"),
+            responses::ev_completed("resp-2"),
+        ]),
+    ]);
+    let response_mock = responses::mount_sse_sequence(&responses_server, sse_responses).await;
+    let openai_form_advertised = OpenAiFormAdvertisements::default();
+    let (apps_server_url, apps_server_handle) =
+        start_apps_server(scenario, openai_form_advertised.clone()).await?;
     Ok((
         responses_server,
         response_mock,
         apps_server_url,
         apps_server_handle,
+        openai_form_advertised,
     ))
 }
 
@@ -411,8 +484,8 @@ struct ElicitationRoundTripFixture {
 
 impl ElicitationRoundTripFixture {
     async fn start(scenario: ElicitationScenario) -> Result<Self> {
-        let (responses_server, response_mock, apps_server_url, apps_server_handle) =
-            start_elicitation_services(scenario).await?;
+        let (responses_server, response_mock, apps_server_url, apps_server_handle, _) =
+            start_elicitation_services(scenario, /*warmup_turns*/ 1).await?;
         let codex_home = TempDir::new()?;
         write_config_toml(codex_home.path(), &responses_server.uri(), &apps_server_url)?;
         write_chatgpt_auth(
@@ -619,9 +692,13 @@ struct AppsServerState {
     expected_account_id: String,
 }
 
+/// Whether each MCP `initialize` the apps server received advertised `openai/form`, in order.
+type OpenAiFormAdvertisements = Arc<StdMutex<Vec<bool>>>;
+
 #[derive(Clone)]
 struct ElicitationAppsMcpServer {
     scenario: ElicitationScenario,
+    openai_form_advertised: OpenAiFormAdvertisements,
 }
 
 impl ServerHandler for ElicitationAppsMcpServer {
@@ -630,18 +707,18 @@ impl ServerHandler for ElicitationAppsMcpServer {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, rmcp::ErrorData> {
-        if matches!(self.scenario, ElicitationScenario::OpenAiForm) {
-            assert_eq!(
+        // The client only answers `openai/form` on a connection that advertised it, so the
+        // round trip itself proves the advertisement; this records which connections did.
+        self.openai_form_advertised
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(
                 request
                     .capabilities
                     .extensions
                     .as_ref()
-                    .and_then(|extensions| extensions.get("openai/form"))
-                    .cloned()
-                    .map(Value::Object),
-                Some(json!({}))
+                    .is_some_and(|extensions| extensions.contains_key("openai/form")),
             );
-        }
         context.peer.set_peer_info(request);
         Ok(self.get_info())
     }
@@ -772,7 +849,10 @@ impl ServerHandler for ElicitationAppsMcpServer {
     }
 }
 
-async fn start_apps_server(scenario: ElicitationScenario) -> Result<(String, JoinHandle<()>)> {
+async fn start_apps_server(
+    scenario: ElicitationScenario,
+    openai_form_advertised: OpenAiFormAdvertisements,
+) -> Result<(String, JoinHandle<()>)> {
     let state = Arc::new(AppsServerState {
         expected_bearer: "Bearer chatgpt-token".to_string(),
         expected_account_id: "account-123".to_string(),
@@ -782,7 +862,12 @@ async fn start_apps_server(scenario: ElicitationScenario) -> Result<(String, Joi
     let addr = listener.local_addr()?;
 
     let mcp_service = StreamableHttpService::new(
-        move || Ok(ElicitationAppsMcpServer { scenario }),
+        move || {
+            Ok(ElicitationAppsMcpServer {
+                scenario,
+                openai_form_advertised: openai_form_advertised.clone(),
+            })
+        },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );

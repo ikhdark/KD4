@@ -1025,10 +1025,11 @@ async fn refresh_from_remote_updates_cached_bundle() {
     let fetcher = Arc::new(SequenceBundleClient::new(vec![
         Ok(test_bundle()),
         Ok(replacement_bundle.clone()),
+        Ok(invalid_config_bundle()),
     ]));
     let service = CloudConfigBundleService::new(
         auth_manager_with_plan("business").await,
-        fetcher,
+        fetcher.clone(),
         codex_home.path().to_path_buf(),
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
@@ -1042,6 +1043,17 @@ async fn refresh_from_remote_updates_cached_bundle() {
         .await
         .expect("load cache");
     assert_eq!(signed_payload.bundle, replacement_bundle);
+    let valid_cache_bytes = std::fs::read(cache.path()).expect("valid cached bytes");
+    assert!(service.refresh_cache_once().await, "refresh failures remain retryable");
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        std::fs::read(cache.path()).expect("invalid refresh must retain cache"),
+        valid_cache_bytes
+    );
+    assert_eq!(
+        cache.load(Some("user-12345"), Some("account-12345")).await.expect("valid cache retained").bundle,
+        replacement_bundle
+    );
 }
 
 #[test]

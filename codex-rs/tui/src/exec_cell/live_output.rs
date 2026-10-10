@@ -240,7 +240,9 @@ impl LiveCommandOutputLine {
                 let escape = &self.head.as_bytes()[start + 1..];
                 match escape.first() {
                     Some(b']') if !escape.contains(&b'\x07') => Some('\x07'),
-                    Some(b'[') if !escape[1..].iter().any(u8::is_ascii_alphabetic) => Some('m'),
+                    Some(b'[') if !escape[1..].iter().any(|byte| (0x40..=0x7e).contains(byte)) => {
+                        Some('m')
+                    }
                     _ => None,
                 }
             });

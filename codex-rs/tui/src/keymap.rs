@@ -1485,6 +1485,48 @@ impl RuntimeKeymap {
             ],
         )?;
 
+        // App shortcuts run before the focused Vim editor as well as insert mode.
+        validate_no_shadow_with_allowed_overlaps(
+            "app",
+            [
+                ("open_transcript", self.app.open_transcript.as_slice()),
+                ("open_external_editor", self.app.open_external_editor.as_slice()),
+                ("copy", self.app.copy.as_slice()),
+                ("clear_terminal", self.app.clear_terminal.as_slice()),
+                ("toggle_vim_mode", self.app.toggle_vim_mode.as_slice()),
+                ("toggle_fast_mode", self.app.toggle_fast_mode.as_slice()),
+                ("toggle_raw_output", self.app.toggle_raw_output.as_slice()),
+            ],
+            [
+                ("vim_normal.enter_insert", self.vim_normal.enter_insert.as_slice()),
+                ("vim_normal.append_after_cursor", self.vim_normal.append_after_cursor.as_slice()),
+                ("vim_normal.append_line_end", self.vim_normal.append_line_end.as_slice()),
+                ("vim_normal.insert_line_start", self.vim_normal.insert_line_start.as_slice()),
+                ("vim_normal.open_line_below", self.vim_normal.open_line_below.as_slice()),
+                ("vim_normal.open_line_above", self.vim_normal.open_line_above.as_slice()),
+                ("vim_normal.move_left", self.vim_normal.move_left.as_slice()),
+                ("vim_normal.move_right", self.vim_normal.move_right.as_slice()),
+                ("vim_normal.move_up", self.vim_normal.move_up.as_slice()),
+                ("vim_normal.move_down", self.vim_normal.move_down.as_slice()),
+                ("vim_normal.move_word_forward", self.vim_normal.move_word_forward.as_slice()),
+                ("vim_normal.move_word_backward", self.vim_normal.move_word_backward.as_slice()),
+                ("vim_normal.move_word_end", self.vim_normal.move_word_end.as_slice()),
+                ("vim_normal.move_line_start", self.vim_normal.move_line_start.as_slice()),
+                ("vim_normal.move_line_end", self.vim_normal.move_line_end.as_slice()),
+                ("vim_normal.delete_char", self.vim_normal.delete_char.as_slice()),
+                ("vim_normal.substitute_char", self.vim_normal.substitute_char.as_slice()),
+                ("vim_normal.delete_to_line_end", self.vim_normal.delete_to_line_end.as_slice()),
+                ("vim_normal.change_to_line_end", self.vim_normal.change_to_line_end.as_slice()),
+                ("vim_normal.yank_line", self.vim_normal.yank_line.as_slice()),
+                ("vim_normal.paste_after", self.vim_normal.paste_after.as_slice()),
+                ("vim_normal.start_delete_operator", self.vim_normal.start_delete_operator.as_slice()),
+                ("vim_normal.start_yank_operator", self.vim_normal.start_yank_operator.as_slice()),
+                ("vim_normal.start_change_operator", self.vim_normal.start_change_operator.as_slice()),
+                ("vim_normal.cancel_operator", self.vim_normal.cancel_operator.as_slice()),
+            ],
+            [],
+        )?;
+
         validate_unique(
             "vim_normal",
             [
@@ -2181,6 +2223,16 @@ mod tests {
         let err = RuntimeKeymap::from_config(&keymap).expect_err("expected shadowing conflict");
         assert!(err.contains("composer.queue"));
         assert!(err.contains("open_external_editor"));
+    }
+
+    #[test]
+    fn rejects_app_shortcut_shadowing_vim_normal_motion() {
+        let mut keymap = TuiKeymap::default();
+        keymap.global.open_transcript = Some(one("h"));
+
+        let err = RuntimeKeymap::from_config(&keymap).expect_err("expected Vim shadowing conflict");
+        assert!(err.contains("open_transcript"), "{err}");
+        assert!(err.contains("vim_normal.move_left"), "{err}");
     }
 
     #[test]

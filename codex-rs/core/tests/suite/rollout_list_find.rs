@@ -102,6 +102,8 @@ async fn find_locates_rollout_file_by_id() {
 #[tokio::test]
 async fn find_handles_gitignore_covering_codex_home_directory() {
     let repo = TempDir::new().unwrap();
+    // Repo-aware ignore walkers only activate .gitignore rules under a repository marker.
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
     let codex_home = repo.path().join(".codex");
     std::fs::create_dir_all(&codex_home).unwrap();
     std::fs::write(repo.path().join(".gitignore"), ".codex/**\n").unwrap();
@@ -158,6 +160,7 @@ async fn find_falls_back_to_filesystem_when_sqlite_has_no_match() {
 #[tokio::test]
 async fn find_ignores_granular_gitignore_rules() {
     let home = TempDir::new().unwrap();
+    std::fs::create_dir(home.path().join(".git")).unwrap();
     let id = Uuid::new_v4();
     let expected = write_minimal_rollout_with_id(home.path(), id);
     std::fs::write(home.path().join("sessions/.gitignore"), "*.jsonl\n").unwrap();

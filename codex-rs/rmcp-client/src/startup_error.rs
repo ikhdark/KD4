@@ -72,5 +72,26 @@ mod tests {
         assert!(!is_authentication_required_error(&anyhow::anyhow!(
             "HTTP 503"
         )));
+        // A non-auth failure in the same transport wrapper must stay unclassified.
+        let unavailable = ClientInitializeError::TransportError {
+            error: DynamicTransportError::from_parts(
+                "streamable_http",
+                TypeId::of::<()>(),
+                Box::new(
+                    StreamableHttpError::<StreamableHttpClientAdapterError>::Client(
+                        StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+                            status: http::StatusCode::SERVICE_UNAVAILABLE,
+                            body_preview: "offline".to_string(),
+                            retry_after: None,
+                            retry_after_received_at: tokio::time::Instant::now(),
+                        },
+                    ),
+                ),
+            ),
+            context: "send initialize request".into(),
+        };
+        assert!(!is_authentication_required_error(
+            &Error::new(unavailable).context("initialize server")
+        ));
     }
 }

@@ -310,6 +310,31 @@ mod tests {
     }
 
     #[test]
+    fn environment_block_replaces_inherited_parser_source() -> io::Result<()> {
+        // The bootstrap evaluates this variable, so an inherited value in any
+        // spelling must not reach the parser host next to the trusted one.
+        let block = environment_block(
+            [
+                (
+                    OsString::from("codex_internal_powershell_parser_source"),
+                    OsString::from("inherited"),
+                ),
+                (OsString::from("A"), OsString::from("first")),
+            ]
+            .into_iter(),
+        )?;
+        let text = String::from_utf16_lossy(&block);
+        let entries: Vec<&str> = text.split('\0').filter(|entry| !entry.is_empty()).collect();
+        let trusted = format!(
+            "{}={}",
+            super::super::PARSER_SOURCE_ENV,
+            super::super::encoded_parser_source()
+        );
+        assert_eq!(entries, ["A=first", trusted.as_str()]);
+        Ok(())
+    }
+
+    #[test]
     fn missing_executable_fails_after_native_handle_setup() -> anyhow::Result<()> {
         let current = std::env::current_exe()?;
         let cwd = current
@@ -340,9 +365,8 @@ mod tests {
 
     #[test]
     fn pwsh_parser_does_not_inherit_unrelated_pipe_while_alive() -> anyhow::Result<()> {
-        let Some(host) = crate::powershell::try_find_pwsh_executable_blocking() else {
-            return Ok(());
-        };
+        let host = crate::powershell::try_find_pwsh_executable_blocking()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "PowerShell 7 (pwsh.exe)"))?;
         check_parser_pipe_isolation(host.as_path())
     }
 

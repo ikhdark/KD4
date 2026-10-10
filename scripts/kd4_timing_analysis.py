@@ -1794,8 +1794,14 @@ def analyze_runner_evidence(
         if not isinstance(params, dict):
             continue
         elapsed = row.get("elapsedMs")
+        try:
+            valid_elapsed = type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 0
+        except OverflowError:
+            valid_elapsed = False
+        if not valid_elapsed:
+            elapsed = None
         location = {"eventIndex": index, "elapsedMs": elapsed}
-        if type(elapsed) in (int, float):
+        if elapsed is not None:
             if previous_event is not None and elapsed >= previous_event["elapsedMs"]:
                 event_gaps.append(
                     {

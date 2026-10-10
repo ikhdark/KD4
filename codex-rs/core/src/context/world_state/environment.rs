@@ -44,24 +44,6 @@ impl EnvironmentsState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_subagents(mut self, subagents: String) -> Self {
-        if !subagents.is_empty() {
-            let mut budget = codex_context_fragments::ModelContextBudget::new(1024);
-            let mut lines = Vec::new();
-            for line in subagents.lines() {
-                if !budget.try_take(line) {
-                    lines
-                        .push("Additional subagents omitted; use list_agents for current details.");
-                    break;
-                }
-                lines.push(line);
-            }
-            self.subagents = Some(lines.join("\n"));
-        }
-        self
-    }
-
     fn rendered_full(&self) -> RenderedEnvironments {
         RenderedEnvironments {
             updates: self

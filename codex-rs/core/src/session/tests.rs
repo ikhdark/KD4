@@ -73,7 +73,6 @@ use crate::tools::context::ToolDispatchState;
 use crate::tools::format_exec_output_str;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
-use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::LoaderOverrides;
 use codex_config::NetworkConstraints;
 use codex_config::NetworkDomainPermissionToml;
@@ -7389,7 +7388,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
 
 #[tokio::test]
 async fn notify_request_permissions_response_ignores_unmatched_call_id() {
-    let (session, _turn_context) = make_session_and_context().await;
+    let (session, turn_context) = make_session_and_context().await;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
 
     session
@@ -7407,10 +7406,19 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
         )
         .await;
 
+    // Grants are keyed by the environment's approval scope, not its environment id.
+    let approval_scope_id = turn_context
+        .environments
+        .primary()
+        .expect("primary environment")
+        .environment
+        .approval_scope_id();
     assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+        session.granted_turn_permissions(approval_scope_id).await,
+        None
+    );
+    assert_eq!(
+        session.granted_session_permissions(approval_scope_id).await,
         None
     );
 }
@@ -11330,42 +11338,50 @@ async fn plugin_availability_change_reuses_the_mcp_manager() {
 
 #[tokio::test]
 async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::matchers::{method, path};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => serde_json::json!({
+                    "protocolVersion": body["params"]["protocolVersion"],
+                    "capabilities": {"resources": {}},
+                    "serverInfo": {"name": "resource-server", "version": "1"},
+                }),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "resources/list" => serde_json::json!({"resources": []}),
+                "resources/templates/list" => serde_json::json!({"resourceTemplates": []}),
+                _ => return ResponseTemplate::new(400),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
+
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
     let step_context = session.capture_step_context(turn_context).await.unwrap();
 
     let mut refresh_config = step_context.turn.config.as_ref().clone();
-    refresh_config.mcp_servers.set(HashMap::from([(
-        "newer".to_string(),
-        McpServerConfig {
-            auth: Default::default(),
-            transport: McpServerTransportConfig::Stdio {
-                command: "missing-test-mcp-server".to_string(),
-                args: Vec::new(),
-                env: None,
-                env_vars: Vec::new(),
-                cwd: None,
-            },
-            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            enabled: true,
-            required: false,
-            supports_parallel_tool_calls: false,
-            disabled_reason: None,
-            startup_timeout_sec: None,
-            tool_timeout_sec: None,
-            default_tools_approval_mode: None,
-            enabled_tools: None,
-            disabled_tools: None,
-            scopes: None,
-            oauth: None,
-            oauth_resource: None,
-            tools: HashMap::new(),
-        },
-    )]))?;
+    refresh_config.mcp_servers.set(serde_json::from_value::<HashMap<String, McpServerConfig>>(
+        serde_json::json!({"newer": {"url": format!("{}/mcp", server.uri())}}),
+    )?)?;
     session
         .refresh_mcp_servers_now(step_context.turn.as_ref(), &refresh_config)
         .await;
+    assert!(session.services.latest_mcp_runtime().manager()
+        .wait_for_server_ready("newer", Duration::from_secs(5)).await);
 
     let router = crate::session::turn::built_tools(
         session.as_ref(),
@@ -11380,6 +11396,16 @@ async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
             .iter()
             .any(|name| name.to_string() == "list_mcp_resources")
     );
+
+    // A new turn captures the working replacement. Without this positive
+    // contrast, two snapshots lacking resources make the old-step check vacuous.
+    let fresh_turn = session.new_default_turn_with_sub_id("fresh-mcp".to_string()).await;
+    let fresh_step = session.capture_step_context(fresh_turn).await?;
+    let fresh_router = crate::session::turn::built_tools(
+        session.as_ref(), &fresh_step, &[], &CancellationToken::new(),
+    ).await?;
+    assert!(fresh_router.registered_tool_names_for_test().iter()
+        .any(|name| name.to_string() == "list_mcp_resources"));
     Ok(())
 }
 
@@ -12638,7 +12664,8 @@ fn policy_admission_never_cuts_a_negation_and_has_priority_over_capabilities() {
     assert!(take_prompt_fragment(codex_extension_api::PromptFragment::developer_policy("prohibition ".repeat(1_000)), &mut budget, "turn").is_none());
     assert_eq!(budget.remaining_bytes(), remaining);
     let capability = take_prompt_fragment(codex_extension_api::PromptFragment::developer_capability("catalog ".repeat(1_000)), &mut budget, "turn");
-    assert!(capability.is_none_or(|(_, text)| !text.contains(policy)));
+    // A capability only gets what the policy left: truncated or dropped, never admitted whole.
+    assert!(capability.is_none_or(|(_, text)| text.len() <= remaining));
 }
 
 #[tokio::test]
@@ -14157,6 +14184,13 @@ async fn user_shell_command_dispatches_foreign_primary_environment_to_exec_serve
     assert_eq!(completed.cwd, foreign_cwd);
     assert_eq!(completed.exit_code, Some(-1));
     assert!(completed.stderr.contains("execution error:"));
+    // The local path rejects a foreign cwd with the same exit code and prefix,
+    // so only this distinguishes a dispatch to the (closed) exec server.
+    assert!(
+        !completed.stderr.contains("not native to the Codex host"),
+        "foreign primary environment must not run through the local shell path: {}",
+        completed.stderr
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -18603,12 +18637,6 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
     );
 
     pretty_assertions::assert_eq!(output, expected);
-    pretty_assertions::assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
-        None
-    );
 
     // The rejection should not poison the non-escalated path for the same
     // command. Force DangerFullAccess so this check stays focused on approval

@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts import rust_build_status, rust_test_runner
+from scripts import benchmark_stream_delivery, rust_build_status, rust_test_runner
 
 
 class LaneLatencyTests(unittest.TestCase):
@@ -144,6 +144,54 @@ class LaneLatencyTests(unittest.TestCase):
                 self.assertEqual(Path.cwd(), root)
             with contextlib.chdir(rust):
                 rust_build_status._guard_cargo_checkout_cwd(["cargo", "check"], root)
+
+
+class StreamBenchmarkTests(unittest.TestCase):
+    def test_isolated_copy_excludes_only_renderer_dependent_tests(self):
+        root = Path(benchmark_stream_delivery.__file__).resolve().parents[1]
+        rust = root / "codex-rs"
+        source_paths = (
+            "tui/src/table_detect.rs", "tui/src/streaming/chunking.rs",
+            "tui/src/streaming/table_holdback.rs", "tui/src/markdown_stream.rs",
+        )
+        originals = {path: (rust / path).read_bytes() for path in source_paths}
+        captured = {}
+
+        def run(command, cwd):
+            if command[:2] == ["rustc", "--version"]:
+                return "fixture compiler"
+            if command[0] == "rustc":
+                work = Path(command[command.index("-o") + 1]).parent
+                captured.update({path: (work / Path(path).name).read_bytes()
+                                 for path in source_paths})
+                return ""
+            if Path(command[0]).stem == "probe":
+                return '{"scanner_25600_lines_us":1}\n'
+            return "fixture tests passed"
+
+        output = io.StringIO()
+        with (mock.patch.object(benchmark_stream_delivery, "run", side_effect=run),
+              mock.patch.object(sys, "argv", ["benchmark_stream_delivery", "--iterations", "1"]),
+              contextlib.redirect_stdout(output)):
+            benchmark_stream_delivery.main()
+
+        table_marker = b"#[cfg(test)]\nmod tests {"
+        holdback_marker = (b"    #[test]\n"
+                           b"    fn indented_fence_markers_do_not_change_table_holdback() {")
+        for path, original in originals.items():
+            self.assertEqual((rust / path).read_bytes(), original)
+            expected = original
+            if path.endswith("/table_detect.rs"):
+                self.assertEqual(original.count(table_marker), 1)
+                expected = original.replace(table_marker, b"#[cfg(any())]\nmod tests {")
+            elif path.endswith("/table_holdback.rs"):
+                self.assertEqual(original.count(holdback_marker), 1)
+                expected = original.replace(holdback_marker, b"    #[cfg(any())]\n" + holdback_marker)
+            self.assertEqual(captured[path], expected, path)
+        self.assertIn(
+            "table_holdback::tests::indented_fence_markers_do_not_change_table_holdback",
+            json.loads(output.getvalue())["excluded_tests"],
+        )
 
 
 if __name__ == "__main__":

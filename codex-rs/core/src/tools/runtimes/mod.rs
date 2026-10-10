@@ -231,25 +231,6 @@ pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
 /// environment. We need access to both so snapshot restore logic can preserve
 /// runtime-only vars like `CODEX_THREAD_ID` without pretending they came from
 /// the explicit override policy.
-#[cfg(test)]
-pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
-    command: &[String],
-    session_shell: &Shell,
-    shell_snapshot: Option<&AbsolutePathBuf>,
-    explicit_env_overrides: &HashMap<String, String>,
-    env: &HashMap<String, String>,
-) -> Vec<String> {
-    let metrics = codex_otel::global();
-    maybe_wrap_shell_lc_with_snapshot_and_metrics(
-        command,
-        session_shell,
-        shell_snapshot,
-        explicit_env_overrides,
-        env,
-        metrics.as_ref(),
-    )
-}
-
 pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file(
     command: &[String],
     session_shell: &Shell,
@@ -299,46 +280,6 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
         explicit_env_overrides,
         env,
         metrics.as_ref(),
-    )
-}
-
-#[cfg(test)]
-fn maybe_wrap_shell_lc_with_snapshot_and_metrics(
-    command: &[String],
-    session_shell: &Shell,
-    shell_snapshot: Option<&AbsolutePathBuf>,
-    explicit_env_overrides: &HashMap<String, String>,
-    env: &HashMap<String, String>,
-    metrics: Option<&MetricsClient>,
-) -> Vec<String> {
-    let record_powershell_skip = |reason| {
-        if matches!(session_shell.shell_type, ShellType::PowerShell) {
-            record_shell_snapshot_replay(metrics, "skipped", reason);
-        }
-    };
-    let Some(snapshot) = shell_snapshot else {
-        record_powershell_skip("snapshot_unavailable");
-        return command.to_vec();
-    };
-
-    if !snapshot.exists() {
-        record_powershell_skip("snapshot_missing");
-        return command.to_vec();
-    }
-
-    let Ok(snapshot_contents) = std::fs::read_to_string(snapshot) else {
-        record_powershell_skip("snapshot_unreadable");
-        return command.to_vec();
-    };
-
-    maybe_wrap_shell_lc_with_snapshot_source(
-        command,
-        session_shell,
-        &snapshot.to_string_lossy(),
-        &snapshot_contents,
-        explicit_env_overrides,
-        env,
-        metrics,
     )
 }
 
@@ -858,12 +799,14 @@ mod shell_snapshot_replay_tests {
         env.insert("CODEX_TEST_OVERRIDE".to_string(), "current".to_string());
         env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
 
-        let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        let rewritten = maybe_wrap_shell_lc_with_snapshot_source(
             &original,
             &shell,
-            Some(&snapshot_path),
+            &snapshot_path.to_string_lossy(),
+            &std::fs::read_to_string(&snapshot_path).expect("read snapshot"),
             &explicit_overrides,
             &env,
+            None,
         );
 
         assert_eq!(rewritten.get(1).map(String::as_str), Some("-NoProfile"));
@@ -900,12 +843,14 @@ mod shell_snapshot_replay_tests {
             )
             .expect("PowerShell args");
 
-        let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        let rewritten = maybe_wrap_shell_lc_with_snapshot_source(
             &original,
             &shell,
-            Some(&snapshot_path),
+            &snapshot_path.to_string_lossy(),
+            &std::fs::read_to_string(&snapshot_path).expect("read snapshot"),
             &HashMap::new(),
             &std::env::vars().collect(),
+            None,
         );
         let output = std::process::Command::new(&rewritten[0])
             .args(&rewritten[1..])
@@ -923,14 +868,6 @@ mod shell_snapshot_replay_tests {
 
     #[test]
     fn activation_metric_distinguishes_powershell_snapshot_replay_applied_and_skipped() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let snapshot_path = AbsolutePathBuf::from_absolute_path(dir.path().join("snapshot.ps1"))
-            .expect("absolute snapshot path");
-        std::fs::write(
-            &snapshot_path,
-            format!("# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n"),
-        )
-        .expect("write PowerShell snapshot");
         let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
             .expect("PowerShell is required on Windows");
         let command = shell
@@ -948,19 +885,21 @@ mod shell_snapshot_replay_tests {
         )
         .expect("in-memory metrics client");
 
-        let applied = maybe_wrap_shell_lc_with_snapshot_and_metrics(
+        let applied = maybe_wrap_shell_lc_with_snapshot_source(
             &command,
             &shell,
-            Some(&snapshot_path),
+            "snapshot.ps1",
+            &format!("# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n"),
             &HashMap::new(),
             &env,
             Some(&metrics),
         );
         assert_ne!(applied, command);
-        let skipped = maybe_wrap_shell_lc_with_snapshot_and_metrics(
+        let skipped = maybe_wrap_shell_lc_with_snapshot_source(
             &command,
             &shell,
-            None,
+            "snapshot.ps1",
+            "# Snapshot file\n",
             &HashMap::new(),
             &env,
             Some(&metrics),
@@ -1011,7 +950,7 @@ mod shell_snapshot_replay_tests {
                 (
                     "powershell".to_string(),
                     "skipped".to_string(),
-                    "snapshot_unavailable".to_string(),
+                    "unsupported_format".to_string(),
                     1,
                 ),
             ])

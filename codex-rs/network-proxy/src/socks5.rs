@@ -902,14 +902,18 @@ mod tests {
             TcpRequest::new(HostWithPort::try_from("example.com:443").expect("valid authority"));
         request.extensions_mut().insert(state.clone());
 
-        let result = handle_socks5_tcp(
+        let err = handle_socks5_tcp(
             request,
             /*policy_decider*/ None,
             /*environment_id*/ None,
         )
-        .await;
+        .await
+        .expect_err("proxy-disabled request should be denied");
 
-        assert!(result.is_err(), "proxy-disabled request should be denied");
+        assert!(
+            format!("{err:?}").contains("network proxy is disabled"),
+            "unexpected error: {err:?}"
+        );
         assert_eq!(reload_checks.load(Ordering::SeqCst), 1);
     }
 
@@ -1086,13 +1090,20 @@ mod tests {
             credential_broker: true,
             ..NetworkProxyConfig::default()
         };
-        settings.set_allowed_domains(vec!["api.openai.com".to_string()]);
+        // The brokered host is a public IP literal: local binding stays disabled, and the
+        // local-network check classifies a literal without asking the ambient DNS resolver.
+        settings.set_allowed_domains(vec!["8.8.8.8".to_string()]);
         let state = state_for_settings(settings);
-        let mut env = HashMap::from([("OPENAI_API_KEY".to_string(), "sk-real".to_string())]);
+        let mut env = HashMap::from([
+            ("GH_HOST".to_string(), "8.8.8.8".to_string()),
+            (
+                "GH_ENTERPRISE_TOKEN".to_string(),
+                "ghp-enterprise-real".to_string(),
+            ),
+        ]);
         state.virtualize_child_credentials(&mut env);
-        let mut request = TcpRequest::new(
-            HostWithPort::try_from("api.openai.com:8443").expect("valid authority"),
-        );
+        let mut request =
+            TcpRequest::new(HostWithPort::try_from("8.8.8.8:8443").expect("valid authority"));
         request.extensions_mut().insert(state.clone());
 
         let result = handle_socks5_tcp(
@@ -1106,7 +1117,7 @@ mod tests {
         let Socks5TcpConnection::DetectTls { target, mode, allow_local_binding, .. } = result.conn else {
             panic!("brokered nonstandard port must select TLS detection");
         };
-        assert_eq!(target.host.to_string(), "api.openai.com");
+        assert_eq!(target.host.to_string(), "8.8.8.8");
         assert_eq!(target.port, 8443);
         assert_eq!(mode, NetworkMode::Full);
         assert!(!allow_local_binding);

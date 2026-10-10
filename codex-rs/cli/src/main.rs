@@ -2285,6 +2285,13 @@ mod tests {
         let auth = CodexAuth::from_api_key("sk-test");
 
         assert!(is_supported_exec_server_remote_auth(&auth));
+
+        // Control: a credential that is neither ChatGPT nor an OpenAI API key is not accepted.
+        let bedrock = CodexAuth::BedrockApiKey(codex_login::auth::BedrockApiKeyAuth {
+            api_key: "bedrock-test".to_string(),
+            region: "us-east-1".to_string(),
+        });
+        assert!(!is_supported_exec_server_remote_auth(&bedrock));
     }
 
     #[test]
@@ -3391,6 +3398,8 @@ mod tests {
         let cli = MultitoolCli::try_parse_from(["codex", "--strict-config", "exec-server"])
             .expect("parse");
 
+        // The check below returns Ok without consulting the subcommand when the flag is unset.
+        assert!(cli.interactive.strict_config);
         reject_root_strict_config_for_subcommand(cli.interactive.strict_config, &cli.subcommand)
             .expect("exec-server should support root --strict-config");
     }

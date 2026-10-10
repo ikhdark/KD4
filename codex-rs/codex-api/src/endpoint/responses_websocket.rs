@@ -1073,6 +1073,66 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
+    #[tokio::test(start_paused = true)]
+    async fn handshake_server_error_preserves_transport_provenance() {
+        use codex_protocol::error::CodexErr;
+
+        let deadline = Instant::now() + Duration::from_secs(7);
+        for scheme in ["ws", "wss"] {
+            let url = Url::parse(&format!("{scheme}://example.test/responses")).unwrap();
+            let response = http::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("retry-after", "7")
+                .header("x-request-id", "upgrade-request")
+                .body(Some(b"upgrade unavailable".to_vec()))
+                .unwrap();
+            let mapped = crate::map_api_error(map_ws_error(WsError::Http(Box::new(response)), &url));
+            assert!(mapped.is_retryable());
+            assert_eq!(mapped.retry_after().unwrap().deadline(), deadline);
+            let CodexErr::UnexpectedStatus(error) = mapped else {
+                panic!("upgrade rejection must remain a transport error: {mapped:?}");
+            };
+            assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(error.url.as_deref(), Some(url.as_str()));
+            assert_eq!(error.request_id.as_deref(), Some("upgrade-request"));
+            assert_eq!(error.body, "upgrade unavailable");
+
+            // A recognized provider error takes precedence even during the upgrade.
+            let response = http::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("retry-after", "7")
+                .body(Some(
+                    br#"{"error":{"code":"server_error","message":"retry"}}"#.to_vec(),
+                ))
+                .unwrap();
+            let mapped = crate::map_api_error(map_ws_error(WsError::Http(Box::new(response)), &url));
+            assert_eq!(mapped.retry_after().unwrap().deadline(), deadline);
+            assert!(matches!(mapped, CodexErr::Stream(message, _) if message == "retry"));
+        }
+
+        // Neither ordinary HTTP 500s nor errors received after upgrade gain fallback eligibility.
+        for url in [
+            None,
+            Some("http://example.test/responses"),
+            Some("https://example.test/responses"),
+        ] {
+            let mapped = crate::map_api_error(ApiError::Transport(TransportError::Http {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                url: url.map(str::to_owned),
+                headers: None,
+                body: None,
+                retry_after: None,
+            }));
+            assert!(matches!(mapped, CodexErr::InternalServerError { .. }));
+        }
+        let payload =
+            json!({"type": "error", "status": 500, "headers": {"retry-after": "7"}}).to_string();
+        let wrapped = parse_wrapped_websocket_error_event(&payload).unwrap();
+        let mapped = crate::map_api_error(map_wrapped_websocket_error_event(wrapped, payload).unwrap());
+        assert_eq!(mapped.retry_after().unwrap().deadline(), deadline);
+        assert!(matches!(mapped, CodexErr::InternalServerError { .. }));
+    }
+
     #[test]
     fn transport_audit_permanent_setup_errors_do_not_retry() {
         let url = Url::parse("wss://example.test/responses").unwrap();
@@ -1143,6 +1203,13 @@ mod tests {
             let result = run_websocket_response_stream(&mut ws_stream, tx, Duration::from_millis(80),
                 None, ResponsesStreamMetadata::default(), None).await;
             assert_eq!(result.is_ok(), productive, "{result:?}");
+            if !productive {
+                assert!(
+                    matches!(&result, Err(ApiError::Stream(message))
+                        if message == "idle timeout waiting for websocket after 80ms"),
+                    "{result:?}"
+                );
+            }
             producer.await.unwrap();
         }
     }
@@ -1414,35 +1481,6 @@ mod tests {
         );
         drop(stream);
         drop(tx_message);
-    }
-
-    #[tokio::test]
-    async fn websocket_ingress_enforces_item_and_byte_limits() {
-        let (item_tx, mut item_rx) = ws_ingress_channel(1, 1024);
-        item_tx
-            .try_send(Message::Text("first".into()))
-            .expect("first item should fit");
-        assert_eq!(
-            item_tx.try_send(Message::Text("second".into())),
-            Err(WsIngressSendError::Full)
-        );
-        assert_eq!(item_rx.recv().await, Some(Message::Text("first".into())));
-        item_tx
-            .try_send(Message::Text("second".into()))
-            .expect("capacity should be released after receive");
-
-        let (byte_tx, mut byte_rx) = ws_ingress_channel(2, 3);
-        byte_tx
-            .try_send(Message::Text("ab".into()))
-            .expect("first payload should fit byte budget");
-        assert_eq!(
-            byte_tx.try_send(Message::Text("cd".into())),
-            Err(WsIngressSendError::Full)
-        );
-        assert_eq!(byte_rx.recv().await, Some(Message::Text("ab".into())));
-        byte_tx
-            .try_send(Message::Text("cd".into()))
-            .expect("byte budget should be released after receive");
     }
 
     #[tokio::test]
@@ -2477,27 +2515,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_wrapped_websocket_error_event_with_connection_limit_maps_retryable() {
-        let payload = json!({
-            "type": "error",
-            "status": 400,
-            "error": {
-                "type": "invalid_request_error",
-                "code": "websocket_connection_limit_reached",
-                "message": "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."
-            }
-        })
-        .to_string();
+    fn parse_wrapped_websocket_error_event_with_retryable_code_maps_retryable() {
+        // The server's message is preserved; the built-in text is only a fallback.
+        for (error, expected) in [
+            (
+                json!({
+                    "type": "invalid_request_error",
+                    "code": "websocket_connection_limit_reached",
+                    "message": "server-supplied connection limit message"
+                }),
+                "server-supplied connection limit message",
+            ),
+            (
+                json!({
+                    "type": "invalid_request_error",
+                    "code": "websocket_connection_limit_reached"
+                }),
+                "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.",
+            ),
+            (
+                json!({
+                    "type": "invalid_request_error",
+                    "code": "previous_response_not_found",
+                    "message": "server-supplied missing response message"
+                }),
+                "server-supplied missing response message",
+            ),
+            (
+                json!({
+                    "type": "invalid_request_error",
+                    "code": "previous_response_not_found"
+                }),
+                "Previous response was not found. Retrying the full request.",
+            ),
+        ] {
+            let payload = json!({
+                "type": "error",
+                "status": 400,
+                "error": error
+            })
+            .to_string();
 
-        let wrapped_error = parse_wrapped_websocket_error_event(&payload)
-            .expect("expected websocket error payload to be parsed");
-        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
-            .expect("expected websocket error payload to map to ApiError");
-        let ApiError::Retryable { message, delay } = api_error else {
-            panic!("expected ApiError::Retryable");
-        };
-        assert_eq!(message, WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE);
-        assert_eq!(delay, None);
+            let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+                .expect("expected websocket error payload to be parsed");
+            let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+                .expect("expected websocket error payload to map to ApiError");
+            let ApiError::Retryable { message, delay } = api_error else {
+                panic!("expected ApiError::Retryable");
+            };
+            assert_eq!(message, expected);
+            assert_eq!(delay, None);
+        }
     }
 
     #[test]

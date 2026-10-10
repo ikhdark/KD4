@@ -358,6 +358,15 @@ mod tests {
     use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
 
+    /// These tests exchange real HTTP with a loopback server. Report missing
+    /// network access instead of passing without exercising the client.
+    fn require_network() {
+        assert!(
+            std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_err(),
+            "Behavior unverified: required network access is unavailable in this sandbox."
+        );
+    }
+
     #[tokio::test]
     async fn setup_reuses_native_listing_but_later_fetches_are_fresh() {
         let server = wiremock::MockServer::start().await;
@@ -501,16 +510,10 @@ mod tests {
         assert_eq!(error.to_string(), "Ollama provider must have a base_url");
     }
 
-    // Happy-path tests using a mock HTTP server; skip if sandbox network is disabled.
+    // Happy-path tests using a mock HTTP server; they require network access.
     #[tokio::test]
     async fn test_fetch_models_happy_path() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} is set; skipping test_fetch_models_happy_path",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -534,13 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_models_reports_invalid_listings_instead_of_missing_models() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} is set; skipping fetch_models_reports_invalid_listings_instead_of_missing_models",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         for (status, body) in [
             (503, serde_json::json!(null)),
@@ -581,13 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_version() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} is set; skipping test_fetch_version",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -617,13 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_model_stream_uses_shared_http_client() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} set; skipping test_pull_model_stream_uses_shared_http_client",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         let server = wiremock::MockServer::start().await;
         // The final update has no trailing newline and must still be delivered.
@@ -638,6 +623,9 @@ mod tests {
         );
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/pull"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "model": "test-model", "stream": true
+            })))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"),
             )
@@ -664,14 +652,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_stream_rejects_an_unbounded_line() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} set; skipping pull_stream_rejects_an_unbounded_line",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
+    async fn pull_error_and_early_eof_never_report_success() {
+        require_network();
+
+        for (body, expected_error) in [
+            (
+                "{\"error\":\"model unavailable\"}\n{\"status\":\"success\"}\n",
+                "Pull failed: model unavailable",
+            ),
+            (
+                "{\"status\":\"pulling layers\"}",
+                "Pull stream ended unexpectedly without success.",
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/api/pull"))
+                .and(wiremock::matchers::body_json(serde_json::json!({
+                    "model": "test-model", "stream": true
+                })))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_raw(body, "application/x-ndjson"),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+            let client = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
+            let events = client
+                .pull_model_stream("test-model")
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            if body.contains("model unavailable") {
+                assert_matches!(events.as_slice(), [PullEvent::Error(message)]
+                    if message == "model unavailable");
+            } else {
+                assert_matches!(events.as_slice(), [PullEvent::Status(message)]
+                    if message == "pulling layers");
+            }
+            let error = client.pull_with_cli_progress("test-model").await.unwrap_err();
+            assert_eq!(error.to_string(), expected_error);
         }
+    }
+
+    #[tokio::test]
+    async fn pull_stream_rejects_an_unbounded_line() {
+        require_network();
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -699,13 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_requests_time_out_when_the_server_never_answers() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} set; skipping setup_requests_time_out_when_the_server_never_answers",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -737,13 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_version_treats_unreadable_body_as_unknown() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} set; skipping fetch_version_treats_unreadable_body_as_unknown",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -760,13 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_server_happy_path_openai_compat_and_native() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} set; skipping test_probe_server_happy_path_openai_compat_and_native",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         let server = wiremock::MockServer::start().await;
 
@@ -799,13 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_oss_provider_err_when_server_missing() {
-        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
-            tracing::info!(
-                "{} set; skipping test_try_from_oss_provider_err_when_server_missing",
-                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-            );
-            return;
-        }
+        require_network();
 
         let server = wiremock::MockServer::start().await;
         let err = OllamaClient::try_from_provider_with_base_url(&format!("{}/v1", server.uri()))

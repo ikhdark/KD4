@@ -42,8 +42,8 @@ impl Write for TestLogSink {
 fn test_get_codex_user_agent() {
     let user_agent = get_codex_user_agent();
     let originator = originator().value;
-    let prefix = format!("{originator}/");
-    assert!(user_agent.starts_with(&prefix));
+    let prefix = format!("{originator}/{} (", env!("CARGO_PKG_VERSION"));
+    assert!(user_agent.starts_with(&prefix), "{user_agent}");
 }
 
 #[test]
@@ -206,6 +206,8 @@ async fn test_create_client_sets_default_headers() {
 #[test]
 fn default_client_constructors_reject_invalid_custom_ca() {
     const CHILD_ENV: &str = "CODEX_LOGIN_INVALID_CA_TEST_CHILD";
+    const REACHED: &str = "invalid custom CA rejected by every constructor";
+    const ROUTE_URL: &str = "https://example.test/invalid-ca";
 
     if std::env::var_os(CHILD_ENV).is_none() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
@@ -235,22 +237,56 @@ fn default_client_constructors_reject_invalid_custom_ca() {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
+            // A filter that matches no test also exits successfully.
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(REACHED),
+                "isolated CA subprocess never ran the constructor assertions (sandboxed: {sandboxed})",
+            );
         }
         return;
     }
 
     let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-    assert!(create_client().is_err());
-    assert!(create_client_without_request_logging().is_err());
-    assert!(create_client_with_chatgpt_cookies(&factory).is_err());
-    assert!(
-        create_client_for_route(
-            &factory,
-            "https://example.test/invalid-ca",
-            ClientRouteClass::Auth,
+    let rejected = |result: Result<HttpClient, BuildCustomCaTransportError>| {
+        matches!(
+            result,
+            Err(BuildCustomCaTransportError::InvalidCaFile {
+                source_env: "CODEX_CA_CERTIFICATE",
+                ..
+            })
         )
-        .is_err()
+    };
+    assert!(rejected(create_client()));
+    assert!(rejected(create_client_without_request_logging()));
+    assert!(rejected(create_client_with_chatgpt_cookies(&factory)));
+    let route_rejected = |result: Result<HttpClient, BuildRouteAwareHttpClientError>| {
+        matches!(
+            result,
+            Err(BuildRouteAwareHttpClientError::CustomCa(
+                BuildCustomCaTransportError::InvalidCaFile {
+                    source_env: "CODEX_CA_CERTIFICATE",
+                    ..
+                }
+            ))
+        )
+    };
+    assert!(route_rejected(create_client_for_route(
+        &factory,
+        ROUTE_URL,
+        ClientRouteClass::Auth,
+    )));
+    // A ReqwestDefault factory returns through create_client(). Prime the route so the
+    // route-aware builder is reached (outside the sandbox) without a live system/PAC lookup.
+    codex_http_client::cache_system_proxy_route_for_test(
+        ROUTE_URL,
+        "http://127.0.0.1:9".to_string(),
     );
+    assert!(route_rejected(create_client_for_route(
+        &HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        ROUTE_URL,
+        ClientRouteClass::Auth,
+    )));
+    println!("{REACHED}");
 }
 
 #[tokio::test]

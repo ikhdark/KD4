@@ -355,6 +355,56 @@ class RolloutSnapshotTest(unittest.TestCase):
                 self.assertEqual(list(rollout_snapshot.rollout_payload_root(output).iterdir()), [])
                 self.assertEqual((directory / f"{digest}.json").read_bytes(), data)
 
+    def test_same_store_export_authenticates_payloads_before_publication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "sessions" / "rollout.jsonl"
+            source.parent.mkdir()
+            output = source.with_name("snapshot.jsonl")
+            data = b'{"type":"event_msg","payload":{}}'
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            blob = directory / f"{digest}.json"
+            source.write_text(json.dumps({"type": "rollout_payload_artifact", "payload": {
+                "sha256": digest, "bytes": len(data), "item_type": "event_msg",
+            }}) + "\n", encoding="utf-8")
+            for payload, error in ((None, FileNotFoundError), (b"x" * len(data), ValueError)):
+                with self.subTest(payload=payload):
+                    if payload is not None:
+                        blob.write_bytes(payload)
+                    output.write_bytes(b"previous evidence")
+                    with (
+                        mock.patch.object(rollout_snapshot, "_codex_home_payload_roots", return_value=[]),
+                        contextlib.redirect_stdout(io.StringIO()) as stdout,
+                        self.assertRaises(error),
+                    ):
+                        rollout_snapshot.main([str(source), "--output", str(output)])
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(output.read_bytes(), b"previous evidence")
+            blob.write_bytes(data)
+            with (
+                mock.patch.object(rollout_snapshot.os, "link") as link,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(rollout_snapshot.main([str(source), "--output", str(output)]), 0)
+            link.assert_not_called()
+            self.assertEqual(output.read_bytes(), source.read_bytes())
+            self.assertEqual(blob.read_bytes(), data)
+            # A same-store export must also localize a dependency that was
+            # found only in the original CODEX_HOME after relocation.
+            home_store = Path(temp) / "home" / "rollout-payloads"
+            home_store.mkdir(parents=True)
+            blob.rename(home_store / blob.name)
+            with (
+                mock.patch.object(rollout_snapshot, "_codex_home_payload_roots", return_value=[home_store]),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                rollout_snapshot.main([str(source), "--output", str(output)])
+            self.assertEqual(blob.read_bytes(), data)
+            with mock.patch.object(rollout_snapshot, "_codex_home_payload_roots", return_value=[]):
+                [(record, _)] = rollout_snapshot.read_rollout_records(output)
+            self.assertEqual(record["type"], "event_msg")
+
     def test_snapshot_context_propagates_errors_and_supports_explicit_closing(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "rollout.jsonl"

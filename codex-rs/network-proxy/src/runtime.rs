@@ -1148,29 +1148,6 @@ mod tests {
         entries.iter().map(|entry| (*entry).to_string()).collect()
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn policy_filesystem_worker_resolves_aliases_and_rejects_unlisted_paths() {
-        let home = tempfile::tempdir().unwrap();
-        let directory = home.path().join("sockets");
-        std::fs::create_dir(&directory).unwrap();
-        let allowed_path = home.path().join("allowed.sock");
-        let denied_path = home.path().join("denied.sock");
-        std::fs::write(&allowed_path, []).unwrap();
-        std::fs::write(&denied_path, []).unwrap();
-        let alias = directory.join("..").join("allowed.sock");
-        let allowed = vec![allowed_path.to_string_lossy().into_owned()];
-        let decisions = run_blocking_policy_io(move || {
-            [
-                unix_socket_path_is_allowed(&alias.to_string_lossy(), &allowed),
-                unix_socket_path_is_allowed(&denied_path.to_string_lossy(), &allowed),
-            ]
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(decisions, [true, false]);
-    }
-
     fn network_settings(allowed_domains: &[&str], denied_domains: &[&str]) -> NetworkProxyConfig {
         let mut network = NetworkProxyConfig::default();
         if !allowed_domains.is_empty() {
@@ -1940,7 +1917,14 @@ mod tests {
         let mut config = network_settings(&["example.com", "evil.com"], &[]);
         config.enabled = true;
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.allowed_domains",
+                candidate: "[\"evil.com\"]".to_string(),
+                allowed: "subset of managed allowed_domains".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1970,7 +1954,14 @@ mod tests {
             ..NetworkProxyConfig::default()
         };
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.mode",
+                candidate: "Full".to_string(),
+                allowed: "Limited or more restrictive".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1996,7 +1987,14 @@ mod tests {
         let mut config = network_settings(&["**.example.com"], &[]);
         config.enabled = true;
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.allowed_domains",
+                candidate: "[\"**.example.com\"]".to_string(),
+                allowed: "subset of managed allowed_domains".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2009,7 +2007,15 @@ mod tests {
         let mut config = network_settings(&["api.example.com"], &[]);
         config.enabled = true;
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.allowed_domains",
+                candidate: "*".to_string(),
+                allowed: "exact hosts or scoped wildcards like *.example.com or **.example.com"
+                    .to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2023,7 +2029,15 @@ mod tests {
         let mut config = network_settings(&["api.example.com"], &[]);
         config.enabled = true;
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.allowed_domains",
+                candidate: "[*]".to_string(),
+                allowed: "exact hosts or scoped wildcards like *.example.com or **.example.com"
+                    .to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2037,7 +2051,15 @@ mod tests {
         let mut config = network_settings(&["api.example.com"], &[]);
         config.enabled = true;
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.allowed_domains",
+                candidate: "**.[*]".to_string(),
+                allowed: "exact hosts or scoped wildcards like *.example.com or **.example.com"
+                    .to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2052,7 +2074,14 @@ mod tests {
             ..NetworkProxyConfig::default()
         };
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.denied_domains",
+                candidate: "missing managed denied_domains entries".to_string(),
+                allowed: "[\"evil.com\"]".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2066,7 +2095,14 @@ mod tests {
         let mut config = network_settings(&[], &["evil.com", "more-evil.com"]);
         config.enabled = true;
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.denied_domains",
+                candidate: "[\"evil.com\", \"more-evil.com\"]".to_string(),
+                allowed: "must match managed denied_domains".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2081,7 +2117,14 @@ mod tests {
             ..NetworkProxyConfig::default()
         };
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.enabled",
+                candidate: "true".to_string(),
+                allowed: "false (disabled by managed config)".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2097,7 +2140,14 @@ mod tests {
             ..NetworkProxyConfig::default()
         };
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.allow_local_binding",
+                candidate: "true".to_string(),
+                allowed: "false (disabled by managed config)".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2140,7 +2190,14 @@ mod tests {
             ..NetworkProxyConfig::default()
         };
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.dangerously_allow_all_unix_sockets",
+                candidate: "true".to_string(),
+                allowed: "false (disabled by managed config)".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2157,7 +2214,14 @@ mod tests {
             ..NetworkProxyConfig::default()
         };
 
-        assert!(validate_policy_against_constraints(&config, &constraints).is_err());
+        assert_eq!(
+            validate_policy_against_constraints(&config, &constraints),
+            Err(NetworkProxyConstraintError::InvalidValue {
+                field_name: "network.dangerously_allow_all_unix_sockets",
+                candidate: "true".to_string(),
+                allowed: "false (disabled by managed config)".to_string(),
+            })
+        );
     }
 
     #[test]

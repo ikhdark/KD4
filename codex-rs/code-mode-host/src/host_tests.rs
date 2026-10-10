@@ -704,16 +704,22 @@ async fn session_id_cannot_be_reused_after_shutdown() {
             .expect("host hello");
 
         let id = session_id("session-1");
-        for (request_id, request) in [
+        for (request_id, request, expected) in [
             (
                 request_id(/*value*/ 1),
                 HostRequest::OpenSession {
+                    session_id: id.clone(),
+                },
+                HostResponse::SessionReady {
                     session_id: id.clone(),
                 },
             ),
             (
                 request_id(/*value*/ 2),
                 HostRequest::ShutdownSession {
+                    session_id: id.clone(),
+                },
+                HostResponse::SessionClosed {
                     session_id: id.clone(),
                 },
             ),
@@ -725,11 +731,13 @@ async fn session_id_cannot_be_reused_after_shutdown() {
                 })
                 .await
                 .expect("session request");
-            reader
-                .read::<HostToClient>()
-                .await
-                .expect("session response")
-                .expect("session response message");
+            assert_eq!(
+                reader.read::<HostToClient>().await.expect("session response"),
+                Some(HostToClient::Response {
+                    id: request_id,
+                    result: WireResult::Ok { value: expected },
+                })
+            );
         }
         writer
             .write(&ClientToHost::Request {

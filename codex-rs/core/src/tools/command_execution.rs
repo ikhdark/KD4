@@ -2821,6 +2821,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distinct_rg_argument_vectors_do_not_share_negative_search_evidence() {
+        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        std::fs::write(root.join("example.txt"), "needle\n").unwrap();
+        // One literal pattern containing the old identity delimiter is not
+        // equivalent to two separate -e patterns. The real searches prove it.
+        let commands = [
+            vec!["rg", "--no-config", "--no-ignore-global", "--no-ignore-parent", "-e", "needle\u{1e}-e\u{1e}other", "example.txt"],
+            vec!["rg", "--no-config", "--no-ignore-global", "--no-ignore-parent", "-e", "needle", "-e", "other", "example.txt"],
+        ].map(|args| args.into_iter().map(str::to_string).collect::<Vec<_>>());
+        let ledger = CommandExecutionLedger::default();
+        for (index, command) in commands.iter().enumerate() {
+            let actual = std::process::Command::new("rg")
+                .args(&command[1..])
+                .current_dir(root)
+                .output()
+                .expect("run ripgrep");
+            assert_eq!(actual.status.code(), Some(if index == 0 { 1 } else { 0 }));
+            assert_eq!(actual.stdout, if index == 0 { Vec::new() } else { b"needle\n".to_vec() });
+            let mut search = classify_rg_search_narrowing(command, None, root, root)
+                .unwrap()
+                .expect("rg search");
+            observe_rg_search_scope_state(&mut search).await;
+            assert!(search.scope_state_identity.is_some());
+            let attempt = CommandAttemptKey::new(
+                "exec_command", "local", root.to_string_lossy(), command,
+            ).with_search_narrowing("turn-a", "repo-a", Some(search));
+            ledger.begin_attempt(&attempt, false).await
+                .expect("a different executable query must not inherit a cached miss");
+            ledger.record_exit(&attempt, actual.status.code().unwrap()).await;
+            if index == 0 {
+                ledger.begin_attempt(&attempt, false).await
+                    .expect_err("the exact original miss must still be cached");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn audit189_rg_classifier_drives_narrowing_ledger_for_real_commands() {
         use crate::shell::ShellType;
         use crate::tools::handlers::command_search::classify_rg_search_narrowing;

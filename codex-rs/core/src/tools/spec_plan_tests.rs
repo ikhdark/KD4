@@ -983,7 +983,11 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
                 "missing {contract_field}"
             );
         }
-        assert!(!exec.description.contains("curr_time(args:"));
+        let clock = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
+            "clock",
+            "curr_time",
+        ));
+        assert!(!exec.description.contains(&format!("{clock}(args:")));
         assert!(!exec.description.contains("Return the current time in UTC."));
         assert!(exec.description.contains("read_file(args:"));
         assert!(exec.description.contains("read_tool_output(args:"));
@@ -1192,7 +1196,12 @@ async fn code_mode_keeps_direct_mcp_contracts_lazy() {
     let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
         panic!("expected code mode exec tool");
     };
-    assert!(!exec.description.contains("mcp__direct_lookup(args:"));
+    // Nested declarations use the code-mode identifier, not the display name.
+    let nested_name = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
+        "mcp__direct",
+        "lookup",
+    ));
+    assert!(!exec.description.contains(&format!("{nested_name}(args:")));
 }
 
 #[tokio::test]
@@ -1869,7 +1878,7 @@ async fn malformed_extension_specs_are_skipped_without_panicking() {
     )
     .await;
 
-    plan.assert_registered_lacks(&["broken.run"]);
+    plan.assert_registered_lacks(&[ToolName::namespaced("broken", "run").to_string().as_str()]);
     assert!(
         plan.warnings
             .iter()
@@ -2429,7 +2438,11 @@ async fn code_mode_only_exposes_configured_dynamic_namespace_directly() {
     let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
         panic!("expected code mode exec tool");
     };
-    assert!(!exec.description.contains("direct_only_lookup(args:"));
+    let nested_name = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
+        "direct_only",
+        "lookup",
+    ));
+    assert!(!exec.description.contains(&format!("{nested_name}(args:")));
 }
 
 #[tokio::test]
@@ -2458,7 +2471,11 @@ async fn deferred_tools_enable_nested_tool_guidance_without_prompt_inventory() {
         exec.description
             .contains("Some deferred nested tools may be omitted")
     );
-    assert!(!exec.description.contains("deferred_lookup(args:"));
+    let nested_name = codex_tools::code_mode_name_for_tool_name(&ToolName::namespaced(
+        "deferred",
+        "lookup",
+    ));
+    assert!(!exec.description.contains(&format!("{nested_name}(args:")));
 }
 
 #[tokio::test]
@@ -2562,6 +2579,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     .await;
     v1.assert_visible_contains(&[MULTI_AGENT_V1_NAMESPACE]);
     v1.assert_visible_lacks(&[
+        MULTI_AGENT_V2_NAMESPACE,
         "spawn_agent",
         "send_input",
         "resume_agent",
@@ -2617,6 +2635,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     .await;
     v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
     v2.assert_visible_lacks(&[
+        MULTI_AGENT_V1_NAMESPACE,
         "spawn_agent",
         "send_message",
         "followup_task",

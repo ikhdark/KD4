@@ -689,6 +689,9 @@ mod tests {
             .await
             .expect("flush acknowledged")
             .expect("flush inserted burst");
+        // The first batch becomes the pending scope; the other seven merge into it
+        // while the startup cleanup is still blocked.
+        assert_eq!(telemetry.event_count("cleanup_coalesced"), 7);
 
         control.fail_next_deletion();
         control.release_blocked_deletion();
@@ -706,7 +709,9 @@ mod tests {
             .expect("join writer");
 
         assert_eq!(control.max_active_deletions(), 1);
-        assert!(telemetry.event_count("cleanup_coalesced") >= 1);
+        // The failed startup scope merges back into the pending burst scope, so the
+        // completed cleanup is its retry and not only the burst that was already waiting.
+        assert_eq!(telemetry.event_count("cleanup_coalesced"), 8);
         assert_eq!(telemetry.event_count("cleanup_failed"), 1);
         assert_eq!(telemetry.event_count("cleanup_retry_pending"), 1);
     }
@@ -846,7 +851,7 @@ mod tests {
         };
         let sqlite_logs = String::from_utf8(
             runtime
-                .query_feedback_logs("thread-1")
+                .query_feedback_logs_for_threads(&["thread-1"])
                 .await
                 .expect("query feedback logs"),
         )
@@ -984,7 +989,13 @@ mod tests {
             .set_default();
 
         tracing::info!("interval-log");
-        let after_interval = wait_for_log_count(&runtime, /*expected*/ 1).await;
+        // Bound the wait below the default interval so an ignored setting cannot pass.
+        let after_interval = tokio::time::timeout(
+            LOG_FLUSH_INTERVAL / 2,
+            wait_for_log_count(&runtime, /*expected*/ 1),
+        )
+        .await
+        .expect("configured interval flushes before the default interval");
         drop(guard);
 
         assert_eq!(after_interval[0].message.as_deref(), Some("interval-log"));

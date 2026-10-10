@@ -16,16 +16,21 @@ use pretty_assertions::assert_eq;
 use std::path::Path;
 
 #[test]
-fn default_linux_sandbox_uses_platform_sandbox_tag() {
-    let actual = permission_profile_sandbox_tag(
-        &PermissionProfile::read_only(),
-        WindowsSandboxLevel::Disabled,
-        /*enforce_managed_network*/ false,
-    );
-    let expected = get_platform_sandbox(/*windows_sandbox_enabled*/ false)
-        .map(SandboxType::as_metric_tag)
-        .unwrap_or("none");
-    assert_eq!(actual, expected);
+fn read_only_profile_is_tagged_with_the_windows_sandbox_only_when_enabled() {
+    for (level, expected) in [
+        (WindowsSandboxLevel::RestrictedToken, "windows_sandbox"),
+        (WindowsSandboxLevel::Disabled, "none"),
+    ] {
+        assert_eq!(
+            permission_profile_sandbox_tag(
+                &PermissionProfile::read_only(),
+                level,
+                /*enforce_managed_network*/ false,
+            ),
+            expected,
+            "{level:?}"
+        );
+    }
 }
 
 #[test]
@@ -62,14 +67,13 @@ fn unrestricted_managed_profile_with_enabled_network_is_untagged() {
         network: NetworkSandboxPolicy::Enabled,
     };
 
-    assert_eq!(
-        permission_profile_sandbox_tag(
-            &profile,
-            WindowsSandboxLevel::Disabled,
-            /*enforce_managed_network*/ false,
-        ),
-        "none"
-    );
+    for level in [WindowsSandboxLevel::Disabled, WindowsSandboxLevel::Elevated] {
+        assert_eq!(
+            permission_profile_sandbox_tag(&profile, level, /*enforce_managed_network*/ false),
+            "none",
+            "{level:?}"
+        );
+    }
 }
 
 #[test]
@@ -87,14 +91,13 @@ fn root_write_managed_profile_with_enabled_network_is_untagged() {
         network: NetworkSandboxPolicy::Enabled,
     };
 
-    assert_eq!(
-        permission_profile_sandbox_tag(
-            &profile,
-            WindowsSandboxLevel::Disabled,
-            /*enforce_managed_network*/ false,
-        ),
-        "none"
-    );
+    for level in [WindowsSandboxLevel::Disabled, WindowsSandboxLevel::Elevated] {
+        assert_eq!(
+            permission_profile_sandbox_tag(&profile, level, /*enforce_managed_network*/ false),
+            "none",
+            "{level:?}"
+        );
+    }
 }
 
 #[test]

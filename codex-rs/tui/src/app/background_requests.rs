@@ -219,7 +219,11 @@ impl App {
         &mut self,
         app_server: &AppServerSession,
         force_refetch: bool,
+        request_id: uuid::Uuid,
     ) {
+        if !self.chat_widget.accepts_connectors_request(request_id) {
+            return;
+        }
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         let thread_id = self
@@ -230,6 +234,7 @@ impl App {
                 .await
                 .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::ConnectorsLoaded {
+                request_id,
                 result,
                 is_final: true,
             });
@@ -1503,6 +1508,17 @@ mod tests {
         assert_eq!(
             marketplace_add_source_for_request(&cwd, "./marketplace#main".to_string()),
             format!("{}#main", cwd.join("marketplace").display())
+        );
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, r".\marketplace".to_string()),
+            cwd.join("marketplace").display().to_string()
+        );
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, r"..\shared@v1".to_string()),
+            format!(
+                "{}@v1",
+                cwd.parent().expect("cwd parent").join("shared").display()
+            )
         );
         assert_eq!(
             marketplace_add_source_for_request(&cwd, "owner/repo".to_string()),

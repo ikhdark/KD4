@@ -238,10 +238,7 @@ mod tests {
         );
         for model in catalog.models {
             let expected = match model.slug.as_str() {
-                AMAZON_BEDROCK_GPT_5_5_MODEL_ID => (
-                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
-                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
-                ),
+                AMAZON_BEDROCK_GPT_5_5_MODEL_ID => (Some(272_000), Some(272_000)),
                 _ => (Some(272_000), Some(872_000)),
             };
             assert_eq!(

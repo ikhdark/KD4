@@ -316,4 +316,54 @@ mod tests {
             &cloned.capability_summaries
         ));
     }
+
+    #[test]
+    fn inactive_plugins_retain_metadata_without_effective_capabilities() {
+        let rich_plugin = |name: &str| {
+            let mut plugin = loaded_plugin(name, vec![test_path(&format!("{name}-skills"))]);
+            plugin.mcp_servers.insert(name.to_string(), ());
+            plugin.apps.push(AppDeclaration {
+                name: name.to_string(),
+                connector_id: AppConnectorId(name.to_string()),
+                category: None,
+            });
+            plugin.hook_sources.push(PluginHookSource {
+                plugin_id: crate::PluginId::parse(name).unwrap(),
+                plugin_root: plugin.root.clone(),
+                plugin_data_root: test_path(&format!("{name}-data")),
+                source_path: plugin.root.join("hooks.json"),
+                source_relative_path: "hooks.json".to_string(),
+                hooks: codex_config::HookEventsToml::default(),
+            });
+            plugin.hook_load_warnings.push(format!("{name} warning"));
+            plugin
+        };
+        let active = rich_plugin("active@test");
+        let mut disabled = rich_plugin("disabled@test");
+        disabled.enabled = false;
+        let mut failed = rich_plugin("failed@test");
+        failed.error = Some("invalid plugin".to_string());
+        let plugins = vec![disabled, active.clone(), failed];
+        let outcome = PluginLoadOutcome::from_plugins(plugins.clone());
+
+        assert_eq!(outcome.plugins(), plugins);
+        assert_eq!(outcome.effective_skill_roots(), active.skill_roots);
+        assert_eq!(
+            outcome.effective_plugin_skill_roots(),
+            vec![PluginSkillRoot {
+                path: active.skill_roots[0].clone(),
+                plugin_id: active.config_name.clone(),
+                plugin_namespace: "active".to_string(),
+                plugin_root: active.root.clone(),
+            }]
+        );
+        assert_eq!(outcome.effective_mcp_servers(), active.mcp_servers);
+        assert_eq!(outcome.effective_apps(), vec![AppConnectorId("active@test".to_string())]);
+        assert_eq!(outcome.effective_plugin_hook_sources(), active.hook_sources);
+        assert_eq!(outcome.effective_plugin_hook_warnings(), active.hook_load_warnings);
+        let [summary] = outcome.capability_summaries() else {
+            panic!("only the active plugin may advertise capabilities");
+        };
+        assert_eq!(summary.config_name, "active@test");
+    }
 }

@@ -6820,7 +6820,7 @@ fn audit_reports_17_19_pending_images_use_modality_estimates() {
 fn stop_hook_continuation_reaches_the_final_response() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "stop_hook_continuation_reaches_the_final_response",
-        || stop_hook_continuation_reaches_the_final_response_impl(false),
+        stop_hook_continuation_reaches_the_final_response_impl,
     )
 }
 
@@ -7081,17 +7081,7 @@ async fn registered_command_repair_preserves_safety_history_and_post_hook_contex
     Ok(())
 }
 
-#[test]
-fn direct_runtime_stop_hook_continuation_reaches_the_final_response() -> Result<()> {
-    run_turn_multi_thread_test_with_stack(
-        "direct_runtime_stop_hook_continuation_reaches_the_final_response",
-        || stop_hook_continuation_reaches_the_final_response_impl(true),
-    )
-}
-
-async fn stop_hook_continuation_reaches_the_final_response_impl(
-    direct_runtime: bool,
-) -> Result<()> {
+async fn stop_hook_continuation_reaches_the_final_response_impl() -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
     let response_log = responses::mount_sse_sequence(
@@ -7129,12 +7119,7 @@ async fn stop_hook_continuation_reaches_the_final_response_impl(
         .with_pre_build_hook(|home| {
             write_one_shot_stop_hook(home).expect("write stop-hook fixture");
         })
-        .with_config(move |config| {
-            trust_discovered_hooks(config);
-            if direct_runtime {
-                let _ = config.features.enable(Feature::DirectRuntime);
-            }
-        });
+        .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
 
     test.codex
@@ -7415,8 +7400,10 @@ fn controlled_tool_call(
     )
 }
 
+// This polls the future itself; it does not drive the sampling loop that
+// decides when an accepted call is first polled.
 #[tokio::test]
-async fn accepted_tool_future_starts_without_waiting_for_the_response_tail() {
+async fn in_flight_tool_call_future_relays_its_result_once_polled() {
     let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
@@ -7429,7 +7416,7 @@ async fn accepted_tool_future_starts_without_waiting_for_the_response_tail() {
     let result_task = tokio::spawn(async move { in_flight.next().await.unwrap() });
     tokio::time::timeout(Duration::from_secs(5), first_poll_rx)
         .await
-        .expect("accepted call must start while the response is still open")
+        .expect("a polled call must start its handler")
         .expect("tool handler started");
     release_tx.send(()).unwrap();
     assert_eq!(

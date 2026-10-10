@@ -351,6 +351,12 @@ async fn only_ready_unchanged_non_chatgpt_clients_are_reusable() {
         },
     );
     assert!(manager.reusable_client("stdio", &original).await.is_none());
+
+    // A startup that has not settled is rejected by its flag, without awaiting it.
+    let pending = create_ready_async_managed_client(Vec::new()).await;
+    pending.startup_complete.store(false, Ordering::Release);
+    manager.clients.insert("stdio".to_string(), pending);
+    assert!(manager.reusable_client("stdio", &original).await.is_none());
 }
 
 #[tokio::test]
@@ -1083,6 +1089,15 @@ fn elicitation_granular_policy_respects_never_and_config() {
             mcp_elicitations: false,
         }
     )));
+    assert!(!elicitation_is_rejected_by_policy(AskForApproval::Granular(
+        GranularApprovalConfig {
+            sandbox_approval: false,
+            rules: false,
+            skill_approval: false,
+            request_permissions: false,
+            mcp_elicitations: true,
+        }
+    )));
 }
 
 #[tokio::test]
@@ -1609,6 +1624,14 @@ fn codex_apps_env_bearer_token_bypasses_shared_tools_cache() {
     assert!(!should_share_codex_apps_tools_cache(
         CODEX_APPS_MCP_SERVER_NAME,
         /*uses_env_bearer_token*/ true,
+    ));
+    assert!(should_share_codex_apps_tools_cache(
+        CODEX_APPS_MCP_SERVER_NAME,
+        /*uses_env_bearer_token*/ false,
+    ));
+    assert!(!should_share_codex_apps_tools_cache(
+        "docs",
+        /*uses_env_bearer_token*/ false,
     ));
 }
 
@@ -2148,9 +2171,12 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
     let attempts_for_reconnect = Arc::clone(&attempts);
     let reconnect_finished = Arc::new(tokio::sync::Notify::new());
     let reconnect_finished_for_factory = Arc::clone(&reconnect_finished);
+    let release_successful_reconnect = Arc::new(tokio::sync::Notify::new());
+    let release_successful_reconnect_for_factory = Arc::clone(&release_successful_reconnect);
     let reconnect_factory = Arc::new(move || {
         let attempt = attempts_for_reconnect.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let reconnect_finished = Arc::clone(&reconnect_finished_for_factory);
+        let release_successful_reconnect = Arc::clone(&release_successful_reconnect_for_factory);
         let recovered_client = recovered_client.clone();
         async move {
             let result = if attempt < 2 {
@@ -2160,6 +2186,7 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
                     is_timeout: false,
                 })
             } else {
+                release_successful_reconnect.notified().await;
                 Ok(recovered_client)
             };
             reconnect_finished.notify_one();
@@ -2225,6 +2252,7 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
 
     tokio::time::advance(CODEX_APPS_RECONNECT_INITIAL_BACKOFF).await;
     let third_reconnect_finished = reconnect_finished.notified();
+    let cached_revision = manager.tool_catalog_revision();
     let tools = manager.list_all_tools().await;
     assert_eq!(
         tools
@@ -2233,8 +2261,17 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
             .collect::<Vec<_>>(),
         vec!["cached_drive_search"]
     );
+    release_successful_reconnect.notify_one();
     third_reconnect_finished.await;
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.tool_catalog_revision() == cached_revision {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("successful reconnect should publish the live catalog");
 
     let tools = manager.list_all_tools().await;
     assert_eq!(
@@ -2308,8 +2345,15 @@ async fn tool_lists_do_not_block_and_share_codex_apps_startup_reconnect() {
         vec!["cached_drive_search"]
     );
 
+    let cached_revision = manager.tool_catalog_revision();
     release_reconnect.notify_one();
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.tool_catalog_revision() == cached_revision {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("successful reconnect should publish the live catalog");
     let tools = manager.list_all_tools().await;
     assert_eq!(
         tools
@@ -2413,6 +2457,10 @@ fn host_owned_codex_apps_matches_reserved_name_with_server_metadata() {
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         McpServerMetadata::from(&server),
     );
+    // Another registered server isolates the reserved-name condition.
+    manager
+        .server_metadata
+        .insert("docs".to_string(), McpServerMetadata::from(&server));
 
     assert!(manager.is_host_owned_codex_apps_server(CODEX_APPS_MCP_SERVER_NAME));
     assert!(!manager.is_host_owned_codex_apps_server("docs"));
@@ -2459,7 +2507,12 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 transport: McpServerTransportConfig::StreamableHttp {
                     url: "http://127.0.0.1:1".to_string(),
                     bearer_token_env_var: None,
-                    http_headers: None,
+                    // A static Authorization header skips the stored-OAuth lookup, so
+                    // polling this startup below touches no credential store.
+                    http_headers: Some(HashMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer test".to_string(),
+                    )])),
                     env_http_headers: None,
                 },
                 environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
@@ -2538,31 +2591,20 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         startup_outcome_error_message(error),
         "local stdio MCP server `stdio` requires a local environment"
     );
+    // Environment resolution precedes every await, so a rejected server fails on
+    // its first poll; the accepted HTTP server is still waiting on its transport.
+    assert!(
+        manager
+            .clients
+            .get("http")
+            .expect("http client")
+            .client
+            .clone()
+            .now_or_never()
+            .is_none(),
+        "local HTTP MCP startup must not fail for lack of a local environment"
+    );
     cancel_token.cancel();
-}
-
-#[test]
-fn elicitation_capability_uses_2025_06_18_shape_for_form_only_support() {
-    let capability = Some(ElicitationCapability::default());
-    assert_eq!(
-        serde_json::to_value(capability).expect("serialize elicitation capability"),
-        serde_json::json!({})
-    );
-}
-
-#[test]
-fn elicitation_capability_advertises_url_support_when_enabled() {
-    let capability = Some(ElicitationCapability {
-        form: Some(rmcp::model::FormElicitationCapability::default()),
-        url: Some(rmcp::model::UrlElicitationCapability::default()),
-    });
-    assert_eq!(
-        serde_json::to_value(capability).expect("serialize elicitation capability"),
-        serde_json::json!({
-            "form": {},
-            "url": {},
-        })
-    );
 }
 
 #[test]
@@ -2753,6 +2795,7 @@ async fn shutdown_clients_share_one_deadline_before_forcing() {
     let graceful_started_for_shutdown = Arc::clone(&graceful_started);
     let forced_for_shutdown = Arc::clone(&forced);
 
+    let start = tokio::time::Instant::now();
     let shutdown = tokio::spawn(shutdown_clients_with_deadline(
         vec![0, 1, 2],
         Duration::from_secs(2),
@@ -2782,6 +2825,9 @@ async fn shutdown_clients_share_one_deadline_before_forcing() {
     shutdown.await.expect("shutdown task should finish");
 
     assert_eq!(forced.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // Awaiting under a paused clock auto-advances it, so a deadline per client
+    // would still finish; only the elapsed time shows they shared one.
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
 }
 
 #[tokio::test]

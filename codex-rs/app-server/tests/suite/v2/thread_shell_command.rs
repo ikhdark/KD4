@@ -59,7 +59,8 @@ use super::exec_server_test_support::read_exec_server_json;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
-async fn thread_shell_command_history_responses_exclude_persisted_command_executions() -> Result<()>
+async fn thread_shell_command_history_responses_keep_the_user_shell_execution_exactly_once()
+-> Result<()>
 {
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
@@ -646,11 +647,38 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
 }
 
 fn assert_user_shell_command(items: &[ThreadItem], context: &str, command_id: &str, expected_output: &str) {
-    let commands = items.iter().filter(|item| matches!(item,
-        ThreadItem::CommandExecution { id, source: CommandExecutionSource::UserShell,
-            status: CommandExecutionStatus::Completed, aggregated_output, exit_code: Some(0), .. }
-            if id == command_id && aggregated_output.as_deref() == Some(expected_output))).count();
-    assert_eq!(commands, 1, "{context} must preserve the completed user-shell execution exactly once");
+    // Count every user-shell execution and every item with this id, so a second
+    // copy in another state or under another id is a duplicate too.
+    let commands = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ThreadItem::CommandExecution { id, source, .. }
+                    if id == command_id || *source == CommandExecutionSource::UserShell
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commands.len(),
+        1,
+        "{context} must preserve the user-shell execution exactly once: {commands:?}"
+    );
+    assert!(
+        matches!(
+            commands[0],
+            ThreadItem::CommandExecution {
+                id,
+                source: CommandExecutionSource::UserShell,
+                status: CommandExecutionStatus::Completed,
+                aggregated_output,
+                exit_code: Some(0),
+                ..
+            } if id == command_id && aggregated_output.as_deref() == Some(expected_output)
+        ),
+        "{context} must preserve the completed user-shell execution: {:?}",
+        commands[0]
+    );
 }
 
 fn current_shell_output_command(text: &str) -> Result<(String, String)> {

@@ -93,6 +93,10 @@ async fn account_analytics_preserves_signed_credit_events() {
             }],
         })
     );
+    // Credit events take no range parameters; callers cache them per route.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.query(), None);
 }
 
 #[tokio::test]

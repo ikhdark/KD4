@@ -96,8 +96,8 @@ def _hydrate_verified_payload(record: dict[str, Any], data: bytes) -> dict[str, 
 
 def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
     """Copy dependencies before publishing a byte-identical portable snapshot."""
-    if rollout_payload_root(snapshot.path) == rollout_payload_root(output):
-        return
+    directory = rollout_payload_root(output)
+    same_store = rollout_payload_root(snapshot.path) == directory
     seen = set()
     with snapshot.open_lines() as lines:
         for line in lines:
@@ -116,9 +116,12 @@ def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
             if digest in seen:
                 continue
             seen.add(digest)
-            directory = rollout_payload_root(output)
-            directory.mkdir(parents=True, exist_ok=True)
             destination = directory / f"{digest}.json"
+            # Sharing a store avoids copying, not authentication. A relocated
+            # rollout may have loaded from CODEX_HOME instead of this store.
+            if same_store and destination.is_file():
+                continue
+            directory.mkdir(parents=True, exist_ok=True)
             # Publish atomically without replacing any existing immutable blob.
             temporary_path = None
             try:

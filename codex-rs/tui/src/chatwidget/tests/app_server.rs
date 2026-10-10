@@ -1,6 +1,64 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+#[tokio::test]
+async fn mcp_result_without_transport_error_preserves_failed_status() {
+    use codex_app_server_protocol::McpToolCallResult;
+    use codex_app_server_protocol::McpToolCallStatus;
+    use ratatui::style::Color;
+
+    for replay in [false, true] {
+        for (status, expected_color) in [
+            (McpToolCallStatus::Failed, Color::Red),
+            (McpToolCallStatus::Completed, Color::Green),
+        ] {
+            let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+            let _ = drain_insert_history(&mut rx);
+            let item = AppServerThreadItem::McpToolCall {
+                id: "mcp-result-status".to_string(),
+                server: "example".to_string(),
+                tool: "check".to_string(),
+                status,
+                arguments: json!({}),
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                result: Some(Box::new(McpToolCallResult {
+                    content: vec![json!({"type": "text", "text": "tool-reported result"})],
+                    structured_content: None,
+                    meta: None,
+                })),
+                error: None,
+                duration_ms: Some(1),
+            };
+            if replay {
+                chat.replay_thread_item(item, "turn-mcp".to_string(), ReplayKind::ThreadSnapshot);
+            } else {
+                chat.handle_server_notification(
+                    ServerNotification::ItemCompleted(ItemCompletedNotification {
+                        thread_id: "019cff70-2599-75e2-af72-b90000000002".to_string(),
+                        turn_id: "turn-mcp".to_string(),
+                        completed_at_ms: 1,
+                        item,
+                    }),
+                    None,
+                );
+            }
+            let cells = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    AppEvent::InsertHistoryCell(cell) => Some(cell),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(cells.len(), 1);
+            let display = cells[0].display_lines(80);
+            assert!(lines_to_single_string(&display).contains("tool-reported result"));
+            assert_eq!(display[0].spans[0].style.fg, Some(expected_color));
+            assert!(chat.transcript.active_cell.is_none());
+        }
+    }
+}
+
 const SAFETY_BUFFERING_HEADER_TEXT: &str =
     "Our systems are thinking a bit more about this request before responding.";
 
@@ -907,6 +965,24 @@ async fn live_app_server_config_warning_prefixes_summary() {
         rendered.contains("Invalid configuration; using defaults."),
         "expected config warning summary, got {rendered}"
     );
+
+    chat.handle_server_notification(
+        ServerNotification::ConfigWarning(ConfigWarningNotification {
+            summary: "Invalid configuration".to_string(),
+            details: Some("unknown key foo".to_string()),
+            path: None,
+            range: None,
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one detailed warning history cell");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Invalid configuration: unknown key foo"),
+        "expected details prefixed by the summary, got {rendered}"
+    );
 }
 
 #[tokio::test]
@@ -1525,6 +1601,63 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
     );
 
     assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(!chat.bottom_pane.is_task_running());
+
+    // Control: an error that only arrives with the failed turn is not a duplicate and must render.
+    handle_turn_started(&mut chat, "turn-2");
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            surfaced_result: None,
+            thread_id: "thread-1".to_string(),
+            turn: app_server_turn(
+                "turn-2",
+                AppServerTurnStatus::Failed,
+                /*duration_ms*/ None,
+                Some(AppServerTurnError {
+                    message: "disk full".to_string(),
+                    codex_error_info: None,
+                    additional_details: None,
+                }),
+            ),
+            timing: None,
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let control_cells = drain_insert_history(&mut rx);
+    assert_eq!(control_cells.len(), 1);
+    assert!(lines_to_single_string(&control_cells[0]).contains("disk full"));
+    assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
+async fn failed_turn_without_error_preserves_uncommitted_answer() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    handle_turn_started(&mut chat, "turn-partial");
+    let _ = drain_insert_history(&mut rx);
+    let partial = "Partial response still belongs to the transcript.";
+    handle_agent_message_delta(&mut chat, partial);
+
+    // A failed turn does not require an error payload. Already received answer
+    // text must survive this terminal event even before the next commit tick.
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: app_server_turn("turn-partial", AppServerTurnStatus::Failed, None, None),
+            surfaced_result: None,
+            timing: None,
+        }),
+        None,
+    );
+
+    let sources = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::ConsolidateAgentMessage { source, .. } => Some(source),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sources, vec![partial.to_string()]);
+    assert!(chat.stream_controller.is_none());
     assert!(!chat.bottom_pane.is_task_running());
 }
 

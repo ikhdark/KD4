@@ -627,6 +627,47 @@ async fn provider_retry_preserves_jitter_and_prioritizes_cancellation() {
 }
 
 #[tokio::test]
+async fn owner_cancellation_interrupts_each_active_retry_wait() {
+    for kind in ["provider", "network", "fallback"] {
+        let home = tempfile::tempdir().unwrap();
+        let (session, mut turn, events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                |config| config.model_provider.supports_websockets = true,
+            )
+            .await;
+        if kind == "network" {
+            std::sync::Arc::get_mut(&mut turn).unwrap().session_source = SessionSource::Cli;
+        }
+        let mut client = session.services.model_client.new_session();
+        let mut state = ResponsesStreamRetryState::default();
+        let cancellation = CancellationToken::new();
+        tokio::time::pause();
+        let advice = RetryAfter::from_delay(Duration::from_secs(60));
+        let error = match kind {
+            "network" => connection_failed(),
+            "fallback" => unexpected_status(StatusCode::SERVICE_UNAVAILABLE).with_retry_after(advice),
+            _ => CodexErr::Stream("retry later".into(), advice),
+        };
+        let retry = handle_retryable_response_stream_error(
+            &mut state, if kind == "fallback" { 0 } else { 5 }, error,
+            &mut client, &session, &turn, ResponsesStreamRequest::Sampling, &cancellation,
+        );
+        tokio::pin!(retry);
+        assert!(futures::poll!(retry.as_mut()).is_pending(), "{kind}");
+        assert!(events.try_recv().is_ok(), "{kind} must enter the announced wait");
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(1), retry.as_mut())
+            .await.expect("cancellation must not wait for the retry deadline");
+        assert!(matches!(result, Err(CodexErr::TurnAborted)), "{kind}");
+        assert!(events.try_recv().is_err(), "cancellation must not announce another retry");
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
 async fn cancelled_retry_does_not_switch_transport_or_announce_an_attempt() {
     let home = tempfile::tempdir().unwrap();
     let (session, turn_context, events) =

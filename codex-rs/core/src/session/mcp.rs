@@ -629,7 +629,9 @@ impl Session {
 
         let config = self.get_config().await;
         let refresh_config = McpServerRefreshConfig {
-            mcp_servers: serde_json::to_value(config.mcp_servers.get())?,
+            // The refresh replaces the whole catalog, so it needs the built-in, plugin and
+            // extension servers too, not only the ones declared in config.
+            mcp_servers: serde_json::to_value(self.runtime_mcp_servers(&config).await)?,
             mcp_oauth_credentials_store_mode: serde_json::to_value(
                 config.mcp_oauth_credentials_store_mode,
             )?,

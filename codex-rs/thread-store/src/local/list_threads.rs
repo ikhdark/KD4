@@ -817,7 +817,15 @@ mod tests {
             .list_threads(params)
             .await
             .expect_err("relationship filter must reject scan cursor");
-        assert!(matches!(err, ThreadStoreError::InvalidRequest { .. }));
+        // A malformed cursor is also an InvalidRequest; pin the relationship rejection.
+        assert!(
+            matches!(
+                &err,
+                ThreadStoreError::InvalidRequest { message }
+                    if message == "relationship-filtered thread listing requires a state DB cursor"
+            ),
+            "unexpected error: {err}"
+        );
 
         let mut params = list_params(10, None, ThreadListStorageMode::PreferStateDb);
         params.relation_filter = Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id));

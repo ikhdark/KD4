@@ -411,23 +411,6 @@ impl PartialEq for NetworkProxy {
 
 impl Eq for NetworkProxy {}
 
-pub const PROXY_URL_ENV_KEYS: &[&str] = &[
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "WS_PROXY",
-    "WSS_PROXY",
-    "ALL_PROXY",
-    "FTP_PROXY",
-    "YARN_HTTP_PROXY",
-    "YARN_HTTPS_PROXY",
-    "NPM_CONFIG_HTTP_PROXY",
-    "NPM_CONFIG_HTTPS_PROXY",
-    "NPM_CONFIG_PROXY",
-    "BUNDLE_HTTP_PROXY",
-    "BUNDLE_HTTPS_PROXY",
-    "PIP_PROXY",
-];
-
 pub const ALL_PROXY_ENV_KEYS: &[&str] = &["ALL_PROXY", "all_proxy"];
 pub const PROXY_ACTIVE_ENV_KEY: &str = "CODEX_NETWORK_PROXY_ACTIVE";
 pub const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "CODEX_NETWORK_ALLOW_LOCAL_BINDING";
@@ -492,23 +475,6 @@ pub const DEFAULT_NO_PROXY_VALUE: &str = concat!(
     "172.16.0.0/12,",
     "192.168.0.0/16"
 );
-
-pub fn proxy_url_env_value<'a>(
-    env: &'a HashMap<String, String>,
-    canonical_key: &str,
-) -> Option<&'a str> {
-    if let Some(value) = env.get(canonical_key) {
-        return Some(value.as_str());
-    }
-    let lower_key = canonical_key.to_ascii_lowercase();
-    env.get(lower_key.as_str()).map(String::as_str)
-}
-
-pub fn has_proxy_url_env_vars(env: &HashMap<String, String>) -> bool {
-    PROXY_URL_ENV_KEYS
-        .iter()
-        .any(|key| proxy_url_env_value(env, key).is_some_and(|value| !value.trim().is_empty()))
-}
 
 fn set_env_keys(env: &mut HashMap<String, String>, keys: &[&str], value: &str) {
     for key in keys {
@@ -1274,18 +1240,7 @@ mod tests {
             socks_url: format!("http://{socks_addr}"),
             ..NetworkProxyConfig::default()
         }));
-        let proxy = match NetworkProxy::builder().state(state).build().await {
-            Ok(proxy) => proxy,
-            Err(err) => {
-                if err
-                    .chain()
-                    .any(|cause| cause.to_string().contains("Operation not permitted"))
-                {
-                    return;
-                }
-                panic!("failed to build managed proxy: {err:#}");
-            }
-        };
+        let proxy = NetworkProxy::builder().state(state).build().await.unwrap();
 
         assert!(proxy.http_addr.ip().is_loopback());
         assert!(proxy.socks_addr.ip().is_loopback());
@@ -1387,18 +1342,7 @@ mod tests {
             ..NetworkProxyConfig::default()
         };
         let state = Arc::new(network_proxy_state_for_policy(settings));
-        let proxy = match NetworkProxy::builder().state(state).build().await {
-            Ok(proxy) => proxy,
-            Err(err) => {
-                if err
-                    .chain()
-                    .any(|cause| cause.to_string().contains("Operation not permitted"))
-                {
-                    return;
-                }
-                panic!("failed to build managed proxy: {err:#}");
-            }
-        };
+        let proxy = NetworkProxy::builder().state(state).build().await.unwrap();
 
         assert!(proxy.http_addr.ip().is_loopback());
         assert_ne!(proxy.http_addr.port(), 0);
@@ -1446,39 +1390,6 @@ mod tests {
             StdTcpListener::bind(proxy.http_addr()).is_err(),
             "builder must reserve the replacement port"
         );
-    }
-
-    #[test]
-    fn proxy_url_env_value_resolves_lowercase_aliases() {
-        let mut env = HashMap::new();
-        env.insert(
-            "http_proxy".to_string(),
-            "http://127.0.0.1:3128".to_string(),
-        );
-
-        assert_eq!(
-            proxy_url_env_value(&env, "HTTP_PROXY"),
-            Some("http://127.0.0.1:3128")
-        );
-    }
-
-    #[test]
-    fn has_proxy_url_env_vars_detects_lowercase_aliases() {
-        let mut env = HashMap::new();
-        env.insert(
-            "all_proxy".to_string(),
-            "socks5h://127.0.0.1:8081".to_string(),
-        );
-
-        assert_eq!(has_proxy_url_env_vars(&env), true);
-    }
-
-    #[test]
-    fn has_proxy_url_env_vars_detects_websocket_proxy_keys() {
-        let mut env = HashMap::new();
-        env.insert("wss_proxy".to_string(), "http://127.0.0.1:3128".to_string());
-
-        assert_eq!(has_proxy_url_env_vars(&env), true);
     }
 
     #[test]

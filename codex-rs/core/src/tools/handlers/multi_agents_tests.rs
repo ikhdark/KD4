@@ -1771,60 +1771,115 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
 
 #[tokio::test]
 async fn multi_agent_v2_typed_spawn_failure_releases_write_claim() {
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
+    config.ephemeral = false;
     let state_runtime = init_state_db(&config)
         .await
         .expect("typed spawn requires persistent test state");
-    let root_session_id = session.services.agent_control.session_id().to_string();
-    session
-        .services
-        .agent_control
-        .task_coordinator()
-        .initialize(state_runtime, root_session_id.clone())
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Some(state_runtime),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let root = manager
+        .start_thread(config.clone())
         .await
-        .expect("typed task coordinator should initialize");
+        .expect("root thread should start");
+    session.services.agent_control = root.thread.codex.session.services.agent_control.clone();
+    session.services.state_db = root.thread.codex.session.services.state_db.clone();
+    session.thread_id = root.thread_id;
+    let agent_control = session.services.agent_control.clone();
+    let root_session_id = agent_control.session_id().to_string();
     set_turn_config(&mut turn, config);
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-    let failed_claim_path = format!("failed-claim-{}", ThreadId::new());
+    let task_name = format!(
+        "failed_writer_{}",
+        ThreadId::new().to_string().replace('-', "")
+    );
+    let failed_claim_path = format!("failed-claim-{task_name}");
 
-    for task_name in ["failed_writer_one", "failed_writer_two"] {
-        let error = SpawnAgentHandlerV2::default()
-            .handle(invocation(
-                Arc::clone(&session),
-                Arc::clone(&turn),
-                "spawn_agent",
-                function_payload(json!({
-                    "task_name": task_name,
-                    "agent_type": "worker",
-                    "assignment": {
-                        "objective": "exercise spawn rollback",
-                        "acceptance_criteria": [{
-                            "id": "criterion-1",
-                            "text": "release the claim after failure"
-                        }],
-                        "write_scope": [{"path": failed_claim_path.clone(), "recursive": true}],
-                        "stop_condition": "stop when spawning fails"
-                    }
-                })),
-            ))
+    // Hold the spawn after admission and binding, then fail it there: a
+    // reservation rejected before admission has nothing to roll back.
+    let before_initial_submission = Arc::new(AgentControlTestBarrier::default());
+    agent_control
+        .set_before_initial_submission_barrier(Some(Arc::clone(&before_initial_submission)));
+    let spawn_invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "task_name": task_name.clone(),
+            "agent_type": "worker",
+            "assignment": {
+                "objective": "exercise spawn rollback",
+                "acceptance_criteria": [{
+                    "id": "criterion-1",
+                    "text": "release the claim after failure"
+                }],
+                "write_scope": [{"path": failed_claim_path, "recursive": true}],
+                "required_evidence": ["focused validation passes"],
+                "stop_condition": "stop when spawning fails"
+            }
+        })),
+    );
+    let cancellation_token = spawn_invocation.cancellation_token.clone();
+    let spawn_task = tokio::spawn(async move {
+        SpawnAgentHandlerV2::default()
+            .handle(spawn_invocation)
             .await
-            .err()
-            .expect("the detached test control has no live thread manager");
-        assert_eq!(
-            error,
-            FunctionCallError::RespondToModel("collab manager unavailable".to_string())
-        );
-    }
+    });
+    timeout(
+        Duration::from_secs(15),
+        before_initial_submission.wait_until_reached(),
+    )
+    .await
+    .expect("typed spawn should be admitted and reach initial submission");
+    agent_control.set_before_initial_submission_barrier(None);
+    let agent_path = AgentPath::root()
+        .join(&task_name)
+        .expect("typed writer path should be valid");
+    let assignment_id = agent_control
+        .task_coordinator()
+        .binding_for_agent_path(&agent_path)
+        .expect("admitted assignment should be bound before the spawn fails")
+        .assignment_id;
+
+    cancellation_token.cancel();
+    let error = timeout(Duration::from_secs(30), spawn_task)
+        .await
+        .expect("failed spawn should finish its rollback")
+        .expect("typed spawn task should join")
+        .err()
+        .expect("a spawn cancelled before its initial submission must fail");
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel("collab spawn failed: turn aborted".to_string())
+    );
+    assert_eq!(
+        agent_control
+            .task_coordinator()
+            .get_agent_task(assignment_id, Some(0))
+            .await
+            .expect("abandoned assignment should remain readable")
+            .current_attempt
+            .state,
+        codex_agent_task_store::AttemptState::Abandoned
+    );
     assert!(
-        session
-            .services
-            .agent_control
+        agent_control
+            .task_coordinator()
+            .binding_for_assignment(assignment_id)
+            .is_none()
+    );
+    assert!(
+        agent_control
             .task_coordinator()
             .store()
             .expect("typed task store should remain available")
@@ -4916,10 +4971,19 @@ async fn wait_agent_uses_owned_wait_below_floor() {
                 "timeout_ms": timeout_ms
             })),
         )));
+        // An owned wait has no deadline. Outlast the floor on a paused clock,
+        // so a timeout clamped to that floor would fire inside this window.
+        tokio::time::pause();
         assert!(
-            timeout(Duration::from_millis(20), &mut waiting).await.is_err(),
-            "a below-floor timeout must retain the wait rather than reject or spin"
+            timeout(
+                Duration::from_millis(MULTI_AGENT_MIN_WAIT_TIMEOUT_MS as u64 + 1),
+                &mut waiting,
+            )
+            .await
+            .is_err(),
+            "a below-floor timeout must retain the wait rather than reject, spin, or clamp"
         );
+        tokio::time::resume();
         thread.thread.submit(Op::Shutdown {}).await.expect("shutdown target");
         let output = timeout(Duration::from_secs(1), waiting)
             .await.expect("target completion wakes wait").expect("wait succeeds");

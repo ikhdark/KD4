@@ -629,6 +629,7 @@ mod tests {
     #[test]
     fn legacy_session_capability_roots_use_runtime_workspace_roots_for_workspace_root() {
         let tmp = TempDir::new().expect("tempdir");
+        crate::setup::set_test_user_profile(&tmp.path().join("user-profile"));
         let codex_home = tmp.path().join("codex-home");
         let workspace_root = tmp.path().join("workspace");
         let command_cwd = workspace_root.join("subdir");
@@ -738,6 +739,7 @@ mod tests {
     #[test]
     fn legacy_capability_roots_use_effective_write_roots() {
         let temp = TempDir::new().expect("tempdir");
+        crate::setup::set_test_user_profile(&temp.path().join("user-profile"));
         let codex_home = temp.path().join("codex-home");
         let workspace = temp.path().join("workspace");
         let active_root = temp.path().join("active-root");

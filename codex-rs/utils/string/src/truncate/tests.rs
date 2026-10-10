@@ -73,6 +73,31 @@ fn token_budget_includes_marker_for_small_positive_budgets() {
 }
 
 #[test]
+fn token_budget_reports_only_omitted_source_bytes() {
+    for input in ["abcdefghijklmnopqrstuvwxyz".repeat(32), "a😀雪éz".repeat(64)] {
+        for budget in [12, 16, 32] {
+            let (output, original) = truncate_middle_with_token_budget(&input, budget);
+            let (prefix, rest) = output.split_once('…').expect("truncation marker");
+            let (marker, suffix) = rest.split_once('…').expect("marker end");
+            assert!(!prefix.is_empty() && !suffix.is_empty());
+            assert!(input.starts_with(prefix) && input.ends_with(suffix));
+            assert!(prefix.len() + suffix.len() < input.len());
+
+            // The documented estimate is ceil(UTF-8 bytes / 4). The marker
+            // describes removed source only, not its own rendered bytes or
+            // the original input's total size.
+            let omitted_bytes = input.len() - prefix.len() - suffix.len();
+            assert_eq!(
+                marker,
+                format!("{} tokens truncated", omitted_bytes.div_ceil(4))
+            );
+            assert_eq!(original, Some(input.len().div_ceil(4) as u64));
+            assert!(output.len() <= budget * 4);
+        }
+    }
+}
+
+#[test]
 fn token_budget_handles_dense_ends_and_large_sparse_middle() {
     let input = format!(
         "{}{}{}",

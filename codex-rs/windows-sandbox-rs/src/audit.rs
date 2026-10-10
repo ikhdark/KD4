@@ -677,16 +677,24 @@ mod tests {
     #[test]
     fn audit_acl_read_failure_reports_incomplete() -> anyhow::Result<()> {
         let cwd = tempfile::tempdir()?;
-        let missing = cwd.path().join("missing");
+        // Win32 strips the trailing dot from a non-verbatim path, so this child enumerates as a
+        // directory but its ACL cannot be opened by name. A missing candidate would also fail
+        // read_dir, which reports an incomplete scan without any ACL read.
+        let child = cwd.path().join("unreadable.");
+        let verbatim_child = cwd.path().canonicalize()?.join("unreadable.");
+        fs::create_dir(&verbatim_child)?;
         // SAFETY: the native query borrows a path and owns all security descriptor storage.
-        assert!(unsafe { super::path_has_world_write_allow(&missing) }.is_err());
+        assert!(unsafe { super::path_has_world_write_allow(&child) }.is_err());
         let scan = super::audit_everyone_writable_with_candidates(
             cwd.path(),
             None,
             std::time::Duration::MAX,
-            || vec![missing],
-        )?;
+            Vec::new,
+        );
+        fs::remove_dir(&verbatim_child)?;
+        let scan = scan?;
         assert!(scan.incomplete);
+        assert!(scan.paths.is_empty());
         Ok(())
     }
 

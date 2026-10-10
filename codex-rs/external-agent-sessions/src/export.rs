@@ -314,15 +314,28 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let visible_message_event_count = imported
+        let visible_messages = imported
             .rollout_items
             .iter()
-            .filter(|item| match item {
-                RolloutItem::EventMsg(EventMsg::UserMessage(event)) => event.message == request,
-                RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => event.message == answer,
-                _ => false,
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
+                    Some(("user", event.message.as_str()))
+                }
+                RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => {
+                    Some(("assistant", event.message.as_str()))
+                }
+                _ => None,
             })
-            .count();
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible_messages,
+            vec![
+                ("user", request.as_str()),
+                ("assistant", answer.as_str()),
+                ("assistant", "<EXTERNAL SESSION IMPORTED>"),
+            ]
+        );
 
         assert_eq!(
             response_messages,
@@ -331,7 +344,6 @@ mod tests {
                 ("assistant", vec![ContentItem::OutputText { text: answer }]),
             ]
         );
-        assert_eq!(visible_message_event_count, 2);
     }
 
     #[test]
@@ -528,10 +540,7 @@ mod tests {
             .expect("load")
             .expect("session");
 
-        assert_eq!(
-            imported.title.as_deref(),
-            Some(IMPORTED_SESSION_FALLBACK_TITLE)
-        );
+        assert_eq!(imported.title.as_deref(), Some("Imported session"));
     }
 
 

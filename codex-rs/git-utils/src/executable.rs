@@ -115,6 +115,13 @@ mod tests {
         let inherited = std::env::var_os("PATH");
         let first = git_executable_async().await;
         assert_eq!(first, git_executable());
+        // The bare `git` fallback satisfies every other assertion here.
+        #[cfg(windows)]
+        assert!(
+            first.is_absolute() && first.ends_with("git.exe"),
+            "Git for Windows resolution fell back to {}",
+            first.display()
+        );
         assert_eq!(inherited, std::env::var_os("PATH"));
         assert!(
             tokio::process::Command::new(first)

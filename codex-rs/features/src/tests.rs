@@ -125,6 +125,17 @@ fn user_settable_registry_excludes_internal_features_and_legacy_aliases() {
         user_settable_feature_for_key("terminal_resize_reflow"),
         None
     );
+    // A registered internal key resolves, but not through the user-facing lookups.
+    for (key, feature) in [
+        ("experimental_windows_sandbox", Feature::WindowsSandbox),
+        ("elevated_windows_sandbox", Feature::WindowsSandboxElevated),
+    ] {
+        assert_eq!(feature.stage(), Stage::Internal, "{key}");
+        assert_eq!(feature_for_key(key), Some(feature), "{key}");
+        assert_eq!(user_settable_feature_for_key(key), None, "{key}");
+        assert_eq!(feature_requirement_for_key(key), None, "{key}");
+        assert!(!is_known_feature_key(key), "{key}");
+    }
     assert_eq!(
         user_settable_feature_for_key("experimental_use_unified_exec_tool"),
         None
@@ -600,6 +611,7 @@ fn apps_require_feature_flag_and_chatgpt_auth() {
 fn from_sources_applies_base_profile_and_overrides() {
     let mut base_entries = BTreeMap::new();
     base_entries.insert("plugins".to_string(), false);
+    base_entries.insert("code_mode".to_string(), false);
     base_entries.insert("code_mode_only".to_string(), false);
     base_entries.insert("web_search_request".to_string(), true);
     let base_features = FeaturesToml {
@@ -636,6 +648,8 @@ fn from_sources_applies_base_profile_and_overrides() {
 #[test]
 fn structured_features_have_one_serialized_storage_location() {
     let structured = [
+        Feature::ContextManagement,
+        Feature::TokenBudget,
         Feature::CodeMode,
         Feature::MultiAgentV2,
         Feature::CurrentTimeReminder,
@@ -855,9 +869,12 @@ fn unstable_warning_event_only_mentions_enabled_under_development_features() {
     configured_features.insert("enable_fanout".to_string(), TomlValue::Boolean(true));
     configured_features.insert("personality".to_string(), TomlValue::Boolean(true));
     configured_features.insert("unknown".to_string(), TomlValue::Boolean(true));
+    // Under development and configured on, but not enabled in the resolved set.
+    configured_features.insert("runtime_metrics".to_string(), TomlValue::Boolean(true));
 
     let mut features = Features::with_defaults();
     features.enable(Feature::SpawnCsv);
+    assert!(!features.enabled(Feature::RuntimeMetrics));
 
     let warning = unstable_features_warning_event(
         Some(&configured_features),
@@ -872,6 +889,7 @@ fn unstable_warning_event_only_mentions_enabled_under_development_features() {
     };
     assert!(message.contains("enable_fanout"));
     assert!(!message.contains("personality"));
+    assert!(!message.contains("runtime_metrics"));
     assert!(message.contains("/tmp/config.toml"));
 }
 

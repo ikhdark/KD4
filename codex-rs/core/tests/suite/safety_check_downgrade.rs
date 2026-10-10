@@ -260,7 +260,10 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
             {
                 warning_count += 1;
             }
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
+                break;
+            }
             _ => {}
         }
     }
@@ -301,7 +304,10 @@ async fn openai_model_header_casing_only_mismatch_does_not_warn() -> Result<()> 
             {
                 warning_count += 1;
             }
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
+                break;
+            }
             _ => {}
         }
     }

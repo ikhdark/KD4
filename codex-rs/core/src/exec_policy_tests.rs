@@ -112,6 +112,17 @@ async fn child_exec_policy_sharing_depends_only_on_policy_inputs() {
     let (_home, parent_config) = test_config().await;
     assert!(child_uses_parent_exec_policy(&parent_config, &parent_config.clone()));
 
+    // Different rule folders must not inherit the parent's live policy manager.
+    let parent_rules = tempdir().expect("parent rules folder");
+    let child_rules = tempdir().expect("child rules folder");
+    let mut parent_with_rules = parent_config.clone();
+    parent_with_rules.config_layer_stack =
+        config_stack_for_dot_codex_folder(parent_rules.path()).into();
+    let mut child_with_rules = parent_with_rules.clone();
+    child_with_rules.config_layer_stack =
+        config_stack_for_dot_codex_folder(child_rules.path()).into();
+    assert!(!child_uses_parent_exec_policy(&parent_with_rules, &child_with_rules));
+
     let mut child_config = parent_config.clone();
     let mut layers: Vec<_> = child_config
         .config_layer_stack
@@ -1056,46 +1067,58 @@ async fn exec_approval_requirement_respects_approval_policy() {
 fn unmatched_granular_policy_still_prompts_for_restricted_sandbox_escalation() {
     let command = vec!["madeup-cmd".to_string()];
 
-    assert_eq!(
-        Decision::Prompt,
-        render_decision_for_unmatched_command(
-            &command,
-            UnmatchedCommandContext {
-                approval_policy: AskForApproval::Granular(GranularApprovalConfig {
-                    sandbox_approval: true,
-                    rules: true,
-                    skill_approval: true,
-                    request_permissions: true,
-                    mcp_elicitations: true,
-                }),
-                permission_profile: &PermissionProfile::read_only(),
-                windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                sandbox_permissions: SandboxPermissions::RequireEscalated,
-                used_complex_parsing: false,
-                command_origin: ExecPolicyCommandOrigin::Generic,
-            },
-        )
-    );
+    // With the sandbox backend enabled the escalation request, not the
+    // no-backend fallback, is what decides between prompting and running.
+    for (sandbox_permissions, expected) in [
+        (SandboxPermissions::RequireEscalated, Decision::Prompt),
+        (SandboxPermissions::UseDefault, Decision::Allow),
+    ] {
+        assert_eq!(
+            expected,
+            render_decision_for_unmatched_command(
+                &command,
+                UnmatchedCommandContext {
+                    approval_policy: AskForApproval::Granular(GranularApprovalConfig {
+                        sandbox_approval: true,
+                        rules: true,
+                        skill_approval: true,
+                        request_permissions: true,
+                        mcp_elicitations: true,
+                    }),
+                    permission_profile: &PermissionProfile::read_only(),
+                    windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                    sandbox_permissions,
+                    used_complex_parsing: false,
+                    command_origin: ExecPolicyCommandOrigin::Generic,
+                },
+            )
+        );
+    }
 }
 
 #[test]
 fn unmatched_on_request_uses_permission_profile_file_system_policy_for_escalation_prompts() {
     let command = vec!["madeup-cmd".to_string()];
 
-    assert_eq!(
-        Decision::Prompt,
-        render_decision_for_unmatched_command(
-            &command,
-            UnmatchedCommandContext {
-                approval_policy: AskForApproval::OnRequest,
-                permission_profile: &PermissionProfile::read_only(),
-                windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                sandbox_permissions: SandboxPermissions::RequireEscalated,
-                used_complex_parsing: false,
-                command_origin: ExecPolicyCommandOrigin::Generic,
-            },
-        )
-    );
+    for (sandbox_permissions, expected) in [
+        (SandboxPermissions::RequireEscalated, Decision::Prompt),
+        (SandboxPermissions::UseDefault, Decision::Allow),
+    ] {
+        assert_eq!(
+            expected,
+            render_decision_for_unmatched_command(
+                &command,
+                UnmatchedCommandContext {
+                    approval_policy: AskForApproval::OnRequest,
+                    permission_profile: &PermissionProfile::read_only(),
+                    windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                    sandbox_permissions,
+                    used_complex_parsing: false,
+                    command_origin: ExecPolicyCommandOrigin::Generic,
+                },
+            )
+        );
+    }
 }
 
 #[test]

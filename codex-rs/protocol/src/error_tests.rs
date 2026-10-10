@@ -260,7 +260,8 @@ fn ordinary_interrupts_do_not_suggest_reporting_a_bug() {
 fn sandbox_denied_uses_aggregated_output_when_stderr_empty() {
     let output = ExecToolCallOutput {
         exit_code: 77,
-        stdout: StreamOutput::new(String::new()),
+        // A populated stream proves the aggregate is preferred, not merely a last resort.
+        stdout: StreamOutput::new("stdout detail".to_string()),
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new("aggregate detail".to_string()),
         duration: Duration::from_millis(10),
@@ -295,8 +296,10 @@ fn truncation_policy_owns_text_dispatch() {
     let content = "abcdefghij";
     assert_eq!(
         TruncationPolicy::Bytes(6).truncate_text(content),
-        codex_utils_string::truncate_middle_chars(content, 6)
+        "abc…4 chars truncated…hij"
     );
+    // Ten bytes are three approximate tokens, so the same limit only truncates as bytes.
+    assert_eq!(TruncationPolicy::Tokens(6).truncate_text(content), content);
 }
 
 #[test]

@@ -411,11 +411,11 @@ fn repository_stable_context_identity_covers_sources_order_scope_and_content() {
     let moved_source =
         stable_context_loaded(&[("moved/AGENTS.md", "root"), ("nested/AGENTS.md", "nested")]);
 
-    let identity = original.stable_context_identity(&cwd);
+    let identity = original.stable_context_bundle(&cwd).identity;
     for changed in [&edited, &added, &removed, &reordered, &moved_source] {
-        assert_ne!(identity, changed.stable_context_identity(&cwd));
+        assert_ne!(identity, changed.stable_context_bundle(&cwd).identity);
     }
-    assert_ne!(identity, original.stable_context_identity(&moved_cwd));
+    assert_ne!(identity, original.stable_context_bundle(&moved_cwd).identity);
 }
 
 #[test]
@@ -875,13 +875,24 @@ async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice(
         });
     }
     let nearest_path = candidates.last().expect("nearest candidate").path.clone();
-    let cwd = PathUri::from_abs_path(&tmp.path().abs());
+    let config = make_config(&tmp, SOURCE_LIMIT, /*instructions*/ None).await;
+    let discovery = ProjectInstructionsDiscovery {
+        environments: vec![EnvironmentProjectInstructionsDiscovery {
+            environment_id: "local".to_string(),
+            cwd: PathUri::from_abs_path(&tmp.path().abs()),
+            filesystem: Arc::clone(&LOCAL_FS),
+            result: Ok(candidates),
+        }],
+    };
 
-    let rendered =
-        read_discovered_agents_md(LOCAL_FS.as_ref(), "local", &cwd, candidates, SOURCE_LIMIT)
-            .await
-            .expect("project docs should load");
-    let loaded = rendered.loaded.expect("bounded instructions expected");
+    let load = load_project_instructions_from_discovery(
+        &config.config,
+        /*user_instructions*/ None,
+        discovery,
+        /*omission_recovery*/ None,
+    )
+    .await;
+    let loaded = load.loaded.expect("bounded instructions expected");
     let text = loaded.text();
 
     assert!(loaded.entries.iter().any(|entry| {
@@ -1033,19 +1044,30 @@ async fn read_agents_md_propagates_read_errors() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join("AGENTS.md"), "project doc").unwrap();
     let config = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
-    let fs = FailingFileSystem {
+    let filesystem: Arc<dyn ExecutorFileSystem> = Arc::new(FailingFileSystem {
         path: config.cwd.join("AGENTS.md"),
         failure: InjectedFailure::Read(io::ErrorKind::PermissionDenied),
         metadata_calls: Arc::default(),
+    });
+    let environments = TurnEnvironmentSnapshot {
+        generation: 0,
+        turn_environments: vec![TurnEnvironment::new(
+            "local".to_string(),
+            Arc::new(Environment::default_for_tests_with_filesystem(filesystem)),
+            PathUri::from_abs_path(&config.cwd),
+            /*shell*/ None,
+        )],
+        starting: Vec::new(),
     };
 
-    let cwd = config.cwd.clone();
-    let err = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect_err("read error");
+    let load =
+        load_project_instructions(&config.config, /*user_instructions*/ None, &environments).await;
 
-    assert_eq!(err.kind(), io::ErrorKind::Other);
-    assert_eq!(err.to_string(), "instruction source read failed");
+    assert!(
+        !load.complete,
+        "a failed source read must make the snapshot incomplete"
+    );
+    assert!(load.loaded.is_none());
 }
 
 #[tokio::test]
@@ -1053,19 +1075,30 @@ async fn read_agents_md_reports_files_removed_after_discovery() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join("AGENTS.md"), "project doc").unwrap();
     let config = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
-    let fs = FailingFileSystem {
+    let filesystem: Arc<dyn ExecutorFileSystem> = Arc::new(FailingFileSystem {
         path: config.cwd.join("AGENTS.md"),
         failure: InjectedFailure::Read(io::ErrorKind::NotFound),
         metadata_calls: Arc::default(),
+    });
+    let environments = TurnEnvironmentSnapshot {
+        generation: 0,
+        turn_environments: vec![TurnEnvironment::new(
+            "local".to_string(),
+            Arc::new(Environment::default_for_tests_with_filesystem(filesystem)),
+            PathUri::from_abs_path(&config.cwd),
+            /*shell*/ None,
+        )],
+        starting: Vec::new(),
     };
 
-    let cwd = config.cwd.clone();
-    let err = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect_err("removed discovered file must make the snapshot incomplete");
+    let load =
+        load_project_instructions(&config.config, /*user_instructions*/ None, &environments).await;
 
-    assert_eq!(err.kind(), io::ErrorKind::Other);
-    assert_eq!(err.to_string(), "instruction source read failed");
+    assert!(
+        !load.complete,
+        "removed discovered file must make the snapshot incomplete"
+    );
+    assert!(load.loaded.is_none());
 }
 
 #[tokio::test]

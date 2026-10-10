@@ -1079,6 +1079,8 @@ fn unified_exec_env_respects_shell_environment_policy() {
         include_only: vec![
             EnvironmentVariablePattern::new_case_insensitive("NO_COLOR"),
             EnvironmentVariablePattern::new_case_insensitive("KEEP"),
+            // Exclusion must win even when the allowlist permits this default.
+            EnvironmentVariablePattern::new_case_insensitive("PAGER"),
         ],
         exclude: vec![EnvironmentVariablePattern::new_case_insensitive("PAGER")],
         ..Default::default()
@@ -1201,28 +1203,57 @@ async fn initial_output_yields_after_meaningful_output_quiet_period() {
 
 #[tokio::test(start_paused = true)]
 async fn background_wait_yields_after_meaningful_output_quiet_period() {
-    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
-    let output_notify = Arc::new(Notify::new());
-    let output_closed = Arc::new(AtomicBool::new(false));
-    let output_closed_notify = Arc::new(Notify::new());
-    let cancellation_token = CancellationToken::new();
-    let started_at = Instant::now();
-
-    output_buffer.lock().await.push_chunk(b"ready\n");
-
-    let collected = UnifiedExecProcessManager::collect_output_until_progress_or_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
         None,
-        started_at + Duration::from_secs(10),
     )
     .await;
-
-    assert_eq!(collected, b"ready\n");
-    assert_eq!(Instant::now() - started_at, Duration::from_millis(250));
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager,
+        &session,
+        &turn,
+        1000,
+        Arc::clone(&process),
+    )
+    .await;
+    // Without a terminal, only until-output mode enables the quiet-period yield.
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&1000)
+        .unwrap()
+        .tty = false;
+    for (until_output, elapsed) in [(true, 250), (false, 1_000)] {
+        process
+            .output_handles()
+            .output_buffer
+            .lock()
+            .await
+            .push_chunk(b"ready\n");
+        let started_at = Instant::now();
+        let request = WriteStdinRequest {
+            process_id: 1000,
+            input: "",
+            yield_time_ms: 1000,
+            max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            nested_deadline: None,
+        };
+        let result = if until_output {
+            manager.write_stdin_until_output(request).await
+        } else {
+            manager.write_stdin(request).await
+        }
+        .unwrap();
+        assert_eq!(result.raw_output, b"ready\n");
+        assert_eq!(Instant::now() - started_at, Duration::from_millis(elapsed));
+    }
+    manager.process_store.lock().await.remove(1000);
+    process.terminate_confirmed().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -1321,42 +1352,56 @@ async fn output_wait_does_not_spin_on_resume_or_closed_pause_channel() {
 
 #[tokio::test(start_paused = true)]
 async fn initial_output_preserves_quiet_deadline_and_evidence_across_pause() {
-    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
-    let output_notify = Arc::new(Notify::new());
-    let output_closed = Arc::new(AtomicBool::new(false));
-    let output_closed_notify = Arc::new(Notify::new());
-    let cancellation_token = CancellationToken::new();
-    let (pause_sender, pause_receiver) = watch::channel(false);
-    let started_at = Instant::now();
-    let producer = tokio::spawn({
-        let output_buffer = Arc::clone(&output_buffer);
-        let output_notify = Arc::clone(&output_notify);
-        async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            pause_sender.send(true).unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            pause_sender.send(false).unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            output_buffer.lock().await.push_chunk(b"after approval\n");
-            output_notify.notify_waiters();
-            pause_sender
+    for (before_pause, after_pause, expected, elapsed_ms) in [
+        (false, true, b"after approval\n".as_slice(), 1_450),
+        (true, false, b"ready\n".as_slice(), 1_250),
+        (true, true, b"ready\nafter approval\n".as_slice(), 1_450),
+    ] {
+        let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+        let output_notify = Arc::new(Notify::new());
+        let output_closed = Arc::new(AtomicBool::new(false));
+        let output_closed_notify = Arc::new(Notify::new());
+        let cancellation_token = CancellationToken::new();
+        let (pause_sender, pause_receiver) = watch::channel(false);
+        let started_at = Instant::now();
+        if before_pause {
+            output_buffer.lock().await.push_chunk(b"ready\n");
         }
-    });
+        let producer = tokio::spawn({
+            let output_buffer = Arc::clone(&output_buffer);
+            let output_notify = Arc::clone(&output_notify);
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                pause_sender.send(true).unwrap();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                pause_sender.send(false).unwrap();
+                if after_pause {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    output_buffer.lock().await.push_chunk(b"after approval\n");
+                    output_notify.notify_waiters();
+                }
+                pause_sender
+            }
+        });
 
-    let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
-        Some(pause_receiver),
-        started_at + Duration::from_secs(10),
-    )
-    .await;
+        let collected = UnifiedExecProcessManager::collect_initial_output_until_deadline(
+            &output_buffer,
+            &output_notify,
+            &output_closed,
+            &output_closed_notify,
+            &cancellation_token,
+            Some(pause_receiver),
+            started_at + Duration::from_secs(10),
+        )
+        .await;
 
-    assert_eq!(collected, b"after approval\n");
-    assert_eq!(Instant::now() - started_at, Duration::from_millis(1_450));
-    drop(producer.await.unwrap());
+        // A pause preserves the remaining 150ms of an active quiet timer:
+        // 100ms before pause + 1s paused + 150ms after resume = 1.25s.
+        // New output at 1.2s restarts its 250ms quiet period, yielding at 1.45s.
+        assert_eq!(collected, expected);
+        assert_eq!(Instant::now() - started_at, Duration::from_millis(elapsed_ms));
+        drop(producer.await.unwrap());
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -2731,8 +2776,8 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         validation_launch: false,
     };
 
+    // Nothing was retained before the denial, so the caller's fallback is the output.
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    transcript.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
 
     emit_failed_initial_exec_end_if_unstored(
         /*process_started_alive*/ false,
@@ -2767,7 +2812,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     assert_eq!(item.process_id.as_deref(), Some("123"));
     assert_eq!(
         item.aggregated_output.as_deref(),
-        Some("PARTIAL_TRANSCRIPT")
+        Some("PRE_DENIAL_MARKER")
     );
     assert_eq!(item.output_metadata.as_ref().unwrap().failure_cause.as_deref(),
         Some("Network access denied"));

@@ -142,7 +142,8 @@ fn builds_permissions_from_profile_with_denied_reads() {
     let text = instructions.body();
     assert!(text.contains("## Denied filesystem reads"));
     assert!(text.contains("Do not request escalation or additional permissions"));
-    assert!(text.contains(denied_root.to_string_lossy().as_ref()));
+    // The glob below starts with the denied root, so match the whole path entry.
+    assert!(text.contains(&format!("- path `{}`", denied_root.to_string_lossy())));
     assert!(text.contains(&format!("glob `{}`", denied_glob.to_string_lossy())));
 }
 
@@ -207,6 +208,16 @@ fn includes_request_permissions_tool_instructions_for_unless_trusted_when_enable
         AskForApproval::UnlessTrusted
     )));
     assert!(text.contains("# request_permissions Tool"));
+
+    // Control: without the tool the same policy must not advertise it.
+    let without_tool = approval_text(
+        AskForApproval::UnlessTrusted,
+        /*approval_messages*/ None,
+        &Policy::empty(),
+        /*exec_permission_approvals_enabled*/ false,
+        /*request_permissions_tool_enabled*/ false,
+    );
+    assert!(!without_tool.contains("request_permissions"));
 }
 
 #[test]
@@ -233,6 +244,16 @@ fn includes_request_permission_rule_instructions_for_on_request_when_enabled() {
     assert!(text.contains("Simple PowerShell `-NoProfile` commands can match"));
     assert!(text.contains("cmd.exe `^` are not POSIX separators"));
     assert!(text.contains("Unsupported syntax may require approval for the whole invocation"));
+
+    // Control: with inline permission requests disabled the request mode is not offered.
+    let without_inline_requests = approval_text(
+        AskForApproval::OnRequest,
+        /*approval_messages*/ None,
+        &Policy::empty(),
+        /*exec_permission_approvals_enabled*/ false,
+        /*request_permissions_tool_enabled*/ false,
+    );
+    assert!(!without_inline_requests.contains("additional_permissions"));
 }
 
 #[test]
@@ -253,6 +274,16 @@ fn includes_request_permissions_tool_instructions_for_on_request_when_tool_is_en
     let text = instructions.body();
     assert!(text.contains("# request_permissions Tool"));
     assert!(text.contains("The built-in `request_permissions` tool is available in this session."));
+
+    // Control: without the tool the same policy must not advertise it.
+    let without_tool = approval_text(
+        AskForApproval::OnRequest,
+        /*approval_messages*/ None,
+        &Policy::empty(),
+        /*exec_permission_approvals_enabled*/ false,
+        /*request_permissions_tool_enabled*/ false,
+    );
+    assert!(!without_tool.contains("request_permissions"));
 }
 
 #[test]
@@ -295,6 +326,25 @@ fn catalog_approval_messages_are_hard_capped() {
 
     assert!(text.len() <= MAX_APPROVAL_MESSAGE_BYTES);
     assert!(text.ends_with(APPROVAL_MESSAGE_TRUNCATED_MARKER));
+
+    let messages = ApprovalMessages {
+        on_request: Some("界".repeat(MAX_APPROVAL_MESSAGE_BYTES)),
+    };
+    let text = approval_text(
+        AskForApproval::OnRequest,
+        Some(&messages),
+        &Policy::empty(),
+        false,
+        false,
+    );
+    // Each character occupies three UTF-8 bytes; reserve the marker without
+    // slicing a character or silently replacing valid source text.
+    let retained_characters =
+        (MAX_APPROVAL_MESSAGE_BYTES - APPROVAL_MESSAGE_TRUNCATED_MARKER.len()) / 3;
+    assert_eq!(
+        text,
+        format!("{}{APPROVAL_MESSAGE_TRUNCATED_MARKER}", "界".repeat(retained_characters))
+    );
 }
 
 #[test]
@@ -551,6 +601,25 @@ fn granular_policy_omits_request_permissions_category_and_tool_section_when_tool
 
     assert!(!text.contains("- `request_permissions`"));
     assert!(!text.contains("# request_permissions Tool"));
+
+    // Control: the same policy lists the category and the tool once the tool is available.
+    let with_tool = approval_text(
+        AskForApproval::Granular(GranularApprovalConfig {
+            sandbox_approval: false,
+            rules: false,
+            skill_approval: false,
+            request_permissions: true,
+            mcp_elicitations: false,
+        }),
+        /*approval_messages*/ None,
+        &Policy::empty(),
+        /*exec_permission_approvals_enabled*/ true,
+        /*request_permissions_tool_enabled*/ true,
+    );
+    assert!(with_tool.contains(
+        "These approval categories may still prompt the user when needed:\n- `request_permissions`"
+    ));
+    assert!(with_tool.contains("# request_permissions Tool"));
 }
 
 #[test]

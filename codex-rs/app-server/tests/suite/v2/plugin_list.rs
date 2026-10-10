@@ -1691,9 +1691,9 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
         .path()
         .join("plugins/cache/openai-curated-remote/stale");
 
+    // No startup tasks: they run the same sync, and plugin/list must be its only trigger here.
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .with_plugin_startup_tasks()
         .without_auto_env()
         .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
         .build()
@@ -2449,7 +2449,8 @@ async fn plugin_list_includes_api_curated_marketplace_for_api_auth_when_remote_p
 async fn plugin_list_does_not_query_openai_curated_remote_collection_by_default() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_plugins_enabled_config_with_base_url(
+    // With remote_plugin on, the collection is never queried whatever the kinds are.
+    write_remote_plugins_disabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;

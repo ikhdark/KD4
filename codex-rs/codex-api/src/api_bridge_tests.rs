@@ -383,12 +383,23 @@ fn map_api_error_does_not_fallback_limit_name_to_limit_id() {
 
 #[test]
 fn map_api_error_ignores_unparseable_rate_limit_reached_type_headers() {
-    let values = [
-        http::HeaderValue::from_static("future_rate_limit_reached_type"),
-        http::HeaderValue::from_bytes(&[0xff]).expect("valid opaque header value"),
+    let cases = [
+        (
+            http::HeaderValue::from_static("future_rate_limit_reached_type"),
+            None,
+        ),
+        (
+            http::HeaderValue::from_bytes(&[0xff]).expect("valid opaque header value"),
+            None,
+        ),
+        // Control: a recognized value on the same header is surfaced.
+        (
+            http::HeaderValue::from_static("workspace_owner_credits_depleted"),
+            Some(codex_protocol::protocol::RateLimitReachedType::WorkspaceOwnerCreditsDepleted),
+        ),
     ];
 
-    for value in values {
+    for (value, expected) in cases {
         let mut headers = HeaderMap::new();
         headers.insert("x-codex-rate-limit-reached-type", value);
         let body = serde_json::json!({
@@ -409,7 +420,7 @@ fn map_api_error_ignores_unparseable_rate_limit_reached_type_headers() {
         let CodexErr::UsageLimitReached(usage_limit) = err else {
             panic!("expected CodexErr::UsageLimitReached, got {err:?}");
         };
-        assert_eq!(usage_limit.rate_limit_reached_type, None);
+        assert_eq!(usage_limit.rate_limit_reached_type, expected);
     }
 }
 

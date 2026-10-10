@@ -809,6 +809,12 @@ mod tests {
 
         assert_eq!(http_addr, "0.0.0.0:3128".parse::<SocketAddr>().unwrap());
         assert_eq!(socks_addr, "0.0.0.0:8081".parse::<SocketAddr>().unwrap());
+
+        let (http_addr, socks_addr) =
+            clamp_bind_addrs(http_addr, socks_addr, &NetworkProxyConfig::default());
+
+        assert_eq!(http_addr, "127.0.0.1:3128".parse::<SocketAddr>().unwrap());
+        assert_eq!(socks_addr, "127.0.0.1:8081".parse::<SocketAddr>().unwrap());
     }
 
     #[test]

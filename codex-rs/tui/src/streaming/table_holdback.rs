@@ -259,6 +259,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn indented_fence_markers_do_not_change_table_holdback() {
+        let table = "| Key | Value |\n| --- | --- |\n";
+        for indent in ["    ", "\t", " \t", "  \t", "   \t"] {
+            let prefix = format!("{indent}```sh\n\n");
+            let source = format!("{prefix}{table}");
+            assert!(pulldown_cmark::Parser::new_ext(&source, pulldown_cmark::Options::ENABLE_TABLES)
+                .any(|event| matches!(event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_)))));
+            let mut scanner = TableHoldbackScanner::new();
+            scanner.push_source_chunk(&source);
+            assert_eq!(scanner.state(), TableHoldbackState::Confirmed { table_start: prefix.len() }, "{source:?}");
+
+            // Four-column indentation cannot close a real code fence either.
+            let source = format!("```sh\n{indent}```\n{table}");
+            assert!(!pulldown_cmark::Parser::new_ext(&source, pulldown_cmark::Options::ENABLE_TABLES)
+                .any(|event| matches!(event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_)))));
+            let mut scanner = TableHoldbackScanner::new();
+            scanner.push_source_chunk(&source);
+            assert_eq!(scanner.state(), TableHoldbackState::None, "{source:?}");
+        }
+    }
+
+    #[test]
     fn single_parse_scanner_matches_reference_at_each_committed_boundary() {
         for source in [
             "ordinary prose\nnext line\n",

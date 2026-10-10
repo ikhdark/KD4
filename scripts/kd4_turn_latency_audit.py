@@ -882,10 +882,14 @@ def _request_cost_model(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         for request in record["timing"].get("modelRequests") or []:
             usage = request.get("tokenUsage") or {}
             wait_ns = request.get("modelStreamWaitNs")
-            if isinstance(wait_ns, (int, float)):
-                tokens = (usage.get("visibleOutputTokens") or 0) + (
-                    usage.get("reasoningTokens") or 0
-                )
+            if (
+                type(wait_ns) is int and wait_ns >= 0
+                and isinstance(usage, dict)
+                and all(type(usage.get(key)) is int and usage[key] >= 0
+                        for key in ("visibleOutputTokens", "reasoningTokens"))
+            ):
+                # Missing output counts are unmeasured, not zero-token samples.
+                tokens = usage["visibleOutputTokens"] + usage["reasoningTokens"]
                 points.append((tokens, wait_ns / 1e9))
     count = len(points)
     if count < 3:
@@ -1211,11 +1215,19 @@ def _apply_detailed_tool_timing(
         ]
 
         ambiguous_group = bool(ambiguous_records)
-        if len(remaining_records) == len(remaining_details) == 1:
-            apply(call_key, remaining_records[0], remaining_details[0], "unambiguous")
-        elif remaining_records and len(remaining_records) == len(remaining_details):
+        if remaining_records and len(remaining_records) == len(remaining_details):
+            match = "unambiguous" if len(remaining_records) == 1 else "ordered"
             for record, call in zip(remaining_records, remaining_details, strict=True):
-                apply(call_key, record, call, "ordered")
+                if (
+                    record.get("executionId") not in (None, "")
+                    and call.get("executionId") not in (None, "")
+                    and str(record["executionId"]) != str(call["executionId"])
+                ):
+                    # Count/order fallback cannot override contradictory identity.
+                    ambiguous_group = True
+                    ambiguous_records.append(record)
+                else:
+                    apply(call_key, record, call, match)
         elif remaining_records or remaining_details:
             ambiguous_group = True
             ambiguous_records.extend(remaining_records)

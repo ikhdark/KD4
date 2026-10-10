@@ -113,6 +113,11 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
                 "interrupted": {
                     "type": "boolean",
                     "description": "Whether the request was interrupted before normal completion."
+                },
+                "disposition": {
+                    "type": "string",
+                    "enum": ["answered", "timed_out", "skipped", "interrupted", "transport_error"],
+                    "description": "How the request ended, when reported by the client. Omitted by legacy clients; missing answers are not approval."
                 }
             },
             "required": ["answers", "interrupted"],

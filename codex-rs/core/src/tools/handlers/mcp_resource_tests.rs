@@ -485,7 +485,16 @@ fn cursorless_single_server_resource_page_is_bounded_to_a_prefix() {
     let resources = value["resources"].as_array().expect("resources array");
     assert!(!resources.is_empty());
     assert!(resources.len() < resource_count);
-    assert_eq!(resources[0]["uri"], json!("app://connector-0"));
+    for (index, entry) in resources.iter().enumerate() {
+        assert_eq!(
+            entry,
+            &json!({
+                "server": "codex_apps",
+                "uri": format!("app://connector-{index}"),
+                "name": format!("connector-{index}-{}", "x".repeat(80)),
+            }),
+        );
+    }
     assert_eq!(value["truncated"], json!(true));
     assert_eq!(
         value["omittedCount"],
@@ -1083,14 +1092,30 @@ async fn resource_completed_result_survives_cancelled_terminal_delivery() {
         .expect("terminal delivery cannot delay cancellation")
         .expect("known operation result is preserved");
     assert!(output.success_for_logging());
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    assert_eq!(output.code_mode_result(&payload), json!("known bytes"));
+    assert_eq!(
+        output.canonical_result(&payload).expect("retained result").bytes,
+        codex_tools::CanonicalToolResult::json(json!({"value":"known bytes"})).bytes,
+    );
+    let completed = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let event = events.recv().await.unwrap();
-            if matches!(event.msg, EventMsg::ItemCompleted(_)) {
-                break;
+            if let EventMsg::ItemCompleted(event) = event.msg
+                && let TurnItem::McpToolCall(item) = event.item
+                && item.id == "known-result"
+            {
+                break item;
             }
         }
     })
     .await
     .expect("terminal event is eventually published");
+    assert_eq!(completed.status, McpToolCallStatus::Completed);
+    assert!(completed.error.is_none());
+    let result = completed.result.expect("completed resource result");
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(result.content, vec![json!({"type":"text","text":"known bytes"})]);
 }

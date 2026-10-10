@@ -45,6 +45,7 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
@@ -64,24 +65,87 @@ pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type HmacSha256 = Hmac<Sha256>;
 
-#[cfg(unix)]
+/// Windows delivers Ctrl-C per console, so the server gets a private windowless console and a
+/// helper process attaches to it to raise the event.
+#[cfg(windows)]
 #[tokio::test]
-async fn websocket_sigterm_gracefully_stops_idle_server() -> Result<()> {
+async fn websocket_ctrl_c_gracefully_stops_idle_server() -> Result<()> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Shorter than the runner's per-test limit, so a lost signal is reported as such.
+    const SIGNAL_TIMEOUT: Duration = Duration::from_secs(20);
+    const SEND_CTRL_C: &str = r#"
+$kernel32 = Add-Type -Name Kernel32 -Namespace CodexTest -PassThru -MemberDefinition '
+[DllImport("kernel32.dll")] public static extern bool FreeConsole();
+[DllImport("kernel32.dll")] public static extern bool AttachConsole(uint processId);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);'
+[void]$kernel32::FreeConsole()
+if (-not $kernel32::AttachConsole([uint32]$env:CODEX_TEST_CTRL_C_PID)) { exit 2 }
+# This helper shares the console now and must not take the event itself.
+[void]$kernel32::SetConsoleCtrlHandler([IntPtr]::Zero, $true)
+if (-not $kernel32::GenerateConsoleCtrlEvent(0, 0)) { exit 3 }
+exit 0
+"#;
+
+    // The Rust test runner starts its process group with Ctrl-C ignored, and children inherit
+    // that; the server has to be spawned with default Ctrl-C processing to observe the event.
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: *const std::ffi::c_void, add: i32) -> i32;
+    }
+    // SAFETY: a null handler with `add = FALSE` only restores default Ctrl-C processing.
+    let restored = unsafe { SetConsoleCtrlHandler(std::ptr::null(), 0) };
+    assert_ne!(restored, 0, "failed to restore Ctrl-C processing");
+
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut cmd = websocket_server_command(
+        codex_home.path(),
+        "ws://127.0.0.1:0",
+        &[],
+        OriginatorOverride::Inherit,
+    )?;
+    let mut process = cmd
+        .creation_flags(CREATE_NO_WINDOW)
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to spawn websocket app-server process")?;
+    let stderr = process
+        .stderr
+        .take()
+        .context("failed to capture websocket app-server stderr")?;
+    let bind_addr = read_websocket_bind_addr(stderr).await?;
     let mut ws = connect_websocket(bind_addr).await?;
-    send_initialize_request(&mut ws, 1, "sigterm_client").await?;
+    send_initialize_request(&mut ws, 1, "ctrl_c_client").await?;
     read_response_for_id(&mut ws, 1).await?;
 
     let pid = process.id().context("server should still be running")?;
-    let delivered = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status()
-        .await?;
-    assert!(delivered.success(), "SIGTERM should be delivered");
-    let status = timeout(DEFAULT_READ_TIMEOUT, process.wait()).await??;
+    let encoded_script = base64::engine::general_purpose::STANDARD.encode(
+        SEND_CTRL_C
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let delivered = timeout(
+        SIGNAL_TIMEOUT,
+        Command::new("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"])
+            .arg(encoded_script)
+            .env("CODEX_TEST_CTRL_C_PID", pid.to_string())
+            .creation_flags(CREATE_NO_WINDOW)
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .context("timed out delivering Ctrl-C")??;
+    assert!(
+        delivered.status.success(),
+        "Ctrl-C should be delivered: {delivered:?}"
+    );
+    let status = timeout(SIGNAL_TIMEOUT, process.wait())
+        .await
+        .context("server did not exit after Ctrl-C")??;
     assert!(
         status.success(),
         "server must drain and exit normally: {status}"
@@ -741,6 +805,25 @@ async fn spawn_websocket_server_with_options(
     extra_args: &[String],
     originator_override: OriginatorOverride<'_>,
 ) -> Result<(WebSocketServerProcess, SocketAddr)> {
+    let mut cmd = websocket_server_command(codex_home, listen_url, extra_args, originator_override)?;
+    let mut process = WebSocketServerProcess::spawn(&mut cmd)
+        .context("failed to spawn websocket app-server process")?;
+
+    let stderr = process
+        .stderr
+        .take()
+        .context("failed to capture websocket app-server stderr")?;
+    let bind_addr = read_websocket_bind_addr(stderr).await?;
+
+    Ok((process, bind_addr))
+}
+
+fn websocket_server_command(
+    codex_home: &Path,
+    listen_url: &str,
+    extra_args: &[String],
+    originator_override: OriginatorOverride<'_>,
+) -> Result<Command> {
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
     let mut cmd = Command::new(program);
@@ -762,13 +845,11 @@ async fn spawn_websocket_server_with_options(
             cmd.env("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", value);
         }
     }
-    let mut process = WebSocketServerProcess::spawn(&mut cmd)
-        .context("failed to spawn websocket app-server process")?;
+    Ok(cmd)
+}
 
-    let stderr = process
-        .stderr
-        .take()
-        .context("failed to capture websocket app-server stderr")?;
+/// Reads the bound websocket address from the server's stderr, then keeps draining it.
+async fn read_websocket_bind_addr(stderr: tokio::process::ChildStderr) -> Result<SocketAddr> {
     let mut stderr_reader = BufReader::new(stderr).lines();
     let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     let bind_addr = loop {
@@ -815,7 +896,7 @@ async fn spawn_websocket_server_with_options(
         }
     });
 
-    Ok((process, bind_addr))
+    Ok(bind_addr)
 }
 
 pub(super) async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient> {
@@ -1135,13 +1216,150 @@ pub(super) async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage)
         .context("failed to send websocket frame")
 }
 
+#[tokio::test]
+async fn websocket_read_deadlines_are_not_reset_by_unrelated_frames() -> Result<()> {
+    for reader_kind in 0..5 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let (client, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr()?),
+            listener.accept(),
+        );
+        let mut client = WebSocketStream::from_raw_socket(
+            MaybeTlsStream::Plain(client?),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut server = WebSocketStream::from_raw_socket(
+            accepted?.0,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let mut reader = tokio::spawn(async move {
+            match reader_kind {
+                0 => read_jsonrpc_message(&mut client).await.map(|_| ()),
+                1 => read_response_for_id(&mut client, 7).await.map(|_| ()),
+                2 => read_notification_for_method(&mut client, "wanted").await.map(|_| ()),
+                3 => read_response_and_notification_for_method(&mut client, 7, "wanted")
+                    .await
+                    .map(|_| ()),
+                _ => read_error_for_id(&mut client, 7).await.map(|_| ()),
+            }
+        });
+        let exercised = async {
+            for round in 0..2 {
+                if round == 1 {
+                    tokio::time::pause();
+                    tokio::time::advance(DEFAULT_READ_TIMEOUT - Duration::from_secs(5)).await;
+                    tokio::time::resume();
+                }
+                // An acknowledged Ping proves the reader consumed the preceding
+                // unrelated JSON, rather than merely scheduling an OS write.
+                // Keep time running during real I/O so paused-time auto-advance
+                // cannot time out the read before that evidence arrives.
+                timeout(Duration::from_secs(2), async {
+                    if reader_kind != 0 {
+                        server.send(WebSocketMessage::Text(
+                            r#"{"method":"unrelated","params":{}}"#.into(),
+                        )).await?;
+                    }
+                    let payload = vec![round];
+                    server.send(WebSocketMessage::Ping(payload.clone().into())).await?;
+                    let reply = server.next().await.context("peer closed before Pong")??;
+                    if reply != WebSocketMessage::Pong(payload.into()) {
+                        bail!("expected matching Pong, got {reply:?}");
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }).await.context("timed out exercising unrelated frame handling")??;
+            }
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        if exercised.is_err() {
+            reader.abort();
+            let _ = reader.await;
+            exercised?;
+            unreachable!();
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::resume();
+        let result = timeout(Duration::from_secs(2), &mut reader).await;
+        if result.is_err() {
+            reader.abort();
+            let _ = reader.await;
+        }
+        let error = result
+            .with_context(|| format!("reader {reader_kind} exceeded its total deadline"))?
+            .context("websocket reader task failed")?
+            .expect_err("an unmatched read must time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "reader {reader_kind} must fail on its deadline, not a transport error: {error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_read_cancellation_and_expired_deadline_preserve_queued_frames() -> Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let (client, accepted) = tokio::join!(
+        tokio::net::TcpStream::connect(listener.local_addr()?),
+        listener.accept(),
+    );
+    let mut client = WebSocketStream::from_raw_socket(
+        MaybeTlsStream::Plain(client?),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    let mut server = WebSocketStream::from_raw_socket(
+        accepted?.0,
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+
+    // Cancel a genuinely pending read, then reuse the same real connection.
+    let mut pending = Box::pin(read_jsonrpc_message(&mut client));
+    assert!(futures::poll!(&mut pending).is_pending());
+    drop(pending);
+    let expected = json!({"id": 7, "result": {"sentinel": "preserved"}});
+    server.send(WebSocketMessage::Pong(vec![1].into())).await?;
+    server.send(WebSocketMessage::Text(expected.to_string().into())).await?;
+
+    // Prove transport data is already ready; an expired deadline must still win
+    // without consuming either the unrelated frame or the following response.
+    let MaybeTlsStream::Plain(socket) = client.get_ref() else {
+        bail!("expected plaintext test socket");
+    };
+    let mut byte = [0];
+    assert!(timeout(Duration::from_secs(2), socket.peek(&mut byte)).await?? > 0);
+    let error = read_jsonrpc_message_before(&mut client, Instant::now())
+        .await
+        .expect_err("already queued frames must not bypass an expired deadline");
+    assert!(error.to_string().contains("timed out"), "{error:#}");
+    let response = timeout(Duration::from_secs(2), read_response_for_id(&mut client, 7))
+        .await??;
+    assert_eq!(serde_json::to_value(response)?, expected);
+
+    server.close(None).await?;
+    let error = timeout(Duration::from_secs(2), read_jsonrpc_message(&mut client))
+        .await?
+        .expect_err("peer closure must terminate the read, not wait for its deadline");
+    assert!(error.to_string().contains("websocket closed"), "{error:#}");
+    Ok(())
+}
+
 pub(super) async fn read_response_for_id(
     stream: &mut WsClient,
     id: i64,
 ) -> Result<JSONRPCResponse> {
+    let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     let target_id = RequestId::Integer(id);
     loop {
-        let message = read_jsonrpc_message(stream).await?;
+        let message = read_jsonrpc_message_before(stream, deadline).await?;
         if let JSONRPCMessage::Response(response) = message
             && response.id == target_id
         {
@@ -1154,8 +1372,9 @@ pub(super) async fn read_notification_for_method(
     stream: &mut WsClient,
     method: &str,
 ) -> Result<JSONRPCNotification> {
+    let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
-        let message = read_jsonrpc_message(stream).await?;
+        let message = read_jsonrpc_message_before(stream, deadline).await?;
         if let JSONRPCMessage::Notification(notification) = message
             && notification.method == method
         {
@@ -1169,12 +1388,13 @@ pub(super) async fn read_response_and_notification_for_method(
     id: i64,
     method: &str,
 ) -> Result<(JSONRPCResponse, JSONRPCNotification)> {
+    let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     let target_id = RequestId::Integer(id);
     let mut response = None;
     let mut notification = None;
 
     while response.is_none() || notification.is_none() {
-        let message = read_jsonrpc_message(stream).await?;
+        let message = read_jsonrpc_message_before(stream, deadline).await?;
         match message {
             JSONRPCMessage::Response(candidate) if candidate.id == target_id => {
                 response = Some(candidate);
@@ -1204,9 +1424,10 @@ pub(super) async fn read_response_and_notification_for_method(
 }
 
 pub(super) async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCError> {
+    let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     let target_id = RequestId::Integer(id);
     loop {
-        let message = read_jsonrpc_message(stream).await?;
+        let message = read_jsonrpc_message_before(stream, deadline).await?;
         if let JSONRPCMessage::Error(err) = message
             && err.id == target_id
         {
@@ -1216,8 +1437,21 @@ pub(super) async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<
 }
 
 pub(super) async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage> {
+    read_jsonrpc_message_before(stream, Instant::now() + DEFAULT_READ_TIMEOUT).await
+}
+
+// A selected JSON-RPC read has one total budget, including ignored frames and
+// control-frame replies. Activity is not progress toward the requested result.
+async fn read_jsonrpc_message_before(
+    stream: &mut WsClient,
+    deadline: Instant,
+) -> Result<JSONRPCMessage> {
     loop {
-        let frame = timeout(DEFAULT_READ_TIMEOUT, stream.next())
+        // Ready buffered noise must not bypass the deadline by never yielding.
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for websocket frame");
+        }
+        let frame = timeout_at(deadline, stream.next())
             .await
             .context("timed out waiting for websocket frame")?
             .context("websocket stream ended unexpectedly")?
@@ -1226,7 +1460,9 @@ pub(super) async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRP
         match frame {
             WebSocketMessage::Text(text) => return Ok(serde_json::from_str(text.as_ref())?),
             WebSocketMessage::Ping(payload) => {
-                stream.send(WebSocketMessage::Pong(payload)).await?;
+                timeout_at(deadline, stream.send(WebSocketMessage::Pong(payload)))
+                    .await
+                    .context("timed out replying to websocket ping")??;
             }
             WebSocketMessage::Pong(_) => {}
             WebSocketMessage::Close(frame) => {

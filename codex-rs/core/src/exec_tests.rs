@@ -210,15 +210,6 @@ fn sandbox_detection_identifies_keyword_in_stderr() {
 }
 
 #[test]
-fn sandbox_detection_respects_quick_reject_exit_codes() {
-    let output = make_exec_output(/*exit_code*/ 127, "", "command not found", "");
-    assert!(!is_likely_sandbox_denied(
-        SandboxType::WindowsRestrictedToken,
-        &output
-    ));
-}
-
-#[test]
 fn sandbox_detection_ignores_non_sandbox_mode() {
     let output = make_exec_output(/*exit_code*/ 1, "", "Operation not permitted", "");
     assert!(!is_likely_sandbox_denied(SandboxType::None, &output));
@@ -664,6 +655,34 @@ async fn combined_exec_cancellation_waits_inline_for_every_source() {
             timeout(Duration::from_secs(1), wait).await.expect("each cancellation source wakes the wait"),
             ExecExpirationOutcome::Cancelled
         );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn combined_exec_expiration_preserves_timeout_and_each_cancellation_source() {
+    // Adding cancellation must not replace a configured timeout, nor discard
+    // earlier cancellation sources as the representation grows into a set.
+    for source_count in 1..=3 {
+        for cancelled_index in std::iter::once(None).chain((0..source_count).map(Some)) {
+            let tokens = (0..source_count).map(|_| CancellationToken::new()).collect::<Vec<_>>();
+            let mut expiration = ExecExpiration::Timeout(Duration::from_millis(250));
+            for token in &tokens {
+                expiration = expiration.with_cancellation(token.clone());
+            }
+            let started = tokio::time::Instant::now();
+            let wait = expiration.wait_with_outcome();
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            let (expected, elapsed_ms) = if let Some(index) = cancelled_index {
+                tokio::time::advance(Duration::from_millis(100)).await;
+                tokens[index].cancel();
+                (ExecExpirationOutcome::Cancelled, 100)
+            } else {
+                (ExecExpirationOutcome::TimedOut, 250)
+            };
+            assert_eq!(timeout(Duration::from_secs(1), wait).await.unwrap(), expected);
+            assert_eq!(started.elapsed(), Duration::from_millis(elapsed_ms));
+        }
     }
 }
 

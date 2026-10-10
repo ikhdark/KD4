@@ -113,9 +113,7 @@ enum McpServerElicitationFieldInput {
         options: Vec<McpServerElicitationOption>,
         default_idx: Option<usize>,
     },
-    Text {
-        secret: bool,
-    },
+    Text,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -576,7 +574,7 @@ fn parse_field(
                 label,
                 prompt,
                 required,
-                input: McpServerElicitationFieldInput::Text { secret: false },
+                input: McpServerElicitationFieldInput::Text,
             })
         }
         McpElicitationPrimitiveSchema::Boolean(schema) => {
@@ -796,9 +794,7 @@ impl McpServerElicitationOverlay {
                         selection.selected_idx = default_idx.or(Some(0));
                         (ComposerDraft::default(), default_idx.is_some())
                     }
-                    McpServerElicitationFieldInput::Text { .. } => {
-                        (ComposerDraft::default(), false)
-                    }
+                    McpServerElicitationFieldInput::Text => (ComposerDraft::default(), false),
                 };
                 McpServerElicitationAnswerState {
                     selection,
@@ -889,6 +885,7 @@ impl McpServerElicitationOverlay {
         if self.current_field_is_select() {
             return;
         }
+        self.composer.discard_paste_burst();
         if let Some(answer) = self.current_answer_mut() {
             answer.draft = ComposerDraft::default();
             answer.answer_committed = false;
@@ -912,13 +909,6 @@ impl McpServerElicitationOverlay {
         matches!(
             self.current_field().map(|field| &field.input),
             Some(McpServerElicitationFieldInput::Select { .. })
-        )
-    }
-
-    fn current_field_is_secret(&self) -> bool {
-        matches!(
-            self.current_field().map(|field| &field.input),
-            Some(McpServerElicitationFieldInput::Text { secret: true })
         )
     }
 
@@ -1086,9 +1076,13 @@ impl McpServerElicitationOverlay {
         if len == 0 {
             return;
         }
-        self.save_current_draft();
         let offset = if next { 1 } else { len.saturating_sub(1) };
-        self.current_idx = (self.current_idx + offset) % len;
+        let next_idx = (self.current_idx + offset) % len;
+        if next_idx != self.current_idx {
+            self.composer.flush_pending_paste_burst();
+        }
+        self.save_current_draft();
+        self.current_idx = next_idx;
         self.prompt_offset.set(0);
         self.validation_error = None;
         self.restore_current_draft();
@@ -1097,6 +1091,9 @@ impl McpServerElicitationOverlay {
     fn jump_to_field(&mut self, idx: usize) {
         if idx >= self.field_count() {
             return;
+        }
+        if idx != self.current_idx {
+            self.composer.flush_pending_paste_burst();
         }
         self.save_current_draft();
         self.current_idx = idx;
@@ -1115,7 +1112,7 @@ impl McpServerElicitationOverlay {
                 let selected_idx = answer.selection.selected_idx?;
                 options.get(selected_idx).map(|option| option.value.clone())
             }
-            McpServerElicitationFieldInput::Text { .. } => {
+            McpServerElicitationFieldInput::Text => {
                 if !answer.answer_committed {
                     return None;
                 }
@@ -1377,11 +1374,7 @@ impl McpServerElicitationOverlay {
             render_rows(area, buf, &rows, &state, rows.len().max(1), "No options");
             return;
         }
-        if self.current_field_is_secret() {
-            self.composer.render_with_mask(area, buf, Some('*'));
-        } else {
-            self.composer.render(area, buf);
-        }
+        self.composer.render(area, buf);
     }
 
     fn render_footer(&self, area: Rect, input_area_height: u16, buf: &mut Buffer) {
@@ -1950,6 +1943,120 @@ mod tests {
     }
 
     #[test]
+    fn field_navigation_keeps_held_input_in_its_original_field() {
+        for navigation in [
+            Some(KeyEvent::from(KeyCode::PageDown)),
+            Some(KeyEvent::from(KeyCode::PageUp)),
+            Some(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            None,
+        ] {
+            let (tx, mut rx) = test_sender();
+            let request = from_form_request(
+                ThreadId::default(),
+                form_request(
+                    "Fill both fields",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "first": { "type": "string" },
+                            "second": { "type": "string" },
+                        },
+                    }),
+                    None,
+                ),
+            )
+            .expect("supported text form");
+            let mut overlay = McpServerElicitationOverlay::new(request, tx, true, false, false);
+            overlay.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+            assert!(overlay.composer.is_in_paste_burst());
+            assert_eq!(overlay.composer.current_text(), "");
+
+            if let Some(key) = navigation {
+                overlay.handle_key_event(key);
+            } else {
+                overlay.jump_to_field(1);
+            }
+            assert_eq!(overlay.current_idx, 1);
+            overlay.composer.flush_pending_paste_burst();
+            assert_eq!(overlay.composer.current_text(), "", "{navigation:?}");
+            overlay.jump_to_field(0);
+            assert_eq!(overlay.composer.current_text(), "a", "{navigation:?}");
+            assert!(!overlay.composer.is_in_paste_burst());
+            overlay.handle_key_event(KeyEvent::from(KeyCode::Char('界')));
+            assert_eq!(overlay.composer.current_text(), "a界");
+            overlay.jump_to_field(1);
+            assert_eq!(overlay.composer.current_text(), "");
+            overlay.jump_to_field(0);
+            assert_eq!(overlay.composer.current_text(), "a界");
+            assert!(rx.try_recv().is_err(), "navigation must not submit a response");
+        }
+    }
+
+    #[test]
+    fn same_field_navigation_preserves_pending_paste_burst() {
+        let (tx, _rx) = test_sender();
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Enter text",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "string" } },
+                }),
+                None,
+            ),
+        )
+        .expect("supported text form");
+        let mut overlay = McpServerElicitationOverlay::new(request, tx, true, false, false);
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        overlay.handle_key_event(KeyEvent::from(KeyCode::PageDown));
+        overlay.handle_key_event(KeyEvent::from(KeyCode::PageUp));
+        overlay.jump_to_field(0);
+        assert_eq!(overlay.current_idx, 0);
+        assert_eq!(overlay.composer.current_text(), "");
+        assert!(overlay.composer.is_in_paste_burst());
+        overlay.composer.flush_pending_paste_burst();
+        assert_eq!(overlay.composer.current_text(), "a");
+    }
+
+    #[test]
+    fn clearing_text_draft_discards_held_input() {
+        let (tx, mut rx) = test_sender();
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Enter text",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "string" } },
+                }),
+                None,
+            ),
+        )
+        .expect("supported text form");
+        let mut overlay = McpServerElicitationOverlay::new(request, tx, true, false, false);
+        overlay.composer.handle_paste("visible".to_string());
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        assert!(overlay.composer.is_in_paste_burst());
+
+        assert_eq!(overlay.on_ctrl_c(), CancellationEvent::Handled);
+        overlay.composer.flush_pending_paste_burst();
+        assert_eq!(overlay.composer.current_text(), "");
+        assert!(!overlay.done);
+        assert!(rx.try_recv().is_err(), "clearing a draft must not cancel the request");
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Char('界')));
+        assert_eq!(overlay.composer.current_text(), "界");
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        assert!(overlay.composer.is_in_paste_burst());
+        overlay.on_ctrl_c();
+        overlay.composer.flush_pending_paste_burst();
+        assert_eq!(overlay.composer.current_text(), "");
+        assert!(!overlay.done);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn oversized_form_prompt_keeps_visible_text_and_cursor_below_it() {
         let (tx, mut rx) = test_sender();
         let request = from_form_request(
@@ -1973,7 +2080,12 @@ mod tests {
             assert_eq!(line.trim(), "prompt");
         }
         let (_, cursor_y) = overlay.cursor_pos(area).expect("text input cursor");
-        assert!((9..20).contains(&cursor_y));
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let last_prompt_row = rows
+            .iter()
+            .rposition(|line| line.trim() == "prompt")
+            .expect("visible prompt rows");
+        assert!(((last_prompt_row + 1)..20).contains(&usize::from(cursor_y)));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -2990,6 +3102,9 @@ mod tests {
 
     #[test]
     fn approval_form_tool_approval_with_param_summary_snapshot() {
+        // Every argument is listed and none is shortened. The "should truncate" note and the
+        // "Ignored" label describe a display limit that no longer exists; the wording stays
+        // because the snapshot pins it.
         let (tx, _rx) = test_sender();
         let request = from_form_request(
             ThreadId::default(),

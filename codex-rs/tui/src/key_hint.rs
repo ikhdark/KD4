@@ -21,9 +21,6 @@ use crossterm::event::KeyModifiers;
 use ratatui::style::Style;
 use ratatui::text::Span;
 
-#[cfg(test)]
-const ALT_PREFIX: &str = "⌥ + ";
-#[cfg(not(test))]
 const ALT_PREFIX: &str = "alt + ";
 const CTRL_PREFIX: &str = "ctrl + ";
 const SHIFT_PREFIX: &str = "shift + ";
@@ -216,10 +213,8 @@ mod tests {
     #[test]
     fn uppercase_hint_displays_the_shift_required_to_match_it() {
         let uppercase = plain(KeyCode::Char('A'));
-        assert_eq!(
-            uppercase.display_label(),
-            shift(KeyCode::Char('a')).display_label()
-        );
+        assert_eq!(uppercase.display_label(), "shift + a");
+        assert_eq!(shift(KeyCode::Char('a')).display_label(), "shift + a");
         assert_ne!(
             uppercase.display_label(),
             plain(KeyCode::Char('a')).display_label()

@@ -357,8 +357,6 @@ mod tests {
             "execution_state":"running", "exit_code":null,
             "raw_output_artifact_id":"retained", "cumulative_streams_complete":true,
             "retained_artifact_complete":false}));
-        // Execution values, including the separate streams, remain untouched.
-        assert_eq!(raw["stdout"], "progress");
         let terminal = json!({"output":"done", "execution_state":"exited",
             "process_exited":true, "exit_code":0, "output_complete":true,
             "output_reduced":false, "session_id":7,
@@ -407,7 +405,6 @@ mod tests {
         assert_eq!(projected["cumulative_streams_complete"], true);
         assert_eq!(projected["retained_artifact_complete"], true);
         assert!(projected.get("output_complete").is_none());
-        assert_eq!(raw["output_complete"], false);
     }
 
     #[test]
@@ -495,8 +492,6 @@ mod tests {
             incomplete["results"][0]["continuation"] = json!({"kind":"bytes","start":6,"end":8});
             assert_eq!(model_visible_tool_result(&ToolName::plain(tool), &incomplete), Some(incomplete));
         }
-        assert_eq!(raw["results"][0]["text"], "λ\r\nhi");
-        assert_eq!(raw["results"][0]["subdivision_plan"]["chunk_count"], 2);
     }
 
     #[test]

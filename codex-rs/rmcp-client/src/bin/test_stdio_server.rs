@@ -888,6 +888,13 @@ mod tests {
             request.arguments =
                 Some(serde_json::from_value(json!({"sleep_before_ms": 0.5})).unwrap());
             assert!(client.call_tool(request).await.is_err());
+            // An unrouted tool name is rejected too, so prove the same call is
+            // accepted once the argument is an integer.
+            let mut request = CallToolRequestParams::new(name);
+            request.arguments =
+                Some(serde_json::from_value(json!({"sleep_before_ms": 0})).unwrap());
+            let result = client.call_tool(request).await.unwrap();
+            assert_eq!(result.structured_content, Some(json!({"result": "ok"})));
         }
         let mut request = CallToolRequestParams::new("echo");
         request.arguments =

@@ -650,8 +650,9 @@ fn plan_history_projection_retains_post_success_failures_in_sampling_and_compact
     }
     items.splice(2..2, early_failure.clone());
     let history = create_history_with_items(items.clone());
-    let compacted = history.clone().for_compaction_prompt_with_completed_tool_projection(
+    let compacted = history.clone().for_local_compaction_prompt(
         &default_input_modalities(), None,
+        &crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests(),
     );
     assert!(!compacted.iter().any(|item| matches!(item,
         ResponseItem::FunctionCall { call_id, .. } if call_id == "old-plan")));
@@ -2813,41 +2814,6 @@ fn prepared_prompt_cache_reuses_shared_items_across_non_history_changes() {
 }
 
 #[test]
-fn projection_budget_drops_are_ordered_to_match_the_prompt_representations() {
-    let prepared = create_history_with_items(vec![agent_message("hello")])
-        .prepare_for_prompt(&default_input_modalities());
-    let drops = |count: u32| crate::tool_history::ToolOutputBudgetDrops {
-        count,
-        tokens: u64::from(count) * 100,
-    };
-    // Distinct items force a real projection instead of the unchanged-input
-    // early return, so the recorded drops are the ones applied here.
-    let projection = ToolHistoryProjection {
-        items: Arc::from(vec![agent_message("projected")]),
-        unreplaced_items: Arc::from(vec![agent_message("unreplaced")]),
-        substitutions: Arc::from(Vec::new()),
-        items_budget_drops: drops(1),
-        unreplaced_items_budget_drops: drops(3),
-    };
-    let fallback_projection = ToolHistoryProjection {
-        items: Arc::from(vec![agent_message("fallback")]),
-        unreplaced_items: Arc::from(vec![agent_message("unreplaced fallback")]),
-        substitutions: Arc::from(Vec::new()),
-        items_budget_drops: drops(2),
-        unreplaced_items_budget_drops: drops(4),
-    };
-
-    let projected = apply_tool_history_projection(prepared, projection, fallback_projection, None);
-
-    assert_eq!(
-        projected.tool_output_budget_drops(),
-        [drops(1), drops(2), drops(3), drops(4)],
-        "order must match Prompt's [input, stable-context fallback, \
-         tool-history fallback, both fallbacks]"
-    );
-}
-
-#[test]
 fn unchanged_tool_projection_preserves_prepared_sidecars() {
     let prepared = create_history_with_items(vec![agent_message("hello")])
         .prepare_for_prompt(&default_input_modalities());
@@ -3234,8 +3200,6 @@ fn interrupted_skill_survives_sampling_and_compaction() {
 
 #[test]
 fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
-    let _budget =
-        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
     let workspace = crate::git_workspace::GitWorkspaceCache::new();
     let evidence = |index: usize| format!("result-{index} {}", "evidence ".repeat(500));
     let budget_candidate = |call_id: &str, output: String| ToolHistoryCandidate {
@@ -3285,8 +3249,8 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
     };
 
     // These synthetic code-mode results have no workspace dependencies. Record
-    // that classification just as dispatch does, so freshness validation keeps
-    // their text and only the aggregate budget shapes the projection.
+    // that classification just as dispatch does, so freshness validation
+    // appends no notice to the projection.
     let register = |history: &mut ContextManager, call_id: &str, output: String| {
         assert!(history.apply_tool_history_mutation(
             &crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
@@ -3344,16 +3308,12 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
         "a continuation request must keep the previous request's input as its prefix"
     );
     assert_eq!(&second.items()[first.items().len()..], &appended[..]);
-    assert_eq!(
-        second.tool_output_budget_drops(),
-        first.tool_output_budget_drops()
-    );
 
-    // Compaction prompts are budgeted in full and leave the sampling anchor alone.
+    // Compaction prompts leave the sampling anchor alone.
     let anchor_before_compaction = history.sampling_projection_anchor_len();
     let _ = history
         .clone()
-        .for_compaction_prompt_with_completed_tool_projection(&default_input_modalities(), None);
+        .for_local_compaction_prompt(&default_input_modalities(), None, &workspace);
     assert_eq!(
         history.sampling_projection_anchor_len(),
         anchor_before_compaction
@@ -3433,7 +3393,7 @@ fn agent_message_sampling_preserves_prepared_and_projected_prefixes() {
                         &default_input_modalities(),
                         StableContextTarget::Sampling,
                         None,
-                        Some(&workspace),
+                        &workspace,
                         completed_tool_projection,
                     )
             };
@@ -3872,52 +3832,12 @@ async fn tool_history_registration_does_not_wait_for_snapshot_cache_locks() {
     );
 }
 
-#[test]
-fn recorded_context_window_scales_the_tool_result_budget() {
-    let mut history = ContextManager::new();
-    assert_eq!(
-        history
-            .tool_history_state()
-            .configured_model_visible_tool_result_token_budget(),
-        None
-    );
-    history.update_token_info(
-        &TokenUsage {
-            total_tokens: 100,
-            ..Default::default()
-        },
-        Some(258_400),
-    );
-    assert_eq!(
-        history
-            .tool_history_state()
-            .configured_model_visible_tool_result_token_budget(),
-        Some(75_000)
-    );
-    // A reloaded ledger has no window of its own; the derived budget carries over.
-    history.set_tool_history_state(ToolHistoryState::default());
-    assert_eq!(
-        history
-            .tool_history_state()
-            .configured_model_visible_tool_result_token_budget(),
-        Some(75_000)
-    );
-    history.set_token_info(None);
-    assert_eq!(
-        history
-            .tool_history_state()
-            .configured_model_visible_tool_result_token_budget(),
-        None
-    );
-}
-
 /// The prompt estimate that gates compaction must measure the projected
 /// prompt. Session `4ab1` was compacted at turn start because its raw tool
 /// outputs exceeded the limit while the projected prompt was a third of it.
 #[test]
 fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
-    let _budget =
-        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
+    let workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
     let base = BaseInstructions {
         text: "base".to_string(),
     };
@@ -3943,8 +3863,7 @@ fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
         history.record_items([&call, &output], TruncationPolicy::Tokens(24_000));
         canonical.push(call);
         canonical.push(output);
-        // Classified as dispatch does, so workspace freshness leaves these
-        // results alone and only the aggregate budget shapes the prompt.
+        // Classified as dispatch does, so workspace freshness appends no notice.
         assert!(history.apply_tool_history_mutation(
             &crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
                 call_id: call_id.clone(),
@@ -3990,17 +3909,16 @@ fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
     .expect("raw estimate");
     assert!(
         raw_estimate > 12_000,
-        "fixture must exceed the budget as raw output: {raw_estimate}"
+        "fixture must carry substantial raw output: {raw_estimate}"
     );
     // Pressure must reflect full preserved output, not hypothetical receipts.
     let sent_prompt = history
         .clone()
-        .prepare_for_prompt_with_completed_tool_projection_target(
+        .prepare_for_sampling_prompt_with_completed_tool_projection(
             &default_input_modalities(),
             StableContextTarget::Sampling,
             None,
-            None,
-            true,
+            &workspace,
         );
     let sent_estimate = ContextManager::estimate_items_token_count_with_base_instructions(
         sent_prompt.items(),
@@ -4042,7 +3960,6 @@ fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
         );
     }
     // Changing the window must not hide pressure by silently rewriting outputs.
-    drop(_budget);
     history.update_token_info(
         &TokenUsage {
             total_tokens: 100,
@@ -4052,12 +3969,11 @@ fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
     );
     let tightened_prompt = history
         .clone()
-        .prepare_for_prompt_with_completed_tool_projection_target(
+        .prepare_for_sampling_prompt_with_completed_tool_projection(
             &default_input_modalities(),
             StableContextTarget::Sampling,
             None,
-            None,
-            true,
+            &workspace,
         );
     let tightened_estimate = ContextManager::estimate_items_token_count_with_base_instructions(
         tightened_prompt.items(),
@@ -4081,98 +3997,7 @@ fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
 }
 
 #[test]
-fn tool_history_budget_compacts_unread_local_shell_pairs() {
-    let _budget =
-        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
-    let mut canonical = Vec::new();
-    for call_id in ["older-shell", "newer-shell"] {
-        canonical.push(ResponseItem::LocalShellCall {
-            id: None,
-            call_id: Some(call_id.to_string()),
-            status: LocalShellStatus::Completed,
-            action: LocalShellAction::Exec(LocalShellExecAction {
-                command: vec!["echo".to_string(), call_id.to_string()],
-                timeout_ms: None,
-                working_directory: None,
-                env: None,
-                user: None,
-            }),
-            internal_chat_message_metadata_passthrough: None,
-        });
-        canonical.push(ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: call_id.to_string(),
-            output: FunctionCallOutputPayload::from_text("x".repeat(24_000)),
-            internal_chat_message_metadata_passthrough: None,
-        });
-    }
-    let mut history = ContextManager::new();
-    history.record_items(canonical.iter(), TruncationPolicy::Tokens(24_000));
-    // Both unread outcomes fit as compact receipts; keep both complete pairs.
-    for target in [StableContextTarget::FailOpen, StableContextTarget::Sampling] {
-        let prepared = history
-            .clone()
-            .prepare_for_prompt_with_completed_tool_projection_target(
-                &default_input_modalities(),
-                target,
-                None,
-                None,
-                true,
-            );
-        for items in [
-            prepared.shared_items(),
-            prepared.shared_unreplaced_items(),
-            prepared.shared_fallback_items(),
-            prepared.shared_unreplaced_fallback_items(),
-        ] {
-            assert_eq!(items.len(), 4);
-            if target == StableContextTarget::Sampling {
-                assert_eq!(items.as_ref(), canonical.as_slice());
-                continue;
-            }
-            let mut output_tokens = 0;
-            for (pair, call_id) in items.as_chunks::<2>().0.iter().zip(["older-shell", "newer-shell"]) {
-                assert!(
-                    matches!(&pair[0], ResponseItem::LocalShellCall { call_id: Some(id), .. } if id == call_id)
-                );
-                let ResponseItem::FunctionCallOutput {
-                    call_id: id,
-                    output,
-                    ..
-                } = &pair[1]
-                else {
-                    panic!("complete shell pair");
-                };
-                assert_eq!(id, call_id);
-                let codex_protocol::models::FunctionCallOutputBody::Text(text) = &output.body
-                else {
-                    panic!("compact text receipt");
-                };
-                if text == &"x".repeat(24_000) {
-                    output_tokens += codex_utils_string::approx_token_count(text);
-                    continue;
-                }
-                let receipt: serde_json::Value = serde_json::from_str(text).unwrap();
-                assert_eq!(receipt["kind"], "unconsumed_tool_outcome");
-                assert_eq!(receipt["call_id"], call_id);
-                assert_eq!(receipt["output_omitted"], true);
-                assert!(receipt["digest"].as_str().unwrap().contains('x'));
-                output_tokens += codex_utils_string::approx_token_count(text);
-            }
-            assert!(output_tokens <= 10_000);
-        }
-        assert_eq!(
-            Arc::ptr_eq(&prepared.shared_items(), &prepared.shared_fallback_items()),
-            true
-        );
-    }
-    assert_eq!(history.raw_items(), canonical);
-}
-
-#[test]
-fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projection() {
-    let _budget =
-        crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
+fn tool_history_candidate_lifecycle_preserves_prepared_base() {
     let call_id = "call-cached-tool-history";
     let bounded_output =
         "bounded model-visible tool output with enough material for a smaller receipt\n"
@@ -4288,46 +4113,6 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
         .prepared
         .shared_items();
     assert!(Arc::ptr_eq(&cached_after_delta_consumption, &prepared_base));
-
-    let projected = delta_history
-        .prepare_for_prompt_with_completed_tool_projection_target(
-            &default_input_modalities(), StableContextTarget::FailOpen, None, None, true)
-        .shared_items();
-    assert_eq!(
-        history.prepare_for_prompt_with_completed_tool_projection_target(
-            &default_input_modalities(), StableContextTarget::FailOpen, None, None, true)
-            .shared_items(),
-        projected,
-        "production mutations and direct consumption must refresh the same receipt projection",
-    );
-    assert!(
-        projected
-            .iter()
-            .any(crate::tool_history::response_item_has_valid_tool_history_receipt)
-    );
-    assert_eq!(
-        projected.len(),
-        2,
-        "the call and recoverable result must remain"
-    );
-    let ResponseItem::FunctionCallOutput {
-        call_id: projected_call_id,
-        output,
-        ..
-    } = &projected[1]
-    else {
-        panic!("expected the projected tool output");
-    };
-    assert_eq!(projected_call_id, call_id);
-    let receipt: serde_json::Value =
-        serde_json::from_str(&output.body.to_text().expect("receipt text")).expect("receipt JSON");
-    assert_eq!(receipt["call_id"], call_id);
-    assert_eq!(receipt["artifact_id"], "artifact-cached-tool-history");
-    assert_eq!(receipt["bytes"], 96_000);
-    assert_eq!(
-        receipt["sha256"],
-        crate::tool_history::sha256(b"canonical artifact")
-    );
 }
 
 #[test]

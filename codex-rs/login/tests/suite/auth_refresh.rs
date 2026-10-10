@@ -238,7 +238,7 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         .as_ref()
         .context("last_refresh should be recorded")?;
     assert!(
-        *refreshed_at >= initial_last_refresh,
+        *refreshed_at > initial_last_refresh,
         "last_refresh should advance"
     );
 
@@ -304,7 +304,7 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
         .as_ref()
         .context("last_refresh should be recorded")?;
     assert!(
-        *refreshed_at >= initial_last_refresh,
+        *refreshed_at > initial_last_refresh,
         "last_refresh should advance"
     );
 
@@ -376,7 +376,7 @@ async fn auth_refreshes_when_access_token_is_near_expiry() -> Result<()> {
         .as_ref()
         .context("last_refresh should be recorded")?;
     assert!(
-        *refreshed_at >= initial_last_refresh,
+        *refreshed_at > initial_last_refresh,
         "last_refresh should advance"
     );
 
@@ -661,7 +661,7 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
         .as_ref()
         .context("last_refresh should be recorded")?;
     assert!(
-        *refreshed_at >= fresh_refresh,
+        *refreshed_at > fresh_refresh,
         "last_refresh should advance"
     );
 

@@ -77,6 +77,38 @@ fn legacy_command_exec_config(
     Ok(config)
 }
 
+/// Loads the config a `permissionProfile` request runs under.
+async fn permission_profile_command_exec_config(
+    config_manager: &ConfigManager,
+    base_cwd: &AbsolutePathBuf,
+    cwd: &AbsolutePathBuf,
+    permission_profile: String,
+) -> Result<Config, JSONRPCErrorError> {
+    let overrides = ConfigOverrides {
+        cwd: Some(cwd.to_path_buf()),
+        default_permissions: Some(permission_profile),
+        ..Default::default()
+    };
+    let config = config_manager
+        .load_for_cwd(
+            /*request_overrides*/ None,
+            overrides,
+            Some(base_cwd.to_path_buf()),
+        )
+        .await
+        .map_err(|err| invalid_request(format!("invalid permission profile: {err}")))?;
+    if let Some(warning) = config
+        .startup_warnings
+        .iter()
+        .find(|warning| warning.contains("Configured value for `permission_profile` is disallowed"))
+    {
+        return Err(invalid_request(format!(
+            "invalid permission profile: {warning}"
+        )));
+    }
+    Ok(config)
+}
+
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
     config: Arc<Config>,
@@ -278,27 +310,13 @@ impl CommandExecRequestProcessor {
             managed_network_requirements_enabled,
             windows_sandbox_workspace_roots,
         ) = if let Some(permission_profile) = permission_profile {
-            let overrides = ConfigOverrides {
-                cwd: Some(cwd.to_path_buf()),
-                default_permissions: Some(permission_profile),
-                ..Default::default()
-            };
-            let config = self
-                .config_manager
-                .load_for_cwd(
-                    /*request_overrides*/ None,
-                    overrides,
-                    Some(self.config.cwd.to_path_buf()),
-                )
-                .await
-                .map_err(|err| invalid_request(format!("invalid permission profile: {err}")))?;
-            if let Some(warning) = config.startup_warnings.iter().find(|warning| {
-                warning.contains("Configured value for `permission_profile` is disallowed")
-            }) {
-                return Err(invalid_request(format!(
-                    "invalid permission profile: {warning}"
-                )));
-            }
+            let config = permission_profile_command_exec_config(
+                &self.config_manager,
+                &self.config.cwd,
+                &cwd,
+                permission_profile,
+            )
+            .await?;
             (
                 config.permissions.effective_permission_profile(),
                 config.permissions.network.clone(),
@@ -483,6 +501,73 @@ mod tests {
         );
         assert!(
             !file_system_policy.can_write_path_with_cwd(base_cwd.as_path(), request_cwd.as_path())
+        );
+    }
+
+    // The sandboxed launch itself is covered once by the integration suite;
+    // which profile and proxy a request selects is decided here, before it.
+    #[tokio::test]
+    async fn command_exec_permission_profile_selects_that_profile_and_only_its_network_proxy() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cwd = temp_dir.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::write(
+            temp_dir.path().join("config.toml"),
+            r#"default_permissions = "networked"
+
+[features]
+network_proxy = true
+
+[permissions.networked.filesystem]
+":root" = "read"
+
+[permissions.networked.network]
+enabled = true
+proxy_url = "http://127.0.0.1:0"
+enable_socks5 = false
+"#,
+        )
+        .expect("write config");
+        let config_manager =
+            ConfigManager::without_managed_config_for_tests(temp_dir.path().to_path_buf());
+        let base_config = config_manager
+            .load_latest_config(Some(cwd.clone()))
+            .await
+            .expect("load base config");
+        assert!(
+            base_config.permissions.network.is_some(),
+            "the default profile brings a network proxy"
+        );
+        let cwd = AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd");
+
+        let networked = permission_profile_command_exec_config(
+            &config_manager,
+            &base_config.cwd,
+            &cwd,
+            "networked".to_string(),
+        )
+        .await
+        .expect("the networked profile is accepted");
+        assert!(networked.permissions.network.is_some());
+
+        let read_only = permission_profile_command_exec_config(
+            &config_manager,
+            &base_config.cwd,
+            &cwd,
+            codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string(),
+        )
+        .await
+        .expect("the built-in read-only profile is accepted");
+        assert!(
+            read_only.permissions.network.is_none(),
+            "an explicit profile must not reuse the default profile's proxy"
+        );
+        assert_eq!(read_only.cwd, cwd);
+        assert!(
+            !read_only
+                .permissions
+                .file_system_sandbox_policy()
+                .can_write_path_with_cwd(cwd.as_path(), cwd.as_path())
         );
     }
 }

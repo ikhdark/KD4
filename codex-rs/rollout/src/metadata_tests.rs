@@ -201,6 +201,16 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     expected.recency_at = expected.updated_at;
 
     assert_eq!(outcome.metadata, expected);
+    // `expected` is built by the extraction's own helpers; pin what SessionMeta supplies.
+    assert_eq!(outcome.metadata.id, id);
+    assert_eq!(
+        outcome.metadata.created_at,
+        DateTime::parse_from_rfc3339("2026-01-27T12:34:56Z")
+            .expect("timestamp")
+            .with_timezone(&Utc)
+    );
+    assert_eq!(outcome.metadata.history_mode, ThreadHistoryMode::Paginated);
+    assert_eq!(outcome.metadata.cli_version, "0.0.0");
     assert_eq!(outcome.parent_thread_id, Some(parent_thread_id));
     assert_eq!(outcome.parse_errors, 0);
 }
@@ -413,10 +423,13 @@ async fn extract_metadata_from_rollout_rejects_unknown_history_mode() {
     let mut file = File::create(&path).expect("create rollout");
     writeln!(file, "{rollout_line}").expect("write rollout");
 
+    let Err(err) = extract_metadata_from_rollout(&path, "openai").await else {
+        panic!("unknown history mode must fail extraction");
+    };
+    // Skipping the line as malformed also fails, as an empty rollout; pin the rejection.
     assert!(
-        extract_metadata_from_rollout(&path, "openai")
-            .await
-            .is_err()
+        format!("{err:#}").contains("invalid session metadata history_mode"),
+        "unexpected error: {err:#}"
     );
 }
 

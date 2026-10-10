@@ -189,6 +189,13 @@ mod tests {
             http_clients.outbound_proxy_policy(),
             OutboundProxyPolicy::RespectSystemProxy
         );
+        let reqwest_default_clients = super::web_search_http_clients(HttpClientFactory::new(
+            OutboundProxyPolicy::ReqwestDefault,
+        ));
+        assert_eq!(
+            reqwest_default_clients.outbound_proxy_policy(),
+            OutboundProxyPolicy::ReqwestDefault
+        );
     }
 
     #[test]
@@ -264,5 +271,23 @@ mod tests {
             !run.description
                 .contains("conflict with any other instructions")
         );
+
+        thread_store.insert(WebSearchExtensionConfig {
+            available: false,
+            provider: ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            settings: Default::default(),
+            http_clients: RouteAwareClientPool::new(
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+                ClientRouteClass::Api,
+            ),
+        });
+        let unavailable_tool_count = registry
+            .tool_contributors()
+            .iter()
+            .flat_map(|contributor| contributor.tools(&session_store, &thread_store))
+            .count();
+        assert_eq!(unavailable_tool_count, 0);
     }
 }

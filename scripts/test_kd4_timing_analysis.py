@@ -955,15 +955,17 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         )
 
     def test_tool_durations_reject_bad_clocks_and_keep_search_failures(self):
-        for start, end, expected in [
-            (10, 10, 0),
-            (10, 35, 25),
-            (None, 35, None),
-            (40, 35, None),
-            (-1, 35, None),
-            (True, 35, None),
-            (10, float("inf"), None),
-            (float("nan"), 35, None),
+        for start, end, expected, gaps in [
+            (10, 10, 0, [0] * 5),
+            (10, 35, 25, [25] * 3),
+            (None, 35, None, [0] * 2),
+            (40, 35, None, [5] * 2),
+            (-1, 35, None, [0] * 2),
+            (True, 35, None, [0] * 2),
+            (10, float("inf"), None, [0] * 2),
+            (float("nan"), 35, None, [0] * 2),
+            (2**2048, 35, None, [0] * 2),
+            (10, 2**2048, None, [0] * 2),
         ]:
             with self.subTest(start=start, end=end):
                 events = []
@@ -998,6 +1000,11 @@ class SharedTimingAnalysisTest(unittest.TestCase):
                     {"schemaVersion": 1, "events": events}
                 )
                 durations = report["toolActivity"]["durations"]
+                # Three start/end pairs: preserve valid forward gaps, ignore
+                # invalid clocks, and do not turn backwards gaps into zeros.
+                self.assertEqual(
+                    [gap["durationMs"] for gap in report["longestEventGaps"]], gaps
+                )
                 self.assertEqual(durations["rgSearch"]["observedCount"], 1)
                 self.assertEqual(durations["rgSearch"]["totalMs"], expected)
                 self.assertEqual(

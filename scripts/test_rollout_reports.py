@@ -386,6 +386,37 @@ class RolloutReportsTest(unittest.TestCase):
         self.assertIn('second record', suffix)
         self.assertEqual(result.stdout.count('wrote '), 2)
 
+    def test_report_cli_rejects_colliding_output_names_before_writing(self):
+        self.path.write_bytes(encode([record("event_msg", {"type": "user_message", "message": "first"})]))
+        other = self.root / "other" / self.path.name
+        other.parent.mkdir()
+        other.write_bytes(encode([record("event_msg", {"type": "user_message", "message": "second"})]))
+        originals = {path: path.read_bytes() for path in (self.path, other)}
+        for command, suffix in ((["dump"], ".txt"), (["dump", "--complete"], ".txt"),
+                                (["narrative"], ".narr.txt")):
+            for existing in (False, True):
+                with self.subTest(command=command, existing=existing):
+                    outdir = self.root / f"reports-{command[-1]}-{existing}"
+                    output = outdir / (self.path.stem + suffix)
+                    if existing:
+                        outdir.mkdir()
+                        output.write_bytes(b"previous report")
+                    with (
+                        contextlib.redirect_stdout(io.StringIO()) as stdout,
+                        contextlib.redirect_stderr(io.StringIO()) as stderr,
+                        self.assertRaises(SystemExit) as raised,
+                    ):
+                        reports.main([*command, str(outdir), str(self.path), str(other)])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn("same report output", stderr.getvalue())
+                    self.assertEqual(stdout.getvalue(), "")
+                    if existing:
+                        self.assertEqual(list(outdir.iterdir()), [output])
+                        self.assertEqual(output.read_bytes(), b"previous report")
+                    else:
+                        self.assertFalse(outdir.exists())
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
     def test_reader_rejects_interior_corruption_and_nonobjects_before_output(self):
         prefix = encode([record("session_meta", {})])
         for bad in (b"broken\n", b"[]\n", b"[]", b"\xff\n"):

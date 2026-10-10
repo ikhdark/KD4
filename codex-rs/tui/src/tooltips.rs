@@ -307,6 +307,7 @@ mod tests {
             ALL_TOOLTIPS.len(),
             TOOLTIPS.len() + experimental_tooltips().len()
         );
+        let mut seen = std::collections::BTreeSet::new();
         for seed in [7, 42] {
             let mut first = StdRng::seed_from_u64(seed);
             let mut second = StdRng::seed_from_u64(seed);
@@ -314,8 +315,13 @@ mod tests {
                 let tip = pick_tooltip(&mut first).expect("available tooltip");
                 assert!(ALL_TOOLTIPS.contains(&tip));
                 assert_eq!(Some(tip), pick_tooltip(&mut second));
+                seen.insert(tip);
             }
         }
+        assert!(
+            seen.len() > 1,
+            "sixteen draws from the pool should not all pick the same tooltip: {seen:?}"
+        );
     }
 
     #[test]
@@ -499,14 +505,16 @@ target_plan_types = ["prp"]
 
     #[test]
     fn announcement_tip_toml_matches_windows_and_rejects_other_operating_systems() {
+        // The last matching entry wins, so the non-Windows entry goes last: it must be
+        // rejected for the Windows announcement to survive.
         let toml = r#"
-[[announcements]]
-content = "other operating system announcement"
-target_oses = ["other"]
-
 [[announcements]]
 content = "windows announcement"
 target_oses = ["windows"]
+
+[[announcements]]
+content = "other operating system announcement"
+target_oses = ["other"]
         "#;
 
         let expected = "windows announcement";

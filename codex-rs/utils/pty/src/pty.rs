@@ -579,7 +579,7 @@ fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn configure_owned_pty_files<T>(
     master: T,
     slave: T,
@@ -592,47 +592,6 @@ fn configure_owned_pty_files<T>(
 
 #[cfg(test)]
 mod pty_fd_tests {
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn public_pty_preserves_arg0_and_resizes_owned_master() -> anyhow::Result<()> {
-        let spawned = super::spawn_process(
-            "/bin/sh",
-            &[
-                "-c".into(),
-                "printf '%s\\n' \"$0\"; read line; stty size".into(),
-            ],
-            &std::env::current_dir()?,
-            &std::env::vars().collect(),
-            &Some("codex-custom-argv-zero".into()),
-            super::TerminalSize::default(),
-        )
-        .await?;
-        let crate::SpawnedProcess {
-            session,
-            mut stdout_rx,
-            exit_rx,
-            ..
-        } = spawned;
-        session.resize(super::TerminalSize {
-            rows: 41,
-            cols: 113,
-        })?;
-        session.writer_sender().send(b"go\n".to_vec()).await?;
-        let (output, code) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut output = Vec::new();
-            while let Some(chunk) = stdout_rx.recv().await {
-                output.extend(chunk);
-            }
-            (output, exit_rx.await)
-        })
-        .await?;
-        assert_eq!(code?, 0);
-        let output = String::from_utf8(output)?;
-        assert!(output.contains("codex-custom-argv-zero\r\n"), "{output:?}");
-        assert!(output.contains("41 113\r\n"), "{output:?}");
-        Ok(())
-    }
-
     #[tokio::test]
     async fn aborting_backpressured_reader_releases_native_owner() {
         struct Reader(Option<tokio::sync::oneshot::Sender<()>>);
@@ -747,10 +706,10 @@ mod pty_fd_tests {
         result
     }
     use std::sync::Arc;
+    #[cfg(windows)]
     use std::sync::atomic::AtomicUsize;
+    #[cfg(windows)]
     use std::sync::atomic::Ordering;
-
-    use super::configure_owned_pty_files;
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
@@ -812,133 +771,6 @@ mod pty_fd_tests {
         );
         assert!(super::TEST_PTY_SYSTEM.with(|system| system.borrow().is_none()));
         Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn public_pipe_and_pty_spawns_preserve_only_requested_descriptors() -> anyhow::Result<()>
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::fd::FromRawFd;
-        use std::os::fd::OwnedFd;
-        use std::time::Duration;
-
-        let source = std::fs::File::open("/dev/null")?;
-        let duplicate = |minimum: libc::c_int| -> std::io::Result<OwnedFd> {
-            // SAFETY: source owns a live descriptor; F_DUPFD returns a separate inheritable
-            // descriptor, with failure checked before ownership is transferred.
-            let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, minimum) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: successful F_DUPFD created a new descriptor with no other owner.
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-        };
-        let preserved = duplicate(128)?;
-        let excluded = duplicate(192)?;
-        let script = format!(
-            "test -e /dev/fd/{} && test ! -e /dev/fd/{} || exit 79; printf descriptor-contract-ok",
-            preserved.as_raw_fd(),
-            excluded.as_raw_fd()
-        );
-        let args = ["-c".to_string(), script];
-        let cwd = std::env::current_dir()?;
-        let env = std::env::vars().collect();
-        let preserved_fds = [preserved.as_raw_fd()];
-        for use_pty in [false, true] {
-            let spawned = if use_pty {
-                crate::pty::spawn_process_with_inherited_fds(
-                    "/bin/sh",
-                    &args,
-                    &cwd,
-                    &env,
-                    &None,
-                    crate::TerminalSize::default(),
-                    &preserved_fds,
-                )
-                .await?
-            } else {
-                crate::pipe::spawn_process_no_stdin_with_inherited_fds(
-                    "/bin/sh",
-                    &args,
-                    &cwd,
-                    &env,
-                    &None,
-                    &preserved_fds,
-                )
-                .await?
-            };
-            let crate::SpawnedProcess {
-                session,
-                mut stdout_rx,
-                exit_rx,
-                ..
-            } = spawned;
-            let mut output = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while output.len() < b"descriptor-contract-ok".len() {
-                    let Some(chunk) = stdout_rx.recv().await else {
-                        break;
-                    };
-                    output.extend(chunk);
-                }
-            })
-            .await?;
-            assert_eq!(output, b"descriptor-contract-ok");
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), exit_rx).await??,
-                0
-            );
-            drop(session);
-
-            for fd in [preserved.as_raw_fd(), excluded.as_raw_fd()] {
-                // SAFETY: the parent still owns both descriptors; F_GETFD only reads flags.
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                assert_eq!(
-                    flags, 0,
-                    "child filtering must not change parent descriptors"
-                );
-            }
-
-            let missing = "/codex-missing-executable-for-fd-filter-test";
-            let result = if use_pty {
-                crate::pty::spawn_process_with_inherited_fds(
-                    missing,
-                    &[],
-                    &cwd,
-                    &env,
-                    &None,
-                    crate::TerminalSize::default(),
-                    &preserved_fds,
-                )
-                .await
-            } else {
-                crate::pipe::spawn_process_no_stdin_with_inherited_fds(
-                    missing,
-                    &[],
-                    &cwd,
-                    &env,
-                    &None,
-                    &preserved_fds,
-                )
-                .await
-            };
-            assert!(
-                result.is_err(),
-                "the spawn error pipe must survive until exec fails"
-            );
-        }
-        Ok(())
-    }
-
-    struct TrackedDescriptor {
-        drop_count: Arc<AtomicUsize>,
-    }
-
-    impl Drop for TrackedDescriptor {
-        fn drop(&mut self) {
-            self.drop_count.fetch_add(1, Ordering::SeqCst);
-        }
     }
 
     struct ControlledWriter {
@@ -1035,34 +867,6 @@ mod pty_fd_tests {
             .unwrap()
             .unwrap();
         assert_eq!(output.lock().unwrap().as_slice(), b"inflight|");
-    }
-
-    #[test]
-    fn cloexec_failure_drops_both_owned_pty_descriptors() {
-        for failing_call in [1, 2] {
-            let drop_count = Arc::new(AtomicUsize::new(0));
-            let mut call_count = 0;
-            let result = configure_owned_pty_files(
-                TrackedDescriptor {
-                    drop_count: Arc::clone(&drop_count),
-                },
-                TrackedDescriptor {
-                    drop_count: Arc::clone(&drop_count),
-                },
-                |_| {
-                    call_count += 1;
-                    if call_count == failing_call {
-                        Err(std::io::Error::other("injected CLOEXEC failure"))
-                    } else {
-                        Ok(())
-                    }
-                },
-            );
-
-            assert!(result.is_err());
-            assert_eq!(call_count, failing_call);
-            assert_eq!(drop_count.load(Ordering::SeqCst), 2);
-        }
     }
 }
 

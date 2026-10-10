@@ -17,12 +17,6 @@ impl ToolDefinition {
         self.name = name;
         self
     }
-
-    pub fn into_deferred(mut self) -> Self {
-        self.output_schema = None;
-        self.defer_loading = true;
-        self
-    }
 }
 
 #[cfg(test)]

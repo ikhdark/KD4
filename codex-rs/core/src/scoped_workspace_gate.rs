@@ -228,6 +228,60 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn queued_writer_blocks_later_readers_until_downgrade() {
+        let gate = Arc::new(ScopedWorkspaceGate::default());
+        let reader = Arc::clone(&gate).read_owned().await;
+        let writer = Arc::clone(&gate).write_owned();
+        tokio::pin!(writer);
+        assert!(futures::poll!(&mut writer).is_pending());
+        let later_reader = Arc::clone(&gate).read_owned();
+        tokio::pin!(later_reader);
+        assert!(futures::poll!(&mut later_reader).is_pending());
+        assert!(Arc::clone(&gate).try_read_owned().is_err());
+
+        drop(reader);
+        let writer = tokio::time::timeout(Duration::from_secs(1), writer).await.unwrap();
+        assert!(futures::poll!(&mut later_reader).is_pending());
+        let observer = writer.downgrade();
+        let later_reader = tokio::time::timeout(Duration::from_secs(1), later_reader).await.unwrap();
+        assert!(Arc::clone(&gate).try_write_owned().is_err());
+        drop((observer, later_reader));
+        assert!(Arc::clone(&gate).try_write_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn queued_addition_revalidates_created_target_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("left")).unwrap();
+        std::fs::create_dir(root.path().join("right")).unwrap();
+        let gate = Arc::new(ScopedWorkspaceGate::default());
+        let addition = NativeAdditions::resolve(
+            root.path(), root.path(), &[PathBuf::from("left/new")],
+        ).await.unwrap();
+        let writer = Arc::clone(&gate).write_owned().await;
+        let pending = addition.acquire(Arc::clone(&gate));
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        std::fs::write(root.path().join("left/new"), "created by preceding writer").unwrap();
+        drop(writer);
+        let fallback = tokio::time::timeout(Duration::from_secs(1), pending).await.unwrap();
+
+        // The target is now an update, not an addition. It must hold an opaque
+        // write lease, excluding even a genuinely disjoint addition.
+        let disjoint = NativeAdditions::resolve(
+            root.path(), root.path(), &[PathBuf::from("right/new")],
+        ).await.unwrap();
+        // Isolate admission from later filesystem awaits: Pending here can
+        // only mean the existing lease excludes this resolved footprint.
+        let disjoint = Arc::clone(&gate).acquire(Access::Additions(disjoint.directories));
+        tokio::pin!(disjoint);
+        assert!(futures::poll!(&mut disjoint).is_pending());
+        drop(fallback);
+        let _disjoint = tokio::time::timeout(Duration::from_secs(1), disjoint).await.unwrap();
+        assert_eq!(std::fs::read(root.path().join("left/new")).unwrap(), b"created by preceding writer");
+    }
+
+    #[tokio::test]
     async fn native_addition_claims_exclude_overlaps_and_release_cancelled_waiters() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("left")).unwrap();

@@ -39,6 +39,7 @@ async fn contributes_hosted_plugin_runtime_without_an_executor() -> TestResult {
         panic!("hosted plugin runtime should use streamable HTTP");
     };
     assert_eq!(url, "https://chatgpt.com/backend-api/ps/mcp");
+    assert!(server.enabled);
 
     Ok(())
 }

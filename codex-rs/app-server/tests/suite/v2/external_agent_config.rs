@@ -117,8 +117,10 @@ async fn external_agent_config_import_sends_completion_notification_for_sync_onl
         codex_state::StateRuntime::init(sqlite_home.path().to_path_buf(), "mock_provider".into())
             .await?;
     let details_record = state_db
-        .external_agent_config_import_details_record(&import_id)
+        .external_agent_config_import_history_records()
         .await?
+        .into_iter()
+        .find(|record| record.import_id == import_id)
         .expect("completed import details should be recorded by import id");
     let expected_successes = completed
         .item_type_results

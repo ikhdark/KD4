@@ -259,26 +259,29 @@ mod tests {
             list_cached_all_connectors(&config, &[]).await,
             Some(expected.clone())
         );
-        // Replace the one-entry in-memory cache through its normal refresh API.
-        // The original identity can now be restored only from its on-disk cache.
-        let other_context = ConnectorDirectoryCacheContext::new(
-            home.path().to_path_buf(),
-            ConnectorDirectoryCacheKey::new(
-                format!("{}/other", config.chatgpt_base_url),
-                None,
-                None,
-                false,
-            ),
-        );
-        let other =
-            codex_connectors::list_all_connectors_with_options(other_context, true, |_| async {
-                Ok(serde_json::from_value(serde_json::json!({
-                    "apps": [], "next_token": null
-                }))?)
-            })
-            .await
-            .expect("replace in-memory cache");
-        assert!(other.is_empty());
+        // Evict the original identity from the in-memory cache through its normal refresh
+        // API: the cache keeps 16 scopes (MAX_DIRECTORY_CACHE_SCOPES), so the 16th new scope
+        // displaces the oldest entry. It can now be restored only from its on-disk cache.
+        for scope in 0..16 {
+            let other_context = ConnectorDirectoryCacheContext::new(
+                home.path().to_path_buf(),
+                ConnectorDirectoryCacheKey::new(
+                    format!("{}/other-{scope}", config.chatgpt_base_url),
+                    None,
+                    None,
+                    false,
+                ),
+            );
+            let other =
+                codex_connectors::list_all_connectors_with_options(other_context, true, |_| async {
+                    Ok(serde_json::from_value(serde_json::json!({
+                        "apps": [], "next_token": null
+                    }))?)
+                })
+                .await
+                .expect("replace in-memory cache");
+            assert!(other.is_empty());
+        }
         assert_eq!(
             list_cached_all_connectors(&config, &[]).await,
             Some(expected)

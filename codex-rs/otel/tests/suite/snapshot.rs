@@ -144,10 +144,7 @@ fn manager_snapshot_metrics_collects_without_shutdown() -> Result<()> {
             "app.version".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         ),
-        (
-            "auth_mode".to_string(),
-            TelemetryAuthMode::ApiKey.to_string(),
-        ),
+        ("auth_mode".to_string(), "ApiKey".to_string()),
         ("model".to_string(), "gpt-5.1".to_string()),
         ("originator".to_string(), "other".to_string()),
         ("service".to_string(), "codex-cli".to_string()),

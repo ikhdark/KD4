@@ -660,6 +660,35 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["True"] * 7,
         )
 
+    def test_common_rust_env_unrepresentable_sizes_remain_unknown(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = (
+            "$ErrorActionPreference = 'Stop'; "
+            f". {ps_single_quote(REPO_ROOT / 'scripts/common-rust-env.ps1')}; "
+            "$values = @('79228162514264337593543950335E', '9223372036854775807', "
+            "'9223372036854775808', '0.5K', '0.1'); "
+            "$results = @($values | ForEach-Object { "
+            "@{input=$_; value=(ConvertTo-CodexRustByteSize -Value $_)} }); "
+            "$env:CODEX_SCCACHE_CACHE_SIZE = $values[0]; "
+            "@{values=$results; matches=(Test-CodexRustSccacheStatsCacheSize "
+            "-Stats @('Max cache size 80 GiB'))} | ConvertTo-Json -Depth 4 -Compress"
+        )
+        result = subprocess.run(
+            [shell, "-NoProfile", "-Command", command], capture_output=True,
+            text=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        proof = json.loads(result.stdout)
+        # Byte counts must fit signed Int64 and contain no fractional byte.
+        self.assertEqual(
+            [row["value"] for row in proof["values"]],
+            [None, 9223372036854775807, None, 512, None],
+        )
+        # An unknown format is not proof that a shared server needs restarting.
+        self.assertTrue(proof["matches"])
+
     def test_sccache_perf_stats_reports_size_drift_without_restarting(self) -> None:
         shell = powershell()
         if shell is None:

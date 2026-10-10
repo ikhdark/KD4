@@ -47,6 +47,11 @@ fn screen(view: &mut AnalyticsView, width: u16, height: u16) -> String {
 #[test]
 fn analytics_exact_fit_content_has_no_scroll_hint() {
     let mut view = fixture::view(models::AccountKind::Enterprise);
+    // A longer list drops neighboring rows to fit a short viewport, so it never fills the
+    // measured height; the selected row alone is always shown.
+    let mut chats = fixture::chats();
+    chats.rows.truncate(/*len*/ 1);
+    view.chats = Load::Ready(chats);
     view.section = Section::Chats;
     screen(&mut view, /*width*/ 120, /*height*/ 60);
     let chrome_height = 60 - view.viewport_height;
@@ -59,6 +64,13 @@ fn analytics_exact_fit_content_has_no_scroll_hint() {
     let exact = screen(&mut view, /*width*/ 120, exact_height);
     assert!(!exact.contains("scroll"));
     assert_eq!(view.viewport_height, content_height);
+    assert_eq!(
+        view.panel(Section::Chats, /*width*/ 116, /*chart_height*/ 4)
+            .lines
+            .len(),
+        content_height
+    );
+    assert!(screen(&mut view, /*width*/ 120, exact_height - 1).contains("scroll"));
 }
 
 #[test]
@@ -329,16 +341,29 @@ fn analytics_model_labels_and_tool_remainders_are_unambiguous() {
     let mut tools = fixture::history(/*report*/ 4, /*range*/ 0, /*group*/ 0);
     for day in &mut tools.data {
         day.values[1].label = "Other".into();
+        // Eight skills exceed the six-row budget of a 32-row screen, so the collapsed table
+        // must fold the smallest ones into a remainder row.
+        for label in ["Docs", "Refactoring", "Release notes", "Triage"] {
+            day.total += 1.0;
+            day.values.push(models::AccountAnalyticsValue {
+                key: label.into(),
+                label: label.into(),
+                value: 1.0,
+            });
+        }
     }
     view.sections[Section::Skills].history = Load::Ready(tools);
     press(&mut view, KeyCode::Char('3'));
     let overview = screen(&mut view, /*width*/ 140, /*height*/ 64);
     assert!(overview.contains("Friendly model"));
-    assert!(overview.contains("Skills"));
     press(&mut view, KeyCode::Char('5'));
+    let collapsed = screen(&mut view, /*width*/ 100, /*height*/ 32);
+    assert!(collapsed.lines().any(|line| line.contains("● Other")));
+    assert!(collapsed.lines().any(|line| line.contains("… 3 more")));
     press(&mut view, KeyCode::Enter);
     let skills = screen(&mut view, /*width*/ 100, /*height*/ 32);
-    assert!(skills.contains("Other"));
+    assert!(skills.lines().any(|line| line.contains("● Other")));
+    assert!(!skills.contains("… 3 more"));
 }
 
 #[test]

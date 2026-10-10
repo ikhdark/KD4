@@ -832,11 +832,11 @@ function Test-PackageContentsAreComplete {
 
     $actual = @{}
     $packageRoot = [IO.Path]::GetFullPath($PackageDir).TrimEnd("\") + "\"
-    foreach ($file in Get-ChildItem -LiteralPath $PackageDir -File -Recurse) {
-        if ($file.Name -in @("codex-package.json", $InstallMetadataFile)) {
+    foreach ($file in Get-ChildItem -LiteralPath $PackageDir -File -Recurse -Force) {
+        $relative = $file.FullName.Substring($packageRoot.Length).Replace("\", "/")
+        if ($relative -in @("codex-package.json", $InstallMetadataFile)) {
             continue
         }
-        $relative = $file.FullName.Substring($packageRoot.Length).Replace("\", "/")
         $actual[$relative] = $true
     }
     if ($actual.Count -ne $declared.Count) {

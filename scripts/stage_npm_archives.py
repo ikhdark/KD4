@@ -264,7 +264,9 @@ def materialize_cached_tree(
         cached_dir,
         dest_dir,
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(COMPLETE_MARKER),
+        ignore=lambda directory, names: (
+            {COMPLETE_MARKER} if Path(directory) == cached_dir else set()
+        ),
     )
 
 
@@ -281,7 +283,7 @@ def hardlink_tree(
 
         dest = dest_dir / src.name
         if src.is_dir():
-            hardlink_tree(src, dest, ignored_names=ignored_names)
+            hardlink_tree(src, dest, ignored_names=set())
         elif src.is_file():
             os.link(src, dest)
         else:
@@ -371,7 +373,7 @@ def cache_tree_digest(root: Path) -> str:
     for path in sorted(
         root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
     ):
-        if path.name == COMPLETE_MARKER:
+        if path == root / COMPLETE_MARKER:
             continue
         relative = path.relative_to(root).as_posix().encode("utf-8")
         if path.is_symlink():

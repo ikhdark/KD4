@@ -385,22 +385,44 @@ mod tests {
 
     #[test]
     fn invalid_commands_are_rejected_and_opaque_references_are_valid() {
-        for json in [
-            "{}",
-            r#"{"response_length":"long"}"#,
-            r#"{"open":[]}"#,
-            r#"{"open":[{"ref_id":" "}]}"#,
-            r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}]}"#,
+        // Each input must be rejected by its own rule, not by a neighbouring one.
+        let no_operation =
+            "web.run requires at least one operation; response_length alone is not an operation";
+        let four_queries = "four search queries require response_length medium or long";
+        for (json, expected) in [
+            ("{}", no_operation),
+            (r#"{"response_length":"long"}"#, no_operation),
+            (r#"{"open":[]}"#, no_operation),
+            (
+                r#"{"open":[{"ref_id":" "}]}"#,
+                "page operations require a nonblank ref_id (a returned reference or URL)",
+            ),
+            (
+                r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}]}"#,
+                four_queries,
+            ),
+            (
+                r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}],"response_length":"short"}"#,
+                four_queries,
+            ),
+            (
+                r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"},{"q":"e"}],"response_length":"long"}"#,
+                "search_query accepts at most four queries",
+            ),
         ] {
             let commands = serde_json::from_str(json).expect("commands");
-            assert!(matches!(
+            assert_eq!(
                 super::validate_commands(&commands),
-                Err(codex_extension_api::FunctionCallError::RespondToModel(_))
-            ));
+                Err(codex_extension_api::FunctionCallError::RespondToModel(
+                    expected.to_string()
+                )),
+                "{json}"
+            );
         }
         for json in [
             r#"{"open":[{"ref_id":"turn0search0"}]}"#,
             r#"{"search_query":[{"q":""}]}"#,
+            r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}],"response_length":"medium"}"#,
             r#"{"search_query":[{"q":"a"},{"q":"b"},{"q":"c"},{"q":"d"}],"response_length":"long"}"#,
         ] {
             let commands = serde_json::from_str(json).expect("commands");

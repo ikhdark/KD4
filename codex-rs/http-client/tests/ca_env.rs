@@ -520,6 +520,11 @@ fn exclusive_tls_roots_do_not_trust_process_custom_ca_bundle() {
         "unexpected probe failure:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("UnknownIssuer"),
+        "the excluded process root must fail certificate verification, not merely the request:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

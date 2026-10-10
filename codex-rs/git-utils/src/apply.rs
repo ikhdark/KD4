@@ -1319,8 +1319,12 @@ mod tests {
         let (commit_code, _, commit_err) = run(root, &["git", "commit", "-am", "apply change"]);
         assert_eq!(commit_code, 0, "commit applied change: {commit_err}");
 
+        std::fs::write(root.join("prepared.txt"), "prepared commit contents\n").unwrap();
+        let _ = run(root, &["git", "add", "prepared.txt"]);
+        std::fs::write(root.join("prepared.txt"), "unstaged work must stay separate\n").unwrap();
         let (_code_before, staged_before, _stderr_before) =
-            run(root, &["git", "diff", "--cached", "--name-only"]);
+            run(root, &["git", "diff", "--cached", "--binary"]);
+        assert!(staged_before.contains("+prepared commit contents"));
 
         let preflight_req = ApplyGitRequest {
             cwd: root.to_path_buf(),
@@ -1331,11 +1335,15 @@ mod tests {
         let res_preflight = apply_git_patch(&preflight_req).expect("preflight ok");
         assert_eq!(res_preflight.exit_code, 0, "revert preflight succeeded");
         let (_code_after, staged_after, _stderr_after) =
-            run(root, &["git", "diff", "--cached", "--name-only"]);
+            run(root, &["git", "diff", "--cached", "--binary"]);
         assert_eq!(
-            staged_after.trim(),
-            staged_before.trim(),
-            "preflight should not stage new paths",
+            staged_after,
+            staged_before,
+            "preflight must preserve staged paths and their contents",
+        );
+        assert_eq!(
+            read_file_normalized(&root.join("prepared.txt")),
+            "unstaged work must stay separate\n"
         );
 
         let after_preflight = read_file_normalized(&root.join("file.txt"));

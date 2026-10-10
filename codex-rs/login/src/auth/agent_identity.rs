@@ -167,14 +167,6 @@ impl AgentIdentityAuth {
         Self::from_record(record, agent_identity_authapi_base_url, auth_route_config).await
     }
 
-    #[cfg(test)]
-    fn from_initialized_record(mut record: AgentIdentityAuthRecord, run_task_id: String) -> Self {
-        record.task_id = Some(run_task_id);
-        Self {
-            record: Arc::new(record),
-        }
-    }
-
     pub fn record(&self) -> &AgentIdentityAuthRecord {
         self.record.as_ref()
     }
@@ -500,18 +492,6 @@ mod tests {
         assert_eq!(auth.record().agent_runtime_id, "agent-runtime-1");
         assert_eq!(auth.run_task_id(), "task-run-1");
         Ok(())
-    }
-
-    #[test]
-    fn run_task_is_shared_across_clones() {
-        let auth = AgentIdentityAuth::from_initialized_record(
-            agent_identity_record_with_generated_key(),
-            "task-run-1".to_string(),
-        );
-        let cloned = auth.clone();
-
-        assert!(Arc::ptr_eq(&auth.record, &cloned.record));
-        assert_eq!(cloned.run_task_id(), "task-run-1");
     }
 
     #[tokio::test]

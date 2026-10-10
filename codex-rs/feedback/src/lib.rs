@@ -1308,10 +1308,13 @@ mod tests {
             .set_default();
 
         tracing::info!(target: FEEDBACK_TAGS_TARGET, model = "gpt-5", cached = true, "tags");
+        // Fields logged to any other target are not feedback tags.
+        tracing::info!(target: "codex_core::client", model = "other", unrelated = "log field");
 
         let snap = fb.snapshot(/*session_id*/ None);
         pretty_assertions::assert_eq!(snap.tags.get("model").map(String::as_str), Some("gpt-5"));
         pretty_assertions::assert_eq!(snap.tags.get("cached").map(String::as_str), Some("true"));
+        assert!(!snap.tags.contains_key("unrelated"));
     }
 
     #[test]
@@ -1470,6 +1473,10 @@ mod tests {
                         path: unknown_path.clone(),
                         attachment_filename_override: None,
                     },
+                    FeedbackAttachmentPath {
+                        path: unknown_path.clone(),
+                        attachment_filename_override: Some("session.JSONL".to_string()),
+                    },
                 ],
                 /*logs_override*/ None,
             );
@@ -1494,6 +1501,11 @@ mod tests {
                 (
                     unknown_filename.as_str(),
                     Some("application/octet-stream"),
+                    unknown_bytes.as_slice(),
+                ),
+                (
+                    "session.JSONL",
+                    Some("text/plain"),
                     unknown_bytes.as_slice(),
                 ),
             ]
@@ -1578,5 +1590,11 @@ mod tests {
             upload_tags.get("cli_version").map(String::as_str),
             Some(env!("CARGO_PKG_VERSION"))
         );
+
+        for client_tags in [None, Some(&client_tags)] {
+            let without_optional_fields = snapshot.upload_tags("bug", None, client_tags, None);
+            assert!(!without_optional_fields.contains_key("reason"));
+            assert!(!without_optional_fields.contains_key("session_source"));
+        }
     }
 }

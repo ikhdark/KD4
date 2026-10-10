@@ -438,10 +438,20 @@ mod tests {
             }
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("dynamic request emits its start event")
-            .expect("event channel remains open");
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.expect("event channel remains open");
+                if let codex_protocol::protocol::EventMsg::DynamicToolCallRequest(request) = event.msg
+                {
+                    break request;
+                }
+            }
+        })
+        .await
+        .expect("dynamic request reaches the client before cancellation");
+        assert_eq!(dispatched.call_id, "cancelled-dynamic-call");
+        assert_eq!(dispatched.tool, "dynamic_test");
+        assert_eq!(dispatched.arguments, serde_json::json!({}));
         cancellation.cancel();
         let error = tokio::time::timeout(std::time::Duration::from_secs(1), request)
             .await

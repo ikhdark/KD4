@@ -171,6 +171,7 @@ pub(crate) fn discover_handlers(
 
     let once_per = hook_entries
         .iter()
+        .filter(|entry| !entry.is_managed)
         .filter_map(|entry| {
             let scope = hook_states.get(&entry.key)?.once_per?;
             Some((
@@ -1061,6 +1062,12 @@ mod tests {
         assert_eq!(
             handlers[0].matcher.as_ref().map(HookMatcher::as_str),
             Some("*")
+        );
+        assert!(
+            handlers[0]
+                .matcher
+                .as_ref()
+                .is_some_and(|matcher| matcher.matches(Some("Bash")) && matcher.matches(None))
         );
     }
 

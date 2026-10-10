@@ -655,8 +655,10 @@ mod tests {
             );
             let err = toml::from_str::<TuiKeymap>(&toml_input)
                 .expect_err("expected removed backtrack action to be rejected");
+            // The rendered error echoes the offending line, so match the diagnostic itself.
             assert!(
-                err.to_string().contains(action),
+                err.to_string()
+                    .contains(&format!("unknown field `{action}`")),
                 "expected error to mention removed field {action}, got: {err}"
             );
         }
@@ -719,16 +721,39 @@ mod tests {
                 ]),
             ),
             ("[]", KeybindingsSpec::Many(vec![])),
+            // Modifiers are stored as ctrl-alt-shift and aliases as their canonical key name.
+            (
+                "'Shift-Option-Control-A'",
+                KeybindingsSpec::One(KeybindingSpec("ctrl-alt-shift-a".to_string())),
+            ),
+            (
+                "'escape'",
+                KeybindingsSpec::One(KeybindingSpec("esc".to_string())),
+            ),
+            (
+                "'ctrl-PageUp'",
+                KeybindingsSpec::One(KeybindingSpec("ctrl-page-up".to_string())),
+            ),
         ] {
             let keymap =
                 toml::from_str::<TuiKeymap>(&format!("[global]\nopen_transcript = {value}"))
                     .unwrap();
-            assert_eq!(keymap.global.open_transcript, Some(expected));
+            assert_eq!(keymap.global.open_transcript, Some(expected), "{value}");
         }
-        for value in ["'notakey'", "['ctrl-a', 'notakey']"] {
+        for (value, diagnostic) in [
+            ("'notakey'", "unknown key `notakey`"),
+            ("['ctrl-a', 'notakey']", "unknown key `notakey`"),
+            (
+                "'ctrl-control-a'",
+                "duplicate modifier in keybinding `ctrl-control-a`",
+            ),
+            ("'ctrl'", "missing key in keybinding `ctrl`"),
+            ("'a-ctrl'", "modifiers must come before the key"),
+            ("''", "keybinding cannot be empty"),
+        ] {
             let err = toml::from_str::<TuiKeymap>(&format!("[global]\nopen_transcript = {value}"))
                 .unwrap_err();
-            assert!(err.to_string().contains("unknown key `notakey`"), "{err}");
+            assert!(err.to_string().contains(diagnostic), "{value}: {err}");
         }
     }
 }

@@ -1066,18 +1066,24 @@ mod tests {
         let buf = render_buffer(&view, /*width*/ 112);
         let expected = accent_style();
 
-        let selected_cell = buf
+        let accented = buf
             .content
             .iter()
-            .find(|cell| {
+            .filter(|cell| cell.symbol() == "P")
+            .map(|cell| {
                 let style = cell.style();
-                cell.symbol() == "P"
-                    && style.fg == expected.fg
-                    && style.add_modifier.contains(Modifier::BOLD)
+                style.fg == expected.fg && style.add_modifier.contains(Modifier::BOLD)
             })
-            .expect("selected event row should use the shared accent style");
+            .collect::<Vec<_>>();
 
-        assert_eq!(selected_cell.style().fg, expected.fg);
+        // In reading order the first "P" belongs to the selected PreToolUse row.
+        // The unselected P-rows, UserPromptSubmit and the footer must stay plain.
+        assert_eq!(
+            accented.first(),
+            Some(&true),
+            "selected event row should use the shared accent style"
+        );
+        assert_eq!(accented.iter().filter(|is_accented| **is_accented).count(), 1);
     }
 
     #[test]

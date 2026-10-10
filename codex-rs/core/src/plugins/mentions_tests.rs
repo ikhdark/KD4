@@ -139,10 +139,24 @@ fn collect_explicit_plugin_mentions_dedupes_structured_and_linked_mentions() {
 fn collect_explicit_plugin_mentions_ignores_non_plugin_paths() {
     let plugins = vec![plugin("sample@test", "sample")];
 
+    // Every path names the known plugin under a non-plugin scheme, so only the
+    // path-kind filter keeps it out of the result.
     let mentioned = collect_explicit_plugin_mentions(
-        &[text_input(
-            "use [$app](app://calendar) and [$skill](skill://team/skill) and [$file](/tmp/file.txt)",
-        )],
+        &[
+            text_input("use [@sample](app://sample@test) and [@sample](skill://sample@test)"),
+            UserInput::Mention {
+                name: "sample".to_string(),
+                path: "app://sample@test".to_string(),
+            },
+            UserInput::Mention {
+                name: "sample".to_string(),
+                path: "mcp://sample@test".to_string(),
+            },
+            UserInput::Mention {
+                name: "sample".to_string(),
+                path: "sample@test".to_string(),
+            },
+        ],
         &plugins,
     );
 

@@ -3595,9 +3595,6 @@ pub(crate) fn build_prompt(
         stable_context_fallback_input: Arc::clone(&input),
         tool_history_fallback_input: Arc::clone(&input),
         stable_context_tool_history_fallback_input: input,
-        // This path builds one representation directly and runs no aggregate
-        // output budget over it.
-        tool_output_budget_drops: Default::default(),
         tool_history_substitutions: Arc::from([]),
         stable_context_fallback_tool_history_substitutions: Arc::from([]),
         stable_context_manifest: Default::default(),
@@ -4021,7 +4018,6 @@ fn build_projected_prompt_from_scaffold(
         stable_context_fallback_input: fallback_input,
         tool_history_fallback_input,
         stable_context_tool_history_fallback_input,
-        tool_output_budget_drops: prepared.tool_output_budget_drops(),
         tool_history_substitutions: prepared.tool_history_substitutions(),
         stable_context_fallback_tool_history_substitutions: prepared
             .fallback_tool_history_substitutions(),

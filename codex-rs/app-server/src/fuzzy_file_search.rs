@@ -392,6 +392,33 @@ mod tests {
         )
     }
 
+    // Stopping a session drops it; a finished search emits nothing either way,
+    // so the cancellation is only observable on the signals the workers read.
+    #[tokio::test]
+    async fn dropping_a_session_cancels_its_search_and_delivery_relay() {
+        let (tx, _rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let root = tempfile::tempdir().expect("search root");
+        let session = start_fuzzy_file_search_session(
+            ConnectionId(1),
+            "session".to_string(),
+            vec![root.path().to_string_lossy().into_owned()],
+            outgoing,
+        )
+        .expect("session starts");
+        let shared = Arc::clone(&session.shared);
+        assert!(!shared.canceled.load(Ordering::Relaxed));
+        assert!(!shared.delivery_cancellation.is_cancelled());
+
+        drop(session);
+
+        assert!(shared.canceled.load(Ordering::Relaxed));
+        assert!(shared.delivery_cancellation.is_cancelled());
+    }
+
     #[tokio::test]
     async fn delivery_relay_bounds_pending_work_and_cancels_a_saturated_send() {
         let (tx, mut rx) = mpsc::channel(1);

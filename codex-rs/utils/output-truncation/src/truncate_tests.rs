@@ -101,6 +101,8 @@ fn json_outline_preserves_lazy_prefix_intervening_lines_and_line_endings() {
         "plain output\r\n".repeat(2000),
         "{not JSON}\n".repeat(2000),
         "{\"small\":1}\n".repeat(2000),
+        // The short lines above are rejected by size; only an oversized line reaches the parser.
+        format!("{{{}", "not JSON ".repeat(2000)),
     ] {
         assert_eq!(super::outline_oversized_json_lines(&source, budget), None);
     }
@@ -1279,13 +1281,22 @@ fn projection_line_markers_cover_exact_crlf_gaps() {
     let output = crate::truncate_text_with_line_markers(&source, 1000);
     assert!(crate::approx_token_count(&output) <= 1000);
     assert_eq!(output.matches("[omitted lines ").count(), 2);
+    let mut marked = std::collections::BTreeSet::new();
     for marker in output.lines().filter_map(|line| line.strip_prefix("[omitted lines ")) {
         let (span, total) = marker.trim_end_matches(']').split_once(" of ").unwrap();
         assert_eq!(total, "3000");
         let (start, end) = span.split_once('-').unwrap();
         for line in start.parse::<usize>().unwrap()..=end.parse::<usize>().unwrap() {
             assert!(!output.contains(&format!("source line {line:04}")));
+            marked.insert(line);
         }
+    }
+    // A marker that understates its gap would leave an omitted line unreported.
+    for line in 1..=3000usize {
+        assert!(
+            marked.contains(&line) || output.contains(&format!("source line {line:04}")),
+            "line {line} is neither retained nor marked"
+        );
     }
 }
 
@@ -1316,6 +1327,12 @@ fn marked_recovery_preserves_the_entire_known_gap() {
     let gap = source.lines().skip(first - 1).take(last - first + 1).collect::<Vec<_>>();
     assert_eq!(gap.first().copied(), Some(format!("source 雪 line {first:04}").as_str()));
     assert_eq!(gap.last().copied(), Some(format!("source 雪 line {last:04}").as_str()));
+    // The source slice above is indexed by the marker itself; only the projection
+    // shows whether those endpoints bound the lines that were actually dropped.
+    let text = &marked.output.text;
+    for (line, retained) in [(first - 1, true), (first, false), (last, false), (last + 1, true)] {
+        assert_eq!(text.contains(&format!("source 雪 line {line:04}")), retained, "line {line}");
+    }
 }
 
 /// Recovery receipts must name the whole first gap. Source code repeats braces

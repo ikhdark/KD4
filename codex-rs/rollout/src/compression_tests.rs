@@ -590,6 +590,26 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
     let fresh_temp = active_path.with_file_name("rollout-fresh.jsonl.zst.tmp");
     fs::write(&fresh_temp, "fresh temp")?;
 
+    let current_owned_temps = [
+        active_path.with_file_name("rollout-compress-Ab12xy.tmp"),
+        archived_path.with_file_name("rollout-old.jsonl.decompress.123.0.tmp"),
+    ];
+    for path in &current_owned_temps {
+        fs::write(path, "stale owned temporary data")?;
+        set_old_mtime(path)?;
+    }
+
+    let unrelated_temps = [
+        active_path.with_file_name("notes.tmp"),
+        archived_path.with_file_name("notes.tmp"),
+        active_path.with_file_name("rollout-notes.tmp"),
+        archived_path.with_file_name("rollout-old.jsonl.decompress.notes.tmp"),
+    ];
+    for path in &unrelated_temps {
+        fs::write(path, "user-owned temporary data")?;
+        set_old_mtime(path)?;
+    }
+
     worker::run(home.path().to_path_buf()).await?;
 
     assert!(!active_path.exists());
@@ -600,11 +620,16 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
     assert!(!compressed_rollout_path(&fresh_path).exists());
     assert!(!stale_temp.exists());
     assert!(fresh_temp.exists());
+    for path in &current_owned_temps {
+        assert!(!path.exists(), "owned stale temporary file must be cleaned: {}", path.display());
+    }
+    for path in &unrelated_temps {
+        assert_eq!(fs::read_to_string(path)?, "user-owned temporary data");
+    }
+    // Claiming creates the marker; only a completed run leaves the nonempty
+    // contents that record its cooldown.
     assert!(
-        home.path()
-            .join(".tmp")
-            .join("rollout-compression.lock")
-            .exists()
+        fs::metadata(home.path().join(".tmp").join("rollout-compression.lock"))?.len() > 0
     );
     Ok(())
 }

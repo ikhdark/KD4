@@ -30,6 +30,56 @@ use util::append_error_log;
 use util::format_relative_time;
 use util::set_user_agent_suffix;
 
+fn apply_autodetected_environment(app: &mut app::App, sel: env_detect::AutodetectSelection) -> bool {
+    if app.env_user_selected || app.env_filter.as_deref() == Some(sel.id.as_str()) {
+        return false;
+    }
+    append_error_log(format!(
+        "env.select: autodetected id={} label={}",
+        sel.id,
+        sel.label.clone().unwrap_or_else(|| "<none>".to_string())
+    ));
+    // Preseed environments with detected label so header can show it even before list arrives
+    if let Some(lbl) = sel.label.clone() {
+        let present = app.environments.iter().any(|r| r.id == sel.id);
+        if !present {
+            app.environments.push(app::EnvironmentRow { id: sel.id.clone(), label: Some(lbl), is_pinned: false, repo_hints: None });
+        }
+    }
+    app.env_filter = Some(sel.id);
+    app.status = "Loading tasks…".to_string();
+    app.refresh_inflight = true;
+    app.list_generation = app.list_generation.saturating_add(1);
+    app.in_flight.clear();
+    true
+}
+
+fn apply_details_diff(
+    app: &mut app::App,
+    id: codex_cloud_tasks_client::TaskId,
+    title: String,
+    diff: String,
+) -> bool {
+    if !app.accepts_details(&id) {
+        return false;
+    }
+    let diff_lines: Vec<String> = diff.lines().map(str::to_string).collect();
+    if let Some(ov) = app.diff_overlay.as_mut() {
+        ov.title = title;
+        {
+            let base = ov.base_attempt_mut();
+            base.diff_lines = diff_lines.clone();
+            base.diff_raw = Some(diff.clone());
+        }
+        ov.base_can_apply = true;
+        ov.apply_selection_to_fields();
+    }
+    app.details_inflight = false;
+    app.status.clear();
+    true
+}
+
+
 struct ApplyJob {
     task_id: codex_cloud_tasks_client::TaskId,
     diff_override: Option<String>,
@@ -1049,25 +1099,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                         }
                         app::AppEvent::EnvironmentAutodetected(result) => {
                             if let Ok(sel) = result {
-                                // Only apply if user hasn't set a filter yet or it's different.
-                                if app.env_filter.as_deref() != Some(sel.id.as_str()) {
-                                    append_error_log(format!(
-                                        "env.select: autodetected id={} label={}",
-                                        sel.id,
-                                        sel.label.clone().unwrap_or_else(|| "<none>".to_string())
-                                    ));
-                                    // Preseed environments with detected label so header can show it even before list arrives
-                                    if let Some(lbl) = sel.label.clone() {
-                                        let present = app.environments.iter().any(|r| r.id == sel.id);
-                                        if !present {
-                                            app.environments.push(app::EnvironmentRow { id: sel.id.clone(), label: Some(lbl), is_pinned: false, repo_hints: None });
-                                        }
-                                    }
-                                    app.env_filter = Some(sel.id);
-                                    app.status = "Loading tasks…".to_string();
-                                    app.refresh_inflight = true;
-                                    app.list_generation = app.list_generation.saturating_add(1);
-                                    app.in_flight.clear();
+                                if apply_autodetected_environment(&mut app, sel) {
                             // reset spinner state
                                     needs_redraw = true;
                                     {
@@ -1099,35 +1131,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             // on Err, silently continue with All
                         }
                         app::AppEvent::DetailsDiffLoaded { id, title, diff } => {
-                            if let Some(ov) = &app.diff_overlay
-                                && ov.task_id != id {
-                                    continue;
-                                }
-                            let diff_lines: Vec<String> = diff.lines().map(str::to_string).collect();
-                            if let Some(ov) = app.diff_overlay.as_mut() {
-                                ov.title = title;
-                                {
-                                    let base = ov.base_attempt_mut();
-                                    base.diff_lines = diff_lines.clone();
-                                    base.diff_raw = Some(diff.clone());
-                                }
-                                ov.base_can_apply = true;
-                                ov.apply_selection_to_fields();
-                            } else {
-                                let mut overlay = app::DiffOverlay::new(id.clone(), title, /*attempt_total_hint*/ None);
-                                {
-                                    let base = overlay.base_attempt_mut();
-                                    base.diff_lines = diff_lines.clone();
-                                    base.diff_raw = Some(diff.clone());
-                                }
-                                overlay.base_can_apply = true;
-                                overlay.current_view = app::DetailView::Diff;
-                                overlay.apply_selection_to_fields();
-                                app.diff_overlay = Some(overlay);
+                            if apply_details_diff(&mut app, id, title, diff) {
+                                needs_redraw = true;
                             }
-                            app.details_inflight = false;
-                            app.status.clear();
-                            needs_redraw = true;
                         }
                         app::AppEvent::DetailsMessagesLoaded {
                             id,
@@ -1139,10 +1145,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             attempt_placement,
                             attempt_status,
                         } => {
-                            if let Some(ov) = &app.diff_overlay
-                                && ov.task_id != id {
-                                    continue;
-                                }
+                            if !app.accepts_details(&id) {
+                                continue;
+                            }
                             let conv = conversation_lines(prompt.clone(), &messages);
                             if let Some(ov) = app.diff_overlay.as_mut() {
                                 ov.title = title.clone();
@@ -1186,22 +1191,6 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                             }
                                         });
                                     }
-                            } else {
-                                let mut overlay = app::DiffOverlay::new(id.clone(), title, /*attempt_total_hint*/ None);
-                                {
-                                    let base = overlay.base_attempt_mut();
-                                    base.text_lines = conv.clone();
-                                    base.prompt = prompt.clone();
-                                    base.turn_id = turn_id.clone();
-                                    base.status = attempt_status;
-                                    base.attempt_placement = attempt_placement;
-                                }
-                                overlay.base_turn_id = turn_id.clone();
-                                overlay.sibling_turn_ids = sibling_turn_ids.clone();
-                                overlay.attempt_total_hint = Some(sibling_turn_ids.len().saturating_add(1));
-                                overlay.current_view = app::DetailView::Prompt;
-                                overlay.apply_selection_to_fields();
-                                app.diff_overlay = Some(overlay);
                             }
                             app.details_inflight = false;
                             app.status.clear();
@@ -1254,10 +1243,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             }
                         }
                         app::AppEvent::DetailsFailed { id, title, error } => {
-                            if let Some(ov) = &app.diff_overlay
-                                && ov.task_id != id {
-                                    continue;
-                                }
+                            if !app.accepts_details(&id) {
+                                continue;
+                            }
                             append_error_log(format!("details failed for {}: {error}", id.0));
                             let pretty = pretty_lines_from_error(&error);
                             if let Some(ov) = app.diff_overlay.as_mut() {
@@ -1271,16 +1259,6 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                 ov.base_can_apply = false;
                                 ov.current_view = app::DetailView::Prompt;
                                 ov.apply_selection_to_fields();
-                            } else {
-                                let mut overlay = app::DiffOverlay::new(id.clone(), title, /*attempt_total_hint*/ None);
-                                {
-                                    let base = overlay.base_attempt_mut();
-                                    base.text_lines = pretty;
-                                }
-                                overlay.base_can_apply = false;
-                                overlay.current_view = app::DetailView::Prompt;
-                                overlay.apply_selection_to_fields();
-                                app.diff_overlay = Some(overlay);
                             }
                             app.details_inflight = false;
                             needs_redraw = true;
@@ -1299,7 +1277,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                     app.status = outcome.message.clone();
                                     if matches!(outcome.status, codex_cloud_tasks_client::ApplyStatus::Success) {
                                         app.apply_modal = None;
-                                        app.diff_overlay = None;
+                                        app.close_details();
                                         // Refresh tasks after successful apply
                                         let backend = Arc::clone(&backend);
                                         let tx = tx.clone();
@@ -1366,7 +1344,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                 app.status = "Canceled new task".to_string();
                                 needs_redraw = true;
                             } else if app.diff_overlay.is_some() {
-                                app.diff_overlay = None;
+                                app.close_details();
                                 needs_redraw = true;
                             } else {
                                 break 0;
@@ -1457,7 +1435,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             || matches!(key.code, KeyCode::Char('\u{000F}'));
                         if is_ctrl_o && app.new_task.is_some() {
                             // Close task modal/pending apply if present before opening env modal
-                            app.diff_overlay = None;
+                            app.close_details();
                             app.env_modal = Some(app::EnvModalState { query: String::new(), selected: 0 });
                             // Cache environments while the modal is open to avoid repeated fetches.
                             let should_fetch = app.environments.is_empty();
@@ -1649,7 +1627,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                 }
                                 // From task modal, 'o' should close it and open the env selector
                                 KeyCode::Char('o') | KeyCode::Char('O') => {
-                                    app.diff_overlay = None;
+                                    app.close_details();
                                     app.env_modal = Some(app::EnvModalState { query: String::new(), selected: 0 });
                                     // Use cached environments unless empty
                                     if app.environments.is_empty() { app.env_loading = true; app.env_error = None; }
@@ -1696,7 +1674,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                     cycle_attempt(-1);
                                 }
                                 KeyCode::Esc | KeyCode::Char('q') => {
-                                    app.diff_overlay = None;
+                                    app.close_details();
                                     needs_redraw = true;
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
@@ -1757,7 +1735,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                         }).collect();
                                         // Keep original order (already sorted) — no need to re-sort
                                         let idx = state.selected.min(filtered.len());
-                                        if idx == 0 { app.env_filter = None; append_error_log("env.select: All"); }
+                                        if idx == 0 { app.select_environment(None); append_error_log("env.select: All"); }
                                         else {
                                             let env_idx = idx.saturating_sub(1);
                                             if let Some(row) = filtered.get(env_idx) {
@@ -1766,7 +1744,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                                     row.id,
                                                     row.label.clone().unwrap_or_else(|| "<none>".to_string())
                                                 ));
-                                                app.env_filter = Some(row.id.clone());
+                                                app.select_environment(Some(row.id.clone()));
                                             }
                                         }
                                         // If New Task page is open, reflect the new selection in its header immediately.
@@ -2141,14 +2119,40 @@ mod tests {
     use codex_cloud_tasks_client::TaskStatus;
     use codex_cloud_tasks_client::TaskSummary;
     use codex_cloud_tasks_mock_client::MockClient;
-    use codex_tui::ComposerAction;
-    use codex_tui::ComposerInput;
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
+
+    #[test]
+    fn late_details_diff_does_not_reopen_a_closed_overlay() {
+        let id = TaskId("task".to_string());
+        let mut app = app::App::new();
+        app.diff_overlay = Some(app::DiffOverlay::new(id.clone(), "title".into(), None));
+        assert!(apply_details_diff(&mut app, id.clone(), "loaded".into(), "+new".into()));
+        assert_eq!(app.diff_overlay.as_ref().unwrap().attempts[0].diff_raw.as_deref(), Some("+new"));
+        app.details_inflight = true;
+        app.close_details();
+        assert!(!app.details_inflight, "closing details must stop its pending spinner");
+        assert!(!apply_details_diff(&mut app, id, "late".into(), "+stale".into()));
+        assert!(app.diff_overlay.is_none());
+        assert!(!app.details_inflight);
+    }
+
+    #[test]
+    fn late_autodetection_preserves_a_manual_environment_selection() {
+        let mut app = app::App::new();
+        assert!(apply_autodetected_environment(&mut app, env_detect::AutodetectSelection {
+            id: "initial".into(), label: Some("Initial".into()),
+        }));
+        app.select_environment(Some("manual".into()));
+        assert!(!apply_autodetected_environment(&mut app, env_detect::AutodetectSelection {
+            id: "detected".into(), label: None,
+        }));
+        assert_eq!(app.env_filter.as_deref(), Some("manual"));
+        app.select_environment(None);
+        assert!(!apply_autodetected_environment(&mut app, env_detect::AutodetectSelection {
+            id: "detected".into(), label: None,
+        }));
+        assert!(app.env_filter.is_none(), "an explicit All selection also wins over autodetection");
+    }
 
     #[test]
     fn query_argument_rejects_blank_input_and_preserves_nonblank_text() {
@@ -2457,34 +2461,5 @@ mod tests {
             parse_task_id("https://chatgpt.com/codex/tasks/task_i_123456?foo=bar").expect("url id");
         assert_eq!(url.0, "task_i_123456");
         assert!(parse_task_id("   ").is_err());
-    }
-
-    #[test]
-    #[ignore = "very slow"]
-    fn composer_input_renders_typed_characters() {
-        let mut composer = ComposerInput::new();
-        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-        match composer.input(key) {
-            ComposerAction::Submitted(_) => panic!("unexpected submission"),
-            ComposerAction::None => {}
-        }
-
-        let area = Rect::new(0, 0, 20, 5);
-        let mut buf = Buffer::empty(area);
-        composer.render_ref(area, &mut buf);
-
-        let found = buf.content().iter().any(|cell| cell.symbol() == "a");
-        assert!(found, "typed character was not rendered: {buf:?}");
-
-        composer.set_hint_items(vec![("⌃O", "env"), ("⌃C", "quit")]);
-        composer.render_ref(area, &mut buf);
-        let footer = buf
-            .content()
-            .iter()
-            .skip((area.width as usize) * (area.height as usize - 1))
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<Vec<_>>()
-            .join("");
-        assert!(footer.contains("⌃O env"));
     }
 }

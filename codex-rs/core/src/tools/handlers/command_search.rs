@@ -515,12 +515,14 @@ pub(crate) fn classify_rg_search_narrowing_without_native_scope(
 }
 
 fn rg_query_identity(argv: &[String], path_indices: &[usize]) -> String {
-    argv.iter()
+    let arguments = argv.iter()
         .enumerate()
         .filter(|(index, _)| *index != 0 && !path_indices.contains(index))
         .map(|(_, argument)| argument.as_str())
-        .collect::<Vec<_>>()
-        .join("\u{1e}")
+        .collect::<Vec<_>>();
+    // Arguments can contain the control characters used between identities.
+    // JSON preserves argument boundaries and escapes those separators.
+    serde_json::json!(arguments).to_string()
 }
 
 fn path_scope_identity(targets: &[PathBuf]) -> String {

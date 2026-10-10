@@ -464,7 +464,7 @@ fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {
         .map_err(|err| format!("invalid value: {err}"))
 }
 
-fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
+pub(crate) fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
     if path.trim().is_empty() {
         return Err("keyPath must not be empty".to_string());
     }

@@ -361,8 +361,30 @@ mod tests {
             }
             None => panic!("expected a selected command for exact match"),
         }
-    }
 
+        // `/init` has no competing prefix match. A service tier named `mod` is
+        // listed after `/model`, so only exact-match ranking selects it first.
+        let exact = ServiceTierCommand {
+            id: "priority".to_string(),
+            name: "mod".to_string(),
+            description: "exact name match".to_string(),
+        };
+        let mut popup = CommandPopup::new(
+            CommandPopupFlags {
+                service_tier_commands_enabled: true,
+                ..CommandPopupFlags::default()
+            },
+            vec![exact.clone()],
+        );
+        popup.on_composer_text_change("/mod".to_string());
+        assert_eq!(
+            popup.filtered_items(),
+            vec![
+                CommandItem::ServiceTier(exact),
+                CommandItem::Builtin(SlashCommand::Model),
+            ]
+        );
+    }
 
     #[test]
     fn service_tier_command_uses_catalog_name_and_description() {
@@ -499,7 +521,9 @@ mod tests {
     #[test]
     fn equivalent_commands_are_deduped_after_matching() {
         for (filter, equivalents) in [
-            ("/agent", ["agent", "subagents"]),
+            // Not `/agent`: a name-prefix match suppresses the fuzzy `subagents`
+            // match, so only one of the pair would reach the dedupe step.
+            ("/gent", ["agent", "subagents"]),
             ("/it", ["exit", "quit"]),
             ("/ephem", ["side", "btw"]),
         ] {

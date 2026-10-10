@@ -16,12 +16,13 @@ fn root_only_sampling_keeps_unscoped_unavailable_evidence_unknown() {
         serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
     assert!(restored.can_use_root_only_workspace_identity(&items));
     let current = workspace_identity("current");
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     for identity in [None, Some(&current)] {
-        let projected = restored.project_with_workspace_identity(Arc::clone(&items), identity);
-        let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(notice["historical_authenticity"], "authenticated");
-        assert_eq!(notice["valid_for_current_workspace"], false);
+        let notices = freshness_notices(&restored, &items, identity, &cache);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["historical_authenticity"], "authenticated");
+        assert_eq!(notices[0]["workspace_evidence_freshness"], "unknown");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
     }
 
     // Unknown outer provenance cannot hide a nested digest-based requirement.
@@ -66,20 +67,55 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
     root_only.index_identity = None;
     root_only.worktree_identity = None;
     root_only.path_fingerprints = None;
-    assert_eq!(state.project_with_workspace_cache(Arc::clone(&items), Some(&root_only), &cache).items, items);
+    assert!(freshness_notices(&state, &items, Some(&root_only), &cache).is_empty());
     let mut other_root = root_only.clone();
     other_root.repository_root = Some("different-repository".into());
     assert!(!observation.is_current(Some(&other_root), Some(&cache)));
 
     // Restoring a ledger does not restore its original watch ownership.
     let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(freshness_notices(&restored, &items, Some(&revision), &cache).is_empty(),
+        "serialization must preserve proof still owned by the live cache");
     let other_cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let restored_projection = restored.project_with_workspace_cache(Arc::clone(&items), Some(&root_only), &other_cache);
-    assert!(textual_output_identity(&restored_projection.items[1]).unwrap().1.contains("stale_workspace_evidence"));
+    let foreign = freshness_notices(&restored, &items, Some(&root_only), &other_cache);
+    assert_eq!(foreign.len(), 1);
+    assert_eq!(foreign[0]["stale_workspace_evidence"], true);
 
     // A complete outer observation must not hide an unscoped nested result.
     let mut unscoped = observation.clone();
     unscoped.source_path_observations.clear();
+    // Older ledgers can have matching repository digests but no dependency
+    // watches. That is unknown freshness, not evidence of a source change.
+    for include_nested in [false, true] {
+        let mut legacy = state.clone();
+        legacy.workspace_evidence.insert("watched".into(), unscoped.clone());
+        if include_nested {
+            let mut old_nested = unscoped.clone();
+            old_nested.call_id = "legacy-nested".into();
+            let mut current_nested = observation.clone();
+            current_nested.call_id = "watched-nested".into();
+            legacy.code_mode_nested_evidence.insert("watched".into(), BTreeMap::from([
+                ("legacy-nested".into(), NestedWorkspaceEvidence { observation: old_nested, output: "before".into() }),
+                ("watched-nested".into(), NestedWorkspaceEvidence { observation: current_nested, output: "before".into() }),
+            ]));
+        }
+        let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+        let notices = freshness_notices(&restored, &items, Some(&revision), &cache);
+        assert_eq!(notices.len(), 1);
+        let notice = &notices[0];
+        assert_eq!(notice["workspace_evidence_freshness"], "unknown");
+        assert_eq!(notice["historical_authenticity"], "authenticated");
+        assert_eq!(notice["valid_for_current_workspace"], false);
+        if include_nested {
+            let current = notice["current_nested_results"].as_array().unwrap();
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0]["call_id"], "watched-nested");
+            let stale = notice["stale_nested_results"].as_array().unwrap();
+            assert_eq!(stale.len(), 1);
+            assert_eq!(stale[0]["call_id"], "legacy-nested");
+            assert_eq!(stale[0]["source_scope"]["dependencies"][0]["freshness"], "unknown");
+        }
+    }
     state.code_mode_nested_evidence.insert("watched".into(), BTreeMap::from([
         ("nested".into(), NestedWorkspaceEvidence { observation: unscoped.clone(), output: "before".into() }),
     ]));
@@ -107,13 +143,11 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
 
     // Git digests never override a changed or lost dependency watch.
     cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
-    let changed = state.project_with_workspace_cache(Arc::clone(&items), Some(&root_only), &cache);
-    let (_, text) = textual_output_identity(&changed.items[1]).unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap()["workspace_evidence_freshness"], "changed");
+    let changed = freshness_notices(&state, &items, Some(&root_only), &cache);
+    assert_eq!(changed[0]["workspace_evidence_freshness"], "changed");
     cache.note_host_workspace_mutation();
-    let unknown = state.project_with_workspace_cache(items, Some(&root_only), &cache);
-    let (_, text) = textual_output_identity(&unknown.items[1]).unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap()["workspace_evidence_freshness"], "unknown");
+    let unknown = freshness_notices(&state, &items, Some(&root_only), &cache);
+    assert_eq!(unknown[0]["workspace_evidence_freshness"], "unknown");
 }
 
 #[test]
@@ -134,38 +168,20 @@ fn salience_receipt_spends_space_on_all_small_diagnostic_groups() {
 }
 
 #[test]
-fn salience_evidence_budget_uses_sent_receipt_not_retained_payload() {
-    let mut state = ToolHistoryState::default();
-    state.register(candidate("large-source", "x".repeat(320_000)));
-    let generation = ModelGenerationId { turn_id: "turn".into(), ordinal: 1 };
-    // Only this compact representation was actually sent.
-    state.mark_consumed_with_delta(&[text_output("large-source", "x".repeat(8_000))], generation.clone());
-    assert_eq!(state.last_visible_tool_output_tokens, Some(2_000));
-    assert_eq!(state.task_sensitive_tool_result_budget(100_000, 90_000, 8192), 3808);
-    // A later request containing no tool output must not inherit the old cost.
-    state.mark_consumed_with_delta(&[], generation);
-    assert_eq!(state.last_visible_tool_output_tokens, Some(0));
-    assert_eq!(state.task_sensitive_tool_result_budget(100_000, 90_000, 8192), 1808);
-    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-    assert_eq!(restored.last_visible_tool_output_tokens, None);
-    assert_eq!(restored.task_sensitive_tool_result_budget(100_000, 90_000, 8192), 1808);
-}
-
-#[test]
 fn epistemic_unknown_dependency_scope_never_proves_currentness() {
     let revision = workspace_identity("unchanged");
     let output = text_output("unknown", "retained exact historical bytes".into());
     let observation = WorkspaceEvidenceObservation::from_response_item(
         Some(revision.clone()), &output, BTreeSet::new()).unwrap();
-    assert!(!observation.is_current(Some(&revision), None));
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    assert!(!observation.is_current(Some(&revision), Some(&cache)));
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(observation);
-    let projected = state.project_with_workspace_identity(
-        Arc::from([function_call("unknown"), output]), Some(&revision));
-    let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(notice["valid_for_current_workspace"], false);
-    assert_eq!(notice["workspace_evidence_freshness"], "unknown");
+    let items: Arc<[ResponseItem]> = Arc::from([function_call("unknown"), output]);
+    let notices = freshness_notices(&state, &items, Some(&revision), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["valid_for_current_workspace"], false);
+    assert_eq!(notices[0]["workspace_evidence_freshness"], "unknown");
 }
 
 #[tokio::test]
@@ -201,31 +217,6 @@ async fn epistemic_remote_receipts_require_local_claim_authentication() {
         &session, &turn, vec![function_call("auth"), original.clone()], Vec::new(),
         &crate::compact::InitialContextInjection::DoNotInject).await.unwrap();
     assert!(retained.contains(&original));
-}
-
-#[test]
-fn epistemic_search_receipt_binds_identity_order_and_count() {
-    let mut pair = tool_search_pair("identity", 0);
-    let ResponseItem::ToolSearchOutput { tools, .. } = &mut pair[1] else {
-        panic!("expected search output");
-    };
-    tools.push(serde_json::json!({"name":"second-tool"}));
-    let (item, _) = tool_search_receipt_item(&pair[1], None).unwrap();
-    let original = tool_search_receipt(&item).unwrap();
-    assert!(original.is_valid("identity", "completed", "client"));
-    assert_eq!(original.ordered_tool_identities, ["tool-identity", "second-tool"]);
-    let mut reordered = original.clone();
-    reordered.ordered_tool_identities.reverse();
-    assert!(!reordered.is_valid("identity", "completed", "client"));
-    for identities in [vec!["invented.admin".to_string()], Vec::new(),
-        vec!["tool-identity".to_string(), "extra".to_string()]] {
-        let mut changed = original.clone();
-        changed.ordered_tool_identities = identities;
-        assert!(!changed.is_valid("identity", "completed", "client"));
-    }
-    let mut legacy = original;
-    legacy.version = 1;
-    assert!(!legacy.is_valid("identity", "completed", "client"), "legacy identities were not bound");
 }
 
 #[test]
@@ -625,7 +616,7 @@ fn receipt_digest_preserves_decisive_diagnostic_at_any_position() {
             let mut record = candidate("failure", output);
             record.successful = false;
             record.refresh_derived();
-            let receipt: serde_json::Value = serde_json::from_str(record.admission_receipt().unwrap().1).unwrap();
+            let receipt: serde_json::Value = serde_json::from_str(record.render_receipt(false, false).unwrap().1).unwrap();
             assert!(receipt["digest"].as_str().unwrap().contains("decisive counterexample"));
             assert!(record.artifact_pin_value().unwrap()["digest"].as_str().unwrap().contains("decisive counterexample"));
         }
@@ -634,20 +625,6 @@ fn receipt_digest_preserves_decisive_diagnostic_at_any_position() {
         "results":[{"selector":{"kind":"lines","start":1,"end":2},
             "status":"not_found", "message":"decisive selection error"}]}).to_string());
     assert!(record.artifact_pin_value().unwrap()["digest"].as_str().unwrap().contains("decisive selection error"));
-}
-
-#[test]
-fn recovered_detail_preference_ends_after_turn_or_compact_exposure() {
-    let mut state = ToolHistoryState::default();
-    state.recovered_call_ids.insert("page".into());
-    state.mark_consumed(&[text_output("page", "small recovered detail".into())],
-        ModelGenerationId { turn_id:"first".into(), ordinal:1 });
-    assert!(state.reuse_priority("page", 5) < state.reuse_priority("cold", 5));
-    state.mark_consumed(&[text_output("next", "new investigation".into())],
-        ModelGenerationId { turn_id:"second".into(), ordinal:1 });
-    assert_eq!(state.reuse_priority("page", 5), state.reuse_priority("cold", 5));
-    state.exposed_representations.insert("page".into(), ExposedRepresentation::Compact { sha256: "pin".into() });
-    assert_eq!(state.reuse_priority("page", 5), state.reuse_priority("cold", 5));
 }
 
 #[test]
@@ -712,63 +689,6 @@ fn read_status_merges_only_same_snapshot_and_retains_unknown_and_stale_states() 
     assert_eq!(serde_json::to_value(restored).unwrap(), persisted, "read-only query");
 }
 
-#[test]
-fn evidence_budget_reserves_generation_room_without_plan_authority() {
-    let mut state = ToolHistoryState::default();
-    let mut reusable = candidate("reusable", "retained source\n".repeat(100));
-    reusable.consumed_by_generation = Some(ModelGenerationId {
-        turn_id: "previous".into(), ordinal: 1,
-    });
-    state.register(reusable);
-    let baseline = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
-    let pressured = state.task_sensitive_tool_result_budget(100_000, 90_000, 8192);
-    assert!(pressured < baseline, "evidence must leave room for generation");
-    assert!(pressured <= 100_000 - 8192);
-    state.recovered_call_ids.insert("reusable".into());
-    let reusable_budget = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
-    assert!(reusable_budget >= baseline);
-    assert!(reusable_budget <= model_visible_tool_result_token_budget());
-}
-
-#[tokio::test]
-async fn recovered_evidence_budget_is_identical_with_pending_completed_and_absent_plans() {
-    use codex_protocol::plan_tool::PlanItemArg;
-    use codex_protocol::plan_tool::StepStatus;
-    use codex_protocol::plan_tool::UpdatePlanArgs;
-    let (session, _) = crate::session::tests::make_session_and_context().await;
-    let mut state = ToolHistoryState::default();
-    // The recovered detail and its originating artifact are distinct calls.
-    // Recent recovery may prefer the detail, never promote its whole producer.
-    let mut origin = candidate("origin", "canonical source".into());
-    origin.consumed_by_generation = Some(ModelGenerationId { turn_id: "old".into(), ordinal: 1 });
-    state.register(origin);
-    state.consumption_turns.push("old".into());
-    let mut evidence = candidate("recovered", "source ".repeat(20_000));
-    evidence.consumed_by_generation = Some(ModelGenerationId { turn_id: "old".into(), ordinal: 1 });
-    state.register(evidence);
-    let baseline = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
-    state.recovered_call_ids.insert("recovered".into());
-    let expected = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
-    assert!(expected > baseline, "fixture must exercise recovered evidence preference");
-    {
-        let mut owner = session.lock_history_state_for_test().await;
-        owner.history.set_token_info(Some(codex_protocol::protocol::TokenUsageInfo {
-            model_context_window: Some(100_000),
-            total_token_usage: Default::default(),
-            last_token_usage: Default::default(),
-        }));
-        owner.history.set_tool_history_state(state);
-    }
-    for status in [Some(StepStatus::Pending), Some(StepStatus::Completed), None] {
-        session.services.plan_store.restore(status.map(|status| UpdatePlanArgs {
-            explanation: None,
-            plan: vec![PlanItemArg { step: "Investigate".into(), status }],
-        })).await;
-        assert_eq!(session.clone_history().await.tool_history_state()
-            .configured_model_visible_tool_result_token_budget(), Some(expected));
-    }
-}
-
 #[tokio::test]
 async fn journal_writer_reuses_handles_and_replays_after_another_writer() {
     let temp = tempfile::tempdir().unwrap();
@@ -826,7 +746,7 @@ async fn admission_read_only_proof_rejects_shell_writes_and_unknown_commands() {
 /// Deterministic projection/recovery workload, not a model-latency benchmark.
 #[tokio::test]
 #[expect(clippy::print_stderr, reason = "this comparison intentionally reports projection and recovery measurements")]
-async fn long_session_prompt_pressure_comparison() {
+async fn only_checkpointed_evidence_is_pinned_after_restart_and_stays_recoverable() {
     use crate::tools::command_output_artifact::ToolOutputSelector;
 
     let home = tempfile::tempdir().unwrap();
@@ -872,114 +792,9 @@ async fn long_session_prompt_pressure_comparison() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     });
-    let items: Arc<[ResponseItem]> = items.into();
-    let mut reports = Vec::new();
-    for budget in [129_000, 96_000, 75_000, 4_000] {
-        let started = std::time::Instant::now();
-        let mut state = original.clone();
-        state.set_model_visible_tool_result_token_budget(Some(budget));
-        let projection = state.project(Arc::clone(&items));
-        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-        let sampling =
-            state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
-        let tokens = |items: &[ResponseItem]| {
-            items
-                .iter()
-                .filter_map(canonical_textual_output_identity)
-                .map(|(_, text)| approx_token_count(&text))
-                .sum::<usize>()
-        };
-        let mut session_input_tool_tokens = 0;
-        for count in 1..=18 {
-            let mut request = items[..count * 2].to_vec();
-            request.extend_from_slice(&items[36..]);
-            let request = state.project_sampling_with_workspace_cache(request.into(), None, &cache);
-            session_input_tool_tokens += tokens(&request.items);
-        }
-        assert!(
-            projection
-                .items
-                .contains(&text_output("active", active.clone())),
-            "budget={budget}"
-        );
-        let mut compact_receipt_tokens = 0;
-        let mut recovery_calls = 0;
-        for item in projection.items.iter() {
-            let Some((id, text)) = canonical_textual_output_identity(item) else {
-                continue;
-            };
-            if id == "active" || text == source {
-                continue;
-            }
-            compact_receipt_tokens += approx_token_count(&text);
-        }
-        // Revisit a fixed working set, recovering omitted evidence from the
-        // artifact owner instead of executing any producer again.
-        for index in 1..18 {
-            let id = format!("completed-{index}");
-            if projection.items.contains(&text_output(&id, source.clone())) {
-                continue;
-            }
-            let artifact = &state.candidates[&id].artifact_id;
-            let (recovered, _) = crate::tools::handlers::execute_recovery_transaction(
-                home.path(),
-                "pressure",
-                artifact,
-                vec![ToolOutputSelector::Lines { start: 1, end: 2 }],
-                false,
-            )
-            .await
-            .unwrap();
-            recovery_calls += 1;
-            assert!(recovered.complete);
-            assert_eq!(
-                recovered.results[0]
-                    .text
-                    .as_deref()
-                    .unwrap()
-                    .lines()
-                    .collect::<Vec<_>>(),
-                source.lines().take(2).collect::<Vec<_>>()
-            );
-        }
-        assert!(tokens(&projection.items) <= budget);
-        let report = serde_json::json!({
-            "budget": budget,
-            "model_input_tool_tokens": tokens(&sampling.items),
-            "session_input_tool_tokens": session_input_tool_tokens,
-            "compaction_input_tool_tokens": tokens(&projection.items),
-            "compact_receipt_tokens": compact_receipt_tokens,
-            "read_tool_output_recovery_calls": recovery_calls,
-            "producer_results": original.candidates.len() - 1,
-            "completion_ms": started.elapsed().as_secs_f64() * 1000.0,
-        });
-        eprintln!("tool-history-pressure {report}");
-        reports.push(report);
-    }
-    assert!(
-        reports[3]["read_tool_output_recovery_calls"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
-    // Ordinary sampling preserves evidence until explicit checkpointing;
-    // changing the compaction working set alone is not a sampling speedup.
-    assert_eq!(
-        reports[0]["model_input_tool_tokens"],
-        reports[2]["model_input_tool_tokens"]
-    );
-    assert!(
-        reports[0]["read_tool_output_recovery_calls"]
-            .as_u64()
-            .unwrap()
-            <= reports[2]["read_tool_output_recovery_calls"]
-                .as_u64()
-                .unwrap()
-    );
-
-    // The next task uses the real sampling owner, including restart recovery.
-    // A final answer plus review-to-fix continuation is not a checkpoint. The
-    // same evidence stays directly usable without manufactured recovery calls.
+    // Sampling after a restart: a final answer plus review-to-fix continuation
+    // is not a checkpoint. The same evidence stays directly usable without
+    // manufactured recovery calls.
     persist_tool_history_state(home.path(), "pressure", &original).await.unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), "pressure").await);
     let mut history = crate::context_manager::ContextManager::new();
@@ -1038,23 +853,6 @@ async fn long_session_prompt_pressure_comparison() {
 }
 
 #[test]
-fn task_sensitive_budget_reserves_unread_evidence_and_releases_it_after_consumption() {
-    let mut state = ToolHistoryState::default();
-    let evidence = candidate("active-budget", bounded_output().repeat(2));
-    state.register(evidence.clone());
-    let mut history = crate::context_manager::ContextManager::new();
-    history.update_token_info(&codex_protocol::protocol::TokenUsage::default(), Some(40_000));
-    history.set_tool_history_state(state);
-    let budget = history.tool_history_state().configured_model_visible_tool_result_token_budget().unwrap();
-    assert!(budget > 20_000 && budget <= 30_000, "{budget}");
-    history.mark_tool_history_consumed_with_delta(
-        &[text_output("active-budget", evidence.bounded_model_output)],
-        ModelGenerationId { turn_id: "task".into(), ordinal: 0 },
-    );
-    assert_eq!(history.tool_history_state().configured_model_visible_tool_result_token_budget(), Some(20_000));
-}
-
-#[test]
 fn checkpoint_does_not_grant_contract_provenance_to_printed_text() {
     let mut state = ToolHistoryState::default();
     for id in ["ordinary", "lookup", "source-marker", "unread-schema"] {
@@ -1086,30 +884,6 @@ fn checkpoint_does_not_grant_contract_provenance_to_printed_text() {
 }
 
 #[test]
-fn consumed_failure_keeps_receipt_without_displacing_corrected_evidence() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(3_000);
-    let mut state = ToolHistoryState::default();
-    let mut failed = candidate("bad-selector", "invalid selector diagnostic\n".repeat(4_000));
-    failed.successful = false;
-    failed.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
-    let artifact = failed.artifact_id.clone();
-    let old = failed.bounded_model_output.clone();
-    state.register(failed);
-    let current = "required corrected selection\n".repeat(300);
-    state.register(candidate("correct-selector", current.clone()));
-    let projected = state.project(Arc::from([
-        function_call("bad-selector"), text_output("bad-selector", old),
-        function_call("correct-selector"), text_output("correct-selector", current.clone()),
-    ]));
-    let outputs = projected.items.iter().filter_map(textual_output_identity).collect::<BTreeMap<_, _>>();
-    assert_eq!(outputs["correct-selector"], current);
-    let receipt: serde_json::Value = serde_json::from_str(outputs["bad-selector"]).unwrap();
-    assert_eq!(receipt["artifact_id"], artifact);
-    assert_eq!(receipt["successful"], false);
-    assert!(state.failure_resolution(&state.candidates["bad-selector"], &FailureResolutionIndex::default()).is_none());
-}
-
-#[test]
 fn phase_checkpoint_leaves_tiny_results_inline() {
     let mut state = ToolHistoryState::default();
     for text in ["ok".to_string(), "x".repeat(900), " ".repeat(2_000)] {
@@ -1119,10 +893,8 @@ fn phase_checkpoint_leaves_tiny_results_inline() {
             ordinal: 0,
         });
         state.register(tiny);
-        assert_eq!(
-            state.phase_checkpoint_receipts(&["tiny".into()]).unwrap(),
-            serde_json::json!({})
-        );
+        // The projection compacts a checkpointed result only when it has a pin.
+        assert!(state.candidates["tiny"].checkpoint_pin().is_none());
     }
 }
 
@@ -1167,11 +939,11 @@ fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
         text_output("active", source.clone()),
         checkpoint.clone(),
     ]);
-    let projection = state.project_inner(Arc::clone(&items), None, None);
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let projection = state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
     let before: Arc<[ResponseItem]> = Arc::from(items[..items.len() - 1].to_vec());
     let anchor = SamplingProjectionAnchor {
-        projection: state.project_inner(Arc::clone(&before), None, None),
+        projection: state.project_sampling_with_workspace_cache(Arc::clone(&before), None, &cache),
         prepared_items: before,
     };
     assert!(
@@ -1313,22 +1085,37 @@ fn verified_evidence_uncertainty_only_lineage_downgrades_both_reference_sets() {
     }
 }
 
-#[test]
-fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_history() {
+#[tokio::test]
+async fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_history() {
+    // A live cache proves freshness through dependency watches, never through
+    // matching repository digests alone.
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.rs");
+    std::fs::write(&source, "before").unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let captured = workspace_identity("captured");
-    let changed = workspace_identity("changed");
-    let later = workspace_identity("later-unrelated-edit");
+    let identity = |label: &str| {
+        let mut identity = workspace_identity(label);
+        identity.repository_root = Some(root.path().to_string_lossy().into_owned());
+        identity
+    };
+    let captured = identity("captured");
+    let changed = identity("changed");
+    let later = identity("later-unrelated-edit");
     let output = text_output("read-old", "original source evidence".into());
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call("read-old"), output.clone()]);
     let mut state = ToolHistoryState::default();
+    let watch = cache
+        .begin_source_path_change_observation(root.path(), &source, false)
+        .await
+        .unwrap();
     state.register_workspace_evidence(
         WorkspaceEvidenceObservation::from_response_item(
             Some(captured.clone()),
             &output,
-            BTreeSet::from([SourceDependencyV1::new(std::path::Path::new("source.rs"), false)]),
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
         )
-        .unwrap(),
+        .unwrap()
+        .with_source_path_observations(vec![watch]),
     );
     let initial = state.project_sampling_with_workspace_cache(
         Arc::clone(&canonical),
@@ -1340,6 +1127,7 @@ fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_histo
         prepared_items: Arc::clone(&canonical),
         projection: initial.clone(),
     };
+    cache.note_host_workspace_mutation();
     let invalidated = state
         .project_continuation_with_workspace_cache(
             &anchor,
@@ -1384,13 +1172,18 @@ fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_histo
     );
 
     let new_output = text_output("read-new", "current source evidence".into());
+    let watch = cache
+        .begin_source_path_change_observation(root.path(), &source, false)
+        .await
+        .unwrap();
     state.register_workspace_evidence(
         WorkspaceEvidenceObservation::from_response_item(
             Some(later.clone()),
             &new_output,
-            BTreeSet::from([SourceDependencyV1::new(std::path::Path::new("source.rs"), false)]),
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
         )
-        .unwrap(),
+        .unwrap()
+        .with_source_path_observations(vec![watch]),
     );
     let mut extended = canonical.to_vec();
     extended.extend([function_call("read-new"), new_output.clone()]);
@@ -1582,16 +1375,17 @@ fn stale_receipt_keeps_a_bounded_historical_digest() {
 }
 
 #[test]
-fn stale_workspace_projection_keeps_only_authenticated_historical_text() {
+fn stale_workspace_notice_authenticates_only_recorded_matching_output() {
     let call_id = "historical-evidence";
     let captured = workspace_identity("captured");
     let changed = workspace_identity("changed");
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let original = "old finding: ".repeat(2000);
     let output = text_output(call_id, original.clone());
-    for (record_observation, visible_output, expect_digest) in [
-        (true, original.clone(), true),
-        (false, original, false),
-        (true, "tampered output".to_string(), false),
+    for (record_observation, visible_output, authenticity) in [
+        (true, original.clone(), "authenticated"),
+        (false, original, "unverified"),
+        (true, "tampered output".to_string(), "unverified"),
     ] {
         let mut state = ToolHistoryState::default();
         if record_observation {
@@ -1604,28 +1398,27 @@ fn stale_workspace_projection_keeps_only_authenticated_historical_text() {
                 .unwrap(),
             );
         }
-        let projection = state.project_with_workspace_identity(
-            Arc::from([function_call(call_id), text_output(call_id, visible_output)]),
-            Some(&changed),
-        );
-        let (_, text) = textual_output_identity(&projection.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+        let items: Arc<[ResponseItem]> =
+            Arc::from([function_call(call_id), text_output(call_id, visible_output)]);
+        let notices = freshness_notices(&state, &items, Some(&changed), &cache);
+        assert_eq!(notices.len(), 1);
+        let notice = &notices[0];
         assert_eq!(notice["valid_for_current_workspace"], false);
         assert_eq!(notice["stale_workspace_evidence"], true);
-        assert_eq!(notice.get("historical_digest").is_some(), expect_digest);
-        if expect_digest {
-            let digest = notice["historical_digest"].as_str().unwrap();
-            assert!(digest.contains("old finding:"));
-            assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
-        }
+        assert_eq!(notice["historical_authenticity"], authenticity);
+        // The bytes stay in their tool message; the notice never repeats them.
+        let rendered = notice.to_string();
+        assert!(!rendered.contains("old finding:") && !rendered.contains("tampered output"));
     }
 }
 
-#[test]
-fn read_file_workspace_evidence_tracks_paths_and_preserves_skill_reads() {
+#[tokio::test]
+async fn read_file_workspace_evidence_tracks_paths_and_preserves_skill_reads() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     let file = cwd.join("a file.txt");
+    std::fs::write(&file, "old file text").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let arguments = serde_json::json!({"path": "a file.txt", "selectors": [{"kind": "lines", "start": 1, "end": 1}]});
     let payload = ToolPayload::Function {
         arguments: arguments.to_string(),
@@ -1639,42 +1432,39 @@ fn read_file_workspace_evidence_tracks_paths_and_preserves_skill_reads() {
     let call_id = "file-read";
     let output = text_output(call_id, "old file text".to_string());
     let canonical: Arc<[ResponseItem]> = Arc::from([
-        named_function_call_with_arguments(call_id, "read_file", arguments),
+        named_function_call_with_arguments(call_id, "read_file", arguments.clone()),
         output.clone(),
     ]);
-    let captured = workspace_identity("captured");
+    let captured = workspace_identity_at(cwd, "captured");
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(captured.clone()),
-            &output,
-            classification.source_dependencies,
+        watched(
+            &cache,
+            cwd,
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()),
+                &output,
+                classification.source_dependencies,
+            )
+            .unwrap(),
         )
-        .unwrap(),
+        .await,
     );
-    assert_eq!(
-        state
-            .project_with_workspace_identity(Arc::clone(&canonical), Some(&captured))
-            .items,
-        canonical
-    );
+    assert!(freshness_notices(&state, &canonical, Some(&captured), &cache).is_empty());
     state.invalidate_source_dependencies(
         Some(&BTreeSet::from([cwd.join("other.txt")])),
         Some(&captured),
     );
-    assert_eq!(
-        state
-            .project_with_workspace_identity(Arc::clone(&canonical), Some(&captured))
-            .items,
-        canonical
-    );
+    assert!(freshness_notices(&state, &canonical, Some(&captured), &cache).is_empty());
     state.invalidate_source_dependencies(Some(&BTreeSet::from([file.clone()])), Some(&captured));
-    let stale = state.project_with_workspace_identity(canonical, Some(&captured));
-    let (_, text) = textual_output_identity(&stale.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
-    assert_eq!(notice["rerun"]["tool"], "read_file");
-    assert!(notice["rerun"].get("force_fresh").is_none());
+    let notices = freshness_notices(&state, &canonical, Some(&captured), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
+    // The recipe is exactly the original read: no recovery-only arguments.
+    assert_eq!(
+        notices[0]["rerun"],
+        serde_json::json!({"tool": "read_file", "arguments": arguments})
+    );
 
     let uri = codex_utils_path_uri::PathUri::from_host_native_path(&file).unwrap();
     let uri_payload = ToolPayload::Function {
@@ -1700,14 +1490,14 @@ fn read_file_workspace_evidence_tracks_paths_and_preserves_skill_reads() {
         named_function_call_with_arguments("skill-read", "read_file", skill_args),
         text_output("skill-read", "skill instructions".to_string()),
     ]);
-    assert_eq!(
-        state
-            .project_with_workspace_identity(
-                Arc::clone(&skill_history),
-                Some(&workspace_identity("changed"))
-            )
-            .items,
-        skill_history
+    assert!(
+        freshness_notices(
+            &state,
+            &skill_history,
+            Some(&workspace_identity("changed")),
+            &cache
+        )
+        .is_empty()
     );
 }
 
@@ -1746,12 +1536,15 @@ fn identity_projection_reuses_shared_response_items() {
         internal_chat_message_metadata_passthrough: None,
     }]);
 
-    let projection =
-        ToolHistoryState::default().project_with_workspace_identity(Arc::clone(&canonical), None);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let projection = ToolHistoryState::default().project_sampling_with_workspace_cache(
+        Arc::clone(&canonical),
+        None,
+        &cache,
+    );
 
     assert!(Arc::ptr_eq(&projection.items, &canonical));
     assert!(Arc::ptr_eq(&projection.unreplaced_items, &canonical));
-    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let anchor = SamplingProjectionAnchor {
         prepared_items: Arc::clone(&canonical),
         projection,
@@ -1766,46 +1559,6 @@ fn identity_projection_reuses_shared_response_items() {
     ));
 }
 
-#[test]
-fn projection_retain_visits_each_item_once_in_order() {
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        text_output("first", "one".to_string()),
-        text_output("second", "two".to_string()),
-        text_output("third", "three".to_string()),
-        text_output("fourth", "four".to_string()),
-    ]);
-    for (retain, expected) in [
-        ([true, false, true, false], vec!["first", "third"]),
-        ([false, true, true, true], vec!["second", "third", "fourth"]),
-        ([true; 4], vec!["first", "second", "third", "fourth"]),
-        ([false; 4], vec![]),
-    ] {
-        for mut items in [
-            ProjectedResponseItems::Shared(Arc::clone(&canonical)),
-            ProjectedResponseItems::Owned(canonical.to_vec()),
-        ] {
-            let was_shared = matches!(items, ProjectedResponseItems::Shared(_));
-            let mut visited = Vec::new();
-            items.retain(|item| {
-                visited.push(item_call_id(item).unwrap().to_string());
-                retain[visited.len() - 1]
-            });
-
-            assert_eq!(visited, ["first", "second", "third", "fourth"]);
-            let items = items.into_shared();
-            assert_eq!(
-                items
-                    .iter()
-                    .map(|item| item_call_id(item).unwrap())
-                    .collect::<Vec<_>>(),
-                expected
-            );
-            if was_shared && retain == [true; 4] {
-                assert!(Arc::ptr_eq(&items, &canonical));
-            }
-        }
-    }
-}
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
@@ -1903,31 +1656,6 @@ fn live_host_test_tool_observes_workspace() {
     assert!(!tool_observes_workspace("functions.exec"));
 }
 
-fn tool_search_pair(call_id: &str, description_bytes: usize) -> [ResponseItem; 2] {
-    [
-        ResponseItem::ToolSearchCall {
-            id: None,
-            call_id: Some(call_id.to_string()),
-            status: Some("completed".to_string()),
-            execution: "client".to_string(),
-            arguments: serde_json::json!({"query": "example"}),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::ToolSearchOutput {
-            id: None,
-            call_id: Some(call_id.to_string()),
-            status: "completed".to_string(),
-            execution: "client".to_string(),
-            tools: vec![serde_json::json!({
-                "name": format!("tool-{call_id}"),
-                "description": "x".repeat(description_bytes),
-            })],
-            omitted_result_count: Some(0),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ]
-}
-
 fn workspace_identity(label: &str) -> WorkspaceEvidenceIdentity {
     WorkspaceEvidenceIdentity {
         unavailable: false,
@@ -1937,6 +1665,69 @@ fn workspace_identity(label: &str) -> WorkspaceEvidenceIdentity {
         worktree_identity: Some(format!("worktree-{label}")),
         path_fingerprints: None,
     }
+}
+
+/// `label`'s digests in the repository at `root`. A live cache compares
+/// repository roots and dependency watches, never the digests.
+fn workspace_identity_at(root: &Path, label: &str) -> WorkspaceEvidenceIdentity {
+    WorkspaceEvidenceIdentity {
+        repository_root: Some(root.to_string_lossy().into_owned()),
+        ..workspace_identity(label)
+    }
+}
+
+/// Attach a live watch to every dependency, as the runtime does when it
+/// records a scoped read.
+async fn watched(
+    cache: &GitWorkspaceCache,
+    root: &Path,
+    observation: WorkspaceEvidenceObservation,
+) -> WorkspaceEvidenceObservation {
+    let paths = observation
+        .source_dependencies
+        .iter()
+        .map(|dependency| (PathBuf::from(&dependency.path), dependency.recursive))
+        .collect::<Vec<_>>();
+    let watches = cache
+        .begin_source_path_change_observations(root, &paths)
+        .await
+        .expect("source watches");
+    observation.with_source_path_observations(watches)
+}
+
+/// The verdicts the runtime freshness projection appends for `items`, one per
+/// invalidated call. It never rewrites history that was already delivered.
+pub(crate) fn freshness_notices(
+    state: &ToolHistoryState,
+    items: &Arc<[ResponseItem]>,
+    identity: Option<&WorkspaceEvidenceIdentity>,
+    cache: &GitWorkspaceCache,
+) -> Vec<serde_json::Value> {
+    let projected = state
+        .project_workspace_freshness_with_cache(Arc::clone(items), identity, cache)
+        .items;
+    assert!(
+        projected.starts_with(items),
+        "freshness must not rewrite delivered history"
+    );
+    projected[items.len()..]
+        .iter()
+        .flat_map(|item| {
+            let ResponseItem::Message { role, content, .. } = item else {
+                panic!("freshness appends only messages: {item:?}")
+            };
+            assert_eq!(role, "developer");
+            let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice()
+            else {
+                panic!("one text notice: {content:?}")
+            };
+            let batch = text
+                .lines()
+                .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .expect("notice JSON");
+            expand_workspace_notices(batch)
+        })
+        .collect()
 }
 
 #[test]
@@ -1974,47 +1765,62 @@ fn workspace_evidence_captured_across_unobserved_revision_change_is_stale() {
         .expect("raced workspace observation"),
     );
 
-    let projection = state.project_with_workspace_identity(canonical, Some(&captured));
-    let (_, stale_output) = textual_output_identity(&projection.items[1]).expect("stale output");
-    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
-    assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
-    assert_eq!(notice["valid_for_current_workspace"], false);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let notices = freshness_notices(&state, &canonical, Some(&captured), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
+    assert_eq!(notices[0]["valid_for_current_workspace"], false);
 }
 
-#[test]
-fn later_duplicate_registration_cannot_revive_invalidated_workspace_evidence() {
+#[tokio::test]
+async fn later_duplicate_registration_cannot_revive_invalidated_workspace_evidence() {
     let call_id = "raced-call";
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.rs");
+    std::fs::write(&source, "old file contents").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let output = text_output(call_id, "old file contents".to_string());
-    let captured = workspace_identity("captured");
-    let changed = workspace_identity("changed");
-    let dependencies = BTreeSet::from([SourceDependencyV1::new(Path::new("/repo/source.rs"), false)]);
+    let captured = workspace_identity_at(root.path(), "captured");
+    let changed = workspace_identity_at(root.path(), "changed");
+    let dependencies = BTreeSet::from([SourceDependencyV1::new(&source, false)]);
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(Some(captured.clone()), &output, dependencies.clone())
-            .expect("initial workspace observation"),
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(Some(captured.clone()), &output, dependencies.clone())
+                .expect("initial workspace observation"),
+        )
+        .await,
     );
-    assert_eq!(state.project_with_workspace_identity(Arc::clone(&canonical), Some(&captured)).items, canonical);
+    assert!(freshness_notices(&state, &canonical, Some(&captured), &cache).is_empty());
     assert!(state.invalidate_source_dependencies(None, None));
 
+    // The duplicate carries a fresh, current watch; it still must not revive
+    // evidence that a mutation already invalidated.
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(changed.clone()),
-            &output,
-            dependencies,
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(changed.clone()),
+                &output,
+                dependencies,
+            )
+            .expect("later duplicate observation"),
         )
-        .expect("later duplicate observation"),
+        .await,
     );
 
-    let projection = state.project_with_workspace_identity(canonical, Some(&changed));
-    let (_, stale_output) = textual_output_identity(&projection.items[1]).expect("stale output");
-    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
-    assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
-    assert_eq!(notice["observed_revision"], serde_json::to_value(captured).unwrap());
+    let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
+    assert_eq!(notices[0]["observed_revision"], serde_json::to_value(captured).unwrap());
 }
 
 #[test]
-fn workspace_evidence_remains_visible_only_for_its_captured_revision() {
+fn unwatched_evidence_notice_reports_the_observed_revision_and_how_to_treat_it() {
     let call_id = "call-1";
     let output = text_output(call_id, "git status output".to_string());
     let captured = workspace_identity("captured");
@@ -2029,40 +1835,43 @@ fn workspace_evidence_remains_visible_only_for_its_captured_revision() {
         )
         .expect("text evidence observation"),
     );
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
 
-    let current = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&captured));
-    assert_eq!(current.items, canonical);
+    // Matching digests without a dependency watch are unknown, not current.
+    let unverified = freshness_notices(&state, &canonical, Some(&captured), &cache);
+    assert_eq!(unverified.len(), 1);
+    assert_eq!(unverified[0]["reason_code"], "workspace_freshness_unverified");
 
-    let stale = state.project_with_workspace_identity(canonical, Some(&changed));
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+    let stale = state.project_workspace_freshness_with_cache(
+        Arc::clone(&canonical),
+        Some(&changed),
+        &cache,
+    );
     assert_eq!(stale.unreplaced_items, stale.items);
-    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
+    let ResponseItem::Message { content, .. } = stale.items.last().unwrap() else {
+        panic!("invalidation message")
+    };
+    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("one text notice: {content:?}")
+    };
+    assert!(text.contains("This is not a request to rerun tests or builds."));
+    assert!(text.contains("Revalidate only when current proof is essential"));
+    assert!(text.contains("otherwise report the affected claim as unverified"));
+
+    let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert_eq!(notice["stale_workspace_evidence"], true);
     assert_eq!(notice["reason_code"], "workspace_identity_changed");
     assert_eq!(notice["valid_for_current_workspace"], false);
-    let instruction = notice["rerun"]["instruction"].as_str().unwrap();
-    assert!(instruction.contains("This notice is not a request to rerun tests or builds."));
-    assert!(instruction.contains("Revalidate only if current evidence is essential to the task"));
-    assert!(instruction.contains("otherwise report the affected claim as unverified"));
     assert_eq!(
         notice["observed_revision"],
         serde_json::to_value(&captured).unwrap()
     );
-    assert_eq!(
-        notice["current_revision"],
-        serde_json::to_value(&changed).unwrap()
-    );
-    assert!(notice["rerun"].get("force_fresh").is_none());
-    assert!(
-        notice["rerun"]["instruction"]
-            .as_str()
-            .unwrap()
-            .contains("supported arguments")
-    );
-    assert_eq!(
-        notice["if_rerun_unavailable"],
-        "Report the affected claim as unverified; this result does not validate the current workspace."
-    );
+    // The shared guidance lives once in the message, not in every notice.
+    assert!(notice["rerun"].get("instruction").is_none());
+    assert!(notice.get("if_rerun_unavailable").is_none());
+    assert!(notice.get("current_revision").is_none());
 }
 
 #[test]
@@ -2077,31 +1886,35 @@ fn workspace_projection_memoizes_verdicts_without_crossing_mutations_or_snapshot
         BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured"), true)]),
     ).unwrap());
     let original = state.clone();
-    let project = |state: &ToolHistoryState, identity: &WorkspaceEvidenceIdentity| {
-        state.project_with_workspace_identity(Arc::clone(&items), Some(identity)).items
+    // Verdicts are memoized only for unwatched evidence, which a live cache
+    // never reports as current; the reason code tells the verdicts apart.
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let reason = |state: &ToolHistoryState, identity: &WorkspaceEvidenceIdentity| {
+        let notices = freshness_notices(state, &items, Some(identity), &cache);
+        assert_eq!(notices.len(), 1);
+        notices[0]["reason_code"].clone()
     };
     let hits = |state: &ToolHistoryState| {
         state.workspace_projection_cache.lock().unwrap()["cached"].hits
     };
-    assert_eq!(project(&state, &captured), items);
-    assert_eq!(project(&state, &captured), items);
+    assert_eq!(reason(&state, &captured), "workspace_freshness_unverified");
+    assert_eq!(reason(&state, &captured), "workspace_freshness_unverified");
     assert_eq!(hits(&state), 1);
-    let stale = project(&state, &changed);
-    assert_ne!(stale, items);
+    assert_eq!(reason(&state, &changed), "workspace_identity_changed");
     assert_eq!(hits(&state), 0);
-    assert_eq!(project(&state.clone(), &changed), stale);
+    assert_eq!(reason(&state.clone(), &changed), "workspace_identity_changed");
     assert_eq!(hits(&state), 1);
     assert!(state.invalidate_source_dependencies(None, Some(&captured)));
-    assert_ne!(project(&state, &captured), items);
+    assert_eq!(reason(&state, &captured), "source_dependencies_invalidated");
     assert_eq!(hits(&state), 0);
-    assert_eq!(project(&original, &captured), items);
+    assert_eq!(reason(&original, &captured), "workspace_freshness_unverified");
     assert_eq!(hits(&state), 0);
     let encoded = serde_json::to_value(&state).unwrap();
     assert!(encoded.get("workspace_projection_cache").is_none());
     let restored: ToolHistoryState = serde_json::from_value(encoded).unwrap();
     assert!(restored.workspace_projection_cache.lock().unwrap().is_empty());
-    assert_ne!(project(&restored, &captured), items);
-    state.project_with_workspace_identity(Arc::from([]), Some(&captured));
+    assert_eq!(reason(&restored, &captured), "source_dependencies_invalidated");
+    state.project_workspace_freshness_with_cache(Arc::from([]), Some(&captured), &cache);
     assert!(state.workspace_projection_cache.lock().unwrap().is_empty());
 }
 
@@ -2119,25 +1932,29 @@ fn workspace_projection_cache_rechecks_output_and_read_arguments() {
         *name = "read_file".into();
         *arguments = r#"{"path":"before.rs"}"#.into();
     }
-    let first = state.project_with_workspace_identity(
-        Arc::from([call.clone(), output.clone()]), Some(&identity),
-    );
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let notice = |call: &ResponseItem, output: ResponseItem| {
+        let items: Arc<[ResponseItem]> = Arc::from([call.clone(), output]);
+        let mut notices = freshness_notices(&state, &items, Some(&identity), &cache);
+        assert_eq!(notices.len(), 1);
+        notices.remove(0)
+    };
+    let first = notice(&call, output.clone());
+    assert_eq!(first["rerun"]["arguments"]["path"], "before.rs");
+    assert_eq!(first["historical_authenticity"], "authenticated");
     if let ResponseItem::FunctionCall { arguments, .. } = &mut call {
         *arguments = r#"{"path":"after.rs"}"#.into();
     }
-    let second = state.project_with_workspace_identity(
-        Arc::from([call.clone(), output]), Some(&identity),
-    );
-    assert_ne!(first.items[1], second.items[1]);
-    let tampered = state.project_with_workspace_identity(
-        Arc::from([call, text_output("read", "unverified replacement".into())]), Some(&identity),
-    );
-    let (_, text) = textual_output_identity(&tampered.items[1]).unwrap();
-    assert!(!text.contains("historical_digest"));
+    let second = notice(&call, output);
+    assert_eq!(second["rerun"]["arguments"]["path"], "after.rs");
+    let tampered = notice(&call, text_output("read", "unverified replacement".into()));
+    assert_eq!(tampered["historical_authenticity"], "unverified");
 }
 
 #[test]
-fn sampling_freshness_omits_duplicate_payloads_without_poisoning_replacement_cache() {
+fn sampling_freshness_notice_never_copies_tool_output() {
+    // Verdicts are memoized only for unwatched evidence, which a live cache
+    // never reports as current; the second pass is served from that memo.
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let before = workspace_identity("before");
     let after = workspace_identity("after");
@@ -2166,104 +1983,78 @@ fn sampling_freshness_omits_duplicate_payloads_without_poisoning_replacement_cac
             parent_call_id: "parent".into(), call_id: "nested".into(), output: nested_text.into(),
         }.apply(&mut state));
 
-        let full = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
-        let (_, text) = textual_output_identity(&full.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(notice["historical_output"], payload);
-        assert_eq!(notice["current_nested_results"][0]["output"], nested_text);
-        assert_eq!(notice["nested_commands"][0]["session_id"], 7);
-        assert_eq!(notice["current_revision"], serde_json::to_value(&after).unwrap());
-        assert!(notice.get("historical_digest").is_some());
-
-        // Reuse the same cache across both representations in both directions.
         // Sampling must keep bytes in the original tool message, not its notice.
-        for _ in 0..2 {
+        for pass in 0..2 {
             let sampled = state.project_sampling_with_workspace_cache(
                 Arc::clone(&canonical), Some(&after), &cache,
             );
             assert!(sampled.items.starts_with(&canonical));
             assert_eq!(sampled.items.len(), canonical.len() + 1);
-            let compact = {
+            // Each pass projects twice; only the very first projection computes.
+            assert_eq!(state.workspace_projection_cache.lock().unwrap()["parent"].hits, pass * 2);
+            let memoized = {
                 let cached = state.workspace_projection_cache.lock().unwrap();
-                serde_json::from_str::<serde_json::Value>(
-                    cached["parent"].replacement.as_ref().unwrap(),
-                ).unwrap()
+                cached["parent"].replacement.clone().unwrap()
             };
-            for field in ["historical_output", "historical_digest", "current_revision", "nested_commands"] {
-                assert!(compact.get(field).is_none(), "sampling must not construct {field}");
+            let ResponseItem::Message { content, .. } = sampled.items.last().unwrap() else {
+                panic!("invalidation message")
+            };
+            let delivered = serde_json::to_string(content).unwrap();
+            for rendered in [&memoized, &delivered] {
+                for copied in ["permission denied", "current nested source", "session_id"] {
+                    assert!(!rendered.contains(copied), "{copied} was copied: {rendered}");
+                }
             }
-            let mut expected_compact = notice.clone();
-            for field in ["historical_output", "historical_digest", "current_revision", "nested_commands"] {
-                expected_compact.as_object_mut().unwrap().remove(field);
-            }
-            for nested in expected_compact["current_nested_results"].as_array_mut().unwrap() {
-                nested.as_object_mut().unwrap().remove("output");
-            }
-            assert_eq!(compact, expected_compact,
-                "only fields already discarded by the sampling consumer may differ");
-            assert_eq!(compact["valid_for_current_workspace"], false);
-            assert_eq!(compact["historical_authenticity"], "authenticated");
-            assert_eq!(compact["current_nested_results"][0]["call_id"], "nested");
-            assert_eq!(compact["current_nested_results"][0]["workspace_evidence_freshness"], "current");
-            assert!(compact["current_nested_results"][0].get("output").is_none());
+            let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
+            assert_eq!(notices.len(), 1);
+            let notice = &notices[0];
+            assert_eq!(notice["valid_for_current_workspace"], false);
+            assert_eq!(notice["historical_authenticity"], "authenticated");
+            // Matching digests without a dependency watch are unknown, not current.
+            assert_eq!(notice["stale_nested_results"][0]["call_id"], "nested");
+            assert_eq!(
+                notice["stale_nested_results"][0]["source_scope"]["dependencies"][0]["freshness"],
+                "unknown"
+            );
             if name == "functions.exec" {
-                assert!(compact.get("failure_applicability").is_some());
+                assert!(notice.get("failure_applicability").is_some());
             }
-            let restored = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
-            assert_eq!(restored.items, full.items,
-                "sampling's smaller cache entry must not erase replacement/recovery payloads");
         }
     }
 }
 
-#[test]
-fn workspace_evidence_is_stale_in_a_different_repository() {
+#[tokio::test]
+async fn workspace_evidence_is_stale_in_a_different_repository() {
     let call_id = "call-1";
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.rs");
+    std::fs::write(&source, "source").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let output = text_output(call_id, "git status output".to_string());
-    let captured = workspace_identity("captured");
+    let captured = workspace_identity_at(root.path(), "captured");
     let mut different_repository = captured.clone();
     different_repository.repository_root = Some("/other-repository".to_string());
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(captured.clone()), &output,
-            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured/source.rs"), false)]),
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()), &output,
+                BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+            )
+            .expect("text evidence observation"),
         )
-        .expect("text evidence observation"),
+        .await,
     );
-    assert_eq!(state.project_with_workspace_identity(Arc::clone(&canonical), Some(&captured)).items, canonical);
+    assert!(freshness_notices(&state, &canonical, Some(&captured), &cache).is_empty());
 
-    let stale = state.project_with_workspace_identity(canonical, Some(&different_repository));
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
-    assert_eq!(notice["reason_code"], "workspace_identity_changed");
-    assert_eq!(notice["valid_for_current_workspace"], false);
-}
-
-#[test]
-fn completed_command_evidence_uses_the_post_execution_revision() {
-    let call_id = "mutating-call";
-    let output = text_output(call_id, "mutation completed".to_string());
-    let before = workspace_identity("before");
-    let after = workspace_identity("after");
-    let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
-    let mut state = ToolHistoryState::default();
-    state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(after.clone()),
-            &output,
-            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-after"), true)]),
-        )
-        .expect("post-execution observation"),
-    );
-
-    let current = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
-    assert_eq!(current.items, canonical);
-
-    let stale = state.project_with_workspace_identity(canonical, Some(&before));
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+    // The watch is still current; only the repository the request runs in differs.
+    let notices = freshness_notices(&state, &canonical, Some(&different_repository), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["reason_code"], "workspace_identity_changed");
+    assert_eq!(notices[0]["valid_for_current_workspace"], false);
 }
 
 #[test]
@@ -2277,6 +2068,7 @@ fn workspace_freshness_notice_distinguishes_unknown_from_changed_identity() {
     };
     let output = text_output(call_id, "source evidence".to_string());
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     for (observed, current, expected) in [
         (
             Some(captured.clone()),
@@ -2298,47 +2090,24 @@ fn workspace_freshness_notice_distinguishes_unknown_from_changed_identity() {
             Some(&changed),
             "workspace_identity_changed",
         ),
+        (
+            Some(captured.clone()),
+            Some(&captured),
+            "workspace_freshness_unverified",
+        ),
     ] {
         let mut state = ToolHistoryState::default();
         state.register_workspace_evidence(
             WorkspaceEvidenceObservation::from_response_item(observed, &output, BTreeSet::new())
                 .unwrap(),
         );
-        let projected = state.project_with_workspace_identity(Arc::clone(&canonical), current);
-        let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
-        let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(notice["reason_code"], expected);
-        assert_eq!(notice["valid_for_current_workspace"], false);
-        assert!(notice["rerun"].get("force_fresh").is_none());
+        let notices = freshness_notices(&state, &canonical, current, &cache);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["reason_code"], expected);
+        assert_eq!(notices[0]["workspace_evidence_freshness"], "unknown");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
+        assert!(notices[0].get("rerun").is_none());
     }
-}
-
-#[test]
-fn non_git_workspace_evidence_is_historical_after_external_edit() {
-    let call_id = "non-git-call";
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("source.txt");
-    std::fs::write(&path, "plain directory output").unwrap();
-    let output = text_output(call_id, std::fs::read_to_string(&path).unwrap());
-    let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
-    let mut state = ToolHistoryState::default();
-    state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(None, &output, BTreeSet::new())
-            .expect("non-git observation"),
-    );
-
-    std::fs::write(&path, "externally changed").unwrap();
-    let current = state.project_with_workspace_identity(Arc::clone(&canonical), None);
-    let (_, text) = textual_output_identity(&current.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(notice["reason_code"], "workspace_identity_unavailable");
-    assert_eq!(notice["historical_digest"], "plain directory output");
-    assert_eq!(notice["valid_for_current_workspace"], false);
-
-    let initialized =
-        state.project_with_workspace_identity(canonical, Some(&workspace_identity("initialized")));
-    let (_, stale_output) = textual_output_identity(&initialized.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
 }
 
 #[test]
@@ -2351,17 +2120,26 @@ fn non_git_unknown_workspace_evidence_invalidates_on_recorded_mutation() {
         WorkspaceEvidenceObservation::from_response_item(None, &output, BTreeSet::new())
             .expect("non-git observation"),
     );
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
 
-    let current = state.project_with_workspace_identity(Arc::clone(&canonical), None);
-    assert_ne!(current.items, canonical, "unknown freshness is not current proof");
+    // Unknown freshness is not current proof, in or out of a repository.
+    let initialized = workspace_identity("initialized");
+    for identity in [None, Some(&initialized)] {
+        let notices = freshness_notices(&state, &canonical, identity, &cache);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["reason_code"], "workspace_identity_unavailable");
+        assert_eq!(notices[0]["historical_authenticity"], "authenticated");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
+    }
 
     assert!(state.invalidate_source_dependencies(
         Some(&BTreeSet::from([PathBuf::from("/repo/changed.rs")])),
         None,
     ));
-    let stale = state.project_with_workspace_identity(canonical, None);
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
+    let notices = freshness_notices(&state, &canonical, None, &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
+    assert_eq!(notices[0]["stale_workspace_evidence"], true);
 }
 
 #[test]
@@ -2371,17 +2149,24 @@ fn untracked_legacy_workspace_evidence_fails_closed() {
         function_call(call_id),
         text_output(call_id, "old test result".to_string()),
     ]);
-    let projection = ToolHistoryState::default()
-        .project_with_workspace_identity(canonical, Some(&workspace_identity("current")));
-    let (_, output) = textual_output_identity(&projection.items[1]).expect("stale output");
-    assert!(output.contains("\"stale_workspace_evidence\":true"));
-    assert!(output.contains("no workspace observation is available"));
-    assert!(output.contains("unrecorded or evicted"));
-    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let notices = freshness_notices(
+        &ToolHistoryState::default(),
+        &canonical,
+        Some(&workspace_identity("current")),
+        &cache,
+    );
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert_eq!(notice["stale_workspace_evidence"], true);
+    let reason = notice["reason"].as_str().unwrap();
+    assert!(reason.contains("no workspace observation is available"));
+    assert!(reason.contains("unrecorded or evicted"));
     assert_eq!(notice["reason_code"], "missing_observation");
+    assert_eq!(notice["historical_authenticity"], "unverified");
     assert_eq!(notice["valid_for_current_workspace"], false);
     assert_eq!(notice["observed_revision"], serde_json::Value::Null);
-    assert!(!output.contains("repository identity"));
+    assert!(!notice.to_string().contains("repository identity"));
 }
 
 #[test]
@@ -2398,21 +2183,23 @@ fn workspace_evidence_output_mismatch_does_not_claim_the_repository_changed() {
         )
         .expect("text evidence observation"),
     );
-    let canonical = Arc::from([
+    let canonical: Arc<[ResponseItem]> = Arc::from([
         function_call(call_id),
         text_output(call_id, "different output".to_string()),
     ]);
-    let projection = state.project_with_workspace_identity(canonical, Some(&captured));
-    let (_, output) = textual_output_identity(&projection.items[1]).expect("stale output");
-    let notice: serde_json::Value = serde_json::from_str(output).expect("freshness notice");
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let notices = freshness_notices(&state, &canonical, Some(&captured), &cache);
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
     assert_eq!(notice["stale_workspace_evidence"], true);
     assert_eq!(notice["reason_code"], "output_mismatch");
-    assert!(notice["rerun"].get("force_fresh").is_none());
+    assert_eq!(notice["historical_authenticity"], "unverified");
+    assert!(notice.get("rerun").is_none());
     assert_eq!(
         notice["reason"],
         "the tool output does not match its recorded workspace observation; it is not verified evidence"
     );
-    assert!(!output.contains("different output"));
+    assert!(!notice.to_string().contains("different output"));
 }
 
 #[test]
@@ -2425,7 +2212,7 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
     state.register(candidate(origin_call_id, "old file contents".to_string()));
     state.register_workspace_evidence(
         WorkspaceEvidenceObservation::from_response_item(
-            Some(captured),
+            Some(captured.clone()),
             &origin_output,
             BTreeSet::new(),
         )
@@ -2443,59 +2230,72 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
         text_output(recovery_call_id, "old file contents".to_string()),
     ]);
 
-    let projection =
-        state.project_with_workspace_identity(canonical, Some(&workspace_identity("changed")));
-    let (_, output) = textual_output_identity(&projection.items[1]).expect("stale recovery");
-    assert!(output.contains("\"stale_workspace_evidence\":true"));
-    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
-    assert_eq!(notice["historical_output"], "old file contents");
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let changed = workspace_identity("changed");
+    let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert_eq!(notice["call_id"], recovery_call_id);
+    assert_eq!(notice["stale_workspace_evidence"], true);
+    assert_eq!(notice["reason_code"], "workspace_identity_changed");
+    assert_eq!(notice["observed_revision"], serde_json::to_value(&captured).unwrap());
+    assert_eq!(notice["historical_authenticity"], "authenticated");
     assert_eq!(notice["valid_for_current_workspace"], false);
-    assert!(
-        !state.workspace_evidence[origin_call_id]
-            .is_current(Some(&workspace_identity("changed")), None)
-    );
+    assert!(!state.workspace_evidence[origin_call_id].is_current(Some(&changed), Some(&cache)));
 }
 
-#[test]
-fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
+#[tokio::test]
+async fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
     let call_id = "call-1";
+    let root = tempfile::tempdir().unwrap();
+    let foo = root.path().join("foo.rs");
+    std::fs::write(&foo, "fn foo() {}\n").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let output = text_output(call_id, "search result".to_string());
     let canonical: Arc<[ResponseItem]> =
         Arc::from([named_function_call(call_id, "exec_command"), output.clone()]);
-    let foo = PathBuf::from("/repo/src/foo.rs");
-    let captured = workspace_identity("captured");
+    let captured = workspace_identity_at(root.path(), "captured");
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(captured),
-            &output,
-            BTreeSet::from([SourceDependencyV1::new(&foo, false)]),
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured),
+                &output,
+                BTreeSet::from([SourceDependencyV1::new(&foo, false)]),
+            )
+            .expect("workspace observation"),
         )
-        .expect("workspace observation"),
+        .await,
     );
 
-    let after_unrelated = workspace_identity("after-unrelated");
+    let after_unrelated = workspace_identity_at(root.path(), "after-unrelated");
     assert!(state.invalidate_source_dependencies(
-        Some(&BTreeSet::from([PathBuf::from("/repo/src/bar.rs")])),
+        Some(&BTreeSet::from([root.path().join("bar.rs")])),
         Some(&after_unrelated),
     ));
-    let unrelated =
-        state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after_unrelated));
-    assert_eq!(unrelated.items, canonical);
+    assert!(freshness_notices(&state, &canonical, Some(&after_unrelated), &cache).is_empty());
 
-    let after_overlap = workspace_identity("after-overlap");
+    let after_overlap = workspace_identity_at(root.path(), "after-overlap");
     assert!(
         state.invalidate_source_dependencies(Some(&BTreeSet::from([foo])), Some(&after_overlap),)
     );
-    let stale = state.project_with_workspace_identity(canonical, Some(&after_overlap));
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("source dependencies were invalidated after capture"));
+    let notices = freshness_notices(&state, &canonical, Some(&after_overlap), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
+    assert!(
+        notices[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("source dependencies were invalidated after capture")
+    );
 }
 
 #[test]
 fn recovered_bytes_survive_missing_producer_provenance() {
     let output = "exact historical source recovered successfully";
-    let canonical = Arc::from([
+    let canonical: Arc<[ResponseItem]> = Arc::from([
         named_function_call_with_arguments(
             "recovery",
             "read_tool_output",
@@ -2503,94 +2303,26 @@ fn recovered_bytes_survive_missing_producer_provenance() {
         ),
         text_output("recovery", output.to_string()),
     ]);
-    let projection = ToolHistoryState::default()
-        .project_with_workspace_identity(canonical, Some(&workspace_identity("current")));
-    let (_, text) = textual_output_identity(&projection.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    // The recovered bytes stay in their tool message; the notice only
+    // qualifies them.
+    let notices = freshness_notices(
+        &ToolHistoryState::default(),
+        &canonical,
+        Some(&workspace_identity("current")),
+        &cache,
+    );
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
     assert_eq!(notice["reason_code"], "missing_observation");
-    assert_eq!(notice["historical_output"], output);
-    assert_eq!(notice["valid_for_current_workspace"], false);
+    assert_eq!(notice["historical_authenticity"], "authenticated");
     assert!(
-        notice["rerun"]["instruction"]
+        notice["reason"]
             .as_str()
             .unwrap()
-            .contains("rereading this immutable artifact cannot establish freshness")
+            .contains("recovered historical bytes remain authenticated")
     );
-}
-
-#[test]
-fn investigation_evidence_stays_raw_across_consumed_generations() {
-    let mut state = ToolHistoryState::default();
-    let mut items = Vec::new();
-    // A closeout needs several substantial source reads and the actual validation
-    // result. Merely seeing them once must not replace them with recovery receipts.
-    for index in 0..14 {
-        let call_id = format!("evidence-{index}");
-        let output = format!("source-{index}\n{}", "detail ".repeat(2_600));
-        let mut record = candidate(&call_id, output.clone());
-        record.artifact_id = format!("00000000-0000-7000-8000-{index:012}");
-        record.consumed_by_generation = Some(ModelGenerationId {
-            turn_id: "investigation".into(),
-            ordinal: 1,
-        });
-        state.register(record);
-        items.push(function_call(&call_id));
-        items.push(text_output(&call_id, output));
-    }
-    let original = Arc::<[ResponseItem]>::from(items);
-    let tokens = original
-        .iter()
-        .filter_map(textual_output_identity)
-        .map(|(_, text)| approx_token_count(text))
-        .sum::<usize>();
-    assert!(
-        tokens > 60_000 && tokens <= 75_000,
-        "fixture must exercise the increased budget: {tokens}"
-    );
-    let projection = state.project(Arc::clone(&original));
-    assert_eq!(projection.items.as_ref(), original.as_ref());
-}
-
-#[test]
-fn small_budget_excess_compacts_only_oldest_consumed_results() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(60_000);
-    let output = "x ".repeat(1_000);
-    let mut state = ToolHistoryState::default();
-    let mut items = Vec::new();
-    for index in 0..61 {
-        let call_id = format!("call-{index}");
-        let mut record = candidate(&call_id, output.clone());
-        record.artifact_id = format!("00000000-0000-7000-8000-{index:012}");
-        if index < 60 {
-            record.consumed_by_generation = Some(ModelGenerationId {
-                turn_id: "turn".into(),
-                ordinal: 1,
-            });
-        }
-        state.register(record);
-        items.push(function_call(&call_id));
-        items.push(text_output(&call_id, output.clone()));
-    }
-    let projection = state.project(Arc::from(items));
-    let outputs = projection
-        .items
-        .iter()
-        .filter_map(textual_output_identity)
-        .collect::<Vec<_>>();
-    assert_eq!(outputs.len(), 61, "all outputs must remain recoverable");
-    let raw_count = outputs.iter().filter(|(_, text)| *text == output).count();
-    assert!(
-        raw_count >= 58,
-        "small excess must not compact all consumed results: {raw_count}"
-    );
-    assert_eq!(outputs.last().unwrap().1, output);
-    assert!(
-        outputs
-            .iter()
-            .map(|(_, text)| approx_token_count(text))
-            .sum::<usize>()
-            <= 60_000
-    );
+    assert_eq!(notice["valid_for_current_workspace"], false);
 }
 
 #[test]
@@ -2631,22 +2363,32 @@ fn workspace_error_outputs_preserve_diagnostics_with_historical_applicability() 
         Some(&BTreeSet::from([dependency])),
         Some(&workspace_identity("changed")),
     ));
-    let projection = state.project_with_workspace_identity(
-        Arc::clone(&canonical),
+    // The failed tool message itself is delivered unchanged (the helper
+    // checks that); the notice qualifies it without repeating its text.
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let notices = freshness_notices(
+        &state,
+        &canonical,
         Some(&workspace_identity("changed")),
+        &cache,
     );
-    let (_, text) = textual_output_identity(&projection.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(notice["historical_output"], "permission denied");
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
     assert_eq!(notice["valid_for_current_workspace"], false);
     assert!(notice["failure_applicability"].as_str().unwrap().contains("current applicability is unverified"));
-    assert_eq!(response_item_output_success(&projection.items[1]), Some(false));
+    assert!(!notice.to_string().contains("permission denied"));
+    assert_eq!(response_item_output_success(&canonical[1]), Some(false));
 }
 
 #[tokio::test]
 async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_rerun() {
     let call_id = "stale-search";
-    let dependency = PathBuf::from("/repo/src/foo.rs");
+    let root = tempfile::tempdir().unwrap();
+    let dependency = root.path().join("src/foo.rs");
+    std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    std::fs::write(&dependency, "needle\n").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let arguments = serde_json::json!({
         "program": "rg",
         "args": ["needle", "src/foo.rs"]
@@ -2663,15 +2405,20 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
         named_function_call_with_arguments(call_id, "exec_command", arguments),
         output.clone(),
     ]);
-    let captured = workspace_identity("captured");
+    let captured = workspace_identity_at(root.path(), "captured");
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(captured),
-            &output,
-            BTreeSet::from([SourceDependencyV1::new(&dependency, false)]),
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured),
+                &output,
+                BTreeSet::from([SourceDependencyV1::new(&dependency, false)]),
+            )
+            .expect("successful workspace observation"),
         )
-        .expect("successful workspace observation"),
+        .await,
     );
 
     let search = RgSearchNarrowing {
@@ -2704,36 +2451,26 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
         .await
         .expect_err("unchanged negative search is suppressed");
 
-    let after_unrelated = workspace_identity("after-unrelated");
+    let after_unrelated = workspace_identity_at(root.path(), "after-unrelated");
     assert!(state.invalidate_source_dependencies(
-        Some(&BTreeSet::from([PathBuf::from("/repo/src/bar.rs")])),
+        Some(&BTreeSet::from([root.path().join("src/bar.rs")])),
         Some(&after_unrelated),
     ));
-    let unrelated =
-        state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after_unrelated));
-    assert_eq!(unrelated.items, canonical);
+    assert!(freshness_notices(&state, &canonical, Some(&after_unrelated), &cache).is_empty());
 
-    let after_overlap = workspace_identity("after-overlap");
+    let after_overlap = workspace_identity_at(root.path(), "after-overlap");
     assert!(
         state.invalidate_source_dependencies(
             Some(&BTreeSet::from([dependency])),
             Some(&after_overlap),
         )
     );
-    let stale = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after_overlap));
-    assert_eq!(
-        stale.items[0], canonical[0],
-        "preserve the historical invocation"
-    );
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    let notice: serde_json::Value = serde_json::from_str(stale_output).expect("stale notice");
-    assert!(notice["rerun"].get("force_fresh").is_none());
-    assert!(
-        notice["rerun"]["instruction"]
-            .as_str()
-            .unwrap()
-            .contains("supported arguments")
-    );
+    // The historical invocation and its output stay as delivered; the stale
+    // verdict never asks for an argument the tool does not support.
+    let notices = freshness_notices(&state, &canonical, Some(&after_overlap), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
+    assert!(notices[0].get("rerun").is_none());
     let refreshed_key = attempt_key.with_repository_epoch(2).with_search_narrowing(
         "turn-a",
         "repo-a",
@@ -2828,52 +2565,26 @@ async fn watcher_proof_retains_dependency_scoped_evidence_after_external_disjoin
     cache
         .note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()])
         .await;
-    let unrelated =
-        state.project_with_workspace_cache(Arc::clone(&canonical), Some(&changed), cache.as_ref());
-    assert_eq!(unrelated.items, canonical);
+    assert!(freshness_notices(&state, &canonical, Some(&changed), &cache).is_empty());
 
     cache
         .note_host_workspace_mutation_paths(root.path(), &["src/foo.rs".to_string()])
         .await;
-    let stale = state.project_with_workspace_cache(Arc::clone(&canonical), Some(&changed), cache.as_ref());
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("stale_workspace_evidence"));
-    let notice: serde_json::Value = serde_json::from_str(stale_output).unwrap();
+    let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert_eq!(notice["stale_workspace_evidence"], true);
     assert_eq!(notice["workspace_evidence_freshness"], "changed");
     assert_eq!(notice["qualification"], "Observed dependency change");
     assert_eq!(notice["historical_authenticity"], "authenticated");
     cache.note_host_workspace_mutation();
-    let unknown = state.project_with_workspace_cache(canonical, Some(&changed), cache.as_ref());
-    let (_, output) = textual_output_identity(&unknown.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
+    let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
     assert_eq!(notice["workspace_evidence_freshness"], "unknown");
     assert_eq!(notice["qualification"], "Currentness unknown; no dependency change established");
     assert_eq!(notice["historical_authenticity"], "authenticated");
     assert_eq!(notice["valid_for_current_workspace"], false);
-}
-
-#[test]
-fn dependency_scoped_workspace_evidence_invalidates_on_external_revision_change() {
-    let call_id = "call-1";
-    let output = text_output(call_id, "search result".to_string());
-    let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
-    let mut state = ToolHistoryState::default();
-    state.register_workspace_evidence(
-        WorkspaceEvidenceObservation::from_response_item(
-            Some(workspace_identity("captured")),
-            &output,
-            BTreeSet::from([SourceDependencyV1::new(
-                Path::new("/repo/src/foo.rs"),
-                false,
-            )]),
-        )
-        .expect("workspace observation"),
-    );
-
-    let stale = state
-        .project_with_workspace_identity(canonical, Some(&workspace_identity("external-edit")));
-    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
-    assert!(stale_output.contains("\"stale_workspace_evidence\":true"));
 }
 
 #[tokio::test]
@@ -2916,11 +2627,8 @@ async fn external_source_evidence_survives_repo_edits_but_not_attachment_changes
     cache
         .note_host_workspace_mutation_paths(root.path(), &["unrelated.txt".into()])
         .await;
-    assert_eq!(
-        state
-            .project_with_workspace_cache(Arc::clone(&canonical), Some(&after), &cache)
-            .items,
-        canonical,
+    assert!(
+        freshness_notices(&state, &canonical, Some(&after), &cache).is_empty(),
         "an unrelated repository edit must preserve both unchanged inputs"
     );
 
@@ -2933,18 +2641,19 @@ async fn external_source_evidence_survives_repo_edits_but_not_attachment_changes
     .await
     .expect("native watcher must observe the external attachment changing");
     assert!(cache.source_path_change_observation_is_current(&observations[0]));
-    let projected = state.project_with_workspace_cache(canonical, Some(&after), &cache);
-    let (_, output) = textual_output_identity(&projected.items[1]).unwrap();
-    let notice: serde_json::Value = serde_json::from_str(output).unwrap();
-    assert_eq!(notice["stale_workspace_evidence"], true);
-    assert_eq!(notice["valid_for_current_workspace"], false);
+    let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["stale_workspace_evidence"], true);
+    assert_eq!(notices[0]["valid_for_current_workspace"], false);
 }
 
-#[test]
-fn nested_workspace_evidence_retains_only_current_results_after_resume() {
+#[tokio::test]
+async fn nested_workspace_evidence_retains_only_current_results_after_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let mut state = ToolHistoryState::default();
-    let before = workspace_identity("before");
-    let after = workspace_identity("after");
+    let before = workspace_identity_at(root.path(), "before");
+    let after = workspace_identity_at(root.path(), "after");
     let parent = text_output("parent", "combined A and B".into());
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call("parent"), parent.clone()]);
     state.register_workspace_evidence(
@@ -2955,15 +2664,23 @@ fn nested_workspace_evidence_retains_only_current_results_after_resume() {
         )
         .expect("parent"),
     );
-    for (id, path, output) in [("a", "/repo/a", "old A"), ("b", "/repo/b", "current B")] {
+    let path_a = root.path().join("a");
+    let path_b = root.path().join("b");
+    for (id, path, output) in [("a", &path_a, "old A"), ("b", &path_b, "current B")] {
+        std::fs::write(path, output).unwrap();
         let nested = text_output(id, output.into());
         state.register_workspace_evidence(
-            WorkspaceEvidenceObservation::from_response_item(
-                Some(before.clone()),
-                &nested,
-                BTreeSet::from([SourceDependencyV1::new(Path::new(path), false)]),
+            watched(
+                &cache,
+                root.path(),
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(before.clone()),
+                    &nested,
+                    BTreeSet::from([SourceDependencyV1::new(path, false)]),
+                )
+                .expect("nested"),
             )
-            .expect("nested"),
+            .await,
         );
         assert!(
             ToolHistoryMutation::RegisterCodeModeNestedEvidence {
@@ -2979,44 +2696,36 @@ fn nested_workspace_evidence_retains_only_current_results_after_resume() {
     // survive pruning and durable serialization with the live parent.
     let encoded = serde_json::to_vec(&state).expect("serialize ledger");
     let mut state: ToolHistoryState = serde_json::from_slice(&encoded).expect("resume ledger");
-    state.invalidate_source_dependencies(
-        Some(&BTreeSet::from([PathBuf::from("/repo/a")])),
-        Some(&after),
-    );
-    let projected = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
-    let (_, output) = textual_output_identity(&projected.items[1]).expect("parent result");
-    let notice: serde_json::Value = serde_json::from_str(output).expect("freshness notice");
+    state.invalidate_source_dependencies(Some(&BTreeSet::from([path_a.clone()])), Some(&after));
+    let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
     let current = notice["current_nested_results"].as_array().unwrap();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0]["call_id"], "b");
-    assert_eq!(current[0]["output"], "current B");
     assert_eq!(current[0]["workspace_evidence_freshness"], "current");
     assert_eq!(current[0]["source_scope"]["dependencies"][0]["path"],
-        SourceDependencyV1::new(Path::new("/repo/b"), false).path);
+        SourceDependencyV1::new(&path_b, false).path);
     assert_eq!(notice["stale_nested_results"][0]["call_id"], "a");
     assert_eq!(notice["stale_nested_results"][0]["source_scope"]["dependencies"][0]["path"],
-        SourceDependencyV1::new(Path::new("/repo/a"), false).path);
-    assert!(!output.contains("old A"));
-    assert_eq!(notice["historical_digest"], "combined A and B");
+        SourceDependencyV1::new(&path_a, false).path);
+    // Nested bytes, current or stale, stay in the parent's own tool message.
+    assert!(current[0].get("output").is_none());
+    let rendered = notice.to_string();
+    assert!(!rendered.contains("old A") && !rendered.contains("current B"));
     assert_eq!(notice["valid_for_current_workspace"], false);
 
     let mut mutated = state.clone();
-    mutated.invalidate_source_dependencies(
-        Some(&BTreeSet::from([PathBuf::from("/repo/b")])),
-        Some(&after),
-    );
-    let projected = mutated.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
-    let (_, output) = textual_output_identity(&projected.items[1]).expect("mutated parent");
-    assert!(!output.contains("current B"));
-    let projected = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
-    let (_, output) = textual_output_identity(&projected.items[1]).expect("original snapshot");
-    assert!(output.contains("current B"));
+    mutated.invalidate_source_dependencies(Some(&BTreeSet::from([path_b.clone()])), Some(&after));
+    let notices = freshness_notices(&mutated, &canonical, Some(&after), &cache);
+    assert!(notices[0].get("current_nested_results").is_none());
+    let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
+    assert_eq!(notices[0]["current_nested_results"][0]["call_id"], "b");
 
-    // An unobserved external revision has no proof that B stayed unchanged.
-    let projected =
-        state.project_with_workspace_identity(canonical, Some(&workspace_identity("external")));
-    let (_, output) = textual_output_identity(&projected.items[1]).expect("stale parent");
-    assert!(!output.contains("current B"));
+    // A mutation the journal cannot attribute leaves no proof that B stayed unchanged.
+    cache.note_host_workspace_mutation();
+    let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
+    assert!(notices[0].get("current_nested_results").is_none());
     state.retain_for_history(&[]);
     assert!(state.is_persisted_empty());
 }
@@ -3371,9 +3080,15 @@ fn select_string_named_pattern_retains_positional_paths() {
 }
 
 #[cfg(windows)]
-#[test]
-fn select_string_named_pattern_batch_invalidates_when_positional_path_changes() {
-    let cwd = Path::new("/repo");
+#[tokio::test]
+async fn select_string_named_pattern_batch_invalidates_when_positional_path_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path();
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    for name in ["first.rs", "second.rs"] {
+        std::fs::write(cwd.join("src").join(name), "needle\n").unwrap();
+    }
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     for search in [
         "Select-String -Pattern 'needle' src/second.rs",
         "Select-String src/second.rs -pAtTeRn 'needle'",
@@ -3400,32 +3115,36 @@ fn select_string_named_pattern_batch_invalidates_when_positional_path_changes() 
         ]);
         let mut state = ToolHistoryState::default();
         state.register_workspace_evidence(
-            WorkspaceEvidenceObservation::from_response_item(
-                Some(workspace_identity("captured")),
-                &output,
-                classification.source_dependencies,
+            watched(
+                &cache,
+                cwd,
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(workspace_identity_at(cwd, "captured")),
+                    &output,
+                    classification.source_dependencies,
+                )
+                .expect("batch observation"),
             )
-            .expect("batch observation"),
+            .await,
         );
-        let unrelated = workspace_identity("unrelated");
+        let unrelated = workspace_identity_at(cwd, "unrelated");
         state.invalidate_source_dependencies(
             Some(&BTreeSet::from([cwd.join("notes.txt")])),
             Some(&unrelated),
         );
-        assert_eq!(
-            state.project_with_workspace_identity(Arc::clone(&canonical), Some(&unrelated)).items,
-            canonical
+        assert!(
+            freshness_notices(&state, &canonical, Some(&unrelated), &cache).is_empty(),
+            "{search}"
         );
-        let changed = workspace_identity("second-file-changed");
+        let changed = workspace_identity_at(cwd, "second-file-changed");
         state.invalidate_source_dependencies(
             Some(&BTreeSet::from([cwd.join("src/second.rs")])),
             Some(&changed),
         );
-        let projected = state.project_with_workspace_identity(canonical, Some(&changed));
-        let (_, text) = textual_output_identity(&projected.items[1]).expect("stale result");
-        let notice: serde_json::Value = serde_json::from_str(text).expect("stale evidence notice");
-        assert_eq!(notice["stale_workspace_evidence"], true, "{search}");
-        assert_eq!(notice["reason_code"], "source_dependencies_invalidated", "{search}");
+        let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+        assert_eq!(notices.len(), 1, "{search}");
+        assert_eq!(notices[0]["stale_workspace_evidence"], true, "{search}");
+        assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated", "{search}");
     }
 }
 
@@ -3452,59 +3171,6 @@ fn commands_that_may_read_anywhere_still_make_the_batch_opaque() {
             "{shell}: {command}"
         );
     }
-}
-
-#[test]
-fn tool_result_budget_caps_large_model_context_windows() {
-    assert_eq!(model_visible_tool_result_token_budget_for_context_window(Some(760_000)), 75_000);
-    assert_eq!(model_visible_tool_result_token_budget_for_context_window(Some(32_000)), 16_000);
-    assert_eq!(
-        model_visible_tool_result_token_budget_for_context_window(None),
-        model_visible_tool_result_token_budget()
-    );
-    assert_eq!(
-        model_visible_tool_result_token_budget_for_context_window(Some(0)),
-        model_visible_tool_result_token_budget()
-    );
-    assert_eq!(
-        model_visible_tool_result_token_budget_for_context_window(Some(258_400)),
-        75_000
-    );
-
-    // A configured window budget replaces the fixed default for projection.
-    let output = "x ".repeat(1_000);
-    let mut items = Vec::new();
-    let mut state = ToolHistoryState::default();
-    for index in 0..8 {
-        let call_id = format!("call-{index}");
-        let mut record = candidate(&call_id, output.clone());
-        record.artifact_id = format!("00000000-0000-7000-8000-{index:012}");
-        record.consumed_by_generation = Some(ModelGenerationId {
-            turn_id: "turn".into(),
-            ordinal: 1,
-        });
-        state.register(record);
-        items.push(function_call(&call_id));
-        items.push(text_output(&call_id, output.clone()));
-    }
-    let items = Arc::<[ResponseItem]>::from(items);
-    let raw_count = |state: &ToolHistoryState| {
-        state
-            .project(Arc::clone(&items))
-            .items
-            .iter()
-            .filter_map(textual_output_identity)
-            .filter(|(_, text)| *text == output)
-            .count()
-    };
-    state.set_model_visible_tool_result_token_budget(Some(3_000));
-    assert!(raw_count(&state) < 8, "a small window budget must compact");
-    state.set_model_visible_tool_result_token_budget(Some(129_200));
-    assert_eq!(
-        raw_count(&state),
-        8,
-        "a large window keeps the evidence raw"
-    );
 }
 
 #[test]
@@ -3565,8 +3231,143 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
 }
 
 #[test]
-fn cargo_configuration_changes_invalidate_observed_validation() {
+fn cargo_local_overrides_do_not_leave_validation_evidence_current() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let external = root.path().join("external");
+    let transitive = root.path().join("transitive");
+    for package in [workspace.join("app"), external.clone(), transitive.clone()] {
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    }
+    std::fs::write(workspace.join("app/Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\n[dependencies]\nsupport='0.1.0'\n").unwrap();
+    std::fs::write(external.join("Cargo.toml"),
+        "[package]\nname='support'\nversion='0.1.0'\n[dependencies]\ntransitive={path='../transitive'}\n").unwrap();
+    std::fs::write(transitive.join("Cargo.toml"),
+        "[package]\nname='transitive'\nversion='0.1.0'\n").unwrap();
+    // Cargo local source overrides participate in the selected build even
+    // though the selected package declares a registry dependency, not a path.
+    std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    // Without an override this fixture has a known scope, so the unknown
+    // scopes below come from the override and not from the fixture.
+    std::fs::write(workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['app']\nresolver='2'\n").unwrap();
+    let plain = ToolPayload::Function {
+        arguments: serde_json::json!({"package":"app", "workdir":workspace}).to_string(),
+    };
+    assert!(!classify_workspace_tool_call("cargo_test", &plain, &workspace)
+        .source_dependencies.is_empty());
+    for (overrides, config_name, config) in [
+        ("[patch.crates-io]\nsupport={path='../external'}\n", "config.toml", ""),
+        ("[replace]\n'support:0.1.0'={path='../external'}\n", "config.toml", ""),
+        ("", "config.toml", "paths=['../external']\n"),
+        ("", "config", "paths=['../external']\n"),
+        ("", "config.toml", "[patch.crates-io]\nsupport={path='../external'}\n"),
+    ] {
+        for name in ["config", "config.toml"] {
+            match std::fs::remove_file(workspace.join(".cargo").join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("removing prior fixture config failed: {error}"),
+            }
+        }
+        std::fs::write(workspace.join(".cargo").join(config_name), config).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"),
+            format!("[workspace]\nmembers=['app']\nresolver='2'\n{overrides}")).unwrap();
+        let arguments = serde_json::json!({"package":"app", "workdir":workspace});
+        let payload = ToolPayload::Function { arguments: arguments.to_string() };
+        let classification = classify_workspace_tool_call("cargo_test", &payload, &workspace);
+        assert!(classification.observes_workspace);
+        assert!(classification.source_dependencies.is_empty(),
+            "unresolved local overrides must use unknown scope: {overrides} {config}");
+        for changed_path in [external.join("src/lib.rs"), transitive.join("src/lib.rs")] {
+            let output = text_output("validation", "test result: ok. 1 passed".into());
+            let canonical: Arc<[ResponseItem]> = Arc::from([
+                named_function_call_with_arguments("validation", "cargo_test", arguments.clone()),
+                output.clone(),
+            ]);
+            let mut state = ToolHistoryState::default();
+            state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+                Some(workspace_identity("captured")), &output,
+                classification.source_dependencies.clone(),
+            ).unwrap());
+            let changed = workspace_identity("override-source-edited");
+            state.invalidate_source_dependencies(Some(&BTreeSet::from([changed_path.clone()])), Some(&changed));
+            let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+            let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+            assert_eq!(notices.len(), 1,
+                "an edited Cargo override must not remain current: {overrides} {changed_path:?}");
+            assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
+            assert_eq!(notices[0]["valid_for_current_workspace"], false);
+            assert_eq!(notices[0]["historical_authenticity"], "authenticated");
+        }
+    }
+}
+
+#[test]
+fn cargo_configuration_guards_preserve_plain_graph_and_reject_opaque_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("app")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=['app']\n").unwrap();
+    std::fs::write(workspace.join("app/Cargo.toml"), "[package]\nname='app'\nversion='0.1.0'\n").unwrap();
+    let arguments = serde_json::json!({"package":"app"});
+    let expected = cargo_test_dependencies(&arguments, &workspace);
+    assert!(expected.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
+    let config = root.path().join(".cargo/config.toml");
+    for source in ["", "paths=[]\n[build]\njobs=2\n",
+        "[patch.crates-io]\nsupport={git='https://example.com/support', rev='revision'}\n"] {
+        std::fs::write(&config, source).unwrap();
+        assert_eq!(cargo_test_dependencies(&arguments, &workspace), expected);
+    }
+    for source in ["paths=['external']\n".as_bytes(),
+        "[patch.crates-io]\nsupport={path='external'}\n".as_bytes(),
+        b"paths=[", &[0xff]] {
+        std::fs::write(&config, source).unwrap();
+        assert!(cargo_test_dependencies(&arguments, &workspace).is_empty());
+    }
+    std::fs::write(&config, "").unwrap();
+    for options in [vec!["--config", "patch.crates-io.support.path='external'"],
+        vec!["--config=patch.crates-io.support.path='external'"]] {
+        let cargo_args = ["test", "-p", "app"].into_iter().chain(options).map(str::to_owned).collect::<Vec<_>>();
+        assert!(cargo_test_dependencies(&serde_json::json!({"package":"app", "cargo_args":cargo_args}), &workspace).is_empty());
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({"program":"cargo", "args":cargo_args}).to_string(),
+        };
+        assert!(source_dependencies_for_tool_call("exec_command", &payload, &workspace).is_empty());
+    }
+    let after_separator = ["test", "-p", "app", "--", "--config", "test-argument"].map(str::to_owned);
+    assert_eq!(cargo_argv_dependencies(&after_separator, &workspace), expected);
+    // Exercise the production config reader with a home outside the invocation
+    // ancestry, without mutating the process environment shared by other tests.
+    let cargo_home = root.path().join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    assert!(cargo_configuration_dependencies(&workspace, None).is_none());
+    let config_scope = cargo_configuration_dependencies(&workspace, Some(&cargo_home)).unwrap();
+    for name in ["config", "config.toml"] {
+        let path = cargo_home.join(name);
+        assert!(config_scope.contains(&SourceDependencyV1::new(&path, false)),
+            "absent Cargo home config must be watched too");
+        std::fs::write(&path, "[build]\njobs=2\n").unwrap();
+        assert_eq!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)), Some(config_scope.clone()));
+        for source in ["paths=['../external']\n", "[patch.crates-io]\nsupport={path='../external'}\n", "paths=["] {
+            std::fs::write(&path, source).unwrap();
+            assert!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)).is_none());
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)).is_none(),
+            "an unreadable config cannot prove a complete graph");
+        std::fs::remove_dir(&path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cargo_configuration_changes_invalidate_observed_validation() {
     let temp = tempfile::tempdir().expect("workspace fixture");
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let workspace = temp.path().join("workspace");
     let app = workspace.join("app");
     std::fs::create_dir_all(&app).expect("package directory");
@@ -3603,41 +3404,40 @@ fn cargo_configuration_changes_invalidate_observed_validation() {
             assert!(!path.exists(), "track configuration before it is created");
             let mut state = ToolHistoryState::default();
             state.register_workspace_evidence(
-                WorkspaceEvidenceObservation::from_response_item(
-                    Some(workspace_identity("captured")),
-                    &output,
-                    classification.source_dependencies.clone(),
+                watched(
+                    &cache,
+                    temp.path(),
+                    WorkspaceEvidenceObservation::from_response_item(
+                        Some(workspace_identity_at(temp.path(), "captured")),
+                        &output,
+                        classification.source_dependencies.clone(),
+                    )
+                    .expect("validation observation"),
                 )
-                .expect("validation observation"),
+                .await,
             );
-            let unrelated = workspace_identity("unrelated");
+            let unrelated = workspace_identity_at(temp.path(), "unrelated");
             state.invalidate_source_dependencies(
                 Some(&BTreeSet::from([workspace.join("notes.txt")])),
                 Some(&unrelated),
             );
-            assert_eq!(
-                state
-                    .project_with_workspace_identity(Arc::clone(&canonical), Some(&unrelated))
-                    .items,
-                canonical,
+            assert!(
+                freshness_notices(&state, &canonical, Some(&unrelated), &cache).is_empty(),
                 "unrelated changes must preserve the validation result"
             );
-            let changed = workspace_identity("configuration-changed");
+            let changed = workspace_identity_at(temp.path(), "configuration-changed");
             state.invalidate_source_dependencies(
                 Some(&BTreeSet::from([path.clone()])),
                 Some(&changed),
             );
-            let projected =
-                state.project_with_workspace_identity(Arc::clone(&canonical), Some(&changed));
-            let (_, text) = textual_output_identity(&projected.items[1]).expect("stale result");
-            let notice: serde_json::Value =
-                serde_json::from_str(text).expect("stale evidence notice");
-            assert_eq!(notice["stale_workspace_evidence"], true, "{path:?}");
+            let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+            assert_eq!(notices.len(), 1, "{path:?}");
+            assert_eq!(notices[0]["stale_workspace_evidence"], true, "{path:?}");
             assert_eq!(
-                notice["reason_code"], "source_dependencies_invalidated",
+                notices[0]["reason_code"], "source_dependencies_invalidated",
                 "{path:?}"
             );
-            assert!(notice["rerun"].get("force_fresh").is_none(), "{path:?}");
+            assert!(notices[0].get("rerun").is_none(), "{path:?}");
         }
     }
 }
@@ -3654,19 +3454,52 @@ fn verified_named_runner_scope_uses_manifest_target_package_graph() {
         std::fs::write(workspace.join(name).join("Cargo.toml"), format!("[package]\nname=\"{name}\"\nversion=\"0.1.0\"\n")).unwrap();
     }
     let manifest = workspace.join(".config/kd4-rust-tests.toml");
-    std::fs::write(&manifest, "version=1\n[targets.app_lib]\npackage=\"app\"\n[gates.small]\nsteps=[{target=\"app_lib\"}]\n").unwrap();
+    std::fs::write(&manifest, "version=1\n[targets.app_lib]\npackage=\"app\"\n[targets.tui_lib]\npackage=\"tui\"\n[gates.small]\nsteps=[{target=\"app_lib\"}]\n[gates.other]\nsteps=[{target=\"tui_lib\"}]\n").unwrap();
     let mut runner: codex_shell_command::validation::RepositoryRunner = serde_json::from_value(serde_json::json!({
         "programs":["python"], "prefixes":[["scripts/rust_test_runner.py", "run-target"],["scripts/rust_test_runner.py", "run-gate"]],
         "operations":["test"], "receipt_runner":"rust_test_runner", "allow_extra_args":true,
     })).unwrap();
     runner.path_context = Some((root.path().to_path_buf(), root.path().to_path_buf()));
-    for (operation, name) in [("run-target", "app_lib"), ("run-gate", "small")] {
-        let command = ["python", "scripts/rust_test_runner.py", operation, name].map(str::to_owned);
+    for names in [vec!["small", "other"], vec!["other", "small"], vec!["small", "other", "small"]] {
+        let command = ["python", "scripts/rust_test_runner.py", "run-gate"].into_iter()
+            .chain(names).map(str::to_owned).collect::<Vec<_>>();
         let scope = runner_source_dependencies(&command, root.path(), &[runner.clone()]).unwrap();
-        assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
-        assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)));
-        assert!(scope.contains(&SourceDependencyV1::new(&manifest, false)));
+        for package in ["app", "tui"] {
+            assert!(scope.contains(&SourceDependencyV1::new(&workspace.join(package), true)),
+                "every selected gate contributes dependencies: {command:?} missing {package}");
+        }
     }
+    let unknown = ["python", "scripts/rust_test_runner.py", "run-gate", "small", "missing"]
+        .map(str::to_owned);
+    assert!(runner_source_dependencies(&unknown, root.path(), &[runner.clone()])
+        .is_none_or(|scope| scope.is_empty()), "a partial gate selection is not complete scope");
+    for (operation, name) in [("run-target", "app_lib"), ("run-gate", "small")] {
+        for options in [vec![], vec!["--profile", "fast"], vec!["--profile=fast"],
+            vec!["--no-fail-fast", "--command-timeout-seconds", "5", "--target-dir", "target",
+                "--success-output=always"]] {
+            let command = ["python", "scripts/rust_test_runner.py", operation].into_iter()
+                .chain(options).chain([name]).map(str::to_owned).collect::<Vec<_>>();
+            let scope = runner_source_dependencies(&command, root.path(), &[runner.clone()])
+                .unwrap_or_else(|| panic!("documented runner selection lost its scope: {command:?}"));
+            assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
+            assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)));
+            assert!(scope.contains(&SourceDependencyV1::new(&manifest, false)));
+        }
+    }
+    for selection in [vec!["--profile"], vec!["--profile=", "small"],
+        vec!["--profile", "--no-fail-fast", "small"], vec!["--unknown", "small"],
+        vec!["small", "--unknown"], vec!["--command-timeout-seconds"]] {
+        let command = ["python", "scripts/rust_test_runner.py", "run-gate"].into_iter()
+            .chain(selection).map(str::to_owned).collect::<Vec<_>>();
+        assert!(runner_source_dependencies(&command, root.path(), &[runner.clone()])
+            .is_none_or(|scope| scope.is_empty()), "unknown or missing option value: {command:?}");
+    }
+    let filtered = ["python", "scripts/rust_test_runner.py", "run-target", "--all", "app_lib",
+        "-E", "test(run-gate)", "--", "other"].map(str::to_owned);
+    let scope = runner_source_dependencies(&filtered, root.path(), &[runner]).unwrap();
+    assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
+    assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)),
+        "target filter remainder does not select another gate");
 }
 
 #[test]
@@ -3859,76 +3692,6 @@ async fn stored_candidate(
 }
 
 #[test]
-fn completed_tool_history_receipt_lifecycle_keeps_canonical_history_unchanged() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let call_id = "call-1";
-    let bounded = bounded_output();
-    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
-    let canonical_before = serde_json::to_vec(&canonical).expect("serialize canonical history");
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, bounded));
-
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-    let projection = state.project(Arc::clone(&canonical));
-
-    let (fallback_call_id, fallback_output) =
-        textual_output_identity(&projection.unreplaced_items[0])
-            .expect("fallback must retain a recovery handle");
-    let pin: serde_json::Value =
-        serde_json::from_str(fallback_output).expect("fallback artifact pin");
-    assert_eq!(fallback_call_id, call_id);
-    assert_eq!(pin["kind"], "tool_history_artifact_pin");
-    assert_eq!(pin["artifact_id"], "artifact-1");
-    assert_eq!(pin["bytes"], 96_000);
-    assert_eq!(pin["sha256"], sha256(b"canonical artifact"));
-    assert_eq!(projection.substitutions.len(), 1);
-    assert_eq!(projection.substitutions[0].item_index, 0);
-    assert_eq!(projection.substitutions[0].call_id, call_id);
-    assert!(
-        response_item_has_valid_tool_history_receipt(&projection.items[0]),
-        "projected item: {:#?}",
-        projection.items[0]
-    );
-    assert_eq!(
-        serde_json::to_vec(&canonical).expect("serialize canonical history"),
-        canonical_before
-    );
-}
-
-#[test]
-fn completed_tool_history_receipt_does_not_expose_source_dependency_paths() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let call_id = "call-1";
-    let bounded = bounded_output();
-    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
-    let mut tracked = candidate(call_id, bounded);
-    tracked.source_dependencies = BTreeSet::from([SourceDependencyV1::new(
-        Path::new("/private/workspace/src/secret.rs"),
-        false,
-    )]);
-    let mut state = ToolHistoryState::default();
-    state.register(tracked);
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let projection = state.project(canonical);
-    let (_, receipt) = textual_output_identity(&projection.items[0]).expect("receipt output");
-    assert!(!receipt.contains("/private/workspace"));
-    assert!(serde_json::from_str::<ToolHistoryReceiptV2>(receipt).is_ok());
-}
-
-#[test]
 fn token_efficiency_compact_v2_receipt_retains_integrity_and_accepts_legacy_v1() {
     let call_id = "call-1";
     let tracked = candidate(call_id, bounded_output());
@@ -3985,278 +3748,9 @@ fn token_efficiency_compact_v2_receipt_retains_integrity_and_accepts_legacy_v1()
 }
 
 #[test]
-fn tool_history_receipt_does_not_replace_output_when_only_an_empty_digest_fits() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    // This call ID leaves exactly enough envelope space for an empty digest.
-    // Such a receipt would fail the consumer's nonempty-digest validation.
-    let bounded = bounded_output();
-    let sample = candidate("", bounded.clone());
-    let mut empty: ToolHistoryReceiptV2 =
-        serde_json::from_str(sample.admission_receipt().unwrap().1).unwrap();
-    empty.digest.clear();
-    let envelope_bytes = serde_json::to_vec(&empty).unwrap().len();
-    let call_id = "c".repeat(
-        codex_utils_string::approx_bytes_for_tokens(RECEIPT_MAX_TOKENS) - envelope_bytes,
-    );
-    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(&call_id, bounded.clone())]);
-    let tracked = candidate(&call_id, bounded);
-    assert!(tracked.admission_receipt().is_none());
-    let mut state = ToolHistoryState::default();
-    state.register(tracked);
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let projection = state.project(Arc::clone(&canonical));
-    assert!(projection.substitutions.is_empty());
-    let (projected_call_id, output) =
-        textual_output_identity(&projection.items[0]).expect("artifact recovery output");
-    let pin: serde_json::Value = serde_json::from_str(output).expect("artifact pin JSON");
-    assert_eq!(projected_call_id, call_id);
-    assert_eq!(pin["kind"], "tool_history_artifact_pin");
-    assert_eq!(pin["artifact_id"], "artifact-1");
-}
-
-#[test]
 fn tool_history_receipt_requires_nonempty_model_output() {
     let tracked = candidate("empty-output", String::new());
-    assert!(tracked.admission_receipt().is_none());
-}
-
-#[test]
-fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let call_id = "call-1";
-    let bounded = bounded_output();
-    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, bounded.clone()));
-
-    assert!(state.candidates[call_id].admission_receipt().is_some());
-    assert!(state.candidates[call_id].receipt().is_none());
-    assert!(!state.mark_consumed(
-        &[text_output(call_id, "tampered".to_string())],
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId { turn_id: "turn-1".into(), ordinal: 1 },
-    ));
-    assert!(state.candidates[call_id].receipt().is_some());
-    assert_eq!(state.project(Arc::clone(&canonical)).substitutions.len(), 1);
-
-    let mut incomplete = candidate(call_id, bounded);
-    incomplete.complete = false;
-    state.register(incomplete);
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 2,
-        },
-    ));
-    assert!(state.candidates[call_id].admission_receipt().is_none());
-    assert!(state.candidates[call_id].receipt().is_none());
-    assert!(state.project(canonical).substitutions.is_empty());
-}
-
-#[test]
-fn tool_history_admission_keeps_first_exposure_receipt_detail_unresolved() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let first = "alpha ".repeat(6_000);
-    let second = "beta ".repeat(6_000);
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        text_output("call-1", first.clone()),
-        text_output("call-2", second.clone()),
-    ]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate("call-1", first));
-    state.register(candidate("call-2", second));
-
-    let projection = state.project(Arc::clone(&canonical));
-    assert_eq!(projection.unreplaced_items.len(), 2);
-    assert!(
-        projection
-            .unreplaced_items
-            .iter()
-            .filter_map(textual_output_identity)
-            .map(|(_, output)| approx_token_count(output))
-            .sum::<usize>()
-            <= model_visible_tool_result_token_budget()
-    );
-    assert_eq!(
-        projection
-            .unreplaced_items
-            .iter()
-            .filter_map(output_call_id)
-            .collect::<Vec<_>>(),
-        vec!["call-1", "call-2"]
-    );
-    assert!(
-        projection
-            .items
-            .iter()
-            .filter_map(textual_output_identity)
-            .map(|(_, output)| approx_token_count(output))
-            .sum::<usize>()
-            <= model_visible_tool_result_token_budget()
-    );
-    assert_eq!(projection.substitutions.len(), 1);
-    assert_eq!(
-        projection
-            .items
-            .iter()
-            .filter(|item| response_item_has_valid_tool_history_receipt(item))
-            .count(),
-        1
-    );
-    assert!(state.mark_consumed(
-        &projection.items,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-    assert_eq!(state.consumed_outputs_for_tool("functions.exec").len(), 1);
-    let unread = state.candidates.values().find(|candidate| candidate.consumed_by_generation.is_none()).unwrap().call_id.clone();
-    let _pressure = override_model_visible_tool_result_token_budget_for_test(1);
-    let consumed = state.project(canonical);
-    let rendered = serde_json::to_string(&consumed.items).unwrap();
-    assert!(rendered.contains("unread outcomes are unresolved"));
-    assert!(rendered.contains(&unread));
-    assert!(rendered.contains("artifact-1"));
-}
-
-#[test]
-fn tool_history_recovery_handles_cannot_bypass_the_aggregate_budget() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let mut state = ToolHistoryState::default();
-    let mut items = Vec::new();
-    for index in 0..160 {
-        let call_id = format!("call-{index:03}");
-        let output = format!("result-{index} {}", "evidence ".repeat(500));
-        let mut tracked = candidate(&call_id, output.clone());
-        tracked.artifact_id = format!("artifact-{index:03}");
-        tracked.refresh_derived();
-        state.register(tracked);
-        items.push(function_call(&call_id));
-        items.push(text_output(&call_id, output));
-    }
-    let canonical: Arc<[ResponseItem]> = Arc::from(items);
-    let before = serde_json::to_vec(&canonical).unwrap();
-    let first = state.project(Arc::clone(&canonical));
-    // Replaying already-projected receipts must not bypass admission's original-output hash.
-    let replay = state.project(Arc::clone(&first.items));
-    for items in [
-        &first.items,
-        &first.unreplaced_items,
-        &replay.items,
-        &replay.unreplaced_items,
-    ] {
-        let outputs = items
-            .iter()
-            .filter_map(textual_output_identity)
-            .collect::<Vec<_>>();
-        assert!(
-            outputs
-                .iter()
-                .map(|(_, text)| approx_token_count(text))
-                .sum::<usize>()
-                <= model_visible_tool_result_token_budget()
-        );
-        assert!(!outputs.is_empty());
-        assert!(
-            outputs.len() < 160,
-            "fixture must exhaust even the recovery-handle budget"
-        );
-        assert!(outputs.iter().any(|(id, _)| *id == "call-159"));
-        for item in items.iter() {
-            if let ResponseItem::FunctionCall { call_id, .. } = item {
-                assert!(outputs.iter().any(|(id, _)| *id == call_id));
-            }
-        }
-    }
-    assert_eq!(serde_json::to_vec(&canonical).unwrap(), before);
-    assert_eq!(
-        state.candidates.len(),
-        160,
-        "projection must not delete saved recovery state"
-    );
-    for substitution in first.substitutions.iter() {
-        assert_eq!(
-            output_call_id(&first.items[substitution.item_index]),
-            Some(substitution.call_id.as_str())
-        );
-    }
-}
-
-#[test]
-fn final_budget_reserves_recovery_before_admitting_untracked_raw_output() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(1_000);
-    let mut state = ToolHistoryState::default();
-    let old_output = "prior source evidence\n".repeat(400);
-    let mut tracked = candidate("prior-read", old_output.clone());
-    tracked.consumed_by_generation = Some(ModelGenerationId {
-        turn_id: "current-turn".into(),
-        ordinal: 0,
-    });
-    tracked.refresh_derived();
-    let pin = tracked.artifact_pin().unwrap();
-    state.register(tracked);
-    // This result has no history candidate (as with dispatch/continuation
-    // outcomes). It fits alone, but must not consume the older recovery handle.
-    let recent_output = "r".repeat(3_800);
-    assert!(approx_token_count(&recent_output) <= 1_000);
-    assert!(approx_token_count(&recent_output) + pin.1 > 1_000);
-    let canonical: Arc<[ResponseItem]> = Arc::from(vec![
-        function_call("prior-read"),
-        text_output("prior-read", old_output),
-        function_call("recent-outcome"),
-        text_output("recent-outcome", recent_output),
-    ]);
-
-    let projection = state.project(Arc::clone(&canonical));
-    for items in [&projection.items, &projection.unreplaced_items] {
-        let outputs = items
-            .iter()
-            .filter_map(canonical_textual_output_identity)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            ["prior-read", "recent-outcome"],
-            "raw output must not displace recovery when both receipts fit"
-        );
-        assert!(
-            outputs
-                .iter()
-                .map(|(_, text)| approx_token_count(text))
-                .sum::<usize>()
-                <= 1_000
-        );
-        let prior: serde_json::Value = serde_json::from_str(&outputs[0].1).unwrap();
-        assert_eq!(prior["artifact_id"], "artifact-1");
-        let recent: serde_json::Value = serde_json::from_str(&outputs[1].1).unwrap();
-        assert_eq!(recent["kind"], "unconsumed_tool_outcome");
-        assert_eq!(recent["output_omitted"], true);
-        assert_eq!(
-            items
-                .iter()
-                .filter(|item| item_call_id(item).is_some())
-                .count(),
-            4
-        );
-    }
-    assert_eq!(projection.items_budget_drops.count, 0);
-    assert_eq!(projection.unreplaced_items_budget_drops.count, 0);
-    assert_eq!(canonical.len(), 4);
+    assert!(tracked.render_receipt(false, false).is_none());
 }
 
 #[test]
@@ -4309,7 +3803,6 @@ fn continuation_projection_reuses_unmodified_prepared_storage() {
 
 #[test]
 fn continuation_projection_keeps_the_previous_request_as_a_prefix() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let workspace = crate::git_workspace::GitWorkspaceCache::new();
     let mut state = ToolHistoryState::default();
     let mut items = Vec::new();
@@ -4318,21 +3811,43 @@ fn continuation_projection_keeps_the_previous_request_as_a_prefix() {
         let call_id = format!("saved-{index:03}");
         let mut tracked = candidate(&call_id, evidence(index));
         tracked.artifact_id = format!("artifact-{index:03}");
+        if index == 0 {
+            tracked.consumed_by_generation = Some(ModelGenerationId {
+                turn_id: "turn".into(),
+                ordinal: 0,
+            });
+        }
         tracked.refresh_derived();
         state.register(tracked);
         // These synthetic results have no workspace dependencies; classify them
-        // as dispatch does so freshness validation leaves their text alone and
-        // only the aggregate budget shapes the projection.
+        // as dispatch does so freshness validation appends no notice and only
+        // the checkpoint shapes the projection.
         state.register_non_workspace_code_mode_call(call_id.clone());
         items.push(function_call(&call_id));
         items.push(text_output(&call_id, evidence(index)));
     }
+    let receipts = state
+        .phase_checkpoint_receipts(&["saved-000".into()])
+        .expect("the consumed result can be checkpointed");
+    items.push(ResponseItem::Message {
+        id: None,
+        role: "developer".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!(
+                "<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts":receipts})
+            ),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
     let canonical: Arc<[ResponseItem]> = Arc::from(items.clone());
-    let first = state.project_with_workspace_cache(Arc::clone(&canonical), None, &workspace);
+    let first =
+        state.project_sampling_with_workspace_cache(Arc::clone(&canonical), None, &workspace);
     assert_ne!(
         &first.items[..],
         &canonical[..],
-        "fixture must exceed the aggregate budget so the projection is not the raw history"
+        "fixture must pin the checkpointed result so the projection is not the raw history"
     );
     let anchor = SamplingProjectionAnchor {
         prepared_items: Arc::clone(&canonical),
@@ -4340,8 +3855,7 @@ fn continuation_projection_keeps_the_previous_request_as_a_prefix() {
     };
 
     // The model observed that request; the next request appends one more result.
-    // Re-running the budget now demotes the observed outputs behind the new one,
-    // which is exactly the prefix churn a continuation must not produce.
+    // The continuation must extend what was sent instead of projecting again.
     let _ = state.mark_consumed_with_delta(
         &canonical,
         ModelGenerationId {
@@ -4374,12 +3888,6 @@ fn continuation_projection_keeps_the_previous_request_as_a_prefix() {
         &continued.unreplaced_items[..first.unreplaced_items.len()],
         &first.unreplaced_items[..]
     );
-    assert_eq!(continued.substitutions, first.substitutions);
-    assert_eq!(continued.items_budget_drops, first.items_budget_drops);
-    assert_eq!(
-        continued.unreplaced_items_budget_drops,
-        first.unreplaced_items_budget_drops
-    );
 
     // A rewritten or shorter history is not a continuation of that request.
     let mut diverged = extended.to_vec();
@@ -4403,96 +3911,6 @@ fn continuation_projection_keeps_the_previous_request_as_a_prefix() {
                 &workspace
             )
             .is_none()
-    );
-}
-
-#[test]
-fn aggregate_budget_drops_are_recorded_per_representation() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let mut state = ToolHistoryState::default();
-    let mut items = Vec::new();
-    for index in 0..20 {
-        let call_id = format!("saved-{index:03}");
-        let output = format!("result-{index} {}", "evidence ".repeat(500));
-        let mut tracked = candidate(&call_id, output.clone());
-        tracked.artifact_id = format!("artifact-{index:03}");
-        tracked.consumed_by_generation = Some(ModelGenerationId {
-            turn_id: "prior-turn".into(),
-            ordinal: 0,
-        });
-        tracked.refresh_derived();
-        state.register(tracked);
-        items.push(function_call(&call_id));
-        items.push(text_output(&call_id, output));
-    }
-    // Short untracked outcomes are already cheaper than a compact receipt.
-    // Enough of them must still exhaust both representations' aggregate budget.
-    for index in 0..130 {
-        let call_id = format!("unsaved-{index:03}");
-        items.push(function_call(&call_id));
-        items.push(text_output(
-            &call_id,
-            format!("unsaved-{index} {}", "pending ".repeat(30)),
-        ));
-    }
-    let canonical: Arc<[ResponseItem]> = Arc::from(items);
-
-    // The budget is one of several stages that can remove an output, so its
-    // own drops are measured where it runs.
-    let outputs = |items: &ProjectedResponseItems| {
-        items
-            .iter()
-            .filter_map(textual_output_identity)
-            .map(|(call_id, text)| (call_id.to_string(), approx_token_count(text)))
-            .collect::<Vec<_>>()
-    };
-    let mut budgeted = ProjectedResponseItems::Shared(Arc::clone(&canonical));
-    let before = outputs(&budgeted);
-    let drops = state.enforce_tool_result_budget(&mut budgeted);
-    let after = outputs(&budgeted);
-    assert!(
-        !after.is_empty() && after.len() < before.len(),
-        "fixture must exhaust the aggregate budget without emptying history"
-    );
-    assert_eq!(
-        drops.count as usize,
-        before.len() - after.len(),
-        "the recorded count must match the results the budget removed"
-    );
-    assert_eq!(
-        drops.tokens,
-        before
-            .iter()
-            .filter(|(call_id, _)| !after.iter().any(|(kept, _)| kept == call_id))
-            .map(|(_, tokens)| *tokens as u64)
-            .sum::<u64>(),
-        "the recorded tokens must be what the dropped results would have cost"
-    );
-
-    // Both representations carry their own numbers into the projection. They
-    // present different output sizes to the same budget, so one shared number
-    // could not describe both.
-    let projection = state.project(Arc::clone(&canonical));
-    assert!(projection.items_budget_drops.count > 0);
-    assert!(projection.items_budget_drops.tokens > 0);
-    assert_ne!(
-        projection.items_budget_drops, projection.unreplaced_items_budget_drops,
-        "each representation must be measured on what it actually sends"
-    );
-
-    // A history that fits records nothing, so a request that sends it reports
-    // no drop delta.
-    let small = state.project(Arc::from(vec![
-        function_call("call-000"),
-        text_output("call-000", "short".to_string()),
-    ]));
-    assert_eq!(
-        small.items_budget_drops,
-        crate::tool_history::ToolOutputBudgetDrops::default()
-    );
-    assert_eq!(
-        small.unreplaced_items_budget_drops,
-        crate::tool_history::ToolOutputBudgetDrops::default()
     );
 }
 
@@ -4546,8 +3964,9 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     let mut items = Vec::new();
     for index in 0..96 {
-        // Reverse lexical ordering to distinguish recency from the candidate map's key order.
-        let call_id = format!("call-{:03}", 96 - index);
+        // Call ids sort oldest first, so the candidate map's key order alone
+        // would put the oldest result first instead of the newest.
+        let call_id = format!("call-{index:03}");
         let mut tracked = candidate(&call_id, format!("output-{index}"));
         tracked.artifact_id = format!("artifact-{index:03}");
         tracked.refresh_derived();
@@ -4614,754 +4033,7 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
 }
 
 #[test]
-fn tool_history_admission_reserves_competing_results_before_spending_the_shared_budget() {
-    let older = "older ".repeat(1_000);
-    let newest = "abc ".repeat(model_visible_tool_result_token_budget());
-    assert_eq!(
-        approx_token_count(&newest),
-        model_visible_tool_result_token_budget()
-    );
-    let mut state = ToolHistoryState::default();
-    state.register(candidate("older-call", older.clone()));
-    state.register(candidate("newest-call", newest.clone()));
-
-    let projection = state.project(Arc::from([
-        function_call("older-call"),
-        text_output("older-call", older),
-        function_call("newest-call"),
-        text_output("newest-call", newest),
-    ]));
-
-    for call_id in ["older-call", "newest-call"] {
-        assert!(projection.items.iter().any(|item| {
-            matches!(item, ResponseItem::FunctionCall { call_id: projected, .. } if projected == call_id)
-        }));
-        assert!(
-            projection
-                .items
-                .iter()
-                .filter_map(textual_output_identity)
-                .any(|(projected, _)| projected == call_id)
-        );
-    }
-    assert!(
-        projection
-            .items
-            .iter()
-            .filter_map(textual_output_identity)
-            .map(|(_, output)| approx_token_count(output))
-            .sum::<usize>()
-            <= model_visible_tool_result_token_budget()
-    );
-}
-
-#[test_case::test_case(20_000; "oversized results")]
-#[test_case::test_case(1_000; "individually fitting results")]
-fn token_backfire_tool_history_pressure_keeps_every_result_recoverable(repetitions: usize) {
-    let mut state = ToolHistoryState::default();
-    let mut items = Vec::new();
-    for index in 0..80 {
-        let call_id = format!("call-{index}");
-        let output = format!("result-{index} ").repeat(repetitions);
-        let mut registered = candidate(&call_id, output.clone());
-        registered.artifact_id = format!("00000000-0000-7000-8000-{index:012}");
-        state.register(registered);
-        items.push(function_call(&call_id));
-        items.push(text_output(&call_id, output));
-    }
-
-    let projection = state.project(Arc::from(items));
-
-    for items in [&projection.items, &projection.unreplaced_items] {
-        assert_eq!(items.len(), 160);
-        let outputs = items
-            .iter()
-            .filter_map(textual_output_identity)
-            .collect::<Vec<_>>();
-        assert!(
-            outputs
-                .iter()
-                .map(|(_, output)| approx_token_count(output))
-                .sum::<usize>()
-                <= model_visible_tool_result_token_budget(),
-            "recoverability must not increase the aggregate token budget"
-        );
-        for index in 0..80 {
-            let call_id = format!("call-{index}");
-            let output = outputs
-                .iter()
-                .find(|(projected_call_id, _)| *projected_call_id == call_id.as_str())
-                .map(|(_, output)| *output)
-                .expect(
-                    "every result must retain a model-visible recovery path in both projections",
-                );
-            if !output.starts_with(&format!("result-{index} ")) {
-                let recovery: serde_json::Value = serde_json::from_str(output).unwrap();
-                assert_eq!(
-                    recovery["artifact_id"],
-                    format!("00000000-0000-7000-8000-{index:012}")
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn tool_history_admission_preserves_newest_unconsumed_non_text_content() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let call_id = "image-call";
-    let output = "small text".to_string();
-    let images = vec![FunctionCallOutputContentItem::InputImage {
-        image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
-        detail: None,
-    }; 300];
-    let mut image_candidate = candidate(call_id, output.clone());
-    let non_text_tokens =
-        approx_token_count(&serde_json::to_string(&images).expect("serialize image content"))
-            as u64;
-    assert!(non_text_tokens > model_visible_tool_result_token_budget() as u64);
-    image_candidate.preserved_non_text_tokens = Some(non_text_tokens);
-    let mut content = vec![FunctionCallOutputContentItem::InputText { text: output }];
-    content.extend(images);
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        function_call(call_id),
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: call_id.to_string(),
-            output: FunctionCallOutputPayload::from_content_items(content),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ]);
-    let mut state = ToolHistoryState::default();
-    state.register(image_candidate);
-
-    let projection = state.project(Arc::clone(&canonical));
-
-    assert_eq!(projection.items, canonical);
-    assert_eq!(projection.unreplaced_items, canonical);
-    assert!(projection.substitutions.is_empty());
-}
-
-#[test]
-fn tool_history_keeps_consumed_contract_details_when_all_results_fit() {
-    let call_id = "read-contract";
-    let output = format!(
-        "{}\nReject non-ASCII input with ValueError; inventory total must be 5.",
-        "Source and contract details needed for the subsequent edit.\n".repeat(60)
-    );
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        function_call(call_id),
-        text_output(call_id, output.clone()),
-        named_function_call("read-tests", "non_workspace_operation"),
-        text_output(
-            "read-tests",
-            "Three tests exercise the contract.".to_string(),
-        ),
-    ]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, output.clone()));
-    assert_eq!(state.project(Arc::clone(&canonical)).items, canonical);
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let projection = state.project(Arc::clone(&canonical));
-    assert_eq!(projection.items, canonical);
-    assert_eq!(
-        textual_output_identity(&projection.items[1]),
-        Some((call_id, output.as_str()))
-    );
-    assert!(projection.substitutions.is_empty());
-}
-
-#[test]
-fn tool_history_admission_keeps_small_consumed_raw_output_when_receipt_costs_more() {
-    let call_id = "small-call";
-    let output = "ok".to_string();
-    let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, output.clone())]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, output.clone()));
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let projection = state.project(canonical);
-
-    assert!(projection.substitutions.is_empty());
-    assert_eq!(
-        textual_output_identity(&projection.items[0]),
-        Some((call_id, output.as_str()))
-    );
-}
-
-#[test]
-fn tool_history_admission_keeps_in_budget_consumed_output_below_savings_thresholds() {
-    let output = "abc ".repeat(MINIMUM_RAW_TOKENS as usize);
-    let raw_tokens = approx_token_count(&output);
-    assert_eq!(raw_tokens, MINIMUM_RAW_TOKENS as usize);
-    assert!(raw_tokens <= model_visible_tool_result_token_budget());
-    let call_id = (1..64)
-        .map(|length| "threshold-call".repeat(length))
-        .find(|call_id| {
-            candidate(call_id, output.clone())
-                .admission_receipt()
-                .is_some_and(|(_, _, tokens)| {
-                    tokens <= raw_tokens as u64
-                        && (raw_tokens as u64 - tokens) < MINIMUM_SAVED_TOKENS
-                })
-        })
-        .expect("fixture leaves less than the minimum savings");
-    let call_id = call_id.as_str();
-
-    let canonical: Arc<[ResponseItem]> =
-        Arc::from([function_call(call_id), text_output(call_id, output.clone())]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, output));
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let stored = &state.candidates[call_id];
-    let (_, _, admission_receipt_tokens) = stored
-        .admission_receipt()
-        .expect("complete candidate has an admission receipt");
-    assert!(admission_receipt_tokens <= raw_tokens as u64);
-    assert!(stored.receipt().is_none());
-
-    let projection = state.project(Arc::clone(&canonical));
-
-    assert_eq!(projection.items, canonical);
-    assert!(Arc::ptr_eq(&projection.items, &canonical));
-    assert!(Arc::ptr_eq(&projection.unreplaced_items, &canonical));
-    assert!(projection.substitutions.is_empty());
-}
-
-#[test]
-fn tool_history_admission_prioritizes_plain_failure_outputs() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let failure = "failure evidence ".repeat(1_800);
-    let success = "ordinary success ".repeat(1_800);
-    let mut failure_candidate = candidate("failure-call", failure.clone());
-    failure_candidate.semantic_class = "tool_failure".to_string();
-    let mut state = ToolHistoryState::default();
-    state.register(failure_candidate);
-    state.register(candidate("success-call", success.clone()));
-
-    let projection = state.project(Arc::from([
-        function_call("failure-call"),
-        text_output("failure-call", failure.clone()),
-        function_call("success-call"),
-        text_output("success-call", success),
-    ]));
-
-    assert!(projection.items.iter().any(|item| {
-        textual_output_identity(item)
-            .is_some_and(|(call_id, output)| call_id == "failure-call" && output == failure)
-    }));
-    assert!(projection.items.iter().any(|item| {
-        textual_output_identity(item).is_some_and(|(call_id, output)| {
-            call_id == "success-call"
-                && serde_json::from_str::<ToolHistoryReceiptV2>(output).is_ok()
-        })
-    }));
-}
-
-#[test]
-fn tool_history_admission_budgets_structured_tool_search_pairs() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let older = tool_search_pair("search-older", 48_000);
-    let latest = tool_search_pair("search-latest", 48_000);
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        older[0].clone(),
-        older[1].clone(),
-        latest[0].clone(),
-        latest[1].clone(),
-    ]);
-
-    let projection = ToolHistoryState::default().project(Arc::clone(&canonical));
-
-    assert_eq!(projection.items.len(), 4);
-    let receipts = projection
-        .items
-        .iter()
-        .filter_map(tool_search_receipt)
-        .collect::<Vec<_>>();
-    assert_eq!(receipts.len(), 2);
-    assert!(receipts.iter().all(|receipt| {
-        receipt.complete
-            && receipt.result_count == 1
-            && receipt.omitted_result_count == Some(0)
-            && receipt.ordered_tool_identities.len() == 1
-            && receipt.arguments["query"] == "example"
-    }));
-    assert_eq!(projection.unreplaced_items.len(), 1);
-    assert!(
-        matches!(&projection.unreplaced_items[0], ResponseItem::Message { role, content, .. }
-        if role == "developer" && format!("{content:?}").contains("2 unread outcomes"))
-    );
-}
-
-#[test]
-fn tool_search_receipt_retains_largest_fitting_identity_prefix() {
-    for count in [0, 1, 10, 99, 256] {
-        let mut item = tool_search_pair("prefix", 0)[1].clone();
-        let ResponseItem::ToolSearchOutput { tools, .. } = &mut item else {
-            unreachable!()
-        };
-        *tools = (0..count)
-            .map(|index| {
-                serde_json::json!({
-                    "name": format!("tool_{index}_{}", "long_name".repeat(index % 7)),
-                })
-            })
-            .collect();
-        let identities = tools
-            .iter()
-            .filter_map(tool_search_result_identity)
-            .collect::<Vec<_>>();
-        let (result, tokens) = tool_search_receipt_item(&item, None).expect("receipt fits");
-        let receipt = tool_search_receipt(&result).unwrap();
-        let retained = receipt.ordered_tool_identities.len();
-        assert_eq!(receipt.ordered_tool_identities, identities[..retained]);
-        assert_eq!(receipt.omitted_identity_count, count - retained);
-        assert_eq!(
-            tokens,
-            approx_token_count(&serde_json::to_string(&result).unwrap())
-        );
-        assert!(tokens <= TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS);
-        assert!(
-            approx_token_count(&serde_json::to_string(&receipt).unwrap()) <= RECEIPT_MAX_TOKENS
-        );
-        // Every longer prefix must fail at least one of the two independent ceilings.
-        for length in retained + 1..=count {
-            let mut larger = receipt.clone();
-            larger.ordered_tool_identities = identities[..length].to_vec();
-            larger.omitted_identity_count = count - length;
-            larger.receipt_id = tool_search_receipt_id(
-                &larger.call_id,
-                &larger.status,
-                &larger.execution,
-                &larger.arguments,
-                &larger.result_set_sha256,
-                larger.result_count,
-                larger.omitted_result_count,
-                larger.complete,
-                larger.omitted_identity_count,
-                &larger.ordered_tool_identities,
-            );
-            let mut envelope = result.clone();
-            let ResponseItem::ToolSearchOutput { tools, .. } = &mut envelope else {
-                unreachable!()
-            };
-            *tools = vec![serde_json::json!({"type": "tool_search_receipt", "receipt": larger})];
-            assert!(
-                approx_token_count(&serde_json::to_string(&larger).unwrap()) > RECEIPT_MAX_TOKENS
-                    || approx_token_count(&serde_json::to_string(&envelope).unwrap())
-                        > TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS
-            );
-        }
-    }
-}
-
-#[test]
-fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let mut pair = tool_search_pair("search", 48_000);
-    let ResponseItem::ToolSearchCall { arguments, .. } = &mut pair[0] else {
-        panic!("expected search call");
-    };
-    *arguments = serde_json::json!({
-        "query": "q".repeat(20_000),
-        "namespace": "n".repeat(20_000),
-        "limit": ["large".repeat(20_000)],
-        "cursor": "c".repeat(20_000),
-    });
-    let original_arguments = arguments.clone();
-
-    let projection = ToolHistoryState::default().project(Arc::from(pair));
-    let (receipt_item, receipt) = projection
-        .items
-        .iter()
-        .find_map(|item| tool_search_receipt(item).map(|receipt| (item, receipt)))
-        .expect("bounded search receipt");
-    let rendered_item = serde_json::to_string(receipt_item).expect("serialize receipt envelope");
-    assert!(approx_token_count(&rendered_item) <= TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS);
-    let rendered = serde_json::to_string(&receipt).expect("serialize receipt");
-    assert!(approx_token_count(&rendered) <= RECEIPT_MAX_TOKENS);
-    for key in ["query", "namespace", "limit", "cursor"] {
-        assert_eq!(
-            receipt.arguments[format!("{key}_sha256")],
-            sha256(original_arguments[key].to_string().as_bytes())
-        );
-    }
-
-    // Size the fixture from the actual envelope so it exceeds the global budget.
-    // The normal admission path must instead charge the complete model-visible outputs.
-    let pressure_count =
-        model_visible_tool_result_token_budget() / approx_token_count(&rendered_item) + 1;
-    let pressure_items = (0..pressure_count)
-        .flat_map(|index| {
-            let mut pair = tool_search_pair(&format!("search-{index}"), 48_000);
-            let ResponseItem::ToolSearchCall { arguments, .. } = &mut pair[0] else {
-                panic!("expected search call");
-            };
-            *arguments = original_arguments.clone();
-            pair
-        })
-        .collect::<Vec<_>>();
-    let pressured = ToolHistoryState::default().project(Arc::from(pressure_items));
-    let receipts = pressured
-        .items
-        .iter()
-        .filter(|item| matches!(item, ResponseItem::ToolSearchOutput { .. }))
-        .collect::<Vec<_>>();
-    assert!(!receipts.is_empty());
-    assert!(receipts.len() < pressure_count);
-    let total_output_tokens = receipts
-        .into_iter()
-        .map(|item| {
-            let receipt = tool_search_receipt(item).expect("retained search output is a receipt");
-            assert!(
-                approx_token_count(&serde_json::to_string(&receipt).unwrap()) <= RECEIPT_MAX_TOKENS
-            );
-            let tokens = approx_token_count(&serde_json::to_string(item).unwrap());
-            assert!(tokens <= TOOL_SEARCH_RECEIPT_ENVELOPE_MAX_TOKENS);
-            tokens
-        })
-        .sum::<usize>();
-    assert!(total_output_tokens <= model_visible_tool_result_token_budget());
-
-    let mut changed = receipt.clone();
-    changed.status = "failed".to_string();
-    assert_ne!(
-        receipt.receipt_id,
-        tool_search_receipt_id(
-            &changed.call_id,
-            &changed.status,
-            &changed.execution,
-            &changed.arguments,
-            &changed.result_set_sha256,
-            changed.result_count,
-            changed.omitted_result_count,
-            changed.complete,
-            changed.omitted_identity_count,
-            &changed.ordered_tool_identities,
-        )
-    );
-}
-
-#[test]
-fn structured_tool_search_negative_evidence_has_failure_priority() {
-    let tool = serde_json::json!({"name": "matching-tool"});
-
-    assert_eq!(
-        tool_search_admission_priority("failed", std::slice::from_ref(&tool)),
-        1
-    );
-    assert_eq!(tool_search_admission_priority("completed", &[]), 1);
-    assert_eq!(tool_search_admission_priority("completed", &[tool]), 2);
-}
-
-#[test]
-fn structured_tool_search_negative_evidence_precedes_success_under_budget() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let mut failed = tool_search_pair("search-failed", 28_000);
-    let ResponseItem::ToolSearchCall { status, .. } = &mut failed[0] else {
-        panic!("expected search call");
-    };
-    *status = Some("failed".to_string());
-    let ResponseItem::ToolSearchOutput { status, .. } = &mut failed[1] else {
-        panic!("expected search output");
-    };
-    *status = "failed".to_string();
-    let successful = tool_search_pair("search-success", 28_000);
-
-    let projection = ToolHistoryState::default().project(Arc::from([
-        failed[0].clone(),
-        failed[1].clone(),
-        successful[0].clone(),
-        successful[1].clone(),
-    ]));
-
-    let failed_output = projection
-        .items
-        .iter()
-        .find(|item| item_call_id(item) == Some("search-failed"))
-        .and_then(|_| {
-            projection.items.iter().find(|item| {
-                matches!(
-                    item,
-                    ResponseItem::ToolSearchOutput { call_id: Some(call_id), .. }
-                        if call_id == "search-failed"
-                )
-            })
-        })
-        .expect("failed output retained");
-    assert!(tool_search_receipt(failed_output).is_none());
-    assert!(projection.items.iter().any(|item| {
-        matches!(
-            item,
-            ResponseItem::ToolSearchOutput { call_id: Some(call_id), .. }
-                if call_id == "search-success"
-        ) && tool_search_receipt(item).is_some()
-    }));
-}
-
-#[test]
-fn tool_history_admission_supersedes_identical_results_with_latest_pair() {
-    let bounded = bounded_output();
-    let mut first = candidate("call-1", bounded.clone());
-    first.supersession_identity = Some(format!(
-        "functions.exec:{}:{}",
-        sha256(b"same action"),
-        sha256(b"same result")
-    ));
-    first.consumed_by_generation = Some(ModelGenerationId {
-        turn_id: "turn-1".to_string(),
-        ordinal: 0,
-    });
-    let mut second = candidate("call-2", bounded.clone());
-    second.supersession_identity = first.supersession_identity.clone();
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        function_call("call-1"),
-        text_output("call-1", bounded.clone()),
-        function_call("call-2"),
-        text_output("call-2", bounded),
-    ]);
-    let mut state = ToolHistoryState::default();
-    state.register(first);
-    state.register(second);
-
-    let projection = state.project(Arc::clone(&canonical));
-    assert_eq!(canonical.len(), 4);
-    assert_eq!(projection.unreplaced_items.len(), 2);
-    assert!(
-        projection
-            .unreplaced_items
-            .iter()
-            .all(|item| item_call_id(item) == Some("call-2"))
-    );
-    assert_eq!(projection.items.len(), 2);
-    assert!(
-        projection
-            .items
-            .iter()
-            .all(|item| { item_call_id(item).is_some_and(|call_id| call_id == "call-2") })
-    );
-}
-
-#[test]
-fn tool_history_admission_preserves_unconsumed_identical_parallel_pairs() {
-    let bounded = bounded_output();
-    let supersession_identity = format!(
-        "functions.exec:{}:{}",
-        sha256(b"same action"),
-        sha256(b"same result")
-    );
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        function_call("call-1"),
-        text_output("call-1", bounded.clone()),
-        function_call("call-2"),
-        text_output("call-2", bounded.clone()),
-        function_call("call-3"),
-        text_output("call-3", bounded.clone()),
-    ]);
-    let mut state = ToolHistoryState::default();
-    for call_id in ["call-1", "call-2", "call-3"] {
-        let mut candidate = candidate(call_id, bounded.clone());
-        candidate.supersession_identity = Some(supersession_identity.clone());
-        state.register(candidate);
-    }
-
-    let projection = state.project(canonical);
-
-    assert_eq!(projection.items.len(), 6);
-    for call_id in ["call-1", "call-2", "call-3"] {
-        assert_eq!(
-            projection
-                .items
-                .iter()
-                .filter(|item| item_call_id(item).is_some_and(|id| id == call_id))
-                .count(),
-            2,
-            "call/output pair should remain visible for {call_id}"
-        );
-    }
-}
-
-#[test]
-fn legacy_result_only_supersession_identity_does_not_collapse_actions() {
-    let bounded = bounded_output();
-    let mut first = candidate("call-1", bounded.clone());
-    first.supersession_identity = Some(format!("functions.exec:{}", sha256(b"same result")));
-    first.consumed_by_generation = Some(ModelGenerationId {
-        turn_id: "turn-1".into(), ordinal: 0,
-    });
-    let mut second = candidate("call-2", bounded.clone());
-    second.supersession_identity = first.supersession_identity.clone();
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        function_call("call-1"),
-        text_output("call-1", bounded.clone()),
-        function_call("call-2"),
-        text_output("call-2", bounded),
-    ]);
-    let mut state = ToolHistoryState::default();
-    state.register(first);
-    state.register(second);
-
-    let projection = state.project(canonical);
-
-    assert_eq!(projection.items.len(), 4);
-    assert!(
-        projection
-            .items
-            .iter()
-            .any(|item| item_call_id(item) == Some("call-1"))
-    );
-    assert!(
-        projection
-            .items
-            .iter()
-            .any(|item| item_call_id(item) == Some("call-2"))
-    );
-}
-
-#[test]
-fn mcp_content_item_receipt_preserves_non_text_modalities() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let call_id = "mcp-call";
-    let bounded = bounded_output();
-    let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputText {
-                text: bounded.clone(),
-            },
-            FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,aW1hZ2U=".to_string(),
-                detail: None,
-            },
-            FunctionCallOutputContentItem::EncryptedContent {
-                encrypted_content: "opaque".to_string(),
-            },
-        ]),
-        internal_chat_message_metadata_passthrough: None,
-    }]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, bounded));
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let projection = state.project(canonical);
-    let ResponseItem::FunctionCallOutput { output, .. } = &projection.items[0] else {
-        panic!("expected function output");
-    };
-    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
-        panic!("expected MCP content items");
-    };
-    assert!(matches!(
-        &items[0],
-        FunctionCallOutputContentItem::InputText { text }
-            if serde_json::from_str::<ToolHistoryReceiptV2>(text).is_ok()
-    ));
-    assert!(matches!(
-        &items[1],
-        FunctionCallOutputContentItem::InputImage { image_url, .. }
-            if image_url == "data:image/png;base64,aW1hZ2U="
-    ));
-    assert!(matches!(
-        &items[2],
-        FunctionCallOutputContentItem::EncryptedContent { encrypted_content }
-            if encrypted_content == "opaque"
-    ));
-}
-
-#[test]
-fn mcp_multi_text_content_is_canonicalized_and_receipted_without_losing_modalities() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let call_id = "mcp-multi-text";
-    let first = "first section\n".repeat(2_000);
-    let second = "second section\n".repeat(2_000);
-    let bounded = format!("{first}\n{second}");
-    assert!(approx_token_count(&bounded) > model_visible_tool_result_token_budget());
-    let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputText { text: first },
-            FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,aW1hZ2U=".to_string(),
-                detail: None,
-            },
-            FunctionCallOutputContentItem::InputText { text: second },
-            FunctionCallOutputContentItem::EncryptedContent {
-                encrypted_content: "opaque".to_string(),
-            },
-        ]),
-        internal_chat_message_metadata_passthrough: None,
-    }]);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate(call_id, bounded));
-    assert!(state.mark_consumed(
-        &canonical,
-        ModelGenerationId {
-            turn_id: "turn-1".to_string(),
-            ordinal: 1,
-        },
-    ));
-
-    let projection = state.project(canonical);
-    let ResponseItem::FunctionCallOutput { output, .. } = &projection.items[0] else {
-        panic!("expected function output");
-    };
-    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
-        panic!("expected content items");
-    };
-    assert_eq!(
-        items
-            .iter()
-            .filter(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
-            .count(),
-        1
-    );
-    assert!(items.iter().any(|item| matches!(
-        item,
-        FunctionCallOutputContentItem::InputText { text }
-            if serde_json::from_str::<ToolHistoryReceiptV2>(text).is_ok()
-    )));
-    assert!(items.iter().any(|item| matches!(
-        item,
-        FunctionCallOutputContentItem::InputImage { image_url, .. }
-            if image_url == "data:image/png;base64,aW1hZ2U="
-    )));
-    assert!(items.iter().any(|item| matches!(
-        item,
-        FunctionCallOutputContentItem::EncryptedContent { encrypted_content }
-            if encrypted_content == "opaque"
-    )));
-}
-
-#[test]
 fn structural_receipt_validation_rejects_receipt_like_text_and_tampering() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-1";
     let bounded = bounded_output();
     let canonical: Arc<[ResponseItem]> = Arc::from([text_output(call_id, bounded.clone())]);
@@ -5374,13 +4046,13 @@ fn structural_receipt_validation_rejects_receipt_like_text_and_tampering() {
             ordinal: 1,
         },
     );
-    let projection = state.project(canonical);
-    let ResponseItem::FunctionCallOutput { output, .. } = &projection.items[0] else {
-        panic!("expected receipt output");
-    };
-    let FunctionCallOutputBody::Text(receipt) = &output.body else {
-        panic!("expected text receipt");
-    };
+    let (_, receipt, _) = state.candidates[call_id]
+        .receipt()
+        .expect("consumed output has a receipt");
+    assert!(response_item_has_valid_tool_history_receipt(&text_output(
+        call_id,
+        receipt.to_string(),
+    )));
     let mut tampered: serde_json::Value =
         serde_json::from_str(receipt).expect("valid receipt JSON");
     tampered["receipt_id"] = serde_json::Value::String("thr1-tampered".to_string());
@@ -5417,7 +4089,6 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         code_mode_nested_evidence: BTreeMap::new(),
         internal_artifact_origins: BTreeMap::new(),
         artifact_call_ids: BTreeMap::new(),
-        model_visible_tool_result_token_budget: None,
         workspace_projection_cache: Arc::default(),
         ..Default::default()
     };
@@ -5440,13 +4111,10 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
 }
 
 #[tokio::test]
-async fn recovered_source_does_not_displace_newer_evidence_after_persistence() {
+async fn artifact_recovery_marks_persist_until_history_retires_them() {
     let temp = tempfile::tempdir().unwrap();
     let output = "exact source evidence ".repeat(500);
-    let _budget = override_model_visible_tool_result_token_budget_for_test(
-        approx_token_count(&output) + 1_000);
     let mut state = ToolHistoryState::default();
-    let mut items = Vec::new();
     for id in ["old-hot", "new-cold"] {
         let mut record = candidate(id, output.clone());
         let canonical = CanonicalToolResult::text(output.clone());
@@ -5456,12 +4124,7 @@ async fn recovered_source_does_not_displace_newer_evidence_after_persistence() {
         record.artifact_sha256 = canonical.sha256;
         record.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
         state.register(record);
-        items.extend([function_call(id), text_output(id, output.clone())]);
     }
-    let items: Arc<[ResponseItem]> = items.into();
-    let baseline = state.project(Arc::clone(&items));
-    assert!(baseline.items.iter().filter_map(textual_output_identity)
-        .any(|(id, text)| id == "new-cold" && text == output));
     assert!(!ToolHistoryMutation::MarkArtifactRecovered { artifact_id: "unknown".into() }.apply(&mut state));
     persist_tool_history_state(temp.path(), "thread", &state).await.unwrap();
     let mutation = ToolHistoryMutation::MarkArtifactRecovered {
@@ -5471,41 +4134,13 @@ async fn recovered_source_does_not_displace_newer_evidence_after_persistence() {
     assert!(!mutation.apply(&mut state), "repeated recovery must not grow the ledger");
     persist_tool_history_mutations(temp.path(), "thread", "writer", &[(1, mutation)]).await.unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
-    let projection = restored.project(items);
-    let outputs = projection.items.iter().filter_map(textual_output_identity).collect::<Vec<_>>();
-    assert!(!outputs.iter().any(|(id, text)| *id == "old-hot" && *text == output));
-    assert!(outputs.iter().any(|(id, text)| *id == "new-cold" && *text == output));
-    assert!(restored.reuse_priority("new-cold", 0) < restored.reuse_priority("old-hot", 5));
-    assert!(restored.reuse_priority("new-unread", 2) < restored.reuse_priority("old-hot", 5));
+    assert_eq!(restored.recovered_call_ids, BTreeSet::from(["old-hot".to_string()]));
     persist_tool_history_state(temp.path(), "thread", &restored).await.unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
-    assert!(restored.recovered_call_ids.contains("old-hot"));
+    assert_eq!(restored.recovered_call_ids, BTreeSet::from(["old-hot".to_string()]));
     let mut retired = restored;
     retired.retain_for_history(&[]);
     assert!(retired.recovered_call_ids.is_empty());
-}
-
-#[test]
-fn recovered_evidence_does_not_promote_its_mixed_purpose_carrier() {
-    let mut state = ToolHistoryState::default();
-    let output = text_output("nested", "exact file evidence".into());
-    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-        None, &output, BTreeSet::from([SourceDependencyV1::new(Path::new("file.txt"), false)])
-    ).unwrap());
-    assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
-        parent_call_id: "outer".into(), call_id: "nested".into(), output: "exact file evidence".into(),
-    }.apply(&mut state));
-    assert!(ToolHistoryMutation::RegisterArtifactOrigin {
-        artifact_id: "file-artifact".into(), call_id: "nested".into(), bytes: 19,
-        sha256: sha256(b"exact file evidence"),
-    }.apply(&mut state));
-    assert_eq!(state.reuse_priority("outer", 5), state.reuse_priority("cold", 5));
-    assert!(ToolHistoryMutation::MarkArtifactRecovered {
-        artifact_id: "file-artifact".into(),
-    }.apply(&mut state));
-    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-    assert_eq!(restored.reuse_priority("outer", 5), restored.reuse_priority("cold", 5));
-    assert!(restored.reuse_priority("unread", 2) < restored.reuse_priority("outer", 5));
 }
 
 #[test]
@@ -5520,7 +4155,7 @@ fn compaction_artifact_references_survive_history_replacement() {
         sha256: sha256(b"canonical artifact"),
     })
     .expect("serialize artifact pin");
-    let receipt = record.admission_receipt().unwrap().1.to_string();
+    let receipt = record.render_receipt(false, false).unwrap().1.to_string();
     for summary in [pin, receipt] {
         let mut state = ToolHistoryState::default();
         state.register(record.clone());
@@ -5533,7 +4168,7 @@ fn compaction_artifact_references_survive_history_replacement() {
 fn confirmed_performance_artifact_reference_walker_matches_borrowed_receipt_and_pin_objects() {
     let candidate = candidate("call-1", bounded_output());
     let (_, receipt, _) = candidate
-        .admission_receipt()
+        .render_receipt(false, false)
         .expect("complete candidate has an admission receipt");
     let receipt: serde_json::Value = serde_json::from_str(receipt).expect("receipt JSON");
     let pin = serde_json::json!({
@@ -5596,19 +4231,14 @@ fn compaction_pins_exact_inline_output_but_rejects_same_count_changed_identifier
 
 #[test]
 fn token_backfire_compaction_pins_artifact_without_model_copying_receipt() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let call_id = "call-1";
     let output = bounded_output();
     let mut state = ToolHistoryState::default();
     state.register(candidate(call_id, output.clone()));
-    let projection = state.project(Arc::from([
-        function_call(call_id),
-        text_output(call_id, output),
-    ]));
 
     let pin_payload = state
-        .artifact_pin_payload_for_items(&projection.items)
-        .expect("the compaction projection must yield a deterministic recovery sidecar");
+        .artifact_pin_payload_for_items(&[function_call(call_id), text_output(call_id, output)])
+        .expect("compacted history must yield a deterministic recovery sidecar");
     let pins: serde_json::Value = serde_json::from_str(&pin_payload).expect("valid pin payload");
     let artifact = &pins["artifacts"][0];
     assert_eq!(
@@ -6044,7 +4674,6 @@ async fn recovery_checkpoint_cancellation_keeps_source_until_successful_restart(
 
 #[tokio::test]
 async fn fork_remints_receipt_artifact_into_child_namespace() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let temp = tempfile::tempdir().expect("tempdir");
     let source_thread_id = "source-thread";
     let target_thread_id = "target-thread";
@@ -6097,14 +4726,9 @@ async fn fork_remints_receipt_artifact_into_child_namespace() {
         .expect("persist target ledger");
     let restored =
         expect_loaded_tool_history(load_tool_history_state(temp.path(), target_thread_id).await);
-    let projection = restored.project(canonical_history);
-    assert_eq!(projection.substitutions.len(), 1);
-    let ResponseItem::FunctionCallOutput { output, .. } = &projection.items[0] else {
-        panic!("expected projected function output");
-    };
-    let FunctionCallOutputBody::Text(receipt) = &output.body else {
-        panic!("expected receipt text");
-    };
+    let (_, receipt, _) = restored.candidates[call_id]
+        .receipt()
+        .expect("the consumed output keeps a receipt in the child ledger");
     let receipt: ToolHistoryReceiptV2 = serde_json::from_str(receipt).expect("receipt JSON");
     assert_eq!(receipt.artifact_id, target_artifact_id);
     assert_eq!(
@@ -6118,16 +4742,6 @@ async fn fork_remints_receipt_artifact_into_child_namespace() {
             .await
             .expect("read source artifact"),
         canonical_bytes
-    );
-    assert_ne!(
-        temp.path()
-            .join("tool-output")
-            .join(source_thread_id)
-            .join(format!("{source_artifact_id}.log")),
-        temp.path()
-            .join("tool-output")
-            .join(target_thread_id)
-            .join(format!("{target_artifact_id}.log"))
     );
 }
 
@@ -6253,10 +4867,10 @@ fn receipt_and_candidate_fingerprints_are_cached_and_reused() {
     );
 
     let first = candidate
-        .admission_receipt()
+        .render_receipt(false, false)
         .expect("complete candidate has an admission receipt");
     let second = candidate
-        .admission_receipt()
+        .render_receipt(false, false)
         .expect("cached admission receipt remains available");
     assert_eq!(first, second);
     assert_eq!(first.0, candidate.derived.receipt_id);
@@ -6432,7 +5046,8 @@ fn workspace_observation_from_argument_parts_matches_payload_classifier() {
         };
         assert_eq!(
             tool_call_observes_workspace_parts("exec_command", arguments),
-            tool_call_observes_workspace("exec_command", &payload),
+            classify_workspace_tool_call("exec_command", &payload, std::path::Path::new("."))
+                .observes_workspace,
             "argument-only classification diverged for {arguments}"
         );
     }
@@ -6458,10 +5073,10 @@ fn borrowed_ledger_serialization_matches_owned_compatibility_shape() {
     assert_eq!(borrowed, owned);
 }
 
-#[test]
-fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reuse() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
+#[tokio::test]
+async fn cargo_manifest_read_failures_widen_scope_without_losing_selective_invalidation() {
     let temp = tempfile::tempdir().expect("workspace fixture");
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let workspace = temp.path().join("workspace");
     let app = workspace.join("app");
     let support = temp.path().join("support");
@@ -6560,8 +5175,7 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
             );
         }
 
-        let bounded = bounded_output();
-        let mut output = text_output(case, bounded.clone());
+        let mut output = text_output(case, "test result: ok. 1 passed".to_string());
         let ResponseItem::FunctionCallOutput { output: body, .. } = &mut output else {
             unreachable!();
         };
@@ -6570,186 +5184,59 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
             named_function_call_with_arguments(case, "cargo_test", arguments.clone()),
             output.clone(),
         ]);
-        let mut tracked = candidate(case, bounded);
-        tracked.tool_identity = "cargo_test".to_string();
-        tracked.source_dependencies = classification.source_dependencies.clone();
-        let known_dependencies = !tracked.source_dependencies.is_empty();
-        let captured = workspace_identity("captured");
+        let known_dependencies = !classification.source_dependencies.is_empty();
+        let captured = workspace_identity_at(temp.path(), "captured");
+        let observation = WorkspaceEvidenceObservation::from_response_item_with_freshness(
+            Some(captured.clone()),
+            &output,
+            classification.source_dependencies,
+            true,
+        )
+        .expect("successful tool observation");
         let mut state = ToolHistoryState::default();
-        state.register(tracked);
-        state.register_workspace_evidence(
-            WorkspaceEvidenceObservation::from_response_item_with_freshness(
-                Some(captured.clone()),
-                &output,
-                classification.source_dependencies,
-                true,
-            )
-            .expect("successful tool observation"),
-        );
-        assert!(state.mark_consumed(
-            &canonical,
-            ModelGenerationId {
-                turn_id: case.to_string(),
-                ordinal: 1
-            },
-        ));
-        let initial =
-            state.project_with_workspace_identity(Arc::clone(&canonical), Some(&captured));
-        let (_, receipt_text) =
-            textual_output_identity(&initial.items[1]).expect("initial receipt");
-        if known_dependencies {
-            let receipt: ToolHistoryReceiptV2 =
-                serde_json::from_str(receipt_text).expect("valid scoped receipt");
-            assert_eq!(receipt.call_id, case);
-            assert_eq!(receipt.artifact_id, "artifact-1");
-            assert_eq!(receipt.bytes, 96_000);
+        state.register_workspace_evidence(if known_dependencies {
+            watched(&cache, temp.path(), observation).await
         } else {
-            let notice: serde_json::Value = serde_json::from_str(receipt_text).unwrap();
-            assert_eq!(notice["workspace_evidence_freshness"], "unknown");
-            assert_eq!(notice["historical_authenticity"], "authenticated");
-            assert!(notice["historical_digest"].as_str().unwrap().contains("bounded model-visible tool output"));
+            observation
+        });
+        // A recorded scope stays current until it changes; an unknown scope is never proven.
+        let initial = freshness_notices(&state, &canonical, Some(&captured), &cache);
+        assert_eq!(initial.is_empty(), known_dependencies, "{case}");
+        if let Some(notice) = initial.first() {
+            assert_eq!(notice["reason_code"], "workspace_freshness_unverified", "{case}");
         }
 
         for (path, must_be_stale) in [(&unrelated, !complete), (&transitive.join("lib.rs"), true)] {
-            let changed = workspace_identity("changed");
+            let changed = workspace_identity_at(temp.path(), "changed");
             state.invalidate_source_dependencies(
                 Some(&BTreeSet::from([path.clone()])),
                 Some(&changed),
             );
-            let projected =
-                state.project_with_workspace_identity(Arc::clone(&canonical), Some(&changed));
-            if must_be_stale {
-                let (_, text) = textual_output_identity(&projected.items[1]).expect("stale output");
-                let mut value: serde_json::Value =
-                    serde_json::from_str(text).expect("stale evidence JSON");
-                let digest = value
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("historical_digest")
-                    .expect("authenticated historical output");
-                let digest = digest.as_str().unwrap();
-                assert!(digest.contains("bounded model-visible tool output"));
-                assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
-                assert_eq!(value["qualification"], "Currentness unknown; no dependency change established");
-                assert_eq!(value["historical_authenticity"], "authenticated");
-                assert_eq!(value["workspace_evidence_freshness"], "unknown");
-                assert_eq!(value["source_scope"]["dependency_scope"], if known_dependencies { "recorded" } else { "unknown" });
-                assert!(value["source_scope"]["dependencies"].as_array().is_some_and(|dependencies|
-                    dependencies.is_empty() != known_dependencies
-                        && dependencies.iter().all(|dependency| dependency["freshness"] == "unknown")));
-                for key in ["qualification", "historical_authenticity", "workspace_evidence_freshness", "source_scope"] {
-                    value.as_object_mut().unwrap().remove(key);
-                }
-                assert_eq!(
-                    value,
-                    serde_json::json!({
-                        "call_id": case,
-                        "rerun": { "instruction": "This notice is not a request to rerun tests or builds. Revalidate only if current evidence is essential to the task, using the cheapest scoped read or check with supported arguments; otherwise report the affected claim as unverified. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence." },
-                        "reason": "source dependencies were invalidated after capture; this does not establish which dependency changed; current workspace freshness is unverified",
-                        "stale_workspace_evidence": true,
-                        "reason_code": "source_dependencies_invalidated",
-                        "valid_for_current_workspace": false,
-                        "observed_revision": if complete { &changed } else { &captured },
-                        "current_revision": changed,
-                        "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
-                    }),
-                    "{case}"
+            let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
+            if !must_be_stale {
+                assert!(
+                    notices.is_empty(),
+                    "an unrelated edit must preserve the validation result: {notices:?}"
                 );
-            } else {
-                assert_eq!(
-                    projected.items, initial.items,
-                    "unrelated edit must preserve exact receipt"
-                );
+                continue;
             }
-        }
-    }
-}
-
-#[test]
-fn tool_history_admission_recovers_legacy_non_text_cost_from_response_content() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
-    let image = FunctionCallOutputContentItem::InputImage {
-        image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
-        detail: None,
-    };
-    let images = vec![image; 300];
-    let non_text_tokens = approx_token_count(&serde_json::to_string(&images).unwrap());
-    assert!(non_text_tokens > model_visible_tool_result_token_budget());
-    for legacy_missing_cost in [false, true] {
-        let mut state = ToolHistoryState::default();
-        let mut canonical = Vec::new();
-        for call_id in ["older-image", "newest-image"] {
-            let text = format!("image result for {call_id}");
-            let mut registered = candidate(call_id, text.clone());
-            registered.artifact_id = format!("artifact-{call_id}");
-            registered.preserved_non_text_tokens = Some(non_text_tokens as u64);
-            let mut serialized = serde_json::to_value(registered).unwrap();
-            if legacy_missing_cost {
-                serialized
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("preserved_non_text_tokens");
-            }
-            let restored: ToolHistoryCandidate = serde_json::from_value(serialized).unwrap();
+            assert_eq!(notices.len(), 1, "{case} {path:?}");
+            let notice = &notices[0];
+            assert_eq!(notice["call_id"], case);
+            assert_eq!(notice["reason_code"], "source_dependencies_invalidated", "{case}");
+            assert_eq!(notice["historical_authenticity"], "authenticated", "{case}");
+            assert_eq!(notice["valid_for_current_workspace"], false, "{case}");
             assert_eq!(
-                restored.preserved_non_text_tokens,
-                (!legacy_missing_cost).then_some(non_text_tokens as u64)
+                notice["source_scope"]["dependency_scope"],
+                if known_dependencies { "recorded" } else { "unknown" },
+                "{case}"
             );
-            state.register(restored);
-            canonical.push(function_call(call_id));
-            let mut content = vec![FunctionCallOutputContentItem::InputText { text }];
-            content.extend(images.clone());
-            canonical.push(ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: call_id.to_string(),
-                output: FunctionCallOutputPayload::from_content_items(content),
-                internal_chat_message_metadata_passthrough: None,
-            });
-        }
-        let expected: Arc<[ResponseItem]> = Arc::from(canonical[2..].to_vec());
-        let projection = state.project(Arc::from(canonical));
-        for items in [&projection.items, &projection.unreplaced_items] {
             assert_eq!(
-                &items[..expected.len()],
-                expected.as_ref(),
-                "legacy_missing_cost={legacy_missing_cost}"
-            );
-            assert_eq!(items.len(), expected.len() + 1);
-            assert!(
-                matches!(&items[expected.len()], ResponseItem::Message { role, content, .. }
-                if role == "developer" && format!("{content:?}").contains("1 unread outcomes"))
+                notice["observed_revision"],
+                serde_json::json!(if complete { &changed } else { &captured }),
+                "{case}"
             );
         }
-        assert!(projection.substitutions.is_empty());
-    }
-
-    // Persisted zero is a known text-only cost; only legacy omission needs a scan.
-    // Both remain eligible for normal raw reuse after restoring the ledger.
-    for legacy_missing_cost in [false, true] {
-        let call_id = "text-only";
-        let text = "exact text-only result".to_string();
-        let mut serialized = serde_json::to_value(candidate(call_id, text.clone())).unwrap();
-        assert_eq!(serialized["preserved_non_text_tokens"], 0);
-        if legacy_missing_cost {
-            serialized
-                .as_object_mut()
-                .unwrap()
-                .remove("preserved_non_text_tokens");
-        }
-        let restored: ToolHistoryCandidate = serde_json::from_value(serialized).unwrap();
-        assert_eq!(
-            restored.preserved_non_text_tokens,
-            (!legacy_missing_cost).then_some(0)
-        );
-        let mut state = ToolHistoryState::default();
-        state.register(restored);
-        let canonical: Arc<[ResponseItem]> =
-            Arc::from([function_call(call_id), text_output(call_id, text)]);
-        state.register_non_workspace_code_mode_call(call_id.to_string());
-        let projection = state.project_with_workspace_identity(Arc::clone(&canonical), None);
-        assert_eq!(projection.items, canonical);
-        assert_eq!(projection.unreplaced_items, canonical);
-        assert!(projection.substitutions.is_empty());
     }
 }
 
@@ -6867,118 +5354,6 @@ fn workspace_dependencies_preserve_powershell_parser_host() {
     }
 }
 
-#[test]
-fn aggregate_budget_preserves_freshness_warning_when_pinning_historical_output() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate("stale", "old evidence ".repeat(2000)));
-    let notice = serde_json::json!({
-        "stale_workspace_evidence": true,
-        "valid_for_current_workspace": false,
-        "reason_code": "source_dependencies_invalidated",
-        "rerun": { "instruction": "Revalidate the original source, not this immutable artifact." },
-        "historical_output": "old evidence ".repeat(2000),
-    });
-    let mut items = ProjectedResponseItems::Owned(vec![text_output("stale", notice.to_string())]);
-    assert_eq!(state.enforce_tool_result_budget(&mut items).count, 0);
-    let (_, text) = canonical_textual_output_identity(&items[0]).unwrap();
-    let compact: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(compact["kind"], "tool_history_artifact_pin");
-    assert_eq!(compact["stale_workspace_evidence"], true);
-    assert_eq!(compact["valid_for_current_workspace"], false);
-    assert_eq!(compact["reason_code"], notice["reason_code"]);
-    assert_eq!(compact["rerun"], notice["rerun"]);
-    assert!(approx_token_count(&text) <= 700);
-}
-
-#[test]
-fn aggregate_pressure_keeps_fitting_unread_diagnostics_verbatim() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
-    let detail = format!(
-        "write failed: permission denied\n{}",
-        "details ".repeat(150)
-    );
-    let mut failure = text_output("failure", detail.clone());
-    if let ResponseItem::FunctionCallOutput { output, .. } = &mut failure {
-        output.success = Some(false);
-    }
-    let mut items =
-        ProjectedResponseItems::Owned(vec![failure, text_output("large", "output ".repeat(2000))]);
-    let state = ToolHistoryState::default();
-    assert_eq!(state.enforce_tool_result_budget(&mut items).count, 0);
-    let (_, actual) = items
-        .iter()
-        .filter_map(canonical_textual_output_identity)
-        .find(|(call_id, _)| *call_id == "failure")
-        .unwrap();
-    assert_eq!(actual, detail);
-    let (_, compact) = items
-        .iter()
-        .filter_map(canonical_textual_output_identity)
-        .find(|(call_id, _)| *call_id == "large")
-        .unwrap();
-    let compact: serde_json::Value = serde_json::from_str(&compact).unwrap();
-    assert_eq!(compact["output_omitted"], true);
-    assert!(
-        items
-            .iter()
-            .filter_map(canonical_textual_output_identity)
-            .map(|(_, text)| approx_token_count(&text))
-            .sum::<usize>()
-            <= 700
-    );
-}
-
-#[test]
-fn observed_untracked_output_does_not_displace_newer_source_evidence() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
-    let mut state = ToolHistoryState::default();
-    let old = "old detail ".repeat(220);
-    let source = format!("{}\nrequired final condition", "source ".repeat(260));
-    state.register(candidate("source", source.clone()));
-    let history: Arc<[ResponseItem]> = Arc::from([
-        function_call("old"),
-        text_output("old", old),
-        function_call("source"),
-        text_output("source", source.clone()),
-    ]);
-    let generation = ModelGenerationId {
-        turn_id: "investigation".into(),
-        ordinal: 2,
-    };
-    // Both results were actually delivered, but only the source has an artifact.
-    assert_eq!(
-        state.mark_consumed_with_delta(&history, generation.clone()),
-        BTreeSet::from(["old".into(), "source".into()])
-    );
-    assert!(
-        state
-            .mark_consumed_with_delta(&history, generation)
-            .is_empty()
-    );
-    let projection = state.project(Arc::clone(&history));
-    for items in [&projection.items, &projection.unreplaced_items] {
-        let (_, actual) = items
-            .iter()
-            .filter_map(canonical_textual_output_identity)
-            .find(|(id, _)| *id == "source")
-            .expect("recent source remains available after its first exposure");
-        assert_eq!(actual, source);
-        assert!(
-            items
-                .iter()
-                .filter_map(canonical_textual_output_identity)
-                .map(|(_, text)| approx_token_count(&text))
-                .sum::<usize>()
-                <= 700
-        );
-    }
-    assert_eq!(
-        canonical_textual_output_identity(&history[3]).unwrap().1,
-        source
-    );
-}
-
 #[tokio::test]
 async fn untracked_exposure_survives_journal_checkpoint_and_fork() {
     let temp = tempfile::tempdir().unwrap();
@@ -7033,8 +5408,7 @@ async fn untracked_exposure_survives_journal_checkpoint_and_fork() {
 }
 
 #[test]
-fn untracked_exposure_preserves_fresh_failures_and_late_artifact_registration() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
+fn late_artifact_registration_inherits_untracked_consumption() {
     let mut state = ToolHistoryState::default();
     let generation = ModelGenerationId {
         turn_id: "turn".into(),
@@ -7042,21 +5416,7 @@ fn untracked_exposure_preserves_fresh_failures_and_late_artifact_registration() 
     };
     let old = text_output("seen", "old detail ".repeat(220));
     assert!(state.mark_consumed(std::slice::from_ref(&old), generation.clone()));
-    let detail = format!(
-        "{}\nwrite failed: permission denied",
-        "diagnostic ".repeat(160)
-    );
-    let mut failure = text_output("failure", detail);
-    if let ResponseItem::FunctionCallOutput { output, .. } = &mut failure {
-        output.success = Some(false);
-    }
-    let projection = state.project(Arc::from([old, failure.clone()]));
-    for items in [&projection.items, &projection.unreplaced_items] {
-        assert!(
-            items.contains(&failure),
-            "an undelivered failure retains its full diagnostics"
-        );
-    }
+    assert!(state.output_was_consumed("seen"));
     assert!(!state.output_was_consumed("failure"));
     state.register(candidate("seen", "old detail ".repeat(220)));
     assert_eq!(
@@ -7064,217 +5424,6 @@ fn untracked_exposure_preserves_fresh_failures_and_late_artifact_registration() 
         Some(generation)
     );
     assert!(!state.untracked_consumption.contains_key("seen"));
-}
-
-#[test]
-fn budget_receipts_distinguish_observed_and_unread_untracked_outputs() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
-    let mut state = ToolHistoryState::default();
-    let old = text_output("seen", "previous observation ".repeat(2_000));
-    state.mark_consumed(
-        std::slice::from_ref(&old),
-        ModelGenerationId {
-            turn_id: "turn".into(),
-            ordinal: 1,
-        },
-    );
-    let unread = text_output("unread", "fresh observation ".repeat(2_000));
-    let projection = state.project(Arc::from([old, unread]));
-    for items in [&projection.items, &projection.unreplaced_items] {
-        let receipts = items
-            .iter()
-            .filter_map(canonical_textual_output_identity)
-            .map(|(id, text)| {
-                (
-                    id,
-                    serde_json::from_str::<serde_json::Value>(&text).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(receipts["seen"]["kind"], "observed_tool_outcome");
-        assert_eq!(receipts["unread"]["kind"], "unconsumed_tool_outcome");
-        assert_eq!(receipts["seen"]["output_omitted"], true);
-        assert_eq!(receipts["unread"]["output_omitted"], true);
-    }
-}
-
-#[test]
-fn projected_prompt_preserves_fresh_and_recovered_detail_before_consumed_history() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
-    for tool in ["read_file", "read_tool_output"] {
-        let mut state = ToolHistoryState::default();
-        let old_text = "old validation evidence ".repeat(2000);
-        let mut old = candidate("old", old_text.clone());
-        old.consumed_by_generation = Some(ModelGenerationId {
-            turn_id: "turn".to_string(),
-            ordinal: 0,
-        });
-        state.register(old);
-        state.register_non_workspace_code_mode_call("old".to_string());
-        let fresh = format!(
-            "{}\nDECISIVE: this entire late diagnostic must reach the model",
-            "detail ".repeat(150)
-        );
-        if tool == "read_file" {
-            state.register(candidate("fresh", fresh.clone()));
-        }
-        state.register_non_workspace_code_mode_call("fresh".to_string());
-        let canonical: Arc<[ResponseItem]> = Arc::from([
-            function_call("old"),
-            text_output("old", old_text),
-            named_function_call_with_arguments("fresh", tool, serde_json::json!({})),
-            text_output("fresh", fresh.clone()),
-        ]);
-        let projection = state.project(canonical);
-        for items in [&projection.items, &projection.unreplaced_items] {
-            let (_, actual) = items
-                .iter()
-                .filter_map(canonical_textual_output_identity)
-                .find(|(call_id, _)| *call_id == "fresh")
-                .expect("fresh result survives prompt projection");
-            assert_eq!(
-                actual, fresh,
-                "{tool}: preserve body, not only outcome or handle"
-            );
-        }
-    }
-}
-
-#[test]
-fn unread_failure_and_live_handle_survive_aggregate_pressure() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(700);
-    let state = ToolHistoryState::default();
-    let mut failure = text_output(
-        "failed-write",
-        format!(
-            "write failed: permission denied\n{}",
-            "details ".repeat(2000)
-        ),
-    );
-    if let ResponseItem::FunctionCallOutput { output, .. } = &mut failure {
-        output.success = Some(false);
-    }
-    let live = text_output(
-        "running",
-        format!(
-            "Process running with session ID 12345\n{}",
-            "output ".repeat(2000)
-        ),
-    );
-    let mut items = ProjectedResponseItems::Owned(vec![failure, live]);
-    let drops = state.enforce_tool_result_budget(&mut items);
-    assert_eq!(drops.count, 0);
-    let combined = items
-        .iter()
-        .filter_map(canonical_textual_output_identity)
-        .map(|(_, text)| text.into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(combined.contains("permission denied"));
-    assert!(combined.contains("12345"));
-    assert!(combined.contains("\"successful\":false"));
-    assert!(
-        items
-            .iter()
-            .filter_map(canonical_textual_output_identity)
-            .map(|(_, output)| approx_token_count(&output))
-            .sum::<usize>()
-            <= 700
-    );
-}
-
-#[test]
-fn observed_failure_detail_does_not_evict_an_unread_live_handle() {
-    let old_output = "previously observed failure detail ".repeat(100);
-    let _budget =
-        override_model_visible_tool_result_token_budget_for_test(approx_token_count(&old_output));
-    let mut old = candidate("old-failure", old_output.clone());
-    old.successful = false;
-    old.consumed_by_generation = Some(ModelGenerationId {
-        turn_id: "observed-turn".to_string(),
-        ordinal: 1,
-    });
-    let mut state = ToolHistoryState::default();
-    state.candidates.insert(old.call_id.clone(), old);
-    let mut items = ProjectedResponseItems::Owned(vec![
-        text_output("old-failure", old_output),
-        text_output(
-            "new-live",
-            format!(
-                "Process running with session ID 12345\n{}",
-                "output ".repeat(2000),
-            ),
-        ),
-    ]);
-    let drops = state.enforce_tool_result_budget(&mut items);
-    assert_eq!(drops.count, 0);
-    let old = items
-        .iter()
-        .find(|item| item_call_id(item) == Some("old-failure"))
-        .expect("the older result can still fit as an exact recovery handle");
-    let (_, old_text) = canonical_textual_output_identity(old).unwrap();
-    let old_pin: serde_json::Value = serde_json::from_str(&old_text).unwrap();
-    assert_eq!(old_pin["artifact_id"], "artifact-1");
-    assert_eq!(old_pin["successful"], false);
-    let live = items
-        .iter()
-        .find(|item| item_call_id(item) == Some("new-live"))
-        .expect("new continuation must survive previously observed detail");
-    assert!(
-        canonical_textual_output_identity(live)
-            .unwrap()
-            .1
-            .contains("12345")
-    );
-    assert_eq!(
-        items.len(),
-        2,
-        "both the live handle and the older recovery handle fit"
-    );
-    assert!(
-        items
-            .iter()
-            .filter_map(canonical_textual_output_identity)
-            .map(|(_, text)| approx_token_count(&text))
-            .sum::<usize>()
-            <= model_visible_tool_result_token_budget()
-    );
-}
-
-#[test]
-fn impossible_unread_receipt_budget_reports_unresolved_overflow() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(1);
-    let mut state = ToolHistoryState::default();
-    state.register(candidate("tracked", "tracked output".into()));
-    let mut items = ProjectedResponseItems::Owned(vec![
-        function_call("tracked"),
-        text_output("tracked", "tracked output".into()),
-        function_call("unread"),
-        text_output("unread", "operation failed".into()),
-    ]);
-    let dropped = state.enforce_tool_result_budget(&mut items);
-    assert_eq!(dropped.count, 2);
-    assert!(items.iter().all(|item| item_call_id(item).is_none()));
-    let ResponseItem::Message { content, .. } = &items[0] else {
-        panic!("expected overflow notice");
-    };
-    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else {
-        panic!("expected one text notice");
-    };
-    assert!(text.contains("2 unread outcomes"));
-    // Pairs are removed whole, so recovery depends on the notice naming them.
-    let manifest = text
-        .split_once("Manifest page 1/1, offset 0: ")
-        .and_then(|(_, rest)| rest.split_once(". Recover each"))
-        .map(|(manifest, _)| manifest)
-        .expect("overflow manifest");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(manifest).unwrap(),
-        serde_json::json!([
-            {"call_id": "tracked", "artifact_id": "artifact-1"},
-            {"call_id": "unread"},
-        ])
-    );
 }
 
 #[tokio::test]
@@ -7301,36 +5450,16 @@ async fn audit_equal_git_identity_does_not_override_dependency_watcher() {
         .unwrap()
         .with_source_path_observations(vec![proof]),
     );
-    assert_eq!(
-        state
-            .project_with_workspace_cache(Arc::clone(&canonical), Some(&revision), &cache)
-            .items,
-        canonical
-    );
+    assert!(freshness_notices(&state, &canonical, Some(&revision), &cache).is_empty());
     std::fs::write(&source, "after!").unwrap();
     cache
         .note_host_workspace_mutation_paths(root.path(), &["ignored-input.txt".to_owned()])
         .await;
-    let projected = state.project_with_workspace_cache(canonical, Some(&revision), &cache);
-    let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
-    assert!(text.contains("stale_workspace_evidence"));
-    assert!(text.contains("workspace_freshness_unverified"));
-}
-
-#[test]
-fn unread_structured_admission_overflow_is_explicit_in_both_projections() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(1);
-    let projection =
-        ToolHistoryState::default().project(Arc::from(tool_search_pair("unread-search", 1000)));
-    for items in [&projection.items, &projection.unreplaced_items] {
-        assert!(
-            items
-                .iter()
-                .all(|item| item_call_id(item) != Some("unread-search"))
-        );
-        assert!(items.iter().any(|item| matches!(item,
-            ResponseItem::Message { content, .. } if format!("{content:?}").contains("1 unread outcomes"))));
-    }
+    let notices = freshness_notices(&state, &canonical, Some(&revision), &cache);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["stale_workspace_evidence"], true);
+    assert_eq!(notices[0]["reason_code"], "workspace_freshness_unverified");
+    assert_eq!(notices[0]["workspace_evidence_freshness"], "changed");
 }
 
 #[test]
@@ -7399,7 +5528,7 @@ fn internal_artifact_provenance_and_protection_survive_resume_and_history_retent
     assert!(resumed.is_persisted_empty());
 }
 #[test]
-fn recovery_priority_and_exact_selectors_survive_compaction_metadata() {
+fn exact_recovery_selectors_survive_restore_into_compaction_metadata() {
     let mut state = ToolHistoryState::default();
     let record = candidate("origin", bounded_output());
     let artifact_id = record.artifact_id.clone();
@@ -7413,15 +5542,6 @@ fn recovery_priority_and_exact_selectors_survive_compaction_metadata() {
     assert!(!mutation.apply(&mut state));
     let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
     restored.refresh_derived_and_indexes();
-    assert!(restored.reuse_priority("recovery", 2) < restored.reuse_priority("cold", 2));
-    let output = text_output("recovery", serde_json::json!({
-        "artifact_id": artifact_id,
-        "results": [{"selector": selector, "status": "ok", "text": "exact"}],
-    }).to_string());
-    let (receipt, _) = restored.tool_result_budget_receipt(&output, "recovery").unwrap();
-    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
-    assert_eq!(receipt["recovery"]["artifact_id"], artifact_id);
-    assert_eq!(receipt["recovery"]["selectors"], serde_json::json!([selector]));
     let pin: serde_json::Value = serde_json::from_str(&restored.artifact_pin_payload_for_items(&[
         function_call("origin"), text_output("origin", bounded_output())
     ]).unwrap()).unwrap();
@@ -7537,7 +5657,6 @@ async fn overflow_directory_preserves_every_artifact_after_replacement_and_resum
 }
 #[test]
 fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(3000);
     let fact = format!("{}\nDECISIVE_FACT: use the canonical byte offset, not the display offset\n{}",
         "source prelude\n".repeat(80), "source suffix\n".repeat(80));
     let failure = "error: the current implementation addresses normalized bytes\n".repeat(8);
@@ -7553,73 +5672,29 @@ fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
     for call_id in ["generic", "reviewed", "failure"] {
         state.register_non_workspace_code_mode_call(call_id.to_string());
     }
+    let receipts = state.phase_checkpoint_receipts(&["reviewed".into()]).unwrap();
     let checkpoint = ResponseItem::Message {
-        id:None, role:"assistant".into(), content:vec![codex_protocol::models::ContentItem::InputText {
+        id:None, role:"developer".into(), content:vec![codex_protocol::models::ContentItem::InputText {
             text:format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
-                state.phase_checkpoint_receipts(&["reviewed".into()]).unwrap()),
+                serde_json::json!({"receipts":receipts})),
         }], phase:None, internal_chat_message_metadata_passthrough:None,
     };
+    // The checkpoint is live: a sampling projection would retire the reviewed result.
+    assert_eq!(phase_checkpoint_ids(&checkpoint), Some(vec!["reviewed".to_string()]));
     let items = [function_call("generic"), text_output("generic", generic),
         function_call("reviewed"), text_output("reviewed", fact.clone()), checkpoint,
         function_call("failure"), text_output("failure", failure.clone())];
     let mut history = crate::context_manager::ContextManager::new();
     history.set_tool_history_state(state);
     history.record_items(items.iter(), TruncationPolicy::Tokens(100_000));
-    let prompt = history.for_compaction_prompt_with_completed_tool_projection(
-        &[codex_protocol::openai_models::InputModality::Text], None);
+    // The local summarizer cannot read artifacts, so even the checkpointed result stays raw.
+    let prompt = history.for_local_compaction_prompt(
+        &[codex_protocol::openai_models::InputModality::Text], None,
+        &GitWorkspaceCache::with_noop_watcher_for_tests());
     let outputs = prompt.iter().filter_map(canonical_textual_output_identity).collect::<BTreeMap<_, _>>();
     assert_eq!(outputs.get("reviewed").map(std::convert::AsRef::as_ref), Some(fact.as_str()));
     assert_eq!(outputs.get("failure").map(std::convert::AsRef::as_ref), Some(failure.as_str()));
-    let tokens = prompt.iter().filter_map(canonical_textual_output_identity)
-        .map(|(_, text)| approx_token_count(&text)).sum::<usize>();
-    assert!(tokens <= 3000, "compaction reuses its existing allowance: {tokens}");
 }
-#[test]
-fn verified10_search_receipts_are_semantically_idempotent() {
-    for omitted in [Some(0), Some(7), None] {
-        let mut item = tool_search_pair("idempotent", 2000)[1].clone();
-        if let ResponseItem::ToolSearchOutput { tools, omitted_result_count, .. } = &mut item {
-            *tools = (0..80).map(|index| serde_json::json!({"name":format!("tool-{index}"), "description":"detail".repeat(100)})).collect();
-            *omitted_result_count = omitted;
-        }
-        let (once, _) = tool_search_receipt_item(&item, Some(&serde_json::json!({"query":"scope"}))).unwrap();
-        let (twice, _) = tool_search_receipt_item(&once, None).unwrap();
-        assert_eq!(once, twice);
-        let receipt = tool_search_receipt(&twice).unwrap();
-        assert_eq!(receipt.result_count, 80);
-        assert_eq!(receipt.omitted_result_count, omitted);
-        assert_eq!(receipt.ordered_tool_identities.len() + receipt.omitted_identity_count, 80);
-        let mut invalid = twice;
-        if let ResponseItem::ToolSearchOutput { tools, .. } = &mut invalid { tools[0]["receipt"]["result_count"] = 1.into(); }
-        assert!(tool_search_receipt_item(&invalid, None).is_none());
-    }
-}
-
-#[test]
-fn verified10_pressure_keeps_exact_nested_continuation_contracts() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(100);
-    let states = (0..4).map(|index| serde_json::json!({
-        "call_id":format!("nested-{index}"), "session_id":index + 1,
-        "execution_state":"running", "process_exited":false,
-        "session_capabilities":{"stdin":index == 0, "interrupt":index == 1,
-            "polling":true, "cancellation":index != 1, "incarnation":format!("creation-{index}")},
-        "pending_deferred_completions":[format!("job-{index}")],
-        "continuation":{"tool":"write_stdin", "arguments":{"session_id":index+1, "incarnation":format!("creation-{index}"), "chars":""}}
-    })).collect::<Vec<_>>();
-    for output in [
-        serde_json::json!({"essential":{"nested_commands":states}, "output":"log ".repeat(4000)}).to_string(),
-        format!("{}\nNested command states (independent of script completion):\n{}", "log ".repeat(4000), serde_json::json!(states)),
-    ] {
-        let state = ToolHistoryState::default();
-        let mut items = ProjectedResponseItems::Owned(vec![text_output("batch", output)]);
-        assert_eq!(state.enforce_tool_result_budget(&mut items).count, 0);
-        let (_, output) = canonical_textual_output_identity(&items[0]).unwrap();
-        let receipt: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(receipt["control"]["nested_commands"], serde_json::json!(states));
-        assert!(receipt["output_omitted"].as_bool().unwrap());
-    }
-}
-
 #[test]
 fn verified10_typed_receipts_distinguish_scope_and_incomplete_coverage() {
     for (path, complete) in [("owner.rs", true), ("consumer.rs", false)] {
@@ -7633,16 +5708,15 @@ fn verified10_typed_receipts_distinguish_scope_and_incomplete_coverage() {
         assert_eq!(pin["evidence"]["file_complete"], complete);
         assert_eq!(pin["evidence"]["results"][0]["selector"]["start"], 5);
         assert!(pin["evidence"]["results"][0].get("text").is_none());
-        if let Some((_, receipt, _)) = record.admission_receipt() {
-            let receipt: serde_json::Value = serde_json::from_str(receipt).unwrap();
-            assert_eq!(receipt["evidence"], pin["evidence"]);
-        }
+        let (_, receipt, _) = record.render_receipt(false, false)
+            .expect("typed read evidence fits the receipt");
+        let receipt: serde_json::Value = serde_json::from_str(receipt).unwrap();
+        assert_eq!(receipt["evidence"], pin["evidence"]);
     }
 }
 
 #[test]
 fn verified10_local_compaction_retains_late_counterexample_under_pressure() {
-    let _budget = override_model_visible_tool_result_token_budget_for_test(200);
     let source = format!("All selected unit tests passed.\n{}\nCounterexample: integration failed; do NOT claim complete coverage.\n{}",
         "irrelevant detail ".repeat(1500), "irrelevant tail ".repeat(1500));
     let mut record = candidate("review", source.clone());

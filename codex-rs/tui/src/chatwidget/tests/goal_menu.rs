@@ -14,6 +14,19 @@ async fn goal_summary_status_snapshots() {
         chat.show_goal_summary(test_goal(thread_id, status, budget));
         assert_chatwidget_snapshot!(snapshot, rendered_goal_summary(&mut rx));
     }
+
+    // Complete has no snapshot file; pin its label and command hint inline.
+    chat.show_goal_summary(test_goal(thread_id, AppThreadGoalStatus::Complete, None));
+    assert_eq!(
+        rendered_goal_summary(&mut rx),
+        "Goal\n\
+         Status: complete\n\
+         Objective: Keep improving the bare goal command until it feels calm and useful.\n\
+         Time used: 1m\n\
+         Tokens used: 12.5K\n\
+         \n\
+         Commands: /goal edit, /goal clear\n"
+    );
 }
 
 #[tokio::test]

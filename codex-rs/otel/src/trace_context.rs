@@ -441,6 +441,7 @@ mod tests {
 
     #[test]
     fn reused_headers_follow_supplied_span_and_clear_for_invalid_span() {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
         let provider = SdkTracerProvider::builder().build();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("headers")));
@@ -451,10 +452,20 @@ mod tests {
         headers.insert("tracestate", "stale=value".parse().unwrap());
         headers.insert("authorization", "preserved".parse().unwrap());
         assert!(super::inject_span_w3c_trace_headers(&span, &mut headers));
-        let expected = super::span_w3c_trace_context(&span).unwrap();
+        // Expect the supplied span's own ids in W3C form, not the output of the helper
+        // the injection is built on.
+        let context = span.context();
+        let otel_span = context.span();
+        let span_context = otel_span.span_context();
+        assert!(span_context.is_valid());
         assert_eq!(
             headers["traceparent"].to_str().unwrap(),
-            expected.traceparent.unwrap()
+            format!(
+                "00-{}-{}-{:02x}",
+                span_context.trace_id(),
+                span_context.span_id(),
+                u8::from(span_context.is_sampled())
+            )
         );
         assert!(!headers.contains_key("tracestate"));
         headers.insert("tracestate", "stale=value".parse().unwrap());
@@ -521,6 +532,9 @@ mod tests {
             super::validate_tracestate_member(key, &fields).unwrap();
         }
         assert!(super::validate_tracestate_member("vendor", &BTreeMap::new()).is_err());
+        // `f:` plus the value is the encoded member value, capped at 256 bytes.
+        let longest = BTreeMap::from([("f".to_string(), "v".repeat(254))]);
+        super::validate_tracestate_member("vendor", &longest).unwrap();
         let oversized = BTreeMap::from([("f".to_string(), "v".repeat(255))]);
         assert!(super::validate_tracestate_member("vendor", &oversized).is_err());
         let mut entries: BTreeMap<_, _> = (0..32)

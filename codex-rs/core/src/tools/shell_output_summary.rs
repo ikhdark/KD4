@@ -98,9 +98,31 @@ pub(crate) fn summarize_shell_output_for_model_with_streams(
     if options.command_text.is_some_and(|command| {
         is_read_only_command(command)
             || powershell_command_segments(command).is_some_and(|segments| {
-                segments
-                    .into_iter()
-                    .any(|segment| source_read_output_budget(segment).is_some())
+                segments.into_iter().any(|segment| {
+                    // A reader inside control flow keeps its block's closers, and
+                    // its operand can be a loop variable that the read-only parser
+                    // cannot bind in isolation. Neither changes what it prints.
+                    let segment = segment
+                        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '}' | ')'));
+                    if source_read_output_budget(segment).is_some() {
+                        return true;
+                    }
+                    let is_variable = |word: &str| {
+                        word.strip_prefix('$').is_some_and(|name| {
+                            !name.is_empty()
+                                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        })
+                    };
+                    segment.split_whitespace().any(is_variable)
+                        && source_read_output_budget(
+                            &segment
+                                .split_whitespace()
+                                .map(|word| if is_variable(word) { "operand" } else { word })
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                        .is_some()
+                })
             })
     }) {
         if let Some(command) = options.command_text

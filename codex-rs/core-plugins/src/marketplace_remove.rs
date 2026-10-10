@@ -296,14 +296,17 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &root).unwrap();
         assert!(!root.exists());
+        let err = remove_marketplace_sync(
+            home.path(),
+            MarketplaceRemoveRequest {
+                marketplace_name: "debug".to_string(),
+            },
+        )
+        .unwrap_err();
+        // A staging failure would also leave the link in place without exercising the restore.
         assert!(
-            remove_marketplace_sync(
-                home.path(),
-                MarketplaceRemoveRequest {
-                    marketplace_name: "debug".to_string()
-                }
-            )
-            .is_err()
+            err.to_string()
+                .contains("failed to remove marketplace 'debug' from user config.toml")
         );
         assert_eq!(fs::read_link(root).unwrap(), target);
     }

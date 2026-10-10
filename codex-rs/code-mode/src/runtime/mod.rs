@@ -471,19 +471,6 @@ async fn receive_runtime_startup<T>(
     }
 }
 
-#[cfg(test)]
-fn spawn_supervised_runtime_thread(
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    task_failure_handler: Option<TaskFailureHandler>,
-    runtime: impl FnOnce() + Send + 'static,
-) {
-    thread::spawn(move || {
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(runtime)) {
-            report_runtime_panic(payload, event_tx, task_failure_handler);
-        }
-    });
-}
-
 fn report_runtime_panic(
     payload: Box<dyn std::any::Any + Send>,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
@@ -1008,7 +995,6 @@ mod tests {
     use super::RuntimeEvent;
     use super::receive_runtime_startup;
     use super::spawn_runtime;
-    use super::spawn_supervised_runtime_thread;
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
@@ -1207,39 +1193,59 @@ if (results.next.value !== 8 || results.next.step_id !== "plan-step") throw Erro
         assert_eq!(startup_tx.send(Ok(())), Err(Ok(())));
     }
 
+    /// Starts a production runtime thread whose startup gate panics inside the
+    /// supervised section: the gate's release sender is already gone.
+    async fn spawn_panicking_runtime(
+        event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+        task_failure_handler: Option<crate::TaskFailureHandler>,
+    ) {
+        let (release, receiver) = std::sync::mpsc::channel();
+        drop(release);
+        let gate = std::sync::Arc::new(super::StartupTestGate {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(receiver),
+            exited: tokio::sync::Notify::new(),
+        });
+        let started = super::STARTUP_TEST_GATE
+            .scope(gate, spawn_runtime(
+                HashMap::new(), execute_request("text('unreachable');"), 60_000, event_tx,
+                std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
+                task_failure_handler,
+            ))
+            .await;
+        assert_eq!(started.err(), Some("failed to initialize code mode runtime".to_string()));
+    }
+
     #[tokio::test]
     async fn runtime_thread_panic_before_initialization_is_reported_directly() {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         drop(event_rx);
         let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
-        spawn_supervised_runtime_thread(
+        spawn_panicking_runtime(
             event_tx,
             Some(std::sync::Arc::new(move |reason| {
                 let _ = failure_tx.send(reason);
             })),
-            || panic!("runtime thread panic probe"),
-        );
+        )
+        .await;
 
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
-                .await
-                .expect("runtime failure timeout")
-                .expect("runtime failure"),
-            "code-mode V8 runtime thread panicked: runtime thread panic probe"
+        let reason = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+            .await
+            .expect("runtime failure timeout")
+            .expect("runtime failure");
+        assert!(
+            reason.starts_with("code-mode V8 runtime thread panicked: "),
+            "{reason}"
         );
     }
 
     #[tokio::test]
     async fn runtime_thread_panic_is_forwarded_without_owner_supervision() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        spawn_supervised_runtime_thread(
-            event_tx,
-            /*task_failure_handler*/ None,
-            || panic!("runtime thread panic probe"),
-        );
+        spawn_panicking_runtime(event_tx, /*task_failure_handler*/ None).await;
 
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
                 .await
                 .expect("runtime panic event timeout"),
             Some(RuntimeEvent::ThreadPanicked)

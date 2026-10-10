@@ -315,7 +315,9 @@ mod tests {
         assert!(headers.starts_with("HTTP/1.1 200 OK"));
         assert!(body.is_empty());
 
-        server.shutdown().await;
+        timeout(Duration::from_secs(1), server.shutdown())
+            .await
+            .expect("shutdown must not wait for the held chunk gate");
 
         let mut remaining = Vec::new();
         timeout(
@@ -537,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_responses_are_fifo_and_completion_timestamps_monotonic() {
+    async fn multiple_responses_are_fifo_and_complete_in_request_order() {
         let first_chunks = vec![StreamingSseChunk {
             gate: None,
             body: "event: first\n\n".to_string(),
@@ -559,6 +561,18 @@ mod tests {
         let (_, first_body) = split_response(&first_response);
         assert_eq!(first_body, "event: first\n\n");
 
+        assert_eq!(completions.len(), 2);
+        let first_completion = completions.remove(0);
+        let first_timestamp = timeout(Duration::from_secs(1), first_completion)
+            .await
+            .expect("first response must complete before the second request")
+            .expect("first completion");
+        assert!(first_timestamp > 0);
+        assert!(matches!(
+            completions[0].try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
         let mut second_stream = connect(server.uri()).await;
         send_request(
             &mut second_stream,
@@ -569,13 +583,14 @@ mod tests {
         let (_, second_body) = split_response(&second_response);
         assert_eq!(second_body, "event: second\n\n");
 
-        let first_completion = completions.remove(0);
         let second_completion = completions.remove(0);
-        let first_timestamp = first_completion.await.expect("first completion");
-        let second_timestamp = second_completion.await.expect("second completion");
-        assert!(first_timestamp > 0);
+        let second_timestamp = timeout(Duration::from_secs(1), second_completion)
+            .await
+            .expect("second response must complete")
+            .expect("second completion");
         assert!(second_timestamp > 0);
-        assert!(first_timestamp <= second_timestamp);
+        // Unix wall-clock timestamps can move backwards. Completion ownership,
+        // not their numeric ordering, establishes FIFO behavior.
         assert!(completions.is_empty());
         server.shutdown().await;
     }

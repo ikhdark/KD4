@@ -440,7 +440,13 @@ mod tests {
         let payload = ToolPayload::Function {
             arguments: "{}".to_string(),
         };
-        assert_eq!(output.code_mode_result(&payload)["detail"], json!(expected));
+        // Independently encoded fixture bytes; detail-only checks would also
+        // accept an unrelated image or a constant payload from the handler.
+        let expected_url = "data:application/octet-stream;base64,bm90IGEgcmVhbCBpbWFnZQ==";
+        assert_eq!(
+            output.code_mode_result(&payload),
+            json!({"image_url": expected_url, "detail": expected}),
+        );
         let ResponseInputItem::FunctionCallOutput { output, .. } =
             output.to_response_item("call-view-image", &payload)
         else {
@@ -449,8 +455,12 @@ mod tests {
         let FunctionCallOutputBody::ContentItems(items) = output.body else {
             panic!("expected image content");
         };
-        assert!(
-            matches!(items.as_slice(), [FunctionCallOutputContentItem::InputImage { detail: Some(actual), .. }] if *actual == expected)
+        assert_eq!(
+            items,
+            vec![FunctionCallOutputContentItem::InputImage {
+                image_url: expected_url.to_string(),
+                detail: Some(expected),
+            }],
         );
     }
 

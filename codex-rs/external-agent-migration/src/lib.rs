@@ -1413,10 +1413,7 @@ mod tests {
         let hook_path = Path::new("/repo/.codex")
             .join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR)
             .join(script_name);
-        format!(
-            "python3 {}",
-            shell_single_quote(hook_path.to_string_lossy().as_ref())
-        )
+        format!("python3 '{}'", hook_path.to_string_lossy())
     }
 
     #[test]
@@ -1851,6 +1848,21 @@ command = "repo-server"
             Vec::<String>::new()
         );
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+        // A mappable restriction is carried over instead of blocking the import.
+        fs::write(
+            source.join("mapped.md"),
+            "---\nname: mapped\ndescription: Review\npermissionMode: readOnly\n---\nReview carefully.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            missing_subagent_names(&source, &target).unwrap(),
+            vec!["mapped"]
+        );
+        assert_eq!(import_subagents(&source, &target).unwrap(), vec!["mapped"]);
+        let agent: TomlValue =
+            toml::from_str(&fs::read_to_string(target.join("mapped.toml")).unwrap()).unwrap();
+        assert_eq!(agent["sandbox_mode"].as_str(), Some("read-only"));
     }
 
     #[test]
@@ -1859,9 +1871,12 @@ command = "repo-server"
             parse_document_content("---\nname: incomplete\n---\nInvestigate carefully.\n");
         let missing_body =
             parse_document_content("---\nname: incomplete\ndescription: Missing body\n---\n");
+        let missing_name =
+            parse_document_content("---\ndescription: No name\n---\nInvestigate carefully.\n");
 
         assert!(agent_metadata(&missing_description).is_none());
         assert!(agent_metadata(&missing_body).is_none());
+        assert!(agent_metadata(&missing_name).is_none());
     }
 
     #[test]
@@ -2178,6 +2193,10 @@ Review carefully."""
                         "type": "command",
                         "command": "echo setup",
                         "timeout": -1
+                    }, {
+                        "type": "command",
+                        "command": "echo bounded",
+                        "timeout": 30
                     }]
                 }]
             }
@@ -2198,6 +2217,10 @@ Review carefully."""
                     "hooks": [{
                         "type": "command",
                         "command": "echo setup"
+                    }, {
+                        "type": "command",
+                        "command": "echo bounded",
+                        "timeout": 30
                     }]
                 }]
             })

@@ -1558,6 +1558,26 @@ mod canonical_tests {
     }
 
     #[test]
+    fn essential_projection_preserves_array_indexes_without_promoting_payloads() {
+        let value = serde_json::json!({"results": [
+            {"text": "first payload"},
+            {"status": "failed", "text": "second payload"},
+            "third payload",
+            {"nested": [{"text": "nested payload"}, {"nextCursor": "page-2"}]}
+        ]});
+        let output = JsonToolOutput::new(value.clone());
+        let metadata = output.projection_metadata().expect("JSON projection");
+        assert_eq!(metadata.essential_inline, serde_json::json!({"results": [
+            null,
+            {"status": "failed"},
+            null,
+            {"nested": [null, {"nextCursor": "page-2"}]}
+        ]}));
+        assert_eq!(metadata.spillable_text, vec![value.to_string()]);
+        assert_eq!(output.value(), &value);
+    }
+
+    #[test]
     fn failed_json_output_exposes_failure_signature_as_private_sampling_signal() {
         let output = JsonToolOutput::with_success(
             serde_json::json!({

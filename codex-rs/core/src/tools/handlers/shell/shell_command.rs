@@ -135,13 +135,6 @@ impl ShellCommandHandler {
     }
 
     #[cfg(test)]
-    pub(super) fn base_command(shell: &Shell, command: &str, use_login_shell: bool) -> Vec<String> {
-        shell
-            .derive_exec_args(command, use_login_shell)
-            .expect("test shell must be executable on Windows")
-    }
-
-    #[cfg(test)]
     pub(super) fn to_exec_params(
         params: &ShellCommandToolCallParams,
         invocation: &CommandInvocation,

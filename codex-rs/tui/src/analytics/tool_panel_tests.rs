@@ -62,8 +62,10 @@ fn analytics_tools_handle_empty_days_and_independent_failures() {
     press(&mut view, KeyCode::Left);
     let missing = screen(&mut view, /*width*/ 140, /*height*/ 44);
     assert!(missing.contains("Data not reported for Sep 1."));
+    let marker_row = empty.lines().position(|line| line.contains('▲'));
+    assert!(marker_row.is_some());
     assert_eq!(
-        empty.lines().position(|line| line.contains('▲')),
+        marker_row,
         missing.lines().position(|line| line.contains('▲')),
     );
     view.sections[Section::Skills].history =

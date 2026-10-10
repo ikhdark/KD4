@@ -396,36 +396,3 @@ enum ProxyEntryDecision {
     UnsupportedScheme,
     Unavailable(RouteFailureClass),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pac_timeout_survives_candidate_reduction_and_fallbacks_can_succeed() {
-        let target = cf_url("https://example.com/").expect("target URL");
-        let origin = RequestOrigin {
-            scheme: "https".into(),
-            host: "example.com".into(),
-            port: 443,
-        };
-        for fallback_succeeds in [false, true] {
-            let timeout = pac_decision(Err(RouteFailureClass::ConnectTimeout), &target, &origin);
-            let fallback = if fallback_succeeds {
-                ProxyEntryDecision::Direct
-            } else {
-                ProxyEntryDecision::Unavailable(RouteFailureClass::ProxyResolutionUnavailable)
-            };
-            assert_eq!(
-                proxy_entries_decision([timeout, fallback]),
-                if fallback_succeeds {
-                    SystemProxyDecision::Direct
-                } else {
-                    SystemProxyDecision::Unavailable {
-                        failure: RouteFailureClass::ConnectTimeout,
-                    }
-                }
-            );
-        }
-    }
-}

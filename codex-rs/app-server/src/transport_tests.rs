@@ -25,7 +25,7 @@ fn experimental_notification() -> ServerNotification {
 }
 
 #[test]
-fn empty_notification_opt_outs_skip_method_rendering_and_lock_acquisition() {
+fn empty_notification_opt_outs_skip_lock_acquisition() {
     let (writer, _reader) = mpsc::channel(1);
     let opt_outs = Arc::new(OutboundNotificationOptOuts::new(HashSet::new()));
     let connection = OutboundConnectionState::new(

@@ -1492,8 +1492,8 @@ mod tests {
         });
     }
 
-    #[test]
-    fn command_end_does_not_recapture_an_unavailable_workspace_observation() {
+    #[tokio::test]
+    async fn command_end_does_not_recapture_an_unavailable_workspace_observation() {
         assert!(workspace_identity_capture_required(true, false));
         assert!(!workspace_identity_capture_required(true, true));
         assert!(!workspace_identity_capture_required(false, false));
@@ -1501,6 +1501,52 @@ mod tests {
         // Avoiding a second scan must not upgrade unavailable evidence.
         assert_eq!(observed_workspace_identity_changed(Some(&None), None), None);
         assert_eq!(observed_workspace_identity_changed(None, None), None);
+
+        // Outside a repository every capture yields no identity, so the first
+        // post-command capture cannot be told apart from "not captured" by value.
+        let temp = tempdir().expect("tempdir");
+        let (session, mut turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, temp.path())],
+        );
+        let cache = &session.services.git_workspace;
+        assert!(cache.workspace_evidence_identity(temp.path()).await.is_none());
+        let emitter = ToolEmitter::shell(
+            vec!["custom-mutator".to_string()],
+            AbsolutePathBuf::from_absolute_path(temp.path()).expect("absolute cwd"),
+            ExecCommandSource::Agent,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        );
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        emitter
+            .begin(ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "non-git-call",
+                Some(&tracker),
+            ))
+            .await
+            .expect("begin event should publish");
+        let captures_before_end = cache.workspace_evidence_capture_sequence();
+        emitter
+            .finish(
+                ToolEventCtx::new(
+                    session.as_ref(),
+                    turn.as_ref(),
+                    "non-git-call",
+                    Some(&tracker),
+                ),
+                Ok(ExecToolCallOutput::default()),
+                None,
+            )
+            .await
+            .expect("successful uncertain command");
+        assert_eq!(
+            cache.workspace_evidence_capture_sequence() - captures_before_end,
+            1
+        );
     }
 
     #[tokio::test]

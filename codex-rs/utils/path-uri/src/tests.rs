@@ -269,15 +269,24 @@ fn malformed_bad_path_uris_are_rejected() {
 
 #[test]
 fn structurally_valid_bad_path_uri_with_invalid_native_payload_fails_conversion() {
-    let uri = PathUri::parse("file:///%00/bad/path/YQ")
-        .expect("canonical base64 fallback URI should parse");
+    for uri in [
+        // One byte infers no convention, so it never reaches payload decoding.
+        "file:///%00/bad/path/YQ",
+        // UTF-16LE `C:relative`: a Windows payload that is not absolute.
+        "file:///%00/bad/path/QwA6AHIAZQBsAGEAdABpAHYAZQA",
+        // UTF-16LE `C:\ok`: an absolute path whose only URI is `file:///C:/ok`.
+        "file:///%00/bad/path/QwA6AFwAbwBrAA",
+    ] {
+        let uri = PathUri::parse(uri).expect("canonical base64 fallback URI should parse");
 
-    assert_eq!(
-        uri.to_abs_path()
-            .expect_err("relative fallback payload should not convert")
-            .kind(),
-        io::ErrorKind::InvalidInput
-    );
+        assert_eq!(
+            uri.to_abs_path()
+                .expect_err("invalid fallback payload should not convert")
+                .kind(),
+            io::ErrorKind::InvalidInput,
+            "converting {uri}"
+        );
+    }
 }
 
 #[test]

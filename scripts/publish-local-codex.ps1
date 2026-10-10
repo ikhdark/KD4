@@ -1191,7 +1191,12 @@ function Get-VersionProofLines {
 
             $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
             $standardErrorTask = $process.StandardError.ReadToEndAsync()
-            if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            $probeTimer = [Diagnostics.Stopwatch]::StartNew()
+            # Parent exit does not close pipes inherited by a descendant.
+            if (-not $process.WaitForExit($TimeoutMilliseconds) -or
+                -not [Threading.Tasks.Task]::WaitAll(
+                    [Threading.Tasks.Task[]]@($standardOutputTask, $standardErrorTask),
+                    [int][Math]::Max(0, $TimeoutMilliseconds - $probeTimer.ElapsedMilliseconds))) {
                 try {
                     $process.Kill()
                     [void]$process.WaitForExit(2000)
@@ -2271,7 +2276,12 @@ function Test-DesktopRuntimeProof {
         $process.StandardInput.Close()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+        $probeTimer = [Diagnostics.Stopwatch]::StartNew()
+        # Include output completion in the same budget as parent exit.
+        if (-not $process.WaitForExit($TimeoutMilliseconds) -or
+            -not [Threading.Tasks.Task]::WaitAll(
+                [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask),
+                [int][Math]::Max(0, $TimeoutMilliseconds - $probeTimer.ElapsedMilliseconds))) {
             try {
                 $process.Kill()
                 [void]$process.WaitForExit(2000)
@@ -2329,7 +2339,7 @@ function Assert-NoCodexRunningTurns {
     $unfinished = [System.Collections.Generic.List[string]]::new()
     # Active rollouts are materialized as JSONL. Completed compressed rollouts
     # cannot contain a live writer. Read every chat, not just the caller's host.
-    foreach ($file in Get-ChildItem -LiteralPath $sessions -Recurse -File -Filter "rollout-*.jsonl") {
+    foreach ($file in Get-ChildItem -LiteralPath $sessions -Recurse -File -Force -Filter "rollout-*.jsonl") {
         $active = @{}
         $reader = [IO.File]::OpenText($file.FullName)
         try {

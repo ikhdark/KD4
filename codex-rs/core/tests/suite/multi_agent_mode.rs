@@ -98,7 +98,11 @@ async fn submit_turn(
             },
         })
         .await?;
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let event = wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = event else {
+        unreachable!("completion predicate only accepts TurnComplete");
+    };
+    assert_eq!(completed.error, None);
     Ok(())
 }
 

@@ -1310,37 +1310,64 @@ async fn submit_user_message_ignores_inaccessible_app_mentions_from_bindings() {
 
     chat.on_connectors_loaded(
         Ok(ConnectorsSnapshot {
-            connectors: vec![AppInfo {
-                id: "arabica_uae".to_string(),
-                name: "% Arabica UAE".to_string(),
-                description: Some("Directory-only app".to_string()),
-                logo_url: None,
-                logo_url_dark: None,
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: None,
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                install_url: Some("https://example.test/arabica".to_string()),
-                is_accessible: false,
-                is_enabled: true,
-                plugin_display_names: Vec::new(),
-            }],
+            connectors: vec![
+                AppInfo {
+                    id: "arabica_uae".to_string(),
+                    name: "% Arabica UAE".to_string(),
+                    description: Some("Directory-only app".to_string()),
+                    logo_url: None,
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: None,
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: Some("https://example.test/arabica".to_string()),
+                    is_accessible: false,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                },
+                // Accessible control: proves the loaded snapshot reaches mention resolution.
+                AppInfo {
+                    id: "google_drive".to_string(),
+                    name: "Google Drive".to_string(),
+                    description: Some("Installed app".to_string()),
+                    logo_url: None,
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: None,
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: Some("https://example.test/google-drive".to_string()),
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                },
+            ],
         }),
         /*is_final*/ false,
     );
 
     chat.submit_user_message(UserMessage {
-        text: "$arabica-uae".to_string(),
+        text: "$arabica-uae $google-drive".to_string(),
         local_images: Vec::new(),
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
-        mention_bindings: vec![MentionBinding {
-            sigil: '$',
-            mention: "arabica-uae".to_string(),
-            path: "app://arabica_uae".to_string(),
-        }],
+        mention_bindings: vec![
+            MentionBinding {
+                sigil: '$',
+                mention: "arabica-uae".to_string(),
+                path: "app://arabica_uae".to_string(),
+            },
+            MentionBinding {
+                sigil: '$',
+                mention: "google-drive".to_string(),
+                path: "app://google_drive".to_string(),
+            },
+        ],
     });
 
     let items = match next_submit_op(&mut op_rx) {
@@ -1349,10 +1376,16 @@ async fn submit_user_message_ignores_inaccessible_app_mentions_from_bindings() {
     };
     assert_eq!(
         items,
-        vec![UserInput::Text {
-            text: "$arabica-uae".to_string(),
-            text_elements: Vec::new(),
-        }]
+        vec![
+            UserInput::Text {
+                text: "$arabica-uae $google-drive".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Mention {
+                name: "Google Drive".to_string(),
+                path: "app://google_drive".to_string(),
+            },
+        ]
     );
 }
 
@@ -1388,15 +1421,15 @@ fn user_message_display_from_inputs_matches_flattened_user_message_shape() {
 
     assert_eq!(
         rendered,
-        ChatWidget::user_message_display_from_parts(
-            "hello world".to_string(),
-            vec![
+        UserMessageDisplay {
+            message: "hello world".to_string(),
+            remote_image_urls: vec!["https://example.com/remote.png".to_string()],
+            local_images: vec![local_image],
+            text_elements: vec![
                 TextElement::new((0..5).into(), Some("hello".to_string())),
                 TextElement::new((6..11).into(), Some("planet".to_string())),
             ],
-            vec![local_image],
-            vec!["https://example.com/remote.png".to_string()],
-        )
+        }
     );
 }
 
@@ -1417,12 +1450,12 @@ fn user_message_display_from_inputs_hides_prompt_context() {
 
     assert_eq!(
         rendered,
-        ChatWidget::user_message_display_from_parts(
-            "Ask $figma".to_string(),
-            vec![TextElement::new((4..10).into(), Some("$figma".to_string()))],
-            Vec::new(),
-            Vec::new(),
-        )
+        UserMessageDisplay {
+            message: "Ask $figma".to_string(),
+            remote_image_urls: Vec::new(),
+            local_images: Vec::new(),
+            text_elements: vec![TextElement::new((4..10).into(), Some("$figma".to_string()))],
+        }
     );
 }
 
@@ -1599,6 +1632,10 @@ async fn failed_submission_restores_draft_without_recording_success() {
         assert_eq!(chat.bottom_pane.composer_text(), text);
         assert!(!chat.input_queue.user_turn_pending_start);
         while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::AppendMessageHistoryEntry { .. }),
+                "failed submission must not be appended to message history"
+            );
             if let AppEvent::InsertHistoryCell(cell) = event {
                 assert!(cell.as_any().downcast_ref::<UserHistoryCell>().is_none());
             }

@@ -588,17 +588,20 @@ mod tests {
 
     #[test]
     fn capability_token_args_reject_malformed_token_hash() {
-        let err = AppServerWebsocketAuthArgs {
-            ws_auth: Some(WebsocketAuthCliMode::CapabilityToken),
-            ws_token_sha256: Some("not-a-sha256".to_string()),
-            ..Default::default()
+        // The second value has the right length, so only the hex-digit check can reject it.
+        for token_sha256 in ["not-a-sha256".to_string(), format!("{}g", "a".repeat(63))] {
+            let err = AppServerWebsocketAuthArgs {
+                ws_auth: Some(WebsocketAuthCliMode::CapabilityToken),
+                ws_token_sha256: Some(token_sha256),
+                ..Default::default()
+            }
+            .try_into_settings()
+            .expect_err("capability-token mode should reject malformed token hashes");
+            assert!(
+                err.to_string().contains("64-character hex"),
+                "unexpected error: {err}"
+            );
         }
-        .try_into_settings()
-        .expect_err("capability-token mode should reject malformed token hashes");
-        assert!(
-            err.to_string().contains("64-character hex"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]
@@ -792,6 +795,16 @@ mod tests {
             /*max_clock_skew_seconds*/ 30,
         )
         .expect("jwt audience arrays should verify");
+
+        let err = verify_signed_bearer_token(
+            &token,
+            shared_secret,
+            /*issuer*/ None,
+            Some("missing-audience"),
+            /*max_clock_skew_seconds*/ 30,
+        )
+        .expect_err("an audience outside the jwt audience array should be rejected");
+        assert_eq!(err.message(), "websocket jwt audience mismatch");
     }
 
     #[test]

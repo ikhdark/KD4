@@ -77,7 +77,7 @@ impl CodeModeElicitationHarness {
     }
 
     async fn finish(&self) {
-        wait_for_event_with_timeout(
+        let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
             &self.test.codex,
             |event| match event {
                 EventMsg::TurnComplete(event) => event.turn_id == self.turn_id,
@@ -85,7 +85,11 @@ impl CodeModeElicitationHarness {
             },
             TURN_COMPLETE_TIMEOUT,
         )
-        .await;
+        .await else {
+            unreachable!("matching turn completion");
+        };
+        assert!(completed.error.is_none(), "{completed:?}");
+        assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
         self.follow_up.single_request();
     }
 }
@@ -187,6 +191,8 @@ await tools.exec_command({
         })
         .await?;
     harness.finish().await;
+    let output = harness.follow_up.single_request().custom_tool_call_output("call-1");
+    assert!(output.to_string().contains("code_mode_approval_marker"), "{output}");
     Ok(())
 }
 

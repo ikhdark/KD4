@@ -1079,19 +1079,22 @@ async fn rate_limit_switch_prompt_defers_until_task_complete() {
     let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.has_chatgpt_account = true;
 
-    chat.bottom_pane.set_task_running(/*running*/ true);
+    // Drive the real turn lifecycle: calling the show hook by hand would pass even if turn
+    // completion never surfaced the deferred prompt.
+    handle_turn_started(&mut chat, "turn-1");
     chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 90.0)));
     assert!(matches!(
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Pending
     ));
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
 
-    chat.bottom_pane.set_task_running(/*running*/ false);
-    chat.maybe_show_pending_rate_limit_prompt();
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
     assert!(matches!(
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Shown
     ));
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
 }
 
 
@@ -1191,6 +1194,11 @@ async fn workspace_owner_limit_states_do_not_prompt_for_owner_nudge() {
         chat.on_rate_limit_error(error_kind, "Usage limit reached.".to_string());
         let popup = render_bottom_popup(&chat, /*width*/ 90);
         assert!(!popup.contains("workspace owner"));
+        // The usage-limit nudge never says "workspace owner", so it needs its own marker.
+        assert!(
+            !popup.contains("Request a limit increase from your owner"),
+            "popup: {popup}"
+        );
         assert_no_owner_nudge_or_rate_limit_refresh(&mut rx);
     }
 }
@@ -1243,6 +1251,11 @@ async fn missing_rate_limit_reached_type_does_not_prompt_or_refresh() {
     );
     let popup = render_bottom_popup(&chat, /*width*/ 90);
     assert!(!popup.contains("workspace owner"));
+    // A usage-limit error would open the usage-limit nudge, which never says "workspace owner".
+    assert!(
+        !popup.contains("Request a limit increase from your owner"),
+        "popup: {popup}"
+    );
     assert_no_owner_nudge_or_rate_limit_refresh(&mut rx);
 }
 
@@ -1265,6 +1278,9 @@ async fn workspace_owner_nudge_reappears_after_dismissing_no() {
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_no_owner_nudge_or_rate_limit_refresh(&mut rx);
+    // Without this the final check would also pass on a prompt that was never dismissed.
+    let dismissed = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(!dismissed.contains(expected), "popup: {dismissed}");
 
     chat.on_rate_limit_error(
         if usage_limit { RateLimitErrorKind::UsageLimit } else { RateLimitErrorKind::Generic },
@@ -2053,6 +2069,11 @@ async fn status_line_invalid_items_warn_once() {
         rendered.contains("bogus_item"),
         "warning cell missing invalid item content: {rendered}"
     );
+    assert_eq!(
+        rendered.matches("bogus_item").count(),
+        1,
+        "a repeated invalid id must be reported once: {rendered}"
+    );
 
     chat.refresh_status_line();
     let cells = drain_insert_history(&mut rx);
@@ -2290,8 +2311,13 @@ async fn status_line_branch_refreshes_after_terminal_turns() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     install_noop_workspace_command_runner(&mut chat);
     chat.config.tui_status_line = Some(vec!["git-branch".to_string()]);
+    // A finished lookup is only kept for the cwd it ran in. Key the cache with a first refresh,
+    // otherwise any status refresh restarts the lookup and hides a missing turn-end refresh.
+    chat.refresh_status_line();
     chat.status_line_branch_lookup_complete = true;
     chat.status_line_branch_pending_request_id = None;
+    chat.refresh_status_line();
+    assert!(chat.status_line_branch_pending_request_id.is_none());
 
     if interrupted {
         handle_turn_interrupted(&mut chat, "turn-1");

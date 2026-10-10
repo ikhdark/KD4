@@ -31,6 +31,7 @@ use codex_extension_api::TurnStopInput;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalRuntimeHandle;
 use codex_goal_extension::GoalService;
+use codex_goal_extension::GoalServiceError;
 use codex_goal_extension::GoalSetRequest;
 use codex_goal_extension::GoalTokenBudgetUpdate;
 use codex_goal_extension::install_with_backend;
@@ -177,7 +178,9 @@ async fn failed_usage_flush_does_not_prevent_stopping_and_is_retried() -> anyhow
                     },
                 )
                 .await;
-            assert!(result.is_err());
+            assert!(
+                matches!(result, Err(GoalServiceError::Internal(message)) if message.starts_with("failed to prepare external goal mutation: "))
+            );
             harness
                 .goal_service
                 .set_thread_goal(
@@ -872,6 +875,9 @@ async fn turn_error_usage_limit_accounts_progress_and_clears_accounting() -> any
         ],
         harness.sink.goal_events()
     );
+    // The later charges are also filtered by goal status, so only the tool
+    // surface shows that the stopped goal left live accounting.
+    assert_eq!(tool_names(&harness.tools()), ["create_goal"]);
 
     harness
         .record_token_usage(
@@ -1358,6 +1364,11 @@ async fn thread_resume_rehydrates_active_goal_idle_accounting() -> anyhow::Resul
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+
+    harness.stop_turn("turn-1").await;
+    // Persist the goal only after the harness turn has ended: a turn that starts
+    // with a stored active goal already marks it active, so resume would be a no-op.
     runtime
         .thread_goals()
         .replace_thread_goal(
@@ -1367,9 +1378,6 @@ async fn thread_resume_rehydrates_active_goal_idle_accounting() -> anyhow::Resul
             /*token_budget*/ None,
         )
         .await?;
-    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
-
-    harness.stop_turn("turn-1").await;
     harness.sink.clear();
     harness.resume_thread().await;
     tokio::time::sleep(Duration::from_millis(1_100)).await;

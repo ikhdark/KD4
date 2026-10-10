@@ -14,6 +14,11 @@ async fn out_of_band_leases_require_every_release() {
                 leases.acquire(lease(owner, 10)).expect("acquire lease"),
                 owner as i64
             );
+            assert!(matches!(
+                leases.acquire(lease(owner, 10)),
+                Err(CodexErr::InvalidRequest(_))
+            ));
+            assert_eq!(leases.active_count(), owner as i64);
         }
         let mut waiting = Box::pin(service.wait_until_clear());
         assert!(futures::poll!(waiting.as_mut()).is_pending());
@@ -84,6 +89,7 @@ async fn explicit_release_is_idempotent_and_cancelled_waiters_do_not_release_lea
 #[tokio::test]
 async fn closing_out_of_band_leases_clears_every_registration_and_rejects_new_ones() {
     let service = ElicitationService::new();
+    let in_band_approval = service.register();
     let leases = OutOfBandElicitationLeases::new(service.clone());
     assert_eq!(leases.acquire(lease(1, 10)).expect("acquire lease"), 1);
     assert_eq!(leases.acquire(lease(2, 20)).expect("acquire lease"), 2);
@@ -91,9 +97,13 @@ async fn closing_out_of_band_leases_clears_every_registration_and_rejects_new_on
     assert!(futures::poll!(waiting.as_mut()).is_pending());
 
     leases.close();
+    assert_eq!(leases.active_count(), 0);
+    // Closing this owner's leases must not release a separate approval.
+    assert!(futures::poll!(waiting.as_mut()).is_pending());
+    drop(in_band_approval);
     tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
         .await
-        .expect("closing leases should unblock waiters");
+        .expect("releasing every registration should unblock waiters");
     assert_eq!(leases.active_count(), 0);
     assert!(matches!(
         leases.acquire(lease(3, 30)),

@@ -70,17 +70,13 @@ fn build_request_plugin_install_elicitation_request_injects_plugin_metadata() {
     assert_eq!(
         request,
         ElicitationRequest::Form {
-            meta: Some(json!(RequestPluginInstallMeta {
-                codex_approval_kind: REQUEST_PLUGIN_INSTALL_APPROVAL_KIND_VALUE,
-                persist: REQUEST_PLUGIN_INSTALL_PERSIST_ALWAYS_VALUE,
-                tool_type: DiscoverableToolType::Plugin,
-                suggest_type: DiscoverableToolAction::Install,
-                suggest_reason: "Use the sample plugin's skills and MCP server",
-                tool_id: "sample@openai-curated-remote",
-                tool_name: "Sample Plugin",
-                install_url: None,
-                remote_plugin_id: Some("plugins~Plugin_sample"),
-                app_connector_ids: Some(&["connector_calendar".to_string()]),
+            meta: Some(json!({
+                "codex_approval_kind": "tool_suggestion", "persist": "always",
+                "tool_type": "plugin", "suggest_type": "install",
+                "suggest_reason": "Use the sample plugin's skills and MCP server",
+                "tool_id": "sample@openai-curated-remote", "tool_name": "Sample Plugin",
+                "remote_plugin_id": "plugins~Plugin_sample",
+                "app_connector_ids": ["connector_calendar"]
             })),
             message: "Use the sample plugin's skills and MCP server".to_string(),
             requested_schema: json!({

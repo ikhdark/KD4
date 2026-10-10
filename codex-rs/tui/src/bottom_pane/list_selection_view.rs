@@ -994,7 +994,11 @@ impl BottomPaneView for ListSelectionView {
             } if self.selected_item_has_toggle()
                 && (!self.is_searchable || self.search_query.is_empty()) =>
             {
-                self.toggle_selected()
+                // Consume held/released Space without repeating a persisted toggle or
+                // falling through to searchable-list query input.
+                if key_event.kind == crossterm::event::KeyEventKind::Press {
+                    self.toggle_selected();
+                }
             }
             KeyEvent {
                 code: KeyCode::Char(' '),
@@ -2032,6 +2036,52 @@ mod tests {
 
         assert_eq!(view.active_tab_id(), Some("alpha"));
         assert_eq!(view.selected_actual_idx(), Some(1));
+    }
+
+    #[test]
+    fn held_space_toggles_plugin_setting_only_once() {
+        for is_searchable in [false, true] {
+            let (tx, mut rx) = unbounded_channel();
+            let mut view = new_view(
+                SelectionViewParams {
+                    is_searchable,
+                    items: vec![SelectionItem {
+                        name: "Plugin".to_string(),
+                        search_value: Some("Plugin".to_string()),
+                        toggle: Some(SelectionToggle {
+                            is_on: false,
+                            action: Box::new(|enabled, tx| {
+                                tx.send(AppEvent::SetPluginEnabled {
+                                    cwd: std::path::PathBuf::from("workspace"),
+                                    plugin_id: "plugin@marketplace".to_string(),
+                                    enabled,
+                                });
+                            }),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                AppEventSender::new(tx),
+            );
+            for enabled in [true, false] {
+                view.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+                assert!(matches!(rx.try_recv(), Ok(AppEvent::SetPluginEnabled {
+                    plugin_id, enabled: actual, ..
+                }) if plugin_id == "plugin@marketplace" && actual == enabled));
+                for kind in [
+                    crossterm::event::KeyEventKind::Repeat,
+                    crossterm::event::KeyEventKind::Release,
+                ] {
+                    view.handle_key_event(KeyEvent::new_with_kind(
+                        KeyCode::Char(' '), KeyModifiers::NONE, kind,
+                    ));
+                    assert_eq!(view.active_items()[0].toggle.as_ref().unwrap().is_on, enabled);
+                    assert!(view.search_query.is_empty());
+                    assert!(rx.try_recv().is_err(), "held Space must not repeat config writes");
+                }
+            }
+        }
     }
 
     #[test]

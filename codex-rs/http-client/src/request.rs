@@ -342,12 +342,13 @@ mod tests {
             request.headers[http::header::CONTENT_LENGTH],
             HeaderValue::from(body.as_bytes().len())
         );
-        assert!(
+        assert_eq!(
             request
                 .clone()
                 .with_compression(RequestCompression::Zstd)
                 .into_prepared()
-                .is_err()
+                .expect_err("a prepared body must reject recompression"),
+            "cannot change compression of an already prepared body"
         );
         assert_eq!(
             request

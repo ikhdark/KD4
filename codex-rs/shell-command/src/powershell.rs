@@ -436,17 +436,38 @@ mod tests {
     }
 
     #[test]
-    fn direct_resolution_accepts_rooted_local_exe_but_rejects_relative_and_unc_paths() {
-        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
-            return;
-        };
+    fn direct_resolution_accepts_rooted_local_exe_but_rejects_relative_and_non_drive_paths() {
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
         let canonical = fs::canonicalize(pwsh.as_path()).expect("canonical pwsh");
         assert_eq!(
             resolve_direct_exe(&canonical.to_string_lossy(), ""),
+            Some(canonical.clone())
+        );
+        // An empty PATH rejects every bare or relative name, so search the host's own
+        // directory: the bare name resolves there and only the relative form is refused.
+        let path = pwsh
+            .as_path()
+            .parent()
+            .expect("pwsh parent")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            resolve_direct_exe("pwsh.exe", &path),
+            Some(canonical.clone())
+        );
+        assert_eq!(resolve_direct_exe(".\\pwsh.exe", &path), None);
+        assert_eq!(resolve_direct_exe("\\\\server\\share\\pwsh.exe", ""), None);
+        // That UNC host does not exist, so the line above would hold without the prefix
+        // guard. The DOS device form of the same executable is reachable, so only the
+        // guard can refuse it.
+        let device_path = canonical.to_string_lossy().replacen(r"\\?\", r"\\.\", 1);
+        assert!(device_path.starts_with(r"\\.\"), "{device_path}");
+        assert_eq!(
+            super::canonical_exe(std::path::Path::new(&device_path)),
             Some(canonical)
         );
-        assert_eq!(resolve_direct_exe(".\\pwsh.exe", ""), None);
-        assert_eq!(resolve_direct_exe("\\\\server\\share\\pwsh.exe", ""), None);
+        assert_eq!(resolve_direct_exe(&device_path, ""), None);
     }
 
     #[test]
@@ -669,9 +690,8 @@ mod tests {
 
     #[test]
     fn direct_candidate_contains_semantic_native_argument_values() {
-        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
-            return;
-        };
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
         let command = vec![
             pwsh.as_path().to_string_lossy().into_owned(),
             "-NoProfile".to_string(),
@@ -702,9 +722,8 @@ mod tests {
 
     #[test]
     fn direct_candidate_rejects_dynamic_and_compound_forms() {
-        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
-            return;
-        };
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
         for script in [
             "python $path",
             "python (Get-Location)",
@@ -745,9 +764,8 @@ mod tests {
 
     #[test]
     fn final_state_proof_executes_canonical_exe_and_is_state_bound() {
-        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
-            return;
-        };
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
         let executable = fs::canonicalize(pwsh.as_path()).expect("canonical pwsh");
         let executable_dir = executable.parent().expect("pwsh parent");
         let cwd = std::env::current_dir().expect("cwd");
@@ -811,9 +829,8 @@ mod tests {
 
     #[test]
     fn path_shadowing_and_powershell_commands_fail_closed() {
-        let Some(pwsh) = try_find_pwsh_executable_blocking() else {
-            return;
-        };
+        let pwsh = try_find_pwsh_executable_blocking()
+            .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
         let executable = fs::canonicalize(pwsh.as_path()).expect("canonical pwsh");
         let executable_dir = executable.parent().expect("pwsh parent");
         let cwd = std::env::current_dir().expect("cwd");
@@ -842,6 +859,15 @@ mod tests {
             "-Command".to_string(),
             "pwsh --version".to_string(),
         ];
+        // Control: the same request is provable when nothing shadows pwsh.exe,
+        // so the rejection below is caused by the earlier PATH entry.
+        let unshadowed = HashMap::from([
+            ("PATH".to_string(), executable_dir.display().to_string()),
+            ("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+        ]);
+        assert!(
+            prove_noprofile_powershell_command_as_direct_argv(&native, &cwd, &unshadowed).is_some()
+        );
         assert_eq!(
             prove_noprofile_powershell_command_as_direct_argv(&native, &cwd, &env),
             None

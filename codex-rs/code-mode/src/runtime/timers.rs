@@ -273,6 +273,7 @@ fn normalize_delay_ms(delay_ms: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
     use std::time::Instant;
@@ -410,14 +411,62 @@ mod tests {
     fn zero_timer_preserves_due_deadline_order_and_earlier_timers_wake_worker() {
         let (tx, rx) = std_mpsc::channel();
         let mut scheduler = TimerScheduler::new(tx);
-        scheduler.shared.0.lock().unwrap().scheduled.insert(1, Instant::now()-Duration::from_secs(1));
+        // The earlier deadline has the larger ID, so ID order cannot stand in.
+        scheduler.shared.0.lock().unwrap().scheduled.insert(5, Instant::now()-Duration::from_secs(1));
         scheduler.schedule(2, Duration::ZERO).unwrap();
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(scheduler.take_fired(), vec![1, 2]);
+        assert_eq!(scheduler.take_fired(), vec![5, 2]);
         scheduler.schedule(3, Duration::from_secs(60)).unwrap();
+        // Let the worker park on the 60s deadline; only the wake delivers 4.
+        std::thread::sleep(Duration::from_millis(50));
         scheduler.schedule(4, Duration::from_millis(1)).unwrap();
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(scheduler.take_fired(), vec![4]);
         scheduler.cancel(3);
+    }
+
+    #[test]
+    fn nonzero_timer_is_queued_once_at_its_monotonic_deadline_not_before() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut scheduler = TimerScheduler::new(tx);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        scheduler.barrier = Some(Arc::clone(&barrier));
+        let delay = Duration::from_millis(100);
+        let before = Instant::now();
+        let scheduled = scheduler.schedule(1, delay);
+        let after = Instant::now();
+        // Release the worker before any assertion can unwind into its joining
+        // destructor. Inspect the real queue while that worker is gated.
+        let evidence = {
+            let mut work = scheduler.shared.0.lock().unwrap();
+            work.scheduled.get(&1).copied().map(|deadline| {
+                let early_result = work.queue_due(deadline - Duration::from_nanos(1), &scheduler.runtime_command_tx);
+                let early_fired = work.fired.clone();
+                let early_wake = rx.try_recv();
+                let due_result = work.queue_due(deadline, &scheduler.runtime_command_tx);
+                let due_wake = rx.try_recv();
+                let repeat_result = work.queue_due(deadline + delay, &scheduler.runtime_command_tx);
+                let repeated_wake = rx.try_recv();
+                (deadline, early_result, early_fired, early_wake, due_result, due_wake,
+                    repeat_result, repeated_wake, work.fired.clone(), work.scheduled.is_empty())
+            })
+        };
+        if scheduler.worker.is_some() {
+            barrier.wait();
+        }
+        drop(scheduler);
+        scheduled.unwrap();
+        let (deadline, early_result, early_fired, early_wake, due_result, due_wake,
+            repeat_result, repeated_wake, fired, empty) = evidence.unwrap();
+        assert!(deadline >= before + delay && deadline <= after + delay);
+        early_result.unwrap();
+        assert!(early_fired.is_empty());
+        assert!(matches!(early_wake, Err(std_mpsc::TryRecvError::Empty)));
+        due_result.unwrap();
+        assert!(matches!(due_wake, Ok(super::RuntimeCommand::TimersReady)));
+        repeat_result.unwrap();
+        assert!(matches!(repeated_wake, Err(std_mpsc::TryRecvError::Empty)));
+        assert_eq!(fired, vec![1]);
+        assert!(empty);
     }
 }

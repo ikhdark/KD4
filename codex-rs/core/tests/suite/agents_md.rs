@@ -832,6 +832,15 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
     assert_eq!(instruction_fragments(&requests[0]), vec![initial]);
     assert!(instruction_fragments(&requests[1]).is_empty());
     assert!(instruction_fragments(&requests[2]).is_empty());
+    for (request, latest_prompt) in [
+        (&requests[1], "continue resumed thread"),
+        (&requests[2], "continue again"),
+    ] {
+        let user_texts = request.message_input_texts("user");
+        for expected in ["persist instructions", latest_prompt] {
+            assert_eq!(user_texts.iter().filter(|text| text.as_str() == expected).count(), 1);
+        }
+    }
 
     Ok(())
 }
@@ -923,6 +932,15 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
         OLD_GLOBAL_INSTRUCTIONS,
         NEW_GLOBAL_INSTRUCTIONS,
     );
+    for (request, latest_prompt) in [
+        (&requests[1], "continue fork"),
+        (&requests[2], "continue fork again"),
+    ] {
+        let user_texts = request.message_input_texts("user");
+        for expected in ["persist instructions", latest_prompt] {
+            assert_eq!(user_texts.iter().filter(|text| text.as_str() == expected).count(), 1);
+        }
+    }
 
     Ok(())
 }
@@ -947,12 +965,15 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     } else {
         SPAWN_FRESH_PARENT_PROMPT
     };
+    // Fork sanitization retains final answers, not unclassified assistant messages.
+    let mut seed_message = responses::ev_assistant_message("seed-message", "seeded");
+    seed_message["item"]["phase"] = json!("final_answer");
     let seed_mock = responses::mount_sse_once_match(
         &server,
         |request: &wiremock::Request| request_body_contains(request, SPAWN_SEED_PROMPT),
         responses::sse(vec![
             responses::ev_response_created("seed-response"),
-            responses::ev_assistant_message("seed-message", "seeded"),
+            seed_message,
             responses::ev_completed("seed-response"),
         ]),
     )
@@ -996,7 +1017,13 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     )?;
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
+        .with_model_info_override("gpt-5.5", |info| {
+            info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+        })
         .with_config(|config| {
+            // Keep this fork-history fixture independent of default child-model changes.
+            config.model_catalog.as_mut().expect("test catalog").models
+                .retain(|model| model.slug == "gpt-5.5");
             let _ = config.features.enable(Feature::Collab);
             let _ = config.features.disable(Feature::MultiAgentV2);
             let _ = config.features.disable(Feature::EnableRequestCompression);
@@ -1039,9 +1066,12 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     assert_ne!(source, new_source);
     let mut created_threads = test.thread_manager.subscribe_thread_created();
     test.submit_turn(parent_prompt).await?;
+    let spawn_outputs = server.received_requests().await.unwrap_or_default()
+        .iter().filter_map(|request| function_call_output(request, SPAWN_CALL_ID))
+        .collect::<Vec<_>>();
     let child_thread_id = tokio::time::timeout(Duration::from_secs(10), created_threads.recv())
         .await
-        .map_err(|_| anyhow!("timed out waiting for the subagent thread"))??;
+        .map_err(|_| anyhow!("timed out waiting for the subagent thread; spawn outputs: {spawn_outputs:?}"))??;
     let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
     let spawn_request = spawn_mock.single_request();
     let child_request = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1064,7 +1094,7 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
                 .map(|request| {
                     let body = request_body_text(&request).unwrap_or_default();
                     format!(
-                        "path={}, model={:?}, cache_key={:?}, user_texts={:?}, function_output={:?}, spawn_call={}",
+                        "path={}, model={:?}, cache_key={:?}, user_texts={:?}, function_output={:?}, spawn_call={}, turn_metadata={:?}",
                         request.url.path(),
                         serde_json::from_str::<serde_json::Value>(&body)
                             .ok()
@@ -1077,6 +1107,7 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
                         request_user_texts(&request),
                         function_call_output(&request, SPAWN_CALL_ID),
                         body.contains(SPAWN_CALL_ID),
+                        request.headers.get("x-codex-turn-metadata"),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1090,6 +1121,31 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     assert_single_fresh_instruction_fragment_contains(&seed_request, OLD_GLOBAL_INSTRUCTIONS);
     assert_single_fresh_instruction_fragment_contains(&spawn_request, OLD_GLOBAL_INSTRUCTIONS);
     assert_single_fresh_instruction_fragment_contains(&child_request, OLD_GLOBAL_INSTRUCTIONS);
+    for request in [&seed_request, &spawn_request, &child_request] {
+        assert!(instruction_fragments(request).iter().all(|text| {
+            !text.contains(NEW_GLOBAL_INSTRUCTIONS)
+        }), "a child must not reload changed global instructions independently of its parent");
+    }
+    let child_user_texts = child_request.message_input_texts("user");
+    assert_eq!(
+        child_user_texts.iter().filter(|text| text.as_str() == SPAWN_CHILD_PROMPT).count(),
+        1,
+        "both forked and fresh children must receive their own prompt exactly once"
+    );
+    let child_assistant_texts = child_request
+        .inputs_of_type("message")
+        .into_iter()
+        .filter(|item| item["role"] == "assistant")
+        .filter_map(|item| item["content"].as_array().cloned())
+        .flatten()
+        .filter(|span| span["type"] == "output_text")
+        .filter_map(|span| span["text"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_assistant_texts.iter().filter(|text| text.as_str() == "seeded").count(),
+        usize::from(fork_context),
+        "forking preserves parent assistant history; fresh children must not inherit it"
+    );
     assert_eq!(
         test.codex.instruction_sources().await,
         vec![PathUri::from_abs_path(&source)],

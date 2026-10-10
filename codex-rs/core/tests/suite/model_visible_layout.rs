@@ -180,6 +180,19 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2, "expected two requests");
+    assert_eq!(requests[0].body_json()["model"], "gpt-5.4");
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.4");
+    let first_developer = requests[0].message_input_texts("developer");
+    let second_developer = requests[1].message_input_texts("developer");
+    assert!(first_developer.iter().any(|text| {
+        text.contains("Approval policy is `never`")
+    }));
+    assert!(!second_developer.iter().any(|text| {
+        text.contains("Approval policy is `never`")
+    }));
+    assert!(second_developer.iter().any(|text| {
+        text.starts_with("<permissions instructions>") && text.contains("require_escalated")
+    }));
     insta::assert_snapshot!(
         "model_visible_layout_turn_overrides",
         format_labeled_requests_snapshot(
@@ -497,6 +510,8 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     .await;
 
     let resumed_request = resumed_mock.single_request();
+    assert_eq!(initial_request.body_json()["model"], "gpt-5.2");
+    assert_eq!(resumed_request.body_json()["model"], "gpt-5.4");
     insta::assert_snapshot!(
         "model_visible_layout_resume_with_personality_change",
         format_labeled_requests_snapshot(
@@ -605,6 +620,8 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     .await;
 
     let resumed_request = resumed_mock.single_request();
+    assert_eq!(initial_request.body_json()["model"], "gpt-5.2");
+    assert_eq!(resumed_request.body_json()["model"], "gpt-5.2");
     insta::assert_snapshot!(
         "model_visible_layout_resume_override_matches_rollout_model",
         format_labeled_requests_snapshot(

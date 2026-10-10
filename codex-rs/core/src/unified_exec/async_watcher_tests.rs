@@ -287,6 +287,120 @@ async fn final_capacity_marker_separates_nonadjacent_head_and_tail() {
 }
 
 #[tokio::test]
+async fn streaming_utf8_pending_bytes_are_isolated_between_stdout_and_stderr() {
+    use crate::exec::OutputDeltaLimiter;
+    use crate::unified_exec::process::ProcessOutputChunk;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ExecOutputStream;
+
+    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let limiter = OutputDeltaLimiter::default();
+    let mut pending = super::PendingOutput::default();
+    // Each stream has its own split character: stdout is é and stderr is ñ.
+    // Neither stream may complete or invalidate the other stream's prefix.
+    for (stream, bytes) in [
+        (ExecOutputStream::Stdout, vec![0xc3]),
+        (ExecOutputStream::Stderr, vec![0xc3]),
+        (ExecOutputStream::Stdout, vec![0xa9]),
+        (ExecOutputStream::Stderr, vec![0xb1]),
+    ] {
+        super::process_chunk(
+            &mut pending,
+            &transcript,
+            "stream-isolation",
+            &session,
+            &turn,
+            &limiter,
+            ProcessOutputChunk { stream, bytes },
+        )
+        .await;
+    }
+    super::flush_pending(
+        &mut pending, &transcript, "stream-isolation", &session, &turn, &limiter,
+    )
+    .await;
+    let mut deltas = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::ExecCommandOutputDelta(delta) = event.msg {
+            assert_eq!(delta.call_id, "stream-isolation");
+            deltas.push((delta.stream, delta.chunk));
+        }
+    }
+    assert_eq!(
+        deltas,
+        vec![
+            (ExecOutputStream::Stdout, "é".as_bytes().to_vec()),
+            (ExecOutputStream::Stderr, "ñ".as_bytes().to_vec()),
+        ]
+    );
+    assert!(pending.stdout.is_empty());
+    assert!(pending.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_lag_flushes_both_utf8_prefixes_before_post_gap_bytes() {
+    use crate::exec::OutputDeltaLimiter;
+    use crate::unified_exec::process::ProcessOutputChunk;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ExecOutputStream;
+
+    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let limiter = OutputDeltaLimiter::default();
+    let mut pending = super::PendingOutput::default();
+    for byte in [0xc3, 0xa9] {
+        if byte == 0xa9 {
+            // These bytes are not adjacent in either producer stream. A lag
+            // must not let their UTF-8 projections fabricate an é character.
+            super::handle_lagged_output(
+                7, &mut pending, &transcript, "stream-gap", &session, &turn, &limiter,
+            )
+            .await;
+        }
+        for stream in [ExecOutputStream::Stdout, ExecOutputStream::Stderr] {
+            super::process_chunk(
+                &mut pending,
+                &transcript,
+                "stream-gap",
+                &session,
+                &turn,
+                &limiter,
+                ProcessOutputChunk { stream, bytes: vec![byte] },
+            )
+            .await;
+        }
+    }
+    super::flush_pending(
+        &mut pending, &transcript, "stream-gap", &session, &turn, &limiter,
+    )
+    .await;
+    let mut deltas = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::ExecCommandOutputDelta(delta) = event.msg {
+            assert_eq!(delta.call_id, "stream-gap");
+            deltas.push((delta.stream, delta.chunk));
+        }
+    }
+    assert_eq!(
+        deltas,
+        vec![
+            (ExecOutputStream::Stdout, vec![0xc3]),
+            (ExecOutputStream::Stderr, vec![0xc3]),
+            (
+                ExecOutputStream::Stdout,
+                b"\n[output unavailable: streaming receiver lagged by 7 chunk(s)]\n".to_vec(),
+            ),
+            (ExecOutputStream::Stdout, vec![0xa9]),
+            (ExecOutputStream::Stderr, vec![0xa9]),
+        ]
+    );
+    assert_eq!(transcript.lock().await.lagged_chunks(), 7);
+    assert!(pending.stdout.is_empty());
+    assert!(pending.stderr.is_empty());
+}
+
+#[tokio::test]
 async fn capped_live_output_preserves_transcript_without_growing_pending_buffers() {
     use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
     use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;

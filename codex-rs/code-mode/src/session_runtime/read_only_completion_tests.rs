@@ -148,6 +148,22 @@ async fn durable_read_only_completion_still_owns_publication() {
     );
     tokio::pin!(completion);
     assert!(futures::poll!(&mut completion).is_pending());
+    // Staging alone is also pending on its first poll. Only the gate keeps the
+    // completion blocked and unpublished for this long.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut completion)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        runtime
+            .inner
+            .durable_state
+            .get()
+            .unwrap()
+            .completed_cell("1"),
+        None
+    );
     drop(gate);
     assert_eq!(completion.await, CompletionCommit::Committed);
     assert_eq!(

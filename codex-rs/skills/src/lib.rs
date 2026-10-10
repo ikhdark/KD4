@@ -329,7 +329,16 @@ mod tests {
                 std::io::Error::other("full disk"),
             ))
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(
+                result,
+                Err(SystemSkillsError::Io {
+                    action: "injected staging failure",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
         assert_eq!(
             fs::read_to_string(marker.as_path()).expect("old marker"),
             "old-version"
@@ -350,7 +359,10 @@ mod tests {
 
         let backup = home.join(SKILLS_DIR_NAME).join(".system-backup");
         fs::rename(dest.as_path(), backup.as_path()).expect("simulate interrupted publication");
-        install_system_skills(&home).expect("recover previous tree");
+        // The backed-up tree is current, so a writer call would mean it was discarded and
+        // reinstalled rather than restored.
+        install_system_skills_with(&home, |_| panic!("recovery must restore, not reinstall"))
+            .expect("recover previous tree");
         assert!(skill.as_path().is_file());
         assert!(!backup.as_path().exists());
         uninstall_system_skills(&home).expect("uninstall");

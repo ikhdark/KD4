@@ -77,6 +77,10 @@ fn codex_app_tool(
 
 #[test]
 fn accessible_connectors_from_mcp_tools_carries_plugin_display_names() {
+    let mut foreign_connector = codex_app_tool(
+        "foreign_list_events", "foreign-calendar", Some("Foreign Calendar"), &["ignored"],
+    );
+    foreign_connector.server_name = "other-server".to_string();
     let tools = vec![
         codex_app_tool(
             "calendar_list_events",
@@ -102,6 +106,7 @@ fn accessible_connectors_from_mcp_tools_carries_plugin_display_names() {
             connector_name: None,
             plugin_display_names: plugin_names(&["ignored"]),
         },
+        foreign_connector,
     ];
 
     let connectors = accessible_connectors_from_mcp_tools(&tools);

@@ -153,6 +153,7 @@ async fn websocket_fallback_recovers_first_abrupt_close_and_stays_on_http() -> R
                 panic!("must switch before retrying WebSockets: {error:?}")
             }
             EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
                 assert_eq!(
                     completed.last_agent_message.as_deref(),
                     Some("recovered over HTTP")
@@ -164,7 +165,8 @@ async fn websocket_fallback_recovers_first_abrupt_close_and_stays_on_http() -> R
     }
     disconnect.await?;
     assert_eq!(fallback_warnings, 1);
-    test.submit_turn("second").await?;
+    let completed = test.submit_turn_and_capture_completion("second").await?;
+    assert_eq!(completed.error, None);
     assert_eq!(upgrades.load(Ordering::SeqCst), 1);
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
@@ -221,9 +223,25 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
     });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("hello").await?;
+    let completed = test.submit_turn_and_capture_completion("hello").await?;
+    assert_eq!(completed.error, None);
 
     let requests = server.received_requests().await.unwrap_or_default();
+    let mut turn_websocket_attempts = 0;
+    for request in requests.iter().filter(|request| {
+        request.method == Method::GET && request.url.path().ends_with("/responses")
+    }) {
+        if let Some(metadata) = request.headers.get("x-codex-turn-metadata") {
+            let metadata: serde_json::Value = serde_json::from_str(metadata.to_str()?)?;
+            if metadata["request_kind"] == "turn" {
+                turn_websocket_attempts += 1;
+            }
+        }
+    }
+    assert_eq!(
+        turn_websocket_attempts, 3,
+        "speculative startup attempts must not hide missing or extra turn retries"
+    );
     let websocket_attempts = requests
         .iter()
         .filter(|req| req.method == Method::GET && req.url.path().ends_with("/responses"))
@@ -255,7 +273,7 @@ async fn websocket_fallback_surfaces_every_websocket_retry_stream_error() -> Res
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
-    let _response_mock = mount_sse_once(
+    let response_mock = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -316,7 +334,11 @@ async fn websocket_fallback_surfaces_every_websocket_retry_stream_error() -> Res
             .msg;
         match event {
             EventMsg::StreamError(e) => stream_error_messages.push(e.message),
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::Error(error) => panic!("unexpected terminal error: {error:?}"),
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error, None);
+                break;
+            }
             _ => {}
         }
     }
@@ -328,8 +350,10 @@ async fn websocket_fallback_surfaces_every_websocket_retry_stream_error() -> Res
             .strip_prefix(&format!("{expected} (next retry in "))
             .and_then(|message| message.strip_suffix("ms)"))
             .expect("retry notice includes the millisecond backoff");
-        assert!(delay.parse::<f64>()? > 0.0);
+        let delay = delay.parse::<f64>()?;
+        assert!(delay.is_finite() && delay > 0.0);
     }
+    assert_eq!(response_mock.requests().len(), 1);
 
     Ok(())
 }
@@ -365,7 +389,8 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
     });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("first").await?;
+    let completed = test.submit_turn_and_capture_completion("first").await?;
+    assert_eq!(completed.error, None);
     let first_requests = server.received_requests().await.expect("captured requests");
     assert_eq!(first_requests.iter().filter(|req| {
         req.method == Method::GET && req.url.path().ends_with("/responses")
@@ -374,7 +399,8 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
         req.method == Method::POST && req.url.path().ends_with("/responses")
     }).count(), 1);
     assert_eq!(response_mock.requests().len(), 1);
-    test.submit_turn("second").await?;
+    let completed = test.submit_turn_and_capture_completion("second").await?;
+    assert_eq!(completed.error, None);
 
     let requests = server.received_requests().await.unwrap_or_default();
     let websocket_attempts = requests

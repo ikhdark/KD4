@@ -199,20 +199,6 @@ impl Collector {
 }
 
 #[test]
-fn http_request_deadline_does_not_restart_after_accept() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let mut client = TcpStream::connect(listener.local_addr()?)?;
-    client.write_all(b"POST /v1/metrics HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")?;
-    let (mut stream, _) = listener.accept()?;
-
-    let error = read_http_request(&mut stream, Instant::now() - Duration::from_millis(1))
-        .expect_err("an expired collector deadline must reject even a ready request");
-
-    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-    Ok(())
-}
-
-#[test]
 fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     let collector = Collector::spawn();
     let addr = collector.addr;

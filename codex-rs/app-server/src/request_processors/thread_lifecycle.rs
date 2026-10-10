@@ -837,7 +837,14 @@ async fn process_thread_listener_event(
     thread_state: &Arc<Mutex<ThreadState>>,
     event: codex_protocol::protocol::Event,
 ) {
-    let queue_completed = matches!(&event.msg, EventMsg::TurnComplete(_));
+    let (is_current_turn, summary_failed) = {
+        let state = thread_state.lock().await;
+        (
+            state.is_current_summary_turn(&event.id),
+            state.turn_summary_for(&event.id).is_some_and(|summary| summary.last_error.is_some()),
+        )
+    };
+    let queue_completed = is_current_turn && matches!(&event.msg, EventMsg::TurnComplete(_));
     // Core emits the legacy user-message event after recording the input in
     // either history format. Reconcile custody off the listener's critical path.
     if matches!(&event.msg, EventMsg::UserMessage(_))
@@ -845,10 +852,10 @@ async fn process_thread_listener_event(
     {
         queue.input_recorded(conversation_id);
     }
-    let queue_paused = matches!(&event.msg, EventMsg::TurnAborted(_))
+    let queue_paused = is_current_turn && (matches!(&event.msg, EventMsg::TurnAborted(_))
         || matches!(&event.msg, EventMsg::TurnComplete(completed)
             if completed.error.is_some())
-        || queue_completed && thread_state.lock().await.turn_summary.last_error.is_some();
+        || queue_completed && summary_failed);
     if queue_paused && let Some(queue) = &context.thread_queue_processor {
         queue.pause(conversation_id).await;
     }
@@ -1860,6 +1867,161 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn late_terminal_event_preserves_the_successor_turn_state_and_requests() {
+        use codex_app_server_protocol::ServerRequestPayload;
+        use codex_app_server_protocol::ThreadActiveFlag;
+        use codex_app_server_protocol::ToolRequestUserInputParams;
+        use codex_protocol::protocol::Event;
+        use codex_protocol::protocol::TurnAbortReason;
+        use codex_protocol::protocol::TurnAbortedEvent;
+        use codex_protocol::protocol::TurnCompleteEvent;
+        use codex_protocol::protocol::TurnStartedEvent;
+
+        for abort in [false, true] {
+            let mut fixture = LateShutdownFixture::new().await;
+            let config = fixture.thread.config().await;
+            let context = ListenerTaskContext {
+                thread_queue_processor: None,
+                thread_manager: Arc::clone(&fixture.thread_manager),
+                thread_state_manager: fixture.thread_state_manager.clone(),
+                outgoing: Arc::clone(&fixture.outgoing),
+                pending_thread_unloads: Arc::clone(&fixture.pending_thread_unloads),
+                thread_watch_manager: fixture.thread_watch_manager.clone(),
+                thread_list_state_permit: Arc::new(Semaphore::new(1)),
+                fallback_model_provider: config.model_provider_id.clone(),
+                codex_home: config.codex_home.to_path_buf(),
+                skills_watcher: SkillsWatcher::new(
+                    fixture.thread_manager.skills_service(),
+                    Arc::clone(&fixture.outgoing),
+                ),
+            };
+            let connection_id = ConnectionId(1);
+            fixture.outgoing.connection_opened(
+                connection_id,
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ).await;
+            fixture.thread_state_manager.connection_initialized(
+                connection_id, ConnectionCapabilities::default(),
+            ).await;
+            let state = fixture.thread_state_manager.try_ensure_connection_subscribed(
+                fixture.thread_id, connection_id, false,
+            ).await.expect("live connection");
+            state.lock().await.seed_turn_index_from_history(&[]);
+            // Core detaches A before publishing its terminal event; a stalled
+            // publication can therefore arrive after B has already started.
+            for (id, started_at) in [("turn-a", 1), ("turn-b", 2)] {
+                process_thread_listener_event(&context, fixture.thread_id, &fixture.thread, &state,
+                    Event {
+                        id: id.to_string(),
+                        msg: EventMsg::TurnStarted(TurnStartedEvent {
+                            turn_id: id.to_string(), trace_id: None, started_at: Some(started_at),
+                            model_context_window: None, collaboration_mode_kind: Default::default(),
+                        }),
+                    },
+                ).await;
+            }
+            let successor_error = codex_app_server_protocol::TurnError {
+                message: "successor-only diagnostic".to_string(),
+                codex_error_info: None, additional_details: None,
+            };
+            {
+                let mut state = state.lock().await;
+                state.turn_summary.last_error = Some(successor_error.clone());
+                state.turn_summary.command_execution_started.insert("command-b".to_string());
+            }
+            let guard = fixture.thread_watch_manager.note_user_input_requested(
+                &fixture.thread_id.to_string(),
+            ).await;
+            let outgoing = ThreadScopedOutgoingMessageSender::new(
+                Arc::clone(&fixture.outgoing), vec![connection_id], fixture.thread_id,
+            );
+            let (request_id, mut receiver) = outgoing.send_request(
+                ServerRequestPayload::ToolRequestUserInput(ToolRequestUserInputParams {
+                    thread_id: fixture.thread_id.to_string(), turn_id: "turn-b".to_string(),
+                    item_id: "question-b".to_string(), questions: Vec::new(), auto_resolution_ms: None,
+                }),
+            ).await;
+            assert!(request_id.is_some());
+            while fixture.outgoing_rx.try_recv().is_ok() {}
+            let msg = if abort {
+                EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some("turn-a".to_string()), reason: TurnAbortReason::Interrupted,
+                    completed_at: Some(3), duration_ms: Some(2000), timing: None,
+                })
+            } else {
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-a".to_string(), last_agent_message: None,
+                    surfaced_result: None, error: None, completed_at: Some(3),
+                    duration_ms: Some(2000), time_to_first_token_ms: None, timing: None,
+                })
+            };
+            process_thread_listener_event(&context, fixture.thread_id, &fixture.thread, &state,
+                Event { id: "turn-a".to_string(), msg },
+            ).await;
+            let pending = matches!(receiver.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+            let status = fixture.thread_watch_manager.loaded_status_for_thread(&fixture.thread_id.to_string()).await;
+            let (active_id, summary) = {
+                let state = state.lock().await;
+                (state.in_progress_turn_id().map(str::to_string), state.turn_summary.clone())
+            };
+            let notification = fixture.outgoing_rx.try_recv().expect("late terminal still delivered");
+            process_thread_listener_event(&context, fixture.thread_id, &fixture.thread, &state,
+                Event {
+                    id: "turn-b".to_string(),
+                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                        turn_id: "turn-b".to_string(), last_agent_message: None,
+                        surfaced_result: None, error: None, completed_at: Some(4),
+                        duration_ms: Some(2000), time_to_first_token_ms: None, timing: None,
+                    }),
+                },
+            ).await;
+            let successor_settled = !matches!(receiver.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+            let successor_notification = fixture.outgoing_rx.try_recv().expect("B terminal delivered");
+            let successor_cleared = {
+                let state = state.lock().await;
+                state.in_progress_turn_id().is_none() && state.turn_summary.last_error.is_none()
+                    && state.turn_summary.command_execution_started.is_empty()
+            };
+            // Clean up real resources before regression assertions, including RED runs.
+            outgoing.abort_pending_server_requests().await;
+            drop(guard);
+            fixture.release_shutdown.take().expect("release").send(()).expect("terminal barrier");
+            fixture.thread.shutdown_and_wait().await.expect("thread cleanup");
+
+            assert!(pending, "A terminal must not resolve B's request; abort={abort}");
+            assert_eq!(active_id.as_deref(), Some("turn-b"));
+            assert_eq!(status, ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            });
+            assert_eq!(summary.started_at, Some(2));
+            assert_eq!(summary.last_error, Some(successor_error.clone()));
+            assert!(summary.command_execution_started.contains("command-b"));
+            let message = match notification {
+                OutgoingEnvelope::Broadcast { message } | OutgoingEnvelope::ToConnection { message, .. } => message,
+            };
+            let OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(completed)) = message else {
+                panic!("expected A terminal notification");
+            };
+            assert_eq!(completed.turn.id, "turn-a");
+            assert_eq!(completed.turn.started_at, Some(1));
+            assert_eq!(completed.turn.error, None);
+            assert_eq!(completed.turn.status, if abort { TurnStatus::Interrupted } else { TurnStatus::Completed });
+            assert!(successor_settled);
+            assert!(successor_cleared);
+            let message = match successor_notification {
+                OutgoingEnvelope::Broadcast { message } | OutgoingEnvelope::ToConnection { message, .. } => message,
+            };
+            let OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(completed)) = message else {
+                panic!("expected B terminal notification");
+            };
+            assert_eq!(completed.turn.id, "turn-b");
+            assert_eq!(completed.turn.started_at, Some(2));
+            assert_eq!(completed.turn.error, Some(successor_error));
+            assert_eq!(completed.turn.status, TurnStatus::Failed);
+        }
+    }
+
     struct LateShutdownFixture {
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
@@ -2539,22 +2701,6 @@ mod tests {
         assert!(futures::poll!(same.as_mut()).is_pending());
         drop(permit);
         assert!(same.await);
-    }
-
-    #[tokio::test]
-    async fn resume_waiter_is_released_only_after_unload_finishes() {
-        let pending = Arc::new(PendingThreadUnloads::default());
-        let thread_id = ThreadId::new();
-        assert!(pending.begin(thread_id).await);
-
-        let waiter = pending.wait_until_finished(&thread_id);
-        tokio::pin!(waiter);
-        assert!(futures::poll!(&mut waiter).is_pending());
-
-        pending.finish(&thread_id).await;
-        tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("resume waiter should continue after teardown");
     }
 
     #[tokio::test]

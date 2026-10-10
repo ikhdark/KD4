@@ -26,6 +26,7 @@ use super::support::FileSystemImplementation;
 use super::support::absolute_path;
 use super::support::create_file_system_context;
 use super::support::read_only_sandbox;
+use super::support::read_only_sandbox_with_denied;
 use super::support::workspace_write_sandbox;
 
 #[test]
@@ -68,6 +69,10 @@ async fn file_system_get_metadata_reports_files_and_directories(
     let directory_path = tmp.path().join("notes");
     std::fs::write(&file_path, "hello")?;
     std::fs::create_dir(&directory_path)?;
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_123);
+    std::fs::File::options().write(true).open(&file_path)?.set_modified(modified)?;
+    let native_file = std::fs::metadata(&file_path)?;
+    let native_directory = std::fs::metadata(&directory_path)?;
 
     let file_metadata = file_system
         .get_metadata(
@@ -83,8 +88,8 @@ async fn file_system_get_metadata_reports_files_and_directories(
             is_file: true,
             is_symlink: false,
             size: 5,
-            created_at_ms: file_metadata.created_at_ms,
-            modified_at_ms: file_metadata.modified_at_ms,
+            created_at_ms: native_file.created()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
+            modified_at_ms: 1_600_000_000_123,
         }
     );
     assert!(file_metadata.modified_at_ms > 0);
@@ -102,9 +107,9 @@ async fn file_system_get_metadata_reports_files_and_directories(
             is_directory: true,
             is_file: false,
             is_symlink: false,
-            size: std::fs::metadata(&directory_path)?.len(),
-            created_at_ms: directory_metadata.created_at_ms,
-            modified_at_ms: directory_metadata.modified_at_ms,
+            size: native_directory.len(),
+            created_at_ms: native_directory.created()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
+            modified_at_ms: native_directory.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
         }
     );
     assert!(directory_metadata.modified_at_ms > 0);
@@ -532,23 +537,45 @@ async fn file_system_walk_honors_read_sandbox(
     let file_system = context.file_system;
 
     let tmp = TempDir::new()?;
-    let source_dir = tmp.path().join("source");
+    let readable_root = tmp.path().join("root");
+    let source_dir = readable_root.join("source");
     let file_path = source_dir.join("note.txt");
     std::fs::create_dir_all(&source_dir)?;
     std::fs::write(&file_path, "sandboxed")?;
-    let sandbox = read_only_sandbox(source_dir.clone());
+    let denied_dir = readable_root.join("denied");
+    std::fs::create_dir_all(&denied_dir)?;
+    std::fs::write(denied_dir.join("secret.txt"), "denied")?;
+    let sandbox = read_only_sandbox_with_denied(readable_root, denied_dir.clone());
+    let options = WalkOptions {
+        max_depth: 1,
+        max_directories: 2,
+        max_entries: 2,
+        follow_directory_symlinks: false,
+        prune_hidden_directories: false,
+        filters: Default::default(),
+    };
+
+    // An unsandboxed walk would list the directory the policy denies. The
+    // Windows sandbox only guarantees explicit deny entries: a path merely
+    // outside the readable roots can still be readable through earlier grants.
+    let denied = file_system
+        .walk(
+            &PathUri::from_host_native_path(&denied_dir)?,
+            options.clone(),
+            Some(&sandbox),
+        )
+        .await;
+    assert!(
+        denied
+            .as_ref()
+            .map_or(true, |outcome| outcome.entries.is_empty()),
+        "mode={implementation}: walk of a denied directory returned {denied:?}"
+    );
 
     let outcome = file_system
         .walk(
             &PathUri::from_host_native_path(&source_dir)?,
-            WalkOptions {
-                max_depth: 1,
-                max_directories: 2,
-                max_entries: 2,
-                follow_directory_symlinks: false,
-                prune_hidden_directories: false,
-                filters: Default::default(),
-            },
+            options,
             Some(&sandbox),
         )
         .await
@@ -678,6 +705,9 @@ async fn file_system_sandboxed_metadata_and_read_allow_readable_root(
     std::fs::create_dir_all(&allowed_dir)?;
     std::fs::write(&file_path, "sandboxed hello")?;
     let sandbox = read_only_sandbox(allowed_dir);
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_123);
+    std::fs::File::options().write(true).open(&file_path)?.set_modified(modified)?;
+    let native_file = std::fs::metadata(&file_path)?;
 
     let metadata = file_system
         .get_metadata(&PathUri::from_host_native_path(&file_path)?, Some(&sandbox))
@@ -690,8 +720,8 @@ async fn file_system_sandboxed_metadata_and_read_allow_readable_root(
             is_file: true,
             is_symlink: false,
             size: 15,
-            created_at_ms: metadata.created_at_ms,
-            modified_at_ms: metadata.modified_at_ms,
+            created_at_ms: native_file.created()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
+            modified_at_ms: 1_600_000_000_123,
         }
     );
 
@@ -718,7 +748,10 @@ async fn file_system_sandboxed_bounded_reads_honor_limit_and_root(
     let file_path = allowed_dir.join("note.txt");
     std::fs::create_dir_all(&allowed_dir)?;
     std::fs::write(&file_path, "sandboxed hello")?;
-    let sandbox = read_only_sandbox(allowed_dir.clone());
+    let outside_path = tmp.path().join("outside.txt");
+    std::fs::write(&outside_path, "outside")?;
+    // The sandbox can read both files, so only the confined root rejects the second.
+    let sandbox = read_only_sandbox(tmp.path().to_path_buf());
     let path = PathUri::from_host_native_path(&file_path)?;
     let root = PathUri::from_host_native_path(&allowed_dir)?;
 
@@ -738,6 +771,19 @@ async fn file_system_sandboxed_bounded_reads_honor_limit_and_root(
         .await
         .with_context(|| format!("confined mode={implementation}"))?;
     assert_eq!(confined.as_deref(), Some(b"sandboxed hello".as_slice()));
+    let escape = file_system
+        .read_file_bounded_confined(
+            &PathUri::from_host_native_path(&outside_path)?,
+            &root,
+            /*max_bytes*/ 15,
+            Some(&sandbox),
+        )
+        .await
+        .expect_err("confined read must not escape its root");
+    assert!(
+        escape.to_string().contains("outside the confined root"),
+        "mode={implementation}: {escape}"
+    );
 
     Ok(())
 }

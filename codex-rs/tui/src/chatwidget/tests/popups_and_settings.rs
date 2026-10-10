@@ -14,53 +14,6 @@ use codex_connectors::AppInfo;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn experimental_mode_plan_is_ignored_on_startup() {
-    let codex_home = tempdir().expect("tempdir");
-    let cfg = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .cli_overrides(vec![
-            (
-                "features.collaboration_modes".to_string(),
-                TomlValue::Boolean(true),
-            ),
-            (
-                "tui.experimental_mode".to_string(),
-                TomlValue::String("plan".to_string()),
-            ),
-        ])
-        .build()
-        .await
-        .expect("config");
-    let resolved_model = get_model_offline_for_tests(cfg.model.as_deref());
-    let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
-    let init = ChatWidgetInit {
-        config: cfg.clone(),
-        frame_requester: FrameRequester::test_dummy(),
-        app_event_tx: AppEventSender::new(unbounded_channel::<AppEvent>().0),
-        workspace_command_runner: None,
-        initial_user_message: None,
-        enhanced_keys_supported: false,
-        has_chatgpt_account: false,
-        has_codex_backend_auth: false,
-        model_catalog: test_model_catalog(&cfg),
-        feedback: codex_feedback::CodexFeedback::new(),
-        is_first_run: true,
-        status_account_display: None,
-        runtime_model_provider_base_url: None,
-        initial_plan_type: None,
-        model: Some(resolved_model.clone()),
-        startup_tooltip_override: None,
-        status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
-        terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
-        session_telemetry,
-    };
-
-    let chat = ChatWidget::new_with_app_event(init);
-    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
-    assert_eq!(chat.current_model(), resolved_model);
-}
-
-#[tokio::test]
 async fn plugins_popup_loading_state_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
@@ -233,7 +186,7 @@ async fn plugins_popup_keeps_loaded_marketplace_state_with_load_errors() {
     let popup = render_loaded_plugins_popup(&mut chat, response);
     assert!(
         popup.contains("No marketplace plugins available")
-            && !popup.contains("Marketplace unavailable"),
+            && !popup.contains("Plugin marketplace unavailable"),
         "expected /plugins to keep the loaded marketplace state, got:\n{popup}"
     );
 }
@@ -1880,18 +1833,31 @@ async fn plugins_popup_openai_curated_tab_omits_marketplace_in_rows() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
 
-    render_loaded_plugins_popup(
+    // The selected row swaps its description for a hint, so a second curated row is needed to
+    // observe the marketplace label at all.
+    let all_plugins_popup = render_loaded_plugins_popup(
         &mut chat,
         plugins_test_response(vec![
-            plugins_test_curated_marketplace(vec![plugins_test_summary(
-                "plugin-calendar",
-                "calendar",
-                Some("Calendar"),
-                Some("Schedule management."),
-                /*installed*/ false,
-                /*enabled*/ true,
-                PluginInstallPolicy::Available,
-            )]),
+            plugins_test_curated_marketplace(vec![
+                plugins_test_summary(
+                    "plugin-calendar",
+                    "calendar",
+                    Some("Calendar"),
+                    Some("Schedule management."),
+                    /*installed*/ false,
+                    /*enabled*/ true,
+                    PluginInstallPolicy::Available,
+                ),
+                plugins_test_summary(
+                    "plugin-drive",
+                    "drive",
+                    Some("Drive"),
+                    Some("Document access."),
+                    /*installed*/ false,
+                    /*enabled*/ true,
+                    PluginInstallPolicy::Available,
+                ),
+            ]),
             plugins_test_repo_marketplace(vec![plugins_test_summary(
                 "plugin-repo",
                 "repo",
@@ -1903,6 +1869,10 @@ async fn plugins_popup_openai_curated_tab_omits_marketplace_in_rows() {
             )]),
         ]),
     );
+    assert!(
+        all_plugins_popup.contains("· OpenAI Curated ·"),
+        "expected All Plugins rows to carry the curated marketplace label, got:\n{all_plugins_popup}"
+    );
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Right));
     chat.handle_key_event(KeyEvent::from(KeyCode::Right));
@@ -1913,11 +1883,11 @@ async fn plugins_popup_openai_curated_tab_omits_marketplace_in_rows() {
         "expected OpenAI Curated tab header, got:\n{popup}"
     );
     assert!(
-        popup.contains("Calendar") && !popup.contains("Repo Plugin"),
+        popup.contains("Calendar") && popup.contains("Drive") && !popup.contains("Repo Plugin"),
         "expected OpenAI Curated tab to show only official marketplace plugins, got:\n{popup}"
     );
     assert!(
-        !popup.contains("ChatGPT Marketplace ·"),
+        !popup.contains("ChatGPT Marketplace ·") && !popup.contains("OpenAI Curated ·"),
         "expected marketplace-specific rows to omit marketplace labels, got:\n{popup}"
     );
 }
@@ -2451,7 +2421,7 @@ async fn apps_popup_preserves_selected_app_across_refresh() {
 
 #[tokio::test]
 async fn apps_refresh_failure_with_cached_snapshot_triggers_pending_force_refetch() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     set_chatgpt_auth(&mut chat);
     chat.config
         .features
@@ -2492,6 +2462,17 @@ async fn apps_refresh_failure_with_cached_snapshot_triggers_pending_force_refetc
     assert_matches!(
         &chat.connectors.cache,
         ConnectorsCacheState::Ready(snapshot) if snapshot.connectors == full_connectors
+    );
+    // The widget state looks the same after a plain refresh, so check the dispatched request.
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+            event,
+            AppEvent::FetchConnectorsList {
+                force_refetch: true,
+                ..
+            }
+        )),
+        "expected the pending refetch to be dispatched as a forced refetch"
     );
 }
 
@@ -2915,6 +2896,8 @@ async fn astra_reasoning_picker_uses_its_supported_efforts() {
     for effort in ["Low", "Medium", "High", "Extra high", "Max", "Ultra"] {
         assert!(popup.contains(effort), "missing {effort}: {popup}");
     }
+    // The Ultra description also starts with "Maximum", so anchor Max to its own row label.
+    assert!(popup.contains(". Max "), "missing Max row: {popup}");
     assert!(!popup.contains("None"), "{popup}");
     assert!(!popup.contains("Minimal"), "{popup}");
 }
@@ -3245,7 +3228,7 @@ async fn reasoning_shortcuts_adjust_reasoning_effort() {
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
         ],
         ReasoningEffortConfig::Low,
-        false,
+        /*expect_model_update*/ true,
     ).await;
 }
 
@@ -3419,4 +3402,102 @@ async fn apps_failed_loading_popup_closes_and_retry_shows_loading() {
         fetched |= matches!(event, AppEvent::FetchConnectorsList { .. });
     }
     assert!(fetched, "retry must dispatch another fetch");
+}
+
+#[tokio::test]
+async fn account_update_discards_previous_account_apps() {
+    for is_final in [false, true] {
+        let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+        set_chatgpt_auth(&mut chat);
+        chat.config.features.enable(Feature::Apps).expect("enable apps");
+        chat.bottom_pane.set_connectors_enabled(true);
+        chat.on_connectors_loaded(
+            Ok(ConnectorsSnapshot {
+                connectors: vec![AppInfo {
+                    id: "previous_account_app".to_string(),
+                    name: "Previous Account App".to_string(),
+                    description: None,
+                    logo_url: None,
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: None,
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: None,
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                }],
+            }),
+            is_final,
+        );
+        assert_eq!(chat.connectors_for_mentions().expect("initial apps").len(), 1);
+
+        // AccountUpdated is an identity boundary even when visible auth fields match.
+        chat.update_account_state(None, None, true, true);
+        assert!(
+            chat.connectors_for_mentions().is_none_or(|apps| apps.is_empty()),
+            "account update retained previous apps (is_final={is_final})"
+        );
+        chat.bottom_pane.set_composer_text("$".to_string(), Vec::new(), Vec::new());
+        assert!(!render_bottom_popup(&chat, 80).contains("Previous Account App"));
+        chat.bottom_pane.set_composer_text(String::new(), Vec::new(), Vec::new());
+        chat.add_connectors_output();
+        let popup = render_bottom_popup(&chat, 80);
+        assert!(!popup.contains("Previous Account App"), "{popup}");
+        assert!(popup.contains("Loading installed and available apps..."), "{popup}");
+    }
+}
+
+#[tokio::test]
+async fn account_update_rejects_stale_connector_responses() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_chatgpt_auth(&mut chat);
+    chat.config.features.enable(Feature::Apps).expect("enable apps");
+    chat.bottom_pane.set_connectors_enabled(true);
+    // Establish identical visible fields before and after the identity boundary.
+    chat.update_account_state(None, None, true, true);
+    let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    chat.refresh_connectors(false);
+    let old_request = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
+        match event {
+            AppEvent::FetchConnectorsList { request_id, .. } => Some(request_id),
+            _ => None,
+        }
+    }).expect("old account refresh");
+    chat.refresh_connectors(true);
+    assert!(chat.connectors.force_refetch_pending);
+
+    chat.update_account_state(None, None, true, true);
+    assert!(!chat.accepts_connectors_request(old_request));
+    assert!(!chat.connectors.prefetch_in_flight);
+    assert!(!chat.connectors.force_refetch_pending);
+    chat.add_connectors_output();
+    let new_request = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
+        match event {
+            AppEvent::FetchConnectorsList { request_id, .. } => Some(request_id),
+            _ => None,
+        }
+    }).expect("new account refresh");
+    assert_ne!(old_request, new_request);
+    for is_final in [false, true] {
+        for result in [
+            Ok(ConnectorsSnapshot { connectors: Vec::new() }),
+            Err("old account error".to_string()),
+        ] {
+            chat.on_connectors_response(old_request, result, is_final);
+            assert!(chat.accepts_connectors_request(new_request));
+            assert!(chat.connectors.prefetch_in_flight);
+            assert!(matches!(chat.connectors.cache, super::super::connectors::ConnectorsCacheState::Loading));
+            let popup = render_bottom_popup(&chat, 80);
+            assert!(popup.contains("Loading installed and available apps..."), "{popup}");
+            assert!(!popup.contains("old account error"), "{popup}");
+        }
+    }
+    chat.on_connectors_response(new_request, Ok(ConnectorsSnapshot { connectors: Vec::new() }), true);
+    assert!(!chat.connectors.prefetch_in_flight);
+    assert!(!chat.accepts_connectors_request(new_request));
+    assert!(matches!(chat.connectors.cache, super::super::connectors::ConnectorsCacheState::Ready(_)));
 }

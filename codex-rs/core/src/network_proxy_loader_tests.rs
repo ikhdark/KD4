@@ -18,29 +18,31 @@ use std::collections::BTreeMap;
 use std::fs;
 use tempfile::tempdir;
 
-struct ConfigDiscoveryEdit {
+struct ConfigReadEdit {
     codex_home: AbsolutePathBuf,
+    /// A state build reads the layers twice: discovery, then the published policy.
+    reads_before_edit: usize,
     contents: String,
     modified: std::time::SystemTime,
 }
 
 thread_local! {
-    static CONFIG_DISCOVERY_EDIT: std::cell::RefCell<Option<ConfigDiscoveryEdit>> = const {
+    static CONFIG_READ_EDIT: std::cell::RefCell<Option<ConfigReadEdit>> = const {
         std::cell::RefCell::new(None)
     };
 }
 
-pub(super) fn after_config_discovery(codex_home: &AbsolutePathBuf) {
-    let edit = CONFIG_DISCOVERY_EDIT.with(|pending| {
+pub(super) fn after_config_layers_read(codex_home: &AbsolutePathBuf) {
+    let edit = CONFIG_READ_EDIT.with(|pending| {
         let mut pending = pending.borrow_mut();
-        if pending
-            .as_ref()
-            .is_some_and(|edit| &edit.codex_home == codex_home)
-        {
-            pending.take()
-        } else {
-            None
-        }
+        let due = match pending.as_mut() {
+            Some(edit) if &edit.codex_home == codex_home => {
+                edit.reads_before_edit -= 1;
+                edit.reads_before_edit == 0
+            }
+            _ => false,
+        };
+        if due { pending.take() } else { None }
     });
     if let Some(edit) = edit {
         write_config_with_mtime(&edit.codex_home, &edit.contents, edit.modified);
@@ -77,39 +79,59 @@ mode = "full"
         )
     };
     let initial_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    write_config_with_mtime(&codex_home, &policy("initial.example.com"), initial_mtime);
-    let (initial_state, layer_mtimes) = build_config_state_with_mtimes(&codex_home).await.unwrap();
-    assert!(initial_state.deny_set.is_match("initial.example.com"));
-    let reloader = MtimeConfigReloader::new(layer_mtimes, codex_home.clone());
-    let entry: &dyn ConfigReloader = &reloader;
-    assert!(entry.maybe_reload().await.unwrap().is_none());
+    // The edit lands either between the two reads of one reload, or after the read
+    // whose policy that reload publishes.
+    for (reads_before_edit, first_published) in
+        [(1, "latest.example.com"), (2, "intermediate.example.com")]
+    {
+        write_config_with_mtime(&codex_home, &policy("initial.example.com"), initial_mtime);
+        let (initial_state, layer_mtimes) =
+            build_config_state_with_mtimes(&codex_home).await.unwrap();
+        assert!(initial_state.deny_set.is_match("initial.example.com"));
+        let reloader = MtimeConfigReloader::new(layer_mtimes, codex_home.clone());
+        let entry: &dyn ConfigReloader = &reloader;
+        assert!(entry.maybe_reload().await.unwrap().is_none());
 
-    write_config_with_mtime(
-        &codex_home,
-        &policy("intermediate.example.com"),
-        initial_mtime + std::time::Duration::from_secs(10),
-    );
-    CONFIG_DISCOVERY_EDIT.with(|pending| {
-        *pending.borrow_mut() = Some(ConfigDiscoveryEdit {
-            codex_home,
-            contents: policy("latest.example.com"),
-            modified: initial_mtime + std::time::Duration::from_secs(20),
+        write_config_with_mtime(
+            &codex_home,
+            &policy("intermediate.example.com"),
+            initial_mtime + std::time::Duration::from_secs(10),
+        );
+        CONFIG_READ_EDIT.with(|pending| {
+            *pending.borrow_mut() = Some(ConfigReadEdit {
+                codex_home: codex_home.clone(),
+                reads_before_edit,
+                contents: policy("latest.example.com"),
+                modified: initial_mtime + std::time::Duration::from_secs(20),
+            });
         });
-    });
-    let first = entry
-        .maybe_reload()
-        .await
-        .unwrap()
-        .expect("changed policy must reload");
-    assert!(CONFIG_DISCOVERY_EDIT.with(|pending| pending.borrow().is_none()));
-    let published = entry.maybe_reload().await.unwrap().unwrap_or(first);
-    assert!(published.deny_set.is_match("latest.example.com"));
-    assert!(!published.deny_set.is_match("intermediate.example.com"));
-    assert!(!published.deny_set.is_match("initial.example.com"));
-    assert!(
-        entry.maybe_reload().await.unwrap().is_none(),
-        "stable policy must settle"
-    );
+        let first = entry
+            .maybe_reload()
+            .await
+            .unwrap()
+            .expect("changed policy must reload");
+        assert!(CONFIG_READ_EDIT.with(|pending| pending.borrow().is_none()));
+        assert!(
+            first.deny_set.is_match(first_published),
+            "edit after read {reads_before_edit}"
+        );
+        let published = if reads_before_edit == 2 {
+            entry
+                .maybe_reload()
+                .await
+                .unwrap()
+                .expect("an edit after the published read must stay visible to the next probe")
+        } else {
+            first
+        };
+        assert!(published.deny_set.is_match("latest.example.com"));
+        assert!(!published.deny_set.is_match("intermediate.example.com"));
+        assert!(!published.deny_set.is_match("initial.example.com"));
+        assert!(
+            entry.maybe_reload().await.unwrap().is_none(),
+            "stable policy must settle after read {reads_before_edit}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -819,44 +841,40 @@ default_permissions = "dev"
 }
 
 #[test]
-fn apply_network_constraints_overlay_domain_entries() {
-    let lower_network: toml::Value = toml::from_str(
-        r#"
-default_permissions = "dev"
+fn trusted_constraints_overlay_domain_entries_across_layers() {
+    let lower_layer = ConfigLayerEntry::new(
+        ConfigLayerSource::System {
+            file: AbsolutePathBuf::try_from(std::path::PathBuf::from("/tmp/system.toml"))
+                .expect("system config path should be absolute"),
+        },
+        toml::toml! {
+            default_permissions = "dev"
 
-[permissions.dev.network]
-
-[permissions.dev.network.domains]
-"blocked.example.com" = "deny"
-"#,
+            [permissions.dev.network.domains]
+            "blocked.example.com" = "deny"
+        }
+        .into(),
+    );
+    let higher_layer = ConfigLayerEntry::new(
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+            file: AbsolutePathBuf::try_from(std::path::PathBuf::from("/tmp/managed.toml"))
+                .expect("managed config path should be absolute"),
+        },
+        toml::toml! {
+            [permissions.dev.network.domains]
+            "api.example.com" = "allow"
+        }
+        .into(),
+    );
+    let layers = ConfigLayerStack::new(
+        vec![lower_layer, higher_layer],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
     )
-    .expect("lower layer should parse");
-    let higher_network: toml::Value = toml::from_str(
-        r#"
-default_permissions = "dev"
+    .expect("layer stack should be valid");
 
-[permissions.dev.network]
-
-[permissions.dev.network.domains]
-"api.example.com" = "allow"
-"#,
-    )
-    .expect("higher layer should parse");
-
-    let lower_network = selected_network_from_tables(
-        network_tables_from_toml(&lower_network).expect("lower layer should deserialize"),
-    )
-    .expect("lower layer should select a network table")
-    .expect("lower network table should be present");
-    let higher_network = selected_network_from_tables(
-        network_tables_from_toml(&higher_network).expect("higher layer should deserialize"),
-    )
-    .expect("higher layer should select a network table")
-    .expect("higher network table should be present");
-
-    let mut constraints = NetworkProxyConstraints::default();
-    apply_network_constraints(lower_network, &mut constraints);
-    apply_network_constraints(higher_network, &mut constraints);
+    let constraints = network_constraints_from_trusted_layers(&layers)
+        .expect("trusted network domain layers should load");
 
     assert_eq!(
         constraints.allowed_domains,

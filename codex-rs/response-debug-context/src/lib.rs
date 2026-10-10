@@ -91,8 +91,10 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
 mod tests {
     use super::ResponseDebugContext;
     use super::extract_response_debug_context;
+    use super::extract_response_debug_context_from_api_error;
     use super::telemetry_api_error_message;
     use super::telemetry_transport_error_message;
+    use base64::Engine as _;
     use codex_api::ApiError;
     use codex_api::TransportError;
     use http::HeaderMap;
@@ -131,6 +133,56 @@ mod tests {
                 auth_error_code: Some("token_expired".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn malformed_auth_metadata_preserves_other_debug_headers() {
+        let malformed_metadata = [
+            HeaderValue::from_static("not base64"),
+            HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode("not json"))
+                .expect("ASCII header"),
+            HeaderValue::from_str(
+                &base64::engine::general_purpose::STANDARD.encode(r#"{"error":{"code":401}}"#),
+            )
+            .expect("ASCII header"),
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header"),
+        ];
+
+        for metadata in malformed_metadata {
+            for (primary, expected_request_id) in [
+                (HeaderValue::from_static("primary"), "primary"),
+                (HeaderValue::from_bytes(&[0xff]).expect("opaque header"), "fallback"),
+            ] {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-request-id", primary);
+                headers.insert("x-oai-request-id", HeaderValue::from_static("fallback"));
+                headers.insert("cf-ray", HeaderValue::from_static("ray-auth"));
+                headers.insert(
+                    "x-openai-authorization-error",
+                    HeaderValue::from_static("missing_authorization_header"),
+                );
+                headers.insert("x-error-json", metadata.clone());
+                let transport = TransportError::Http {
+                    retry_after: None,
+                    status: StatusCode::UNAUTHORIZED,
+                    url: None,
+                    headers: Some(headers),
+                    body: None,
+                };
+                let expected = ResponseDebugContext {
+                    request_id: Some(expected_request_id.to_string()),
+                    cf_ray: Some("ray-auth".to_string()),
+                    auth_error: Some("missing_authorization_header".to_string()),
+                    auth_error_code: None,
+                };
+
+                assert_eq!(extract_response_debug_context(&transport), expected);
+                assert_eq!(
+                    extract_response_debug_context_from_api_error(&ApiError::Transport(transport)),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
