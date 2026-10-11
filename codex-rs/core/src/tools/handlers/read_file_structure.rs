@@ -69,6 +69,25 @@ fn trait_method_candidate(item: &CodeItem, name: &str) -> bool {
         alias == name || alias.ends_with(&format!("::{name}")))
 }
 
+// Diagnostic-only repair for impl and <Type as Trait> requests whose paths or
+// generic arguments differ from the source header, which the caller cannot
+// know before reading the file. Never an executable selector.
+fn header_spelling_candidate(item: &CodeItem, name: &str) -> bool {
+    let impl_request = name.starts_with("impl ") || name.contains("::impl ");
+    let trait_request = name.starts_with('<') || name.contains("::<");
+    if !(impl_request || trait_request) || impl_request != (item.kind == "impl") {
+        return false;
+    }
+    let identifiers = |text: &str| text.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty() && !matches!(*token, "impl" | "for" | "as"))
+        .map(str::to_owned).collect::<std::collections::BTreeSet<_>>();
+    let requested = identifiers(name);
+    !requested.is_empty() && requested.is_subset(&identifiers(&item.qualified_name))
+        && name.contains(" for ") == item.qualified_name.contains(" for ")
+        && name.contains(" as ") == item.qualified_name.contains(" as ")
+        && (impl_request || name.rsplit("::").next() == Some(item.name.as_str()))
+}
+
 pub(super) fn resolve_batch(
     path: &str,
     canonical: &mut CanonicalToolResult,
@@ -98,12 +117,22 @@ pub(super) fn resolve_batch(
             resolve_items(items.as_deref().unwrap_or_default(), vec![selector.clone()])
         };
         match result {
-            Ok(ranges) => {
+            Ok((ranges, item)) => {
                 if matches!(&selector, FileSelector::Structure(
                     StructureSelector::Symbol { .. } | StructureSelector::Enclosing { .. }))
                 {
-                    bindings.push(serde_json::json!({"selector_index":index,
-                        "resolved_selectors":ranges}));
+                    let mut binding = serde_json::json!({"selector_index":index,
+                        "resolved_selectors":ranges});
+                    // A bare name or line otherwise arrives without its owner.
+                    // Parser-derived identity, like failure candidates; not type resolution.
+                    if let Some(item) = item {
+                        if item.qualified_name.len() <= 1024 {
+                            binding["qualified_name"] = item.qualified_name.as_str().into();
+                        }
+                        binding["kind"] = item.kind.into();
+                        if item.syntax_error { binding["syntax_error"] = true.into(); }
+                    }
+                    bindings.push(binding);
                 }
                 resolved.extend(ranges);
             }
@@ -126,18 +155,43 @@ pub(super) fn resolve_batch(
                 }
                 let mut candidates = Vec::new();
                 let mut candidate_count = 0;
+                let mut imported = false;
                 if let FileSelector::Structure(StructureSelector::Symbol { name }) = &selector {
-                    for item in items.iter().flatten().filter(|item|
-                        symbol_matches(item, name) || trait_method_candidate(item, name)) {
+                    let mut matches = items.iter().flatten().filter(|item|
+                        symbol_matches(item, name) || trait_method_candidate(item, name)
+                            || header_spelling_candidate(item, name)).collect::<Vec<_>>();
+                    // Diagnostic-only repair for a wrong owner: the item exists in this
+                    // file under another one. Like the trait alias, never executable.
+                    if matches.is_empty()
+                        && let Some((_, last)) = name.rsplit_once("::").or_else(|| name.rsplit_once('.'))
+                    {
+                        matches.extend(items.iter().flatten().filter(|item|
+                            item.kind != "impl" && item.name == last));
+                    }
+                    // A name this file only imports or re-exports is not a macro
+                    // problem: show the declaration that names its owner.
+                    if matches.is_empty() {
+                        let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
+                        matches.extend(items.iter().flatten().filter(|item| item.kind == "use"
+                            && item.signature.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                                .any(|token| token == leaf)));
+                        imported = !matches.is_empty();
+                    }
+                    for item in matches {
                         candidate_count += 1;
-                        if candidates.len() < 8 && item.qualified_name.len() <= 1024 {
-                            candidates.push(serde_json::json!({"qualified_name":item.qualified_name,
+                        let identity = if item.kind == "use" { &item.signature } else { &item.qualified_name };
+                        if candidates.len() < 8 && identity.len() <= 1024 {
+                            candidates.push(serde_json::json!({"qualified_name":identity,
                                 "selector":{"kind":"lines", "start":item.start_line, "end":item.end_line}}));
                         }
                     }
                 }
+                let mut message = error.for_model();
+                if imported {
+                    message.push_str(" The candidates are use declarations: this file imports or re-exports the name rather than defining it; follow the path to its owner.");
+                }
                 failures.push(serde_json::json!({"selector_index":index, "selector":selector,
-                    "status":"invalid_selector", "complete":false, "message":error.for_model(),
+                    "status":"invalid_selector", "complete":false, "message":message,
                     "source_sha256":canonical.sha256, "candidates":candidates,
                     "omitted_candidates":candidate_count - candidates.len()}));
             }
@@ -146,12 +200,14 @@ pub(super) fn resolve_batch(
     (Some(resolved), failures, bindings)
 }
 
+/// Also returns the item bound by the last symbol or enclosing selector.
 fn resolve_items(
     items: &[CodeItem],
     selectors: Vec<FileSelector>,
-) -> Result<Vec<ToolOutputSelector>, ReadToolOutputError> {
+) -> Result<(Vec<ToolOutputSelector>, Option<&CodeItem>), ReadToolOutputError> {
     let error = |message: String| ReadToolOutputError::InvalidRange(message);
     let mut resolved = Vec::new();
+    let mut bound = None;
     for selector in selectors {
         let structure = match selector {
             FileSelector::Exact(selector) => { resolved.push(selector); continue; }
@@ -180,8 +236,9 @@ fn resolve_items(
             }
         };
         resolved.push(ToolOutputSelector::Lines { start: item.start_line, end: item.end_line });
+        bound = Some(item);
     }
-    Ok(resolved)
+    Ok((resolved, bound))
 }
 
 #[cfg(test)]
@@ -304,6 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn imported_names_point_at_their_use_declaration() {
+        let mut canonical = CanonicalToolResult::text(
+            "pub use inner::Thing;\nuse other::{Left, Right};\nfn local() {}\n".to_owned());
+        let (_, errors, _) = resolve_batch("lib.rs", &mut canonical, Some(vec![
+            FileSelector::Structure(StructureSelector::Symbol { name: "Thing".into() }),
+            FileSelector::Structure(StructureSelector::Symbol { name: "other::Right".into() }),
+            FileSelector::Structure(StructureSelector::Symbol { name: "absent".into() }),
+        ]));
+        assert_eq!(errors[0]["candidates"], serde_json::json!([{"qualified_name":"pub use inner::Thing;",
+            "selector":{"kind":"lines","start":1,"end":1}}]));
+        assert!(errors[0]["message"].as_str().unwrap().contains("imports or re-exports the name"));
+        assert_eq!(errors[1]["candidates"][0]["selector"], serde_json::json!({"kind":"lines","start":2,"end":2}));
+        assert!(errors[2]["candidates"].as_array().unwrap().is_empty());
+        assert!(!errors[2]["message"].as_str().unwrap().contains("imports"));
+    }
+
+    #[test]
     fn actionability_trait_repairs_are_suggestions_not_fuzzy_execution() {
         let source = "impl First for S { fn run() {} }\nimpl Second for S { fn run() {} }\nimpl First for Other { fn run() {} }\n";
         let mut canonical = CanonicalToolResult::text(source.to_owned());
@@ -317,5 +391,18 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0]["selector_index"], 1);
         assert_eq!(bindings[0]["resolved_selectors"], serde_json::json!([{"kind":"lines","start":1,"end":1}]));
+        assert_eq!(bindings[0]["qualified_name"], "<S as First>::run");
+        assert_eq!(bindings[0]["kind"], "fn");
+        assert!(bindings[0].get("syntax_error").is_none());
+
+        // An enclosing line names its owner, and a broken item says so.
+        let mut canonical = CanonicalToolResult::text("impl A {\n fn run() {\n }\n}\nfn broken() { let = ; }\n".to_owned());
+        let (_, errors, bindings) = resolve_batch("owner.rs", &mut canonical, Some(vec![
+            FileSelector::Structure(StructureSelector::Enclosing { line: 3 }),
+            FileSelector::Structure(StructureSelector::Symbol { name: "broken".into() }),
+        ]));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(bindings[0]["qualified_name"], "A::run");
+        assert_eq!(bindings[1]["syntax_error"], true);
     }
 }

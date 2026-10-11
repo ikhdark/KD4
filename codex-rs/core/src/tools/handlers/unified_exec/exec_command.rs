@@ -449,6 +449,7 @@ impl ExecCommandHandler {
             crate::tools::handlers::command_preflight::check_full_suite_command(
                 &original_resolved_command.safety_command,
                 original_resolved_command.preflight_shell_type,
+                if environment_is_remote { None } else { native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path) },
             )
             .await
             .map_err(FunctionCallError::RespondToModel)?

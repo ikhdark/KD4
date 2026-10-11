@@ -28,7 +28,7 @@ pub(crate) fn file_selector_schema() -> JsonSchema {
         })
         && let Some(id) = section.properties.as_mut().and_then(|properties| properties.get_mut("id"))
     {
-        id.description = Some("Use outline for a paged Rust/Python item listing (names, signatures, lines, tests, explicit module paths, and unverified linked_path_candidates), then a returned item ID for exact source. Verify module candidates through the selected filesystem only when following them. IDs are source-hash-bound; read_tool_output preserves them on the original snapshot. Ordinary reads do not parse code.".to_string());
+        id.description = Some("Use outline for a paged Rust/Python item listing (names, signatures, lines, tests, explicit module paths, and unverified linked_path_candidates), then a returned item ID for exact source. Imports are not listed; the first page gives their line runs as import_ranges. Verify module candidates through the selected filesystem only when following them. IDs are source-hash-bound; read_tool_output preserves them on the original snapshot. Ordinary reads do not parse code.".to_string());
     }
     if let Some(variants) = &mut schema.one_of {
         variants.push(selector_variant(
@@ -294,7 +294,18 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                                 "line": {"type": "integer", "minimum": 1},
                                 "end_line": {"type": "integer", "minimum": 1},
                                 "start_byte": {"type": "integer", "minimum": 0},
-                                "end_byte": {"type": "integer", "minimum": 0}
+                                "end_byte": {"type": "integer", "minimum": 0},
+                                "enclosing_item": {
+                                    "type": "object",
+                                    "description": "With enclosing:true, the smallest Rust/Python item containing the hit; parser-derived, not type resolution. Absent for imports and hits outside any item.",
+                                    "properties": {
+                                        "qualified_name": {"type": "string"}, "kind": {"type": "string"},
+                                        "start_line": {"type": "integer", "minimum": 1},
+                                        "end_line": {"type": "integer", "minimum": 1}
+                                    },
+                                    "required": ["qualified_name", "kind", "start_line", "end_line"],
+                                    "additionalProperties": false
+                                }
                             },
                             "required": ["line", "end_line", "start_byte", "end_byte"],
                             "additionalProperties": false

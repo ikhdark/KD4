@@ -818,8 +818,7 @@ fn lane2_websocket_cache_denies_speculative_publication() {
     assert!(speculative_session.websocket_cache_publication.is_none());
 }
 
-#[tokio::test]
-async fn turn_preconnect_skips_spawned_agents_and_http_fallback() {
+fn spawned_agent_websocket_test_model_client() -> ModelClient {
     let mut child = websocket_test_model_client();
     Arc::get_mut(&mut child.state).unwrap().session_source =
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -829,9 +828,81 @@ async fn turn_preconnect_skips_spawned_agents_and_http_fallback() {
             agent_nickname: None,
             agent_role: None,
         });
+    child
+}
+
+#[tokio::test(start_paused = true)]
+async fn turn_preconnect_for_spawned_agents_waits_for_attestation_readiness() {
+    #[derive(Debug, Default)]
+    struct NeverReadyAttestation(AtomicUsize);
+
+    impl AttestationProvider for NeverReadyAttestation {
+        fn supports_startup_requests(&self) -> bool {
+            false
+        }
+
+        fn wait_until_ready(
+            &self,
+            _context: AttestationContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn header_for_request(&self, _context: AttestationContext) -> GenerateAttestationFuture<'_> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { None })
+        }
+    }
+
+    // Without attestation there is nothing to wait for.
+    let client = spawned_agent_websocket_test_model_client();
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut session = client.new_session();
+    session.start_websocket_preconnect(
+        &test_model_info(),
+        None,
+        &test_session_telemetry(),
+        &metadata,
+    ).await;
+    assert!(session.pending_websocket_preconnect.is_some());
+    drop(session);
+
+    // A thread that never reaches an attesting client gives up without a handshake.
+    let provider = Arc::new(NeverReadyAttestation::default());
+    let mut client = spawned_agent_websocket_test_model_client();
+    let state = Arc::get_mut(&mut client.state).unwrap();
+    state.include_attestation = true;
+    state.attestation_provider = Some(provider.clone());
+    let mut session = client.new_session();
+    let started = tokio::time::Instant::now();
+    session.start_websocket_preconnect(
+        &test_model_info(),
+        None,
+        &test_session_telemetry(),
+        &metadata,
+    ).await;
+    let transport = session
+        .pending_websocket_preconnect
+        .take()
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(transport.is_none());
+    assert_eq!(started.elapsed(), super::SPAWNED_AGENT_ATTESTATION_WAIT);
+    assert_eq!(provider.0.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn turn_preconnect_skips_http_fallback_and_non_websocket_clients() {
     let fallback = websocket_test_model_client();
     fallback.force_http_fallback(&test_session_telemetry());
-    for client in [child, fallback, test_model_client(SessionSource::Cli)] {
+    for client in [fallback, test_model_client(SessionSource::Cli)] {
         let metadata = test_responses_metadata_for_client(
             &client,
             None,

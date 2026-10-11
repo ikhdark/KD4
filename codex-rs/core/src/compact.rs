@@ -2581,6 +2581,16 @@ async fn drain_to_completed(
         let _model_stream_processing_timing_guard = turn_context
             .turn_timing_state
             .begin_model_stream_processing(&event);
+        if let ResponseEvent::Completed { token_usage, .. } = &event {
+            // Give the compaction request its completion time and usage in the
+            // turn timing record, as remote compaction does.
+            turn_context
+                .turn_timing_state
+                .record_response_event_milestones(&event);
+            turn_context
+                .turn_timing_state
+                .record_generation_token_usage(token_usage.as_ref());
+        }
         match event {
             ResponseEvent::OutputItemDone(item) => {
                 accumulator.record_output(item);

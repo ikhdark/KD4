@@ -370,6 +370,7 @@ impl ShellCommandHandler {
             crate::tools::handlers::command_preflight::check_full_suite_command(
                 &original_safety_command,
                 original_shell_type,
+                (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
             )
             .await
             .map_err(FunctionCallError::RespondToModel)?

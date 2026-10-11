@@ -1179,6 +1179,32 @@ pub fn classify_script_with_runners(script: &str, runners: &[RepositoryRunner]) 
     classify_simple_script(script, 0, runners, false)
 }
 
+/// A check-only `cargo fmt`, bare or as the single command of a shell wrapper.
+/// It reads sources and never takes Cargo's build lock.
+pub fn is_standalone_cargo_fmt_check(program: &str, args: &[String]) -> bool {
+    let binary = normalized_program_name(program);
+    let script = match binary.as_str() {
+        "cargo" => {
+            return matches!(cargo_subcommand_index(args), Ok(Some(index)) if args[index].eq_ignore_ascii_case("fmt"))
+                && execution_mode(&binary, args, ValidationOperation::Lint) == ValidationExecutionMode::Checking;
+        }
+        "bash" | "sh" => args
+            .iter()
+            .position(|arg| shell_executes_command_arg(arg))
+            .and_then(|index| args.get(index + 1).cloned()),
+        "pwsh" | "powershell" => args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c"))
+            .map(|index| args[index + 1..].join(" ")),
+        _ => None,
+    };
+    script.as_deref().and_then(standalone_argv).is_some_and(|argv| {
+        argv.split_first().is_some_and(|(program, args)| {
+            normalized_program_name(program) == "cargo" && is_standalone_cargo_fmt_check(program, args)
+        })
+    })
+}
+
 /// Build and inventory commands may compile, but do not establish a test pass.
 pub fn is_build_or_discovery(program: &str, args: &[String]) -> bool {
     let program = normalized_program_name(program);
@@ -1723,7 +1749,7 @@ mod tests {
                 "justfile fmt runs format.py without --check: {args:?}: {classification:?}"
             );
         }
-        for recipe in ["fmt-check", "fmt-check-fast"] {
+        for recipe in ["fmt-check", "fmt-check-fast", "config-schema-check", "app-server-schema-check"] {
             let ValidationClassification::Validation { leaves, .. } = repository_argv("just", &[recipe])
                 else { panic!("check-only recipe should remain classified"); };
             assert!(leaves.iter().all(|leaf| leaf.mode == ValidationExecutionMode::Checking));

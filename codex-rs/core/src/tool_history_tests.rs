@@ -608,6 +608,53 @@ async fn stale_validation_pin_survives_compaction_and_restart_without_rerun() {
 }
 
 #[test]
+fn stale_carrier_observation_marks_dependency_free_exec_pin_not_current() {
+    let source = PathBuf::from("/repo/input.rs");
+    let text = bounded_output();
+    let output = text_output("carrier", text.clone());
+    let mut record = candidate("carrier", text);
+    record.tool_identity = "exec".to_string();
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+        None, &output, BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+    ).unwrap());
+    let flags = |state: &ToolHistoryState| {
+        let pins: serde_json::Value = serde_json::from_str(
+            &state.artifact_pin_payload_for_items(std::slice::from_ref(&output)).unwrap()).unwrap();
+        [pins["artifacts"][0]["source_dependencies_current"].clone(),
+            state.artifact_recovery_directory()[0]["source_dependencies_current"].clone()]
+    };
+    assert_eq!(flags(&state), [true, true]);
+    assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([source])), None));
+    // The carrier candidate owns no dependencies, so only its observation went stale.
+    assert!(state.candidates["carrier"].source_dependencies_current);
+    assert_eq!(flags(&state), [false, false]);
+}
+
+#[test]
+fn dependency_free_carrier_pins_name_their_observed_sources() {
+    let source = PathBuf::from("/repo/input.rs");
+    let text = bounded_output();
+    let output = text_output("carrier", text.clone());
+    let mut record = candidate("carrier", text);
+    record.tool_identity = "exec".to_string();
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    let pin = |state: &ToolHistoryState| serde_json::from_str::<serde_json::Value>(
+        &state.artifact_pin_payload_for_items(std::slice::from_ref(&output)).unwrap()).unwrap()["artifacts"][0].clone();
+    assert!(pin(&state).get("sources").is_none(), "nothing was observed yet");
+    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+        None, &output, BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+    ).unwrap());
+    let observed = pin(&state);
+    assert!(observed["evidence"].is_null());
+    assert_eq!(observed["sources"], serde_json::json!({
+        "paths": [SourceDependencyV1::new(&source, false).path], "omitted": 0}));
+    assert_eq!(state.artifact_recovery_directory()[0]["sources"], observed["sources"]);
+}
+
+#[test]
 fn receipt_digest_preserves_decisive_diagnostic_at_any_position() {
     for position in [11, 333, 880] {
         let mut lines = vec!["compiler boilerplate"; 1000];
@@ -2764,6 +2811,18 @@ fn command_dependencies_cover_search_test_and_read_inputs() {
     assert_eq!(
         source_dependencies_for_tool_call("exec_command", &python_test, cwd),
         BTreeSet::from([SourceDependencyV1::new(cwd, true)])
+    );
+    // Launched below the repository root, a runner still depends on siblings.
+    let repo = tempfile::tempdir().unwrap();
+    let package = repo.path().join("packages").join("web");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    let npm_test = ToolPayload::Function {
+        arguments: serde_json::json!({"command": ["npm", "test"]}).to_string(),
+    };
+    assert_eq!(
+        source_dependencies_for_tool_call("exec_command", &npm_test, &package),
+        BTreeSet::from([SourceDependencyV1::new(repo.path(), true)])
     );
 
     let read = ToolPayload::Function {
@@ -5617,6 +5676,9 @@ async fn overflow_directory_preserves_every_artifact_after_replacement_and_resum
         serde_json::json!({"kind":"bytes","start":index*2,"end":index*2+1})).collect());
     let payload = session.compaction_artifact_pins(&state, &items).await.unwrap().unwrap();
     let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let instruction = payload["instruction"].as_str().unwrap();
+    assert!(instruction.contains("only when") && !instruction.contains("for every retained artifact"),
+        "the directory is an on-demand index, not a required read after each compaction: {instruction}");
     let directory = &payload["directory"];
     let bytes = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
         session.codex_home().await.as_path(), &session.thread_id().to_string(), directory["artifact_id"].as_str().unwrap()

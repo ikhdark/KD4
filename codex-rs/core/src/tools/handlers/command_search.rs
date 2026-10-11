@@ -830,7 +830,7 @@ fn suggestion_score(candidate: &str, is_dir: bool, name: &str, stem: &str) -> Op
     (extends(candidate_stem, stem) || extends(stem, candidate_stem)).then_some(1)
 }
 
-fn display_suggestion(path: &Path, cwd: &Path) -> String {
+pub(super) fn display_suggestion(path: &Path, cwd: &Path) -> String {
     let mut display = path.strip_prefix(cwd).map_or_else(
         |_| path.display().to_string(),
         |relative| relative.to_string_lossy().replace('\\', "/"),

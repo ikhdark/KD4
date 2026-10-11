@@ -53,13 +53,9 @@ fn assert_listing_entries(
     let mut expected = expected
         .iter()
         .map(|(path, kind)| {
-            (
-                PathUri::from_host_native_path(root.join(path))
-                    .unwrap()
-                    .as_str()
-                    .to_owned(),
-                (*kind).to_owned(),
-            )
+            // The tool's own `path` input contract: cwd-relative, not a URI.
+            assert!(root.join(path).exists(), "{path}");
+            (path.replace('\\', "/"), (*kind).to_owned())
         })
         .collect::<Vec<_>>();
     actual.sort_unstable();
@@ -410,7 +406,9 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
     assert_eq!(walks[0]["sandbox"], json!(expected_sandbox));
     assert_eq!(walks[0]["options"]["maxEntries"], 17);
     assert_eq!(walks[0]["options"]["followDirectorySymlinks"], false);
-    assert_eq!(output["entries"][0]["path"], json!(remote_file));
+    assert_eq!(remote_file.basename().as_deref(), Some("remote-only.txt"));
+    assert_eq!(output["entries"][0]["path"], "remote-only.txt");
+    assert_eq!(output["errors"][0]["path"], ".");
     assert_eq!(output["complete"], false);
     // Descendant errors alone must prevent a complete result even if no
     // traversal budget was exhausted. The filtered call above covers both.

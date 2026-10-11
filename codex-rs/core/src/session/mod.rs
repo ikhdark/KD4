@@ -5809,7 +5809,7 @@ impl Session {
                 .map_err(|error| CodexErr::Fatal(error.to_string()))?;
             self.state.lock().await.apply_tool_history_mutation(&mutation);
             payload["directory"] = directory;
-            payload["instruction"] = "Inline pins are a preview. Recover /items from directory with read_tool_output for every retained artifact, exact identity and recovered selectors. Saved outputs and their provenance remain retained.".into();
+            payload["instruction"] = "Inline pins list the newest retained artifacts. Older artifacts, exact identities and recovered selectors are retained in directory; read its /items with read_tool_output only when a needed artifact is not listed here. Saved outputs and their provenance remain retained.".into();
             while codex_utils_string::approx_token_count(&payload.to_string()) > crate::tool_history::COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET {
                 if payload["artifacts"].as_array_mut().and_then(Vec::pop).is_none() { break; }
                 payload["omitted_artifact_count"] = (payload["omitted_artifact_count"].as_u64().unwrap_or(0) + 1).into();

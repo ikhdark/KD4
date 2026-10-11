@@ -325,9 +325,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         }
         output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned exact bytes and hydrated ranges together cover the entire file in this response, including explicit selections. Retention, match coordinates, and recovery selectors alone do not establish coverage."});
         output["properties"]["selector_bindings"] = json!({"type":"array", "maxItems":64,
-            "description":"Successful symbol/enclosing requests bound by their original zero-based selector index to exact snapshot ranges, before result sorting/merging. Resolution is not delivery: check results and completeness separately. Bound to source_sha256; no source is duplicated.",
+            "description":"Successful symbol/enclosing requests bound by their original zero-based selector index to exact snapshot ranges, before result sorting/merging. Resolution is not delivery: check results and completeness separately. Bound to source_sha256; no source is duplicated. qualified_name and kind are the bound item's parser-derived identity (owner included), not type resolution.",
             "items":{"type":"object", "properties":{
                 "selector_index":{"type":"integer","minimum":0},
+                "qualified_name":{"type":"string"},
+                "kind":{"type":"string"},
+                "syntax_error":{"const":true, "description":"The item contains a parse error; its range may be wrong."},
                 "resolved_selectors":{"type":"array","minItems":1,"maxItems":1,"items":file_selector_schema()}},
                 "required":["selector_index","resolved_selectors"],"additionalProperties":false}});
         output["properties"]["selector_errors"] = json!({"type":"array", "maxItems":64,
@@ -1194,6 +1197,7 @@ mod tests {
             assert_eq!(error["candidates"][1]["selector"], json!({"kind":"lines","start":3,"end":3}));
             assert_eq!(error["omitted_candidates"], 0);
             assert_eq!(output["selector_bindings"], json!([{"selector_index":3,
+                "qualified_name":"A::run", "kind":"fn",
                 "resolved_selectors":[{"kind":"lines","start":2,"end":2}]}]));
         }
     }
@@ -1217,8 +1221,8 @@ mod tests {
             schema.validate(&output).unwrap();
             assert_eq!(output["results"].as_array().unwrap().len(), 1);
             assert_eq!(output["selector_bindings"], json!([
-                {"selector_index":0,"resolved_selectors":[{"kind":"lines","start":2,"end":2}]},
-                {"selector_index":1,"resolved_selectors":[{"kind":"lines","start":1,"end":1}]}
+                {"selector_index":0,"qualified_name":"second","kind":"fn","resolved_selectors":[{"kind":"lines","start":2,"end":2}]},
+                {"selector_index":1,"qualified_name":"first","kind":"fn","resolved_selectors":[{"kind":"lines","start":1,"end":1}]}
             ]));
             let ToolPayload::Function {arguments} = &call.payload else { panic!("function"); };
             let requested = json!({"path":path,"selectors":[{"kind":"lines","start":1,"end":1}]}).to_string();
@@ -1259,6 +1263,8 @@ mod tests {
                 assert_eq!(search["value"]["hydrated_ranges"][0]["text"], unit);
                 assert_eq!(search["value"]["enclosing_complete"], true);
                 assert_eq!(search["value"]["matches_returned"], 1);
+                assert_eq!(search["value"]["matches"][0]["enclosing_item"]["qualified_name"], name);
+                assert_eq!(search["value"]["matches"][0]["enclosing_item"]["start_line"], 1);
                 assert_eq!(search["value"]["remaining_match_count"], 1);
                 assert!(search["continuation"]["start_byte"].as_u64().unwrap() > 0);
                 let outline = results.iter().find(|result| result["selector"]["kind"] == "section").unwrap();

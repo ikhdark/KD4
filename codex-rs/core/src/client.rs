@@ -2306,6 +2306,7 @@ struct WebsocketHistoryBaseline {
 /// The Responses websocket ends every connection after 60 minutes and fails any
 /// response still streaming on it. Rotate at a request boundary before then.
 const WEBSOCKET_ROTATION_AGE: Duration = Duration::from_secs(55 * 60);
+const SPAWNED_AGENT_ATTESTATION_WAIT: Duration = Duration::from_millis(100);
 
 fn websocket_connection_expiring(connected_at: Option<Instant>, now: Instant) -> bool {
     connected_at.is_some_and(|connected_at| {
@@ -3933,13 +3934,22 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) {
-        // Spawned agents may not yet be attached to an attestation-capable client.
-        if self.client.state.session_source.is_non_root_agent()
-            || !self.client.responses_websocket_enabled()
-            || self.pending_websocket_preconnect.is_some()
+        if !self.client.responses_websocket_enabled() || self.pending_websocket_preconnect.is_some()
         {
             return;
         }
+        // A spawned agent's first turn can start before its thread is attached to an
+        // attestation-capable client; the handshake needs that client.
+        let state = &self.client.state;
+        let attestation_ready = state
+            .attestation_provider
+            .clone()
+            .filter(|provider| {
+                state.session_source.is_non_root_agent()
+                    && state.include_attestation
+                    && !provider.supports_startup_requests()
+            })
+            .map(|provider| (provider, AttestationContext { thread_id: state.thread_id }));
         if let Some(connection) = self.websocket_session.connection.as_ref() {
             if !websocket_connection_expiring(self.websocket_session.connected_at, Instant::now())
                 && !connection.is_closed().await
@@ -3954,6 +3964,18 @@ impl ModelClientSession {
         let responses_metadata = responses_metadata.clone();
         self.pending_websocket_preconnect = Some(AbortOnDropHandle::new(tokio::spawn(
             async move {
+                // Dispatch awaits this task, so an attachment that is not imminent yields to
+                // the connect that dispatch performs anyway.
+                if let Some((provider, context)) = attestation_ready
+                    && tokio::time::timeout(
+                        SPAWNED_AGENT_ATTESTATION_WAIT,
+                        provider.wait_until_ready(context),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
                 if let Err(err) = session
                     .preconnect_websocket(
                         &model_info,

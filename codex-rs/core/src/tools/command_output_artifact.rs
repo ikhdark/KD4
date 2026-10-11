@@ -63,8 +63,9 @@ const MAX_RETENTION_INDEX_ROOTS: usize = 4;
 // Artifacts referenced by durable thread history stay protected, so a root
 // holds far more records than the unprotected retention limit. Past this cap
 // every commit falls back to full-root scans (~0.3s each on Windows at 11K
-// records), so size it for protected growth; memory tracks actual records.
-const MAX_RETENTION_INDEX_RECORDS: usize = 65_536;
+// records), so size it for protected growth; memory tracks actual records
+// (~0.8 KB each).
+const MAX_RETENTION_INDEX_RECORDS: usize = 262_144;
 const RETENTION_RECONCILIATION_INTERVAL: u64 = 128;
 const RETENTION_BYTE_GUARD_BAND: u64 = MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
 pub(crate) const RECOVERY_AGGREGATE_TOKEN_CEILING: usize = 10_000;
@@ -4936,30 +4937,44 @@ fn search_logical_artifact(
         let end_line = metadata.line_starts.partition_point(|start| *start <= match_end.saturating_sub(1) as u64).max(line);
         let mut start = line.saturating_sub(context_lines).max(1);
         let mut end = end_line.saturating_add(context_lines).min(metadata.line_starts.len());
-        if enclosing && let Some(range) = metadata.sections.iter()
+        let mut enclosing_item = None;
+        if enclosing && let Some((section, range)) = metadata.sections.iter()
             .filter(|section| section.id.starts_with("code:"))
-            .filter_map(|section| section.canonical_range)
-            .filter(|range| range.start <= match_start as u64 && match_end as u64 <= range.end)
-            .min_by_key(|range| range.len())
+            .filter_map(|section| section.canonical_range.map(|range| (section, range)))
+            .filter(|(_, range)| range.start <= match_start as u64 && match_end as u64 <= range.end)
+            .min_by_key(|(_, range)| range.len())
         {
             start = start.min(metadata.line_starts.partition_point(|offset| *offset <= range.start).max(1));
             end = end.max(metadata.line_starts.partition_point(|offset| *offset < range.end).max(1));
+            // Hydrated ranges are merged, so coordinates alone do not say which
+            // function or impl a use site sits in. The retained outline does.
+            enclosing_item = metadata.sections.iter()
+                .filter(|page| page.id == "outline" || page.id.starts_with("outline:"))
+                .filter_map(|page| page.value.as_ref()?.get("items")?.as_array())
+                .flatten()
+                .find(|item| item["id"] == section.id.as_str())
+                .map(|item| serde_json::json!({"qualified_name": item["qualified_name"], "kind": item["kind"],
+                    "start_line": item["start_line"], "end_line": item["end_line"]}));
         }
-        (line, end_line, start, end)
+        (line, end_line, start, end, enclosing_item)
     }).collect::<Vec<_>>();
     let build_result = |matches_returned: usize| {
         let mut matches = Vec::with_capacity(matches_returned);
         let mut ranges = Vec::with_capacity(matches_returned);
-        for ((match_start, match_end), &(line, end_line, context_start, context_end)) in
+        for ((match_start, match_end), (line, end_line, context_start, context_end, enclosing_item)) in
             indexed_matches.iter().copied().zip(&contexts).take(matches_returned)
         {
-            matches.push(serde_json::json!({
+            let mut record = serde_json::json!({
                 "line": line,
                 "end_line": end_line,
                 "start_byte": match_start,
                 "end_byte": match_end,
-            }));
-            ranges.push((context_start, context_end));
+            });
+            if let Some(item) = enclosing_item {
+                record["enclosing_item"] = item.clone();
+            }
+            matches.push(record);
+            ranges.push((*context_start, *context_end));
         }
         let child_selectors = normalize_line_ranges(ranges).into_iter()
             .map(|(start, end)| ToolOutputSelector::Lines { start, end }).collect::<Vec<_>>();
@@ -6616,13 +6631,81 @@ fn schedule_background_retention_reconciliation(root: &Path) -> bool {
                 }
             };
             if due && permit.is_some() {
-                reconcile_retention_root_blocking(&root);
+                reconcile_external_retention_changes_blocking(&root, false);
             }
             drop(permit);
         })
         .await;
     });
     true
+}
+
+/// Rebuilds the index under the caller's permit, first recovering other
+/// threads' interrupted transactions when another process wrote to the root.
+fn reconcile_external_retention_changes_blocking(root: &Path, only_if_unindexed: bool) {
+    if only_if_unindexed && lock_retention_registry().roots.contains_key(root) {
+        return;
+    }
+    if take_retention_interprocess_index_stale(root)
+        && reconcile_logical_artifact_transactions_in_root(root).is_err()
+    {
+        let mut registry = lock_retention_registry();
+        transition_current_root_to_dirty(&mut registry, root);
+        return;
+    }
+    reconcile_retention_root_blocking(root);
+}
+
+/// Another process's writes leave this process's index incomplete rather than
+/// wrong: its own deltas still apply. Like periodic drift, the rescan that
+/// picks those writes up runs after the triggering commit. Returns false when
+/// the root has no usable index or is near a limit and must reconcile inline.
+fn defer_external_retention_reconciliation(root: &Path) -> bool {
+    let mut registry = lock_retention_registry();
+    let Some(RetentionRootMode::Indexed(index)) =
+        registry.roots.get_mut(root).map(|state| &mut state.mode)
+    else {
+        return false;
+    };
+    if index.near_limit_pending {
+        return false;
+    }
+    if !index.background_reconciliation_pending {
+        if !schedule_background_retention_reconciliation(root) {
+            return false;
+        }
+        index.background_reconciliation_pending = true;
+    }
+    true
+}
+
+/// Builds the index before a process's first artifact write would scan the
+/// whole root inline on a tool result's way back to the model.
+pub(crate) fn spawn_retention_index_prewarm(codex_home: &Path) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let root = codex_home.join("tool-output");
+    runtime.spawn(async move {
+        // Taking the permit invalidates other processes' indexes, so only a
+        // root this process has not indexed yet is worth it.
+        let unindexed = tokio::task::spawn_blocking(move || {
+            let root = normalized_tool_output_root(&root);
+            (root.is_dir() && !lock_retention_registry().roots.contains_key(&root)).then_some(root)
+        })
+        .await;
+        let Ok(Some(root)) = unindexed else {
+            return;
+        };
+        let permit = retention_sweep_permit(&root).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            if permit.is_some() {
+                reconcile_external_retention_changes_blocking(&root, true);
+            }
+            drop(permit);
+        })
+        .await;
+    });
 }
 
 fn invalidate_root_after_ambiguous_failure(root: &Path) {
@@ -7058,7 +7141,12 @@ fn enforce_retention_locked_blocking(
         transition_current_root_to_dirty(&mut registry, &root);
         return;
     }
-    let external_generation_changed = take_retention_interprocess_index_stale(&root);
+    let mut external_generation_changed = take_retention_interprocess_index_stale(&root);
+    if external_generation_changed && defer_external_retention_reconciliation(&root) {
+        // The scheduled pass consumes the flag under its own permit.
+        mark_retention_interprocess_index_stale(&root);
+        external_generation_changed = false;
+    }
     if external_generation_changed
         && reconcile_logical_artifact_transactions_in_root(&root).is_err()
     {
@@ -7456,6 +7544,17 @@ fn take_retention_interprocess_index_stale(root: &Path) -> bool {
             index_stale: true,
         });
     std::mem::take(&mut state.index_stale)
+}
+
+fn mark_retention_interprocess_index_stale(root: &Path) {
+    let root = normalized_tool_output_root(root);
+    if let Some(state) = retention_interprocess_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(&root)
+    {
+        state.index_stale = true;
+    }
 }
 
 fn advance_retention_interprocess_generation(

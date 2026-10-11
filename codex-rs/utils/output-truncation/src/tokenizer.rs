@@ -87,6 +87,17 @@ pub fn truncate_model_text_at_lines_with_limits(
             if model_token_count(&files) <= limit / 3 {
                 marker.push_str(&files);
             }
+            // The cut can swallow the label that owns the retained tail, which
+            // would then read as a continuation of the head's source. Never
+            // let the label crowd out the evidence it describes.
+            let tail_begin = text.len() - (tail_bytes.len() - tail_start);
+            if !text[tail_begin..].starts_with(SOURCE_LABEL_PREFIX)
+                && let Some(label) = omitted_source_label(text, head_end, tail_begin)
+                && model_token_count(&marker) + model_token_count(label) < limit / 2
+            {
+                marker.push_str(label);
+                marker.push('\n');
+            }
         }
         let result = format!(
             "{}{}{}",
@@ -116,6 +127,19 @@ pub fn truncate_model_text_at_lines_with_limits(
     }
 }
 
+/// Mirrors the per-body label printed by the code-mode output projection.
+const SOURCE_LABEL_PREFIX: &str = "[source {";
+
+/// Last complete source label line that begins inside the omitted range.
+fn omitted_source_label(text: &str, start: usize, end: usize) -> Option<&str> {
+    let offset = text[start..end].rmatch_indices(SOURCE_LABEL_PREFIX)
+        .map(|(relative, _)| start + relative)
+        .find(|&offset| offset == 0 || text.as_bytes()[offset - 1] == b'\n')?;
+    let line_end = text[offset..].find('\n').map_or(text.len(), |length| offset + length);
+    let line = text[offset..line_end].trim_end_matches('\r');
+    line.ends_with("}]").then_some(line)
+}
+
 fn omitted_file_counts(text: &str, start: usize, end: usize) -> String {
     let first = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
     let last = if text[..end].ends_with('\n') { end } else {
@@ -126,8 +150,13 @@ fn omitted_file_counts(text: &str, start: usize, end: usize) -> String {
         let path = line.match_indices(':').find_map(|(offset, _)| {
             let rest = &line[offset + 1..];
             let (number, _) = rest.split_once(':')?;
-            (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
-                .then_some(&line[..offset])
+            // Timestamps and syslog prefixes also look like `prefix:digits:`.
+            let candidate = &line[..offset];
+            (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                && (candidate.contains(['/', '\\'])
+                    || !(candidate.contains(char::is_whitespace)
+                        || candidate.starts_with(|ch: char| ch.is_ascii_digit()))))
+                .then_some(candidate)
         }).or_else(|| {
             // Bare paths from rg --files/-l. Do not turn ordinary prose or
             // source lines into invented filenames.
@@ -219,6 +248,19 @@ mod tests {
         assert!(text.contains(&format!("artifact_id={artifact}]")));
         assert!(text.contains("[omitted lines "));
         assert!(model_token_count(&text) <= 120);
+
+        let second = "[source {\"path\":\"b.md\",\"complete\":true}]";
+        let source = format!("[source {{\"path\":\"a.md\",\"complete\":true}}]\n{}{second}\n{}",
+            "first body\n".repeat(1500), "second body\n".repeat(1500));
+        let text = truncate_model_text_at_lines_with_artifact(&source, 200, 0, 3002, Some(artifact));
+        let (_, after_marker) = text.split_once("[omitted lines ").unwrap();
+        let (_, relabeled) = after_marker.split_once(&format!("{second}\n")).unwrap();
+        assert!(relabeled.contains("second body\n") && !relabeled.contains("first body"));
+        assert!(model_token_count(&text) <= 200);
+        // A label the tail still carries is not repeated.
+        let labeled_tail = format!("{}{second}\nsecond body\n", "first body\n".repeat(3000));
+        let text = truncate_model_text_at_lines_with_artifact(&labeled_tail, 200, 0, 3002, Some(artifact));
+        assert_eq!(text.matches(second).count(), 1);
     }
 
     #[test]
@@ -241,6 +283,10 @@ mod tests {
         assert!(output.contains("Omitted hits by file"));
         assert!(model_token_count(&output) <= 300);
         assert!(omitted_file_counts("ordinary prose\n", 0, 15).is_empty());
+        for log in ["2026-06-02T00:35:13.759Z INFO healthcheck ok\n", "Jun 3 09:15:22 host msg\n",
+            "12:2026-06-02T00:35:13 single-file hit\n"] {
+            assert!(omitted_file_counts(log, 0, log.len()).is_empty(), "{log}");
+        }
         assert!(omitted_file_counts("src/日本語.rs\n", 0, "src/日本語.rs\n".len()).contains("src/日本語.rs: 1"));
         let many = (0..30).map(|i| format!("src/file_{i}.rs\n")).collect::<String>();
         assert!(omitted_file_counts(&many, 0, many.len()).contains("22 additional files"));

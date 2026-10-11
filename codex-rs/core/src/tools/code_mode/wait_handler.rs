@@ -37,6 +37,9 @@ use super::wait_spec::create_wait_tool;
 // Give it time to commit the terminal response and retained output afterward;
 // matching that inner deadline races cleanup and discards recoverable evidence.
 const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+// Most cells preempted by already-queued mail finish well inside a second,
+// which is far less than the model request needed to wait for them again.
+const MAILBOX_PREEMPTION_GRACE: Duration = Duration::from_secs(1);
 /// Compatibility default for bounded polls. Passive wait_for_output owns
 /// continuation internally; cell waits wake on decisions, input, or the actor's idle bound.
 pub(crate) const NESTED_DEFAULT_POLL: Duration = Duration::from_secs(285);
@@ -387,6 +390,17 @@ where
         exit: OwnerHeldCodeModeExit::InputActivity(activity),
         drained_observations: 0,
     };
+    let decided = |result: Result<codex_code_mode::WaitOutcome, String>| {
+        result
+            .map(|response| OwnerHeldCodeModeWait {
+                exit: OwnerHeldCodeModeExit::Runtime(response),
+                drained_observations: 0,
+            })
+            .map_err(|message| OwnerHeldCodeModeWaitError {
+                message,
+                drained_observations: 0,
+            })
+    };
     if cancellation_token.is_cancelled() {
         return Err(cancelled());
     }
@@ -395,24 +409,26 @@ where
     // delivered to an observer that is then dropped is lost. Answer input that
     // is already waiting before starting an observation.
     if let Some(activity) = input_activity.as_mut().now_or_never() {
-        return Ok(steered(activity));
+        if activity != InputQueueActivity::Mailbox {
+            return Ok(steered(activity));
+        }
+        // Mail queued while the model was writing this call would preempt a
+        // cell that is about to finish and cost a model round trip only to
+        // observe its completion. The mail stays queued for the next sampling
+        // request either way, so let an imminent decision arrive first.
+        return tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => Err(cancelled()),
+            result = wait_once() => decided(result),
+            _ = tokio::time::sleep(MAILBOX_PREEMPTION_GRACE) => Ok(steered(activity)),
+        };
     }
     tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => Err(cancelled()),
         // A decision delivered in the same wakeup as new input wins; the input
         // stays queued for the next sampling request.
-        result = wait_once() => {
-            result
-                .map(|response| OwnerHeldCodeModeWait {
-                    exit: OwnerHeldCodeModeExit::Runtime(response),
-                    drained_observations: 0,
-                })
-                .map_err(|message| OwnerHeldCodeModeWaitError {
-                    message,
-                    drained_observations: 0,
-                })
-        }
+        result = wait_once() => decided(result),
         activity = &mut input_activity => {
             Ok(steered(activity))
         }
@@ -1080,6 +1096,51 @@ mod tests {
                 !observed.load(Ordering::Acquire),
                 "an observation abandoned for input can lose a delivered decision"
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_mailbox_activity_yields_to_an_imminent_decision() {
+        for decision_delay in [Some(Duration::from_millis(300)), None] {
+            let (_activity_tx, activity_rx) =
+                tokio::sync::watch::channel(InputQueueActivity::Mailbox);
+            let started = tokio::time::Instant::now();
+            let held = hold_until_state_change(
+                move || async move {
+                    let Some(delay) = decision_delay else {
+                        return std::future::pending().await;
+                    };
+                    tokio::time::sleep(delay).await;
+                    Ok::<_, String>(codex_code_mode::WaitOutcome::LiveCell(
+                        codex_code_mode::RuntimeResponse::ExplicitYield {
+                            cell_id: codex_code_mode::CellId::new("cell-1".to_string()),
+                            content_items: Vec::new(),
+                        },
+                    ))
+                },
+                &tokio_util::sync::CancellationToken::new(),
+                next_input_activity(activity_rx, Some(InputQueueActivity::Mailbox)),
+                "wait cancelled",
+            )
+            .await
+            .expect("mailbox activity is non-terminal");
+
+            match decision_delay {
+                Some(delay) => {
+                    assert!(
+                        matches!(held.exit, OwnerHeldCodeModeExit::Runtime(_)),
+                        "a cell that decides within the grace returns its result"
+                    );
+                    assert_eq!(started.elapsed(), delay);
+                }
+                None => {
+                    assert!(matches!(
+                        held.exit,
+                        OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Mailbox)
+                    ));
+                    assert_eq!(started.elapsed(), MAILBOX_PREEMPTION_GRACE);
+                }
+            }
         }
     }
 

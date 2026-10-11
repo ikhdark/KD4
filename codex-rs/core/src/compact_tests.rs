@@ -2857,3 +2857,40 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
     assert!(matches!(result, Err(CodexErr::TurnAborted)));
     Ok(())
 }
+
+#[tokio::test]
+async fn local_compaction_request_records_usage_and_completion_in_turn_timing() -> anyhow::Result<()> {
+    use core_test_support::responses;
+    core_test_support::require_network!();
+    let server = responses::start_mock_server().await;
+    let home = tempfile::tempdir()?;
+    let (session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test-key"), Vec::new(), home.path(), |config| {
+                config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                config.model_provider.supports_websockets = false;
+            },
+        ).await;
+    let metadata = turn.turn_metadata_state.to_responses_metadata(
+        session.installation_id.clone(), session.current_window_id().await,
+        CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
+            CompactionTrigger::Manual, CompactionReason::UserRequested,
+            CompactionImplementation::Responses, CompactionPhase::StandaloneTurn,
+        )),
+    );
+    responses::mount_sse_once(&server, responses::sse(vec![
+        responses::ev_assistant_message("summary", "summary"),
+        responses::ev_completed_with_tokens("compacted", /*total_tokens*/ 1_234),
+    ])).await;
+    turn.turn_timing_state.mark_turn_started();
+    turn.turn_timing_state.begin_compaction_generation();
+    let mut client = session.services.model_client.new_session();
+    drain_to_completed(&session, &turn, &mut client, &metadata, &Prompt::default(),
+        &CancellationToken::new()).await?;
+
+    let timing = turn.turn_timing_state.complete_snapshot().protocol_timing();
+    let request = timing.model_requests.last().expect("compaction request");
+    assert_eq!(request.token_usage.as_ref().map(|usage| usage.input_tokens), Some(1_234));
+    assert!(request.completed_ms.is_some());
+    Ok(())
+}

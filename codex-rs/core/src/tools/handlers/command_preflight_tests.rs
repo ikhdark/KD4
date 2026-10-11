@@ -310,6 +310,8 @@ async fn missing_rg_paths_are_advisory_and_use_the_execution_workdir() {
     assert!(notice.contains("rg_missing_path"), "{notice}");
     assert!(notice.contains("spec_plan.rs"), "{notice}");
     assert!(notice.contains("not verified replacements"), "{notice}");
+    assert!(notice.contains("\"tools/spec_plan.rs\""), "{notice}");
+    assert!(!notice.contains(&*cwd.to_string_lossy()), "suggestions are cwd-relative: {notice}");
     // The advisory never suppresses execution, the original error, or valid
     // results from the other path.
     let output = std::process::Command::new(&command[0]).args(&command[1..])

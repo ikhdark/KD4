@@ -790,6 +790,72 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_v2_counts_compaction_usage_in_session_totals() -> Result<()> {
+    require_network!();
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("m1", "FIRST_REMOTE_REPLY"),
+                responses::ev_completed_with_tokens("resp-1", /*total_tokens*/ 1_000),
+            ]),
+            responses::sse(vec![
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "ENCRYPTED_CONTEXT_COMPACTION_SUMMARY",
+                    }
+                }),
+                responses::ev_completed_with_tokens("resp-compact", /*total_tokens*/ 7_000),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello remote compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_turn_complete(&codex).await;
+
+    codex.submit(Op::Compact).await?;
+    let mut session_total_tokens = None;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| {
+            if let EventMsg::TokenCount(token_count) = event
+                && let Some(info) = token_count.info.as_ref()
+            {
+                session_total_tokens = Some(info.total_token_usage.total_tokens);
+            }
+            matches!(event, EventMsg::TurnComplete(_))
+        },
+        REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
+
+    assert_eq!(session_total_tokens, Some(8_000));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
     require_network!();
 

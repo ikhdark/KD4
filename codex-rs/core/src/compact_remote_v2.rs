@@ -298,10 +298,15 @@ async fn run_remote_compact_task_inner_impl(
         token_usage,
         owned_client_session: _owned_client_session,
     } = attempt;
-    if let Some(token_usage) = token_usage {
+    if let Some(token_usage) = token_usage.as_ref() {
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
+        // The compaction request is a billed model request: count it in the
+        // session and turn totals, as local compaction does. The post-install
+        // recompute below still resets the active-context estimate.
+        sess.update_token_usage_info(compaction_turn_context, Some(token_usage))
+            .await?;
     }
     let (retained_input, retained_images) = prepare_v2_retained_input(sess, &retention_input).await?;
     analytics_details.retained_image_count = Some(retained_images);

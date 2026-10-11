@@ -391,7 +391,7 @@ fn documentation_only_path(path: &std::path::Path) -> bool {
     let components = normalized.split('/').collect::<Vec<_>>();
     // This repository's prompt crate embeds templates into runtime requests.
     // Instruction files also control the harness; neither is a README.
-    let runtime_input = components.windows(2).any(|pair| pair == ["prompts", "templates"])
+    let runtime_input = components.iter().any(|component| matches!(*component, "prompts" | "templates"))
         || components.last().is_some_and(|name| {
             ["AGENTS.md", "AGENTS.override.md", "SKILL.md"].iter()
                 .any(|instruction| name.eq_ignore_ascii_case(instruction))
@@ -3249,17 +3249,26 @@ impl TurnExecutionControl {
             let docs = changed_paths.iter().filter(|(_, path)| documentation(path))
                 .map(|(environment, path)| format!("{environment}:{}", path.display()))
                 .collect::<Vec<_>>();
-            let uncovered = changed_paths.iter().filter(|(_, path)| !documentation(path))
-                .filter(|(environment, path)| {
-                let path = SourceDependencyV1::new(path, false).path;
-                self.validation_coverage_revision != Some(settled_mutation_revision)
-                    || !self.validation_coverage.values().any(|scope|
+            // A test passing at this revision attributes the inputs its owner derived.
+            // That separates validated from unvalidated paths; it is reported as
+            // attribution because only behavioral_paths proves an exercised surface.
+            let mut uncovered = Vec::new();
+            let mut input_attributed = Vec::new();
+            for (environment, path) in changed_paths.iter().filter(|(_, path)| !documentation(path)) {
+                let normalized = SourceDependencyV1::new(path, false).path;
+                let covered = |behavioral: bool| self.validation_coverage_revision == Some(settled_mutation_revision)
+                    && self.validation_coverage.values().any(|scope| {
+                        let paths = if behavioral { &scope.behavioral_paths } else { &scope.paths };
                         scope.environment_id == *environment
                             && scope.test_execution
-                            && scope.behavioral_paths.iter().any(|scope| source_scope_contains(scope, &path))
-                    )
-            }).map(|(environment, path)| format!("{environment}:{}", path.display()))
-                .collect::<Vec<_>>();
+                            && paths.iter().any(|scope| source_scope_contains(scope, &normalized))
+                    });
+                if covered(true) {
+                    continue;
+                }
+                let changed = format!("{environment}:{}", path.display());
+                if covered(false) { input_attributed.push(changed); } else { uncovered.push(changed); }
+            }
             if !uncovered.is_empty() {
                 // With nothing attributed at all, the likeliest cause is a
                 // repository runner the classifier was never told about.
@@ -3272,8 +3281,14 @@ impl TurnExecutionControl {
                     ""
                 };
                 assessment.verification_gaps.push(format!(
-                    "Changed paths without passing behavioral validation attribution: {}.{unrecognized} Input dependencies and declared paths are not behavioral test coverage; behavior remains unverified. Inspection or intentionally omitted validation must be reported.",
+                    "Changed paths without a passing test execution attributed to them: {}.{unrecognized} Non-test checks and declared paths are not test coverage; behavior remains unverified. Inspection or intentionally omitted validation must be reported.",
                     uncovered.join(", ")
+                ));
+            }
+            if !input_attributed.is_empty() {
+                assessment.advisories.push(format!(
+                    "Passing test executions took these changed paths as inputs: {}. Input attribution is not proof that the changed behavior was exercised.",
+                    input_attributed.join(", ")
                 ));
             }
             if self.validation_coverage_revision == Some(settled_mutation_revision)
@@ -9025,13 +9040,18 @@ mod tests {
                 behavioral_paths: BTreeSet::new(), dependency_scope: None,
             });
             let report = control.completion_assessment_with_changed_paths(0, Some(&changed), false);
-            assert!(report.verification_gaps.iter().any(|gap| gap.contains("unrelated.rs") && gap.contains("behavior remains unverified")));
+            // Only a passing test execution attributes its inputs, and it says so.
+            assert_eq!(report.verification_gaps.iter().any(|gap| gap.contains("unrelated.rs")
+                && gap.contains("behavior remains unverified")), !test_execution);
+            assert_eq!(report.advisories.iter().any(|note| note.contains("unrelated.rs")
+                && note.contains("not proof that the changed behavior was exercised")), test_execution);
             assert_eq!(report.advisories.iter().any(|gap| gap.contains("Non-test checks passed")), !test_execution);
-            // An owner-proved surface is still insufficient for a non-test check.
+            // An owner-proved surface needs no caveat, and is still insufficient for a non-test check.
             control.validation_coverage.get_mut("check").unwrap().behavioral_paths =
                 BTreeSet::from([SourceDependencyV1::new(&changed[0].1, false)]);
-            assert_eq!(control.completion_assessment_with_changed_paths(0, Some(&changed), false)
-                .verification_gaps.is_empty(), test_execution);
+            let proved = control.completion_assessment_with_changed_paths(0, Some(&changed), false);
+            assert_eq!(proved.verification_gaps.is_empty(), test_execution);
+            assert!(!proved.advisories.iter().any(|note| note.contains("unrelated.rs")));
         }
     }
 
@@ -9233,15 +9253,20 @@ mod tests {
                 assert_eq!(revision_gaps.len(), usize::from(matches!(scenario, "failed" | "stale")),
                     "{nested} {scenario}: {revision_gaps:?}");
                 let gaps = control.completion_gaps_with_changed_paths(revision, Some(&changed), false);
-                assert_eq!(gaps.len(), 1 + revision_gaps.len(), "{nested} {scenario}: {gaps:?}");
-                let path_gap = gaps.last().unwrap();
+                let attributed = matches!(scenario, "passed" | "summary" | "background" | "after_edit");
+                assert_eq!(gaps.len(), 1 + usize::from(attributed) + revision_gaps.len(), "{nested} {scenario}: {gaps:?}");
+                let path_gap = gaps.iter().find(|gap| gap.starts_with("Changed paths")).unwrap();
                 assert!(path_gap.contains(&changed[1].1.display().to_string()));
-                assert!(path_gap.contains(&changed[0].1.display().to_string()),
-                    "input attribution never proves behavior: {nested} {scenario}: {gaps:?}");
+                assert_eq!(path_gap.contains(&changed[0].1.display().to_string()), !attributed,
+                    "only a fresh passing test execution attributes its inputs: {nested} {scenario}: {gaps:?}");
+                // Attribution is reported as such, never as exercised behavior.
+                assert_eq!(gaps.iter().any(|gap| gap.contains(&changed[0].1.display().to_string())
+                    && gap.contains("not proof that the changed behavior was exercised")), attributed,
+                    "{nested} {scenario}: {gaps:?}");
                 // Only a turn with no attribution at all points at runner declaration.
                 assert_eq!(
                     path_gap.contains("No passing validation was attributed"),
-                    !matches!(scenario, "passed" | "summary" | "background" | "after_edit"),
+                    !attributed,
                     "{nested} {scenario}: {gaps:?}",
                 );
             }
@@ -9608,7 +9633,9 @@ mod tests {
     #[test]
     fn uncertainty_skill_instructions_are_not_documentation_only() {
         for path in ["skills/demo/SKILL.md", "skills/demo/skill.md", r"skills\demo\SKILL.md",
-            "AGENTS.md", "AGENTS.override.md", "codex-rs/prompts/templates/compact/prompt.md"]
+            "AGENTS.md", "AGENTS.override.md", "codex-rs/prompts/templates/compact/prompt.md",
+            "codex-rs/protocol/src/prompts/base_instructions/default.md",
+            "codex-rs/models-manager/templates/collaboration_mode/plan.md"]
         {
             assert!(!documentation_only_path(std::path::Path::new(path)), "{path}");
         }

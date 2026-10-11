@@ -1004,7 +1004,7 @@ async fn respects_max_scan_depth_for_user_scope() {
     );
     let _too_deep_path = write_skill(
         &codex_home,
-        "d0/d1/d2/d3/d4/d5/d6",
+        "e0/e1/e2/e3/e4/e5/e6",
         "too-deep-skill",
         "should not load",
     );
@@ -1047,6 +1047,32 @@ async fn respects_max_scan_depth_for_user_scope() {
             plugin_id: None,
         }]
     );
+}
+
+#[tokio::test]
+async fn deep_assets_inside_a_discovered_skill_are_not_a_scan_error() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_skill(&codex_home, "sites", "sites-skill", "loads");
+    let skills_root = codex_home.path().join("skills");
+    fs::create_dir_all(skills_root.join("sites/templates/starter/examples/d1/app/api/notes"))
+        .expect("create deep skill assets");
+
+    let outcome = load_skills_from_roots(
+        [SkillRoot {
+            path: skills_root.abs(),
+            scope: SkillScope::User,
+            file_system: Arc::clone(&LOCAL_FS),
+            plugin_id: None,
+            plugin_namespace: None,
+            plugin_root: None,
+        }],
+        /*plugin_skill_snapshots*/ None,
+    )
+    .await;
+
+    assert_eq!(outcome.errors, Vec::new());
+    assert_eq!(outcome.skills.len(), 1);
+    assert_eq!(outcome.skills[0].path_to_skills_md, normalized(&skill_path));
 }
 
 #[tokio::test]

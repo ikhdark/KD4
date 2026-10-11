@@ -703,6 +703,7 @@ fn build_code_mode_executors(
     let mut direct_only_tool_names = Vec::new();
     let mut has_deferred_tools = false;
     let mut has_nested_apply_patch = false;
+    let mut lazy_builtin_tool_names = Vec::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
     for executor in executors {
         let exposure = executor.exposure();
@@ -773,6 +774,12 @@ fn build_code_mode_executors(
                     definition.description = format!("{}\nResult fields: path, total_lines, source_sha256, canonical_bytes, retained_bytes, complete, file_complete, retained_artifact_complete, results; optional artifact_id, continuation, page_selectors, snapshot_error. Each results[] item has selector, status, complete and text or value (search hydrated_ranges), with recovery fields when incomplete.", definition.description).into();
                 }
                 eager_nested_tool_definitions.push(definition);
+            } else if tool_mode == ToolMode::CodeModeOnly
+                && executor.authorization_class() != TypedToolClass::DynamicExternal
+                && executor.tool_name().namespace.is_none()
+            {
+                // Callable, but otherwise named nowhere the model can see.
+                lazy_builtin_tool_names.push(executor.tool_name().name.clone());
             }
             code_mode_nested_tool_specs.push(spec);
         }
@@ -789,6 +796,15 @@ fn build_code_mode_executors(
     };
     if !has_nested_apply_patch {
         eager_nested_tool_descriptions.push("Nested apply_patch is unavailable in this session; use its direct interface only if advertised.".to_string());
+    }
+    if !lazy_builtin_tool_names.is_empty() {
+        // Names only: built-ins keep this line stable when external inventories change.
+        lazy_builtin_tool_names.sort();
+        lazy_builtin_tool_names.dedup();
+        eager_nested_tool_descriptions.push(format!(
+            "Other built-in nested tools (lazy contracts; resolve_tool(name) and call in the same cell): {}.",
+            lazy_builtin_tool_names.join(", ")
+        ));
     }
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
         create_code_mode_tool(

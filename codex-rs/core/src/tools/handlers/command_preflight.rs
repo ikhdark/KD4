@@ -539,18 +539,22 @@ fn missing_rg_path_advisory(
         if !resolved_parent.starts_with(root) {
             continue;
         }
+        // Same cwd-relative spelling as the operand, so a suggestion can be
+        // pasted back and the notice does not repeat the absolute workdir.
         let candidates = super::command_search::nearest_existing_paths(&path, cwd)
             .into_iter()
-            .map(|path| json_string(&path.to_string_lossy()))
+            .map(|path| json_string(&super::command_search::display_suggestion(&path, cwd)))
             .collect::<Vec<_>>();
         let guidance = if candidates.is_empty() {
-            format!("Nearest existing directory: {}.", json_string(&parent.to_string_lossy()))
+            let parent = if parent == cwd { "./".to_string() }
+                else { super::command_search::display_suggestion(parent, cwd) };
+            format!("Nearest existing directory: {}.", json_string(&parent))
         } else {
             format!("Possible existing paths (not verified replacements): {}.", candidates.join(", "))
         };
         notices.push(format!(
-            "Command preflight advisory (rg_missing_path): {} was not found relative to working directory {} at preflight time. {guidance} The command is unchanged; a path error is not evidence of no matches.",
-            json_string(&operand), json_string(&cwd.to_string_lossy()),
+            "Command preflight advisory (rg_missing_path): {} was not found relative to the command's working directory at preflight time. {guidance} The command is unchanged; a path error is not evidence of no matches.",
+            json_string(&operand),
         ));
     }
     (!notices.is_empty()).then(|| notices.join("\n"))

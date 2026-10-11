@@ -366,6 +366,22 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
             recovery_chunk_bytes: None,
         })
         .collect::<Vec<_>>();
+    // Imports are not definitions: one row each used to fill the first pages
+    // of a large file before any item. Their sections above stay addressable;
+    // the directory only summarizes where they are.
+    let mut import_ranges = Vec::<(usize, usize, usize)>::new();
+    let mut previous_was_import = false;
+    for item in items {
+        let import = item.kind == "use";
+        if import {
+            match import_ranges.last_mut().filter(|_| previous_was_import) {
+                Some(run) => { run.1 = item.end_line; run.2 += 1; }
+                None => import_ranges.push((item.start_line, item.end_line, 1)),
+            }
+        }
+        previous_was_import = import;
+    }
+    let items = items.iter().filter(|item| item.kind != "use").collect::<Vec<_>>();
     // Fit ordinary outlines in one response instead of forcing a round trip
     // per handful of items. Larger outlines retain bounded directory pages.
     let mut start = 0;
@@ -381,15 +397,22 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
             end += 1;
         }
         let next = (end < items.len()).then(|| format!("outline:{end}"));
+        let mut value = json!({"items": &items[start..end], "total_items": items.len(), "next": next});
+        if start == 0 && !import_ranges.is_empty() {
+            value["import_ranges"] = import_ranges.iter().take(16)
+                .map(|(start_line, end_line, count)| json!({"start_line": start_line, "end_line": end_line, "count": count}))
+                .collect();
+            if import_ranges.len() > 16 {
+                value["omitted_import_ranges"] = (import_ranges.len() - 16).into();
+            }
+        }
         sections.push(ToolProjectionSection {
             id: if start == 0 {
                 "outline".into()
             } else {
                 format!("outline:{start}")
             },
-            value: Some(
-                json!({"items": &items[start..end], "total_items": items.len(), "next": next}),
-            ),
+            value: Some(value),
             exact_bytes: 0,
             inclusion: ToolProjectionInclusion::Directory,
             canonical_range: None,
@@ -536,5 +559,24 @@ mod tests {
         assert!(parse("a.rs", "fn x() {}", "hash", Instant::now()).is_none());
         assert!(parse("a.txt", "", "hash", Instant::now()).is_none());
         assert!(pages.len() > 1);
+    }
+
+    #[test]
+    fn outline_pages_summarize_imports_instead_of_listing_them() {
+        let source = "use a::A;\nuse b::B;\nfn first() {}\nmod m { use c::C; fn second() {} }\n";
+        let parsed = items("a.rs", source);
+        let sections = sections(&parsed);
+        let page = sections.iter().find(|section| section.id == "outline").unwrap().value.as_ref().unwrap();
+        assert_eq!(
+            page["items"].as_array().unwrap().iter().map(|item| item["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["first", "m", "second"]
+        );
+        assert_eq!(page["total_items"], 3);
+        assert_eq!(page["import_ranges"], json!([
+            {"start_line": 1, "end_line": 2, "count": 2}, {"start_line": 4, "end_line": 4, "count": 1}]));
+        // Import lines stay addressable for enclosing and search hydration.
+        assert_eq!(sections.iter().filter(|section| section.id.starts_with("code:")).count(), parsed.len());
+        let plain = super::sections(&items("a.rs", "fn only() {}\n"));
+        assert!(plain.last().unwrap().value.as_ref().unwrap().get("import_ranges").is_none());
     }
 }

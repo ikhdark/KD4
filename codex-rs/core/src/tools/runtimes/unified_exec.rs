@@ -502,6 +502,10 @@ fn validation_workspace_required(command: &[String]) -> bool {
     let Some((program, arguments)) = command.split_first() else {
         return false;
     };
+    // Nothing to queue behind: a format check never waits on the build lock.
+    if codex_shell_command::validation::is_standalone_cargo_fmt_check(program, arguments) {
+        return false;
+    }
     matches!(
         codex_shell_command::validation::classify_argv(program, arguments),
         ValidationClassification::Validation {
@@ -534,6 +538,12 @@ mod tests {
         for (command, expected) in [
             (vec!["cargo", "test", "-p", "example"], true),
             (vec!["cargo", "check"], true),
+            (vec!["cargo", "clippy"], true),
+            (vec!["cargo", "fmt"], true),
+            (vec!["cargo", "fmt", "--check"], false),
+            (vec!["cargo", "+nightly", "fmt", "--", "--check"], false),
+            (vec!["pwsh.exe", "-NoProfile", "-Command", "cargo fmt --all --check"], false),
+            (vec!["pwsh", "-Command", "cargo fmt --check && cargo test"], true),
             (vec!["python", "-m", "pytest", "tests"], true),
             (vec!["cargo", "run"], false),
             (vec!["cargo", "fuzz", "run", "target"], false),

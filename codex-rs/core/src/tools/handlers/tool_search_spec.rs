@@ -88,7 +88,7 @@ pub(crate) fn render_tool_search_sources(
         let mut source_descriptions = source_descriptions
             .into_iter()
             .map(|(name, description)| match description {
-                Some(description) => format!("- {name}{}: {description}", scope_label(&name)),
+                Some(description) => format!("- {name}{}: {}", scope_label(&name), catalog_summary(&description)),
                 None => format!("- {name}{}", scope_label(&name)),
             })
             .collect::<Vec<_>>();
@@ -103,6 +103,19 @@ pub(crate) fn render_tool_search_sources(
         crate::tools::spec_plan::apply_fair_description_budget(&mut source_descriptions);
         source_descriptions.concat().trim_end().to_string()
     }
+}
+
+/// The catalog only advertises that a source exists. Its complete description
+/// stays on the loadable namespace instead of recurring in every context window.
+fn catalog_summary(description: &str) -> std::borrow::Cow<'_, str> {
+    const MAX_BYTES: usize = 256;
+    let description = description.trim();
+    let first = description.split("\n\n").next().unwrap_or_default().trim_end();
+    let first = &first[..first.floor_char_boundary(MAX_BYTES.min(first.len()))];
+    if first.len() == description.len() {
+        return description.into();
+    }
+    format!("{first} [abridged; the source's full description loads with its tools]").into()
 }
 
 pub(crate) fn canonical_source(info: &ToolSearchInfo) -> &str {
@@ -182,9 +195,18 @@ mod tests {
             },
         ];
         let catalog = render_tool_search_sources(&sources, false, &[]);
-        assert!(catalog.len() <= 40_000);
+        assert!(catalog.len() < 1_024, "{}", catalog.len());
         assert!(catalog.contains("- small: Find small records."));
-        assert!(catalog.contains("context truncated"));
+        assert!(catalog.contains("界 [abridged; the source's full description loads with its tools]"));
+        assert!(!catalog.contains("context truncated"));
+
+        // Only the first paragraph of long server guidance is advertised.
+        let sources = [ToolSearchSourceInfo {
+            name: "guided".to_string(),
+            description: Some(format!("Search the service.\n\n{}", "You MUST follow these rules. ".repeat(250))),
+        }];
+        assert_eq!(render_tool_search_sources(&sources, false, &[]),
+            "- guided: Search the service. [abridged; the source's full description loads with its tools]");
     }
 
     #[test]

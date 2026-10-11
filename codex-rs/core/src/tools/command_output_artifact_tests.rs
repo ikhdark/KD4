@@ -3627,6 +3627,93 @@ async fn periodic_indexed_reconciliation_runs_after_the_triggering_commit() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn external_generation_change_reconciles_after_the_triggering_commit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    drop(create_raw_output_artifact(temp.path(), "thread", b"artifact").await);
+    let root = temp.path().join("tool-output");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&root).await,
+        RetentionModeKind::Indexed
+    );
+    let generation_path = retention_interprocess_lock_target(&root);
+    let external_generation = std::fs::read_to_string(&generation_path)
+        .expect("retention generation")
+        .trim()
+        .parse::<u64>()
+        .expect("numeric retention generation")
+        .checked_add(1)
+        .expect("external generation increment");
+    write_bytes_atomically(&generation_path, external_generation.to_string().as_bytes())
+        .expect("simulate another process mutation");
+    let before = retention_diagnostics_for_test(&root);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&root, Arc::clone(&barrier));
+
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            create_raw_output_artifact(temp.path(), "thread", b"second"),
+        )
+        .await
+        .expect("another process's write must not make the commit scan the root"),
+    );
+    assert_eq!(
+        retention_diagnostics_for_test(&root).reconciliations,
+        before.reconciliations,
+        "the triggering commit must keep its index"
+    );
+    barrier.wait().await;
+    assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Reconciling);
+    barrier.wait().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retention_mode_for_test(&root) != RetentionModeKind::Indexed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background reconciliation installs a fresh index");
+    assert_eq!(
+        retention_diagnostics_for_test(&root).reconciliations,
+        before.reconciliations + 1
+    );
+    assert!(
+        !take_retention_interprocess_index_stale(&root),
+        "the background pass consumes the external change"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn startup_prewarm_indexes_the_root_before_the_first_commit() {
+    let original = tempfile::tempdir().expect("tempdir");
+    drop(create_raw_output_artifact(original.path(), "thread", b"artifact").await);
+    // A renamed home is a root this process has never indexed.
+    let parent = tempfile::tempdir().expect("tempdir");
+    let home = parent.path().join("home");
+    std::fs::rename(original.path(), &home).expect("move home");
+    let root = home.join("tool-output");
+
+    spawn_retention_index_prewarm(&home);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retention_mode_for_test(&root) != RetentionModeKind::Indexed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("prewarm indexes the root");
+    let prewarmed = retention_diagnostics_for_test(&root);
+    assert_eq!(prewarmed.reconciliations, 1);
+
+    drop(create_raw_output_artifact(&home, "thread", b"first commit").await);
+    assert_eq!(
+        retention_diagnostics_for_test(&root).reconciliations,
+        prewarmed.reconciliations,
+        "the first commit must reuse the prewarmed index"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_generation_invalidates_a_rebuilt_scan_only_root() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("tool-output");

@@ -57,7 +57,7 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
         entries.minimum = Some(1.into());
         ToolSpec::Function(ResponsesApiTool {
             name: "list_files".into(),
-            description: "List files and directories through the selected environment's sandboxed filesystem without shell quoting. Start at a narrow path. File include/exclude filters do not prune directories; exclude_directories omits and prunes matching directories. Patterns match case-sensitive basenames at every depth: * is zero or more Unicode characters, ? is one; other characters are literal. At most 64 patterns total, each 1–256 UTF-8 bytes without path separators. Directory symlinks are not followed; hidden directories are listed but not traversed unless include_hidden is true. For an unfiltered audit omit all filters and set include_hidden=true; gitignore is never applied. complete refers only to this requested scope. Check truncated, errors, unexplored cutoff reasons, and effective_walk_options before claiming coverage. Directories are mutable, not stable pages. Recover large output with read_tool_output; repeat list_files for current state.".into(),
+            description: "List files and directories through the selected environment's sandboxed filesystem without shell quoting. Start at a narrow path. File include/exclude filters do not prune directories; exclude_directories omits and prunes matching directories. Patterns match case-sensitive basenames at every depth: * is zero or more Unicode characters, ? is one; other characters are literal. At most 64 patterns total, each 1–256 UTF-8 bytes without path separators. Entry paths are relative to the environment cwd (absolute when outside it) and can be passed to read_file or list_files. Directory symlinks are omitted from entries and never followed; hidden directories are listed but not traversed unless include_hidden is true. For an unfiltered audit omit all filters and set include_hidden=true; gitignore is never applied. complete refers only to this requested scope. Check truncated, errors, unexplored cutoff reasons, and effective_walk_options before claiming coverage. Directories are mutable, not stable pages. Recover large output with read_tool_output; repeat list_files for current state.".into(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -124,6 +124,18 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                 result = filesystem.walk(&path, options.clone(), Some(&sandbox)) => result
                     .map_err(|error| FunctionCallError::RespondToModel(format!("unable to list {}: {error}", path.inferred_native_path_string())))?,
             };
+            // read_file and list_files take native paths, not URIs. The
+            // cwd-relative spelling also keeps every entry from repeating the root.
+            let cwd = environment.cwd().inferred_native_path_string();
+            let display_path = |native: String| {
+                let relative = match native.strip_prefix(cwd.as_str()) {
+                    Some("") => return ".".to_string(),
+                    Some(rest) if cwd.ends_with(['/', '\\']) => rest,
+                    Some(rest) if rest.starts_with(['/', '\\']) => &rest[1..],
+                    _ => return native,
+                };
+                if cwd.contains('\\') { relative.replace('\\', "/") } else { relative.to_string() }
+            };
             let value = json!({
                 "path": path.inferred_native_path_string(),
                 "environment_id": environment.environment_id,
@@ -140,10 +152,17 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                 "limits_clamped": args.max_depth.is_some_and(|value| value > MAX_DEPTH)
                     || args.max_entries.is_some_and(|value| value > MAX_ENTRIES)
                     || args.max_directories.is_some_and(|value| value > 10_000),
-                "entries": outcome.entries,
-                "errors": outcome.errors,
+                "entries": outcome.entries.iter().map(|entry| json!({
+                    "path": display_path(entry.path.inferred_native_path_string()), "kind": entry.kind,
+                })).collect::<Vec<_>>(),
+                "errors": outcome.errors.iter().map(|error| json!({
+                    "path": display_path(error.path.inferred_native_path_string()), "message": error.message,
+                })).collect::<Vec<_>>(),
                 "truncated": outcome.truncated,
-                "unexplored": outcome.unexplored,
+                "unexplored": outcome.unexplored.iter().map(|stop| json!({
+                    "path": display_path(stop.path.inferred_native_path_string()), "reason": stop.reason,
+                    "effectiveLimit": stop.effective_limit, "partiallyExamined": stop.partially_examined,
+                })).collect::<Vec<_>>(),
                 "continuation_policy": "Re-examine unexplored paths with adjusted limits; directories are mutable, not stable resumable pages.",
                 "complete": !outcome.truncated && outcome.errors.is_empty(),
             });

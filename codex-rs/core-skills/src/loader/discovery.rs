@@ -103,11 +103,6 @@ pub(super) async fn discover_skills(
             )
         })
         .collect::<Vec<_>>();
-    if walk.truncated {
-        warnings.push(format!(
-            "skills scan reached its traversal limit (root: {root})"
-        ));
-    }
 
     let skip_hidden = matches!(options.hidden_directories, HiddenDirectoryPolicy::Skip);
     let mut skill_files = Vec::new();
@@ -149,6 +144,23 @@ pub(super) async fn discover_skills(
             }
         }
     }
+    if walk.truncated {
+        // Assets bundled deep inside a discovered skill are not a failed load.
+        // Older remote backends report no frontier and stay conservative.
+        let skill_dirs = skill_files
+            .iter()
+            .filter_map(PathUri::parent)
+            .collect::<HashSet<_>>();
+        let only_skill_assets = !walk.unexplored.is_empty()
+            && walk.unexplored.iter().all(|stop| {
+                stop.reason == "depth_limit" && has_ancestor_in(&stop.path, root, &skill_dirs)
+            });
+        if !only_skill_assets {
+            warnings.push(format!(
+                "skills scan reached its traversal limit (root: {root})"
+            ));
+        }
+    }
     let skills = skill_files
         .into_iter()
         .map(|path| DiscoveredSkill {
@@ -178,6 +190,20 @@ fn has_hidden_ancestor_below_root(path: &PathUri, root: &PathUri) -> bool {
         }
         if current.basename().is_some_and(|name| name.starts_with('.')) {
             return true;
+        }
+        ancestor = current.parent();
+    }
+    false
+}
+
+fn has_ancestor_in(path: &PathUri, root: &PathUri, directories: &HashSet<PathUri>) -> bool {
+    let mut ancestor = path.parent();
+    while let Some(current) = ancestor {
+        if directories.contains(&current) {
+            return true;
+        }
+        if &current == root {
+            return false;
         }
         ancestor = current.parent();
     }

@@ -307,7 +307,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     // Parse `-c` overrides from the CLI.
-    let cli_kv_overrides = match config_overrides.parse_overrides() {
+    let mut cli_kv_overrides = match config_overrides.parse_overrides() {
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
         Err(e) => {
@@ -315,6 +315,12 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             std::process::exit(1);
         }
     };
+    // Exec cannot answer request_user_input: the request is rejected below and
+    // that interrupts the turn. Do not offer the tool to the model at all.
+    cli_kv_overrides.push((
+        "tools.experimental_request_user_input.enabled".to_string(),
+        codex_config::TomlValue::Boolean(false),
+    ));
 
     let resolved_cwd = cwd.clone();
     let config_cwd = match resolved_cwd.as_deref() {

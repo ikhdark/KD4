@@ -48,6 +48,9 @@ async fn semnav_impls_qualified_names_and_generic_repairs_are_snapshot_bound() {
         assert_eq!(result["selector_bindings"][1]["resolved_selectors"], json!([{"kind":"lines","start":6,"end":8}]));
         assert_eq!(result["selector_bindings"][2]["resolved_selectors"], json!([{"kind":"lines","start":3,"end":5}]));
         assert_eq!(result["selector_bindings"][3]["resolved_selectors"], json!([{"kind":"lines","start":7,"end":7}]));
+        assert_eq!(result["selector_bindings"][3]["qualified_name"], "S::make");
+        assert_eq!(result["selector_bindings"][3]["kind"], "fn");
+        assert_eq!(result["selector_bindings"][2]["qualified_name"], "impl Action<u8> for S");
         assert!(semnav_evidence(&result).iter().any(|(_, _, text)| text == "fn caller() { S::make(); }\n"));
 
         call.payload = ToolPayload::Function { arguments:json!({"path":path,"selectors":[
@@ -76,6 +79,10 @@ fn semnav_nested_generics_python_and_duplicate_impls_stay_unambiguous() {
     for (path, source, name, expected) in [
         ("a.rs", "mod m { impl<T> Action<Vec<T>> for S<T> { fn run() {} } }", "m::S::run", "m::<S<T> as Action<Vec<T>>>::run"),
         ("a.rs", "impl Action<<T as Other>::Item> for S { fn run() {} }", "S::run", "<S as Action<<T as Other>::Item>>::run"),
+        // Header spellings the caller cannot know before reading the file.
+        ("a.rs", "impl<T> fmt::Display for S<T> { fn fmt() {} }", "impl Display for S", "impl fmt::Display for S<T>"),
+        ("a.rs", "impl<T> fmt::Display for S<T> { fn fmt() {} }", "<S as Display>::fmt", "<S<T> as fmt::Display>::fmt"),
+        ("a.rs", "impl<T> Stack<T> { fn push() {} }", "impl Stack", "impl Stack<T>"),
     ] {
         let mut canonical = CanonicalToolResult::text(source.to_string());
         let (resolved, errors, _) = structure::resolve_batch(path, &mut canonical, Some(vec![
@@ -92,6 +99,16 @@ fn semnav_nested_generics_python_and_duplicate_impls_stay_unambiguous() {
     let (_, errors, _) = structure::resolve_batch("a.rs", &mut canonical, Some(vec![
         serde_json::from_value(json!({"kind":"symbol","name":"impl S"})).unwrap()]));
     assert_eq!(errors[0]["candidates"].as_array().unwrap().len(), 2);
+    // A wrong owner lists same-named items as diagnostics; an absent name lists none.
+    let mut canonical = CanonicalToolResult::text("struct A;\nstruct B;\nimpl A { fn build() {} }\nfn free() {}\n");
+    let (resolved, errors, _) = structure::resolve_batch("a.rs", &mut canonical, Some(
+        ["B::build", "B::free", "B::absent"].into_iter().map(|name|
+            serde_json::from_value(json!({"kind":"symbol","name":name})).unwrap()).collect()));
+    assert!(resolved.unwrap().is_empty());
+    assert_eq!(errors[0]["candidates"], json!([{"qualified_name":"A::build",
+        "selector":{"kind":"lines","start":3,"end":3}}]));
+    assert_eq!(errors[1]["candidates"][0]["qualified_name"], "free");
+    assert_eq!(errors[2]["candidates"], json!([]));
 }
 
 #[tokio::test]

@@ -51,6 +51,7 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
             description.contains("a later successful command does not validate an earlier search")
         );
         assert!(description.contains("correct only the failed search"));
+        assert!(description.contains("`rg` skips hidden directories and ignored files by default, with or without matches; add `--hidden`"));
         assert!(description.contains("Derive search roots from observed paths"));
         assert!(description.contains("record missing paths as coverage gaps"));
         assert!(description.contains("For a known source file, read whole useful regions."));

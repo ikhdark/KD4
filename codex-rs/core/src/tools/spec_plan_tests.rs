@@ -969,6 +969,12 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         "the authoritative direct argument contract must remain available"
     );
     assert!(mixed_exec.description.contains("apply_patch(input: string"));
+    let lazy_line = nested_exec.description.lines()
+        .find(|line| line.starts_with("Other built-in nested tools (lazy contracts;"))
+        .expect("code-mode-only sessions name lazily resolved built-ins");
+    assert!(lazy_line.contains("list_files"), "{lazy_line}");
+    assert!(!lazy_line.contains("read_file") && !nested_exec.description.contains("list_files(args:"));
+    assert!(!mixed_exec.description.contains("Other built-in nested tools"));
     for exec in [mixed_exec, nested_exec] {
         assert_eq!(exec.description.matches("declare const tools").count(), 1);
         assert!(!exec.description.contains("canonical_sha256"));

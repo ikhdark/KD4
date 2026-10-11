@@ -1525,7 +1525,12 @@ async fn finish_pending_turn_planning_failure(
     )
     .await;
     error!("Pending-turn planning failed before persistence or model send: {err}");
-    Ok(TurnTaskResult::default())
+    // Planning never drained the queue, so input that is still pending would
+    // re-enter this task and repeat the same failure without bound.
+    Ok(TurnTaskResult {
+        defer_pending_input: true,
+        ..TurnTaskResult::default()
+    })
 }
 
 async fn collect_post_sampling_state<A, B>(

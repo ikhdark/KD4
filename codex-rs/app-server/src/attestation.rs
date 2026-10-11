@@ -50,6 +50,16 @@ impl AttestationProvider for AppServerAttestationProvider {
         false
     }
 
+    fn wait_until_ready(
+        &self,
+        context: AttestationContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(
+            self.thread_state_manager
+                .wait_for_thread_subscriber(context.thread_id),
+        )
+    }
+
     fn header_for_request(&self, context: AttestationContext) -> GenerateAttestationFuture<'_> {
         let Some(outgoing) = self.outgoing.upgrade() else {
             return Box::pin(async { None });

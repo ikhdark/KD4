@@ -1936,6 +1936,17 @@ fn validation_summary_test_count(raw_output: &[u8]) -> Option<u64> {
         let skipped = last.strip_prefix("OK (skipped=").and_then(|s| s.strip_suffix(')'))
             .map(str::parse::<u64>).transpose().ok()?.unwrap_or(0);
         count.checked_sub(skipped)?
+    } else if last.strip_prefix("ℹ ").or_else(|| last.strip_prefix("# "))
+        .is_some_and(|rest| rest.starts_with("duration_ms "))
+    {
+        // node:test (spec `ℹ` or TAP `#`) prints its totals last.
+        let field = |name: &str| lines.iter().rev().find_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("ℹ ").or_else(|| line.strip_prefix("# "))?
+                .strip_prefix(name)?.strip_prefix(' ')?.parse::<u64>().ok()
+        });
+        if field("fail")? != 0 { return None; }
+        field("pass")?
     } else {
         PYTEST.captures(last)?[1].parse().ok()?
     };
@@ -2356,6 +2367,14 @@ impl ExecCommandToolOutput {
             if codex_utils_string::approx_token_count(&candidate) <= limits.applied_limit {
                 projected_text = candidate;
             }
+        }
+        // Inline line markers count from this chunk, while the artifact id
+        // addresses the cumulative output. Say so rather than invite a lines read.
+        if first_omitted_lines.is_some()
+            && let Some(start) = self.output_ranges.as_ref().map(|ranges| ranges.range.start)
+                .filter(|start| *start != 0)
+        {
+            projected_text = format!("[line numbers below are relative to this output chunk, which starts at byte {start} of the retained artifact; use recovery_selector or byte selectors]\n{projected_text}");
         }
         ProjectedModelOutput {
             reduced: summarized.is_some() || was_truncated

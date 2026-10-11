@@ -1,7 +1,10 @@
 //! KD4's full Rust suite admission policy. This is a launch limit, not a result
 //! cache: edits, failures, cancellation and force_fresh never replenish it.
 //! Arbitrary programs/scripts remain outside this command-recognition boundary.
+//! So are launches from a local working directory outside a KD4 checkout: other
+//! projects keep their own test conventions.
 
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -24,11 +27,24 @@ impl FullSuiteBudget {
 pub(crate) async fn check_full_suite_command(
     command: &[String],
     shell_type: Option<ShellType>,
+    local_cwd: Option<&Path>,
 ) -> Result<bool, String> {
     let command = command.to_vec();
-    crate::tools::run_blocking_command_analysis(move || check_command(&command, shell_type, 0))
-        .await
-        .map_err(|error| format!("full-suite policy worker failed: {error}"))?
+    let local_cwd = local_cwd.map(Path::to_path_buf);
+    crate::tools::run_blocking_command_analysis(move || {
+        // An unknown or remote working directory stays governed.
+        if local_cwd.as_deref().is_some_and(|cwd| !in_kd4_checkout(cwd)) {
+            return Ok(false);
+        }
+        check_command(&command, shell_type, 0)
+    })
+    .await
+    .map_err(|error| format!("full-suite policy worker failed: {error}"))?
+}
+
+fn in_kd4_checkout(cwd: &Path) -> bool {
+    cwd.ancestors()
+        .any(|root| root.join("codex-rs/.config/kd4-rust-tests.toml").is_file())
 }
 
 fn check_command(
@@ -507,7 +523,8 @@ mod tests {
             assert!(
                 check_full_suite_command(
                     &["bash".into(), "-lc".into(), script.into()],
-                    Some(ShellType::Bash)
+                    Some(ShellType::Bash),
+                    None
                 )
                 .await
                 .is_err()
@@ -520,7 +537,8 @@ mod tests {
                     "-lc".into(),
                     "cargo test --no-fail-fast".into()
                 ],
-                Some(ShellType::Bash)
+                Some(ShellType::Bash),
+                None
             )
             .await,
             Ok(true)
@@ -532,11 +550,42 @@ mod tests {
                     "-lc".into(),
                     "for x in 1 2; do cargo build; done".into()
                 ],
-                Some(ShellType::Bash)
+                Some(ShellType::Bash),
+                None
             )
             .await,
             Ok(false)
         );
+    }
+
+    fn kd4_checkout() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("codex-rs/.config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("kd4-rust-tests.toml"), "").unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn full_suite_policy_governs_only_kd4_checkouts_and_unknown_cwds() {
+        let kd4 = kd4_checkout();
+        let nested = kd4.path().join("codex-rs/core");
+        std::fs::create_dir_all(&nested).unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        // `cargo test` lacks --no-fail-fast, which the policy rejects.
+        for (cwd, governed) in [
+            (None, true),
+            (Some(kd4.path()), true),
+            (Some(nested.as_path()), true),
+            (Some(foreign.path()), false),
+        ] {
+            let result = check_full_suite_command(&words("cargo test"), None, cwd).await;
+            if governed {
+                assert!(result.is_err(), "{cwd:?}: {result:?}");
+            } else {
+                assert_eq!(result, Ok(false), "{cwd:?}");
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -558,6 +607,7 @@ mod tests {
                     script.into(),
                 ],
                 Some(ShellType::PowerShell),
+                None,
             )
             .await;
             if allowed {
@@ -585,7 +635,7 @@ mod tests {
             .enable(codex_features::Feature::Kd4Runtime)
             .unwrap();
         // A missing executable ensures even a broken guard cannot run a suite.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = kd4_checkout();
         let program = temp.path().join("cargo.exe");
         turn.full_suite_budget.admit(true).unwrap();
         let turn = Arc::new(turn);
@@ -602,6 +652,7 @@ mod tests {
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "program": program, "args": ["test", "--no-fail-fast"], "force_fresh": true,
+                    "workdir": temp.path(),
                 })
                 .to_string(),
             },

@@ -70,7 +70,7 @@
     },
     {
       "programs": ["just"],
-      "prefixes": [["check-lane"]],
+      "prefixes": [["check-lane"], ["config-schema-check"], ["app-server-schema-check"]],
       "allow_extra_args": true,
       "operations": ["check"]
     }

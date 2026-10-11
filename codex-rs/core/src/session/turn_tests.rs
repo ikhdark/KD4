@@ -2734,9 +2734,13 @@ async fn planning_failure_records_initial_input_and_emits_status_affecting_error
         !failure.is_retryable(),
         "local planning errors must not retry the transport"
     );
-    finish_pending_turn_planning_failure(&session, &turn_context, &input, failure)
+    let result = finish_pending_turn_planning_failure(&session, &turn_context, &input, failure)
         .await
         .expect("planning failure is surfaced as a terminal turn result");
+    assert!(
+        result.defer_pending_input,
+        "pending input must not re-enter a turn whose planning failed"
+    );
 
     let error = tokio::time::timeout(Duration::from_secs(2), async {
         loop {

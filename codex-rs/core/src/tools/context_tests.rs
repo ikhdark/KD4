@@ -2107,6 +2107,9 @@ async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
     assert!(!retained.contains("already observed"));
     assert!(retained.starts_with("current line"));
     assert_eq!(packet["recovery"]["arguments"]["selectors"][0], *selector);
+    assert!(packet["output"].as_str().unwrap().starts_with(&format!(
+        "[line numbers below are relative to this output chunk, which starts at byte {} of the retained artifact;", prefix.len())),
+        "inline line markers must not read as cumulative artifact lines");
 
     // One recovery request can now deliver this entire gap, without guessing
     // the next 4 KiB window or rereading the already observed cumulative prefix.
@@ -2207,6 +2210,10 @@ fn final_test_summaries_attribute_counts_without_execution_receipts() {
         ("python -m unittest", "Ran 4 tests in 1.2s\nFAILED (failures=1)\n", None),
         ("pytest", "2 failed, 12 passed in 0.20s", None),
         ("echo OK", "Ran 98 tests in 1.2s\nOK", None),
+        ("npm test", "ℹ tests 14\nℹ suites 0\nℹ pass 14\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 812.3\n", Some(14)),
+        ("npm test", "# tests 2\n# pass 2\n# fail 0\n# duration_ms 77\n", Some(2)),
+        ("npm test", "ℹ pass 13\nℹ fail 1\nℹ duration_ms 812.3\n", None),
+        ("npm test", "ℹ pass 0\nℹ fail 0\nℹ duration_ms 1\n", None),
     ] {
         let validation = crate::validation::CommandValidation {
             execution_context: None,

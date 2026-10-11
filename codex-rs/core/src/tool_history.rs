@@ -2717,9 +2717,43 @@ impl ToolHistoryState {
         })
     }
 
+    // A code-mode carrier records no dependencies of its own; its workspace
+    // observation owns freshness. A pin must not outlive that invalidation as current.
+    fn artifact_pin_value_for(&self, candidate: &ToolHistoryCandidate) -> Option<serde_json::Value> {
+        let mut pin = candidate.artifact_pin_value()?;
+        if self.workspace_evidence.get(&candidate.call_id)
+            .is_some_and(|observation| !observation.source_dependencies_current)
+        {
+            pin["source_dependencies_current"] = false.into();
+        }
+        // Its receipt names no file either; without the observed paths the
+        // handle cannot be matched to a source without recovering it.
+        if pin["evidence"].is_null() && let Some(sources) = self.pin_sources(&candidate.call_id) {
+            pin["sources"] = sources;
+        }
+        Some(pin)
+    }
+
+    /// Paths observed through a call whose own receipt names no source: a
+    /// carrier's observation and nested reads, or one nested call's own read.
+    fn pin_sources(&self, call_id: &str) -> Option<serde_json::Value> {
+        let paths = self.workspace_evidence.get(call_id).into_iter()
+            .chain(self.code_mode_nested_evidence.get(call_id).into_iter()
+                .flat_map(|calls| calls.values().map(|nested| &nested.observation)))
+            .chain(self.code_mode_nested_evidence.values()
+                .filter_map(|calls| calls.get(call_id).map(|nested| &nested.observation)))
+            .flat_map(|observation| observation.source_dependencies.iter())
+            .map(|dependency| dependency.path.as_str())
+            .collect::<BTreeSet<_>>();
+        (!paths.is_empty()).then(|| serde_json::json!({
+            "paths": paths.iter().take(4).collect::<Vec<_>>(),
+            "omitted": paths.len().saturating_sub(4),
+        }))
+    }
+
     pub(crate) fn artifact_recovery_directory(&self) -> serde_json::Value {
         let mut pins = self.candidates.values().filter_map(|candidate| {
-            let mut pin = candidate.artifact_pin_value()?;
+            let mut pin = self.artifact_pin_value_for(candidate)?;
             if let Some(ranges) = self.recovered_ranges.get(&candidate.call_id) {
                 pin["recovered_selectors"] = serde_json::json!(ranges);
             }
@@ -2752,7 +2786,7 @@ impl ToolHistoryState {
         let mut pins = candidates
             .into_iter()
             .filter(|(_, candidate)| seen.insert(candidate.artifact_id.clone()))
-            .filter_map(|(_, candidate)| candidate.artifact_pin_value())
+            .filter_map(|(_, candidate)| self.artifact_pin_value_for(candidate))
             .collect::<Vec<_>>();
         let serialized = serde_json::to_string(items).ok()?;
         pins.extend(
@@ -2760,9 +2794,13 @@ impl ToolHistoryState {
                 .iter()
                 .filter(|(id, _)| serialized.contains(id.as_str()) && seen.insert((*id).clone()))
                 .map(|(id, (call_id, bytes, sha))| {
-                    serde_json::json!({
+                    let mut pin = serde_json::json!({
                         "artifact_id": id, "call_id": call_id, "bytes": bytes, "sha256": sha,
-                    })
+                    });
+                    if let Some(sources) = self.pin_sources(call_id) {
+                        pin["sources"] = sources;
+                    }
+                    pin
                 }),
         );
         let total = pins.len();
@@ -2802,6 +2840,7 @@ impl ToolHistoryState {
                 // identity-bound handle, nor prevent considering later pins.
                 reduced.as_object_mut()?.remove("recovered_selectors");
                 reduced.as_object_mut()?.remove("digest");
+                reduced.as_object_mut()?.remove("sources");
                 payload["artifacts"].as_array_mut()?.push(reduced);
                 if approx_token_count(&serde_json::to_string(&payload).ok()?)
                     > COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET
@@ -5355,7 +5394,10 @@ fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDe
         || (matches!(program.as_str(), "npm" | "pnpm" | "yarn")
             && lower.iter().skip(1).any(|arg| arg == "test"));
     if is_test {
-        return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
+        // A runner launched in a subdirectory still loads sibling packages and
+        // root configuration; scope its result to the enclosing repository.
+        let root = codex_git_utils::get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        return BTreeSet::from([SourceDependencyV1::new(&root, true)]);
     }
     if matches!(
         program.as_str(),

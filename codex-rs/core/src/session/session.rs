@@ -1730,6 +1730,9 @@ impl Session {
                     thread_id.to_string(),
                 );
             }
+            crate::tools::command_output_artifact::spawn_retention_index_prewarm(
+                config.codex_home.as_path(),
+            );
             let managed_network_requirements_configured = config
                 .config_layer_stack
                 .requirements_toml()

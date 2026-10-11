@@ -28,5 +28,14 @@ pub trait AttestationProvider: std::fmt::Debug + Send + Sync {
         true
     }
 
+    /// Resolves once attestation can be generated for the thread. Providers that support startup
+    /// requests are always ready.
+    fn wait_until_ready(
+        &self,
+        _context: AttestationContext,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     fn header_for_request(&self, context: AttestationContext) -> GenerateAttestationFuture<'_>;
 }
