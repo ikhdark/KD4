@@ -216,13 +216,31 @@ class FakeExecutor:
         if args[:3] == ["cargo", "nextest", "list"]:
             return nextest_list_payload(self._listing_for(args))
         if args[:3] == ["cargo", "nextest", "run"]:
-            return "\n".join(
+            return "\n".join(self._with_success_output(args, [
                 f"{'SKIP' if ignored else 'PASS'} [ 0.001s] {args[args.index('-p') + 1]}{'::' + self._selector_for(args) if '--test' in args else '::bin/' + args[args.index('--bin') + 1] if '--bin' in args else ''} {test}"
                 for test, ignored in self._listing_for(args).items()
-            )
+            ]))
         if args[:2] == ["cargo", "build"]:
             return self._artifact_output(args)
         return ""
+
+    @staticmethod
+    def _with_success_output(args: list[str], statuses: list[str]) -> list[str]:
+        """Mirror nextest's passing-test output display: `immediate` prints it
+        under each PASS line; `final` repeats each PASS line with its output
+        after the run summary."""
+        mode = args[args.index("--success-output") + 1] if "--success-output" in args else "never"
+        if mode == "never":
+            return statuses
+        output = ("  stdout ───", "    bench: 1 ns/iter")
+        passing = [status for status in statuses if status.startswith("PASS")]
+        immediate = mode in ("immediate", "immediate-final")
+        lines = [line for status in statuses for line in (
+            status, *(output if immediate and status.startswith("PASS") else ()))]
+        lines += ["────────────", f"     Summary [   0.010s] {len(passing)} tests run: {len(passing)} passed"]
+        if mode in ("final", "immediate-final"):
+            lines += [line for status in passing for line in (status, *output)]
+        return lines
 
     def _listing_for(self, args: list[str]) -> dict[str, bool]:
         selector = self._selector_for(args)
@@ -1881,6 +1899,34 @@ class NextestListParsingTest(unittest.TestCase):
         )
 
 
+class NextestResultParsingTest(unittest.TestCase):
+    PASS = "        PASS [   0.026s] codex-core mod::tests::alpha"
+
+    def results(self, *lines: str) -> list[tuple[str, str, str]]:
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="\n".join(lines))
+        return list(rust_test_runner._nextest_results(result))
+
+    def test_final_output_replays_after_the_run_summary_are_not_executions(self) -> None:
+        for summary in (
+            "     Summary [   0.956s] 1 test run: 1 passed, 4881 skipped",
+            "     Summary [   0.123s] 1/3 tests run: 1 passed, 2 skipped",
+        ):
+            with self.subTest(summary=summary):
+                self.assertEqual(
+                    self.results(self.PASS, "  stdout ───", "────────────", summary,
+                                 self.PASS, "  stdout ───"),
+                    [("PASS", "codex-core", "mod::tests::alpha")],
+                )
+
+    def test_duplicate_reports_before_the_run_summary_still_count(self) -> None:
+        # Only nextest's run summary ends the record; test output that merely
+        # mentions a summary cannot hide a second execution report.
+        self.assertEqual(
+            self.results(self.PASS, "    Summary [bench] 2 of 3 cases", self.PASS),
+            [("PASS", "codex-core", "mod::tests::alpha")] * 2,
+        )
+
+
 class HelperUnionTest(RunnerTestCase):
     def test_target_helpers_are_exactly_the_declared_set(self) -> None:
         runner, _ = self.runner()
@@ -2474,7 +2520,7 @@ class RunTargetTest(RunnerTestCase):
 
     def test_requested_success_output_is_streamed_without_changing_receipts(self) -> None:
         receipts = {}
-        for value in ("never", "immediate"):
+        for value in rust_test_runner.SUCCESS_OUTPUT_VALUES:
             executor = self.build_executor(default_listing={"tests::alpha": False})
             runner = RustTestRunner(
                 self.manifest(), self.metadata(), target_dir=self.target_dir,
@@ -2490,7 +2536,10 @@ class RunTargetTest(RunnerTestCase):
             # Status lines stay retained for receipts; requested output streams.
             self.assertEqual(capture, rust_test_runner.CAPTURE_BOTH
                              if value == "never" else rust_test_runner.CAPTURE_STDOUT)
-        self.assertEqual(receipts["immediate"], receipts["never"])
+        # `final` modes replay each PASS line after the summary; receipts must
+        # still record exactly one execution per test.
+        for value, received in receipts.items():
+            self.assertEqual(received, receipts["never"], value)
         with self.assertRaisesRegex(RunnerError, "--success-output must be one of"):
             RustTestRunner(self.manifest(), self.metadata(), success_output="always")
 
@@ -3768,6 +3817,18 @@ class RunGateTest(RunnerTestCase):
         runner, _ = self.runner(executor=executor)
         runner.run_gate("demo-gate")
         self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
+
+    def test_success_output_replays_keep_gate_receipts(self) -> None:
+        receipts = {}
+        for value in rust_test_runner.SUCCESS_OUTPUT_VALUES:
+            runner = RustTestRunner(
+                self.manifest(), self.metadata(), target_dir=self.target_dir,
+                platform="windows", executor=self.gate_executor(self.matching_listings()),
+                success_output=value,
+            )
+            receipts[value] = runner.run_gates(["demo-gate"], quiet=True)
+        for value, received in receipts.items():
+            self.assertEqual(received, receipts["never"], value)
 
     def test_missing_expected_test_id_fails_the_gate(self) -> None:
         listings = self.matching_listings()

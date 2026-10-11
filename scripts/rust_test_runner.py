@@ -802,11 +802,20 @@ def _failure_diagnostic_excerpt(
     return heading + "".join(selected) + separator + (tail[-tail_size:] if tail_size else "")
 
 
+# Nextest's run summary ("N tests run:", or "R/N tests run:" after a cancel)
+# closes the execution record. Status lines after it only head final output
+# replays (`--success-output`/`--failure-output` final) of tests already
+# reported above, so they are presentation, not further executions.
+_NEXTEST_RUN_SUMMARY = re.compile(r"\s*Summary\s+\[[^]\r\n]+\]\s+\d+(?:/\d+)? tests? run:")
+
+
 def _nextest_results(
     result: subprocess.CompletedProcess[str],
 ) -> Iterable[tuple[str, str, str]]:
     for stream in ("stdout", "stderr"):
         for line in _output_lines(result, stream):
+            if _NEXTEST_RUN_SUMMARY.match(line):
+                break
             match = re.fullmatch(
                 r"\s*(PASS|LEAK|FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL)\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
                 line,
