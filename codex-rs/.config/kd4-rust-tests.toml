@@ -580,6 +580,8 @@ tests = [
   "responses_retry::tests::connection_recovery_reaches_https_fallback_without_exhausting_network_waits",
   "responses_retry::tests::batch_and_subagent_sources_do_not_opt_into_unlimited_recovery",
   "responses_retry::tests::audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_transport",
+  "responses_retry::tests::provider_retry_timing_microbenchmark",
+  "responses_retry::tests::cancelled_retry_does_not_switch_transport_or_announce_an_attempt",
   "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
 ]
 
