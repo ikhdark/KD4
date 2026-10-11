@@ -2342,6 +2342,8 @@ struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     /// When `connection` was established; drives rotation before the server's age limit.
     connected_at: Option<Instant>,
+    /// Requests sent on `connection`; reported with its age if the server drops it.
+    requests_sent: u64,
     /// Shared with each response stream, which reports its rate on completion.
     stream_throughput: Arc<StdMutex<WebsocketStreamThroughput>>,
     setup_fingerprint: Option<WebsocketSetupFingerprint>,
@@ -3355,6 +3357,7 @@ impl ModelClientSession {
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.connected_at = None;
+        self.websocket_session.requests_sent = 0;
         self.websocket_session.setup_fingerprint = None;
         self.invalidate_incremental_history("websocket reset");
         self.websocket_session
@@ -4068,6 +4071,7 @@ impl ModelClientSession {
             };
             self.websocket_session.connection = Some(new_conn);
             self.websocket_session.connected_at = Some(Instant::now());
+            self.websocket_session.requests_sent = 0;
             self.websocket_session.setup_fingerprint = setup_fingerprint;
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
@@ -4805,6 +4809,7 @@ impl ModelClientSession {
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
             let connection_reused = self.websocket_session.connection_reused();
+            self.websocket_session.requests_sent += 1;
             let queue_clock = attempt_clock.clone();
             let dispatch_clock = attempt_clock.clone();
             let established_clock = attempt_clock.clone();
@@ -5260,6 +5265,25 @@ impl ModelClientSession {
             _ => false,
         };
         self.switch_fallback_transport(session_telemetry, recoverable)
+    }
+
+    /// Describes the socket the last WebSocket stream used, for the fallback
+    /// warning. Read it before switching transport, which discards that socket.
+    pub(crate) fn websocket_stream_context(&self) -> Option<String> {
+        if self.last_stream_transport != Some(ModelAttemptTransport::ResponsesWebsocket) {
+            return None;
+        }
+        let age = self.websocket_session.connected_at.map_or_else(
+            || "unknown".to_string(),
+            |connected_at| {
+                let seconds = connected_at.elapsed().as_secs();
+                format!("{}m{:02}s", seconds / 60, seconds % 60)
+            },
+        );
+        Some(format!(
+            "socket age {age}, {} requests on that socket",
+            self.websocket_session.requests_sent
+        ))
     }
 
     fn switch_fallback_transport(

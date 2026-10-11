@@ -80,6 +80,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
     // HTTPS fallback when the WebSocket endpoint remains unavailable.
     let retry_budget_exhausted = retry_state.retries >= max_retries
         || (wait_for_connection_recovery && retry_state.connection_retries >= max_retries);
+    // Read before switching transport, which discards the failed socket's state.
+    let websocket_context = client_session.websocket_stream_context();
     // Each new model request resets the retry budget. Switch on the first stream-read
     // failure so intermittent WebSocket drops cannot keep replaying work at "1/N" indefinitely.
     if (matches!(err, CodexErr::ResponseStreamFailed(_)) || retry_budget_exhausted)
@@ -88,10 +90,15 @@ pub(crate) async fn handle_retryable_response_stream_error(
             .try_switch_fallback_transport_after_error(&turn_context.session_telemetry, &err)
     {
         turn_context.turn_timing_state.record_model_fallback();
+        let socket = websocket_context
+            .map(|context| format!(" ({context})"))
+            .unwrap_or_default();
         sess.send_event(
             turn_context,
             EventMsg::Warning(WarningEvent {
-                message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+                message: format!(
+                    "Falling back from WebSockets to HTTPS transport. {err:#}{socket}"
+                ),
             }),
         )
         .await;

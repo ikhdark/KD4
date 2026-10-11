@@ -611,6 +611,75 @@ async fn websocket_fallback_counts_concurrent_websocket_failures_only_once_each(
 }
 
 #[tokio::test]
+async fn websocket_stream_context_describes_the_socket_a_failure_would_drop() {
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::start_websocket_server;
+
+    let server = start_websocket_server(vec![vec![
+        vec![ev_completed("first")],
+        vec![ev_completed("second")],
+    ]])
+    .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = ModelClient::new(
+        None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test".into(),
+        None,
+        false,
+        false,
+        None,
+        false,
+        None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let telemetry = test_session_telemetry();
+    let model = test_model_info();
+    let mut session = client.new_session();
+    assert_eq!(session.websocket_stream_context(), None);
+    for _ in 0..2 {
+        let mut stream = session
+            .stream(
+                &Prompt::default(),
+                &model,
+                &telemetry,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+                &InferenceTraceContext::disabled(),
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+    assert_eq!(server.handshakes().len(), 1);
+    session.websocket_session.connected_at =
+        Some(std::time::Instant::now() - Duration::from_secs(18 * 60 + 30));
+    assert_eq!(
+        session.websocket_stream_context().as_deref(),
+        Some("socket age 18m30s, 2 requests on that socket")
+    );
+    session.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
+    assert_eq!(session.websocket_stream_context(), None);
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
     use core_test_support::responses::ev_completed;
     use core_test_support::responses::start_websocket_server;
