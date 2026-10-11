@@ -238,8 +238,10 @@ where
 {
     let mut addresses = addresses.into_iter();
     let Some(first_address) = addresses.next() else {
+        // An empty lookup is a transient resolution outcome. `InvalidInput`
+        // would mark it as a permanent setup failure, so no retry or fallback.
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+            io::ErrorKind::HostUnreachable,
             "could not resolve to any address",
         ));
     };

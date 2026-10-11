@@ -196,7 +196,11 @@ impl ReqwestTransport {
     }
 
     fn map_error(err: reqwest::Error) -> TransportError {
-        if err.is_builder() || is_permanent_connection_error(&err) {
+        // Body and decode errors occur inside an established exchange. There an
+        // InvalidInput is hyper rejecting damaged (e.g. chunked) framing, which a
+        // new request can recover from; it is not a configuration failure.
+        let established = err.is_body() || err.is_decode();
+        if err.is_builder() || (!established && is_permanent_connection_error(&err)) {
             TransportError::Build(format!("permanent transport configuration failure: {:#}", err.without_url()))
         } else if err.is_connect() {
             TransportError::Connection(err.without_url())

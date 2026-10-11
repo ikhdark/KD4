@@ -129,6 +129,45 @@ async fn permanent_certificate_failure_is_not_connection_recovery() {
     assert!(!error.to_string().contains("hidden"));
 }
 
+#[tokio::test]
+async fn damaged_chunked_body_mid_stream_stays_recoverable() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = std::io::Read::read(&mut socket, &mut [0; 4096]);
+        // One valid chunk, then a size line hyper rejects with InvalidInput.
+        let response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\n";
+        socket.write_all(response).unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let response = ReqwestTransport::new(client)
+        .stream(Request::new(Method::GET, format!("http://{address}/")))
+        .await
+        .expect("headers precede the damaged chunk");
+    let mut bytes = response.bytes;
+    let error = loop {
+        match bytes
+            .next()
+            .await
+            .expect("damaged framing must fail the stream")
+        {
+            Ok(_) => continue,
+            Err(error) => break error,
+        }
+    };
+    server.join().unwrap();
+    assert!(matches!(error, TransportError::Network(_)), "{error:?}");
+}
+
 #[test]
 fn remote_tls_alerts_and_socket_outages_remain_recoverable() {
     assert!(!is_permanent_connection_error(&rustls::Error::AlertReceived(

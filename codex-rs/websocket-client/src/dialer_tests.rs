@@ -645,6 +645,17 @@ async fn assert_no_proxy_subprocess(no_proxy: &str, expect_proxy: bool, proxy_tl
     }
 }
 
+#[tokio::test]
+async fn empty_resolution_is_not_a_permanent_setup_failure() {
+    let error = connect_happy_eyeballs(Vec::new(), |address| async move { Ok(address) })
+        .await
+        .expect_err("no address can connect");
+    assert!(
+        !codex_http_client::is_permanent_connection_error(&error),
+        "{error}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn happy_eyeballs_advances_immediately_after_failure() {
     let failed: SocketAddr = "[2001:db8::1]:443".parse().expect("IPv6 address");
