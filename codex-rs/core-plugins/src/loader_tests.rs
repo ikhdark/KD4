@@ -271,6 +271,69 @@ enabled = true
     assert!(hooks_only_valid.apps.is_empty());
 }
 
+#[tokio::test]
+async fn disabled_required_app_withholds_only_that_plugins_skills() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    for (name, app) in [
+        ("needs", r#"{"id":"connector_needed","required":true}"#),
+        ("optional", r#"{"id":"connector_needed"}"#),
+    ] {
+        let root = temp_dir.path().join(format!("plugins/cache/test/{name}/local"));
+        write_file(
+            &root.join(".codex-plugin/plugin.json"),
+            &format!(r#"{{"name":"{name}"}}"#),
+        );
+        write_file(
+            &root.join("skills/example/SKILL.md"),
+            "---\nname: example\ndescription: example skill\n---\n",
+        );
+        write_file(&root.join(".app.json"), &format!(r#"{{"apps":{{"app":{app}}}}}"#));
+    }
+    let plugins = "[plugins.\"needs@test\"]\nenabled = true\n\n[plugins.\"optional@test\"]\nenabled = true\n";
+    let store = PluginStore::new(temp_dir.path().to_path_buf());
+    for (apps, needs_has_skills) in [
+        ("", true),
+        ("\n[apps.connector_needed]\nenabled = true\n", true),
+        ("\n[apps.connector_needed]\nenabled = false\n", false),
+    ] {
+        let stack = ConfigLayerStack::new(
+            vec![user_layer(
+                user_config_path(&temp_dir, "config.toml"),
+                &format!("{plugins}{apps}"),
+            )],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect("valid config layer stack");
+        let loaded = load_plugins_from_layer_stack(
+            &stack,
+            HashMap::new(),
+            &store,
+            /*plugin_skill_snapshots*/ None,
+            Some(Product::Codex),
+            /*remote_global_catalog_active*/ false,
+        )
+        .await
+        .expect("configured plugins resolve");
+        let plugin = |name: &str| {
+            loaded
+                .iter()
+                .find(|plugin| plugin.config_name == name)
+                .expect("configured plugin should be returned")
+        };
+        let needs = plugin("needs@test");
+        assert_eq!(needs.error, None);
+        assert_eq!(!needs.skill_roots.is_empty(), needs_has_skills, "{apps:?}");
+        assert_eq!(needs.has_enabled_skills, needs_has_skills, "{apps:?}");
+        // The declaration stays, so the app can still be shown and re-enabled.
+        assert_eq!(needs.apps.len(), 1);
+        // An optional app says nothing about whether the skills can work.
+        let optional = plugin("optional@test");
+        assert_eq!(optional.skill_roots.len(), 1, "{apps:?}");
+        assert!(optional.has_enabled_skills, "{apps:?}");
+    }
+}
+
 #[test]
 fn curated_plugin_cache_version_preserves_full_sha_and_non_sha_versions() {
     for version in [

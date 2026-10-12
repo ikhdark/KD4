@@ -12,7 +12,8 @@ fn parses_plugin_app_config_in_order_without_validating_connector_ids() {
             "apps": {
                 "calendar": {
                     "id": "connector_calendar",
-                    "category": "  productivity  "
+                    "category": "  productivity  ",
+                    "required": true
                 },
                 "drive": {
                     "id": "connector_calendar",
@@ -33,16 +34,19 @@ fn parses_plugin_app_config_in_order_without_validating_connector_ids() {
                 name: "calendar".to_string(),
                 connector_id: AppConnectorId("connector_calendar".to_string()),
                 category: Some("productivity".to_string()),
+                required: true,
             },
             AppDeclaration {
                 name: "drive".to_string(),
                 connector_id: AppConnectorId("connector_calendar".to_string()),
                 category: None,
+                required: false,
             },
             AppDeclaration {
                 name: "blank".to_string(),
                 connector_id: AppConnectorId("  ".to_string()),
                 category: None,
+                required: false,
             },
         ]
     );
@@ -73,12 +77,14 @@ fn value_parser_preserves_available_order_and_cleans_categories() {
                     name: name.clone(),
                     connector_id: AppConnectorId(" z ".to_string()),
                     category: Some("work".to_string()),
+                    required: false,
                 }
             } else {
                 AppDeclaration {
                     name: name.clone(),
                     connector_id: AppConnectorId("a".to_string()),
                     category: None,
+                    required: false,
                 }
             }
         })

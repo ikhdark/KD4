@@ -157,10 +157,18 @@ impl DynamicToolHandler {
             content_items,
             success,
         } = response;
-        let body = content_items
+        let mut body = content_items
             .into_iter()
             .map(FunctionCallOutputContentItem::from)
             .collect::<Vec<_>>();
+        // The success flag is internal metadata, not part of the provider wire
+        // payload or the default code-mode result. Preserve a reported failure
+        // in both consumers without replacing the client's multimodal evidence.
+        if !success {
+            body.insert(0, FunctionCallOutputContentItem::InputText {
+                text: "Dynamic tool response has success=false.".to_string(),
+            });
+        }
         Ok(boxed_tool_output(FunctionToolOutput::from_content(
             body,
             Some(success),
@@ -661,6 +669,72 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dynamic_handler_preserves_reported_failure_in_provider_and_code_mode_output() {
+        use crate::session::step_context::StepContext;
+        use crate::tools::context::ToolCallSource;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+
+        for success in [false, true] {
+            for with_content in [false, true] {
+                let (session, turn, _events) = make_session_and_context_with_rx().await;
+                *session.active_turn.lock().await = Some(ActiveTurn::default());
+                let handler = DynamicToolHandler::new(&DynamicToolFunctionSpec {
+                    name: "result_probe".into(),
+                    description: "returns a client operation receipt".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    defer_loading: false,
+                })
+                .unwrap();
+                let payload = ToolPayload::Function { arguments: "{}".into() };
+                let mut call = Box::pin(handler.handle_call(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    call_id: "result-probe".into(),
+                    tool_name: ToolName::plain("result_probe"),
+                    payload: payload.clone(),
+                    source: ToolCallSource::Direct,
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                }));
+                assert!(futures::poll!(call.as_mut()).is_pending());
+                let content_items = if with_content {
+                    vec![
+                        DynamicToolCallOutputContentItem::InputText { text: "receipt 42".into() },
+                        DynamicToolCallOutputContentItem::InputImage {
+                            image_url: "data:image/png;base64,AQID".into(),
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                session.notify_dynamic_tool_response(
+                    &turn.sub_id,
+                    "result-probe",
+                    DynamicToolResponse { content_items, success },
+                ).await;
+                let result = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+                    .await.unwrap().unwrap();
+                let response = result.to_response_item("result-probe", &payload);
+                let wire = serde_json::to_value(response).unwrap();
+                assert_eq!(wire.to_string().contains("success=false"), !success);
+                assert_eq!(result.code_mode_result(&payload).to_string().contains("success=false"), !success);
+                assert_eq!(result.success_for_logging(), success);
+                if with_content {
+                    let items = wire["output"].as_array().expect("native multimodal output");
+                    assert!(items.iter().any(|item| item["text"] == "receipt 42"));
+                    assert!(items.iter().any(|item| item["image_url"] == "data:image/png;base64,AQID"));
+                }
+                session.terminal_tasks.close();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    session.terminal_tasks.wait(),
+                ).await.unwrap();
+            }
+        }
     }
 
     #[test]

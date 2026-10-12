@@ -72,7 +72,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
             .session
             .lock_pending_mcp_server_refresh_config()
             .await,
-        Some(first_refresh.clone())
+        Some(Arc::new(first_refresh.clone()))
     );
     assert_eq!(
         *second
@@ -81,7 +81,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
             .session
             .lock_pending_mcp_server_refresh_config()
             .await,
-        Some(second_refresh.clone())
+        Some(Arc::new(second_refresh.clone()))
     );
 
     let next_first_refresh = refresh_config("next-first");
@@ -111,7 +111,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
             .session
             .lock_pending_mcp_server_refresh_config()
             .await,
-        Some(first_refresh.clone())
+        Some(Arc::new(first_refresh.clone()))
     );
     assert_eq!(
         *second
@@ -120,7 +120,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
             .session
             .lock_pending_mcp_server_refresh_config()
             .await,
-        Some(second_refresh.clone())
+        Some(Arc::new(second_refresh.clone()))
     );
 
     let duplicate = tokio::time::timeout(
@@ -166,7 +166,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
     ));
     assert!(futures::poll!(&mut pending).is_pending());
     drop(pending);
-    assert_eq!(*held, Some(targets[1].1.clone()));
+    assert_eq!(*held, Some(Arc::new(targets[1].1.clone())));
     drop(held);
     for (thread, expected) in targets {
         let pending_config = tokio::time::timeout(
@@ -179,7 +179,7 @@ async fn atomic_mcp_refresh_commits_without_thread_submissions() {
         )
         .await
         .expect("cancelling the batch must release all acquired locks");
-        assert_eq!(*pending_config, Some(expected.clone()));
+        assert_eq!(*pending_config, Some(Arc::new(expected.clone())));
     }
     first
         .thread

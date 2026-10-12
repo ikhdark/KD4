@@ -87,8 +87,20 @@ impl Session {
                 world_state.add_section(SubagentsState::new(environment_subagents));
             }
         }
-        let apps_available =
-            if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
+        // A model whose catalog entry says it needs no usage guidance gets
+        // none. Guidance an earlier request already delivered stays tracked, so
+        // a later loss of the capability is still reported; an untracked
+        // section says nothing, which never claims the capability is gone.
+        let tracked = |id: &str| {
+            previous_world_state
+                .as_ref()
+                .is_some_and(|state| state.section(id).is_some())
+        };
+        if turn_context.model_info.include_apps_usage_instructions || tracked("apps_instructions")
+        {
+            let apps_available = if turn_context.config.include_apps_instructions
+                && turn_context.apps_enabled()
+            {
                 let tools = step_context.mcp_tools().await;
                 connectors::with_app_enabled_state(
                     connectors::accessible_connectors_from_mcp_tools(tools),
@@ -99,10 +111,15 @@ impl Session {
             } else {
                 false
             };
-        world_state.add_section(AppsInstructionsState::new(apps_available));
-        world_state.add_section(PluginsInstructionsState::new(
-            step_context.mcp.plugins_available(),
-        ));
+            world_state.add_section(AppsInstructionsState::new(apps_available));
+        }
+        if turn_context.model_info.include_plugin_usage_instructions
+            || tracked("plugins_instructions")
+        {
+            world_state.add_section(PluginsInstructionsState::new(
+                step_context.mcp.plugins_available(),
+            ));
+        }
         let environments = step_context.environments.to_selections();
         let ready_selected_capability_roots = step_context
             .selected_capability_roots

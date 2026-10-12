@@ -526,10 +526,7 @@ fn classify_argv_at_depth(
         return classify_argv_at_depth(&args[index], &args[index + 1..], depth + 1, runners);
     }
     if matches!(binary.as_str(), "bash" | "sh") {
-        let Some(index) = args.iter().position(|arg| shell_executes_command_arg(arg)) else {
-            return ValidationClassification::Opaque;
-        };
-        let Some(script) = args.get(index + 1) else {
+        let Some(script) = executing_posix_shell_script(args) else {
             return ValidationClassification::Opaque;
         };
         return classify_simple_script(script, depth + 1, runners, false);
@@ -665,12 +662,53 @@ fn execution_modes_do_not_promote_listing_compilation_or_mutation_to_proof() {
     }
 }
 
-fn shell_executes_command_arg(arg: &str) -> bool {
-    arg == "-c"
-        || arg
-            .strip_prefix('-')
-            .filter(|flags| !flags.starts_with('-'))
-            .is_some_and(|flags| flags.contains('c'))
+/// Resolve only supported shell options before the command string. `-c` does
+/// not stop option parsing: `sh -c -n SCRIPT` is still syntax-only, while a
+/// later `+n` enables execution again. Words after SCRIPT are positional args.
+fn executing_posix_shell_script(args: &[String]) -> Option<&str> {
+    let mut command_string = false;
+    let mut noexec = false;
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        if argument == "--" {
+            return (command_string && !noexec)
+                .then(|| args.next().map(String::as_str)).flatten();
+        }
+        if matches!(argument.as_str(), "--norc" | "--noprofile" | "--posix" | "--login") {
+            continue;
+        }
+        let (enabled, flags) = if let Some(flags) = argument.strip_prefix('-') {
+            (true, flags)
+        } else if let Some(flags) = argument.strip_prefix('+') {
+            (false, flags)
+        } else {
+            return (command_string && !noexec).then_some(argument.as_str());
+        };
+        if flags.is_empty() || flags.starts_with('-') {
+            return None;
+        }
+        let mut flags = flags.chars().peekable();
+        while let Some(flag) = flags.next() {
+            match flag {
+                'c' if enabled => command_string = true,
+                'n' => noexec = enabled,
+                'o' if flags.peek().is_none() => {
+                    match args.next()?.as_str() {
+                        "noexec" => noexec = enabled,
+                        "errexit" | "nounset" | "pipefail" | "xtrace" | "noglob"
+                        | "noclobber" | "verbose" => {}
+                        _ => return None,
+                    }
+                }
+                'a' | 'b' | 'e' | 'f' | 'h' | 'k' | 'l' | 'm' | 'p' | 'r'
+                | 'u' | 'v' | 'x' | 'B' | 'C' | 'E' | 'H' | 'P' | 'T' => {}
+                // Interactive, dump/inspection, stdin and unknown modes are
+                // not a proof that this command string ran to completion.
+                _ => return None,
+            }
+        }
+    }
+    None
 }
 
 fn wrapper_program_index(binary: &str, args: &[String]) -> Option<usize> {
@@ -1188,10 +1226,7 @@ pub fn is_standalone_cargo_fmt_check(program: &str, args: &[String]) -> bool {
             return matches!(cargo_subcommand_index(args), Ok(Some(index)) if args[index].eq_ignore_ascii_case("fmt"))
                 && execution_mode(&binary, args, ValidationOperation::Lint) == ValidationExecutionMode::Checking;
         }
-        "bash" | "sh" => args
-            .iter()
-            .position(|arg| shell_executes_command_arg(arg))
-            .and_then(|index| args.get(index + 1).cloned()),
+        "bash" | "sh" => executing_posix_shell_script(args).map(str::to_string),
         "pwsh" | "powershell" => args
             .iter()
             .position(|arg| arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c"))
@@ -1301,20 +1336,20 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(include_str!("../../../.codex/test-runners.json")).unwrap();
         let runners: Vec<RepositoryRunner> = serde_json::from_value(config["runners"].clone()).unwrap();
         for subcommand in ["run-target", "run-gate"] {
-            let baseline = repository_argv("python", &["scripts/rust_test_runner.py", subcommand, "example"]);
+            let baseline = repository_argv("python", &["scripts/build/rust_test_runner.py", subcommand, "example"]);
             for flags in [vec!["-B"], vec!["-I", "-B", "-u"]] {
                 let mut args = flags;
-                args.extend(["scripts/rust_test_runner.py", subcommand, "example"]);
+                args.extend(["scripts/build/rust_test_runner.py", subcommand, "example"]);
                 assert_eq!(repository_argv("python", &args), baseline);
                 assert!(runners.iter().any(|runner| runner.receipt_runner.as_deref() == Some("rust_test_runner")
                     && runner.matches("python", &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>())));
             }
         }
         assert!(is_validation(&repository_argv("python", &[
-            "-B", "scripts/rust_build_status.py", "run-lane", "--", "cargo", "test",
+            "-B", "scripts/build/rust_build_status.py", "run-lane", "--", "cargo", "test",
         ])));
         assert!(!is_validation(&repository_argv("python", &[
-            "-B", "scripts/rust_test_runner.py", "run-target", "--help",
+            "-B", "scripts/build/rust_test_runner.py", "run-target", "--help",
         ])));
     }
 
@@ -1322,7 +1357,7 @@ mod tests {
     #[test]
     fn powershell_receipt_argv_preserves_paths_and_rejects_output_substitution() {
         for (script, path) in [
-            (r"python -B scripts\rust_test_runner.py run-target core_lib", r"scripts\rust_test_runner.py"),
+            (r"python -B scripts\build\rust_test_runner.py run-target core_lib", r"scripts\build\rust_test_runner.py"),
             (r"python -B 'C:\work tree\runner''s.py' run-target core_lib", r"C:\work tree\runner's.py"),
         ] {
             assert_eq!(standalone_powershell_argv(script), Some(
@@ -1345,9 +1380,9 @@ mod tests {
     #[test]
     fn repository_admission_option_preserves_trusted_validation() {
         for subcommand in ["run-target", "run-gate"] {
-            let baseline = repository_argv("python", &["scripts/rust_test_runner.py", subcommand, "example"]);
+            let baseline = repository_argv("python", &["scripts/build/rust_test_runner.py", subcommand, "example"]);
             for options in [vec!["--admission-timeout-seconds", "30"], vec!["--admission-timeout-seconds=30"]] {
-                let mut args = vec!["scripts/rust_test_runner.py"];
+                let mut args = vec!["scripts/build/rust_test_runner.py"];
                 args.extend(options);
                 args.extend([subcommand, "example"]);
                 assert_eq!(repository_argv("python", &args), baseline);
@@ -1368,7 +1403,7 @@ mod tests {
         ] {
             assert_eq!(
                 repository_argv("python", &[
-                    "-I", "scripts/rust_build_status.py", "run-lane", "--lane", "core-tests",
+                    "-I", "scripts/build/rust_build_status.py", "run-lane", "--lane", "core-tests",
                     "--", "cargo", child,
                 ]),
                 ValidationClassification::Validation {
@@ -1380,10 +1415,10 @@ mod tests {
             );
         }
         for args in [
-            vec!["scripts/rust_build_status.py", "run-lane", "--lane", "test"],
-            vec!["scripts/rust_build_status.py", "run-lane", "--", "echo", "cargo test"],
-            vec!["scripts/rust_build_status.py", "run-lane", "--", "cargo", "build"],
-            vec!["scripts/rust_build_status.py", "run-lane", "--", "cargo", "test", "--help"],
+            vec!["scripts/build/rust_build_status.py", "run-lane", "--lane", "test"],
+            vec!["scripts/build/rust_build_status.py", "run-lane", "--", "echo", "cargo test"],
+            vec!["scripts/build/rust_build_status.py", "run-lane", "--", "cargo", "build"],
+            vec!["scripts/build/rust_build_status.py", "run-lane", "--", "cargo", "test", "--help"],
         ] {
             assert!(!is_validation(&repository_argv("python", &args)), "{args:?}");
         }
@@ -1538,12 +1573,12 @@ mod tests {
             argv("just", &["core-gate", "tool-output-recovery"]),
             argv(
                 "python",
-                &["scripts/rust_test_runner.py", "run-target", "core_lib"],
+                &["scripts/build/rust_test_runner.py", "run-target", "core_lib"],
             ),
             argv(
                 "python",
                 &[
-                    "scripts/rust_test_runner.py",
+                    "scripts/build/rust_test_runner.py",
                     "--manifest",
                     "tests.toml",
                     "run-gate",
@@ -1559,9 +1594,9 @@ mod tests {
             argv("just", &["core-test-plan", "core_lib"]),
             argv(
                 "python",
-                &["scripts/rust_test_runner.py", "plan", "core_lib"],
+                &["scripts/build/rust_test_runner.py", "plan", "core_lib"],
             ),
-            argv("python", &["scripts/rust_test_runner.py", "list-targets"]),
+            argv("python", &["scripts/build/rust_test_runner.py", "list-targets"]),
             argv(
                 "python",
                 &["scripts/not_rust_test_runner.py", "run-target", "core_lib"],
@@ -1614,6 +1649,47 @@ mod tests {
                     exit_code_is_authoritative: true,
                 } if leaves == vec![ValidationCommandDescriptor { operation, mode }]
             ), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn posix_shell_modes_do_not_confuse_syntax_checks_with_execution() {
+        for program in ["sh", "bash"] {
+            for (options, executes) in [
+                (vec!["-c"], true),
+                (vec!["-lc"], true),
+                (vec!["-n", "-c"], false),
+                (vec!["-nc"], false),
+                (vec!["-cn"], false),
+                (vec!["-c", "-n"], false),
+                (vec!["-n", "+n", "-c"], true),
+                (vec!["-n", "-c", "+n"], true),
+                (vec!["-o", "noexec", "-c"], false),
+                (vec!["-o", "noexec", "+o", "noexec", "-c"], true),
+                (vec!["-n", "+n", "-n", "-c"], false),
+                (vec!["-euo", "pipefail", "-c"], true),
+                (vec!["--norc", "-c"], true),
+                (vec!["-c", "--"], true),
+                (vec!["--", "-c"], false),
+                (vec!["--help", "-c"], false),
+                (vec!["-D", "-c"], false),
+                (vec!["script.sh", "-c"], false),
+                (vec!["-o", "unsupported-mode", "-c"], false),
+            ] {
+                let mut args = options;
+                args.push("cargo fmt --check");
+                let classification = argv(program, &args);
+                assert_eq!(matches!(classification, ValidationClassification::Validation {
+                    exit_code_is_authoritative: true, ref leaves, ..
+                } if leaves.iter().all(|leaf| leaf.mode.can_prove_validation())), executes,
+                    "{program} {args:?}");
+                assert_eq!(is_standalone_cargo_fmt_check(program,
+                    &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>()), executes,
+                    "format-check consumer: {program} {args:?}");
+            }
+            assert!(matches!(argv(program, &["-c", "cargo check", "-n"]),
+                ValidationClassification::Validation { exit_code_is_authoritative: true, .. }),
+                "positional arguments do not change shell options");
         }
     }
 

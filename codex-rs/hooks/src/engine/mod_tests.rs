@@ -76,6 +76,157 @@ fn scoped_engine_for(
     }
 }
 
+fn assert_whole_hook_instruction_spill(visible: &str, original: &str) {
+    assert!(visible.contains("Hook instructions omitted in full"));
+    assert!(visible.contains("no partial instructions were admitted"));
+    assert!(!visible.contains("instruction-prefix"));
+    assert!(!visible.contains("instruction-suffix"));
+    let (_, path) = visible
+        .split_once("Full hook output saved to: ")
+        .expect("complete instructions must have a recovery source");
+    assert_eq!(fs::read(path).expect("recover hook instructions"), original.as_bytes());
+    fs::remove_file(path).expect("remove recovered test output");
+}
+
+#[tokio::test]
+async fn stop_exit_two_never_admits_truncated_instructions() {
+    for event_name in [HookEventName::Stop, HookEventName::SubagentStop] {
+        // The middle case exceeds the inline budget but not the capture limit;
+        // the final case exceeds the 1 MiB capture limit before stop parsing.
+        for padding in [0, 20_000, 1024 * 1024] {
+            let temp = tempdir().expect("tempdir");
+            let instruction = format!(
+                "instruction-prefix: finish the review. {} instruction-suffix: do not deploy.",
+                "x".repeat(padding)
+            );
+            fs::write(temp.path().join("hook-output.txt"), &instruction).expect("hook output");
+            let mut engine = scoped_engine_for(event_name, codex_config::HookRunScope::Turn);
+            #[cfg(windows)]
+            let command = "type hook-output.txt 1>&2 & exit /b 2";
+            #[cfg(not(windows))]
+            let command = "cat hook-output.txt >&2; exit 2";
+            engine.handlers[0].command = command.to_string();
+            engine.handlers[0].timeout_sec = 30;
+            let run_id = engine.handlers[0].run_id();
+            let target = if event_name == HookEventName::Stop {
+                crate::StopHookTarget::Stop
+            } else {
+                crate::StopHookTarget::SubagentStop {
+                    agent_id: "agent".to_string(),
+                    agent_type: "worker".to_string(),
+                    agent_transcript_path: None,
+                }
+            };
+            let outcome = engine
+                .run_stop(crate::StopRequest {
+                    session_id: ThreadId::new(),
+                    turn_id: "turn-1".to_string(),
+                    cwd: AbsolutePathBuf::try_from(temp.path()).expect("cwd"),
+                    transcript_path: None,
+                    model: "gpt-test".to_string(),
+                    permission_mode: "default".to_string(),
+                    stop_hook_active: false,
+                    last_assistant_message: None,
+                    target,
+                })
+                .await;
+            assert!(outcome.should_block);
+            assert!(!outcome.should_stop);
+            assert_eq!(outcome.hook_events.len(), 1);
+            let completed = &outcome.hook_events[0];
+            assert_eq!(completed.run.status, HookRunStatus::Blocked);
+            assert_eq!(completed.run.id, run_id);
+            assert_eq!(completed.run.event_name, event_name);
+            assert_eq!(outcome.continuation_fragments.len(), 1);
+            let fragment = &outcome.continuation_fragments[0];
+            assert_eq!(
+                fragment,
+                &codex_protocol::items::HookPromptFragment::from_single_hook(
+                    fragment.text.clone(),
+                    run_id,
+                )
+            );
+            if padding == 0 {
+                assert_eq!(fragment.text, instruction);
+                assert_eq!(outcome.block_reason.as_deref(), Some(instruction.as_str()));
+            } else if padding == 20_000 {
+                assert_whole_hook_instruction_spill(&fragment.text, &instruction);
+                assert_eq!(outcome.block_reason.as_deref(), Some(instruction.as_str()));
+            } else {
+                assert!(fragment.text.contains("instruction is incomplete"));
+                assert!(fragment.text.contains("entire instruction was omitted"));
+                assert!(fragment.text.contains("no complete recovery source is available"));
+                assert!(fragment.text.contains("Do not automatically replay the hook"));
+                assert!(!fragment.text.contains("instruction-prefix"));
+                assert!(!fragment.text.contains("instruction-suffix"));
+                assert!(!fragment.text.contains("Full hook output saved to:"));
+                assert!(fragment.text.len() < 1024);
+                assert_eq!(outcome.block_reason.as_deref(), Some(fragment.text.as_str()));
+            }
+            assert_eq!(
+                completed.run.entries,
+                vec![HookOutputEntry {
+                    kind: HookOutputEntryKind::Feedback,
+                    text: outcome.block_reason.expect("block reason"),
+                }]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stopped_post_tool_feedback_spills_whole_instructions() {
+    let temp = tempdir().expect("tempdir");
+    let instruction = format!(
+        "instruction-prefix: finish the review. {} instruction-suffix: do not deploy.",
+        "x".repeat(20_000)
+    );
+    // Stopped feedback prefers `reason`, which need not match the Stop entry.
+    let output = serde_json::json!({
+        "continue": false,
+        "stopReason": "display-only stop reason",
+        "reason": instruction,
+    });
+    fs::write(temp.path().join("hook-output.txt"), output.to_string()).expect("hook output");
+    let mut engine = scoped_engine_for(HookEventName::PostToolUse, codex_config::HookRunScope::Turn);
+    #[cfg(windows)]
+    let command = "type hook-output.txt & exit /b 0";
+    #[cfg(not(windows))]
+    let command = "cat hook-output.txt; exit 0";
+    engine.handlers[0].command = command.to_string();
+    engine.handlers[0].timeout_sec = 30;
+    let request = crate::PostToolUseRequest {
+        session_id: ThreadId::new(),
+        turn_id: "turn-1".to_string(),
+        subagent: None,
+        cwd: AbsolutePathBuf::try_from(temp.path()).expect("cwd"),
+        transcript_path: None,
+        model: "gpt-test".to_string(),
+        permission_mode: "default".to_string(),
+        tool_name: "Bash".to_string(),
+        matcher_aliases: Vec::new(),
+        tool_use_id: "tool-1".to_string(),
+        tool_input: serde_json::json!({}),
+        tool_response: serde_json::json!({}),
+    };
+    let plan = engine.plan_post_tool_use(&request.tool_name, &request.matcher_aliases);
+    let outcome = engine.run_planned_post_tool_use(plan, request).await;
+    assert_eq!(outcome.hook_events.len(), 1);
+    assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Stopped);
+    assert!(!outcome.should_block);
+    assert_eq!(
+        outcome.hook_events[0].run.entries,
+        vec![HookOutputEntry {
+            kind: HookOutputEntryKind::Stop,
+            text: "display-only stop reason".to_string(),
+        }]
+    );
+    assert_whole_hook_instruction_spill(
+        outcome.feedback_message.as_deref().expect("model feedback"),
+        &instruction,
+    );
+}
+
 fn scoped_request(session_id: ThreadId, turn_id: &str, tool_use_id: &str) -> PreToolUseRequest {
     PreToolUseRequest {
         session_id,

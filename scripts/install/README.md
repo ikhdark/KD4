@@ -1,6 +1,6 @@
 # Install Scripts
 
-Agent workflow rules for this directory live in `AGENTS.md`. This README is a
+Repository instructions live in the root [AGENTS.md](../../AGENTS.md). This README is a
 human-facing overview of the installer surface.
 
 ## Overview

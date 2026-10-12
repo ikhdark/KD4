@@ -17,12 +17,12 @@ from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from codex_package import dotslash
-from codex_package.dotslash import DotSlashArtifact
-from codex_package.targets import TARGET_SPECS
-from scripts.process_owner import operation
+from scripts.codex_package import dotslash
+from scripts.codex_package.dotslash import DotSlashArtifact
+from scripts.codex_package.targets import TARGET_SPECS
+from scripts.common.process_owner import operation
 
 
 class DotSlashCacheStampTest(unittest.TestCase):

@@ -1334,6 +1334,14 @@ impl ToolOutput for ExecCommandToolOutput {
             validation: Option<JsonValue>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             pending_deferred_completions: Vec<String>,
+            // A printed result names these scopes in place of `output_reduced`
+            // and `streams_complete`. They are real fields, last and in display
+            // order, so a script can branch on the names the model was shown.
+            current_chunk_display_complete: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cumulative_streams_complete: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retained_artifact_complete: Option<bool>,
         }
 
         let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) =
@@ -1369,7 +1377,8 @@ impl ToolOutput for ExecCommandToolOutput {
         let output_reduced = model_output.reduced;
         let output = model_output.text;
         let recovery_selector = self.missing_output_selector(
-            &raw_output, &output, model_output.first_omitted_lines, raw_output_artifact_bytes,
+            &raw_output, &output, model_output.first_omitted_lines, model_output.ranked_excerpt,
+            raw_output_artifact_bytes,
         );
 
         // Exact programmatic access does not inherit the display-token budget.
@@ -1393,7 +1402,19 @@ impl ToolOutput for ExecCommandToolOutput {
         let (stdout, stderr) = streams
             .map(|(stdout, stderr)| (Some(stdout), Some(stderr)))
             .unwrap_or_default();
+        let raw_output_artifact_retention_limit_hit = self
+            .raw_output_artifact
+            .as_ref()
+            .is_some_and(RawOutputArtifact::retention_limit_hit);
         let result = UnifiedExecCodeModeResult {
+            current_chunk_display_complete: !output_reduced,
+            cumulative_streams_complete: streams_complete,
+            retained_artifact_complete: raw_output_artifact_id.as_ref().map(|_| {
+                self.process_exited
+                    && self.process_id.is_none()
+                    && raw_output_artifact_error.is_none()
+                    && !raw_output_artifact_retention_limit_hit
+            }),
             recovery: raw_output_artifact_id.as_ref().zip(recovery_selector.as_ref())
                 .map(|(artifact_id, selector)| serde_json::json!({
                     "tool":"read_tool_output", "arguments": {
@@ -1424,10 +1445,7 @@ impl ToolOutput for ExecCommandToolOutput {
             raw_output_artifact_id,
             raw_output_artifact_bytes,
             raw_output_artifact_error,
-            raw_output_artifact_retention_limit_hit: self
-                .raw_output_artifact
-                .as_ref()
-                .is_some_and(RawOutputArtifact::retention_limit_hit),
+            raw_output_artifact_retention_limit_hit,
             raw_output_artifact_retention_limit_reason: self
                 .raw_output_artifact
                 .as_ref()
@@ -1959,6 +1977,7 @@ impl ExecCommandToolOutput {
         raw_output: &str,
         output: &str,
         marked_lines: Option<(usize, usize)>,
+        ranked_excerpt: bool,
         artifact_bytes: Option<u64>,
     ) -> Option<JsonValue> {
         let retained = artifact_bytes?;
@@ -1979,8 +1998,11 @@ impl ExecCommandToolOutput {
                 || std::str::from_utf8(&self.raw_output).is_err() {
                 return None;
             }
-            let (start_line, end_line) = marked_lines.or_else(||
-                codex_utils_output_truncation::first_omitted_line_range(raw_output, output))?;
+            // The first line a ranked excerpt skips is the unselected head, not
+            // omitted evidence; offer only the group the summary itself names.
+            let (start_line, end_line) = marked_lines.or_else(|| if ranked_excerpt { None } else {
+                codex_utils_output_truncation::first_omitted_line_range(raw_output, output)
+            })?;
             if ranges.range.start == 0 && ranges.range.end == retained {
                 return Some(serde_json::json!({"kind":"lines", "start":start_line, "end":end_line}));
             }
@@ -2340,6 +2362,9 @@ impl ExecCommandToolOutput {
             .as_ref()
             .and_then(RawOutputArtifact::retained_bytes)
             .is_some_and(|bytes| bytes > source_bytes);
+        let line_summary = summarized
+            .as_deref()
+            .and_then(crate::tools::shell_output_summary::line_summary_omitted_group);
         let (truncated, first_omitted_lines) = match summarized.as_deref() {
             // These coordinates are chunk-relative. The output owner translates
             // them before exposing a cumulative artifact recovery selector.
@@ -2350,7 +2375,7 @@ impl ExecCommandToolOutput {
             }
             content => (
                 formatted_truncate_text_with_output_limit(content.unwrap_or(raw_output), limits),
-                None,
+                line_summary.flatten(),
             ),
         };
         let was_truncated = truncated.was_truncated;
@@ -2382,6 +2407,7 @@ impl ExecCommandToolOutput {
                 || (self.output_ranges.is_none() && !raw_output.is_empty() && artifact_has_more_bytes),
             text: projected_text,
             first_omitted_lines,
+            ranked_excerpt: line_summary.is_some(),
         }
     }
 
@@ -2416,7 +2442,7 @@ impl ExecCommandToolOutput {
         {
             fields.insert("artifact_id".into(), id.to_string().into());
             if let Some(selector) = self.missing_output_selector(
-                raw_output, &projected.text, projected.first_omitted_lines,
+                raw_output, &projected.text, projected.first_omitted_lines, projected.ranked_excerpt,
                 self.raw_output_artifact.as_ref().and_then(RawOutputArtifact::retained_bytes),
             ) {
                 fields.insert("recovery_selector".into(), selector.clone());
@@ -2505,6 +2531,8 @@ struct ProjectedModelOutput {
     reduced: bool,
     /// Bounded first run the text's line markers report omitted from the raw output.
     first_omitted_lines: Option<(usize, usize)>,
+    /// The text is a line summary: selected lines in ranked, not contiguous, order.
+    ranked_excerpt: bool,
 }
 
 fn function_tool_response(

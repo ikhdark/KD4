@@ -7,6 +7,10 @@ mod full_suite;
 pub(crate) use full_suite::FullSuiteBudget;
 pub(crate) use full_suite::check_full_suite_command;
 
+#[path = "managed_cargo_lane.rs"]
+mod managed_cargo_lane;
+pub(crate) use managed_cargo_lane::check_managed_cargo_lane;
+
 use super::command_search::rg_search_path_operands;
 use super::command_search::rg_search_path_indices;
 use crate::shell::ShellType;
@@ -153,17 +157,16 @@ impl CommandPreflightRetry {
     fn render_for_model(&self) -> String {
         match self {
             Self::Argv { program, args } => format!(
-                "kind: \"argv\", program: {}, args: [{}]",
+                "program: {}, args: [{}]",
                 json_string(program),
                 args.iter()
                     .map(|arg| json_string(arg))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::PowerShellScript { script_body } => format!(
-                "kind: \"powershell_script\", script_body: {}",
-                json_string(script_body)
-            ),
+            Self::PowerShellScript { script_body } => {
+                format!("script_body: {}", json_string(script_body))
+            }
         }
     }
 }

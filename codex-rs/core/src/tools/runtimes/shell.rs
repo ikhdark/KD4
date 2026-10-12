@@ -290,7 +290,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             Some(root) => {
                 let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
                 let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
-                Some(crate::workspace_operation_gate::acquire_workspace_validation(root).await)
+                Some(crate::workspace_operation_gate::acquire_workspace_validation(root, &req.hook_command)
+                    .await.map_err(ToolError::Rejected)?)
             }
             None => None,
         };
@@ -328,6 +329,14 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             proof_cwd: Some(req.cwd.as_path()),
         })
         .await;
+
+        if ctx.turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
+            && !req.turn_environment.environment.is_remote()
+        {
+            crate::tools::handlers::command_preflight::check_managed_cargo_lane(
+                &req.command_for_approval, req.cwd.as_path(), &env,
+            ).await.map_err(ToolError::Rejected)?;
+        }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(
             shell_snapshot_location.as_deref(),

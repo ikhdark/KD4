@@ -236,6 +236,27 @@ async fn listing_does_not_follow_directory_symlinks() {
 }
 
 #[tokio::test]
+async fn listing_unreadable_file_link_preserves_siblings_without_claiming_complete() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("ordinary.txt"), "ordinary").unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(root.path().join("missing"), root.path().join("dangling")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.path().join("missing"), root.path().join("dangling")).unwrap();
+    let call = invocation(root.path(), json!({
+        "path": ".", "max_depth": 0, "max_entries": 10, "include_hidden": true,
+    })).await;
+    let payload = call.payload.clone();
+    let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+    assert_eq!(output["complete"], false, "unreadable entries do not prove absence");
+    assert_eq!(output["truncated"], false, "this is a metadata failure, not a budget cutoff");
+    assert_eq!(output["entries"], json!([{"path":"ordinary.txt", "kind":"file"}]));
+    assert_eq!(output["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(output["errors"][0]["path"], "dangling");
+    assert!(!output["errors"][0]["message"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode() {
     let root = tempfile::tempdir().unwrap();
     for dir in ["src", "target", ".hidden"] { std::fs::create_dir(root.path().join(dir)).unwrap(); }

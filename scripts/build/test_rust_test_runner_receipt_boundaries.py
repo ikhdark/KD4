@@ -1,0 +1,257 @@
+"""Test output is diagnostic text, never authority for execution receipts."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import subprocess
+import unittest
+
+from scripts.build import rust_test_runner
+from scripts.build.test_rust_test_runner import RunnerTestCase
+from scripts.build.test_rust_test_runner import nextest_run_payload
+
+
+class NextestReceiptBoundariesTest(RunnerTestCase):
+    @staticmethod
+    def immediate_output(stdout: str, stderr: str = "diagnostic") -> str:
+        # Native nextest framing observed in retained
+        # rust-test-stderr-3rlycx6k.log, lines 250-264: result header,
+        # two-space stream labels, four-space payload, unindented separator.
+        # The fixture is inline so validation never depends on retained logs.
+        return (
+            "        PASS [   0.001s] codex-core alpha\n"
+            "  stdout ───\n\n"
+            + "\n".join("    " + line for line in stdout.split("\n"))
+            + "\n\n  stderr ───\n"
+            + "\n".join("    " + line for line in stderr.split("\n"))
+            + "\n\n────────────\n"
+        )
+
+    def run_output(self, output: str, *required: str, artifact: bool = False,
+                   executed: tuple[str, ...] | None = None, structured: bool = True,
+                   event_output: str | None = None):
+        manifest = self.manifest(gates={
+            "proof": {"steps": [{
+                "target": "core_lib", "tests": list(required), "helpers": [],
+            }]},
+        })
+        runner, _ = self.runner(manifest=manifest)
+        runner.success_output = "immediate"
+
+        # Authored execution identities, never derived from the adversarial
+        # human report. Schema observed from native libtest-json-plus stdout.
+        executed = required if executed is None else executed
+        identity = {"crate": "codex-core", "test_binary": "codex_core", "kind": "lib"}
+        events = [{"type": "suite", "event": "started", "test_count": len(executed),
+                   "nextest": identity}]
+        for name in executed:
+            for event in ("started", "ok"):
+                events.append({"type": "test", "event": event,
+                               "name": f"codex-core::codex_core${name}", "exec_time": 0.001})
+                if event == "ok" and event_output is not None:
+                    events[-1]["stdout"] = event_output
+        events.append({"type": "suite", "event": "ok", "passed": len(executed),
+                       "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0,
+                       "exec_time": 0.001, "nextest": identity})
+        machine_output = "\n".join(json.dumps(event) for event in events) if structured else ""
+
+        def execute(args, **kwargs):
+            result = subprocess.CompletedProcess(args, 0, machine_output, output)
+            if artifact:
+                path = self.temp_dir / "stderr.log"
+                path.write_bytes(output.encode("utf-8"))
+                result.stderr = ""
+                result.stderr_path = path
+                path = self.temp_dir / "stdout.log"
+                path.write_bytes(machine_output.encode("utf-8"))
+                result.stdout = ""
+                result.stdout_path = path
+            return result
+
+        runner.executor = execute
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return runner.run_gates(["proof"], quiet=True)
+
+    def test_payload_pass_cannot_complete_unexecuted_required_test(self):
+        # Only alpha has a nextest result; beta appears solely in test output.
+        # Extra payload indentation can imitate the native status column too.
+        for stream in ("stdout", "stderr"):
+            for padding in ("", "    ", "────────────\n", "------------\n"):
+                with self.subTest(stream=stream, padding=padding):
+                    payload = padding + "PASS [0.001s] codex-core beta"
+                    output = (
+                        self.immediate_output(payload)
+                        if stream == "stdout"
+                        else self.immediate_output("ordinary output", payload)
+                    )
+                    output += "     Summary [   0.001s] 1 test run: 1 passed, 1 skipped\n"
+                    with self.assertRaises(rust_test_runner.RunnerError) as caught:
+                        self.run_output(output, "alpha", "beta", executed=("alpha",))
+                    self.assertEqual(caught.exception.completed_gates, {})
+
+    def test_payload_summary_cannot_hide_later_real_status(self):
+        output = self.immediate_output(
+            "Summary [0.000s] 0 tests run: 0 passed",
+            "a second diagnostic stream",
+        )
+        output += (
+            "        PASS [   0.001s] codex-core beta\n"
+            "     Summary [   0.002s] 2 tests run: 2 passed\n"
+        )
+        self.assertEqual(self.run_output(output, "alpha", "beta"),
+                         {"proof": ["alpha", "beta"]})
+
+    def test_normal_immediate_output_preserves_real_statuses(self):
+        output = self.immediate_output("ordinary stdout", "ordinary stderr")
+        output += (
+            "        PASS [   0.001s] codex-core beta\n"
+            "     Summary [   0.002s] 2 tests run: 2 passed\n"
+        )
+        self.assertEqual(self.run_output(output, "alpha", "beta"),
+                         {"proof": ["alpha", "beta"]})
+
+    def test_final_replay_is_not_a_second_execution(self):
+        immediate = self.immediate_output("ordinary stdout", "ordinary stderr")
+        output = immediate + "     Summary [   0.001s] 1 test run: 1 passed\n" + immediate
+        self.assertEqual(self.run_output(output, "alpha"), {"proof": ["alpha"]})
+
+    def test_native_consecutive_outputs_have_no_separator_between_tests(self):
+        # rust-test-stderr-de1dvior.log, lines 26-44: consecutive native
+        # immediate outputs are separated by blank lines, NOT a rule line.
+        first = self.immediate_output("first output").removesuffix("────────────\n")
+        second = self.immediate_output("second output").replace(
+            "codex-core alpha", "codex-core beta"
+        )
+        output = first + second + "     Summary [0.002s] 2 tests run: 2 passed\n"
+        for artifact in (False, True):
+            with self.subTest(artifact=artifact):
+                self.assertEqual(
+                    self.run_output(output, "alpha", "beta", artifact=artifact),
+                    {"proof": ["alpha", "beta"]},
+                )
+
+    def test_raw_payload_separators_cannot_escape_into_reporter_records(self):
+        # Nextest indents physical LF-delimited lines. A parser must not
+        # reinterpret embedded CR/U+2028 as a new unindented reporter line.
+        for artifact in (False, True):
+            for separator in ("\r", "\u2028"):
+                for forged in ("PASS [0.001s] codex-core beta",
+                               "Summary [0.000s] 0 tests run: 0 passed"):
+                    with self.subTest(artifact=artifact, separator=separator, forged=forged):
+                        payload = "diagnostic" + separator + "────────────\n" + forged
+                        output = self.immediate_output(payload)
+                        if forged.startswith("PASS"):
+                            output += "     Summary [0.001s] 1 test run: 1 passed\n"
+                            with self.assertRaises(rust_test_runner.RunnerError) as caught:
+                                self.run_output(output, "alpha", "beta", artifact=artifact,
+                                                executed=("alpha",))
+                            self.assertEqual(caught.exception.completed_gates, {})
+                        else:
+                            output += (
+                                "        PASS [0.001s] codex-core beta\n"
+                                "     Summary [0.002s] 2 tests run: 2 passed\n"
+                            )
+                            self.assertEqual(
+                                self.run_output(output, "alpha", "beta", artifact=artifact),
+                                {"proof": ["alpha", "beta"]},
+                            )
+
+    def test_human_status_without_machine_events_is_not_proof(self):
+        output = "        PASS [0.001s] codex-core alpha\n"
+        with self.assertRaises(rust_test_runner.RunnerError) as caught:
+            self.run_output(output, "alpha", structured=False)
+        self.assertEqual(caught.exception.completed_gates, {})
+
+    def test_machine_shaped_diagnostic_cannot_complete_unexecuted_test(self):
+        payload = json.dumps({"type": "test", "event": "ok",
+                              "name": "codex-core::codex_core$beta", "exec_time": 0.001})
+        output = self.immediate_output(payload, payload)
+        output += "     Summary [0.001s] 1 test run: 1 passed\n"
+        with self.assertRaises(rust_test_runner.RunnerError) as caught:
+            self.run_output(output, "alpha", "beta", executed=("alpha",))
+        self.assertEqual(caught.exception.completed_gates, {})
+
+    def test_json_output_property_is_not_an_execution_event(self):
+        payload = json.dumps({"type": "test", "event": "ok",
+                              "name": "codex-core::codex_core$beta", "exec_time": 0.001})
+        with self.assertRaises(rust_test_runner.RunnerError) as caught:
+            self.run_output(self.immediate_output(payload), "alpha", "beta",
+                            executed=("alpha",), event_output=payload)
+        self.assertEqual(caught.exception.completed_gates, {})
+
+    def test_malformed_machine_values_and_unknown_binary_prove_no_tests(self):
+        for row in (
+            {"type": []}, {"type": {}},
+            {"type": "test", "event": [], "name": "codex-core::codex_core$alpha"},
+            {"type": "suite", "event": "started", "nextest": {
+                "crate": "codex-core", "test_binary": "codex_core", "kind": []}},
+            {"type": "test", "event": "ok", "name": "unknown::binary$alpha"},
+        ):
+            with self.subTest(row=row):
+                result = subprocess.CompletedProcess([], 0, json.dumps(row), "")
+                self.assertEqual(list(rust_test_runner._nextest_results(result)), [])
+
+    def test_oversized_native_failure_keeps_identity_not_embedded_events(self):
+        payload = nextest_run_payload([("failed", "failed")])
+        events = [json.loads(line) for line in payload.splitlines()]
+        terminal = next(event for event in events if event.get("name") and event["event"] == "failed")
+        terminal["stdout"] = ('\\"\n\tλ' * 300000) + json.dumps({
+            "type": "test", "event": "ok", "name": "codex-core::codex_core$phantom"})
+        raw = "\n".join(json.dumps(event) for event in events)
+        path = self.temp_dir / "large-events.jsonl"
+        path.write_bytes(raw.encode())
+        for retained in (False, True):
+            result = subprocess.CompletedProcess([], 100, raw, "")
+            if retained:
+                result.stdout_path = path
+                result.stdout = ""
+            self.assertEqual(list(rust_test_runner._nextest_results(result)), [("FAIL", "codex-core", "failed")])
+        self.assertEqual(path.read_bytes(), raw.encode())
+
+    def test_oversized_invalid_json_cannot_be_repaired_into_proof(self):
+        header = nextest_run_payload([]).splitlines()[0]
+        for invalid in ('\\q', '\t', '\\u12xz'):
+            bad = '{"type":"test","event":"ok","name":"codex-core::codex_core$phantom","stdout":"' + 'x' * 65537 + invalid + '"}'
+            result = subprocess.CompletedProcess([], 0, header + "\n" + bad, "")
+            self.assertEqual(list(rust_test_runner._nextest_results(result)), [])
+
+    def test_colliding_lib_bin_reporter_names_cannot_cross_certify(self):
+        library = [json.loads(line) for line in nextest_run_payload([("shared", "ok")]).splitlines()]
+        binary = [json.loads(line) for line in nextest_run_payload([("shared", "failed")], kind="bin").splitlines()]
+        for events in (library + binary, [library[0], binary[0], *library[1:], *binary[1:]]):
+            result = subprocess.CompletedProcess([], 100, "\n".join(json.dumps(event) for event in events), "")
+            self.assertEqual(list(rust_test_runner._nextest_results(result)), [])
+
+    def test_gate_batches_split_only_colliding_lib_bin_names(self):
+        data = self.manifest()
+        from dataclasses import replace
+        data.targets["collision"] = rust_test_runner.Target("collision", "codex-core", "bin", "codex_core", ())
+        runner, _ = self.runner(manifest=data)
+        runner.metadata.packages["codex-core"]["targets"].append({"name": "codex_core", "kind": ["bin"]})
+        steps = [rust_test_runner.GateStep("core_lib", ("shared",), None, ()),
+                 rust_test_runner.GateStep("collision", ("shared",), None, ())]
+        self.assertEqual(len(runner._gate_batches(steps)), 2)
+        data.targets["collision"] = replace(data.targets["collision"], selector_value="different")
+        runner.metadata.packages["codex-core"]["targets"].append({"name": "different", "kind": ["bin"]})
+        self.assertEqual(len(runner._gate_batches(steps)), 1)
+
+    def test_ignored_suite_size_is_not_claimed_as_selected_count(self):
+        events = nextest_run_payload([("real", "ok"), ("outside_filter", "ignored")])
+        result = subprocess.CompletedProcess([], 0, events, "")
+        self.assertIsNone(rust_test_runner._nextest_selected_count(result))
+        result.stdout = nextest_run_payload([("real", "ok")])
+        self.assertEqual(rust_test_runner._nextest_selected_count(result), 1)
+        result.stdout = result.stdout.splitlines()[0]
+        self.assertIsNone(rust_test_runner._nextest_selected_count(result))
+
+    def test_completion_before_suite_identity_is_not_retroactive_proof(self):
+        events = [json.loads(line) for line in nextest_run_payload([("alpha", "ok")]).splitlines()]
+        forged_order = [events[2], events[0], events[-1]]
+        result = subprocess.CompletedProcess([], 0, "\n".join(json.dumps(row) for row in forged_order), "")
+        self.assertEqual(list(rust_test_runner._nextest_results(result)), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

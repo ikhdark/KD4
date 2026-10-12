@@ -64,7 +64,8 @@ fn control_character_error_completion_bounds_the_rendered_envelope() {
     let message = format_inter_agent_completion_message(
         AgentPath::root(),
         AgentPath::try_from("/root/worker").expect("valid agent path"),
-        &AgentStatus::Errored("\0".repeat(10_000)),
+        // Large enough to exceed the completion ceiling before any escaping.
+        &AgentStatus::Errored("\0".repeat(COMPLETION_MESSAGE_MAX_TOKENS * 10)),
         None,
     )
     .expect("error status should produce a completion message");

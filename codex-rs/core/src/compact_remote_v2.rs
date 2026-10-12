@@ -572,6 +572,7 @@ async fn prepare_v2_retained_input(
         crate::compact::persist_task_compaction_text_recovery(sess, prompt_input, omitted_text)
             .await?
     {
+        crate::compact::bind_omission_receipts_to_recovery(&mut retained_input, &text);
         retained_input.push(crate::compact::compaction_context_message(text));
     }
     if let Some(plan) = crate::compact::retained_plan_context(sess).await? {
@@ -1343,6 +1344,8 @@ mod tests {
                 "retained_tokens": retained_tokens,
                 "omitted_tokens": original_tokens - retained_tokens,
                 "unresolved": true,
+                // Bound to the recovery artifact once one is persisted; this helper builds none.
+                "artifact_id": null,
             })
         );
         assert_eq!(history[2], output);

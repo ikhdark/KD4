@@ -251,7 +251,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
-        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for informational updates that need no new turn; ask for clarification when needed."
+        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for informational updates that need no new turn; ask for clarification when needed. A typed (`assignment`) agent accepts a follow-up only while its attempt is active; once its receipt is sealed, spawn a new assignment instead."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -301,7 +301,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update or durable typed-task progress. Omit cursor to receive new assignment, gate, receipt, lease, and progress deltas using the caller's automatically retained position. These updates do not establish current workspace freshness. Set an explicit cursor only to replay from that position. Does not return the content; returns either a summary of which agents have updates (if any), typed-task deltas, an interruption summary, or a timeout summary. The wait also ends early when new user input is steered into the active turn."
+        description: "Wait for the next mailbox update or durable typed-task progress. Returns at the first event, not when agents finish: a result that reports only the admission of your own spawn is not progress, so wait again in the same cell. Omit cursor to receive new assignment, gate, receipt, lease, and progress deltas using the caller's automatically retained position; set an explicit cursor only to replay from that position. Does not return the content: a finished agent's answer arrives as a message on your next request. The wait also ends early when new user input is steered into the active turn."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -538,7 +538,7 @@ fn list_agents_output_schema() -> Value {
                     "type": "object",
                     "additionalProperties": true
                 },
-                "description": "Durable typed-task status including workspace identity and strategy, progress, lease, pending gates, stale reason, and next action. Workspace freshness is not tracked; legacy epoch values do not establish freshness."
+                "description": "Durable typed-task status including workspace identity and strategy, progress, lease, pending gates, stale reason, and next action."
             }
         },
         "required": ["agents", "typed_tasks"],
@@ -734,7 +734,7 @@ fn spawn_agent_common_properties_v2(
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Plain-text task admitted with a durable repository-wide diagnostic claim. Claims record coordination risk but do not block overlapping work."
+                "Complete, self-contained task. The new agent sees none of this conversation unless `fork_turns` is set, so include the paths, facts and stop condition it needs. Admitted with a repository-wide diagnostic claim that records coordination risk without blocking overlapping work."
                     .to_string(),
             ))
             .with_encrypted(),
@@ -954,7 +954,7 @@ fn typed_assignment_schema() -> JsonSchema {
             ),
             (
                 "required_evidence".to_string(),
-                string_array("Producer-verified evidence required in a completed receipt. Use inspect:<normalized repository-relative file> to require a complete native read_file source_inspection receipt; this proves inspection, not tests, semantic correctness, or current workspace freshness."),
+                string_array("Evidence the host must have recorded before a `completed` receipt is accepted. Each entry must be `inspect:<normalized repository-relative file>`: the agent satisfies it by reading that whole file with native read_file, and no other form is ever recorded, so any other entry blocks completion. It proves inspection, not tests, semantic correctness, or current workspace freshness."),
             ),
             (
                 "prohibited_changes".to_string(),
@@ -981,7 +981,7 @@ fn typed_assignment_schema() -> JsonSchema {
                 JsonSchema::string_enum(
                     vec![json!("auto"), json!("shared"), json!("isolated")],
                     Some(
-                        "Use shared for the common workspace, including coordinated overlap, and isolated for deliberate competing implementations."
+                        "Use shared (what auto selects) for the common workspace, including coordinated overlap, and isolated for deliberate competing implementations."
                             .to_string(),
                     ),
                 ),
@@ -1001,7 +1001,7 @@ fn typed_assignment_schema() -> JsonSchema {
         Some(false.into()),
     );
     schema.description = Some(
-        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type: architect, explorer, worker, reviewer, verifier, or integrator. Role requirements: architect/explorer need non-empty read_scope and empty required_evidence; worker needs non-empty write_scope and required_evidence; reviewer needs empty required_evidence; verifier/integrator need non-empty required_evidence. With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
+        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type: architect, explorer, worker, reviewer, verifier, or integrator. Role requirements: architect/explorer need non-empty read_scope and empty required_evidence; worker needs non-empty write_scope and required_evidence; reviewer needs empty required_evidence; verifier/integrator need non-empty required_evidence. Architect, explorer, reviewer and verifier need an empty write_scope; integrator needs a non-empty one. Architect, explorer and worker declare no relation; reviewer needs a review relation and verifier a verification relation with exactly one target that is also in dependencies; integrator needs an integration relation whose distinct targets are all in dependencies. With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
             .to_string(),
     );
     schema
@@ -1099,17 +1099,15 @@ fn spawn_agent_tool_description_v2(
         {agent_role_guidance}
         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
-The spawned agent receives a durable task binding. Explicitly typed agents cannot spawn additional subagents; compatibility `message` agents may delegate another compatibility task, which remains bound to its parent while overlap is recorded as advisory metadata.
+The spawned agent receives a durable task binding.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
-Spawn only when the active multi-agent mode authorizes it.
 Before delegating, identify useful work to do locally. Keep immediately blocking work local, give each agent a clear scope, and avoid duplicating delegated work. Review and integrate returned changes before treating the subtask as complete.
 Read every returned report in full, recovering omitted portions from retained output. Account for every substantive finding, including read-only reviews: implement and verify it, reject it with evidence, identify it as outside the user's scope, or keep it unresolved with a next action or blocker. Investigate unresolved in-scope findings before finalizing; partial fixes or an honest disclaimer do not discharge obtainable work. Respect review-only/no-write scope and do not blindly implement recommendations.
 When implementation is authorized, implement verified, applicable, in-scope suggestions and validate the resulting behavior through affected consumers. Do not stop at acknowledging them, listing them in a plan, or describing future work; do not ask for renewed permission to perform already-authorized changes. If current behavior already satisfies a suggestion, record the evidence instead of making unnecessary edits.
 Launch authorized independent assignments in the same batch rather than awaiting each spawn in a loop. In exec, use Promise.allSettled for a bounded batch and retain every success and failure before proceeding; a failed sibling does not authorize respawning successful agents.
 Sequence only real dependencies or shared-resource conflicts. Do not add a model round merely to acknowledge a completed agent; integrate its result with the next substantive step or final response.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
-The new agent's canonical task name will be provided to it along with the message.
 Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted with a repository-wide diagnostic claim; exactly one is required. Both forms are durably admitted, record overlap without rejecting it, and return an `assignment_id`. Typed assignments require an explicit built-in `agent_type`: `architect`, `explorer`, `worker`, `reviewer`, `verifier`, or `integrator`.
 
     {full_history_override_guidance}
@@ -1235,7 +1233,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
             "timeout_ms".to_string(),
             JsonSchema {
                 ..JsonSchema::integer(Some(format!(
-                    "Explicit caller deadline in milliseconds. Omit to keep waiting; the default {} ms interval is internal maintenance cadence only and does not return an unchanged result. Values below {} use that normal wait; values above {} are capped. Use list_agents or get_agent_task for an immediate status snapshot.",
+                    "Explicit caller deadline in milliseconds. Omit to keep waiting; the default {} ms interval is internal maintenance cadence only and does not return an unchanged result. Values below {} are ignored and wait without a deadline; values above {} are capped. Use list_agents or get_agent_task for an immediate status snapshot.",
                     options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
                 )))
             },

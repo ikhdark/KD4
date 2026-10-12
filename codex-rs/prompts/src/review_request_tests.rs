@@ -89,7 +89,7 @@ fn review_rubric_stays_compact_without_losing_output_contracts() {
         "including code outside the diff",
         "generated artifacts, schemas, and required source maps",
         "relevant tests assert the expected behavior and could catch a plausible regression",
-        "build and test results with their scope and freshness",
+        "This session is read-only",
         "do not treat missing validation evidence alone as a demonstrated defect",
         "Missing requested behavior and violations of preserved invariants qualify",
         "cite the affected callers or contracts in the body",

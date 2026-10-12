@@ -354,18 +354,19 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         ctx: &ToolCtx,
     ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
         // Serialize validations with legacy shell validation, never with patches.
-        // This only queues known noninteractive validation, not arbitrary
-        // long-lived servers or opaque scripts. Admission precedes process
-        // creation, so a tool's own execution timeout cannot expire in Cargo's
-        // build-lock queue behind another harness validation.
+        // Reject busy admission before process creation instead of hiding an
+        // unbounded wait before the caller can receive a resumable handle.
+        // Arbitrary long-lived servers and opaque scripts do not use this gate.
         let pending_spawns = if !req.tty && validation_workspace_required(&req.command_for_approval) {
             let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
             let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
             let permit = crate::workspace_operation_gate::acquire_validation_operation(
                 &req.turn_environment.environment,
                 &req.cwd,
+                &req.hook_command,
             )
-            .await;
+            .await
+            .map_err(ToolError::Rejected)?;
             self.pending_spawns.with_workspace_operation(permit)
         } else {
             self.pending_spawns.clone()
@@ -452,6 +453,15 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             proof_cwd: req.normalization_cwd.as_deref(),
         })
         .await;
+
+        if ctx.turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
+            && !req.turn_environment.environment.is_remote()
+            && let Some(cwd) = native_cwd.as_ref()
+        {
+            crate::tools::handlers::command_preflight::check_managed_cargo_lane(
+                &req.command_for_approval, cwd.as_path(), &env,
+            ).await.map_err(ToolError::Rejected)?;
+        }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(
             shell_snapshot_location.as_deref(),
@@ -560,6 +570,135 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn busy_validation_returns_before_launch_without_waiting_for_owner() {
+        let temp = tempdir().unwrap();
+        let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        let cwd = PathUri::from_abs_path(&root);
+        let owner_command = "cargo test -p held-validation";
+        let owner = crate::workspace_operation_gate::acquire_workspace_validation(&root, owner_command).await.unwrap();
+        let manager = UnifiedExecProcessManager::default();
+        let mut runtime = UnifiedExecRuntime::new(&manager);
+        let mut request = test_request(
+            SandboxPermissions::UseDefault,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+        );
+        // The actual command must never reach setup or spawning while busy.
+        request.command = vec!["must-not-launch-validation-fixture".into()];
+        request.command_for_approval = vec!["cargo".into(), "test".into()];
+        request.cwd = cwd.clone();
+        request.sandbox_cwd = cwd.clone();
+        request.turn_environment = test_turn_environment(cwd.clone());
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        // Dispatch must reach admission rather than wait for an approval that
+        // this fixture has no user/event consumer to answer.
+        turn.approval_policy.set(codex_protocol::protocol::AskForApproval::Never).unwrap();
+        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        Arc::make_mut(&mut turn.config).cwd = root.clone();
+        turn.environments.turn_environments = vec![test_turn_environment(cwd.clone())];
+        let ctx = ToolCtx {
+            session: Arc::new(session),
+            turn: Arc::new(turn),
+            call_id: "busy-validation".into(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+        };
+        let permissions = codex_protocol::models::PermissionProfile::Disabled;
+        let attempt = SandboxAttempt {
+            codex_home: &root,
+            sandbox: codex_sandboxing::SandboxType::None,
+            sandbox_requested: false,
+            permissions: &permissions,
+            exec_server_permissions: &permissions,
+            enforce_managed_network: false,
+            sandbox_cwd: &cwd,
+            workspace_roots: std::slice::from_ref(&root),
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+            windows_sandbox_private_desktop: false,
+            network_denial_cancellation_token: None,
+            network_proxy: None,
+        };
+        let (result, observed) = test_observation::observe(tokio::time::timeout(
+            Duration::from_secs(1), runtime.run(&request, &attempt, &ctx),
+        )).await;
+        let result = result.expect("busy admission must not wait for the held owner");
+        assert!(matches!(result, Err(ToolError::Rejected(message))
+            if message.contains("No process was started or queued")
+                && message.contains(owner_command)
+                && message.contains("held for ")
+                && message.contains("This validation did not run")));
+        assert_eq!(observed.process_launches, 0);
+        // Exercise the real dispatch/error conversion and validation ledger,
+        // not a synthetic success=false result constructed by this test.
+        use crate::session::step_context::StepContext;
+        use crate::session::turn_execution::SamplingRequestSettledState;
+        use crate::session::turn_execution::TurnExecutionControl;
+        use crate::tools::context::ToolPayload;
+        use crate::tools::parallel::ToolCallRuntime;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolRouter;
+        use codex_protocol::models::FunctionCallOutputBody;
+        use codex_protocol::models::ResponseInputItem;
+
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([
+                Arc::new(crate::tools::handlers::ExecCommandHandler::default())
+                    as Arc<dyn crate::tools::registry::CoreToolRuntime>,
+            ]),
+            Vec::new(),
+        ));
+        let step = StepContext::for_test(Arc::clone(&ctx.turn)).with_tool_router_for_test(router);
+        let mut control = TurnExecutionControl::new();
+        let baseline = control.baselines(0);
+        let collector = control.collector(&baseline);
+        let dispatch = ToolCallRuntime::new(
+            Arc::clone(&ctx.session), step,
+            Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
+        ).with_sampling_request_signals(collector.clone());
+        let (response, observed) = test_observation::observe(tokio::time::timeout(
+            Duration::from_secs(10), dispatch.handle_tool_call(
+            ToolCall {
+                tool_name: codex_tools::ToolName::plain("exec_command"),
+                call_id: "busy-validation-dispatch".into(),
+                payload: ToolPayload::Function { arguments: serde_json::json!({
+                    "program": "cargo", "args": ["test", "busy_fixture"],
+                    "workdir": root.as_path(),
+                }).to_string() },
+            },
+            CancellationToken::new(),
+        ))).await;
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response
+            .expect("busy dispatch must settle without waiting for the owner").unwrap() else {
+            panic!("busy rejection must be a function failure");
+        };
+        assert_eq!(output.success, Some(false));
+        let FunctionCallOutputBody::Text(message) = output.body else {
+            panic!("busy rejection must contain its diagnostic");
+        };
+        assert!(message.contains(owner_command), "{message}");
+        assert!(message.contains("This validation did not run"), "{message}");
+        assert!(message.contains("No process was started or queued"), "{message}");
+        assert_eq!(observed.process_launches, 0);
+        control.settle(&baseline, &collector, &SamplingRequestSettledState {
+            mutation_revision: 0, attributed_mutation_revision: 0, tool_exposure_revision: 0,
+        });
+        let assessment = control.completion_assessment_with_changed_paths(
+            0, Some(&[(LOCAL_ENVIRONMENT_ID.into(), root.as_path().join("changed.rs"))]), false,
+        );
+        assert!(!assessment.failed_checks.is_empty(), "busy is an unresolved check, not a pass");
+        assert!(assessment.verification_gaps.iter().any(|gap| gap.contains("No passing validation")));
+        assert!(assessment.advisories.is_empty(), "no passing test or check may be attributed");
+        let counters = ctx.turn.turn_timing_state.complete_snapshot().protocol_timing().counters;
+        assert_eq!(counters.executed_validation_count, 0);
+        assert_eq!(counters.executed_validation_duration_ns, 0);
+        assert!(crate::workspace_operation_gate::acquire_workspace_validation(&root, "cargo check").await.is_err());
+        drop(owner);
+        assert!(crate::workspace_operation_gate::acquire_workspace_validation(&root, "cargo check").await.is_ok());
     }
 
     fn test_turn_environment(cwd: PathUri) -> TurnEnvironment {

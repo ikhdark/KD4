@@ -264,6 +264,17 @@ pub trait ThreadStore: Any + Send + Sync {
         params: UpdateThreadMetadataParams,
     ) -> ThreadStoreFuture<'_, StoredThread>;
 
+    /// Applies a metadata patch when the caller only needs acknowledgement, not a thread summary.
+    ///
+    /// The default preserves existing stores' update and error semantics. Overrides may omit
+    /// constructing the unused summary, but must retain commit, compatibility and fallback work.
+    fn update_thread_metadata_ack(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { self.update_thread_metadata(params).await.map(|_| ()) })
+    }
+
     /// Archives a thread.
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()>;
 

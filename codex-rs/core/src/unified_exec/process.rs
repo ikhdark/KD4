@@ -1044,7 +1044,7 @@ impl UnifiedExecProcess {
         Ok(managed)
     }
 
-    fn spawn_exec_server_output_task(
+    pub(super) fn spawn_exec_server_output_task(
         started: StartedExecProcess,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<ProcessOutputChunk>,
@@ -1069,6 +1069,7 @@ impl UnifiedExecProcess {
             let mut artifact_task =
                 RawOutputArtifactTask::spawn(raw_output_artifact, artifact_ready);
             let mut last_seq: u64 = 0;
+            let mut capture_closed = false;
             loop {
                 let received = tokio::select! {
                     biased;
@@ -1200,6 +1201,7 @@ impl UnifiedExecProcess {
                         }
                     }
                     if closed {
+                        capture_closed = true;
                         break;
                     }
                     continue;
@@ -1274,6 +1276,7 @@ impl UnifiedExecProcess {
                         state_tx.send_modify(|state| {
                             state.sandbox_denied |= sandbox_denied.unwrap_or(false);
                         });
+                        capture_closed = true;
                         break;
                     }
                     ExecProcessEvent::Failed(message) => {
@@ -1285,7 +1288,12 @@ impl UnifiedExecProcess {
             output_closed.store(true, Ordering::Release);
             output_closed_notify.notify_waiters();
             cancellation_token.cancel();
-            if let Some(task) = artifact_task {
+            if let Some(mut task) = artifact_task {
+                // Stopping the reader (including transport failure) is not
+                // evidence that every producer byte reached the artifact.
+                if !capture_closed {
+                    task.mark_output_gap();
+                }
                 task.finish().await;
             }
         })

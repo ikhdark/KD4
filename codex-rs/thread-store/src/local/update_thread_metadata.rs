@@ -31,6 +31,46 @@ use crate::UpdateThreadMetadataParams;
 use crate::error::reject_paginated_history_mode;
 use crate::local::read_thread;
 
+pub(super) async fn update_thread_metadata_ack(
+    store: &LocalThreadStore,
+    params: UpdateThreadMetadataParams,
+) -> ThreadStoreResult<()> {
+    if params.patch.is_empty()
+        || needs_rollout_compatibility_update(&params.patch)
+        || (params.patch.project_id.is_some() && !store.supports_projects())
+    {
+        return update_thread_metadata(store, params).await.map(|_| ());
+    }
+
+    let require_sqlite_write = sqlite_write_failure_should_block(&params.patch);
+    let updated = apply_metadata_update(
+        store,
+        params.thread_id,
+        params.patch,
+        params.include_archived,
+        require_sqlite_write,
+    )
+    .await?;
+    if updated.is_some() {
+        // The commit is complete. Live callers discard the summary, so do not reread the
+        // rollout or legacy name index solely to construct it while holding their mutex.
+        return Ok(());
+    }
+
+    // No SQLite row was committed (including best-effort failures). Preserve the returning
+    // API's canonical fallback and its errors rather than acknowledging an unchecked update.
+    read_thread::read_thread(
+        store,
+        ReadThreadParams {
+            thread_id: params.thread_id,
+            include_archived: params.include_archived,
+            include_history: false,
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
 pub(super) async fn update_thread_metadata(
     store: &LocalThreadStore,
     params: UpdateThreadMetadataParams,

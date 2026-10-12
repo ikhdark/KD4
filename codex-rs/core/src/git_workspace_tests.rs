@@ -2494,6 +2494,36 @@ async fn audit_unknown_executor_cannot_fall_back_to_host_evidence() {
 }
 
 #[tokio::test]
+async fn explicit_local_workspace_capture_does_not_contact_remote_primary() {
+    let (_repo_dir, repo) = create_clean_git_repo().await;
+    let (_, mut turn) = crate::session::tests::make_session_and_context().await;
+    // A listening endpoint that never serves a request is an adversarial
+    // primary: an explicitly local observation must not depend on its progress.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = Arc::new(codex_exec_server::Environment::create_for_tests(
+        Some(format!("ws://{}", listener.local_addr().unwrap())),
+    ).unwrap());
+    let local = Arc::new(codex_exec_server::Environment::create_for_tests(None).unwrap());
+    let cwd = PathUri::from_abs_path(&repo);
+    turn.environments = TurnEnvironmentSnapshot {
+        generation: 1,
+        turn_environments: vec![
+            TurnEnvironment::new("remote-primary".into(), remote, cwd.clone(), None),
+            TurnEnvironment::new(LOCAL_ENVIRONMENT_ID.into(), local, cwd.clone(), None),
+        ],
+        starting: Vec::new(),
+    };
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let identity = tokio::time::timeout(std::time::Duration::from_secs(10),
+        cache.workspace_evidence_for_uri(&turn, &cwd, LOCAL_ENVIRONMENT_ID),
+    ).await.expect("local capture must not wait for the remote primary").unwrap();
+    assert!(!identity.unavailable);
+    assert_eq!(identity.repository_root.as_deref(), repo.as_path().to_str());
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept()).await.is_err(),
+        "an explicit local capture must not open a remote connection");
+}
+
+#[tokio::test]
 async fn audit_excluded_paths_do_not_receive_freshness_observations() {
     let root = TempDir::new().unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();

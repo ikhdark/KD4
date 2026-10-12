@@ -1,0 +1,350 @@
+{
+  "version": 2,
+  "prompt_frozen_before_heldout_authorship": false,
+  "baseline_sha256": "f44e5713398ec2dbd6a1226893f2c79cbad4173cafba1ead12e21fd118c9a29e",
+  "candidate_sha256": "ddd8fa7d8efdfa69f440bf7bcdba1f0235a1683de35e11d3eff8c79ce61dcfea",
+  "cases": [
+    {
+      "id": "cargo",
+      "split": "development",
+      "question": "Why did this validation rebuild previously fresh artifacts, take longer than expected, and fail? Diagnose the complete supplied incident; do not change anything. Start with incident.txt.",
+      "scope": "Synthetic closed-world single lane, runs A-D, 09:00-09:12. Explain both freshness losses, added wait, and terminal validation outcome. Not the historical KD4 incident.",
+      "coverage": "The model has exactly two artifact invalidation inputs: source content and codegen configuration. Lock waiting affects latency only; the test assertion is a separate terminal outcome. No other input, toolchain, target directory or cache-state changes exist in this fixture.",
+      "files": {
+        "incident.txt": "Synthetic incident, not a real rollout. At 09:12 validation failed after rebuilding 48 previously fresh artifacts. The console highlights 'codegen context changed'. Working records are catalogued in index.txt. Explain the incident rather than only the highlighted line.",
+        "index.txt": "Records: runs/current.txt; runs/history.txt; inputs/state.txt; config/contexts.txt; scheduler/lane.txt; results/test.txt; controls/replay.txt.",
+        "runs/current.txt": "C: 09:05 raw Cargo, context raw, source v2, 48 dirty. D: 09:08 managed runner, context managed, source v2, 48 dirty; ends 09:12 exit 101. Both used target core-tests and the same compiler. Source v2 was already present before C.",
+        "runs/history.txt": "A: 09:00 managed, source v1, context managed, 48 fresh. B: 09:03 managed, source v2, context managed, 48 dirty; finished 09:04. First freshness loss is B, not C. Full A-D invocation history; no omitted invocation.",
+        "inputs/state.txt": "09:02 generated api.rs content changed from hash h1 to h2 (v1 to v2). The 48 artifacts depend on it. All other source hashes, timestamps relevant to Cargo, compiler and target inputs held fixed across A-D.",
+        "config/contexts.txt": "Raw uses opt-level=0; managed uses opt-level=1. Cargo keys these codegen inputs. C replaces managed-context artifacts; D requires rebuilding managed artifacts. This discrepancy cannot explain B, which used managed context before and after.",
+        "scheduler/lane.txt": "D waited 60 seconds for C's target-directory lock. No simultaneous writes occurred under the Cargo lock. No extra artifact invalidation from waiting. The wait explains added duration, not failed test assertions.",
+        "results/test.txt": "D compiled successfully. Test rejects_invalid_token then failed: expected rejection, got acceptance. Exit 101. This is not a timeout and there was no compiler error. The same assertion fails with artifacts prebuilt and no competing process.",
+        "controls/replay.txt": "Closed-world deterministic controls: revert source only -> B has 48 fresh; unify codegen only -> C/D have 48 fresh after B. Both repairs -> all 48 stay fresh after A. Remove competitor only -> D loses 60s wait but same freshness/test failure. With all build repairs, token assertion still fails. No compiler/cache/target changes exist beyond the declared source/codegen inputs."
+      },
+      "causes": [
+        {
+          "id": "source_change",
+          "claim": "Earlier generated source-content change causes the first loss at B; later configuration mismatch does not explain it.",
+          "evidence": [
+            "runs/history.txt",
+            "inputs/state.txt",
+            "controls/replay.txt"
+          ],
+          "materiality": "Reverting source restores all 48 fresh artifacts at B."
+        },
+        {
+          "id": "context_switch",
+          "claim": "Raw/managed opt-level mismatch causes later C/D rebuilds, not earliest B.",
+          "evidence": [
+            "runs/current.txt",
+            "config/contexts.txt",
+            "controls/replay.txt"
+          ],
+          "materiality": "Unifying codegen removes later rebuilds."
+        }
+      ],
+      "other": [
+        {
+          "id": "lock_wait",
+          "role": "contributing_condition",
+          "evidence": [
+            "scheduler/lane.txt"
+          ],
+          "claim": "Cargo lock contention adds 60s, not invalidation."
+        },
+        {
+          "id": "test_failure",
+          "role": "separate_outcome",
+          "evidence": [
+            "results/test.txt"
+          ],
+          "claim": "Independent token-rejection assertion fails after successful compilation; not timeout."
+        }
+      ],
+      "counterfactuals": {
+        "baseline": 48,
+        "controls": [
+          {
+            "cause": "source_change",
+            "outcome": "B fresh=48"
+          },
+          {
+            "cause": "context_switch",
+            "outcome": "C/D fresh=48 after B"
+          }
+        ]
+      },
+      "exclusions": "Real Cargo fingerprint behavior outside stated fixture inputs; historical KD4 causal claims; fixing the token validator."
+    },
+    {
+      "id": "export",
+      "split": "heldout",
+      "question": "The nightly customer export dropped from 100 expected records to 76 after a release. What caused the missing records, and did the rerun recover them? Read incident.txt and investigate using available records; no changes.",
+      "scope": "One tenant's 100-record synthetic export, release r7 and its rerun. Explain every missing cohort and terminal outcome.",
+      "coverage": "The 100 IDs partition into 76 unaffected, 10 pending-state, 8 checkpoint-window and 6 alias-tenant records. These cohorts are disjoint. Selection, checkpoint eligibility and tenant routing are the only exclusion mechanisms. Source availability, permissions, network and storage are fixed. Controls exhaust all three exclusion inputs.",
+      "files": {
+        "incident.txt": "Export for tenant North fell from 100 to 76 after release r7. Dashboard points to a changed SQL filter. Job exit code is 0. Records available under index.txt.",
+        "index.txt": "sql/query.txt; records/counts.txt; jobs/timeline.txt; jobs/checkpoint.txt; tenants/mapping.txt; controls/replays.txt; reports/final.txt; network/status.txt.",
+        "sql/query.txt": "Release r7 predicate changed from status IN ('paid','pending') to status='paid'. Contract includes both states. It omits 10 pending records. Query revert restores those 10, but not the other missing records.",
+        "records/counts.txt": "Contract snapshot contains 100 unique rows: unaffected IDs1-76; pending IDs77-86; paid IDs87-94 in time window W; paid IDs95-100 under legacy tenant key N_old. Cohorts disjoint; no deletions, duplicates or new arrivals. Inventory is complete within this snapshot.",
+        "jobs/timeline.txt": "Checkpoint fault occurred on r6 at 01:00, BEFORE r7 filter release at 02:00. At 01:00 W batch staged, checkpoint advanced, process died before output commit. At 03:00 r7 and 04:00 rerun both skip W. A release-only explanation cannot explain the earlier loss.",
+        "jobs/checkpoint.txt": "The r6 writer saves high watermark before output commit. Window W has 8 source rows, output absent, watermark above W. Rerun resumes strictly after saved watermark. Reset watermark alone restores exactly those 8.",
+        "tenants/mapping.txt": "Legacy key N_old belongs to North by contract. Route table introduced in r5 maps N_old to archive instead of North. The six legacy rows are excluded before SQL. Repoint only this alias restores exactly six. Regular North IDs already route correctly.",
+        "controls/replays.txt": "Deterministic fixed-snapshot replay: unchanged=76; SQL repair only=86; checkpoint reset only=84; alias repair only=82; SQL+checkpoint=94; SQL+alias=92; checkpoint+alias=90; all three=100. These exhaust the three modeled binary exclusions. Network/ACL/storage/source checks have no variable effect.",
+        "reports/final.txt": "04:00 rerun exit=0; committed=76. Success means upload completed, NOT completeness validation. A separate email notification failed with SMTP 550 after commit; no record effect.",
+        "network/status.txt": "Source reads and output upload all succeeded; ACL and source hashes fixed. SMTP delivery is a separate post-upload step."
+      },
+      "causes": [
+        {
+          "id": "filter",
+          "claim": "r7 paid-only filter omits ten required pending rows.",
+          "evidence": [
+            "sql/query.txt",
+            "records/counts.txt",
+            "controls/replays.txt"
+          ],
+          "materiality": "Filter-only control restores 10 of 24 missing records."
+        },
+        {
+          "id": "checkpoint",
+          "claim": "Pre-release advance-before-commit checkpoint loses window W and causes rerun to skip eight rows.",
+          "evidence": [
+            "jobs/timeline.txt",
+            "jobs/checkpoint.txt",
+            "controls/replays.txt"
+          ],
+          "materiality": "Reset-only control restores eight; r7 is not earliest origin."
+        },
+        {
+          "id": "alias",
+          "claim": "Incorrect legacy-tenant alias routing excludes six North rows independently of SQL.",
+          "evidence": [
+            "tenants/mapping.txt",
+            "records/counts.txt",
+            "controls/replays.txt"
+          ],
+          "materiality": "Alias-only control restores six."
+        }
+      ],
+      "other": [
+        {
+          "id": "rerun",
+          "role": "separate_outcome",
+          "evidence": [
+            "reports/final.txt"
+          ],
+          "claim": "Exit zero rerun still exports 76, not recovered."
+        },
+        {
+          "id": "mail",
+          "role": "separate_outcome",
+          "evidence": [
+            "reports/final.txt"
+          ],
+          "claim": "SMTP failure occurs after commit, not missing-record cause."
+        }
+      ],
+      "counterfactuals": {
+        "baseline": 76,
+        "repaired": 100,
+        "restored": [
+          10,
+          8,
+          6
+        ],
+        "table": [
+          76,
+          86,
+          84,
+          82,
+          94,
+          92,
+          90,
+          100
+        ]
+      },
+      "exclusions": "All tenants and times outside snapshot; real database behavior beyond defined model; repair implementation."
+    },
+    {
+      "id": "latency",
+      "split": "heldout",
+      "question": "The service's measured request latency rose from 100 ms to 700 ms around a deployment. Why, and did rollback fix the incident? Investigate the supplied records, starting with incident.txt; no changes.",
+      "scope": "One synthetic request class over three releases, deterministic serial stage timings. Explain 600ms regression and rollback outcome; no tail-latency or real-world performance claim.",
+      "coverage": "Trace consists of fixed 100ms business work plus three independent binary serial delays: routing=200ms, connection fallback=100ms, client retry=300ms. No other stages or load variations exist. The complete eight-state replay table establishes all in-scope latency causes.",
+      "files": {
+        "incident.txt": "Dashboard: 100ms baseline, 700ms at r3, suspected retry regression. Rollback marked completed. Available evidence catalog: index.txt.",
+        "index.txt": "client/policy.txt; traces/current.txt; traces/history.txt; transport/resolver.txt; routing/topology.txt; controls/replays.txt; release/rollback.txt; health/status.txt.",
+        "client/policy.txt": "r3 client unconditionally waits 300ms and retries even after successful first response. Removing the retry removes 300ms. No duplicate side effects in this read-only request class.",
+        "traces/current.txt": "r3 critical path: business=100ms, routing queue=200ms, first address timeout=100ms, unnecessary retry delay=300ms. These stages are serial, not overlapping. Total=700ms. Stage files document provenance.",
+        "traces/history.txt": "r0 all three delays off =>100ms. r1 routing changed =>300ms. r2 endpoint refresh =>400ms. r3 retry policy =>700ms. Therefore latency degradation began before r3.",
+        "transport/resolver.txt": "r2 resolver cache kept a retired first endpoint. First connection times out after100ms; fallback to current endpoint succeeds. Current DNS is healthy. Refreshing the cached endpoint removes100ms with routing/retry unchanged.",
+        "routing/topology.txt": "At r1 the request class was assigned to a cross-region queue rather than the local route. This adds200ms. Traffic volume and worker capacity are fixed. Restoring local route removes200ms.",
+        "controls/replays.txt": "Fixed serial model; bits routing/fallback/retry. 000=100;100=300;010=200;001=400;110=400;101=600;011=500;111=700 ms. From111: retry repair=400, resolver repair=600, routing repair=500; all repairs=100. Complete state space; no hidden stage.",
+        "release/rollback.txt": "Rollback changed client r3 policy to r2 only. Observed afterward=400ms, not100ms. Request completed successfully, HTTP200. Rollback did not revert r1 routing or r2 cached endpoint.",
+        "health/status.txt": "CPU20%, no resource saturation. A post-response metric shipper warning did not block the measured request. All measurements are deterministic fixture values, not sampled production measurements."
+      },
+      "causes": [
+        {
+          "id": "retry",
+          "claim": "r3 unnecessary successful-response retry adds300ms.",
+          "evidence": [
+            "client/policy.txt",
+            "traces/current.txt",
+            "controls/replays.txt"
+          ],
+          "materiality": "Retry removal lowers700 to400."
+        },
+        {
+          "id": "resolver",
+          "claim": "r2 stale cached first endpoint causes100ms timeout/fallback despite healthy current DNS.",
+          "evidence": [
+            "transport/resolver.txt",
+            "traces/history.txt",
+            "controls/replays.txt"
+          ],
+          "materiality": "Cache repair lowers700 to600."
+        },
+        {
+          "id": "routing",
+          "claim": "Earlier r1 cross-region routing adds200ms independently of r3.",
+          "evidence": [
+            "routing/topology.txt",
+            "traces/history.txt",
+            "controls/replays.txt"
+          ],
+          "materiality": "Routing repair lowers700 to500."
+        }
+      ],
+      "other": [
+        {
+          "id": "rollback",
+          "role": "separate_outcome",
+          "evidence": [
+            "release/rollback.txt"
+          ],
+          "claim": "Rollback leaves400ms, not recovered to100."
+        },
+        {
+          "id": "metrics",
+          "role": "separate_outcome",
+          "evidence": [
+            "health/status.txt"
+          ],
+          "claim": "Post-response metric warning is not latency cause."
+        }
+      ],
+      "counterfactuals": {
+        "baseline": 700,
+        "repaired": 100,
+        "removed": [
+          300,
+          100,
+          200
+        ],
+        "table": [
+          100,
+          300,
+          200,
+          400,
+          400,
+          600,
+          500,
+          700
+        ]
+      },
+      "exclusions": "Real service latency distribution, concurrency, contention outside serial model; deployment repair."
+    },
+    {
+      "id": "access",
+      "split": "heldout",
+      "question": "After a credential rotation, 12 of 30 scheduled uploads were rejected. What explains these failures, and did refreshing credentials resolve them? Investigate available records starting with incident.txt; do not change anything.",
+      "scope": "Synthetic fixed cohort of 30 requests across one rotation and retry. Explain every rejection class and final retry outcome.",
+      "coverage": "The cohort partitions into 18 unaffected requests, five obsolete-token, four clock-skew and three audience-route requests. Disjoint groups; server validation checks exactly token generation, validity time and audience. Network/payload/permissions fixed. Complete controls exhaust these three failure inputs.",
+      "files": {
+        "incident.txt": "30 uploads scheduled,18 accepted,12 rejected after token rotation. Error dashboard groups all as auth failures and recommends refreshing credentials. Records in index.txt.",
+        "index.txt": "auth/generation.txt; requests/cohort.txt; hosts/time.txt; routes/audience.txt; history/events.txt; controls/replay.txt; results/retry.txt; status/transport.txt.",
+        "auth/generation.txt": "Five worker requests use token generation g1 after server switched to g2. Their clocks and audiences are correct. Refreshing these cached tokens restores five. No token contents or credentials are included in fixture.",
+        "requests/cohort.txt": "Complete fixed cohort: R1-18 valid, R19-23 old generation, R24-27 correct generation but rejected nbf, R28-30 correct generation but rejected aud. Cohorts disjoint. nbf=not-before, aud=audience. No payload errors.",
+        "hosts/time.txt": "Host H supplying R24-27 is120s ahead. Tokens issued with H's time have nbf120s in the server's future; server allows30s skew. Correcting H clock alone makes four valid. Refreshing tokens without clock repair repeats future nbf.",
+        "routes/audience.txt": "R28-30 intend upload-prod but a persisted alias selects upload-stage audience while contacting prod. Alias error predates rotation. Correcting alias alone restores three. Server prod audience validation is correct.",
+        "history/events.txt": "Alias fault at10:00; H clock jump at10:05; rotation at10:10; cohort at10:12. Prior probes show aud and nbf rejections before10:10. Rotation explains only generation subset.",
+        "controls/replay.txt": "Fixed cohort replay accepted: no repair18; token only23; clock only22; alias only21; token+clock27; token+alias26; clock+alias25; all30. Full three-factor state space. No other validation condition varies.",
+        "results/retry.txt": "At10:15 token refresh rerun accepted23 rejected7. Upload step failed due remaining rejections. Post-run cleanup also failed deleting a local temp file; cleanup did not affect authentication.",
+        "status/transport.txt": "All30 reached prod server; no network/ACL/payload failures. Auth response records complete for every request. Secrets are intentionally absent and unnecessary."
+      },
+      "causes": [
+        {
+          "id": "generation",
+          "claim": "Five cached g1 tokens become invalid after g2 rotation.",
+          "evidence": [
+            "auth/generation.txt",
+            "requests/cohort.txt",
+            "controls/replay.txt"
+          ],
+          "materiality": "Refresh-only control restores five."
+        },
+        {
+          "id": "clock",
+          "claim": "Host ahead120s yields future nbf beyond30s tolerance for four requests, persisting after token refresh.",
+          "evidence": [
+            "hosts/time.txt",
+            "history/events.txt",
+            "controls/replay.txt"
+          ],
+          "materiality": "Clock-only control restores four."
+        },
+        {
+          "id": "audience",
+          "claim": "Pre-rotation alias picks stage audience for three prod requests.",
+          "evidence": [
+            "routes/audience.txt",
+            "history/events.txt",
+            "controls/replay.txt"
+          ],
+          "materiality": "Alias-only control restores three."
+        }
+      ],
+      "other": [
+        {
+          "id": "retry",
+          "role": "separate_outcome",
+          "evidence": [
+            "results/retry.txt"
+          ],
+          "claim": "Credential refresh leaves7 rejected, not resolved."
+        },
+        {
+          "id": "cleanup",
+          "role": "separate_outcome",
+          "evidence": [
+            "results/retry.txt"
+          ],
+          "claim": "Cleanup failure is separate, not authentication cause."
+        }
+      ],
+      "counterfactuals": {
+        "baseline": 18,
+        "repaired": 30,
+        "restored": [
+          5,
+          4,
+          3
+        ],
+        "table": [
+          18,
+          23,
+          22,
+          21,
+          27,
+          26,
+          25,
+          30
+        ]
+      },
+      "exclusions": "Other request cohorts, credential contents, server validators outside stated checks; real authentication systems."
+    }
+  ],
+  "parent_version": 1,
+  "scorer_revision": 2,
+  "case_provenance": "Unmodified v1 cases reused for a versioned rebase; not fresh held-out generalization evidence."
+}

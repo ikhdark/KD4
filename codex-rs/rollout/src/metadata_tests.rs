@@ -317,6 +317,94 @@ async fn listing_pass_supplies_reconciliation_extraction_without_reopening_rollo
 }
 
 #[tokio::test]
+async fn listing_metadata_cache_recovers_after_payload_repair() {
+    for warm_healthy_cache in [false, true] {
+        let dir = tempdir().expect("tempdir");
+        let id = ThreadId::new();
+        let parent_id = ThreadId::new();
+        let path = dir.path().join(format!("rollout-2026-01-27T12-34-56-{id}.jsonl"));
+        let session_meta = RolloutLine {
+            timestamp: "2026-01-27T12:34:56Z".into(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: id.into(),
+                    id,
+                    parent_thread_id: Some(parent_id),
+                    timestamp: "2026-01-27T12:34:56Z".into(),
+                    cwd: dir.path().to_path_buf(),
+                    originator: "artifact-backed metadata fixture ".repeat(1024),
+                    model_provider: Some("artifact-provider".into()),
+                    history_mode: ThreadHistoryMode::Paginated,
+                    ..SessionMeta::default()
+                },
+                git: None,
+            }),
+        };
+        let serialized = serde_json::to_vec(&session_meta).expect("serialize session metadata");
+        let reference = crate::payload_artifact::store_line(&path, &serialized)
+            .expect("publish metadata payload");
+        let reference_value: serde_json::Value = serde_json::from_slice(&reference).unwrap();
+        assert_eq!(reference_value["type"], crate::payload_artifact::KIND);
+        let payload_path = crate::payload_artifact::root(&path).join(format!(
+            "{}.json",
+            reference_value["payload"]["sha256"].as_str().unwrap()
+        ));
+        let mut rollout_bytes = reference.clone();
+        let user_message = RolloutLine {
+            timestamp: "2026-01-27T12:35:00Z".into(),
+            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "retained inline preview".into(),
+                ..Default::default()
+            })),
+        };
+        rollout_bytes.extend(serde_json::to_vec(&user_message).unwrap());
+        rollout_bytes.push(b'\n');
+        std::fs::write(&path, &rollout_bytes).expect("write referencing rollout");
+        crate::payload_artifact::sync_payload_artifacts(&path).await.unwrap();
+        let original_key = extraction_cache_key(&path, "").await.expect("rollout cache key");
+
+        if warm_healthy_cache {
+            crate::list::read_thread_item_from_rollout(path.clone())
+                .await.expect("healthy listing");
+            let (healthy, cache_hit) = extract_metadata_from_rollout_with_cache_status(&path, "")
+                .await.unwrap();
+            assert!(cache_hit, "healthy listing still supplies reconciliation metadata");
+            assert_eq!(healthy.parse_errors, 0);
+            assert_eq!(healthy.metadata.model_provider, "artifact-provider");
+        }
+
+        std::fs::write(&payload_path, b"corrupt").expect("corrupt only the sidecar");
+        let damaged = crate::list::read_thread_item_from_rollout(path.clone())
+            .await.expect("inline history remains listable");
+        assert_eq!(damaged.thread_id, Some(id));
+        assert_eq!(damaged.model_provider, None);
+        let (degraded, _) = extract_metadata_from_rollout_with_cache_status(&path, "")
+            .await.unwrap();
+        assert_eq!(degraded.parse_errors, 1, "one damaged metadata payload");
+        assert_eq!(degraded.parent_thread_id, None);
+
+        // The normal publisher repairs the shared artifact without appending to
+        // this rollout. Its length, mtime, and both cache paths remain unchanged.
+        let repaired_reference = crate::payload_artifact::store_line(&path, &serialized)
+            .expect("repair metadata payload");
+        assert_eq!(repaired_reference, reference);
+        crate::payload_artifact::sync_payload_artifacts(&path).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), rollout_bytes);
+        assert_eq!(extraction_cache_key(&path, "").await, Some(original_key));
+
+        let (recovered, cache_hit) = extract_metadata_from_rollout_with_cache_status(&path, "")
+            .await.expect("extract repaired metadata");
+        assert_eq!(recovered.parse_errors, 0, "repaired payload must be reread");
+        assert!(!cache_hit, "degraded listing must not leave reusable cache state");
+        assert_eq!(recovered.metadata.id, id);
+        assert_eq!(recovered.metadata.model_provider, "artifact-provider");
+        assert_eq!(recovered.metadata.history_mode, ThreadHistoryMode::Paginated);
+        assert_eq!(recovered.parent_thread_id, Some(parent_id));
+        assert_eq!(recovered.metadata.first_user_message.as_deref(), Some("retained inline preview"));
+    }
+}
+
+#[tokio::test]
 async fn extract_metadata_preserves_persisted_turn_start_recency_over_file_mtime() {
     let dir = tempdir().expect("tempdir");
     let uuid = Uuid::new_v4();

@@ -814,6 +814,68 @@ fn projection_model_render_is_compact_and_keeps_selected_text_unescaped() {
     );
 }
 
+async fn semantic_controls_projection_round_trip() -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let invocation = test_invocation(
+        Arc::new(session), Arc::new(turn), "semantic-controls", ToolName::plain("semantic_fixture"),
+    );
+    let value = serde_json::json!({
+        "a_payload": (0..1000).map(|i| (format!("field_{i:04}"), Value::from("payload".repeat(20))))
+            .collect::<serde_json::Map<_, _>>(),
+        "complete": false, "truncated": true, "status": "partial", "nextCursor": "remaining-page",
+    });
+    let mut result = AnyToolResult {
+        call_id: invocation.call_id.clone(),
+        payload: invocation.payload.clone(),
+        result: Box::new(codex_tools::JsonToolOutput::new(value.clone())),
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+    let mut input = prepare_model_projection(
+        &invocation, &mut result, None, Some(&Default::default()), false, false,
+    ).await.expect("oversized payload requires canonical projection");
+    input.applied_token_limit = 256;
+    let codex_home = input.codex_home.clone();
+    let thread_id = input.thread_id.clone();
+    let projection = project_model_output(input).await.expect("bounded projection");
+    let (header, _) = model_projection_parts(projection.bounded.rendered());
+    assert_eq!(header["complete"], false, "artifact retention is not provider completeness");
+    assert_eq!(header["truncated"], true);
+    assert_eq!(header["status"], "partial");
+    assert_eq!(header["nextCursor"], "remaining-page");
+    let candidate = projection.candidate.as_ref().expect("raw evidence remains recoverable");
+    let recovered = crate::tools::handlers::execute_recovery_transaction_with_continuations(
+        &codex_home, &thread_id, &candidate.artifact_id,
+        vec![crate::tools::command_output_artifact::ToolOutputSelector::JsonPointer {
+            pointer: "/a_payload/field_0000".into(),
+        }], true, &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap();
+    assert_eq!(recovered.output.canonical_sha256, candidate.artifact_sha256);
+    assert_eq!(recovered.output.results[0].value.as_ref(), Some(&value["a_payload"]["field_0000"]));
+    assert!(recovered.output.complete);
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn semantic_controls_survive_registry_projection_and_recovery() {
+    semantic_controls_projection_round_trip().await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in actual projection/persistence/recovery wall-clock benchmark"]
+#[expect(clippy::print_stdout, reason = "report observed runtime timings without speedup assertions")]
+async fn semantic_controls_projection_wall_clock() {
+    let mut micros = Vec::new();
+    for _ in 0..7 {
+        micros.push(semantic_controls_projection_round_trip().await.as_micros());
+    }
+    let total = micros.iter().sum::<u128>();
+    micros.sort_unstable();
+    println!("semantic_projection iterations=7 median_us={} total_us={total} model_requests=0 projection_calls=7 recovery_calls=7", micros[3]);
+}
+
 #[test]
 fn projection_fallback_preserves_essential_inline() {
     let essential = serde_json::json!({

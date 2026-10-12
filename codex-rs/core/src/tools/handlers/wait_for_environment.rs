@@ -115,10 +115,10 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
                     )));
                 };
 
-                if environment.wait_until_ready().await.is_err() {
+                if let Err(error) = environment.wait_until_ready().await {
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(
                         format!(
-                            "Environment `{environment_id}` failed to start and is unavailable. Continue without it."
+                            "Environment `{environment_id}` failed to start and is unavailable: {error}"
                         ),
                         Some(false),
                     )));

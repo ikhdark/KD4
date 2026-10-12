@@ -539,7 +539,7 @@ pub async fn dynamic_tool_response(sess: &Arc<Session>, turn_id: String, id: Str
 
 pub async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefreshConfig) {
     let mut guard = sess.pending_mcp_server_refresh_config.lock().await;
-    *guard = Some(refresh_config);
+    *guard = Some(Arc::new(refresh_config));
 }
 
 pub async fn reload_user_config(sess: &Arc<Session>) {
@@ -1011,6 +1011,16 @@ async fn dispatch_submission(
     debug!(?sub, "Submission");
     let dispatch_span = submission_dispatch_span(&sub);
     async {
+        if matches!(&sub.op, Op::UserInput { .. } | Op::Review { .. }) {
+            // An interrupt cancels startup for the previous preparation. Only a
+            // newly admitted request may reopen it; retries inside cancelled
+            // work must continue to observe cancellation. The ordered dispatcher
+            // drops that preparation before admitting this one.
+            let mut token = sess.services.mcp_startup_cancellation_token.lock().await;
+            if token.is_cancelled() {
+                *token = tokio_util::sync::CancellationToken::new();
+            }
+        }
         match sub.op {
             Op::Interrupt => {
                 interrupt(&sess).await;
@@ -1147,6 +1157,74 @@ mod dispatch_tests {
             client_user_message_id: None,
             trace: None,
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_mcp_preparation_retains_refresh_for_the_next_turn() {
+        let (session, context, events) = crate::session::tests::make_session_and_context_with_rx().await;
+        let requested = McpServerRefreshConfig {
+            mcp_servers: serde_json::json!({"retained-config": {"url": "https://unused.example/mcp", "enabled": false}}),
+            mcp_oauth_credentials_store_mode: serde_json::json!("auto"),
+            auth_keyring_backend_kind: serde_json::json!("direct"),
+        };
+        refresh_mcp_servers(&session, requested.clone()).await;
+        let old_runtime = session.services.latest_mcp_runtime();
+        let pause = Arc::new(super::super::mcp::TestMcpStartupPause::new());
+        let (sender, receiver) = async_channel::bounded(8);
+        let queued = |submission| super::super::QueuedSubmission {
+            submission, mailbox_admission: None, preparation_permit: None,
+        };
+        sender.send(queued(user_submission("mcp-preparing"))).await.unwrap();
+        let dispatcher = tokio::spawn(super::super::mcp::with_test_mcp_startup_pause(
+            Arc::clone(&pause), submission_loop(Arc::clone(&session), Arc::clone(&context.config), receiver),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), pause.started.acquire()).await
+            .expect("real submission preparation reaches MCP startup").unwrap().forget();
+        let mut control = user_submission("interrupt-mcp-preparation");
+        control.op = Op::Interrupt;
+        sender.send(queued(control)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let EventMsg::TurnAborted(event) = events.recv().await.unwrap().msg
+                    && event.turn_id.as_deref() == Some("mcp-preparing") {
+                    break;
+                }
+            }
+        }).await.expect("interrupt drops the actual preparation owner");
+        let retained = session.pending_mcp_server_refresh_config.lock().await.is_some();
+        assert!(Arc::ptr_eq(&old_runtime, &session.services.latest_mcp_runtime()));
+        assert!(pause.token.lock().await.as_ref().unwrap().is_cancelled());
+        if retained {
+            assert!(session.mcp_startup_cancellation_token().await.is_cancelled());
+            // A new real admission retries configuration, not the cancelled
+            // user's effects. Empty review fails after refresh without sampling.
+            let mut retry = user_submission("retry-mcp-config");
+            retry.op = Op::Review { review_request: ReviewRequest {
+                target: codex_protocol::protocol::ReviewTarget::Custom {
+                    instructions: String::new(),
+                },
+                user_facing_hint: None,
+            }};
+            sender.send(queued(retry)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if event.id == "retry-mcp-config" && matches!(event.msg, EventMsg::Error(_)) {
+                        break;
+                    }
+                }
+            }).await.expect("next admission completes refresh before review rejection");
+            let actual = codex_mcp::configured_mcp_servers(session.services.latest_mcp_runtime().config());
+            assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(
+                serde_json::from_value::<std::collections::HashMap<String, codex_config::types::McpServerConfig>>(requested.mcp_servers).unwrap()
+            ).unwrap());
+            assert!(session.pending_mcp_server_refresh_config.lock().await.is_none());
+        }
+        let mut control = user_submission("shutdown");
+        control.op = Op::Shutdown;
+        sender.send(queued(control)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), dispatcher).await.unwrap().unwrap();
+        assert!(retained, "interrupt must not silently consume an unapplied configuration refresh");
     }
 
     #[tokio::test]

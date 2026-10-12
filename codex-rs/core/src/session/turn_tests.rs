@@ -308,11 +308,85 @@ async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
         }
     }
     assert!(stopped, "the real hook must have blocked the prompt");
-    let continuing = run_hooks_and_record_inputs_detailed(&session, &turn, &[
+    let stopped = run_hooks_and_record_inputs_detailed(&session, &turn, vec![
+        TurnInput::UserInput { content: vec![UserInput::Text { text: "blocked continuation".into(), text_elements: Vec::new() }], client_id: None },
+    ]).await.unwrap();
+    assert!(stopped.should_stop);
+    assert!(!stopped.accepted_context_input);
+    let continuing = run_hooks_and_record_inputs_detailed(&session, &turn, vec![
         TurnInput::ResponseItem(crate::compact::compaction_context_message("Accepted ongoing context".to_string())),
         TurnInput::UserInput { content: vec![UserInput::Text { text: "Use subagents".to_string(), text_elements: Vec::new() }], client_id: None },
     ]).await.unwrap();
     assert!(!continuing.should_stop);
+    assert!(continuing.accepted_context_input);
+}
+
+#[tokio::test]
+async fn pending_input_closed_writer_restores_entire_rejected_batch() {
+    let (mut session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    session.live_thread().expect("writer").shutdown().await.expect("close writer");
+    let input = ["first rejected steer", "second rejected steer"].map(|text| TurnInput::UserInput {
+        content: vec![UserInput::Text { text: text.into(), text_elements: Vec::new() }],
+        client_id: None,
+    }).to_vec();
+    session.input_queue.restore_transferred_startup_input(input.clone()).await;
+    let drained = session.input_queue.get_pending_input(&session.active_turn).await;
+    assert_eq!(drained, input);
+    assert!(run_hooks_and_record_inputs_detailed(&session, &turn, drained).await.is_err());
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(events.try_recv().is_err(), "rejected inputs must not publish lifecycle events");
+    assert_eq!(session.input_queue.get_pending_input(&session.active_turn).await, input);
+    assert!(session.input_queue.get_pending_input(&session.active_turn).await.is_empty());
+}
+
+#[tokio::test]
+async fn pending_input_cancelled_waiter_keeps_prefix_and_restores_only_rejected_suffix() {
+    // A real local writer, a FIFO commit gate, and no model request. Cancellation
+    // occurs while the first commit is blocked; the writer then closes between items.
+    let (mut session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    let input = ["owned prefix", "rejected suffix one", "rejected suffix two"].map(|text| {
+        TurnInput::ResponseItem(crate::compact::compaction_context_message(text.into()))
+    }).to_vec();
+    session.input_queue.restore_transferred_startup_input(input.clone()).await;
+    let drained = session.input_queue.get_pending_input(&session.active_turn).await;
+    let held = session.durable_history_commit_gate.acquire().await.expect("hold first commit");
+    let mut waiter = Box::pin(run_hooks_and_record_inputs_detailed(&session, &turn, drained));
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while session.durable_history_commits_in_flight.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("first owned commit starts");
+    // Let the just-spawned commit poll the held semaphore before queuing the
+    // test's next permit. FIFO ordering then gives us the boundary after item 1.
+    tokio::task::yield_now().await;
+    let mut between_items = Box::pin(session.durable_history_commit_gate.acquire());
+    assert!(futures::poll!(between_items.as_mut()).is_pending());
+    drop(waiter);
+    assert!(session.clone_history().await.raw_items().is_empty());
+    assert!(!session.terminal_tasks.is_empty(), "batch owner survives waiter cancellation");
+    drop(held);
+    let boundary = tokio::time::timeout(Duration::from_secs(5), between_items)
+        .await.expect("first commit releases FIFO gate").expect("gate open");
+    let history = session.clone_history().await.into_raw_items();
+    assert_eq!(history.len(), 1, "must close the actual writer after exactly the accepted prefix");
+    assert!(serde_json::to_string(&history[0]).unwrap().contains("owned prefix"));
+    session.live_thread().expect("writer").shutdown().await.expect("close writer between items");
+    drop(boundary);
+    session.terminal_tasks.close();
+    tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+        .await.expect("cancelled batch owner settles failure and restores suffix");
+    let restored = session.input_queue.get_pending_input(&session.active_turn).await;
+    assert_eq!(restored, input[1..], "accepted prefix must never be submitted twice");
+    assert!(session.input_queue.get_pending_input(&session.active_turn).await.is_empty());
+    assert_eq!(session.clone_history().await.into_raw_items(), history);
+    let stored = session.live_thread().expect("writer").load_history(false).await.expect("stored history");
+    let stored_items = stored.items.into_iter().filter_map(|item| match item {
+        codex_protocol::protocol::RolloutItem::ResponseItem(item) => Some(item), _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(stored_items, history, "cancelled waiter must preserve accepted prefix exactly once on disk");
 }
 
 #[tokio::test]
@@ -1565,6 +1639,7 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
     let classifications = dependency_paths.clone().map(|dependency_path| {
         crate::tool_history::WorkspaceCallClassification {
             observes_workspace: true,
+            source_scope_complete: true,
             workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
             source_dependencies: std::collections::BTreeSet::from([
                 crate::tool_history::SourceDependencyV1::new(&dependency_path, false),
@@ -1896,6 +1971,7 @@ async fn workspace_evidence_flush_preserves_authoritative_non_git_identity() {
     let call_id = "non-git-mutation";
     let classification = crate::tool_history::WorkspaceCallClassification {
         observes_workspace: true,
+        source_scope_complete: false,
         workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
         source_dependencies: std::collections::BTreeSet::new(),
     };
@@ -4049,26 +4125,49 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
             let output = |index: usize, id: &str| -> serde_json::Value {
                 serde_json::from_str(&sent[index].function_call_output_text(id).unwrap()).unwrap()
             };
+            let notices_for = |index: usize, id: &str| {
+                sent[index]
+                    .message_input_texts("developer")
+                    .into_iter()
+                    .filter(|text| text.starts_with("<workspace_evidence_invalidation>\n"))
+                    .flat_map(|text| {
+                        let batch = text.lines().find_map(|line| {
+                            serde_json::from_str::<serde_json::Value>(line).ok()
+                        }).expect("structured workspace freshness notice");
+                        crate::tool_history::expand_workspace_notices(batch)
+                    })
+                    .filter(|notice| notice["call_id"] == id)
+                    .collect::<Vec<_>>()
+            };
             assert_ne!(output(1, "validation-failed")["exit_code"], 0);
             assert_eq!(output(3, "validation-stale")["exit_code"], 0);
-            let stale_notices = sent[3].message_input_texts("developer");
+            let stale_notices = notices_for(3, "validation-stale");
             assert!(
-                stale_notices
-                    .iter()
-                    .any(|text| text.contains("workspace_evidence_invalidation")
-                        && text.contains("validation-stale")),
+                stale_notices.iter().any(|notice| {
+                    notice["workspace_evidence_freshness"] == "changed"
+                        && notice["valid_for_current_workspace"] == false
+                        && notice["source_scope"]["dependencies"].as_array().is_some_and(|paths| {
+                            paths.iter().any(|path| path["freshness"] == "changed")
+                        })
+                }),
                 "a pass for the pre-mutation source must not prove the changed checkout"
             );
             assert_eq!(output(5, "validation-current")["exit_code"], 0);
-            assert!(
-                !sent[5]
-                    .message_input_texts("developer")
-                    .iter()
-                    .any(|text| text.contains("workspace_evidence_invalidation")
-                        && text.contains("validation-current")),
-                "fresh validation invalidated: {:?}",
-                sent[5].message_input_texts("developer")
-            );
+            // Cargo's manifest graph is recorded input attribution, not a
+            // complete compiler/build-script/runtime dependency scope. A fresh
+            // run must clear the known mutation without claiming full freshness.
+            let current_notices = notices_for(5, "validation-current");
+            assert!(!current_notices.is_empty(), "incomplete Cargo scope must remain explicit");
+            for notice in current_notices {
+                assert_eq!(notice["reason_code"], "workspace_freshness_unverified", "{notice}");
+                assert_eq!(notice["workspace_evidence_freshness"], "unknown", "{notice}");
+                assert_eq!(notice["historical_authenticity"], "authenticated", "{notice}");
+                assert_eq!(notice["valid_for_current_workspace"], false, "{notice}");
+                assert_eq!(notice["source_scope"]["source_scope_complete"], false, "{notice}");
+                let paths = notice["source_scope"]["dependencies"].as_array().unwrap();
+                assert!(!paths.is_empty(), "recorded dependency observations must survive");
+                assert!(paths.iter().all(|path| path["freshness"] == "current"), "{notice}");
+            }
             assert!(
                 fs::read_to_string(test.workspace_path("src/lib.rs"))?
                     .contains("fn value() -> u8 { 2 }")

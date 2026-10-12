@@ -176,7 +176,7 @@ pub(crate) fn summarize_shell_output_for_model_with_streams(
     };
 
     let mut builder = SummaryBuilder::new();
-    builder.push_line("Shell output summary:");
+    builder.push_line(SUMMARY_HEADING);
     builder.push_line(format!("- original_lines: {line_count}"));
     builder.push_line(format!("- original_bytes: {}", output.len()));
     builder.push_line(format!("- exit_code: {exit_code}"));
@@ -193,10 +193,19 @@ pub(crate) fn summarize_shell_output_for_model_with_streams(
         } else {
             ""
         };
-        builder.push_line(format!("- omitted_diagnostic_groups: at least {} (selection-stage lower bound{qualifier}); final fitting may omit additional diagnostics; inspect the raw output", selection.omitted_groups));
+        // Name the first omitted group so recovery can start at a diagnostic
+        // instead of at whatever line the summary happens to skip first.
+        let first = selection.first_omitted_group.map(|index| {
+            format!(
+                "; {FIRST_OMITTED_GROUP_LABEL} {}-{}",
+                index.saturating_sub(FOCUS_CONTEXT_LINES) + 1,
+                (index + FOCUS_CONTEXT_LINES + 1).min(line_count),
+            )
+        }).unwrap_or_default();
+        builder.push_line(format!("- omitted_diagnostic_groups: at least {} (selection-stage lower bound{qualifier}){first}; final fitting may omit additional diagnostics. To read an omitted group, select its line range (numbers at left) or search the retained artifact with read_tool_output instead of reading it whole", selection.omitted_groups));
     }
     builder.push_line("");
-    builder.push_line("Selected output lines:");
+    builder.push_line(SELECTED_LINES_HEADING);
 
     // Candidate quotas reserve space for actionable and final regions before
     // rendering. Emit the selected lines in source order so a diagnostic stays
@@ -364,8 +373,20 @@ fn structured_compiler_summary_with_streams(
     token_limit: Option<usize>,
     streams: Option<(&str, &str)>,
 ) -> Option<String> {
-    let compiler_output = streams.map_or(output, |(stdout, _)| stdout);
-    let stderr = streams.map(|(_, stderr)| stderr);
+    // Native rustc writes diagnostic JSON to stderr; Cargo wraps it on stdout.
+    // Only switch for an empty stdout and a native diagnostic marker. Mixed
+    // commands retain the conservative stdout/independent-stderr path below.
+    let (compiler_output, stderr, diagnostic_stream) = match streams {
+        Some(("", stderr))
+            if stderr.lines().find(|line| !line.trim().is_empty()).is_some_and(|line|
+                serde_json::from_str::<serde_json::Value>(line)
+                    .is_ok_and(|record| record["$message_type"] == "diagnostic")) =>
+        {
+            (stderr, None, "stderr")
+        }
+        Some((stdout, stderr)) => (stdout, Some(stderr), "stdout"),
+        None => (output, None, "aggregated"),
+    };
     let recovery_selector = |source_line: usize| {
         let range = compiler_output.lines().nth(source_line.saturating_sub(1))
             .and_then(|line| output.find(line).map(|start| (start, start + line.len())))
@@ -506,7 +527,7 @@ fn structured_compiler_summary_with_streams(
             "omitted_diagnostics": omitted,
             "diagnostics_complete": omitted == 0 && diagnostics.iter().all(|item| item["details_omitted"] != true),
             "text_lines": text_lines,
-            "diagnostic_stream": if streams.is_some() { "stdout" } else { "aggregated" },
+            "diagnostic_stream": diagnostic_stream,
             "stderr": stderr,
             "projection": "Redundant rendered text, code explanations and build artifacts omitted. details_omitted marks abbreviated prose/excerpts or omitted children without locations or fixes. Omitted whole diagnostics may include locations and fixes; recover them with recovery_selector against the retained aggregate bytes.",
             "recovery_selector": (omitted > 0).then(|| serde_json::json!({"kind":"bytes", "start":0, "end":output.len()})),
@@ -610,6 +631,29 @@ fn compiler_diagnostic_has_locations(diagnostic: &serde_json::Value) -> bool {
         || diagnostic["children"].as_array().is_some_and(|children| {
             children.iter().any(compiler_diagnostic_has_locations)
         })
+}
+
+const SUMMARY_HEADING: &str = "Shell output summary:";
+const FIRST_OMITTED_GROUP_LABEL: &str = "first omitted group at lines";
+const SELECTED_LINES_HEADING: &str = "Selected output lines:";
+
+/// For a rendered line summary, the source lines (1-based, inclusive) of the
+/// first diagnostic group it names as omitted, if any; `None` for other text.
+/// Its lines are a ranked excerpt, so aligning it with the raw output finds
+/// the unselected head rather than an omitted diagnostic.
+pub(crate) fn line_summary_omitted_group(summary: &str) -> Option<Option<(usize, usize)>> {
+    let mut lines = summary.lines();
+    if lines.next()? != SUMMARY_HEADING {
+        return None;
+    }
+    // Only the header may name the group; selected lines are command output.
+    Some(lines.take_while(|line| *line != SELECTED_LINES_HEADING).find_map(|line| {
+        let (_, rest) = line
+            .strip_prefix("- omitted_diagnostic_groups:")?
+            .split_once(FIRST_OMITTED_GROUP_LABEL)?;
+        let (start, end) = rest.split(';').next()?.split_once('-')?;
+        Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+    }))
 }
 
 fn render_selected_lines(
@@ -981,6 +1025,8 @@ const MAX_DIAGNOSTIC_GROUPS: usize = 64;
 struct LineSelection {
     indexes: BTreeSet<usize>,
     omitted_groups: usize,
+    /// Zero-based headline of the first diagnostic group left out of `indexes`.
+    first_omitted_group: Option<usize>,
     groups_overflowed: bool,
     collapsed_progress_lines: usize,
 }
@@ -1125,9 +1171,15 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
         .filter(|(_, index)| !indexes.contains(index))
         .count()
         + usize::from(groups_overflowed);
+    let first_omitted_group = groups
+        .iter()
+        .map(|(_, index)| *index)
+        .filter(|index| !indexes.contains(index))
+        .min();
     LineSelection {
         indexes,
         omitted_groups,
+        first_omitted_group,
         groups_overflowed,
         collapsed_progress_lines,
     }

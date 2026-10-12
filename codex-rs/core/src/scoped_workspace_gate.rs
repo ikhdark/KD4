@@ -9,6 +9,34 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::Notify;
 
+// Scoped only around dispatch admission, including native-addition revalidation.
+tokio::task_local! {
+    pub(crate) static WORKSPACE_GATE_CALL: WorkspaceGateCall;
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceGateCall {
+    pub(crate) tool_name: String,
+    pub(crate) call_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceGateHolder {
+    pub(crate) call: WorkspaceGateCall,
+    pub(crate) admitted_at: tokio::time::Instant,
+    pub(crate) shared: bool,
+}
+
+impl WorkspaceGateCall {
+    pub(crate) fn admitted(&self, shared: bool) -> WorkspaceGateHolder {
+        WorkspaceGateHolder {
+            call: self.clone(),
+            admitted_at: tokio::time::Instant::now(),
+            shared,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Access {
     Read,
@@ -33,6 +61,7 @@ struct Claim {
     identity: Arc<()>,
     access: Access,
     admitted: bool,
+    holder: Option<WorkspaceGateHolder>,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +94,9 @@ impl WorkspaceLease {
                 && matches!(claim.access, Access::Write)
             {
                 claim.access = Access::Read;
+                if let Some(holder) = claim.holder.as_mut() {
+                    holder.shared = true;
+                }
             }
         }
         self.gate.changed.notify_waiters();
@@ -78,10 +110,16 @@ impl WorkspaceLease {
 }
 
 impl ScopedWorkspaceGate {
+    pub(crate) fn holders(&self, limit: usize) -> (usize, Vec<WorkspaceGateHolder>) {
+        let claims = self.claims.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let holders = claims.iter().filter_map(|claim| claim.holder.as_ref());
+        (holders.clone().count(), holders.take(limit).cloned().collect())
+    }
+
     async fn acquire(self: Arc<Self>, access: Access) -> WorkspaceLease {
         let lease = WorkspaceLease { gate: Arc::clone(&self), identity: Arc::new(()) };
         self.claims.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Claim { identity: Arc::clone(&lease.identity), access, admitted: false });
+            .push(Claim { identity: Arc::clone(&lease.identity), access, admitted: false, holder: None });
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -105,6 +143,9 @@ impl ScopedWorkspaceGate {
                 });
                 if !blocked {
                     claims[index].admitted = true;
+                    claims[index].holder = WORKSPACE_GATE_CALL.try_with(|call| {
+                        call.admitted(matches!(claims[index].access, Access::Read))
+                    }).ok();
                     return lease;
                 }
             }
@@ -118,7 +159,10 @@ impl ScopedWorkspaceGate {
             return Err(());
         }
         let identity = Arc::new(());
-        claims.push(Claim { identity: Arc::clone(&identity), access, admitted: true });
+        let holder = WORKSPACE_GATE_CALL.try_with(|call| {
+            call.admitted(matches!(access, Access::Read))
+        }).ok();
+        claims.push(Claim { identity: Arc::clone(&identity), access, admitted: true, holder });
         Ok(WorkspaceLease { gate: Arc::clone(&self), identity })
     }
 

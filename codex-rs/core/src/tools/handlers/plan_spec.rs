@@ -27,7 +27,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
         "continues".to_string(),
         JsonSchema::array(
             JsonSchema::string(None),
-            Some("Step IDs or unresolved orphan requirement IDs from the last result whose obligations this step carries forward after rewording, splitting, merging, or recovery. May be completed in this same revision when the work is finished; checklist status is not proof.".to_string()),
+            Some("IDs (step_ids of the last result, or unresolved orphan requirement IDs) of removed or reworded steps whose remaining work this step carries.".to_string()),
         ),
     );
     let revision_item =
@@ -47,7 +47,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             Some(vec!["step_id".to_string(), "reason".to_string()]),
             Some(false.into()),
         ),
-        Some("Checklist removals recorded in durable lineage; ungrounded proposals leave original obligations unresolved. Each unfinished step removed must be continued or listed here, or nothing changes.".to_string()),
+        Some("Unfinished steps this revision removes without a continuing step. Each unfinished step removed must be continued or listed here, or nothing changes.".to_string()),
     );
     let mut status_updates = JsonSchema::array(
         JsonSchema {
@@ -71,12 +71,12 @@ pub fn create_update_plan_tool() -> ToolSpec {
             Some(vec!["status".to_string()]),
             Some(false.into()),
         )},
-        Some("Change only these statuses atomically, preserving step text and omitted steps. Use either set or plan. Omitted explanation is preserved with set. Prefer step_id from the last result; index-based updates are rejected without expected_revision.".to_string()),
+        Some("Change only these statuses atomically, preserving step text and omitted steps. Use either set or plan. Omitted explanation is preserved with set. Pass expected_revision with every set: once a step's status has changed, a further change to it is rejected without expected_revision or its expected_step_revisions entry.".to_string()),
     );
     status_updates.min_items = Some(1);
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
-        description: "Updates the task checklist for work with multiple substantive dependent steps. Execute bounded read-only inventories directly. Skip plans for straightforward work; do not create single-step plans. At most one step can be in_progress at a time."
+        description: "Updates the task checklist for work with multiple substantive dependent steps. Skip plans for straightforward or read-only work; do not create single-step plans. At most one step can be in_progress at a time. Send a status update in the same cell as the work it reports, never as a cell of its own."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -88,7 +88,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             ..JsonSchema::object(
             BTreeMap::from([
                 ("expected_revision".to_string(), JsonSchema::string(Some(
-                    "Revision from the last update_plan result or conflict reconciliation. In exec, store the returned object and pass expected_revision: saved.revision directly; do not retype the hash. Checked atomically before any change. A replacement may omit it only if the plan has not changed since this sampling step began; otherwise reconcile and supply it. Index-based updates always require it. Stable-ID deltas may instead use expected_step_revisions.".into()
+                    "Revision from the last update_plan result or conflict reconciliation; in exec pass the returned object's revision directly instead of retyping the hash. Checked atomically before any change. A replacement may omit it only if the plan has not changed since this sampling step began. Index-based updates always require it; stable-ID deltas may instead use expected_step_revisions.".into()
                 ))),
                 (
                     "explanation".to_string(),
@@ -96,7 +96,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                 ),
                 (
                     "plan".to_string(),
-                    JsonSchema::array(revision_item, Some("Complete task checklist, replacing the previous plan. Preserve the user's acceptance criteria; rewriting a step does not complete its old obligations, so carry each removed unfinished step forward with continues or drop it with superseded. A completed checklist is not proof that the request is satisfied.".to_string())),
+                    JsonSchema::array(revision_item, Some("Complete task checklist, replacing the previous plan. Preserve the user's acceptance criteria: each unfinished step you remove must be named in a new step's continues or in superseded, or the update is rejected.".to_string())),
                 ),
                 ("set".to_string(), status_updates),
                 ("expected_step_revisions".to_string(), JsonSchema {
@@ -106,7 +106,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     }.into()))
                 }),
                 ("resolve".to_string(), JsonSchema::array(JsonSchema::string(None), Some(
-                    "Original requirement IDs whose acceptance scope is now fully satisfied. Use in the same update as completing renamed/split/merged descendants; at least one mapped descendant must exist and every mapped descendant must be completed. Reattach orphaned scope with continues before resolving it; authorized retirement uses superseded instead. This is explicit checklist accounting, never test evidence. Newly introduced step text remains an independent obligation.".into()
+                    "Original requirement IDs whose acceptance scope is now fully satisfied. Use in the same update as completing renamed/split/merged descendants; at least one mapped descendant must exist and every mapped descendant must be completed. Reattach orphaned scope with continues before resolving it; authorized retirement uses superseded instead.".into()
                 ))),
                 ("scope_change_instructions".to_string(), JsonSchema {
                     description: Some("Superseded step/orphan ID to the exact complete text of a currently accepted user input authorizing that scope change. The host verifies user-input provenance, not your interpretation; a reason or tool/context quote alone cannot retire scope. Omit for unverified proposals.".into()),

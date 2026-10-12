@@ -8,7 +8,7 @@ Batch independent queries/commands in one call. Examples:
 - Follow a link: `{"click":[{"ref_id":"turn0fetch0","id":17}]}`.
 - Images: `{"image_query":[{"q":"waterfalls"}]}`.
 - PDF screenshot: `{"screenshot":[{"ref_id":"turn1view0","pageno":0}]}`.
-- Data: `finance` accepts ticker/type/market; `weather` location; `sports` league/function/team; `time` utc_offset. Use their schemas.
+- Data: `finance` accepts ticker/type/market; `weather` location; `sports` league/fn/team; `time` utc_offset. Use their schemas.
 
 Set `response_length` when needed; omit the default `short` and other equivalent defaults, empty lists, or nulls. `search_query` allows at most four queries; four require `medium` or `long`.
 

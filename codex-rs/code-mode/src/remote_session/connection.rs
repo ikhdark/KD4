@@ -72,6 +72,28 @@ struct CallerCancellation {
     armed: bool,
 }
 
+struct AcceptedControlRequest<'a> {
+    connection: &'a Connection,
+    operation: &'a str,
+    armed: bool,
+}
+
+impl Drop for AcceptedControlRequest<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let reason = format!(
+                "stopped waiting for code-mode host to {}; effects are uncertain; closing the unobserved host connection",
+                self.operation,
+            );
+            // The existing supervisor owns process cleanup. An accepted
+            // destructive control must not outlive its observer on a reusable
+            // host, even when an outer deadline cancels our inner timeout.
+            mark_connection_dead(&self.connection.alive, &self.connection.failure, reason);
+            self.connection.cancellation.cancel();
+        }
+    }
+}
+
 struct ConnectionSupervisor {
     child: Child,
     managed: Arc<ManagedRootProcess>,
@@ -398,10 +420,24 @@ impl Connection {
         command: DriverCommand,
         response_rx: oneshot::Receiver<Result<T, String>>,
     ) -> Result<T, String> {
-        match tokio::time::timeout(timeout, async {
+        let destructive = matches!(
+            &command,
+            DriverCommand::Terminate { .. } | DriverCommand::ShutdownSession { .. }
+        );
+        let mut accepted = AcceptedControlRequest {
+            connection: self,
+            operation,
+            armed: false,
+        };
+        let result = tokio::time::timeout(timeout, async {
             self.send(command).await?;
+            // No await separates command acceptance from cleanup ownership.
+            // OpenSession retains its existing abandoned-session cleanup.
+            accepted.armed = destructive;
             self.receive(response_rx).await
-        }).await {
+        }).await;
+        accepted.armed = false;
+        match result {
             Ok(result) => result,
             Err(_) => {
                 let reason = format!(
@@ -548,6 +584,7 @@ async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_code_mode_protocol::host::SessionId;
 
     #[tokio::test]
     async fn writer_cancellation_releases_backpressured_pipe_without_replay() {
@@ -628,6 +665,141 @@ mod tests {
         assert!(!connection.is_alive());
         assert!(connection.cancellation.is_cancelled());
         assert!(response_tx.send(Ok(())).is_err(), "late ack cannot report success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_termination_observer_cannot_leave_host_reusable() {
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Connection {
+            command_tx,
+            execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        };
+        let cell_id = CellId::new("held-cell".to_string());
+        // Core's terminate_interrupted_cell observes termination for five
+        // seconds, less than this connection's ten-second control deadline.
+        // Withhold the host acknowledgment while retaining a live transport.
+        let response_tx = {
+            let observer = tokio::time::timeout(
+                Duration::from_secs(5),
+                connection.terminate(
+                    RemoteSession {
+                        id: codex_code_mode_protocol::host::SessionId::new("held-host").unwrap(),
+                        generation: 1,
+                    },
+                    cell_id.clone(),
+                ),
+            );
+            tokio::pin!(observer);
+            assert!(futures::poll!(&mut observer).is_pending());
+            let DriverCommand::Terminate { response_tx, .. } = commands.recv().await.unwrap() else {
+                panic!("expected termination command");
+            };
+            assert!(observer.await.is_err(), "the outer observer reports uncertainty, not termination");
+            response_tx
+        }; // Drop the timed-out control future, as the core caller does.
+        tokio::time::advance(TERMINATE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+
+        assert!(!connection.is_alive(), "dropping the observer must not disable fail-closed control ownership");
+        assert!(connection.cancellation.is_cancelled());
+        assert!(connection.failure_message().contains("effects are uncertain"));
+        assert!(response_tx.send(Ok(WaitOutcome::LiveCell(
+            codex_code_mode_protocol::RuntimeResponse::Terminated {
+                cell_id,
+                content_items: Vec::new(),
+            },
+        ))).is_err(), "late acknowledgment must not become a success receipt");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unadmitted_termination_cancellation_preserves_connection() {
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Connection {
+            command_tx,
+            execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        };
+        let remote = RemoteSession { id: SessionId::new("busy-host").unwrap(), generation: 1 };
+        let (response_tx, _response_rx) = oneshot::channel();
+        connection.command_tx.send(DriverCommand::Terminate {
+            session: remote.clone(),
+            cell_id: CellId::new("already-queued".into()),
+            response_tx,
+        }).await.unwrap();
+        let mut termination = Box::pin(connection.terminate(remote, CellId::new("unadmitted".into())));
+        assert!(futures::poll!(&mut termination).is_pending());
+        drop(termination);
+
+        assert!(connection.is_alive(), "an unaccepted command has no host effects");
+        assert!(!connection.cancellation.is_cancelled());
+        assert!(connection.failure.lock().unwrap().is_none());
+        assert!(matches!(commands.recv().await, Some(DriverCommand::Terminate { cell_id, .. })
+            if cell_id.as_str() == "already-queued"));
+        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_termination_preserves_connection() {
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Connection {
+            command_tx,
+            execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        };
+        let cell_id = CellId::new("finished-cell".into());
+        let mut termination = Box::pin(connection.terminate(
+            RemoteSession { id: SessionId::new("responsive-host").unwrap(), generation: 1 },
+            cell_id.clone(),
+        ));
+        assert!(futures::poll!(&mut termination).is_pending());
+        let DriverCommand::Terminate { response_tx, .. } = commands.recv().await.unwrap() else {
+            panic!("expected termination command");
+        };
+        let outcome = || WaitOutcome::LiveCell(codex_code_mode_protocol::RuntimeResponse::Terminated {
+            cell_id: cell_id.clone(),
+            content_items: Vec::new(),
+        });
+        response_tx.send(Ok(outcome())).unwrap();
+        assert_eq!(termination.await.unwrap(), outcome());
+        assert!(connection.is_alive());
+        assert!(!connection.cancellation.is_cancelled());
+        assert!(connection.failure.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_open_observer_preserves_abandoned_session_cleanup() {
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Connection {
+            command_tx,
+            execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        };
+        let mut opening = Box::pin(connection.open_session(
+            RemoteSession { id: SessionId::new("opening-host").unwrap(), generation: 1 },
+            Arc::new(crate::NoopCodeModeSessionDelegate),
+        ));
+        assert!(futures::poll!(&mut opening).is_pending());
+        let DriverCommand::OpenSession { caller_cancellation, response_tx, .. } = commands.recv().await.unwrap() else {
+            panic!("expected open command");
+        };
+        drop(opening);
+        assert!(caller_cancellation.is_cancelled());
+        assert!(response_tx.is_closed());
+        assert!(connection.is_alive(), "open retains the driver's abandoned-session cleanup");
+        assert!(!connection.cancellation.is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]

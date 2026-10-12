@@ -163,8 +163,10 @@ fn independent_review_shell_policy_rejects_mutation_and_permission_overrides() {
     assert!(validate_independent_review_shell(&reviewer, true, false, false).is_ok());
     let err = validate_independent_review_shell(&reviewer, false, false, false)
         .expect_err("reviewers must reject commands that are not proven read-only");
-    assert!(err.contains("Get-Command"));
-    assert!(err.contains("without assignments or script blocks"));
+    // Get-Command is not on the read-only safelist, so the hint must not offer it.
+    assert!(err.contains("Get-Content"));
+    assert!(!err.contains("Get-Command"));
+    assert!(err.contains("without assignments, script blocks or redirection"));
     assert!(validate_independent_review_shell(&reviewer, true, true, false).is_err());
     assert!(validate_independent_review_shell(&reviewer, true, false, true).is_err());
     assert!(validate_independent_review_stdin(&reviewer, "", false).is_ok());

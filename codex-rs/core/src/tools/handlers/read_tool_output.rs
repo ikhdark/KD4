@@ -526,6 +526,7 @@ impl RecoveryContinuationState {
             canonical_sha256: self.output.canonical_sha256.clone(),
             canonical_bytes: self.output.canonical_bytes,
             retained_bytes: self.output.retained_bytes,
+            capture_complete: self.output.capture_complete,
             unavailable_ranges: self.output.unavailable_ranges.clone(),
             results: vec![exact],
             complete: true,
@@ -1117,9 +1118,28 @@ async fn handle_read_tool_output(
         invocation.session
             .record_tool_history_recovery(args.artifact_id.clone(), invocation.call_id.clone(), selectors).await;
     }
-    let output = recovery_envelope(&output, continuation_stop.as_ref()).map_err(|err| {
+    let completed_inspection = if output.capture_complete {
+        let coordinator = invocation.session.services.agent_control.task_coordinator();
+        if let (Some(binding), Some(store)) = (
+            coordinator.binding_for_turn(&invocation.step_context.turn), coordinator.store(),
+        ) {
+            invocation.session.completed_source_inspection(
+                &args.artifact_id, output.canonical_bytes, &output.canonical_sha256, binding.attempt_id,
+            ).await.map(|(call_id, source)| (store, call_id, source,
+                output.canonical_sha256.clone(), output.canonical_bytes))
+        } else { None }
+    } else { None };
+    let mut output = recovery_envelope(&output, continuation_stop.as_ref()).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
+    if let Some((store, call_id, source, sha256, bytes)) = completed_inspection {
+        match store.record_source_inspection(
+            source.start, call_id, sha256, bytes,
+        ).await {
+            Ok(reference) => output["criterion_evidence"] = serde_json::json!(reference),
+            Err(error) => output["inspection_proof_error"] = serde_json::json!(error.to_string()),
+        }
+    }
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
         inner: recovery_tool_output(output, successful, evidence),
         exact_recovery: exact_recovery_receipt,
@@ -1287,8 +1307,48 @@ async fn drain_recovery_snapshot(
 // selector owner, rather than shrinking the token budget below its metadata floor.
 fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usize) {
     let mut remaining = max_bytes as u64;
+    let mut delivered_hydration = Vec::<(u64, u64)>::new();
     for result in &mut output.results {
         if result.status != ToolOutputSelectorStatus::Ok { continue; }
+        if result.selector.is_search() && let Some(value) = result.value.as_mut() {
+            // Match coordinates are metadata, not source bytes. Keep their exact
+            // context selectors when hydration cannot fit; retrying the same
+            // search at the same byte cap would otherwise never make progress.
+            let mut omitted = false;
+            if let Some(ranges) = value["hydrated_ranges"].as_array_mut() {
+                ranges.retain(|range| {
+                    let available = range["shared"] != true || range["canonical_range"]["start"].as_u64()
+                        .zip(range["canonical_range"]["end"].as_u64())
+                        .is_some_and(|(start, end)| delivered_hydration.iter()
+                            .any(|&(left, right)| left <= start && end <= right));
+                    omitted |= !available;
+                    available
+                });
+                let bytes = ranges.iter().filter_map(|range| {
+                    if !range["text"].is_string() && !range["data_base64"].is_string() { return None; }
+                    range["canonical_range"]["end"].as_u64()?.checked_sub(range["canonical_range"]["start"].as_u64()?)
+                }).sum::<u64>();
+                if bytes > remaining {
+                    ranges.clear();
+                    omitted = true;
+                } else {
+                    remaining -= bytes;
+                    delivered_hydration.extend(ranges.iter().filter_map(|range| {
+                        if !range["text"].is_string() && !range["data_base64"].is_string() { return None; }
+                        Some((range["canonical_range"]["start"].as_u64()?, range["canonical_range"]["end"].as_u64()?))
+                    }));
+                }
+            }
+            if omitted {
+                result.complete = false;
+                if value.get("enclosing_complete").is_some() {
+                    value["enclosing_complete"] = Value::Bool(false);
+                }
+                result.message = Some("Match coordinates delivered; context exceeds the remaining source-byte budget. Read child_selectors for exact context; the search continuation starts after the delivered matches.".into());
+                output.complete = false;
+            }
+            continue;
+        }
         let bytes = result.canonical_range.filter(|_| result.text.is_some()
             || result.data_base64.is_some() || result.value.is_some())
             .map_or(0, |range| range.end - range.start)

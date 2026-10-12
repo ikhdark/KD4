@@ -292,12 +292,16 @@ pub fn truncate_rollout_after_turn_id(
 ///
 /// If fewer than or equal to `n_from_end` fork turns exist, this keeps from the first fork-turn
 /// boundary and still drops pre-turn startup context.
+/// Checkpoints in the suffix must be cut at that same boundary, not allowed to
+/// replace the child history with the parent's excluded prefix. If the boundary
+/// is no longer identifiable, refuse the fork rather than lose checkpoint-only
+/// content or silently restore excluded turns.
 pub(crate) fn truncate_rollout_to_last_n_fork_turns(
     items: &[RolloutItem],
     n_from_end: usize,
-) -> Vec<RolloutItem> {
+) -> CodexResult<Vec<RolloutItem>> {
     if n_from_end == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let fork_turn_positions = fork_turn_positions_in_rollout(items);
@@ -307,9 +311,68 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
         .map(|position| fork_turn_positions[position])
         .or_else(|| fork_turn_positions.first().copied())
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    items[keep_idx..].to_vec()
+    let mut retained = items[keep_idx..].to_vec();
+    if !retained.iter().any(|item| matches!(item, RolloutItem::Compacted(_))) {
+        return Ok(retained);
+    }
+    let cannot_bound_checkpoint = || CodexErr::InvalidRequest(
+        "Cannot fork last-N turns: a compaction checkpoint does not uniquely identify the retained turn boundary. Use full-history or task-capsule mode instead.".into(),
+    );
+    let boundary = match &items[keep_idx] {
+        RolloutItem::ResponseItem(item) => std::borrow::Cow::Borrowed(item),
+        RolloutItem::InterAgentCommunication(communication) => {
+            std::borrow::Cow::Owned(communication.to_model_input_item())
+        }
+        RolloutItem::InterAgentCommunicationMetadata { .. } => {
+            let Some(RolloutItem::ResponseItem(item)) = items.get(keep_idx + 1) else {
+                return Err(cannot_bound_checkpoint());
+            };
+            std::borrow::Cow::Borrowed(item)
+        }
+        _ => return Err(cannot_bound_checkpoint()),
+    };
+    let matches_boundary = |item: &ResponseItem| match (boundary.id(), item.id()) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (None, None) => boundary.as_ref() == item,
+        _ => false,
+    };
+    // Legacy messages lack stable IDs. Repeated raw messages make even a
+    // single checkpoint match ambiguous; never guess using text similarity.
+    let matching_positions = items.iter().enumerate().filter_map(|(index, item)| {
+        let matched = match item {
+            RolloutItem::ResponseItem(item) => matches_boundary(item),
+            RolloutItem::InterAgentCommunication(communication) => {
+                matches_boundary(&communication.to_model_input_item())
+            }
+            _ => false,
+        };
+        matched.then_some(index)
+    }).collect::<Vec<_>>();
+    for (offset, item) in retained.iter_mut().enumerate() {
+        if let RolloutItem::Compacted(compacted) = item {
+            if matching_positions.partition_point(|index| *index < keep_idx + offset) != 1 {
+                return Err(cannot_bound_checkpoint());
+            }
+            let history = compacted.replacement_history.as_mut()
+                .ok_or_else(&cannot_bound_checkpoint)?;
+            let mut matches = history.iter().enumerate()
+                .filter_map(|(index, item)| matches_boundary(item).then_some(index));
+            let start = matches.next().ok_or_else(&cannot_bound_checkpoint)?;
+            if matches.next().is_some() {
+                return Err(cannot_bound_checkpoint());
+            }
+            let mut index = 0;
+            history.retain(|item| {
+                // Source-integrity diagnostics are global, not excluded turns.
+                let keep = index >= start || codex_rollout::is_rollout_reconstruction_notice(item);
+                index += 1;
+                keep
+            });
+        }
+    }
+    Ok(retained)
 }
 
 fn is_real_user_message_boundary(item: &ResponseItem) -> bool {

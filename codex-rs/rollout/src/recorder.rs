@@ -75,6 +75,20 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_state::StateRuntime;
 
+const RECONSTRUCTION_NOTICE_ID_BASE: &str = "msg_rollout_gap";
+
+/// Reserved loader-owned identity; provider output must not claim this namespace.
+pub fn is_rollout_reconstruction_notice_id(id: &str) -> bool {
+    id.starts_with("msg_rollout_gap_")
+}
+
+/// Reconstruction integrity is global source evidence, not a turn-local message.
+/// Text alone (including a quoted gap tag) never grants this lifecycle.
+pub fn is_rollout_reconstruction_notice(item: &codex_protocol::models::ResponseItem) -> bool {
+    matches!(item, codex_protocol::models::ResponseItem::Message { id: Some(id), role, .. }
+        if role == "developer" && is_rollout_reconstruction_notice_id(id))
+}
+
 /// Writes canonical session rollout items to JSONL.
 ///
 /// Rollouts are recorded as JSONL and can be inspected with tools such as:
@@ -160,6 +174,9 @@ enum RolloutCmd {
     },
     Shutdown {
         ack: oneshot::Sender<std::io::Result<()>>,
+    },
+    Discard {
+        ack: oneshot::Sender<()>,
     },
     #[cfg(test)]
     Pause {
@@ -1200,7 +1217,7 @@ impl RolloutRecorder {
             let malformed_records = parse_errors.saturating_sub(trailing_partial_records);
             items.push(RolloutItem::ResponseItem(
                 codex_protocol::models::ResponseItem::Message {
-                    id: None,
+                    id: Some(codex_protocol::ResponseItemId::new(RECONSTRUCTION_NOTICE_ID_BASE)),
                     role: "developer".to_string(),
                     content: vec![codex_protocol::models::ContentItem::InputText {
                         text: format!(
@@ -1378,6 +1395,35 @@ impl RolloutRecorder {
             history: Arc::new(items),
             rollout_path: Some(compression::plain_rollout_path(path)),
         }))
+    }
+
+    /// Stop without materializing buffered records or deleting already-written data.
+    /// A queued discard remains owned by the writer if the caller is cancelled.
+    /// Earlier commands may be blocked on storage; do not wait indefinitely for them.
+    pub async fn discard(&self) -> std::io::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let enqueue_guard = self.writer_task.enqueue_gate.acquire().await
+                .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+            if self.writer_task.lifecycle.load(Ordering::Acquire) == WRITER_SHUT_DOWN {
+                return Ok(());
+            }
+            let permit = self.tx.reserve().await.map_err(|e| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed to reserve rollout discard command: {e}"))
+                })
+            })?;
+            self.writer_task.begin_shutdown()?;
+            let (ack, done) = oneshot::channel();
+            permit.send(RolloutCmd::Discard { ack });
+            drop(enqueue_guard);
+            done.await.map_err(|e| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed waiting for rollout discard: {e}"))
+                })
+            })
+        }).await.map_err(|_| IoError::new(
+            std::io::ErrorKind::TimedOut, "timed out waiting for rollout discard",
+        ))?
     }
 
     /// Drain pending items before stopping the writer task.
@@ -2306,6 +2352,14 @@ async fn rollout_writer(
                     let _ = ack.send(Err(err));
                 }
             },
+            RolloutCmd::Discard { ack } => {
+                // Release pending payload permits and the file before acknowledging.
+                // In particular, do not fall through to the channel-close drain.
+                drop(state);
+                writer_task.finish_shutdown(true);
+                let _ = ack.send(());
+                return Ok(());
+            }
             #[cfg(test)]
             RolloutCmd::Pause { entered, resume } => {
                 let _ = entered.send(());

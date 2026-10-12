@@ -2394,6 +2394,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "v8",
 ]
 

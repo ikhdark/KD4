@@ -278,14 +278,14 @@ pub(crate) async fn exit_review_mode(
 ) {
     let (user_message, assistant_message) = if let Some(out) = review_output.clone() {
         let rendered = render_review_exit_success(
-            "The complete review findings and verdict are in the following assistant message.",
+            "The review explanation and findings are in the following assistant message.",
         );
         let assistant_message = render_review_output_text(&out);
         (rendered, assistant_message)
     } else {
         let rendered = render_review_exit_interrupted();
         let assistant_message =
-            "Review was interrupted. Please re-run /review and wait for it to complete."
+            "The review produced no result (interrupted, failed, or invalid output). Please re-run /review and wait for it to complete."
                 .to_string();
         (rendered, assistant_message)
     };

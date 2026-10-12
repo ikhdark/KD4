@@ -11,6 +11,8 @@ node_modules
 /_build/
 dist/
 build/
+# Tracked build tooling, not build output
+!/scripts/build/
 out/
 storybook-static/
 
@@ -84,6 +86,7 @@ coverage/
 
 # Local documentation
 /docs/
+/audits/
 
 # personal files
 /current-diff.txt
@@ -94,6 +97,10 @@ coverage/
 personal/
 /kd-ui/
 .codex/locks/
+/.codex/diagnostics/
+/.codex/audits/
+/.codex/gitdiff/
+/.codex/benchmark-runs/
 
 # os
 .DS_Store

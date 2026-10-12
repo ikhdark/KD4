@@ -60,10 +60,14 @@ impl Session {
         let recovery = crate::compact::persist_task_compaction_text_recovery(
             self, &source, omitted_text,
         ).await?;
-        let (mut items, snapshot, digests) = self
+        let (initial_context, snapshot, digests) = self
             .build_initial_context_with_world_state_and_provenance(turn, &world_state)
             .await;
-        items.extend(retained);
+        let mut items = crate::compact::insert_compaction_initial_context(
+            retained,
+            initial_context,
+            &crate::compact::InitialContextInjection::AtStart(world_state),
+        );
         if let Some(text) = recovery {
             items.push(crate::compact::compaction_context_message(text));
         }

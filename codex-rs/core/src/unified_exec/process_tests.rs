@@ -2244,6 +2244,159 @@ async fn local_output_closes_while_artifact_finalization_stalls() {
 }
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn remote_output_shutdown_does_not_certify_complete_artifact() {
+    use crate::tools::command_output_artifact::ToolOutputSelector;
+    use crate::tools::command_output_artifact::read_tool_output_selectors;
+
+    // This prefix was captured before the reader stopped. It is not a complete
+    // compiler diagnostic: absence from the retained bytes cannot prove that
+    // the producer never emitted the missing type/bound explanation.
+    const PREFIX: &[u8] = b"error: future cannot be sent between threads safely\n";
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = Arc::new(Mutex::new(
+        create_raw_output_artifact(temp.path(), "remote-reader-shutdown", PREFIX).await,
+    ));
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_handles = OutputHandles {
+        output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        completion_output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stdout_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stderr_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        output_notify: Arc::new(Notify::new()),
+        output_closed: Arc::clone(&output_closed),
+        output_closed_notify: Arc::new(Notify::new()),
+        cancellation_token: CancellationToken::new(),
+    };
+    let (wake_tx, _) = watch::channel(0);
+    let started = StartedExecProcess {
+        process: Arc::new(MockExecProcess {
+            process_id: "stopped-reader".to_string().into(),
+            write_response: WriteResponse { status: WriteStatus::Accepted },
+            read_responses: Mutex::new(VecDeque::new()),
+            terminate_error: None,
+            termination_control: None,
+            wake_tx,
+        }),
+    };
+    let (output_tx, _) = tokio::sync::broadcast::channel(8);
+    let (state_tx, state_rx) = watch::channel(super::process_state::ProcessState::default());
+    let output_shutdown = CancellationToken::new();
+    // The empty receiver stays open. Only the reader's shutdown branch can
+    // end this task; neither an exit nor an authoritative Closed was received.
+    output_shutdown.cancel();
+    let output_task = UnifiedExecProcess::spawn_exec_server_output_task(
+        started, output_handles, output_tx, state_tx, Some(Arc::clone(&artifact)),
+        CancellationToken::new(), output_shutdown,
+    );
+    tokio::time::timeout(Duration::from_secs(5), output_task)
+        .await.expect("reader shutdown must finish").expect("output task");
+    assert!(output_closed.load(Ordering::Acquire));
+    assert!(!state_rx.borrow().has_exited, "reader shutdown is not process exit proof");
+    let (path, id) = {
+        let artifact = artifact.lock().await;
+        let RawOutputArtifact::Stored { path, .. } = &*artifact else {
+            panic!("captured prefix must remain recoverable");
+        };
+        (path.clone(), artifact.artifact_id().unwrap().to_string())
+    };
+    let bytes = tokio::fs::read(path).await.expect("read retained prefix");
+    assert!(bytes.starts_with(PREFIX));
+    let recovered = read_tool_output_selectors(
+        temp.path(), "remote-reader-shutdown", &id,
+        vec![ToolOutputSelector::Search {
+            query: "MutexGuard".into(), case_insensitive: false,
+            start_byte: 0, max_results: 20, context_lines: 0, enclosing: false,
+        }],
+    ).await.expect("recover retained diagnostic prefix");
+    assert!(recovered.complete, "retained search page itself was delivered");
+    let search = recovered.results[0].value.as_ref().expect("search result");
+    assert_eq!(search["total_matches"], 0);
+    assert!(!recovered.capture_complete,
+        "reader shutdown before authoritative closure cannot certify producer capture");
+    assert_eq!(search["coverage_complete"], false,
+        "negative retained search is not absence proof for the interrupted producer");
+    assert!(!String::from_utf8_lossy(&bytes).contains("evicted"),
+        "reader interruption does not establish retention eviction");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn exec_server_authoritative_close_preserves_complete_artifact() {
+    use crate::tools::command_output_artifact::ToolOutputSelector;
+    use crate::tools::command_output_artifact::read_tool_output_selectors;
+
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = Arc::new(Mutex::new(
+        create_raw_output_artifact(temp.path(), "normal-close", b"").await,
+    ));
+    let environment = codex_exec_server::Environment::default_for_tests();
+    let started = environment.get_exec_backend().start(codex_exec_server::ExecParams {
+        process_id: ProcessId::from("capture-normal-close"),
+        argv: ["cmd.exe", "/D", "/S", "/C", "echo compiler-output"]
+            .map(str::to_owned).to_vec(),
+        cwd: codex_utils_path_uri::PathUri::from_host_native_path(temp.path()).unwrap(),
+        env_policy: None,
+        env: std::env::vars().collect(),
+        tty: false,
+        pipe_stdin: false,
+        arg0: None,
+        sandbox: None,
+        enforce_managed_network: false,
+        managed_network: None,
+    }).await.expect("start real native process");
+    let process = Arc::clone(&started.process);
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_handles = OutputHandles {
+        output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        completion_output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stdout_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stderr_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        output_notify: Arc::new(Notify::new()),
+        output_closed: Arc::clone(&output_closed),
+        output_closed_notify: Arc::new(Notify::new()),
+        cancellation_token: CancellationToken::new(),
+    };
+    let (output_tx, _) = tokio::sync::broadcast::channel(8);
+    let (state_tx, state_rx) = watch::channel(super::process_state::ProcessState::default());
+    let mut output_task = UnifiedExecProcess::spawn_exec_server_output_task(
+        started, output_handles, output_tx, state_tx, Some(Arc::clone(&artifact)),
+        CancellationToken::new(), CancellationToken::new(),
+    );
+    match tokio::time::timeout(Duration::from_secs(10), &mut output_task).await {
+        Ok(result) => result.expect("output task"),
+        Err(_) => {
+            let terminated = process.terminate().await;
+            output_task.abort();
+            let _ = output_task.await;
+            panic!("native output did not close; termination result: {terminated:?}");
+        }
+    }
+    assert!(output_closed.load(Ordering::Acquire));
+    assert!(state_rx.borrow().has_exited);
+    assert_eq!(state_rx.borrow().exit_code, Some(0));
+    assert!(state_rx.borrow().failure_message.is_none());
+    let (path, id) = {
+        let artifact = artifact.lock().await;
+        let RawOutputArtifact::Stored { path, truncated, .. } = &*artifact else {
+            panic!("native output must remain recoverable");
+        };
+        assert!(!truncated);
+        (path.clone(), artifact.artifact_id().unwrap().to_string())
+    };
+    assert_eq!(tokio::fs::read(path).await.unwrap(), b"compiler-output\r\n");
+    let recovered = read_tool_output_selectors(temp.path(), "normal-close", &id,
+        vec![ToolOutputSelector::Search {
+            query: "absent".into(), case_insensitive: false,
+            start_byte: 0, max_results: 20, context_lines: 0, enclosing: false,
+        }],
+    ).await.unwrap();
+    assert!(recovered.capture_complete);
+    assert_eq!(recovered.results[0].value.as_ref().unwrap()["coverage_complete"], true);
+}
+
+#[tokio::test]
 async fn remote_termination_keeps_empty_output_inline() {
     for confirmed in [false, true] {
         let temp = tempfile::tempdir().expect("tempdir");

@@ -596,7 +596,7 @@ async fn shell_command_validation_deadline_defaults_preserve_explicit_overrides(
         ("pnpm build", None, 300_000),
         // These are the repository's documented Rust validation entrypoints.
         (
-            "python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib",
+            "python -I -B scripts/build/rust_test_runner.py run-target --profile fast core_lib",
             None,
             300_000,
         ),
@@ -606,12 +606,12 @@ async fn shell_command_validation_deadline_defaults_preserve_explicit_overrides(
             300_000,
         ),
         (
-            "echo python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib",
+            "echo python -I -B scripts/build/rust_test_runner.py run-target --profile fast core_lib",
             None,
             10_000,
         ),
         (
-            "python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib",
+            "python -I -B scripts/build/rust_test_runner.py run-target --profile fast core_lib",
             Some(1_234),
             1_234,
         ),

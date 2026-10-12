@@ -111,6 +111,8 @@ struct CompactionTextOmissionReceiptV1 {
     retained_tokens: usize,
     omitted_tokens: usize,
     unresolved: bool,
+    /// Bound once the recovery artifact exists; `recovery_selector` is relative to it.
+    artifact_id: Option<String>,
 }
 
 /// Controls whether compaction replacement history must include initial context.
@@ -733,6 +735,9 @@ async fn run_compact_task_inner_impl(
     }
     let mut summary_item =
         compaction_summary_item_with_artifact_pins(summary_for_history, artifact_pin_payload);
+    if let Some(text) = &text_recovery_sidecar {
+        bind_omission_receipts_to_recovery(&mut retained_history, text);
+    }
     if let Some(text) = text_recovery_sidecar
         && let ResponseItem::Message { content, .. } = &mut summary_item
     {
@@ -1418,9 +1423,10 @@ fn collect_user_messages_with_indices(items: &[ResponseItem]) -> Vec<(usize, Com
             } if role == "user" => {
                 if is_compaction_summary_item(item)
                     || is_selected_skill_item(item)
+                    || is_compaction_text_bookkeeping_item(item)
                     || (item.turn_id().is_none()
                         && content.iter().any(is_legacy_compaction_warning_fragment)
-                        && crate::event_mapping::is_contextual_user_message_content(content))
+                        && crate::event_mapping::is_contextual_user_message(item))
                 {
                     return None;
                 }
@@ -1447,6 +1453,60 @@ fn collect_user_messages_with_indices(items: &[ResponseItem]) -> Vec<(usize, Com
         .collect::<Vec<_>>();
     messages.reverse();
     messages
+}
+
+/// Omission receipts and recovery sidecars written by an earlier compaction.
+/// They are bookkeeping, not user text: budgeting them as requests squeezes
+/// real input, so every later compaction would cut the same message again and
+/// emit another receipt, sidecar and artifact.
+fn is_compaction_text_bookkeeping_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    role == "user"
+        && !content.is_empty()
+        && is_trusted_stable_context_item(item)
+        && content.iter().all(|part| {
+            matches!(part, ContentItem::InputText { text } if text.starts_with('{')
+                && serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
+                    value["kind"] == COMPACT_TEXT_OMISSION_MARKER
+                        || (value["kind"] == "local_compaction_text_recovery"
+                            && value["artifact_id"].is_string())
+                }))
+        })
+}
+
+/// Bind this compaction's omission receipts to the artifact that holds their
+/// exact text. Receipts carried from earlier compactions already name their own.
+pub(crate) fn bind_omission_receipts_to_recovery(history: &mut [ResponseItem], sidecar: &str) {
+    let Some(artifact_id) = serde_json::from_str::<serde_json::Value>(sidecar)
+        .ok()
+        .and_then(|value| value["artifact_id"].as_str().map(str::to_owned))
+    else {
+        return;
+    };
+    let bound = format!("\"artifact_id\":{}", serde_json::Value::String(artifact_id));
+    for item in history.iter_mut() {
+        if !is_trusted_stable_context_item(item) {
+            continue;
+        }
+        let ResponseItem::Message { content, .. } = item else {
+            continue;
+        };
+        for part in content {
+            let ContentItem::InputText { text } = part else {
+                continue;
+            };
+            let unbound = serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
+                value["kind"] == COMPACT_TEXT_OMISSION_MARKER
+                    && value.get("artifact_id").is_some_and(serde_json::Value::is_null)
+            });
+            if unbound {
+                // A quoted key inside a JSON string is escaped, so this token is the field.
+                *text = text.replacen("\"artifact_id\":null", &bound, 1);
+            }
+        }
+    }
 }
 
 // Call in reverse chronological order, including within mixed-content messages.
@@ -1653,6 +1713,7 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
             .filter(|(index, item)| {
                 *index >= unresolved_start
                     || crate::session::is_unified_exec_resume_invalidation(item)
+                    || codex_rollout::is_rollout_reconstruction_notice(item)
                     || Some(*index) == latest_assistant
                     || Some(*index) == latest_summary
                     || is_selected_skill_item(item)
@@ -1776,7 +1837,11 @@ fn build_bounded_input_history(
             .enumerate()
             .filter(|(_, item)| {
                 crate::session::is_unified_exec_resume_invalidation(item)
+                    || codex_rollout::is_rollout_reconstruction_notice(item)
                     || is_selected_skill_item(item)
+                    // Earlier receipts and sidecars stay the only exact path to
+                    // text an earlier compaction cut; carry them outside the budget.
+                    || is_compaction_text_bookkeeping_item(item)
             })
             .map(|(index, item)| (index, item.clone())),
     );
@@ -1915,6 +1980,7 @@ fn build_bounded_input_history(
                     "kind": COMPACT_TEXT_OMISSION_MARKER,
                     "unresolved": true,
                     "additional_omitted_messages": omitted_receipt_count,
+                    "artifact_id": serde_json::Value::Null,
                     "instruction": "Recover exact text from the compaction recovery artifact.",
                 })
                 .to_string(),
@@ -2008,6 +2074,7 @@ fn compaction_text_omission_receipt(
         retained_tokens,
         omitted_tokens: original_tokens.saturating_sub(retained_tokens),
         unresolved: true,
+        artifact_id: None,
     };
     compaction_context_message(match serde_json::to_string(&receipt) {
         Ok(text) => text,

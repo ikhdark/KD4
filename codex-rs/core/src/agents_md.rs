@@ -334,100 +334,120 @@ pub(crate) async fn load_project_instructions_with_fallback(
         };
     }
 
-    let contributing_environments = discovery
+    // Resolve failed discoveries from accepted source bytes before counting
+    // contributors, so cached environments pay the same generated overhead.
+    let environments = discovery
         .environments
+        .into_iter()
+        .map(|discovery| {
+            let retained = if discovery.result.is_err() {
+                retain_failed_environment(previous, &discovery.environment_id, &discovery.cwd)
+            } else {
+                Vec::new()
+            };
+            (discovery, retained)
+        })
+        .collect::<Vec<_>>();
+    let contributing_environments = environments
         .iter()
-        .filter(|discovery| matches!(&discovery.result, Ok(paths) if !paths.is_empty()))
+        .filter(|(discovery, retained)| {
+            !retained.is_empty()
+                || matches!(&discovery.result, Ok(paths) if !paths.is_empty())
+        })
         .count();
     let mut first_project_environment = true;
-    for EnvironmentProjectInstructionsDiscovery {
+    for (EnvironmentProjectInstructionsDiscovery {
         environment_id,
         cwd,
         filesystem,
         result,
-    } in discovery.environments
+    }, retained) in environments
     {
-        match result {
-            Ok(candidates) if !candidates.is_empty() => {
-                let mut generated_overhead = 0usize;
-                if first_project_environment && loaded.user_instructions.is_some() {
-                    generated_overhead += AGENTS_MD_SEPARATOR.len();
-                }
-                if contributing_environments > 1 {
-                    if !first_project_environment {
-                        generated_overhead += 2;
-                    }
-                    generated_overhead += format!(
-                        "for `{}` with cwd {}\n\n",
-                        environment_id,
-                        cwd.inferred_native_path_string()
-                    )
-                    .len();
-                }
-                if generated_overhead >= remaining_rendered_bytes {
-                    omitted_documents.extend(candidates.iter().map(|candidate| {
-                        ProjectDocOmission {
-                            environment_id: environment_id.clone(),
-                            cwd: cwd.inferred_native_path_string(),
-                            path: candidate.path.inferred_native_path_string(),
-                            source_bytes: candidate.size,
-                        }
-                    }));
-                    remaining_rendered_bytes = 0;
-                    first_project_environment = false;
-                    continue;
-                }
-                remaining_rendered_bytes -= generated_overhead;
-
-                let source_order = candidates.iter().map(|candidate| candidate.path.clone()).collect::<Vec<_>>();
-                let (project_docs, failed_sources) = read_discovered_project_docs(
-                    filesystem.as_ref(),
-                    candidates,
-                    remaining_source_bytes,
-                    /*prefetch_utf8_boundary_slack*/ false,
-                    previous.map(|(_, sources)| (sources, environment_id.as_str(), &cwd)),
-                )
-                .await;
-                complete &= failed_sources.is_empty();
-                let environment_load = render_project_docs(
-                    &environment_id,
-                    &cwd,
-                    project_docs,
-                    remaining_rendered_bytes,
-                );
-                remaining_source_bytes =
-                    remaining_source_bytes.saturating_sub(environment_load.retained_source_bytes);
-                remaining_rendered_bytes =
-                    remaining_rendered_bytes.saturating_sub(environment_load.rendered_bytes);
-                omitted_documents.extend(environment_load.omitted_documents);
-                retained_sources.extend(environment_load.retained_sources);
-                let environment_start = loaded.entries.len();
-                if let Some(docs) = environment_load.loaded {
-                    loaded.entries.extend(docs.entries);
-                }
-                loaded.entries[environment_start..].sort_by_key(|entry| match &entry.provenance {
-                    InstructionProvenance::Project { source_path, .. } =>
-                        source_order.iter().position(|path| path == source_path).unwrap_or(usize::MAX),
-                    _ => usize::MAX,
-                });
-                first_project_environment = false;
-            }
-            Ok(_) => {}
+        let (candidates, retained) = match result {
+            Ok(candidates) => (candidates, None),
             Err(err) => {
                 complete = false;
-                retain_failed_environment(&mut loaded, previous, &environment_id, &cwd, &mut remaining_source_bytes, &mut remaining_rendered_bytes, None);
-                if let Some((_, sources)) = previous {
-                    retained_sources.extend(sources.iter().filter(|source| {
-                        source.environment_id == environment_id && source.cwd == cwd
-                            && loaded.sources().any(|path| path == source.candidate.path)
-                    }).cloned());
-                }
-                error!(
-                    environment_id,
-                    "error trying to find AGENTS.md docs: {err:#}"
-                );
+                error!(environment_id, "error trying to find AGENTS.md docs: {err:#}");
+                let candidates = retained.iter().map(|doc| doc.candidate.clone()).collect();
+                (candidates, Some(retained))
             }
+        };
+        if candidates.is_empty() {
+            continue;
         }
+        let mut generated_overhead = 0usize;
+        if first_project_environment && loaded.user_instructions.is_some() {
+            generated_overhead += AGENTS_MD_SEPARATOR.len();
+        }
+        if contributing_environments > 1 {
+            if !first_project_environment {
+                generated_overhead += 2;
+            }
+            generated_overhead += format!(
+                "for `{}` with cwd {}\n\n",
+                environment_id,
+                cwd.inferred_native_path_string()
+            )
+            .len();
+        }
+        if generated_overhead >= remaining_rendered_bytes {
+            omitted_documents.extend(candidates.iter().map(|candidate| {
+                ProjectDocOmission {
+                    environment_id: environment_id.clone(),
+                    cwd: cwd.inferred_native_path_string(),
+                    path: candidate.path.inferred_native_path_string(),
+                    source_bytes: candidate.size,
+                }
+            }));
+            remaining_rendered_bytes = 0;
+            first_project_environment = false;
+            continue;
+        }
+        remaining_rendered_bytes -= generated_overhead;
+
+        let source_order = candidates.iter().map(|candidate| candidate.path.clone()).collect::<Vec<_>>();
+        let project_docs = if let Some(mut retained) = retained {
+            // Match healthy nearest-first source allocation without any I/O.
+            let mut remaining = remaining_source_bytes;
+            for doc in retained.iter_mut().rev() {
+                truncate_project_doc_to_budget(&mut doc.read, remaining);
+                remaining = remaining.saturating_sub(doc.read.retained_data.len());
+            }
+            retained
+        } else {
+            let (project_docs, failed_sources) = read_discovered_project_docs(
+                filesystem.as_ref(),
+                candidates,
+                remaining_source_bytes,
+                /*prefetch_utf8_boundary_slack*/ false,
+                previous.map(|(_, sources)| (sources, environment_id.as_str(), &cwd)),
+            )
+            .await;
+            complete &= failed_sources.is_empty();
+            project_docs
+        };
+        let environment_load = render_project_docs(
+            &environment_id,
+            &cwd,
+            project_docs,
+            remaining_rendered_bytes,
+        );
+        remaining_source_bytes =
+            remaining_source_bytes.saturating_sub(environment_load.retained_source_bytes);
+        remaining_rendered_bytes =
+            remaining_rendered_bytes.saturating_sub(environment_load.rendered_bytes);
+        omitted_documents.extend(environment_load.omitted_documents);
+        retained_sources.extend(environment_load.retained_sources);
+        let environment_start = loaded.entries.len();
+        if let Some(docs) = environment_load.loaded {
+            loaded.entries.extend(docs.entries);
+        }
+        loaded.entries[environment_start..].sort_by_key(|entry| match &entry.provenance {
+            InstructionProvenance::Project { source_path, .. } =>
+                source_order.iter().position(|path| path == source_path).unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        });
+        first_project_environment = false;
     }
 
     if !omitted_documents.is_empty() {
@@ -450,36 +470,33 @@ pub(crate) async fn load_project_instructions_with_fallback(
 }
 
 fn retain_failed_environment(
-    loaded: &mut LoadedAgentsMd,
     previous: Option<(&LoadedAgentsMd, &[RetainedProjectDoc])>,
     environment_id: &str,
     cwd: &PathUri,
-    source_budget: &mut usize,
-    rendered_budget: &mut usize,
-    failed_sources: Option<&[PathUri]>,
-) {
+) -> Vec<LoadedProjectDoc> {
     // Freshness is reported by the existing world-state transition. Putting a
     // notice in the body would spuriously replace unchanged instructions.
-    let Some((previous, sources)) = previous else { return; };
+    let Some((previous, sources)) = previous else { return Vec::new(); };
+    let mut retained = Vec::new();
     for entry in &previous.entries {
-        if let Some(paths) = failed_sources
-            && !matches!(&entry.provenance, InstructionProvenance::Project { source_path, .. } if paths.contains(source_path))
-        { continue; }
         if !matches!(&entry.provenance, InstructionProvenance::Project { environment_id: id, cwd: old_cwd, .. } if id == environment_id && old_cwd == cwd)
         {
             continue;
         }
-        let bytes = entry.contents.len();
-        let source_bytes = sources.iter().find(|source| {
+        if let Some(source) = sources.iter().find(|source| {
             source.environment_id == environment_id && &source.cwd == cwd
                 && entry.provenance.path().as_ref() == Some(&source.candidate.path)
-        }).map_or(bytes, |source| source.read.retained_data.len());
-        if bytes <= *rendered_budget && source_bytes <= *source_budget {
-            loaded.entries.push(entry.clone());
-            *rendered_budget -= bytes;
-            *source_budget -= source_bytes;
+        }) {
+            retained.push(LoadedProjectDoc {
+                candidate: ProjectDocCandidate {
+                    path: source.candidate.path.clone(),
+                    size: source.read.original_bytes,
+                },
+                read: source.read.clone(),
+            });
         }
     }
+    retained
 }
 
 /// Attempt to locate and load AGENTS.md documentation.

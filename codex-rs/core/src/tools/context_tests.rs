@@ -2144,6 +2144,45 @@ async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
 }
 
 #[tokio::test]
+async fn line_summary_recovery_names_its_first_omitted_diagnostic_group() {
+    let filler = |index: usize| format!("ordinary output line {index:04} padded so the log exceeds the display budget");
+    let mut lines = (0..900).map(filler).collect::<Vec<_>>();
+    for index in 0..12 {
+        lines[40 + index * 20] = format!("fatal: distinct category {index}");
+    }
+    let raw = lines.join("\n");
+    let (mut output, id, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+    output.exit_code = Some(1);
+    let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
+    let text = direct["output"].as_str().unwrap();
+    assert!(text.contains("Shell output summary:"), "{text}");
+    // Eight groups are shown; the first one left out is category 4 on line
+    // 121, addressed with the same three context lines a shown group gets.
+    assert_eq!(lines[120], "fatal: distinct category 4");
+    assert!(!text.contains("fatal: distinct category 4"), "{text}");
+    assert!(text.contains("first omitted group at lines 118-124"), "{text}");
+    let selector = json!({"kind": "lines", "start": 118, "end": 124});
+    assert_eq!(direct["recovery_selector"], selector);
+    assert_eq!(direct["recovery"]["arguments"], json!({"artifact_id": id.to_string(), "selectors": [selector]}));
+    let payload = ToolPayload::Function { arguments: "{}".into() };
+    assert_eq!(output.code_mode_result(&payload)["recovery_selector"], selector);
+
+    // With every diagnostic shown, the unselected head is not offered as the
+    // ready-to-use recovery; the artifact stays addressable.
+    let mut lines = (0..900).map(filler).collect::<Vec<_>>();
+    lines[400] = "fatal: the only failure".to_string();
+    let raw = lines.join("\n");
+    let (mut output, id, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+    output.exit_code = Some(1);
+    let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
+    let text = direct["output"].as_str().unwrap();
+    assert!(text.contains("Shell output summary:") && text.contains("fatal: the only failure"), "{text}");
+    assert!(!text.contains("ordinary output line 0000"), "{text}");
+    assert_eq!(direct["artifact_id"], id.to_string());
+    assert!(direct.get("recovery_selector").is_none() && direct.get("recovery").is_none());
+}
+
+#[tokio::test]
 async fn command_recovery_preserves_gap_extent_and_retained_bounds() {
     use crate::unified_exec::head_tail_buffer::OutputChunkRanges;
     let raw = "exact λ evidence\r\n".repeat(1000);
@@ -2166,7 +2205,7 @@ async fn command_recovery_preserves_gap_extent_and_retained_bounds() {
     // end, including CRLF and multibyte UTF-8, without a second size limit.
     output.raw_output = raw.as_bytes().to_vec();
     output.output_ranges = Some(OutputChunkRanges { range: 18..18 + retained, gap: None });
-    let mapped = output.missing_output_selector(&raw, "", Some((2, 800)), Some(18 + retained));
+    let mapped = output.missing_output_selector(&raw, "", Some((2, 800)), false, Some(18 + retained));
     let line_bytes = "exact λ evidence\r\n".len() as u64;
     assert_eq!(mapped, Some(json!({
         "kind":"bytes", "start":18 + line_bytes, "end":18 + 800 * line_bytes,

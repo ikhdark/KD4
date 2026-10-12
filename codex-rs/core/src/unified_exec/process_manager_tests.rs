@@ -2717,6 +2717,298 @@ async fn late_network_denial_grace_observes_cancellation_after_exit() {
     assert_eq!(Instant::now() - started_at, Duration::from_millis(10));
 }
 
+async fn network_completion_proxy(
+    turn: &crate::session::turn_context::TurnContext,
+) -> anyhow::Result<crate::config::StartedNetworkProxy> {
+    crate::config::NetworkProxySpec::from_config_and_constraints(
+        codex_network_proxy::NetworkProxyConfig {
+            enabled: true,
+            proxy_url: "http://127.0.0.1:0".to_string(),
+            enable_socks5: false,
+            allow_local_binding: true,
+            allow_upstream_proxy: false,
+            ..Default::default()
+        },
+        None,
+        &turn.permission_profile(),
+    )?
+    .start_proxy(
+        turn.config.codex_home.as_path(),
+        &turn.permission_profile(),
+        None,
+        None,
+        true,
+        codex_network_proxy::NetworkProxyAuditMetadata::default(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn network_completion_registration(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    proxy: &NetworkProxy,
+) -> DeferredNetworkApproval {
+    use crate::tools::network_approval::NetworkApprovalMode;
+    use crate::tools::network_approval::NetworkApprovalSpec;
+    crate::tools::network_approval::begin_network_approval(
+        session,
+        true,
+        Some(NetworkApprovalSpec {
+            network: Some(proxy.clone()),
+            mode: NetworkApprovalMode::Deferred,
+            cwd: turn.cwd().clone().into(),
+            command: "network-completion-fixture".to_string(),
+            environment_id: "local".to_string(),
+            approval_scope_id: "local".to_string(),
+        }),
+    )
+    .await
+    .expect("normal network registration")
+    .expect("active approval")
+    .into_deferred()
+    .expect("deferred approval owner")
+}
+
+async fn deny_network_completion(
+    session: &crate::session::session::Session,
+    deferred: &DeferredNetworkApproval,
+) {
+    let mut blocked = codex_network_proxy::BlockedRequest::new(
+        codex_network_proxy::BlockedRequestArgs {
+            host: "completion-denied.example".to_string(),
+            reason: "not_allowed".to_string(),
+            client: None,
+            method: None,
+            mode: None,
+            protocol: "http".to_string(),
+            decision: Some("deny".to_string()),
+            source: Some("decider".to_string()),
+            port: Some(80),
+        },
+    );
+    blocked.execution_id = Some(deferred.registration_id().to_string());
+    session.services.network_approval.record_blocked_request(blocked).await;
+}
+
+#[tokio::test]
+async fn deferred_network_completion_preserves_initial_grace_and_late_denial() -> anyhow::Result<()> {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let proxy = network_completion_proxy(&turn).await?;
+    let allowed = network_completion_registration(&session, &turn, &proxy.proxy()).await;
+    let denied = network_completion_registration(&session, &turn, &proxy.proxy()).await;
+    tokio::time::pause();
+    let started = Instant::now();
+    let mut first = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
+        Some(&session), Some(allowed),
+    ));
+    assert!(futures::poll!(&mut first).is_pending());
+    tokio::time::advance(Duration::from_millis(99)).await;
+    assert!(futures::poll!(&mut first).is_pending(), "first completion must retain the denial grace");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    first.await.map_err(anyhow::Error::msg)?;
+    // The grace is a minimum, not an exact wakeup deadline: Tokio's timer
+    // resolution may round the sleep up even with the clock paused.
+    assert!(started.elapsed() >= Duration::from_millis(100));
+
+    let mut late = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
+        Some(&session), Some(denied.clone()),
+    ));
+    assert!(futures::poll!(&mut late).is_pending());
+    tokio::time::advance(Duration::from_millis(10)).await;
+    deny_network_completion(&session, &denied).await;
+    assert!(late.await.unwrap_err().contains("completion-denied.example"));
+    tokio::time::resume();
+    Ok(())
+}
+
+#[tokio::test]
+async fn deferred_network_completion_concurrent_waiters_and_cancelled_initializer() -> anyhow::Result<()> {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let proxy = network_completion_proxy(&turn).await?;
+    let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
+    tokio::time::pause();
+    let mut cancelled = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
+        Some(&session), Some(deferred.clone()),
+    ));
+    assert!(futures::poll!(&mut cancelled).is_pending());
+    tokio::time::advance(Duration::from_millis(20)).await;
+    drop(cancelled);
+
+    let mut first = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
+        Some(&session), Some(deferred.clone()),
+    ));
+    let mut second = Box::pin(finish_deferred_network_approval_after_process_exit_for_session(
+        Some(&session), Some(deferred.clone()),
+    ));
+    assert!(futures::poll!(&mut first).is_pending());
+    assert!(futures::poll!(&mut second).is_pending());
+    tokio::time::advance(Duration::from_millis(10)).await;
+    deny_network_completion(&session, &deferred).await;
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect_err("surviving initializer must still see late denial");
+    assert!(first.contains("completion-denied.example"));
+    assert_eq!(second.unwrap_err(), first, "both concurrent consumers retain the same denial");
+    tokio::time::resume();
+    Ok(())
+}
+
+#[tokio::test]
+async fn deferred_network_completion_replays_cached_denial() -> anyhow::Result<()> {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let proxy = network_completion_proxy(&turn).await?;
+    let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
+    deny_network_completion(&session, &deferred).await;
+    let first = finish_deferred_network_approval_after_process_exit_for_session(
+        Some(&session), Some(deferred.clone()),
+    ).await.unwrap_err();
+    let second = finish_deferred_network_approval_after_process_exit_for_session(
+        Some(&session), Some(deferred),
+    ).await.unwrap_err();
+    assert!(first.contains("completion-denied.example"));
+    assert_eq!(second, first, "retiring the registration must not erase its cached denial");
+    Ok(())
+}
+
+// Start an actual quiet process through the local pipe owner, then use normal
+// manager registration, streaming and exit-watcher finalization. Only launch
+// policy/preflight is outside this final-poll workload; no model/provider runs.
+async fn network_completion_finished_process(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<crate::session::turn_context::TurnContext>,
+    deferred: Option<DeferredNetworkApproval>,
+) -> anyhow::Result<u32> {
+    let command: Vec<String> = if cfg!(windows) {
+        vec!["cmd.exe", "/d", "/c", "exit 0"]
+    } else {
+        vec!["sh", "-c", "exit 0"]
+    }.into_iter().map(str::to_string).collect();
+    let manager = &session.services.unified_exec_manager;
+    let mut reservation = manager.reserve_process_id().await;
+    manager.reserve_process_capacity(&mut reservation).await?;
+    let process_id = reservation.process_id();
+    let context = UnifiedExecContext::new(
+        Arc::clone(session), Arc::clone(turn), format!("network-completion-{process_id}"),
+    );
+    let cwd: PathUri = turn.cwd().clone().into();
+    let attempt = crate::tools::command_execution::CommandAttemptKey::new(
+        "exec_command", "local", cwd.to_string(), &command,
+    );
+    let mut registration = PendingProcessRegistration::new(
+        Arc::clone(&manager.process_store), &context, attempt.clone(), process_id,
+    );
+    let started = Instant::now();
+    let spawned = codex_utils_pty::spawn_pipe_process_no_stdin(
+        &command[0], &command[1..], turn.cwd().as_path(), &std::env::vars().collect(), &None,
+    ).await?;
+    let process = UnifiedExecProcess::from_spawned(
+        spawned, codex_sandboxing::SandboxType::None,
+        Box::new(crate::unified_exec::NoopSpawnLifecycle), None, &registration.pending_spawns(),
+    ).await?;
+    registration.attach_process(Arc::clone(&process), deferred.clone());
+    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+    ToolEmitter::unified_exec(
+        &command, cwd.clone(), ExecCommandSource::UnifiedExecStartup,
+        Some(process_id.to_string()), "local".to_string(),
+    ).begin(ToolEventCtx::new(session.as_ref(), turn.as_ref(), &context.call_id, None)).await?;
+    start_streaming_output(&process, &context, Arc::clone(&transcript))?;
+    manager.store_process(
+        Arc::clone(&process), &context, &command, command.join(" "), cwd,
+        "local".to_string(), started, process_id, &mut reservation, false, attempt,
+        crate::tools::command_output_artifact::RawOutputArtifact::unavailable("quiet benchmark"),
+        deferred, transcript, Arc::new(AtomicBool::new(false)), &mut registration, false, None,
+    ).await?;
+    tokio::time::timeout(Duration::from_secs(10), process.wait_for_terminal_completion())
+        .await.map_err(|error| anyhow::anyhow!(
+            "terminal completion timed out: {error}; exited={}, output_closed={}, output_drained={}, terminal_ready={}, exit_code={:?}, failure={:?}",
+            process.has_exited(), process.output_is_closed(),
+            process.output_drained_token().is_cancelled(), process.terminal_completion_is_ready(),
+            process.exit_code(), process.failure_message(),
+        ))?.map_err(anyhow::Error::msg)?;
+    assert!(process.has_exited());
+    assert!(process.output_is_closed());
+    assert_eq!(process.exit_code(), Some(0));
+    Ok(process_id)
+}
+
+#[ignore = "latency benchmark"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(clippy::print_stderr, reason = "ignored benchmark emits raw monotonic timings for paired comparison")]
+async fn deferred_network_completion_latency_benchmark() -> anyhow::Result<()> {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let proxy = network_completion_proxy(&turn).await?;
+    let executable = std::env::current_exe()?;
+    let epoch = std::time::Instant::now();
+    let mut samples: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
+    for sample in 0..20 {
+        let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
+        for phase in ["initial_grace", "cached_helper"] {
+            let started = std::time::Instant::now();
+            finish_deferred_network_approval_after_process_exit_for_session(
+                Some(&session), Some(deferred.clone()),
+            ).await.map_err(anyhow::Error::msg)?;
+            let elapsed_ns = u64::try_from(started.elapsed().as_nanos())?;
+            samples.entry(phase).or_default().push(elapsed_ns);
+            eprintln!("{}", serde_json::json!({
+                "benchmark": "deferred_network_completion", "executable": executable,
+                "sample": sample, "phase": phase,
+                "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
+                "elapsed_ns": elapsed_ns,
+            }));
+        }
+    }
+    for (phase, mut values) in samples {
+        values.sort_unstable();
+        let percentile = |percent: usize| values[(values.len() * percent).div_ceil(100) - 1];
+        eprintln!("{}", serde_json::json!({
+            "benchmark": "deferred_network_completion", "executable": executable,
+            "phase": phase, "samples": values.len(), "percentile_method": "nearest_rank",
+            "p50_ns": percentile(50), "p90_ns": percentile(90), "p95_ns": percentile(95),
+        }));
+    }
+    assert!(session.list_background_terminals().await.is_empty());
+    Ok(())
+}
+
+// A single real-process pair checks whether the helper mechanism is actually
+// on the final-poll path. Repeated spawn/finalization is not part of that timing
+// and must not dominate the separate 20-sample helper benchmark.
+#[ignore = "latency benchmark"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(clippy::print_stderr, reason = "ignored benchmark emits raw monotonic timings for paired comparison")]
+async fn deferred_network_completion_final_poll_benchmark() -> anyhow::Result<()> {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let proxy = network_completion_proxy(&turn).await?;
+    let executable = std::env::current_exe()?;
+    let epoch = std::time::Instant::now();
+    for with_network in [false, true] {
+        let deferred = if with_network {
+            Some(network_completion_registration(&session, &turn, &proxy.proxy()).await)
+        } else { None };
+        let process_id = network_completion_finished_process(&session, &turn, deferred).await?;
+        let started = std::time::Instant::now();
+        let response = session.services.unified_exec_manager.write_stdin(WriteStdinRequest {
+            process_id, input: "", yield_time_ms: 5_000, max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1_000),
+            nested_deadline: None,
+        }).await?;
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos())?;
+        assert_eq!(response.exit_code, Some(0));
+        assert!(response.process_exited);
+        assert!(response.process_id.is_none());
+        assert!(response.raw_output.is_empty());
+        let phase = if with_network { "final_poll_network" } else { "final_poll_no_network" };
+        eprintln!("{}", serde_json::json!({
+            "benchmark": "deferred_network_completion", "executable": executable,
+            "sample": 0, "phase": phase,
+            "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
+            "elapsed_ns": elapsed_ns,
+        }));
+    }
+    assert!(session.list_background_terminals().await.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;

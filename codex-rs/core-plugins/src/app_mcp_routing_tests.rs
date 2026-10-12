@@ -8,6 +8,7 @@ fn app(name: &str) -> AppDeclaration {
         name: name.to_string(),
         connector_id: AppConnectorId(format!("connector_{name}")),
         category: None,
+        required: false,
     }
 }
 

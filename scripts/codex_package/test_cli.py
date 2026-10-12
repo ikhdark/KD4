@@ -11,19 +11,19 @@ import unittest
 from unittest import mock
 from contextvars import Context
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from codex_package import cargo as cargo_module
-from codex_package import cli
-from codex_package.cargo import SourceBuildOutputs
-from codex_package.test_layout import use_package_notice_fixture
-from codex_package.test_layout import write_pe
+from scripts.codex_package import cargo as cargo_module
+from scripts.codex_package import cli
+from scripts.codex_package.cargo import SourceBuildOutputs
+from scripts.codex_package.test_layout import use_package_notice_fixture
+from scripts.codex_package.test_layout import write_pe
 
 
 class CliEntrypointTest(unittest.TestCase):
     def test_help_from_any_cwd_with_or_without_safe_path(self) -> None:
         repo = Path(__file__).resolve().parents[2]
-        script = repo / "scripts" / "build_codex_package.py"
+        script = repo / "scripts" / "codex_package" / "build_codex_package.py"
         with tempfile.TemporaryDirectory() as directory:
             for cwd in (repo, Path(directory)):
                 for safe_path in (False, True):

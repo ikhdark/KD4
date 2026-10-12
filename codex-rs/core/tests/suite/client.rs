@@ -1684,6 +1684,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
 async fn apps_guidance_request(
     auth: CodexAuth,
     include_apps_instructions: bool,
+    model: Option<&'static str>,
 ) -> ResponsesRequest {
     let server = MockServer::start().await;
     let apps_server = AppsTestServer::mount(&server)
@@ -1704,6 +1705,9 @@ async fn apps_guidance_request(
             .expect("test config should allow feature update");
         config.chatgpt_base_url = apps_base_url;
         config.include_apps_instructions = include_apps_instructions;
+        if let Some(model) = model {
+            config.model = Some(model.to_string());
+        }
     });
     let codex = builder
         .build(&server)
@@ -1737,17 +1741,26 @@ async fn apps_guidance_is_developer_only_and_gated_by_auth_and_config() {
     require_network!();
     let apps_snippet = "Use a relevant installed app when named";
 
-    for (case, auth, include_apps_instructions, expected) in [
-        ("chatgpt auth", create_dummy_codex_auth(), true, true),
+    for (case, auth, include_apps_instructions, model, expected) in [
+        ("chatgpt auth", create_dummy_codex_auth(), true, None, true),
         (
             "api key auth",
             CodexAuth::from_api_key("Test API Key"),
             true,
+            None,
             false,
         ),
-        ("configured off", create_dummy_codex_auth(), false, false),
+        ("configured off", create_dummy_codex_auth(), false, None, false),
+        // The catalog marks this model as needing no generic Apps guidance.
+        (
+            "model opts out",
+            create_dummy_codex_auth(),
+            true,
+            Some("gpt-6-astra"),
+            false,
+        ),
     ] {
-        let request = apps_guidance_request(auth, include_apps_instructions).await;
+        let request = apps_guidance_request(auth, include_apps_instructions, model).await;
         for needle in [APPS_INSTRUCTIONS_OPEN_TAG, apps_snippet] {
             assert_eq!(
                 message_input_text_contains(&request, "developer", needle),

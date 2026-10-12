@@ -301,6 +301,7 @@ impl ExecCommandHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let preparation_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_handler_preparation");
         let ToolInvocation {
             session,
             step_context,
@@ -691,13 +692,21 @@ impl ExecCommandHandler {
                 environment_fingerprint: environment_hash.clone(),
             });
         }
+        drop(preparation_phase);
+        let baseline_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_workspace_baseline_wait");
         crate::tools::parallel::wait_for_workspace_baseline().await;
+        drop(baseline_phase);
+        let tracker_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_mutation_tracker_wait");
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+        drop(tracker_phase);
+        let revision_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_repository_revision");
         let repository_epoch = session
             .services
             .command_execution
             .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
             .await;
+        drop(revision_phase);
+        let identity_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_workspace_identity");
         let workspace_identity = match cwd.to_abs_path() {
             Ok(cwd) => {
                 session
@@ -711,6 +720,8 @@ impl ExecCommandHandler {
             }
             Err(_) => None,
         };
+        drop(identity_phase);
+        let key_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_key");
         let validation_cwd = cwd.to_string();
         let attempt_key = CommandAttemptKey::new(
             self.tool_name().name.as_str(),
@@ -732,7 +743,9 @@ impl ExecCommandHandler {
             attempt_key
         }
         .with_search_environment(&effective_environment);
+        drop(key_phase);
         if !validation_launch {
+            let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_search_admission");
             session
                 .services
                 .command_execution
@@ -741,6 +754,7 @@ impl ExecCommandHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
         }
         let validation_attempt = validation_launch;
+        let reuse_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_running_validation_reuse");
         if validation.as_ref().is_some_and(crate::validation::CommandValidation::is_validation)
             && let Some((process_id, execution_id)) = session.services.command_execution
                 .identical_running_process(&attempt_key).await
@@ -750,11 +764,13 @@ impl ExecCommandHandler {
         {
             return Ok(boxed_tool_output(response));
         }
+        drop(reuse_phase);
         // Validation shares ordinary attempt accounting. Only input-state
         // determined failures are replayed; focused failing tests remain rerunnable.
         turn.full_suite_budget
             .admit(full_suite)
             .map_err(FunctionCallError::RespondToModel)?;
+        let attempt_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_freshness");
         if let Err(blocked) = session
                 .services
                 .command_execution
@@ -771,7 +787,9 @@ impl ExecCommandHandler {
                 blocked.render_for_model(),
             ));
         }
+        drop(attempt_phase);
 
+        let interception_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_patch_interception");
         let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
             validation_attempt,
@@ -788,6 +806,7 @@ impl ExecCommandHandler {
         )
         .await;
         let interception_wall_time = interception_started_at.elapsed();
+        drop(interception_phase);
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         session
             .services

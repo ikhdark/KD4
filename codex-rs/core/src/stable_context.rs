@@ -81,12 +81,15 @@ fn is_trusted_stable_context_id(id: &ResponseItemId) -> bool {
         .starts_with(TRUSTED_STABLE_CONTEXT_ITEM_ID_PREFIX)
 }
 
-/// Keep provider IDs outside the namespace reserved for local context producers.
+/// Keep provider IDs outside the namespaces reserved for local context, user input,
+/// and loader-owned integrity diagnostics.
 /// The deterministic replacement keeps added/done events and response history
 /// aligned without changing ordinary provider IDs or durable local context IDs.
 pub(crate) fn normalize_provider_context_item_id(item: &mut ResponseItem) {
     if let ResponseItem::Message { id: Some(id), .. } = item
-        && is_trusted_stable_context_id(id)
+        && (is_trusted_stable_context_id(id)
+            || crate::event_mapping::is_user_input_item_id(id)
+            || codex_rollout::is_rollout_reconstruction_notice_id(id))
     {
         *id = ResponseItemId::with_suffix("msg", id.as_str());
     }

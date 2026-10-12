@@ -27,6 +27,16 @@ use uuid::Uuid;
 use crate::context::SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG;
 use crate::context::is_contextual_user_fragment;
 use crate::context::parse_visible_hook_prompt_message;
+
+// Only accepted user-input ingestion assigns this durable origin marker.
+// Generic legacy `msg_` IDs also belong to host context (including hooks), so
+// their content-based classification must remain unchanged.
+pub(crate) const USER_INPUT_ITEM_ID_BASE: &str = "msg_user";
+
+pub(crate) fn is_user_input_item_id(id: &str) -> bool {
+    id.starts_with("msg_user_")
+}
+
 const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
     "<permissions instructions>",
     "<model_switch>",
@@ -42,6 +52,13 @@ const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
 pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> bool {
     // A contextual fragment must not hide ordinary text or images in the same message.
     !message.is_empty() && message.iter().all(is_contextual_user_fragment)
+}
+
+pub(crate) fn is_contextual_user_message(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { id, role, content, .. }
+        if role == "user"
+            && !id.as_ref().is_some_and(|id| is_user_input_item_id(id))
+            && is_contextual_user_message_content(content))
 }
 
 /// Returns true when a developer message contains any rollback-trimmable contextual fragment.
@@ -151,6 +168,9 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
             phase,
             ..
         } => match role.as_str() {
+            "user" if id.as_ref().is_some_and(|id| is_user_input_item_id(id)) => {
+                Some(TurnItem::UserMessage(parse_user_message_content(content)))
+            }
             "user" => parse_visible_hook_prompt_message(id.as_deref(), content)
                 .map(TurnItem::HookPrompt)
                 .or_else(|| parse_user_message(content).map(TurnItem::UserMessage)),

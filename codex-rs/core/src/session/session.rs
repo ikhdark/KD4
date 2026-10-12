@@ -610,7 +610,7 @@ pub(crate) struct Session {
     /// session.
     pub(super) features: ManagedFeatures,
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
-    pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
+    pub(super) pending_mcp_server_refresh_config: Mutex<Option<Arc<McpServerRefreshConfig>>>,
     /// Serializes turn replacement and startup through RunningTask installation.
     pub(crate) task_start_gate: Semaphore,
     /// Bounds ordinary submissions across channels and deferred preparation,

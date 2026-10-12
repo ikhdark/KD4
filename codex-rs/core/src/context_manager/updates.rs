@@ -64,7 +64,7 @@ fn build_permissions_update_item(
     Some(instructions)
 }
 
-fn build_collaboration_mode_update_item(
+pub(crate) fn build_collaboration_mode_update_item(
     previous: Option<&TurnContextItem>,
     next: &TurnContext,
 ) -> Option<String> {
@@ -116,7 +116,7 @@ fn build_multi_agent_mode_update_item(
     }
 }
 
-fn build_personality_update_item(
+pub(crate) fn build_personality_update_item(
     previous: Option<&TurnContextItem>,
     next: &TurnContext,
     personality_feature_enabled: bool,
@@ -162,7 +162,7 @@ fn generic_personality_message(personality: Personality) -> Option<&'static str>
             "Be warm, collaborative, and candid. Keep momentum while explaining decisions clearly; never trade truthfulness for agreement.",
         ),
         Personality::Pragmatic => Some(
-            "Be concise, direct, and engineering-focused. State assumptions, tradeoffs, and next actions plainly; avoid filler.",
+            "Be concise, direct, and engineering-focused. State assumptions, tradeoffs, and next actions only when they change what the user should do; avoid filler.",
         ),
     }
 }

@@ -1125,6 +1125,48 @@ fn original_request_and_corrections_survive_later_bulk_input() {
 }
 
 #[test]
+fn repeated_compaction_without_new_input_adds_no_bookkeeping() {
+    let original = "Diagnosis only; do not edit.";
+    let bulk = "log payload ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 4);
+    let (mut history, _, _, omitted_user, omitted_text) =
+        build_local_task_input_checkpoint(&[user_message(original), user_message(&bulk)]);
+    assert!(omitted_user && omitted_text);
+    // The remote path stores the recovery sidecar as its own context message.
+    let sidecar = |artifact_id: &str| serde_json::json!({
+        "version": 1, "kind": "local_compaction_text_recovery", "artifact_id": artifact_id,
+    }).to_string();
+    bind_omission_receipts_to_recovery(&mut history, &sidecar("artifact-1"));
+    history.push(compaction_context_message(sidecar("artifact-1")));
+    let bookkeeping = |items: &[ResponseItem]| items.iter()
+        .filter(|item| is_compaction_text_bookkeeping_item(item)).cloned().collect::<Vec<_>>();
+    let user_tokens = |items: &[ResponseItem]| collect_user_messages(items).iter()
+        .map(compacted_user_message_text_tokens).sum::<usize>();
+    let first_bookkeeping = bookkeeping(&history);
+    let first_tokens = user_tokens(&history);
+    // One receipt for the cut payload plus the sidecar that holds its exact text.
+    assert_eq!(first_bookkeeping.len(), 2);
+    assert!(collect_user_messages(&history).iter()
+        .any(|message| message.content == compacted_user_message(original).content));
+    for _ in 0..3 {
+        let (mut next, _, _, omitted_user, omitted_text) = build_local_task_input_checkpoint(&history);
+        assert!(!omitted_user && !omitted_text, "nothing new was cut");
+        // A later compaction must not rebind receipts that already name their artifact.
+        bind_omission_receipts_to_recovery(&mut next, &sidecar("artifact-2"));
+        assert_eq!(bookkeeping(&next), first_bookkeeping);
+        assert_eq!(user_tokens(&next), first_tokens);
+        history = next;
+    }
+    let receipt = first_bookkeeping.iter().find_map(|item| {
+        let ResponseItem::Message { content, .. } = item else { return None; };
+        let ContentItem::InputText { text } = &content[0] else { return None; };
+        let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        (value["kind"] == COMPACT_TEXT_OMISSION_MARKER).then_some(value)
+    }).unwrap();
+    assert_eq!(receipt["artifact_id"], "artifact-1");
+    assert_eq!(receipt["recovery_selector"]["pointer"], "/items/1");
+}
+
+#[test]
 fn rebase_cannot_silently_erase_unresolved_prohibition() {
     let anchor = "Diagnosis only; do not edit. Verification remains unfinished.";
     let previous = format!("{SUMMARY_PREFIX}\n## Goal\nDiagnose.\n## Current state\nInvestigating.\n## Completed work\nRead source.\n## Unresolved work\n{anchor}\n## Evidence\nSource.\n## Next action\nVerify.");

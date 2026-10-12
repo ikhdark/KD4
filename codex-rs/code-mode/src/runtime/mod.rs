@@ -933,12 +933,24 @@ fn capture_scope_send_error(
     );
 }
 
+fn unawaited_tool_error(scope: &v8::PinScope<'_, '_>) -> Option<String> {
+    scope.get_slot::<RuntimeState>().and_then(|state| {
+        (!state.pending_tool_calls.is_empty()).then(|| format!(
+            "cell completed with {} unawaited tool call(s); outstanding tool work is cancelled",
+            state.pending_tool_calls.len()
+        ))
+    })
+}
+
 fn send_result(
     scope: &v8::PinScope<'_, '_>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     mut stored_value_writes: HashMap<String, StoredValue>,
     error_text: Option<String>,
 ) {
+    // Timer exit bypasses completion_state. Every terminal path must reject
+    // abandoned tools, including exit(), without replacing an earlier error.
+    let error_text = error_text.or_else(|| unawaited_tool_error(scope));
     // Catching an admission error and completing successfully can compact and
     // commit retained evidence. A failed quota-exceeding cell is transactional:
     // do not commit the prefix of its writes.

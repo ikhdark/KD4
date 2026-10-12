@@ -168,8 +168,8 @@ pub(super) fn resolve_batch(
                         matches.extend(items.iter().flatten().filter(|item|
                             item.kind != "impl" && item.name == last));
                     }
-                    // A name this file only imports or re-exports is not a macro
-                    // problem: show the declaration that names its owner.
+                    // Tokens may be path prefixes, renamed-away names or names in
+                    // another scope. Offer source evidence, not import resolution.
                     if matches.is_empty() {
                         let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
                         matches.extend(items.iter().flatten().filter(|item| item.kind == "use"
@@ -188,7 +188,7 @@ pub(super) fn resolve_batch(
                 }
                 let mut message = error.for_model();
                 if imported {
-                    message.push_str(" The candidates are use declarations: this file imports or re-exports the name rather than defining it; follow the path to its owner.");
+                    message.push_str(" The candidates are lexical token matches in use declarations, not resolved imports or re-exports. Check aliases, scope and cfg before following a possible owner; no definition or reference relationship is established.");
                 }
                 failures.push(serde_json::json!({"selector_index":index, "selector":selector,
                     "status":"invalid_selector", "complete":false, "message":message,
@@ -371,10 +371,28 @@ mod tests {
         ]));
         assert_eq!(errors[0]["candidates"], serde_json::json!([{"qualified_name":"pub use inner::Thing;",
             "selector":{"kind":"lines","start":1,"end":1}}]));
-        assert!(errors[0]["message"].as_str().unwrap().contains("imports or re-exports the name"));
+        assert!(errors[0]["message"].as_str().unwrap().contains("lexical token matches"));
         assert_eq!(errors[1]["candidates"][0]["selector"], serde_json::json!({"kind":"lines","start":2,"end":2}));
         assert!(errors[2]["candidates"].as_array().unwrap().is_empty());
         assert!(!errors[2]["message"].as_str().unwrap().contains("imports"));
+    }
+
+    #[test]
+    fn use_tokens_do_not_establish_imported_symbol_identity() {
+        let mut canonical = CanonicalToolResult::text(
+            "use original::Thing as Alias;\n#[cfg(any())]\nuse disabled::Ghost;\nmod nested { use elsewhere::Other; }\n");
+        let (resolved, errors, bindings) = resolve_batch("lib.rs", &mut canonical, Some(
+            ["original", "Thing", "Alias", "Ghost", "Other"].into_iter().map(|name|
+                FileSelector::Structure(StructureSelector::Symbol { name: name.into() })).collect()));
+        assert!(resolved.unwrap().is_empty());
+        assert!(bindings.is_empty());
+        assert_eq!(errors.len(), 5);
+        for error in errors {
+            assert_eq!(error["complete"], false);
+            assert_eq!(error["source_sha256"], canonical.sha256);
+            assert_eq!(error["candidates"].as_array().unwrap().len(), 1);
+            assert!(error["message"].as_str().unwrap().contains("no definition or reference relationship is established"));
+        }
     }
 
     #[test]

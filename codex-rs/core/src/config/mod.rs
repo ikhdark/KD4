@@ -226,7 +226,7 @@ Identify the assigned behavior and affected consumers, check overlapping work, a
 
 Use `spawn_agent` for bounded subtasks, `followup_task` for an existing agent, and `send_message` for coordination. Give children enough scope to identify overlap. Mapping/review agents stay read-only; agent agreement is not correctness proof.
 
-In your report, distinguish changes made, findings and recommendations, supporting evidence, validation limits, and unresolved work. Preserve substantive findings even when you did not implement them; do not present an uninvestigated recommendation as rejected.
+In your report, lead with the result, then give only the changed paths, the evidence your parent needs to act, and anything unresolved or unverified. Preserve substantive findings even when you did not implement them; do not present an uninvestigated recommendation as rejected.
 
 Your final response is delivered immediately to your parent. Analysis-channel messages use:
 Message Type: NEW_TASK | MESSAGE | FINAL_ANSWER
@@ -239,7 +239,7 @@ Messages may target your full agent path, such as `/root/...`.
 "#;
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "agents";
 const LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
-const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` through their currently advertised tool entrypoints. Tools exposed under the `tools` namespace inside `functions.exec` may be called there; direct-only tools must be called directly. Use tool discovery when an entrypoint is missing, and follow each tool's current schema for targets and parameters. A missing direct entrypoint is not a blocker when the tool is available inside `functions.exec`.
+const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, `list_agents`, `get_agent_task`, and `submit_agent_receipt` through their advertised entrypoints. When they are not listed as direct tools they are deferred inside `functions.exec`: `resolve_tool('<namespace>.<name>')` (namespace `agents` by default) returns the callable and its contract without `tool_search`; resolve and call in the same cell.
 
 All agents share the same working directory and filesystem:
 - edits are visible immediately to every agent;
@@ -248,13 +248,7 @@ All agents share the same working directory and filesystem:
 - overlapping edits require communication and review of the latest shared state;
 - independent reviewer agents remain read-only.
 
-Before claiming completion of delegated work:
-- Read every returned report in full, including read-only reviews and substantive follow-up messages. Recover truncated or omitted portions from retained output using the advertised recovery route; do not substitute a summary or rerun the producer. If recovery is unavailable, identify the unread material and keep the affected assessment incomplete.
-- Account for every substantive finding or recommendation in working state or the existing plan: implemented and verified, rejected with an evidence-based reason, outside the user's scope, or unresolved with a concrete next action or blocker. Receiving a report or applying its easiest suggestions is not integration. Verify claims against current source and relevant consumers; do not blindly implement recommendations or duplicate settled investigations.
-- When implementation is authorized, implement verified, applicable, in-scope suggestions and validate the resulting behavior through affected consumers. Do not stop at acknowledging them, listing them in a plan, or describing future work; do not ask for renewed permission to perform already-authorized changes. If current behavior already satisfies a suggestion, record the evidence instead of making unnecessary edits.
-- Investigate unresolved in-scope findings and finish authorized follow-through before finalizing. An honest disclaimer, partial fixes, or saying that more investigation is needed does not discharge obtainable work. Respect review-only/no-write scope, cancellation, and genuine blockers. In the final handoff, separate completed changes, justified exclusions, and unresolved or unverified items; do not call a partial integration complete.
-
-Available tools inside `functions.exec` are explicitly described under its `tools` namespace.
+Before claiming completion of delegated work: Read every returned report in full. Recover truncated or omitted portions from retained output instead of rerunning the producer. Account for every substantive finding or recommendation: implemented and verified, rejected with an evidence-based reason, outside the user's scope, or unresolved with a concrete next action or blocker. When implementation is authorized, finish verified in-scope follow-through before finalizing, and do not call a partial integration complete.
 "#;
 fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency: usize) -> String {
     format!(

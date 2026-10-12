@@ -6753,3 +6753,59 @@ async fn typed_child_runtime_uses_consumed_parent_identity() {
         .await
         .expect("stop typed child");
 }
+#[test]
+fn spawn_agent_fork_last_n_turns_bounds_compaction_checkpoints() {
+    run_current_thread_test_with_stack(
+        "spawn_agent_fork_last_n_turns_bounds_compaction_checkpoints",
+        || async {
+            for identifiable_boundary in [true, false] {
+                let harness = AgentControlHarness::new().await;
+                let (parent_thread_id, parent_thread) = harness.start_thread().await;
+                parent_thread.inject_user_message_without_turn("excluded old parent task".into()).await;
+                parent_thread.inject_user_message_without_turn("current parent task".into()).await;
+                let mut replacement_history = parent_thread.codex.session.clone_history().await.into_raw_items();
+                if !identifiable_boundary {
+                    replacement_history.retain(|item| !history_contains_text(std::slice::from_ref(item), "current parent task"));
+                }
+                replacement_history.push(assistant_message("checkpoint-only current answer", None));
+                parent_thread.codex.session.persist_rollout_items(&[RolloutItem::Compacted(CompactedItem {
+                    message: String::new(), replacement_history: Some(replacement_history),
+                    window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+                })]).await;
+                let spawn_turn = parent_thread.codex.session.new_default_turn().await;
+                parent_thread.codex.session.record_conversation_items(
+                    &spawn_turn, &[spawn_agent_call("spawn-call-checkpoint")],
+                ).await.unwrap();
+                parent_thread.ensure_rollout_materialized().await;
+                parent_thread.flush_rollout().await.expect("flush parent checkpoint");
+                let started = std::time::Instant::now();
+                let result = harness.control.spawn_agent_with_metadata(
+                    harness.config.clone(), text_input("child task"),
+                    Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        parent_thread_id, depth: 1, agent_path: None, agent_nickname: None, agent_role: None,
+                    })),
+                    SpawnAgentOptions {
+                        fork_parent_spawn_call_id: Some("spawn-call-checkpoint".into()),
+                        fork_mode: Some(SpawnAgentForkMode::LastNTurns(1)), ..Default::default()
+                    },
+                ).await;
+                eprintln!("last_n_checkpoint_spawn_elapsed={:?}", started.elapsed());
+                if identifiable_boundary {
+                    let child_thread_id = result.expect("bounded checkpoint fork").thread_id;
+                    let child = harness.manager.get_thread(child_thread_id).await.expect("child thread");
+                    let history = child.codex.session.clone_history().await;
+                    assert!(!history_contains_text(history.raw_items(), "excluded old parent task"));
+                    assert!(history_contains_text(history.raw_items(), "current parent task"));
+                    assert!(history_contains_text(history.raw_items(), "checkpoint-only current answer"));
+                    assert!(child.codex.session.reference_context_item().await.is_none());
+                    harness.control.shutdown_live_agent(child_thread_id).await.expect("shutdown child");
+                } else {
+                    assert!(matches!(result, Err(CodexErr::InvalidRequest(message))
+                        if message.contains("compaction checkpoint does not uniquely identify")),
+                        "an unidentifiable checkpoint must fail, not leak old turns or lose current checkpoint content");
+                }
+                parent_thread.submit(Op::Shutdown {}).await.expect("shutdown parent");
+            }
+        },
+    );
+}

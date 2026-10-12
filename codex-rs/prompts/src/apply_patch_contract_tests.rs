@@ -21,8 +21,8 @@ fn apply_patch_instructions_stay_compact_and_complete() {
         "Order chunks from top to bottom.",
         "failure or cancellation may leave earlier changes committed",
         "Do not include unified-diff headers such as `diff --git`, `---`, or `+++`.",
-        "After stale context, a concurrent edit, a context mismatch, or a failure that may have modified files, re-read only the affected current sections before retrying.",
-        "For errors known to occur before file mutation, correct the error without re-reading unchanged contents.",
+        "Context, hash, and JSON conflicts are detected before any file is written: correct the patch from the current-source excerpt in the error",
+        "After a concurrent edit or a failure that may have modified files, re-read only the affected current sections before retrying.",
         "rename it without hunks",
         "single multiline argument, preserving actual line breaks",
     ] {

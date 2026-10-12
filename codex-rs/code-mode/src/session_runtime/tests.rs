@@ -874,6 +874,15 @@ async fn named_state_deletion_rejects_concurrent_replacement() {
 }
 
 #[test]
+fn qualified_cell_ids_preserve_legacy_snapshot_counter_parsing() {
+    assert_eq!(cell_id_sequence("17"), Some(17));
+    assert_eq!(cell_id_sequence("00000000-0000-4000-8000-000000000001/17"), Some(17));
+    for invalid in ["foreign/17", "g2:17", "00000000-0000-4000-8000-000000000001/17/2", ""] {
+        assert_eq!(cell_id_sequence(invalid), None);
+    }
+}
+
+#[test]
 fn durable_restart_never_reuses_uncompleted_cell_ids() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.json");
@@ -1276,7 +1285,7 @@ async fn drop_terminates_cells_when_the_registry_is_locked() {
         )
         .await
         .unwrap();
-    assert_eq!(started.cell_id, CellId::new("1"));
+    assert_eq!(cell_id_sequence(started.cell_id.as_str()), Some(1));
     assert_eq!(
         started.initial_event().await,
         Ok(CellEvent::Yielded {

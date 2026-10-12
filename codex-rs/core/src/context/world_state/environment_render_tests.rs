@@ -133,7 +133,7 @@ fn serialize_environment_context_with_network() {
   <shell>bash</shell>
   <current_date>2026-02-26</current_date>
   <timezone>America/Los_Angeles</timezone>
-  <network enabled="true"><allowed>api.example.com,*.openai.com</allowed><denied>blocked.example.com</denied></network>
+  <managed_network_proxy configured_enabled="true"><required_allowed>api.example.com,*.openai.com</required_allowed><required_denied>blocked.example.com</required_denied></managed_network_proxy>
 </environment_context>"#,
         test_path_buf("/repo").display()
     );
@@ -145,7 +145,7 @@ fn serialize_environment_context_with_network() {
 fn serialize_disabled_network_context() {
     assert_eq!(
         NetworkContext::new(/*enabled*/ false, vec![], vec![]).render(),
-        r#"<network enabled="false"></network>"#
+        r#"<managed_network_proxy configured_enabled="false"></managed_network_proxy>"#
     );
 }
 
@@ -158,7 +158,7 @@ fn serialize_network_context_escapes_domain_values() {
             vec!["\"blocked'.example.com".to_string()],
         )
         .render(),
-        r#"<network enabled="true"><allowed>api&amp;&lt;example&gt;.com</allowed><denied>"blocked'.example.com</denied></network>"#
+        r#"<managed_network_proxy configured_enabled="true"><required_allowed>api&amp;&lt;example&gt;.com</required_allowed><required_denied>"blocked'.example.com</required_denied></managed_network_proxy>"#
     );
 }
 

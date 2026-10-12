@@ -229,15 +229,6 @@ impl LocalThreadProjection {
         }
     }
 
-    fn append_durable(&mut self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        if self.pending_items.is_empty() {
-            return self.apply_persisted_items(items);
-        }
-        let mut durable_items = std::mem::take(&mut self.pending_items);
-        durable_items.extend_from_slice(items);
-        self.apply_persisted_items(durable_items.as_slice())
-    }
-
     pub(super) fn append_pending(&mut self, items: Vec<RolloutItem>) {
         self.pending_items.extend(items);
     }
@@ -525,10 +516,6 @@ impl LocalThreadProjectionEntry {
 
     async fn initialize(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
         self.state.lock().await.initialize(items)
-    }
-
-    pub(super) async fn append_durable(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        self.state.lock().await.append_durable(items)
     }
 
     pub(super) async fn append_pending(&self, items: Vec<RolloutItem>) {

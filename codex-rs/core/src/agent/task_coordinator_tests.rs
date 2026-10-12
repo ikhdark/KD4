@@ -34,6 +34,140 @@ fn assignment_draft() -> AssignmentDraft {
     }
 }
 
+#[tokio::test]
+async fn missing_receipt_for_amended_attempt_uses_effective_criteria() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(state, "root-session".to_string())
+        .await
+        .unwrap();
+    let store = coordinator.required_store().unwrap();
+    for (index, status) in [
+        AgentStatus::Completed(Some("correction finished without a receipt".to_string())),
+        AgentStatus::Errored("correction failed".to_string()),
+        AgentStatus::Shutdown,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut draft = assignment_draft();
+        draft.workspace_strategy = WorkspaceStrategy::Shared;
+        let (assignment, original_attempt) = coordinator
+            .create_assignment(repo.path(), draft)
+            .await
+            .unwrap();
+        let task_name = format!("amended_fallback_{index}");
+        let path = AgentPath::root().join(&task_name).unwrap();
+        let thread_id = ThreadId::new();
+        coordinator
+            .bind_agent_task(AgentTaskBindingDraft {
+                assignment_id: assignment.assignment_id,
+                attempt_id: original_attempt.attempt_id,
+                agent_path: path.to_string(),
+                task_name,
+                thread_id: Some(thread_id.to_string()),
+            })
+            .await
+            .unwrap();
+        coordinator
+            .seal_missing_receipt_for_attempt(
+                &path,
+                thread_id,
+                &AgentStatus::Completed(None),
+                original_attempt.attempt_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .set_agent_gate(
+                TaskActor::Root,
+                assignment.assignment_id,
+                codex_agent_task_store::GateKind::Review,
+                codex_agent_task_store::GateStatus::ChangesRequested,
+                "review requires revised acceptance criteria".to_string(),
+            )
+            .await
+            .unwrap();
+        let revised_criteria = vec![AcceptanceCriterion {
+            id: "corrected-criterion".to_string(),
+            text: "the amended requirement is satisfied".to_string(),
+        }];
+        let amended_attempt = store
+            .amend_agent_task(
+                TaskActor::Root,
+                assignment.assignment_id,
+                codex_agent_task_store::AttemptAmendment {
+                    reason: "apply the review correction".to_string(),
+                    objective: None,
+                    acceptance_criteria: Some(revised_criteria.clone()),
+                    stop_condition: None,
+                },
+            )
+            .await
+            .unwrap();
+        coordinator
+            .refresh_binding(assignment.assignment_id)
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .seal_missing_receipt_for_attempt(
+                    &path,
+                    thread_id,
+                    &status,
+                    original_attempt.attempt_id,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "an old completion must not seal the correction attempt"
+        );
+        let receipt = coordinator
+            .seal_missing_receipt_for_attempt(
+                &path,
+                thread_id,
+                &status,
+                amended_attempt.attempt_id,
+            )
+            .await
+            .expect("fallback must satisfy the amended receipt contract")
+            .expect("a missing correction receipt must be sealed");
+        assert_eq!(receipt.attempt_id, amended_attempt.attempt_id);
+        assert_eq!(receipt.status, AgentStatusClaim::NeedsMain);
+        assert_eq!(receipt.criterion_results.len(), revised_criteria.len());
+        for (result, criterion) in receipt.criterion_results.iter().zip(&revised_criteria) {
+            assert_eq!(result.criterion_id, criterion.id);
+            assert_eq!(result.status, CriterionStatus::NotRun);
+            assert!(result.evidence_ref.is_none());
+        }
+        let task = coordinator
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(task.current_attempt.state, AttemptState::NeedsMain);
+        assert_eq!(task.receipt, Some(receipt));
+        assert!(
+            coordinator
+                .seal_missing_receipt_for_attempt(
+                    &path,
+                    thread_id,
+                    &status,
+                    amended_attempt.attempt_id,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "duplicate completion must not replace the immutable receipt"
+        );
+    }
+}
+
 fn test_session_telemetry() -> SessionTelemetry {
     SessionTelemetry::new(
         ThreadId::new(),

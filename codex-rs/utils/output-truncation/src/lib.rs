@@ -75,6 +75,12 @@ pub struct TruncatedTextOutput {
 }
 
 pub fn adaptive_output_budget_description() -> String {
+    // Naming three identical ceilings tells the model nothing.
+    if DEFAULT_FAILURE_OUTPUT_TOKENS == DEFAULT_SUCCESS_OUTPUT_TOKENS
+        && DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS == DEFAULT_SUCCESS_OUTPUT_TOKENS
+    {
+        return format!("Defaults to up to {DEFAULT_SUCCESS_OUTPUT_TOKENS} tokens");
+    }
     format!(
         "Defaults to a coherent packet of up to {DEFAULT_SUCCESS_OUTPUT_TOKENS} tokens; \
          failure/timeout and high-signal diagnostics use up to \

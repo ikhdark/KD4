@@ -1457,6 +1457,7 @@ fn app_declarations_from_remote_app_ids(app_ids: &[String]) -> Vec<AppDeclaratio
             name: app_id.clone(),
             connector_id: AppConnectorId(app_id.clone()),
             category: None,
+            required: false,
         })
         .collect()
 }

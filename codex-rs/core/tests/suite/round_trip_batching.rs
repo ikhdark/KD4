@@ -583,15 +583,14 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
     // roots and workers alike.
     let instructions = requests[0].instructions_text();
     for rule in [
-        "Use supplied sessions for the requested analysis, comparison, review, or implementation; a session alone does not authorize code changes.",
-        "Focused diagnostic or baseline checks may run before and during implementation.",
-        "Run final verification after the last relevant edit, subject to the full-suite budget and failure-only retry rule above.",
+        "User-sent issues, logs, findings, and sessions are requests to investigate; change files only when the request calls for implementation",
+        "Run final verification after the last relevant edit",
         "Sequence dependencies and shared-resource conflicts, including Cargo commands sharing a target directory.",
-        "Resume live operations rather than restarting them.",
-        "Reuse current reads, schemas, exact values, inventories, and passing checks",
-        "Choose the smallest checks that cover the requested behavior and credible regressions introduced by the change",
-        "Retain complete data in the producing environment before crossing the tool boundary",
-        "Recover missing output and follow-up ranges from retained artifacts before rerunning producers or reacquiring unchanged evidence",
+        "Resume a live operation rather than restarting it.",
+        "Do not read or run again what is already in context",
+        "Choose the smallest checks that cover the requested behavior and the credible regressions introduced by the change",
+        "A display limit is not a retention guarantee",
+        "Recover missing output from its retained artifact (`read_tool_output`) before rerunning the producer",
     ] {
         assert_eq!(
             instructions.matches(rule).count(),
@@ -612,7 +611,7 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
 
     assert_eq!(
         instructions
-            .matches("Batch known independent calls with bounded tool-native concurrency")
+            .matches("Batch known independent calls in one execution cell with bounded concurrency")
             .count(),
         1,
         "base instructions must state the batching policy exactly once"

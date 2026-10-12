@@ -279,6 +279,17 @@ impl AgentTaskCoordinator {
         Ok(removed)
     }
 
+    /// Resolve authority against the attempt captured at turn entry, never a
+    /// correction attempt rebound while this turn's calls are still in flight.
+    pub(crate) fn binding_for_turn(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+    ) -> Option<AgentTaskBinding> {
+        turn.agent_task_binding
+            .get_or_init(|| self.binding_for_source(&turn.session_source))
+            .clone()
+    }
+
     pub(crate) fn binding_for_source(
         &self,
         session_source: &SessionSource,
@@ -594,8 +605,11 @@ impl AgentTaskCoordinator {
                 "typed agent {agent_path}, attempt {}, stopped with execution outcome {outcome:?} without submitting a receipt: {summary}", binding.attempt_id
             ),
             criterion_results: task
-                .assignment
-                .acceptance_criteria
+                .current_attempt
+                .amendment
+                .as_ref()
+                .and_then(|amendment| amendment.acceptance_criteria.as_deref())
+                .unwrap_or(&task.assignment.acceptance_criteria)
                 .iter()
                 .map(|criterion| CriterionResult {
                     evidence_ref: None,

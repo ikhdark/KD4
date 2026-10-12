@@ -698,11 +698,18 @@ impl CommandExecutionLedger {
         let (repository_epoch, expected_repository_root) = {
             let mut state = self.state.lock().await;
             let repository_epoch = state.repository.epoch;
+            // Local mutation revisions do not include external edits. A supplied
+            // dispatch baseline must agree before reusing the cached identity.
             if state
                 .repository
                 .observed_workspace_identity
                 .as_ref()
-                .is_some_and(|(epoch, _)| *epoch == repository_epoch)
+                .is_some_and(|(epoch, identity)| {
+                    *epoch == repository_epoch
+                        && observed_workspace_identity
+                            .as_ref()
+                            .is_none_or(|observed| observed == identity)
+                })
                 || (observed_workspace_identity.is_none()
                     && state.repository.workspace_identity_observation_epoch
                         == Some(repository_epoch)
@@ -3543,6 +3550,112 @@ mod tests {
                 .map(|(_, identity)| identity),
             Some(&changed)
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_baseline_same_epoch_external_edit_does_not_reuse_running_process() {
+        let temp = tempfile::tempdir().expect("workspace baseline fixture");
+        let repository = temp.path().join("repo");
+        initialize_git_repository(&repository);
+        let source = repository.join("input.txt");
+        std::fs::write(&source, "original input").expect("initial input");
+        let ledger = CommandExecutionLedger::load_or_new(
+            temp.path().join("home"),
+            "external-edit".to_string(),
+            &repository,
+        )
+        .await;
+        let first = crate::git_workspace::capture_workspace_evidence_identity(&repository)
+            .await
+            .expect("first baseline");
+        ledger
+            .observe_workspace_baseline("turn", 0, &repository, Some(first.clone()))
+            .await;
+        let epoch = ledger.observe_repository_revision("turn", 0).await;
+        let first_hash = ledger
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("first workspace identity");
+        let command = ["cargo", "test", "-p", "app"].map(str::to_string);
+        let attempt = |identity: &str| {
+            CommandAttemptKey::new(
+                "exec_command",
+                codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                repository.to_string_lossy(),
+                &command,
+            )
+            .with_repository_epoch(epoch)
+            .with_workspace_identity(Some(identity))
+        };
+        ledger
+            .track_running_process(
+                42,
+                attempt(&first_hash),
+                RawOutputArtifact::unavailable("fixture"),
+            )
+            .await
+            .expect("track original validation");
+
+        // Another supplied baseline with unchanged inputs may reuse the live run.
+        ledger
+            .observe_workspace_baseline("turn", 0, &repository, Some(first.clone()))
+            .await;
+        let unchanged_hash = ledger
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("unchanged workspace identity");
+        assert_eq!(unchanged_hash, first_hash);
+        assert_eq!(
+            ledger
+                .identical_running_process(&attempt(&unchanged_hash))
+                .await
+                .map(|(id, _)| id),
+            Some(42)
+        );
+
+        // An external write changes the supplied evidence, not the local revision.
+        std::fs::write(&source, "externally changed input").expect("external edit");
+        let changed = crate::git_workspace::capture_workspace_evidence_identity(&repository)
+            .await
+            .expect("changed baseline");
+        assert_eq!(changed.head_identity, first.head_identity);
+        assert_eq!(changed.index_identity, first.index_identity);
+        assert_ne!(changed.worktree_identity, first.worktree_identity);
+        ledger
+            .observe_workspace_baseline("turn", 0, &repository, Some(changed.clone()))
+            .await;
+        assert_eq!(ledger.observe_repository_revision("turn", 0).await, epoch);
+        let changed_hash = ledger
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("changed workspace identity");
+        assert_ne!(changed_hash, first_hash);
+        assert!(
+            ledger
+                .identical_running_process(&attempt(&changed_hash))
+                .await
+                .is_none()
+        );
+        assert!(
+            ledger.running_process(42).await.is_some(),
+            "the old run is not cancelled"
+        );
+        assert_eq!(ledger.workspace_identity_capture_count(), 0);
+
+        ledger.finish_turn("turn").await;
+        let cache_path = &ledger
+            .persistence
+            .as_ref()
+            .expect("persistent ledger")
+            .cache_path;
+        let document: CommandExecutionCacheDocument = serde_json::from_slice(
+            &tokio::fs::read(cache_path)
+                .await
+                .expect("persist latest baseline"),
+        )
+        .expect("valid command cache document");
+        assert_eq!(document.workspace_identity, changed);
+        assert_eq!(ledger.workspace_identity_capture_count(), 0);
     }
 
     #[tokio::test]

@@ -326,6 +326,7 @@ mod tests {
                 name: name.to_string(),
                 connector_id: AppConnectorId(name.to_string()),
                 category: None,
+                required: false,
             });
             plugin.hook_sources.push(PluginHookSource {
                 plugin_id: crate::PluginId::parse(name).unwrap(),

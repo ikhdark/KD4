@@ -82,6 +82,8 @@ async fn models_client_hits_models_endpoint() {
             base_instructions: "base instructions".to_string(),
             model_messages: None,
             include_skills_usage_instructions: false,
+            include_apps_usage_instructions: true,
+            include_plugin_usage_instructions: true,
             supports_reasoning_summaries: false,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,

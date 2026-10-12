@@ -33,6 +33,40 @@ struct EchoDelegate;
 struct OutputBudgetDelegate;
 
 #[tokio::test]
+async fn legacy_numeric_receipt_snapshot_recovers_exact_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let event = crate::session_runtime::CellEvent::Completed {
+        content_items: Vec::new(), error_text: None, output_loss: None,
+    };
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+        "version": 6, "revision": 1, "completed_call_id": "legacy-call", "values": {},
+        "completed_cells": {"1": event}, "completed_cell_order": ["1"], "next_cell_id": 2,
+    })).unwrap()).unwrap();
+    let restored = InProcessCodeModeSession::new();
+    let id = cell_id("g2:1");
+    let expected = RuntimeResponse::Result {
+        cell_id: id.clone(), content_items: Vec::new(), error_text: None, output_loss: None,
+    };
+    assert_eq!(restored.wait(WaitRequest {
+        cell_id: id, yield_time_ms: 1,
+        recovery: Some(crate::ReceiptRecovery { path: path.clone(), terminal_only: true }),
+    }).await.unwrap(), WaitOutcome::LiveCell(expected));
+    let mut request = execute_request("text('new incarnation');");
+    request.state_path = Some(path.clone());
+    request.yield_time_ms = Some(60_000);
+    let started = restored.execute(request).await.unwrap();
+    let new_id = started.cell_id.clone();
+    assert_ne!(new_id, cell_id("1"));
+    assert!(matches!(started.initial_response().await.unwrap(), RuntimeResponse::Result { error_text: None, .. }));
+    let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(snapshot["version"], 7);
+    assert!(snapshot["completed_cells"].get("1").is_some(), "legacy receipt identity must remain exact");
+    assert!(snapshot["completed_cells"].get(new_id.as_str()).is_some(), "new receipt must retain its qualified identity");
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn first_wait_restores_receipt_without_starting_a_cell() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.json");
@@ -248,19 +282,22 @@ async fn fallback_provider_uses_in_process_session_when_host_is_missing() {
         .create_session(Arc::new(NoopCodeModeSessionDelegate))
         .await
         .expect("missing process host should fall back to an in-process session");
-    let response = session
+    let started = session
         .execute(execute_request("text('fallback-ready');"))
         .await
-        .expect("fallback execution should start")
+        .expect("fallback execution should start");
+    let expected_id = started.cell_id.clone();
+    let response = started
         .initial_response()
         .await
         .expect("fallback execution should finish");
+    assert_eq!(response_cell_id(&response), expected_id);
 
     assert_eq!(
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "fallback-ready".to_string(),
             }],
@@ -289,13 +326,20 @@ fn runtime_request_preserves_nested_timeout_policy_independently_of_yield() {
 }
 
 async fn execute(service: &InProcessCodeModeSession, request: ExecuteRequest) -> RuntimeResponse {
-    service
-        .execute(request)
-        .await
-        .unwrap()
-        .initial_response()
-        .await
-        .unwrap()
+    let started = service.execute(request).await.unwrap();
+    let expected_id = started.cell_id.clone();
+    let response = started.initial_response().await.unwrap();
+    assert_eq!(response_cell_id(&response), expected_id);
+    response
+}
+
+fn response_cell_id(response: &RuntimeResponse) -> CellId {
+    match response {
+        RuntimeResponse::Result { cell_id, .. }
+        | RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::ExplicitYield { cell_id, .. }
+        | RuntimeResponse::Terminated { cell_id, .. } => cell_id.clone(),
+    }
 }
 
 #[tokio::test]
@@ -316,7 +360,7 @@ async fn synchronous_exit_returns_successfully() {
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
             }],
@@ -351,7 +395,7 @@ text("after await");
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
             }],
@@ -387,7 +431,7 @@ async fn timer_throwing_exit_sentinel_remains_an_error() {
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: Vec::new(),
             error_text: Some("__codex_code_mode_exit__".to_string()),
         }
@@ -501,7 +545,7 @@ text(JSON.stringify({ names: ALL_TOOL_NAMES, resolved: resolve_tool("sample_tool
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: r#"{"names":["sample_tool"],"resolved":{"name":"sample_tool","description":"exact schema description"},"missing":true}"#.to_string(),
             }],
@@ -719,7 +763,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
         write_response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&write_response),
             content_items: Vec::new(),
             error_text: None,
         }
@@ -728,7 +772,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
         same_session,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&same_session),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "visible".to_string(),
             }],
@@ -739,7 +783,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
         other_session,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&other_session),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "undefined".to_string(),
             }],
@@ -786,7 +830,7 @@ async fn oversized_store_rejects_all_writes_from_the_cell() {
         read_response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&read_response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "undefined".to_string(),
             }],
@@ -841,7 +885,7 @@ async fn store_replacement_releases_bytes_in_current_and_later_cells() {
         first,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&first),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "small".to_string()
             }],
@@ -857,7 +901,7 @@ async fn store_replacement_releases_bytes_in_current_and_later_cells() {
         second,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&second),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "6291456".to_string()
@@ -882,10 +926,11 @@ async fn shutdown_interrupts_cpu_bound_cells() {
         })
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Yielded {
-            cell_id: cell_id("1"),
+            cell_id: expected_id,
             content_items: Vec::new(),
         }
     );
@@ -931,7 +976,7 @@ text(String(typeof console.info === "function"));"#
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
                     text: r#"alias 1 {"ok":true}"#.to_string(),
@@ -1026,7 +1071,7 @@ text("second");"#
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "first".to_string(),
@@ -1059,7 +1104,7 @@ text(new Intl.DateTimeFormat("fr-FR", options).format(date));
     }).await;
     assert_eq!(response, RuntimeResponse::Result {
         output_loss: None,
-        cell_id: cell_id("1"),
+        cell_id: response_cell_id(&response),
         content_items: vec![FunctionCallOutputContentItem::InputText {
             text: "jeudi 2 janvier \u{e0} 03:04:05".into(),
         }; 2],
@@ -1096,7 +1141,7 @@ text(JSON.stringify(returnsExpectedTypes));
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "first".to_string(),
@@ -1140,7 +1185,7 @@ image({
             response,
             RuntimeResponse::Result {
                 output_loss: None,
-                cell_id: cell_id("1"),
+                cell_id: response_cell_id(&response),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
                     detail: Some(crate::ImageDetail::Original),
@@ -1174,7 +1219,7 @@ generatedImage({
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![
                 FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,AAAA".to_string(),
@@ -1216,7 +1261,7 @@ image(
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAAA".to_string(),
                 detail: Some(crate::ImageDetail::Original),
@@ -1255,7 +1300,7 @@ image(
             response,
             RuntimeResponse::Result {
                 output_loss: None,
-                cell_id: cell_id("1"),
+                cell_id: response_cell_id(&response),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
                     detail: Some(crate::ImageDetail::High),
@@ -1289,7 +1334,7 @@ image({
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAAA".to_string(),
                 detail: Some(crate::ImageDetail::Low),
@@ -1325,7 +1370,7 @@ async fn image_helpers_reject_remote_urls() {
                     response,
                     RuntimeResponse::Result {
                         output_loss: None,
-                        cell_id: cell_id("1"),
+                        cell_id: response_cell_id(&response),
                         content_items: Vec::new(),
                         error_text: Some(
                             "TypeError: Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead\n    at exec_main.mjs:1:1".to_string(),
@@ -1360,7 +1405,7 @@ image({
         response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: Vec::new(),
             error_text: Some("TypeError: image detail must be one of: auto, low, high, original\n    at exec_main.mjs:2:1".to_string()),
         }
@@ -1398,7 +1443,7 @@ image({
             response,
             RuntimeResponse::Result {
                 output_loss: None,
-                cell_id: cell_id("1"),
+                cell_id: response_cell_id(&response),
                 content_items: Vec::new(),
                 error_text: Some(
                     "TypeError: image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block\n    at exec_main.mjs:2:1".to_string(),

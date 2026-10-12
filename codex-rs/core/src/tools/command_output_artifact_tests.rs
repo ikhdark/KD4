@@ -4,6 +4,88 @@ use std::time::Duration;
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn raw_rust_diagnostic_recovery_preserves_capture_completeness() {
+    let prefix = b"error[E0382]: use of moved value\n";
+    let omitted = b"error[E0277]: required Send obligation failed\n";
+    for capped in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let mut original = prefix.to_vec();
+        if capped {
+            original.resize(MAX_RAW_OUTPUT_ARTIFACT_BYTES, b' ');
+        }
+        original.extend_from_slice(omitted);
+        let artifact = create_raw_output_artifact(home.path(), "thread", &original).await;
+        assert_eq!(artifact.retention_limit_hit(), capped);
+        let RawOutputArtifact::Stored { id, .. } = artifact else {
+            panic!("raw diagnostic artifact must be stored");
+        };
+        let recovered = read_tool_output_selectors(
+            home.path(),
+            "thread",
+            &id.to_string(),
+            vec![ToolOutputSelector::Bytes {
+                start: 0,
+                end: prefix.len() as u64,
+            }],
+        )
+        .await
+        .expect("the retained diagnostic prefix remains recoverable");
+        assert_eq!(recovered.results[0].text.as_deref(), Some("error[E0382]: use of moved value\n"));
+        assert!(recovered.complete, "the requested prefix was fully delivered");
+        let visible = serde_json::to_value(&recovered).unwrap();
+        // The public schema defines this as all original bytes retained, not
+        // all surviving file bytes. E0277 is deliberately beyond the cap.
+        assert_eq!(
+            visible["retained_artifact_complete"],
+            !capped,
+            "recovery must preserve producer capture completeness (capped={capped})",
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn abandoned_raw_rust_diagnostic_writer_cannot_claim_complete_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let prefix = b"error[E0382]: use of moved value\n";
+    let original = create_raw_output_artifact(home.path(), "thread", prefix).await;
+    let RawOutputArtifact::Stored { id, .. } = &original else {
+        panic!("raw diagnostic artifact must be stored");
+    };
+    let id = id.to_string();
+    let state = Arc::new(Mutex::new(original));
+    let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+    writer
+        .write_chunk(Some(&state), b"error[E0277]: required Send obligation failed\n")
+        .await;
+    // This is the RAII cleanup used when the owning future is aborted after
+    // bytes were accepted but before finish/flush; it cannot certify the prefix.
+    drop(writer);
+    let result = read_tool_output_selectors(
+        home.path(),
+        "thread",
+        &id,
+        vec![ToolOutputSelector::Bytes {
+            start: 0,
+            end: prefix.len() as u64,
+        }],
+    )
+    .await;
+    if let Ok(recovered) = result {
+        assert_eq!(recovered.results[0].text.as_deref(), Some("error[E0382]: use of moved value\n"));
+        let visible = serde_json::to_value(&recovered).unwrap();
+        assert_eq!(
+            visible["retained_artifact_complete"],
+            false,
+            "an unlocked abandoned writer is not evidence of complete capture",
+        );
+    }
+    // Rejecting an abandoned artifact is also safe; exposing it as a complete
+    // compiler transcript is not.
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn unavailable_retention_index_scans_exact_usage_and_fails_closed() {
     for reconciling in [false, true] {
         for protected in [false, true] {
@@ -445,6 +527,7 @@ fn selector_response_cost_matches_serialization_at_every_boundary() {
         canonical_sha256: metadata.canonical_sha256.clone(),
         canonical_bytes: metadata.canonical_bytes,
         retained_bytes: metadata.retained_bytes,
+        capture_complete: metadata.capture_complete,
         complete: false,
         unavailable_ranges: metadata.unavailable_ranges.clone(),
         results: Vec::new(),
@@ -3081,16 +3164,30 @@ async fn streaming_output_gap_retains_suffix_and_marks_capture_incomplete() {
         writer.write_chunk(Some(&state), &suffix).await;
         writer.write_chunk(Some(&state), b"final suffix").await;
         writer.finish(Some(&state)).await;
-        let (path, rendered) = {
+        let (path, rendered, artifact_id) = {
             let artifact = state.lock().await;
             let RawOutputArtifact::Stored { path, truncated, .. } = &*artifact else { panic!("stored suffix"); };
             assert!(*truncated);
-            (path.clone(), artifact.render_for_model())
+            (path.clone(), artifact.render_for_model(), artifact.artifact_id().unwrap().to_string())
         };
         let bytes = tokio::fs::read(path).await.unwrap();
         assert!(bytes.starts_with(b"\n[output gap:"));
         assert!(bytes.ends_with(b"final suffix"));
         assert!(rendered.contains("incomplete capture"));
+        // A retained suffix is recoverable evidence, but a negative search of
+        // it cannot establish absence in the producer bytes lost before it.
+        let recovered = read_tool_output_selectors(
+            temp.path(), "thread", &artifact_id,
+            vec![ToolOutputSelector::Search {
+                query: "missing producer evidence".into(), case_insensitive: false,
+                start_byte: 0, max_results: 20, context_lines: 0, enclosing: false,
+            }],
+        ).await.unwrap();
+        let search = recovered.results[0].value.as_ref().unwrap();
+        assert!(recovered.complete, "the requested retained search page was delivered");
+        assert_eq!(search["total_matches"], 0);
+        assert_eq!(search["coverage_complete"], false,
+            "raw artifact recovery must preserve known producer-output gaps");
     }
 }
 
@@ -3147,8 +3244,69 @@ async fn streaming_chunks_batch_disk_updates_and_preserve_exact_output() {
         vec![b'x'; 200 * 1024]
     );
     let usage = retention_usage_locked_blocking(path.parent().expect("artifact directory"));
-    assert_eq!(usage.thread_bytes, 200 * 1024);
-    assert_eq!(usage.global_bytes, 200 * 1024);
+    let metadata_bytes = std::fs::read(logical_metadata_path(&path)).expect("raw capture metadata");
+    let metadata: RawCaptureMetadata = serde_json::from_slice(&metadata_bytes).unwrap();
+    assert_eq!(metadata.raw_capture_version, 1);
+    assert_eq!(metadata.artifact_id, artifact_id_from_path(&path).unwrap().to_string());
+    assert_eq!(metadata.retained_bytes, 200 * 1024);
+    assert!(metadata.capture_complete);
+    // Quotas cover the entire artifact family, independently of the index's total.
+    let family_bytes = 200 * 1024 + metadata_bytes.len() as u64;
+    assert_eq!(usage.thread_bytes, family_bytes);
+    assert_eq!(usage.global_bytes, family_bytes);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn lazy_streaming_artifact_is_registered_before_persistence_barrier() {
+    for abandon_before_barrier in [false, true] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(temp.path(), "thread")));
+        let mut writer = RawOutputArtifactWriter::open(Some(&state))
+            .await
+            .expect("lazy streaming writer");
+        let output = vec![b'x'; LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES + 1];
+        writer.write_chunk(Some(&state), &output).await;
+        writer.flush_pending(Some(&state)).await;
+        let path = match &*state.lock().await {
+            RawOutputArtifact::Stored { path, bytes, .. } => {
+                assert_eq!(*bytes, output.len() as u64);
+                path.clone()
+            }
+            artifact => panic!("lazy spill did not publish retained output: {artifact:?}"),
+        };
+        // An earlier barrier may have acknowledged initial creation. A later
+        // flushed append must register a new generation before readiness too.
+        assert!(lock_retention_registry().pending_sync.contains_key(&path));
+        sync_tool_output_artifacts(temp.path(), "thread").await.unwrap();
+        assert!(!lock_retention_registry().pending_sync.contains_key(&path));
+        let suffix = b"later output";
+        writer.write_chunk(Some(&state), suffix).await;
+        writer.flush_pending(Some(&state)).await;
+        let mut writer = Some(writer);
+        if abandon_before_barrier {
+            // Cancellation drops the owner without calling its async finish.
+            drop(writer.take());
+        }
+
+        // The persistence contract covers already-published bytes, not only
+        // writers whose optional finalization happened to win the race.
+        inject_streaming_finalize_sync_failure_for_test();
+        let barrier = sync_tool_output_artifacts(temp.path(), "thread").await;
+        // A broken implementation skips the hook when no sync was registered.
+        // Reset it before asserting so the red run cannot poison another test.
+        STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.store(0, Ordering::Release);
+        drop(writer);
+        assert!(
+            barrier.is_err(),
+            "published lazy artifact bypassed the durability barrier; abandoned={abandon_before_barrier}"
+        );
+        assert!(barrier.unwrap_err().to_string().contains("injected artifact barrier sync failure"));
+        assert!(lock_retention_registry().pending_sync.contains_key(&path));
+        sync_tool_output_artifacts(temp.path(), "thread").await.unwrap();
+        assert!(!lock_retention_registry().pending_sync.contains_key(&path));
+        assert_eq!(std::fs::read(path).unwrap(), [output.as_slice(), suffix].concat());
+    }
 }
 
 #[tokio::test]
@@ -5377,4 +5535,240 @@ fn verified10_script_search_fits_remaining_bytes_and_keeps_exact_continuation() 
     assert_eq!(value["matches_returned"], 3);
     assert_eq!(value["remaining_match_count"], 1);
     assert!(!value["hydrated_ranges"].as_array().unwrap().is_empty());
+}
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn raw_safety_cap_search_cannot_prove_absence_after_reload() {
+    let home = tempfile::tempdir().unwrap();
+    let mut original = vec![b'x'; MAX_RAW_OUTPUT_ARTIFACT_BYTES];
+    original.extend_from_slice(b"AUDIT_TAIL_NEEDLE\n");
+    let artifact = create_raw_output_artifact(home.path(), "raw-cap-search", &original).await;
+    assert!(artifact.retention_limit_hit());
+    let id = artifact.artifact_id().unwrap().to_string();
+    drop(artifact);
+    drop(original);
+    // Recovery has only persisted evidence, not the producer's in-memory
+    // truncation flag. The known omitted tail must not become proven absence.
+    for _ in 0..2 {
+        let recovered = read_tool_output_selectors(home.path(), "raw-cap-search", &id,
+            vec![ToolOutputSelector::Search { query: "AUDIT_TAIL_NEEDLE".into(),
+                enclosing: false, case_insensitive: false, start_byte: 0,
+                max_results: 20, context_lines: 0 }],
+        ).await.unwrap();
+        assert!(recovered.complete, "the retained search page was delivered");
+        let visible = serde_json::to_value(&recovered).unwrap();
+        assert_eq!(visible["retained_artifact_complete"], false);
+        let search = recovered.results[0].value.as_ref().unwrap();
+        assert_eq!(search["total_matches"], 0);
+        assert_eq!(search["search_exhausted"], true);
+        assert_eq!(search["coverage_complete"], false);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn missing_canonical_sidecar_does_not_certify_raw_search_coverage() {
+    let home = tempfile::tempdir().unwrap();
+    let text = "retained diagnostic\n";
+    let canonical = CanonicalToolResult::text(text);
+    let artifact = create_canonical_output_artifact(home.path(), "lost-sidecar", &canonical).await;
+    let id = artifact.artifact_id().unwrap();
+    let metadata_path = logical_metadata_path(&home.path().join("tool-output/lost-sidecar").join(format!("{id}.log")));
+    let selector = ToolOutputSelector::Search { query: "absent diagnostic".into(),
+        enclosing: false, case_insensitive: false, start_byte: 0,
+        max_results: 20, context_lines: 0 };
+    let complete = read_tool_output_selectors(home.path(), "lost-sidecar", &id, vec![selector.clone()]).await.unwrap();
+    assert_eq!(complete.results[0].value.as_ref().unwrap()["coverage_complete"], true);
+    std::fs::remove_file(&metadata_path).unwrap();
+    let uncertain = read_tool_output_selectors(home.path(), "lost-sidecar", &id,
+        vec![selector, ToolOutputSelector::Bytes { start: 0, end: text.len() as u64 }],
+    ).await.unwrap();
+    assert!(uncertain.complete, "sidecar loss does not prevent exact retained-byte delivery");
+    assert_eq!(serde_json::to_value(&uncertain).unwrap()["retained_artifact_complete"], false);
+    let search = uncertain.results.iter().find(|result| result.selector.is_search()).unwrap();
+    assert_eq!(search.value.as_ref().unwrap()["total_matches"], 0);
+    assert_eq!(search.value.as_ref().unwrap()["coverage_complete"], false);
+    assert!(uncertain.results.iter().any(|result| result.text.as_deref() == Some(text)));
+    // Unreadable metadata is not the legacy-raw case: storage faults must not
+    // silently fall back to a successful search of a supposedly complete log.
+    std::fs::create_dir(&metadata_path).unwrap();
+    assert!(read_tool_output_selectors(home.path(), "lost-sidecar", &id,
+        vec![ToolOutputSelector::Bytes { start: 0, end: text.len() as u64 }],
+    ).await.is_err());
+}
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn raw_capture_status_tracks_reopen_gap_and_replacement() {
+    let home = tempfile::tempdir().unwrap();
+    let initial = create_raw_output_artifact(home.path(), "raw-lifecycle", b"prefix\n").await;
+    let id = initial.artifact_id().unwrap().to_string();
+    let state = Arc::new(Mutex::new(initial));
+    let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+    assert!(matches!(
+        read_complete_canonical_snapshot(home.path(), "raw-lifecycle", &id, 1024).await,
+        Err(ReadToolOutputError::StillWriting)
+    ));
+    writer.write_chunk(Some(&state), b"tail\n").await;
+    writer.finish(Some(&state)).await;
+    assert_eq!(
+        read_complete_canonical_snapshot(home.path(), "raw-lifecycle", &id, 1024).await.unwrap(),
+        b"prefix\ntail\n"
+    );
+
+    let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+    writer.mark_output_gap(Some(&state)).await;
+    writer.finish(Some(&state)).await;
+    let gapped = state.lock().await.clone();
+    assert!(gapped.retention_limit_hit());
+    assert!(read_complete_canonical_snapshot(home.path(), "raw-lifecycle", &id, 1024).await.is_err());
+
+    // A complete replacement is a new producer capture, not an append to the gap.
+    let replaced = replace_raw_output_artifact(&gapped, b"replacement\n").await;
+    assert!(!replaced.retention_limit_hit());
+    assert_eq!(
+        read_complete_canonical_snapshot(home.path(), "raw-lifecycle", &id, 1024).await.unwrap(),
+        b"replacement\n"
+    );
+    let capped = vec![b'x'; MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1];
+    let replaced = replace_raw_output_artifact(&replaced, &capped).await;
+    assert!(replaced.retention_limit_hit());
+    assert!(read_complete_canonical_snapshot(
+        home.path(), "raw-lifecycle", &id, MAX_RAW_OUTPUT_ARTIFACT_BYTES,
+    ).await.is_err());
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn raw_capture_status_rejects_corruption_and_missing_status_stays_unknown() {
+    let home = tempfile::tempdir().unwrap();
+    let original = create_raw_output_artifact(home.path(), "raw-status", b"prefix\n").await;
+    let RawOutputArtifact::Stored { id, path, .. } = original else { panic!("stored raw output") };
+    let metadata_path = logical_metadata_path(&path);
+    let good: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    let mut invalid = Vec::new();
+    for (field, value) in [
+        ("raw_capture_version", serde_json::json!(2)),
+        ("artifact_id", serde_json::json!(ToolOutputArtifactId::new().to_string())),
+        ("retained_bytes", serde_json::json!(8)),
+    ] {
+        let mut bad = good.clone();
+        bad[field] = value;
+        invalid.push(serde_json::to_vec(&bad).unwrap());
+    }
+    let mut missing_field = good;
+    missing_field.as_object_mut().unwrap().remove("capture_complete");
+    invalid.push(serde_json::to_vec(&missing_field).unwrap());
+    invalid.push(b"{".to_vec());
+    for bad in invalid {
+        std::fs::write(&metadata_path, bad).unwrap();
+        assert!(read_tool_output_selectors(home.path(), "raw-status", &id.to_string(),
+            vec![ToolOutputSelector::Bytes { start: 0, end: 7 }],
+        ).await.is_err(), "invalid status must not become a complete raw capture");
+    }
+    std::fs::remove_file(metadata_path).unwrap();
+    let recovered = read_tool_output_selectors(home.path(), "raw-status", &id.to_string(),
+        vec![ToolOutputSelector::Bytes { start: 0, end: 7 }],
+    ).await.unwrap();
+    assert!(recovered.complete);
+    assert_eq!(recovered.results[0].text.as_deref(), Some("prefix\n"));
+    assert!(!recovered.capture_complete);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn raw_capture_status_write_failure_cannot_certify_flushed_bytes() {
+    let home = tempfile::tempdir().unwrap();
+    let original = create_raw_output_artifact(home.path(), "raw-status-failure", b"prefix\n").await;
+    let RawOutputArtifact::Stored { id, path, .. } = &original else { panic!("stored raw output") };
+    let id = id.to_string();
+    let metadata_path = logical_metadata_path(path);
+    let state = Arc::new(Mutex::new(original));
+    let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+    // Open invalidates the old success receipt. Make the final receipt write fail.
+    std::fs::create_dir(&metadata_path).unwrap();
+    writer.write_chunk(Some(&state), b"tail\n").await;
+    writer.finish(Some(&state)).await;
+    assert!(matches!(&*state.lock().await, RawOutputArtifact::Failed { .. }));
+    assert!(read_complete_canonical_snapshot(home.path(), "raw-status-failure", &id, 1024).await.is_err());
+    std::fs::remove_dir(metadata_path).unwrap();
+    let recovered = read_tool_output_selectors(home.path(), "raw-status-failure", &id,
+        vec![ToolOutputSelector::Bytes { start: 0, end: 12 }],
+    ).await.unwrap();
+    assert_eq!(recovered.results[0].text.as_deref(), Some("prefix\ntail\n"));
+    assert!(recovered.complete);
+    assert!(!recovered.capture_complete);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn raw_capture_completeness_is_required_for_snapshot_protection_and_remint() {
+    for status in ["complete", "gap", "missing"] {
+        let home = tempfile::tempdir().unwrap();
+        let original = create_raw_output_artifact(home.path(), "source", b"prefix\n").await;
+        let RawOutputArtifact::Stored { id, path, .. } = &original else { panic!("stored raw output") };
+        let id = id.to_string();
+        let path = path.clone();
+        if status == "missing" {
+            std::fs::remove_file(logical_metadata_path(&path)).unwrap();
+        } else if status == "gap" {
+            let state = Arc::new(Mutex::new(original));
+            let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+            writer.mark_output_gap(Some(&state)).await;
+            writer.finish(Some(&state)).await;
+        }
+        // Even a matching identity for every surviving byte cannot prove that
+        // a lost producer tail never existed. Complete is the positive control.
+        let retained = std::fs::read(&path).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&retained));
+        let expected_complete = status == "complete";
+        assert_eq!(read_complete_canonical_snapshot(home.path(), "source", &id, retained.len()).await.is_ok(), expected_complete);
+        assert_eq!(protect_active_tool_history_artifact(home.path(), "source", &id, retained.len() as u64, &sha256).await.is_ok(), expected_complete);
+        assert_eq!(remint_tool_history_artifact_for_thread(home.path(), "source", "target", &id, retained.len() as u64, &sha256).await.is_ok(), expected_complete);
+        if !expected_complete {
+            assert!(!home.path().join("tool-output/target").join(format!("{id}.log")).exists());
+        }
+    }
+}
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn binary_continuation_bytes_recover_without_zero_progress() {
+    let home = tempfile::tempdir().unwrap();
+    let original = vec![0x80; 256 * 1024];
+    let canonical = CanonicalToolResult::bytes(original.clone());
+    let artifact = create_canonical_output_artifact(home.path(), "binary-pages", &canonical).await;
+    let id = artifact.artifact_id().unwrap();
+    let mut obtained = Vec::new();
+    let mut calls = 0;
+    let mut continuations = 0;
+    let started = std::time::Instant::now();
+    while obtained.len() < original.len() {
+        let start = obtained.len() as u64;
+        let result = read_tool_output_selectors(home.path(), "binary-pages", &id,
+            vec![ToolOutputSelector::Bytes { start, end: original.len() as u64 }],
+        ).await.unwrap();
+        calls += 1;
+        let result = if result.results[0].status == ToolOutputSelectorStatus::SelectorTooLarge {
+            continuations += 1;
+            let continuation = result.results[0].continuation.clone().expect("bounded recovery");
+            let ToolOutputSelector::Bytes { start: next, end } = continuation else { panic!("byte cursor") };
+            assert_eq!(next, start);
+            assert!(end > start, "binary continuation values are not UTF-8 boundaries");
+            calls += 1;
+            read_tool_output_selectors(home.path(), "binary-pages", &id,
+                vec![ToolOutputSelector::Bytes { start, end }],
+            ).await.unwrap()
+        } else { result };
+        assert!(result.complete);
+        assert_eq!(result.canonical_sha256, canonical.sha256);
+        let bytes = BASE64_STANDARD.decode(result.results[0].data_base64.as_deref().unwrap()).unwrap();
+        assert!(!bytes.is_empty());
+        obtained.extend(bytes);
+        // Every iteration delivers at least one byte and needs at most two
+        // selections. The 1,000-token fragment contract does not promise a
+        // fixed number of calls for a 256 KiB base64 payload.
+        assert!(calls <= 2 * original.len(), "positive progress bounds recovery");
+    }
+    assert_eq!(obtained, original);
+    assert!(continuations > 0, "the fixture must exercise byte-prefix sizing, not only inline recovery");
+    eprintln!("binary_recovery bytes={} calls={calls} wall_us={}", original.len(), started.elapsed().as_micros());
 }

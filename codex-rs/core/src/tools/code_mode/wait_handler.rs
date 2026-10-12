@@ -347,8 +347,10 @@ fn terminal_wait_owner_signal(
     cell_id: &codex_code_mode::CellId,
 ) -> Option<serde_json::Value> {
     let response = match outcome {
-        codex_code_mode::WaitOutcome::LiveCell(response)
-        | codex_code_mode::WaitOutcome::MissingCell(response) => response,
+        codex_code_mode::WaitOutcome::LiveCell(response) => response,
+        // Missing lifecycle evidence reports uncertainty, not a terminal
+        // owner state. Retained terminal receipts arrive as LiveCell.
+        codex_code_mode::WaitOutcome::MissingCell(_) => return None,
     };
     let state = match response {
         codex_code_mode::RuntimeResponse::Terminated { .. } => "terminated",
@@ -823,6 +825,41 @@ mod tests {
             "raw code-mode output has no owner-designated completion projection"
         );
         assert!(terminal_wait_owner_signal(&explicit_empty_yield(&cell_id), &cell_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_cell_wait_preserves_unknown_state_without_terminal_attestation() {
+        let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+        session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        ));
+        let session = Arc::new(session);
+        let output = CodeModeWaitHandler
+            .handle_call(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(Arc::new(turn)),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "wait-unknown-cell".to_string(),
+                tool_name: ToolName::plain(WAIT_TOOL_NAME),
+                source: crate::tools::router::ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({ "cell_id": "never-started-cell" }).to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        session.services.code_mode_service.shutdown().await.unwrap();
+
+        // The real service's missing-cell contract says absence is unknown,
+        // not a confirmed terminal outcome or permission to replay effects.
+        assert!(output.log_preview().contains("unknown_cell"));
+        assert!(output.log_preview().contains("absence does not prove completion"));
+        assert!(output.sampling_request_signal().as_ref().is_none_or(|signal| {
+            signal.get("authoritative_wait_owner_v1").is_none()
+        }), "missing lifecycle evidence must not mint an authoritative terminal fact");
     }
 
     #[test]

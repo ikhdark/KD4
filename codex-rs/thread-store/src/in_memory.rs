@@ -197,7 +197,7 @@ mod tests {
             .append_items_ordered(std::slice::from_ref(&durable))
             .await
             .expect("append durable item");
-        // The immediately flushed append is a separate LiveThread branch from the ordered one.
+        // The synchronous form must use the same acceptance path, then a barrier.
         live_thread
             .append_items(std::slice::from_ref(&durable))
             .await
@@ -216,7 +216,8 @@ mod tests {
             calls.owned_items_copied, 0,
             "no rollout item may be copied into an owned request batch"
         );
-        assert_eq!(calls.append_items_ordered, 1);
+        assert_eq!(calls.append_items_ordered, 2);
+        assert_eq!(calls.flush_thread, 1, "only the synchronous append requests a barrier");
         assert_eq!(calls.append_items, 2);
     }
 

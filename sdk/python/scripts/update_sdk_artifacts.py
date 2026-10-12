@@ -566,10 +566,59 @@ def _make_chatgpt_account_email_nullable(schema: dict[str, Any]) -> None:
     raise RuntimeError("Schema bundle is missing the ChatGPT account variant")
 
 
+def _normalize_nullable_typed_maps(schema: Any) -> None:
+    """Keep nullable map values typed with the pinned generator's union parser."""
+    if not isinstance(schema, dict):
+        return
+    # Traverse schema positions only; enum/const/default/example payloads can
+    # contain the same keys as schemas and must remain literal data.
+    for key in ("definitions", "$defs", "properties", "patternProperties", "dependentSchemas"):
+        children = schema.get(key)
+        if isinstance(children, dict):
+            for child in children.values():
+                _normalize_nullable_typed_maps(child)
+    for key in (
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "prefixItems",
+    ):
+        children = schema.get(key)
+        for child in children if isinstance(children, list) else [children]:
+            _normalize_nullable_typed_maps(child)
+    types_ = schema.get("type")
+    if (
+        isinstance(types_, list)
+        and set(types_) == {"object", "null"}
+        and isinstance(schema.get("additionalProperties"), dict)
+        and set(schema) <= {"type", "additionalProperties", "title", "description", "default"}
+    ):
+        # 0.31.2 drops additionalProperties for type=[object,null], but retains
+        # it for this equivalent union. Leave more complex schemas untouched.
+        values = schema.pop("additionalProperties")
+        del schema["type"]
+        schema["anyOf"] = [
+            {"type": "object", "additionalProperties": values},
+            {"type": "null"},
+        ]
+
+
 def _normalized_schema_bundle_text(schema_dir: Path) -> str:
     """Normalize the schema bundle before feeding it to the Python type generator."""
     schema = json.loads(schema_bundle_path(schema_dir).read_text())
     _make_chatgpt_account_email_nullable(schema)
+    _normalize_nullable_typed_maps(schema)
     definitions = schema.get("definitions", {})
     if isinstance(definitions, dict):
         for definition in definitions.values():

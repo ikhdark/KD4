@@ -10,15 +10,14 @@ use tokio::sync::Mutex;
 use codex_protocol::ThreadId;
 use codex_protocol::items::HookPromptFragment;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::formatted_truncate_text;
 use tokio::fs;
 use tracing::warn;
 use uuid::Uuid;
 
 const HOOK_OUTPUTS_DIR: &str = "hook_outputs";
 const HOOK_OUTPUT_TOKEN_LIMIT: usize = 2_500;
+const OMITTED_HOOK_INSTRUCTIONS: &str = "Hook instructions omitted in full because they exceed the inline budget; no partial instructions were admitted. Recover the full source before acting on it.";
 const HOOK_OUTPUT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const HOOK_OUTPUT_ACTIVE_GRACE: Duration = Duration::from_secs(60 * 60);
 const HOOK_OUTPUT_MAX_FILES: usize = 512;
@@ -65,8 +64,8 @@ impl HookOutputSpiller {
     ///
     /// Oversized text is written in full under the OS temp directory at
     /// `<temp_dir>/hook_outputs/<thread_id>/`
-    /// and replaced with the same head/tail preview style used for other truncated
-    /// output, plus a path back to the preserved full text.
+    /// and replaced with a whole-fragment omission and recovery path. Even
+    /// feedback can contain instructions; splicing can reverse their meaning.
     pub(crate) async fn maybe_spill_text(&self, thread_id: ThreadId, text: String) -> String {
         if approx_token_count(&text) > HOOK_OUTPUT_TOKEN_LIMIT {
             self.prune_crash_leftovers().await;
@@ -87,21 +86,15 @@ impl HookOutputSpiller {
                 "failed to create hook output directory {}: {err}",
                 parent.display()
             );
-            return formatted_truncate_text(
-                &text,
-                TruncationPolicy::Tokens(HOOK_OUTPUT_TOKEN_LIMIT),
-            );
+            return format!("{OMITTED_HOOK_INSTRUCTIONS} Recovery unavailable: {err}");
         }
 
         if let Err(err) = fs::write(path.as_ref(), &text).await {
             warn!("failed to write hook output {}: {err}", path.display());
-            return formatted_truncate_text(
-                &text,
-                TruncationPolicy::Tokens(HOOK_OUTPUT_TOKEN_LIMIT),
-            );
+            return format!("{OMITTED_HOOK_INSTRUCTIONS} Recovery unavailable: {err}");
         }
 
-        spilled_hook_output_preview(&text, &path)
+        format!("{OMITTED_HOOK_INSTRUCTIONS}\n\nFull hook output saved to: {}", path.display())
     }
 
     #[expect(
@@ -287,20 +280,6 @@ fn hook_output_path(output_dir: &AbsolutePathBuf, thread_id: ThreadId) -> Absolu
     output_dir
         .join(thread_id.to_string())
         .join(format!("{}.txt", Uuid::new_v4()))
-}
-
-/// Builds the model-visible replacement for a spilled hook output.
-///
-/// The path footer is budgeted before truncation so adding the recovery path
-/// does not let the preview grow past the hook-output limit.
-fn spilled_hook_output_preview(text: &str, path: &AbsolutePathBuf) -> String {
-    let footer = format!("\n\nFull hook output saved to: {}", path.display());
-    // A token policy keeps the formatter's warning and omission markers inside
-    // its budget, so only the footer needs to be reserved.
-    let preview_policy = TruncationPolicy::Tokens(
-        HOOK_OUTPUT_TOKEN_LIMIT.saturating_sub(approx_token_count(&footer) + 1),
-    );
-    format!("{}{footer}", formatted_truncate_text(text, preview_policy))
 }
 
 #[cfg(test)]

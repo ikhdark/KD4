@@ -1,6 +1,6 @@
 # Named Rust test targets and gates for the fork-local test runner.
 #
-# `scripts/rust_test_runner.py` is the only supported consumer. The runner
+# `scripts/build/rust_test_runner.py` is the only supported consumer. The runner
 # parses this file strictly: unknown tables and unknown keys are errors, and
 # selected targets and helpers are validated against `cargo metadata --no-deps`
 # before execution. `check-manifest` validates every declaration.
@@ -227,6 +227,9 @@ helpers = [
 # Registry projection and turn timing tests use the in-process session fixture
 # or pure state; neither executes code-mode cells nor spawns processes.
 "tools::registry::tests::" = []
+# Parallel tests use the in-process session provider and local test environments.
+# Real commands use disabled permissions (Git/Python/rg), not sandbox helpers.
+"tools::parallel::tests::" = []
 "turn_timing::tests::" = []
 "tools::handlers::apply_patch_retries::tests::" = []
 "tools::handlers::apply_patch::tests::" = []
@@ -484,6 +487,16 @@ package = "codex-tools"
 lib = true
 helpers = []
 
+[targets.hooks_lib]
+package = "codex-hooks"
+lib = true
+helpers = []
+
+[targets.core_plugins_lib]
+package = "codex-core-plugins"
+lib = true
+helpers = []
+
 [targets.code_mode_host_stdio]
 package = "codex-code-mode-host"
 test = "stdio"
@@ -631,6 +644,7 @@ tests = [
   "responses_retry::tests::audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_transport",
   "responses_retry::tests::provider_retry_preserves_jitter_and_prioritizes_cancellation",
   "responses_retry::tests::cancelled_retry_does_not_switch_transport_or_announce_an_attempt",
+  "responses_retry::tests::owner_cancellation_interrupts_each_active_retry_wait",
   "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
 ]
 

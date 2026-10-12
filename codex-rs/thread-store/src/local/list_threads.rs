@@ -120,7 +120,23 @@ async fn list_threads_with_state_db_read_count(
             if let Ok(authoritative_thread) =
                 stored_thread_from_sqlite_metadata_with_name(store, metadata, name).await
             {
-                thread = authoritative_thread;
+                if storage_path == ThreadListStoragePath::StateDb {
+                    thread = authoritative_thread;
+                } else {
+                    // The recorder has already reconciled the scan and only overlaid
+                    // SQLite fields when repair succeeded. Do not replace its filesystem
+                    // evidence with a readable but stale row after a failed repair.
+                    thread.project_id = authoritative_thread.project_id;
+                    thread.extra_config = authoritative_thread.extra_config;
+                    thread.forked_from_id = authoritative_thread.forked_from_id;
+                    thread.model = authoritative_thread.model;
+                    thread.reasoning_effort = authoritative_thread.reasoning_effort;
+                    thread.thread_source = authoritative_thread.thread_source;
+                    thread.agent_path = authoritative_thread.agent_path;
+                    thread.approval_mode = authoritative_thread.approval_mode;
+                    thread.permission_profile = authoritative_thread.permission_profile;
+                    thread.token_usage = authoritative_thread.token_usage;
+                }
                 if params.relation_filter.is_some() {
                     thread.parent_thread_id = relation_parent_thread_id;
                 }
@@ -1130,6 +1146,45 @@ mod tests {
         assert_eq!(page.items[0].model_provider, "test-provider");
         assert_eq!(page.items[0].cli_version, "test_version");
         assert_eq!(page.items[0].source, SessionSource::Cli);
+    }
+
+    #[tokio::test]
+    async fn scan_and_repair_preserves_filesystem_fields_when_sqlite_update_fails() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::new_v4();
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("rollout");
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("id");
+        let runtime = backfilled_runtime(&home, &config).await;
+        let mut stale = runtime.get_thread(thread_id).await.expect("read").expect("metadata");
+        stale.cwd = home.path().join("stale-cwd");
+        stale.model_provider = "stale-provider".into();
+        stale.first_user_message = Some("stale message".into());
+        stale.preview = Some("stale preview".into());
+        stale.title = "Custom title".into();
+        runtime.upsert_thread(&stale).await.expect("seed stale row");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME))
+                .create_if_missing(false)).await.expect("open SQLite");
+        sqlx::query("CREATE TRIGGER fail_scan_repair BEFORE UPDATE ON threads BEGIN SELECT RAISE(FAIL, 'forced repair failure'); END")
+            .execute(&pool).await.expect("install failing update trigger");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let page = store.list_threads(list_params(10, None, ThreadListStorageMode::ScanAndRepair))
+            .await.expect("public scan fallback");
+        assert_eq!(page.items.len(), 1);
+        let actual = &page.items[0];
+        assert_eq!(actual.thread_id, thread_id);
+        assert_eq!(actual.rollout_path.as_ref(), Some(&path));
+        assert_eq!(actual.cwd, home.path());
+        assert_eq!(actual.model_provider, "test-provider");
+        assert_eq!(actual.preview, "Hello from user");
+        assert_eq!(actual.first_user_message.as_deref(), Some("Hello from user"));
+        assert_eq!(actual.name.as_deref(), Some("Custom title"));
+        assert_eq!(runtime.get_thread(thread_id).await.expect("still readable").expect("row").model_provider, "stale-provider",
+            "the test must actually exercise a failed reconciliation, not a repaired row");
+        pool.close().await;
+        runtime.close().await;
     }
 
     #[tokio::test]

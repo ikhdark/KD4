@@ -297,15 +297,22 @@ impl ToolRouter {
             return self.tool_schema_snapshot(&turn.activated_deferred_tools());
         }
         // Activated schemas travel in appended history, never ahead of it.
+        // A rebuilt router can have new eager capabilities within this same
+        // turn (for example, an environment becoming ready). Reuse only an
+        // identical authoritative base schema, not an arbitrary older router.
+        let base_schemas = self.registry.model_visible_schemas();
         let mut state = turn
             .deferred_tool_activations
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(
-            state
-                .model_visible_schemas
-                .get_or_insert_with(|| self.tool_schema_snapshot(&HashSet::new())),
-        )
+        if let Some(schemas) = state.model_visible_schemas.as_ref()
+            && schemas.digest() == base_schemas.digest()
+        {
+            return Arc::clone(schemas);
+        }
+        let schemas = self.tool_schema_snapshot(&HashSet::new());
+        state.model_visible_schemas = Some(Arc::clone(&schemas));
+        schemas
     }
 
     pub(crate) fn deferred_tool_capability_revisions(&self) -> Arc<HashMap<ToolName, String>> {
@@ -877,7 +884,18 @@ async fn authorize_bound_typed_tool_call(
     _external_mutation_intent: ExternalMutationIntent,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
-    let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
+    let Some(binding) = coordinator.binding_for_turn(&step_context.turn) else {
+        // A deliberately unbound turn cannot acquire authority from a task
+        // attached later (or bound to another thread at turn entry).
+        if coordinator
+            .binding_for_source(&step_context.turn.session_source)
+            .is_some()
+        {
+            return Err(FunctionCallError::RequiredOperationBlocked(format!(
+                "{}: this turn has no bound typed assignment attempt",
+                call.tool_name.name
+            )));
+        }
         return Ok(());
     };
     let authorization = coordinator

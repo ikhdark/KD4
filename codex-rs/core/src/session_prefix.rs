@@ -12,7 +12,7 @@ use crate::context::ContextualUserFragment;
 use crate::context::InterAgentCompletionMessage;
 use crate::context::SubagentNotification;
 
-const COMPLETION_MESSAGE_MAX_TOKENS: usize = 1_000;
+const COMPLETION_MESSAGE_MAX_TOKENS: usize = 4_000;
 const COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE: usize = 100;
 const ERROR_MAX_TOKENS: usize =
     COMPLETION_MESSAGE_MAX_TOKENS - COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE;

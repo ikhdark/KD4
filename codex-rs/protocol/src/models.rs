@@ -2234,17 +2234,6 @@ impl CallToolResult {
 
     pub fn as_function_call_output_payload(&self) -> FunctionCallOutputPayload {
         let content_items = convert_mcp_content_to_items(&self.content);
-        if content_items.as_ref().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| matches!(item, FunctionCallOutputContentItem::EncryptedContent { .. }))
-        }) {
-            return FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::ContentItems(content_items.unwrap_or_default()),
-                success: Some(self.success()),
-            };
-        }
-
         let mut items = content_items.unwrap_or_default();
         if let Some(structured) = self
             .structured_content
@@ -2423,22 +2412,14 @@ mod tests {
     }
 
     #[test]
-    fn default_base_instructions_deliver_inventory_coverage_and_report_guidance() {
+    fn default_base_instructions_keep_tool_contract_and_evidence_guidance() {
         let instructions = BaseInstructions::default();
         for required in [
-            "use documented public entrypoints and their contracts (`--describe`, `--help`, AGENTS.md)",
-            "Read implementation only for a specific missing fact",
-            "When a tool returns sufficient evidence for delivery, answer from that result",
-            "do not reopen internal state merely to re-derive returned information",
-            "Further inspection must resolve a concrete scope or correctness question",
-            "Collect candidates once",
-            "retain deduplicated paths, evidence, unresolved items, and coverage",
-            "inspect before scanning only for a named uncertainty",
-            "reuse existing inventory/report tooling",
-            "when file output is permitted",
-            "complete deterministic reports with counts and limitations",
-            "honor inline-only and no-write requests",
-            "Rule matches do not prove semantic completeness or runtime activation",
+            "Use repository tools through their documented entrypoints and contracts (`--describe`, `--help`, AGENTS.md)",
+            "fix a failed invocation at the call rather than rewriting a working tool",
+            "Stop inspecting when further reading would not change the answer",
+            "compute counts and the decision-relevant projection in the tool and print only that",
+            "Separate what you observed from what you infer",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2448,41 +2429,27 @@ mod tests {
     fn default_base_instructions_shorten_the_critical_path_without_dropping_proof() {
         let instructions = BaseInstructions::default();
         for required in [
-            "batch independent reads using native file/snapshot tools",
-            "without reducing requested read coverage",
-            "A new turn alone does not invalidate evidence",
-            "recheck affected dependencies rather than rereading the entire prior scope",
-            "resolve the recovery contract, fetch, check completeness",
-            "with coverage, failures, and continuation controls",
-            "Full-read requests still require full coverage",
-            "start the known expensive validation before independent patch review",
-            "cannot mutate validation inputs, contend for its resources",
-            "prepare the conditional final report in that cell",
-            "Reuse an available callable and current schema; do not rediscover them",
-            "the authorized next call's arguments and postconditions are already known",
-            "resolve and invoke it in the same cell; stop on ambiguity",
-            "check its accepted result and emit the prepared answer in the same delivery cell",
-            "A rejected update requires reconciliation, not a success report",
-            "Unexpected results or unresolved semantic questions still require interpretation",
-            "a passing check alone never proves task completion",
+            "read them in one batch with the native file tools",
+            "a new turn alone does not make evidence stale",
+            "Recover missing output from its retained artifact (`read_tool_output`) before rerunning the producer",
+            "coverage is the obligation",
+            "start known expensive validation before patch review or report writing",
+            "discover and invoke in the same execution cell",
+            "deliver the final answer directly from that cell",
+            "A passing check alone does not prove the task complete",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
     }
 
     #[test]
-    fn default_base_instructions_coordinate_sessions_without_inventing_authority() {
+    fn default_base_instructions_protect_a_shared_checkout() {
         let instructions = BaseInstructions::default();
         for required in [
-            "concurrent sessions are known to share a checkout",
-            "coordinate overlapping edit ownership through available thread/task tools",
-            "do not infer ownership from dirty files or start agents without authorization",
-            "Without a coordination channel, continue disjoint work",
-            "reconcile the affected current source immediately before patching",
-            "an execution lock is not a reservation of an earlier read",
-            "refresh only affected evidence and validation inputs",
+            "When other sessions share the checkout",
+            "reconcile the affected source immediately before patching",
             "do not replay an obsolete whole-file replacement",
-            "launch a duplicate validation while its original run is still live",
+            "do not launch a duplicate validation while its original run is still live",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2492,25 +2459,11 @@ mod tests {
     fn default_base_instructions_narrow_audits_without_replacing_coverage() {
         let instructions = BaseInstructions::default();
         for required in [
-            "narrowing determines inspection order, not required coverage or stopping criteria",
-            "establish the requested scope and coverage obligations before prioritizing candidates",
-            "do not silently turn it into targeted diagnosis",
-            "even when the user did not explicitly request full reads",
-            "narrow candidates with scoped references",
-            "Batch independent deterministic discovery",
-            "inspect complete relevant functions/types",
-            "expand when evidence or unresolved edges require it",
-            "also examine remaining in-scope surfaces independently of candidate hits",
-            "Do not treat fixed search context as an enclosing function",
-            "no search matches as a stopping condition",
-            "Prefer exact selectors only when they preserve required coverage",
-            "honor explicit full-read requests",
-            "Reuse existing revision-bound inventories and coverage ledgers",
-            "reconcile all coverage obligations",
-            "report unexamined areas and unresolved edges explicitly",
-            "incomplete coverage is a partial audit, not a clean result",
-            "Measure input reduction alongside preserved coverage and defect detection",
-            "projection tests establish preservation of selected evidence, not unchanged defect detection",
+            "For a review of a named file or unit, read that unit and the callers needed to confirm a candidate defect",
+            "For a broad audit or an explicit full-read request, coverage is the obligation",
+            "narrowing sets inspection order, not coverage",
+            "track unread ranges",
+            "report unexamined areas as a partial audit, never as a clean result",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2663,6 +2616,39 @@ mod tests {
             serde_json::to_value(result.into_function_call_output_payload()).unwrap(),
             serde_json::json!("native text")
         );
+    }
+
+    #[test]
+    fn encrypted_mcp_projection_preserves_structured_evidence_and_error_status() {
+        for is_error in [false, true] {
+            let result = CallToolResult {
+                content: vec![serde_json::json!({
+                    "type": "text", "text": "enc_opaque",
+                    "_meta": { "codex/encryptedContent": true }
+                })],
+                structured_content: Some(serde_json::json!({"receipt": 42})),
+                is_error: Some(is_error),
+                meta: None,
+            };
+            let wire = serde_json::to_value(ResponseItem::from(
+                ResponseInputItem::McpToolCallOutput {
+                    call_id: "encrypted-call".into(),
+                    output: result,
+                },
+            ))
+            .expect("serialize provider output");
+            let items = wire["output"].as_array().expect("mixed content stays native");
+            assert!(items.iter().any(|item| item == &serde_json::json!({
+                "type": "encrypted_content", "encrypted_content": "enc_opaque"
+            })));
+            assert!(items.iter().any(|item| item == &serde_json::json!({
+                "type": "input_text", "text": "{\"receipt\":42}"
+            })));
+            assert_eq!(
+                items.iter().any(|item| item["text"] == "MCP tool reported an error."),
+                is_error,
+            );
+        }
     }
 
     #[test]

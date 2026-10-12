@@ -15,6 +15,8 @@ struct PluginAppFile {
 struct PluginAppConfig {
     id: String,
     category: Option<String>,
+    #[serde(default)]
+    required: bool,
 }
 
 /// Parses connector declarations from a plugin app configuration file.
@@ -37,6 +39,7 @@ fn app_declarations_from_file(parsed: PluginAppFile) -> Vec<AppDeclaration> {
             name,
             connector_id: AppConnectorId(app.id),
             category: cleaned_category(app.category),
+            required: app.required,
         })
         .collect()
 }

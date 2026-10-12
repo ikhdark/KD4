@@ -2733,6 +2733,47 @@ async fn source_inspection_receipts_bind_kind_without_workspace_tracking() {
 }
 
 #[tokio::test]
+async fn source_inspections_namespace_session_local_call_ids_by_attempt() {
+    use sha2::Digest;
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let path = fixture.repo.path().join("src/lib.rs");
+    let bytes = std::fs::read(&path).unwrap();
+    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let mut inspections = Vec::new();
+    for root in ["first-session", "second-session"] {
+        let (_, attempt) = fixture.store.create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft(root, "src/lib.rs", "inspect:src/lib.rs"),
+        ).await.unwrap();
+        let start = fixture.store.prepare_source_inspection(
+            attempt.attempt_id, path.to_string_lossy().into_owned(),
+        ).await.unwrap().unwrap();
+        // Each independent code-mode runtime legitimately starts with this ID.
+        let reference = fixture.store.record_source_inspection(
+            start, "exec-1-tool-1".into(), hash.clone(), bytes.len() as u64,
+        ).await.expect("another session's local call ID must not prevent inspection evidence");
+        let recorded = fixture.store.get_validation_call(reference.call_id.clone())
+            .await.unwrap().unwrap();
+        assert_eq!(recorded.attempt_id, attempt.attempt_id);
+        assert_eq!(recorded.verified_evidence_kind(), Some(CriterionEvidenceKind::SourceInspection));
+        inspections.push((attempt, reference, recorded));
+    }
+    assert_ne!(inspections[0].1.call_id, inspections[1].1.call_id);
+    let mut stolen = inspections[0].2.clone();
+    stolen.attempt_id = inspections[1].0.attempt_id;
+    assert!(matches!(
+        fixture.store.record_validation_call(stolen).await,
+        Err(StoreError::ValidationCallOwnership { .. })
+    ), "namespacing must not weaken the durable ownership guard");
+    for (attempt, reference, _) in inspections {
+        let mut receipt = completed_receipt(vec![reference.call_id.clone()]);
+        receipt.criterion_results[0].evidence_ref = Some(reference);
+        fixture.store.submit_agent_receipt(attempt.attempt_id, receipt).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn completed_receipt_retains_validation_without_workspace_tracking() {
     let fixture = Fixture::new().await;
     initialize_validation_repository(fixture.repo.path());

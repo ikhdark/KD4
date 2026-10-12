@@ -157,7 +157,7 @@ impl WorldStateSection for EnvironmentsState {
                     && previous
                         .environments
                         .get(id)
-                        .is_some_and(|previous| previous.status == EnvironmentStatus::Starting);
+                        .is_some_and(|previous| previous.status != EnvironmentStatus::Available);
                 (
                     id.clone(),
                     EnvironmentUpdate::Current(environment, became_available),
@@ -199,7 +199,7 @@ impl WorldStateSection for EnvironmentsState {
                     network: changed_value(
                         &current.network,
                         &previous.network,
-                        "<network status=\"unspecified\" />",
+                        "<managed_network_proxy status=\"unspecified\" />",
                     ),
                     filesystem: changed_value(
                         &current.filesystem,
@@ -352,6 +352,9 @@ fn push_environment_values(
     if environment.status == EnvironmentStatus::Starting {
         rendered.push_str(indent);
         rendered.push_str("<status>starting</status>\n");
+    } else if environment.status == EnvironmentStatus::Failed {
+        rendered.push_str(indent);
+        rendered.push_str("<status>failed</status>\n");
     } else if report_available {
         rendered.push_str(indent);
         rendered.push_str("<status>available</status>\n");
@@ -418,6 +421,7 @@ impl EnvironmentSnapshot {
 enum EnvironmentStatus {
     Starting,
     Available,
+    Failed,
 }
 
 fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, EnvironmentState> {
@@ -440,17 +444,19 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
         })
         .collect::<BTreeMap<_, _>>();
     for environment in &snapshot.starting {
-        // Failed futures remain selected for dispatch authority, but must not
-        // keep advertising a startup that can no longer become ready.
-        if environment.has_failed() {
-            continue;
-        }
+        // Failed futures remain selected for dispatch. Preserve their identity:
+        // dropping them can hide the surviving secondary's explicit ID behind
+        // the legacy single-environment rendering, although it is not primary.
         environments
             .entry(environment.selection.environment_id.clone())
             .or_insert_with(|| EnvironmentState {
                 cwd: environment.selection.cwd.clone(),
                 os: None,
-                status: EnvironmentStatus::Starting,
+                status: if environment.has_failed() {
+                    EnvironmentStatus::Failed
+                } else {
+                    EnvironmentStatus::Starting
+                },
                 shell: None,
             });
     }

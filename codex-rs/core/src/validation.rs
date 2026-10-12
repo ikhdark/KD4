@@ -101,6 +101,69 @@ fn validation_signals_require_executing_or_checking_modes() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn syntax_only_shell_wrappers_do_not_prove_validation() {
+    // POSIX `-n` reads commands without executing them. A successful syntax
+    // check of a validation command is not execution of that validation.
+    for program in ["sh", "bash"] {
+        for (args, proof) in [
+            (vec!["-n", "-c", "cargo check"], false),
+            (vec!["-nc", "cargo check"], false),
+            (vec!["-c", "-n", "cargo check"], false),
+            (vec!["-o", "noexec", "-c", "cargo check"], false),
+            (vec!["-c", "cargo check"], true),
+            (vec!["-lc", "cargo check"], true),
+            (vec!["-n", "+n", "-c", "cargo check"], true),
+            (vec!["-n", "-c", "+n", "cargo check"], true),
+        ] {
+            let invocation = CommandInvocation::Argv {
+                program: program.to_string(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            };
+            let validation = CommandValidation {
+                execution_context: None,
+                declared: None,
+                classification: classify_validation(&invocation),
+                receipt_runner: None,
+            };
+            assert_eq!(validation.signal()["proof"], proof, "{program} {args:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "opt-in bounded classifier/proof timing; not an end-to-end shell benchmark"]
+fn validation_shell_mode_proof_bounded_benchmark() {
+    const ITERATIONS: usize = 5_000;
+    for (program, args, proof) in [
+        ("cargo", vec!["check"], true),
+        ("sh", vec!["-c", "cargo check"], true),
+        ("sh", vec!["-n", "-c", "cargo check"], false),
+        ("sh", vec!["-n", "+n", "-c", "cargo check"], true),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: program.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        };
+        let started = std::time::Instant::now();
+        let mut proofs = 0;
+        for _ in 0..ITERATIONS {
+            let validation = CommandValidation {
+                execution_context: None,
+                declared: None,
+                classification: classify_validation(std::hint::black_box(&invocation)),
+                receipt_runner: None,
+            };
+            proofs += usize::from(std::hint::black_box(validation.signal())["proof"] == true);
+        }
+        eprintln!("validation shell proof: {program} {args:?}; iterations={ITERATIONS}; elapsed_us={}",
+            started.elapsed().as_micros());
+        assert_eq!(proofs, if proof { ITERATIONS } else { 0 }, "{program} {args:?}");
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryRunners {
@@ -616,7 +679,7 @@ mod tests {
                 include_str!("../../../.codex/test-runners.json")).unwrap();
             git(&["add", ".codex/test-runners.json"]);
             git(&["commit", "-m", "runner fixture"]);
-            let script = r"python -B scripts\rust_test_runner.py run-target core_lib";
+            let script = r"python -B scripts\build\rust_test_runner.py run-target core_lib";
             for invocation in [CommandInvocation::Script(script.into()), CommandInvocation::PowerShellScript(script.into())] {
                 let validation = resolve_command_validation_with_shell(&invocation,
                     Some(crate::shell::ShellType::PowerShell), Some(root), None).await.unwrap();
@@ -653,7 +716,7 @@ mod tests {
             let mut runner: codex_shell_command::validation::RepositoryRunner =
                 serde_json::from_value(serde_json::json!({
                     "programs": ["python"],
-                    "prefixes": [["scripts/rust_build_status.py", "run-lane"]],
+                    "prefixes": [["scripts/build/rust_build_status.py", "run-lane"]],
                     "allow_extra_args": true,
                     "passthrough_after": "--"
                 })).unwrap();
@@ -665,7 +728,7 @@ mod tests {
                 (vec!["echo", "cargo", "test"], false),
                 (vec![], false),
             ] {
-                let mut args = vec!["scripts/rust_build_status.py", "run-lane", "--lane", "core-tests", "--"];
+                let mut args = vec!["scripts/build/rust_build_status.py", "run-lane", "--lane", "core-tests", "--"];
                 args.extend(child);
                 let invocation = argv("python", &args);
                 assert_eq!(matches!(classify_with_runners(&invocation, &[runner.clone()]),
@@ -673,7 +736,7 @@ mod tests {
             }
             runner.receipt_runner = Some("rust_test_runner".into());
             assert!(!runner.matches("python", &[
-                "scripts/rust_build_status.py", "run-lane", "--", "cargo", "test",
+                "scripts/build/rust_build_status.py", "run-lane", "--", "cargo", "test",
             ].map(str::to_string)));
         }
 

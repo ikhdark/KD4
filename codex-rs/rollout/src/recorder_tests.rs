@@ -862,6 +862,69 @@ async fn recorder_persists_every_sampling_request_token_count() -> std::io::Resu
 }
 
 #[tokio::test]
+async fn recorder_discard_waits_for_owned_cleanup_without_materializing() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = RolloutRecorder::new(
+        &test_config(home.path()),
+        RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
+            None, "discard-test".into(), BaseInstructions::default(), Vec::new()),
+    ).await?;
+    let path = recorder.rollout_path().to_path_buf();
+    recorder.record_canonical_items_ordered(&[agent_message("discarded")]).await?;
+    let (entered, paused) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    recorder.tx.send(RolloutCmd::Pause { entered, resume: resumed }).await.unwrap();
+    paused.await.unwrap();
+    let discard = recorder.discard();
+    tokio::pin!(discard);
+    assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+        std::future::Future::poll(discard.as_mut(), cx))).await, std::task::Poll::Pending));
+    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUTTING_DOWN);
+    assert!(!path.exists());
+    resume.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), discard).await.expect("discard completion")?;
+    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUT_DOWN);
+    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+    assert!(!path.exists(), "acknowledged discard must not run the last-sender drain");
+    assert!(recorder.record_canonical_items_ordered(&[agent_message("too late")]).await.is_err());
+    recorder.discard().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorder_discard_preserves_durable_records_and_drops_pending_suffix() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = storage_overlap_recorder(home.path(), 4)?;
+    recorder.record_canonical_items_ordered(&[agent_message("durable")]).await?;
+    recorder.flush_durable().await?;
+    let before = fs::read(recorder.rollout_path())?;
+    recorder.record_canonical_items_with_flush(&[agent_message("pending")], false, true).await?;
+    recorder.discard().await?;
+    assert_eq!(fs::read(recorder.rollout_path())?, before, "discard must neither flush nor delete durable history");
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorder_cancelled_discard_remains_owned_behind_blocked_storage() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let recorder = storage_overlap_recorder(home.path(), 4)?;
+    let lock = compression::lock_rollout_for_write_blocking(recorder.rollout_path())?;
+    recorder.record_canonical_items_with_flush(&[agent_message("accepted before discard")], true, true).await?;
+    assert!(tokio::time::timeout(Duration::from_millis(20), recorder.discard()).await.is_err());
+    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUTTING_DOWN);
+    assert!(recorder.record_canonical_items_ordered(&[agent_message("too late")]).await.is_err());
+    drop(lock);
+    let worker = recorder.writer_task.handle.lock().unwrap().take().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker).await.expect("owned discard completes").expect("writer task");
+    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUT_DOWN);
+    recorder.discard().await?;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(serde_json::to_value(items)?, serde_json::to_value(vec![agent_message("accepted before discard")])?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn recorder_last_handle_drop_drains_accepted_deferred_records() -> std::io::Result<()> {
     let home = TempDir::new()?;
     let recorder = RolloutRecorder::new(

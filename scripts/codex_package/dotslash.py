@@ -17,8 +17,8 @@ from functools import lru_cache
 from pathlib import Path
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
-from scripts.process_owner import check_operation
-from scripts.process_owner import run_owned
+from scripts.common.process_owner import check_operation
+from scripts.common.process_owner import run_owned
 
 from .targets import TargetSpec
 

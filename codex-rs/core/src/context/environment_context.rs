@@ -265,6 +265,8 @@ pub(crate) fn push_xml_escaped_attribute(rendered: &mut String, value: &str) {
     }
 }
 
+/// Managed proxy configuration and requirement-domain lists, not effective
+/// network access or proof that a configured proxy is active for this turn.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct NetworkContext {
     enabled: bool,
@@ -286,10 +288,13 @@ impl NetworkContext {
     }
 
     pub(super) fn render(&self) -> String {
-        let mut rendered = format!("<network enabled=\"{}\">", self.enabled);
-        Self::push_rendered_domain_element(&mut rendered, "allowed", &self.allowed_domains);
-        Self::push_rendered_domain_element(&mut rendered, "denied", &self.denied_domains);
-        rendered.push_str("</network>");
+        let mut rendered = format!(
+            "<managed_network_proxy configured_enabled=\"{}\">",
+            self.enabled
+        );
+        Self::push_rendered_domain_element(&mut rendered, "required_allowed", &self.allowed_domains);
+        Self::push_rendered_domain_element(&mut rendered, "required_denied", &self.denied_domains);
+        rendered.push_str("</managed_network_proxy>");
         rendered
     }
 

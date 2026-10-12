@@ -337,7 +337,8 @@ impl GoalRuntimeHandle {
         self.inner
             .analytics
             .status_changed(&goal, previous_status, GoalEventAttribution::NoTurn);
-        let objective_changed = previous_goal.as_ref().is_none_or(|previous_goal| {
+        // A first goal edits and supersedes nothing; its continuation prompt carries the objective.
+        let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
             replaced_existing_goal || previous_goal.objective != goal.objective
         });
         if goal.status != codex_state::ThreadGoalStatus::Active {
@@ -891,6 +892,13 @@ mod tests {
                 tools_available_for_thread: true,
             },
         );
+        // Setting the first goal queues no "objective was edited" notice.
+        runtime
+            .apply_external_goal_set(original.clone(), /*previous_goal*/ None)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(pending_goal_id(&runtime), None);
+
         let edited = state_dbs
             .thread_goals()
             .update_thread_goal(

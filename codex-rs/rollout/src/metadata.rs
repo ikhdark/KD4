@@ -199,6 +199,11 @@ pub(crate) async fn cache_extraction_outcome(
     cache.order.retain(|candidate| {
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
+    // Payload artifacts can be repaired without changing the rollout cache key.
+    // Retire any earlier snapshot, but do not retain this incomplete projection.
+    if outcome.parse_errors != 0 {
+        return;
+    }
     cache.order.push_back(key.clone());
     cache.entries.insert(key, outcome);
     while cache.order.len() > EXTRACTION_CACHE_CAPACITY {

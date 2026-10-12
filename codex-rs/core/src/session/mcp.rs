@@ -91,7 +91,7 @@ struct PluginInstallElicitationTelemetryMetadata {
 impl Session {
     pub(crate) async fn lock_pending_mcp_server_refresh_config(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, Option<McpServerRefreshConfig>> {
+    ) -> tokio::sync::MutexGuard<'_, Option<Arc<McpServerRefreshConfig>>> {
         self.pending_mcp_server_refresh_config.lock().await
     }
 
@@ -519,8 +519,11 @@ impl Session {
     }
 
     pub(crate) async fn refresh_mcp_servers_if_requested(&self, turn_context: &TurnContext) {
-        let refresh_config = { self.pending_mcp_server_refresh_config.lock().await.take() };
-        let Some(refresh_config) = refresh_config else {
+        // Preparation is cancellable by the submission dispatcher. Keep the request
+        // queued until its configuration is actually published, without holding the
+        // pending-config lock across startup or adding a background retry owner.
+        let requested = { self.pending_mcp_server_refresh_config.lock().await.clone() };
+        let Some(requested) = requested else {
             return;
         };
 
@@ -528,13 +531,14 @@ impl Session {
             mcp_servers,
             mcp_oauth_credentials_store_mode,
             auth_keyring_backend_kind,
-        } = refresh_config;
+        } = requested.as_ref().clone();
 
         let mcp_servers =
             match serde_json::from_value::<HashMap<String, McpServerConfig>>(mcp_servers) {
                 Ok(servers) => servers,
                 Err(err) => {
                     warn!("failed to parse MCP server refresh config: {err}");
+                    self.acknowledge_mcp_server_refresh(&requested).await;
                     return;
                 }
             };
@@ -544,6 +548,7 @@ impl Session {
             Ok(mode) => mode,
             Err(err) => {
                 warn!("failed to parse MCP OAuth refresh config: {err}");
+                self.acknowledge_mcp_server_refresh(&requested).await;
                 return;
             }
         };
@@ -552,6 +557,7 @@ impl Session {
                 Ok(kind) => kind,
                 Err(err) => {
                     warn!("failed to parse MCP auth keyring backend refresh config: {err}");
+                    self.acknowledge_mcp_server_refresh(&requested).await;
                     return;
                 }
             };
@@ -571,6 +577,7 @@ impl Session {
             .set_enabled(Feature::SecretAuthStorage, secret_auth_storage_enabled)
         {
             warn!("failed to apply MCP auth keyring backend refresh config: {err}");
+            self.acknowledge_mcp_server_refresh(&requested).await;
             return;
         }
 
@@ -604,7 +611,7 @@ impl Session {
             };
             break (mcp_projection, available_environment_ids, expected_runtime);
         };
-        self.refresh_mcp_servers_inner(
+        let runtime = self.refresh_mcp_servers_inner(
             turn_context,
             mcp_projection,
             &turn_context.environments,
@@ -612,6 +619,23 @@ impl Session {
             expected_runtime,
         )
         .await;
+        // A lost compare-and-publish race returns the winning runtime. Only
+        // acknowledge if that authoritative runtime satisfies this request.
+        if codex_mcp::configured_mcp_servers(runtime.config()) == mcp_servers
+            && runtime.config().mcp_oauth_credentials_store_mode == store_mode
+            && runtime.config().auth_keyring_backend_kind == keyring_backend_kind
+        {
+            self.acknowledge_mcp_server_refresh(&requested).await;
+        }
+    }
+
+    async fn acknowledge_mcp_server_refresh(&self, applied: &Arc<McpServerRefreshConfig>) {
+        let mut pending = self.pending_mcp_server_refresh_config.lock().await;
+        // Value equality cannot distinguish a later identical refresh (for
+        // example, a changed elicitation capability using the same server map).
+        if pending.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, applied)) {
+            *pending = None;
+        }
     }
 
     pub(crate) async fn set_openai_form_elicitation_support(
@@ -640,7 +664,7 @@ impl Session {
         self.services
             .supports_openai_form_elicitation
             .store(supported, std::sync::atomic::Ordering::Relaxed);
-        *self.pending_mcp_server_refresh_config.lock().await = Some(refresh_config);
+        *self.pending_mcp_server_refresh_config.lock().await = Some(Arc::new(refresh_config));
         Ok(())
     }
 

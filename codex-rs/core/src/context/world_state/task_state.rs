@@ -103,7 +103,11 @@ impl ContextualUserFragment for TaskState {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        let mut body = "\nCurrent stored task state; replaces earlier task-state snapshots. This is a checklist and obligation ledger, not proof of completion or permission to narrow the user's request. Later user instructions remain authoritative. When execution_suspended is true, this is retained implementation state, not debt of the current planning deliverable; do not repair or complete it in Plan Mode. Retired requirement details remain in durable plan history.\n".to_string();
+        let mut body = "\nCurrent stored task state; replaces earlier task-state snapshots. This is a checklist and obligation ledger, not proof of completion or permission to narrow the user's request.".to_string();
+        if self.0["execution_suspended"] == true {
+            body.push_str(" execution_suspended is true: this is retained implementation state, not debt of the current planning deliverable; do not repair or complete it in Plan Mode.");
+        }
+        body.push('\n');
         push_xml_escaped_text(&mut body, &self.0.to_string());
         body.push('\n');
         body.into()

@@ -5,6 +5,33 @@ use std::fs::FileTimes;
 use std::time::SystemTime;
 use tempfile::tempdir;
 
+#[tokio::test]
+async fn instruction_spills_never_splice_policy_even_when_storage_fails() -> Result<()> {
+    let dir = tempdir()?;
+    let text = format!("Perform the action. {} Except when unapproved, do not perform it. {} Proceed.", "x".repeat(15_000), "y".repeat(45_000));
+    for storage_fails in [false, true] {
+        let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?
+            .join(if storage_fails { "blocked" } else { "available" });
+        if storage_fails {
+            fs::write(output_dir.as_ref(), "not a directory").await?;
+        }
+        let spiller = HookOutputSpiller { output_dir, last_prune: Arc::default() };
+        let output = spiller.maybe_spill_texts(ThreadId::new(), vec![text.clone()]).await.remove(0);
+        assert!(output.starts_with(OMITTED_HOOK_INSTRUCTIONS));
+        assert!(!output.contains("Perform the action."));
+        assert!(!output.contains("Proceed."));
+        assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
+        if storage_fails {
+            assert!(output.contains("Recovery unavailable:"));
+            assert!(!output.contains("Full hook output saved to:"));
+        } else {
+            let path = output.lines().find_map(|line| line.strip_prefix("Full hook output saved to: ")).context("recovery path")?;
+            assert_eq!(fs::read_to_string(path).await?, text);
+        }
+    }
+    Ok(())
+}
+
 fn write_spill(path: &Path, text: &str, modified: SystemTime) -> Result<()> {
     std::fs::create_dir_all(path.parent().context("spill parent")?)?;
     std::fs::write(path, text)?;
@@ -193,8 +220,8 @@ async fn large_hook_output_spills_to_file() -> Result<()> {
         .maybe_spill_text(ThreadId::new(), text.clone())
         .await;
 
-    assert!(output.contains("[omitted before retained middle]"));
-    assert!(output.contains("[omitted after retained middle]"));
+    assert!(output.starts_with(OMITTED_HOOK_INSTRUCTIONS));
+    assert!(!output.contains("hook output hook output"));
     assert!(approx_token_count(&output) <= HOOK_OUTPUT_TOKEN_LIMIT);
     let path = output
         .lines()

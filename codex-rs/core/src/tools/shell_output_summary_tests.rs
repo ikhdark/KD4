@@ -422,6 +422,119 @@ fn compiler_json_uses_complete_stdout_and_keeps_stderr_independent() {
 }
 
 #[test]
+fn rustc_stderr_diagnostics_keep_constraints_through_both_output_paths() {
+    use crate::tools::context::{ExecCommandToolOutput, ToolOutput, ToolPayload};
+    use crate::unified_exec::ProcessOutputSnapshot;
+    use codex_protocol::exec_output::{ExecToolCallOutput, StreamOutput};
+    use codex_utils_output_truncation::TruncationPolicy;
+    use std::sync::Arc;
+
+    // rustc --error-format=json emits native diagnostic records on stderr,
+    // unlike Cargo's compiler-message envelopes on stdout.
+    let cargo: serde_json::Value = serde_json::from_str(&compiler_record("borrow of moved value")).unwrap();
+    let mut diagnostic = cargo["message"].clone();
+    diagnostic["$message_type"] = "diagnostic".into();
+    diagnostic["code"]["code"] = "E0382".into();
+    diagnostic["spans"][0]["suggested_replacement"] = serde_json::Value::Null;
+    diagnostic["spans"][0]["suggestion_applicability"] = serde_json::Value::Null;
+    diagnostic["children"] = serde_json::json!([{
+        "level":"help", "message":"consider cloning the value if the performance cost is acceptable",
+        "spans":[{"file_name":"src/λ.rs", "line_start":6, "column_start":8,
+            "is_primary":true, "suggested_replacement":".clone()",
+            "suggestion_applicability":"MachineApplicable"}], "children":[]
+    }]);
+    diagnostic["spans"].as_array_mut().unwrap().push(serde_json::json!({
+        "file_name":"src/λ.rs", "line_start":6, "column_start":3,
+        "is_primary":false, "label":"value moved here"
+    }));
+    let stderr = format!("{diagnostic}\r\n");
+    let output = ExecToolCallOutput {
+        exit_code: 1,
+        stdout: StreamOutput::new(String::new()),
+        stderr: StreamOutput::new(stderr.clone()),
+        aggregated_output: StreamOutput::new(stderr.clone()),
+        ..Default::default()
+    };
+    let project = |output: &ExecToolCallOutput| crate::tools::project_exec_output_text_with_budget(
+        output, TruncationPolicy::Tokens(2000), Some(2000), Some("rustc --error-format=json"));
+    let assert_constraints = |text: &str| {
+        let summary: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(summary["diagnostic_stream"], "stderr");
+        assert_eq!(summary["error_count"], 1);
+        assert_eq!(summary["stderr"], serde_json::Value::Null);
+        assert_eq!(summary["diagnostics_complete"], true);
+        let kept = &summary["diagnostics"][0]["diagnostic"];
+        assert_eq!(kept["code"]["code"], "E0382");
+        assert_eq!(kept["spans"], diagnostic["spans"]);
+        assert_eq!(kept["children"], diagnostic["children"]);
+        assert!(kept.get("rendered").is_none());
+        assert!(kept["code"].get("explanation").is_none());
+    };
+    assert_constraints(&project(&output).text);
+    assert_eq!(output.stderr.text, stderr);
+    for stream in 0..3 {
+        let mut incomplete = output.clone();
+        match stream {
+            0 => incomplete.stdout.truncated = true,
+            1 => incomplete.stderr.truncated = true,
+            _ => incomplete.aggregated_output.truncated = true,
+        }
+        // A valid captured aggregate may still be projected, but rejected
+        // producer streams must not acquire authoritative stderr attribution.
+        if let Ok(summary) = serde_json::from_str::<serde_json::Value>(&project(&incomplete).text) {
+            assert_eq!(summary["diagnostic_stream"], "aggregated");
+        }
+    }
+    let mut partial = output.clone();
+    let cut = stderr.find("rendered").unwrap();
+    partial.stderr.text.truncate(cut);
+    partial.stderr.truncated = true;
+    partial.aggregated_output.text.truncate(cut);
+    partial.aggregated_output.truncated = true;
+    assert!(!project(&partial).text.contains("\"format\":\"compiler_diagnostics\""));
+    for suffix in ["\n{broken", "\n{\"reason\":\"unknown-output\"}"] {
+        let mut unknown = output.clone();
+        unknown.stderr.text.push_str(suffix);
+        unknown.aggregated_output.text.push_str(suffix);
+        assert!(!project(&unknown).text.contains("\"format\":\"compiler_diagnostics\""));
+    }
+    // Do not silently drop another stream or reinterpret printed source JSON.
+    let mut mixed = output.clone();
+    mixed.stdout.text = "other command output\n".into();
+    mixed.aggregated_output.text.push_str(&mixed.stdout.text);
+    assert!(!project(&mixed).text.contains("\"format\":\"compiler_diagnostics\""));
+    assert!(summarize_shell_output_for_model_with_streams(
+        &stderr, 1, false, options(Some("cat diagnostics.json"), Some(2000)),
+        Some(("", &stderr))).is_none());
+
+    let mut unified = ExecCommandToolOutput {
+        output_ranges: None,
+        process_output: Some(Arc::new(ProcessOutputSnapshot {
+            aggregated_output: stderr.as_bytes().to_vec(),
+            stdout: Vec::new(), stderr: stderr.as_bytes().to_vec(),
+            aggregated_output_is_exact: true, streams_are_exact: true,
+        })),
+        error: None, validation: None, event_call_id: String::new(), chunk_id: String::new(),
+        wall_time: std::time::Duration::ZERO, raw_output: stderr.into_bytes(),
+        truncation_policy: TruncationPolicy::Tokens(2000), max_output_tokens: Some(2000),
+        process_id: None, session_capabilities: None, exit_code: Some(1), process_exited: true,
+        search_no_match: false, original_token_count: None,
+        hook_command: Some("rustc --error-format=json".to_string()),
+        raw_output_artifact: None, repair_notice: None, pending_deferred_completions: Vec::new(),
+    };
+    let payload = ToolPayload::Function { arguments: "{}".to_string() };
+    assert_constraints(unified.code_mode_result(&payload)["output"].as_str().unwrap());
+    Arc::make_mut(unified.process_output.as_mut().unwrap()).streams_are_exact = false;
+    let inexact = unified.code_mode_result(&payload);
+    if let Ok(summary) = serde_json::from_str::<serde_json::Value>(inexact["output"].as_str().unwrap()) {
+        assert_eq!(summary["diagnostic_stream"], "aggregated");
+    }
+    Arc::make_mut(unified.process_output.as_mut().unwrap()).streams_are_exact = true;
+    unified.raw_output = "last poll only\n".repeat(1000).into_bytes();
+    assert!(!unified.code_mode_result(&payload)["output"].as_str().unwrap().contains("compiler_diagnostics"));
+}
+
+#[test]
 fn unified_exec_compiler_streams_do_not_replay_prior_poll_output() {
     use crate::tools::context::{ExecCommandToolOutput, ToolOutput, ToolPayload};
     use crate::unified_exec::ProcessOutputSnapshot;
@@ -789,6 +902,11 @@ fn unretained_distinct_diagnostics_are_counted() {
     );
     assert!(summary.contains("fatal: distinct category 0"));
     assert!(summary.contains("fatal: distinct category 11"));
+    // Category 4 (line 121) is the first group left out; its range carries the
+    // same three context lines a shown group gets.
+    assert!(!summary.contains("fatal: distinct category 4"), "{summary}");
+    assert_eq!(line_summary_omitted_group(&summary), Some(Some((118, 124))));
+    assert_eq!(line_summary_omitted_group("error: plain output"), None);
 }
 
 #[test]

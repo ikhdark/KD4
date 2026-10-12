@@ -118,7 +118,7 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
                     ),
                     (
                         "enclosing".to_string(),
-                        JsonSchema::boolean(Some("Also hydrate complete enclosing Rust/Python items for this bounded page; defaults to false. read_file retains parsed item sections and continuations preserve this option. Recovery uses only those immutable sections, never mutable source. Non-item hits retain ordinary context. Check enclosing_complete and selector errors; ordinary context is not proof of a complete item.".to_string())),
+                        JsonSchema::boolean(Some("Also hydrate complete enclosing Rust/Python items for this bounded page; defaults to false. Continuations preserve this option. Non-item hits retain ordinary context; check enclosing_complete and selector errors.".to_string())),
                     ),
                     (
                         "start_byte".to_string(),
@@ -172,9 +172,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: format!("Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns as much exact content as fits plus continuation metadata; structured selections use JSON pointers. Default recovery has a {} token envelope ceiling ({} in code mode). Scripts explicitly requesting max_bytes above the default instead use a bounded 1 MiB serialized payload, independent of the cell display budget. Print only needed evidence; complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.",
-            crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING,
-            codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS.saturating_sub(1_000)),
+        description: "Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns exact content up to max_bytes plus continuation metadata; complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -217,6 +215,18 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
             "selection_status": {"type": "string", "enum": ["complete", "partial", "failed"], "description": "Requested-page delivery, not transport success or whole-file coverage. Partial and failed batches retain all successful siblings."},
             "retained_artifact_complete": {"type": "boolean", "description": "All original bytes are retained. This does not imply the requested selection was delivered."},
             "delivered_selection_complete": {"type": "boolean", "description": "All requested selectors were delivered completely; legacy complete has the same meaning."},
+            "criterion_evidence": {
+                "type": "object",
+                "description": "Host-recorded source acquisition for the original active typed attempt after all exact snapshot bytes were delivered. Not semantic correctness or current-source proof.",
+                "properties": {
+                    "call_id": {"type": "string"}, "workspace_id": {"type": "string"},
+                    "evidence_epoch": {"type": "integer", "minimum": 0},
+                    "kind": {"const": "source_inspection"}
+                },
+                "required": ["call_id", "workspace_id", "evidence_epoch", "kind"],
+                "additionalProperties": false
+            },
+            "inspection_proof_error": {"type": "string"},
             "unavailable_ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}},
             "results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
             "continuation_stop": {
@@ -301,7 +311,8 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                                     "properties": {
                                         "qualified_name": {"type": "string"}, "kind": {"type": "string"},
                                         "start_line": {"type": "integer", "minimum": 1},
-                                        "end_line": {"type": "integer", "minimum": 1}
+                                        "end_line": {"type": "integer", "minimum": 1},
+                                        "syntax_error": {"const": true, "description": "The item or an owner header contains a parse error; its qualified identity or range may be wrong. Exact source delivery can still be complete."}
                                     },
                                     "required": ["qualified_name", "kind", "start_line", "end_line"],
                                     "additionalProperties": false

@@ -2921,6 +2921,11 @@ impl LocalAgentTaskStore {
         bytes: u64,
     ) -> TaskStoreFuture<'_, crate::CriterionEvidenceRef> {
         Box::pin(async move {
+            // Runtime call IDs are session-local (for example exec-1-tool-1),
+            // while validation_calls is shared by every attempt in this home.
+            // Keep acquisition/recovery IDs local; namespace only the durable
+            // evidence identity and retain the store's ownership checks.
+            let call_id = format!("inspection:{}:{call_id}", start.attempt_id);
             let result = crate::SourceInspectionResult {
                 version: 1, kind: "source_inspection".into(), call_id: call_id.clone(),
                 path: start.path.clone(), source_sha256, bytes,

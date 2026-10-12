@@ -1,5 +1,190 @@
 use super::*;
 
+async fn git_freshness_test_output(cwd: &Path, args: &[&str]) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .current_dir(cwd)
+        .output()
+        .await
+        .expect("run fixture Git command");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn git_read_evidence_invalidates_after_external_head_or_config_change() {
+    for (read_args, mutation_args, changed_path) in [
+        (
+            vec!["status", "--short", "--branch"],
+            vec!["symbolic-ref", "HEAD", "refs/heads/after"],
+            ".git/HEAD",
+        ),
+        (
+            vec!["status", "--short"],
+            vec!["config", "--local", "status.showUntrackedFiles", "no"],
+            ".git/config",
+        ),
+    ] {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git_freshness_test_output(root, &["init", "-q"]).await;
+        git_freshness_test_output(root, &["symbolic-ref", "HEAD", "refs/heads/before"]).await;
+        git_freshness_test_output(root, &["config", "--local", "status.showUntrackedFiles", "all"]).await;
+        let source = root.join("source.txt");
+        std::fs::write(&source, "unchanged source").unwrap();
+        let before = git_freshness_test_output(root, &read_args).await;
+        let arguments = serde_json::json!({"cmd": format!("git {}", read_args.join(" ")), "shell": "bash"});
+        let (classification, _) = classify_workspace_tool_call_at_admission(
+            "exec_command".into(),
+            ToolPayload::Function { arguments: arguments.to_string() },
+            root.to_path_buf(),
+        ).await.unwrap();
+        assert!(classification.observes_workspace);
+        let cache = GitWorkspaceCache::new();
+        let revision = workspace_identity_at(root, "captured");
+        let output = text_output("git-read", before.clone());
+        let source_output = text_output("source-read", "unchanged source".into());
+        let items: Arc<[ResponseItem]> = Arc::from([
+            named_function_call_with_arguments("git-read", "exec_command", arguments),
+            output.clone(),
+            named_function_call_with_arguments("source-read", "read_file", serde_json::json!({"path": source})),
+            source_output.clone(),
+        ]);
+        let mut state = ToolHistoryState::default();
+        for (output, dependencies) in [
+            (&output, classification.source_dependencies),
+            (&source_output, BTreeSet::from([SourceDependencyV1::new(&source, false)])),
+        ] {
+            state.register_workspace_evidence(watched(&cache, root,
+                WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), output, dependencies).unwrap(),
+            ).await);
+        }
+        let delivery_probe = cache.begin_source_path_change_observation(root, &root.join(changed_path), false)
+            .await.unwrap();
+        assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
+
+        // This external writer bypasses host mutation accounting. Wait for an
+        // exact metadata observation so watcher delivery is not the test oracle.
+        git_freshness_test_output(root, &mutation_args).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while cache.source_path_change_observation_is_current(&delivery_probe) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("native watcher must observe the metadata change");
+        assert_ne!(before, git_freshness_test_output(root, &read_args).await,
+            "the Git result actually depends on {changed_path}");
+        let notices = freshness_notices(&state, &items, Some(&revision), &cache);
+        assert_eq!(notices.len(), 1, "invalidate Git evidence, not the unchanged file read: {changed_path}");
+        assert_eq!(notices[0]["call_id"], "git-read");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
+    }
+}
+
+#[tokio::test]
+async fn git_read_from_subdirectory_tracks_sibling_changes_but_exact_reads_do_not() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    git_freshness_test_output(root, &["init", "-q"]).await;
+    git_freshness_test_output(root, &["config", "--local", "status.showUntrackedFiles", "all"]).await;
+    let cwd = root.join("package");
+    std::fs::create_dir(&cwd).unwrap();
+    let source = cwd.join("source.txt");
+    let sibling = root.join("sibling.txt");
+    std::fs::write(&source, "unchanged source").unwrap();
+    let before = git_freshness_test_output(&cwd, &["status", "--short"]).await;
+    let arguments = serde_json::json!({"cmd": "git status --short", "shell": "bash"});
+    let (classification, _) = classify_workspace_tool_call_at_admission(
+        "exec_command".into(), ToolPayload::Function { arguments: arguments.to_string() }, cwd,
+    ).await.unwrap();
+    let cache = GitWorkspaceCache::new();
+    let revision = workspace_identity_at(root, "captured");
+    let output = text_output("git-read", before.clone());
+    let source_output = text_output("source-read", "unchanged source".into());
+    let items: Arc<[ResponseItem]> = Arc::from([
+        named_function_call_with_arguments("git-read", "exec_command", arguments), output.clone(),
+        named_function_call_with_arguments("source-read", "read_file", serde_json::json!({"path": source})), source_output.clone(),
+    ]);
+    let mut state = ToolHistoryState::default();
+    for (output, dependencies) in [
+        (&output, classification.source_dependencies),
+        (&source_output, BTreeSet::from([SourceDependencyV1::new(&source, false)])),
+    ] {
+        state.register_workspace_evidence(watched(&cache, root,
+            WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), output, dependencies).unwrap(),
+        ).await);
+    }
+    let delivery_probe = cache.begin_source_path_change_observation(root, &sibling, false).await.unwrap();
+    assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
+    std::fs::write(&sibling, "new sibling").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while cache.source_path_change_observation_is_current(&delivery_probe) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("native watcher must observe the sibling change");
+    assert_ne!(before, git_freshness_test_output(&root.join("package"), &["status", "--short"]).await);
+    let notices = freshness_notices(&state, &items, Some(&revision), &cache);
+    assert_eq!(notices.len(), 1, "Git status spans the repository, while the exact read does not");
+    assert_eq!(notices[0]["call_id"], "git-read");
+    assert_eq!(notices[0]["valid_for_current_workspace"], false);
+}
+
+#[tokio::test]
+async fn rg_evidence_tracks_pattern_and_ignore_inputs_outside_search_directory() {
+    for (options, input_name, before_input, after_input) in [
+        ("-f patterns.txt", "patterns.txt", "alpha\n", "beta\n"),
+        ("--ignore-file rules.txt alpha", "rules.txt", "", "b.txt\n"),
+        ("alpha", ".ignore", "", "b.txt\n"),
+    ] {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        for file in ["a.txt", "b.txt"] {
+            std::fs::write(src.join(file), "alpha\nbeta\n").unwrap();
+        }
+        let input = root.join(input_name);
+        std::fs::write(&input, before_input).unwrap();
+        let argv = options.split_whitespace().chain(["src"]).collect::<Vec<_>>();
+        let run = || async {
+            let output = tokio::process::Command::new("rg").args(&argv).current_dir(root)
+                .env_remove("RIPGREP_CONFIG_PATH").output().await.expect("run fixture ripgrep");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let before = run().await;
+        let arguments = serde_json::json!({"cmd": format!("rg {options} src"), "shell": "bash"});
+        let (classification, _) = classify_workspace_tool_call_at_admission(
+            "exec_command".into(), ToolPayload::Function { arguments: arguments.to_string() }, root.to_path_buf(),
+        ).await.unwrap();
+        assert!(classification.source_dependencies.iter().any(|dependency|
+            source_dependency_overlaps(dependency, &SourceDependencyV1::new(&input, false).path)),
+            "{input_name} affects the query or directory membership");
+        let cache = GitWorkspaceCache::new();
+        let revision = workspace_identity_at(root, "captured");
+        let output = text_output("rg-read", before.clone());
+        let items: Arc<[ResponseItem]> = Arc::from([
+            named_function_call_with_arguments("rg-read", "exec_command", arguments), output.clone(),
+        ]);
+        let mut state = ToolHistoryState::default();
+        state.register_workspace_evidence(watched(&cache, root,
+            WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), &output, classification.source_dependencies).unwrap(),
+        ).await);
+        let probe = cache.begin_source_path_change_observation(root, &input, false).await.unwrap();
+        assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
+        std::fs::write(&input, after_input).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while cache.source_path_change_observation_is_current(&probe) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("native watcher must observe the search input change");
+        assert_ne!(before, run().await, "the real search output must change");
+        let notices = freshness_notices(&state, &items, Some(&revision), &cache);
+        assert_eq!(notices.len(), 1, "{input_name}");
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
+    }
+}
+
 #[test]
 fn root_only_sampling_keeps_unscoped_unavailable_evidence_unknown() {
     let output = text_output("poll", "retained process bytes".into());
@@ -1379,7 +1564,7 @@ fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
 #[test]
 fn invalidation_reason_changes_do_not_repeat_the_same_evidence_but_nested_changes_do() {
     let previous = serde_json::json!({
-        "call_id": "read", "observed_revision": {"worktree_identity": "captured"},
+        "call_id": "read",
         "stale_workspace_evidence": true, "valid_for_current_workspace": false,
         "reason": "repository changed", "reason_code": "workspace_identity_changed",
         "current_nested_results": [{"call_id": "still-current"}],
@@ -1390,9 +1575,6 @@ fn invalidation_reason_changes_do_not_repeat_the_same_evidence_but_nested_change
     assert!(same_workspace_invalidation(&previous, &next));
     assert!(same_workspace_invalidation(&next, &previous));
     next["current_nested_results"] = serde_json::json!([]);
-    assert!(!same_workspace_invalidation(&previous, &next));
-    next = previous.clone();
-    next["observed_revision"]["worktree_identity"] = "new observation".into();
     assert!(!same_workspace_invalidation(&previous, &next));
     next = previous.clone();
     next["call_id"] = "other".into();
@@ -1863,11 +2045,11 @@ async fn later_duplicate_registration_cannot_revive_invalidated_workspace_eviden
     let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0]["reason_code"], "source_dependencies_invalidated");
-    assert_eq!(notices[0]["observed_revision"], serde_json::to_value(captured).unwrap());
+    assert_eq!(state.workspace_evidence[call_id].revision, Some(captured));
 }
 
 #[test]
-fn unwatched_evidence_notice_reports_the_observed_revision_and_how_to_treat_it() {
+fn unwatched_evidence_notice_reports_how_to_treat_it() {
     let call_id = "call-1";
     let output = text_output(call_id, "git status output".to_string());
     let captured = workspace_identity("captured");
@@ -1911,10 +2093,8 @@ fn unwatched_evidence_notice_reports_the_observed_revision_and_how_to_treat_it()
     assert_eq!(notice["stale_workspace_evidence"], true);
     assert_eq!(notice["reason_code"], "workspace_identity_changed");
     assert_eq!(notice["valid_for_current_workspace"], false);
-    assert_eq!(
-        notice["observed_revision"],
-        serde_json::to_value(&captured).unwrap()
-    );
+    // Repository hashes are not something a tool accepts; the record omits them.
+    assert!(notice.get("observed_revision").is_none());
     // The shared guidance lives once in the message, not in every notice.
     assert!(notice["rerun"].get("instruction").is_none());
     assert!(notice.get("if_rerun_unavailable").is_none());
@@ -2212,7 +2392,6 @@ fn untracked_legacy_workspace_evidence_fails_closed() {
     assert_eq!(notice["reason_code"], "missing_observation");
     assert_eq!(notice["historical_authenticity"], "unverified");
     assert_eq!(notice["valid_for_current_workspace"], false);
-    assert_eq!(notice["observed_revision"], serde_json::Value::Null);
     assert!(!notice.to_string().contains("repository identity"));
 }
 
@@ -2284,8 +2463,9 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
     let notice = &notices[0];
     assert_eq!(notice["call_id"], recovery_call_id);
     assert_eq!(notice["stale_workspace_evidence"], true);
+    // Only the origin's captured revision can differ from the current one here.
     assert_eq!(notice["reason_code"], "workspace_identity_changed");
-    assert_eq!(notice["observed_revision"], serde_json::to_value(&captured).unwrap());
+    assert_eq!(state.workspace_evidence[origin_call_id].revision, Some(captured));
     assert_eq!(notice["historical_authenticity"], "authenticated");
     assert_eq!(notice["valid_for_current_workspace"], false);
     assert!(!state.workspace_evidence[origin_call_id].is_current(Some(&changed), Some(&cache)));
@@ -2622,14 +2802,13 @@ async fn watcher_proof_retains_dependency_scoped_evidence_after_external_disjoin
     let notice = &notices[0];
     assert_eq!(notice["stale_workspace_evidence"], true);
     assert_eq!(notice["workspace_evidence_freshness"], "changed");
-    assert_eq!(notice["qualification"], "Observed dependency change");
+    assert!(notice.get("qualification").is_none(), "freshness is stated once");
     assert_eq!(notice["historical_authenticity"], "authenticated");
     cache.note_host_workspace_mutation();
     let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
     assert_eq!(notices.len(), 1);
     let notice = &notices[0];
     assert_eq!(notice["workspace_evidence_freshness"], "unknown");
-    assert_eq!(notice["qualification"], "Currentness unknown; no dependency change established");
     assert_eq!(notice["historical_authenticity"], "authenticated");
     assert_eq!(notice["valid_for_current_workspace"], false);
 }
@@ -2942,6 +3121,21 @@ fn nine_literal_paths_retain_precise_dependencies() {
 #[test]
 fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands() {
     let cwd = Path::new("/repo");
+    // Directory searches depend on ancestor ignore rules and Git's exclude
+    // file even when those files do not exist at capture time.
+    let expected = |target: &str| {
+        let mut paths = BTreeSet::from([
+            SourceDependencyV1::new(&cwd.join(target), true),
+            SourceDependencyV1::new(&cwd.join(".git/commondir"), true),
+            SourceDependencyV1::new(&cwd.join(".git/info/exclude"), true),
+        ]);
+        for directory in ["", "codex-rs"] {
+            for name in [".gitignore", ".ignore", ".rgignore"] {
+                paths.insert(SourceDependencyV1::new(&cwd.join(directory).join(name), true));
+            }
+        }
+        paths
+    };
     let explicit_pattern = ToolPayload::Function {
         arguments: serde_json::json!({
             "program": "rg",
@@ -2952,10 +3146,7 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
     };
     assert_eq!(
         source_dependencies_for_tool_call("exec_command", &explicit_pattern, cwd),
-        BTreeSet::from([SourceDependencyV1::new(
-            Path::new("/repo/codex-rs/core"),
-            true,
-        )])
+        expected("codex-rs/core")
     );
 
     let compound = ToolPayload::Function {
@@ -2968,10 +3159,7 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
     };
     assert_eq!(
         source_dependencies_for_tool_call("exec_command", &compound, cwd),
-        BTreeSet::from([SourceDependencyV1::new(
-            Path::new("/repo/codex-rs/tui"),
-            true,
-        )])
+        expected("codex-rs/tui")
     );
 }
 
@@ -3041,15 +3229,18 @@ fn search_and_read_in_one_batch_keep_both_scopes() {
 
 #[test]
 fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
-    let cwd = Path::new("/repo");
+    let repo = tempfile::tempdir().unwrap();
+    let cwd = repo.path();
+    std::fs::create_dir(cwd.join(".git")).unwrap();
     let work = SourceDependencyV1::new(&cwd.join("src/work.rs"), false);
     let checkout = SourceDependencyV1::new(cwd, true);
+    let metadata = SourceDependencyV1::new(&cwd.join(".git"), true);
     let src_tree = SourceDependencyV1::new(&cwd.join("src"), true);
     let mut cases = vec![
         (
             "bash",
             "git status --short; cat src/work.rs",
-            BTreeSet::from([checkout.clone(), work.clone()]),
+            BTreeSet::from([checkout.clone(), metadata.clone(), work.clone()]),
         ),
         (
             "bash",
@@ -3085,7 +3276,7 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
         cases.push((
             "powershell",
             "git diff --stat; Get-Content src/work.rs",
-            BTreeSet::from([checkout, work]),
+            BTreeSet::from([checkout, metadata, work]),
         ));
     }
     for (shell, command, expected) in cases {
@@ -3323,6 +3514,8 @@ fn cargo_local_overrides_do_not_leave_validation_evidence_current() {
         ("", "config.toml", "paths=['../external']\n"),
         ("", "config", "paths=['../external']\n"),
         ("", "config.toml", "[patch.crates-io]\nsupport={path='../external'}\n"),
+        ("", "config.toml", "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n"),
+        ("", "config", "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n"),
     ] {
         for name in ["config", "config.toml"] {
             match std::fs::remove_file(workspace.join(".cargo").join(name)) {
@@ -3377,12 +3570,15 @@ fn cargo_configuration_guards_preserve_plain_graph_and_reject_opaque_inputs() {
     assert!(expected.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
     let config = root.path().join(".cargo/config.toml");
     for source in ["", "paths=[]\n[build]\njobs=2\n",
-        "[patch.crates-io]\nsupport={git='https://example.com/support', rev='revision'}\n"] {
+        "[patch.crates-io]\nsupport={git='https://example.com/support', rev='revision'}\n",
+        "[source.crates-io]\nreplace-with='remote'\n[source.remote]\nregistry='https://example.com/index'\n"] {
         std::fs::write(&config, source).unwrap();
         assert_eq!(cargo_test_dependencies(&arguments, &workspace), expected);
     }
     for source in ["paths=['external']\n".as_bytes(),
         "[patch.crates-io]\nsupport={path='external'}\n".as_bytes(),
+        "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n".as_bytes(),
+        "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n".as_bytes(),
         b"paths=[", &[0xff]] {
         std::fs::write(&config, source).unwrap();
         assert!(cargo_test_dependencies(&arguments, &workspace).is_empty());
@@ -3411,7 +3607,9 @@ fn cargo_configuration_guards_preserve_plain_graph_and_reject_opaque_inputs() {
             "absent Cargo home config must be watched too");
         std::fs::write(&path, "[build]\njobs=2\n").unwrap();
         assert_eq!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)), Some(config_scope.clone()));
-        for source in ["paths=['../external']\n", "[patch.crates-io]\nsupport={path='../external'}\n", "paths=["] {
+        for source in ["paths=['../external']\n", "[patch.crates-io]\nsupport={path='../external'}\n",
+            "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../external'\n",
+            "[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='../external'\n", "paths=["] {
             std::fs::write(&path, source).unwrap();
             assert!(cargo_configuration_dependencies(&workspace, Some(&cargo_home)).is_none());
         }
@@ -3446,6 +3644,7 @@ async fn cargo_configuration_changes_invalidate_observed_validation() {
     };
     let classification = classify_workspace_tool_call("cargo_test", &payload, &app);
     assert!(classification.observes_workspace);
+    assert!(!classification.source_scope_complete);
     let call_id = "cargo-proof";
     let output = text_output(call_id, "test result: ok. 1 passed".to_string());
     let canonical: Arc<[ResponseItem]> = Arc::from([
@@ -3471,7 +3670,8 @@ async fn cargo_configuration_changes_invalidate_observed_validation() {
                         &output,
                         classification.source_dependencies.clone(),
                     )
-                    .expect("validation observation"),
+                    .expect("validation observation")
+                    .with_source_scope_complete(classification.source_scope_complete),
                 )
                 .await,
             );
@@ -3480,10 +3680,8 @@ async fn cargo_configuration_changes_invalidate_observed_validation() {
                 Some(&BTreeSet::from([workspace.join("notes.txt")])),
                 Some(&unrelated),
             );
-            assert!(
-                freshness_notices(&state, &canonical, Some(&unrelated), &cache).is_empty(),
-                "unrelated changes must preserve the validation result"
-            );
+            assert_eq!(freshness_notices(&state, &canonical, Some(&unrelated), &cache).len(), 1,
+                "manifest attribution cannot prove an external input is unrelated");
             let changed = workspace_identity_at(temp.path(), "configuration-changed");
             state.invalidate_source_dependencies(
                 Some(&BTreeSet::from([path.clone()])),
@@ -3501,26 +3699,28 @@ async fn cargo_configuration_changes_invalidate_observed_validation() {
     }
 }
 
-#[test]
-fn verified_named_runner_scope_uses_manifest_target_package_graph() {
+#[tokio::test]
+async fn verified_named_runner_scope_uses_manifest_target_package_graph() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("codex-rs");
     std::fs::create_dir_all(workspace.join(".config")).unwrap();
     std::fs::create_dir_all(workspace.join("app")).unwrap();
     std::fs::create_dir_all(workspace.join("tui")).unwrap();
-    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=[\"app\",\"tui\"]\n").unwrap();
-    for name in ["app", "tui"] {
+    std::fs::create_dir_all(root.path().join("scripts")).unwrap();
+    for name in ["helper", "prefix-helper"] { std::fs::create_dir_all(workspace.join(name)).unwrap(); }
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=[\"app\",\"tui\",\"helper\",\"prefix-helper\"]\n").unwrap();
+    for name in ["app", "tui", "helper", "prefix-helper"] {
         std::fs::write(workspace.join(name).join("Cargo.toml"), format!("[package]\nname=\"{name}\"\nversion=\"0.1.0\"\n")).unwrap();
     }
     let manifest = workspace.join(".config/kd4-rust-tests.toml");
-    std::fs::write(&manifest, "version=1\n[targets.app_lib]\npackage=\"app\"\n[targets.tui_lib]\npackage=\"tui\"\n[gates.small]\nsteps=[{target=\"app_lib\"}]\n[gates.other]\nsteps=[{target=\"tui_lib\"}]\n").unwrap();
+    std::fs::write(&manifest, "version=1\n[helpers.runtime]\npackage=\"helper\"\nbin=\"runtime\"\n[helpers.prefix]\npackage=\"prefix-helper\"\nbin=\"prefix\"\n[targets.app_lib]\npackage=\"app\"\nhelpers=[\"runtime\"]\nhelpers_by_test_prefix={ 'suite::'=[\"prefix\"] }\n[targets.tui_lib]\npackage=\"tui\"\n[gates.small]\nsteps=[{target=\"app_lib\"}]\n[gates.other]\nsteps=[{target=\"tui_lib\"}]\n").unwrap();
     let mut runner: codex_shell_command::validation::RepositoryRunner = serde_json::from_value(serde_json::json!({
-        "programs":["python"], "prefixes":[["scripts/rust_test_runner.py", "run-target"],["scripts/rust_test_runner.py", "run-gate"]],
+        "programs":["python"], "prefixes":[["scripts/build/rust_test_runner.py", "run-target"],["scripts/build/rust_test_runner.py", "run-gate"]],
         "operations":["test"], "receipt_runner":"rust_test_runner", "allow_extra_args":true,
     })).unwrap();
     runner.path_context = Some((root.path().to_path_buf(), root.path().to_path_buf()));
     for names in [vec!["small", "other"], vec!["other", "small"], vec!["small", "other", "small"]] {
-        let command = ["python", "scripts/rust_test_runner.py", "run-gate"].into_iter()
+        let command = ["python", "scripts/build/rust_test_runner.py", "run-gate"].into_iter()
             .chain(names).map(str::to_owned).collect::<Vec<_>>();
         let scope = runner_source_dependencies(&command, root.path(), &[runner.clone()]).unwrap();
         for package in ["app", "tui"] {
@@ -3528,7 +3728,7 @@ fn verified_named_runner_scope_uses_manifest_target_package_graph() {
                 "every selected gate contributes dependencies: {command:?} missing {package}");
         }
     }
-    let unknown = ["python", "scripts/rust_test_runner.py", "run-gate", "small", "missing"]
+    let unknown = ["python", "scripts/build/rust_test_runner.py", "run-gate", "small", "missing"]
         .map(str::to_owned);
     assert!(runner_source_dependencies(&unknown, root.path(), &[runner.clone()])
         .is_none_or(|scope| scope.is_empty()), "a partial gate selection is not complete scope");
@@ -3536,29 +3736,61 @@ fn verified_named_runner_scope_uses_manifest_target_package_graph() {
         for options in [vec![], vec!["--profile", "fast"], vec!["--profile=fast"],
             vec!["--no-fail-fast", "--command-timeout-seconds", "5", "--target-dir", "target",
                 "--success-output=always"]] {
-            let command = ["python", "scripts/rust_test_runner.py", operation].into_iter()
+            let command = ["python", "scripts/build/rust_test_runner.py", operation].into_iter()
                 .chain(options).chain([name]).map(str::to_owned).collect::<Vec<_>>();
             let scope = runner_source_dependencies(&command, root.path(), &[runner.clone()])
                 .unwrap_or_else(|| panic!("documented runner selection lost its scope: {command:?}"));
             assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
             assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)));
             assert!(scope.contains(&SourceDependencyV1::new(&manifest, false)));
+            for helper in ["helper", "prefix-helper"] {
+                assert!(scope.contains(&SourceDependencyV1::new(&workspace.join(helper), true)),
+                    "declared helper binaries are test inputs even without a Cargo dependency edge");
+            }
         }
     }
     for selection in [vec!["--profile"], vec!["--profile=", "small"],
         vec!["--profile", "--no-fail-fast", "small"], vec!["--unknown", "small"],
         vec!["small", "--unknown"], vec!["--command-timeout-seconds"]] {
-        let command = ["python", "scripts/rust_test_runner.py", "run-gate"].into_iter()
+        let command = ["python", "scripts/build/rust_test_runner.py", "run-gate"].into_iter()
             .chain(selection).map(str::to_owned).collect::<Vec<_>>();
         assert!(runner_source_dependencies(&command, root.path(), &[runner.clone()])
             .is_none_or(|scope| scope.is_empty()), "unknown or missing option value: {command:?}");
     }
-    let filtered = ["python", "scripts/rust_test_runner.py", "run-target", "--all", "app_lib",
+    let filtered = ["python", "scripts/build/rust_test_runner.py", "run-target", "--all", "app_lib",
         "-E", "test(run-gate)", "--", "other"].map(str::to_owned);
     let scope = runner_source_dependencies(&filtered, root.path(), &[runner]).unwrap();
     assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
     assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)),
         "target filter remainder does not select another gate");
+    // These are dependencies of the runner implementation, not assertions
+    // about what tests its output claims passed. Exercise invalidation through
+    // the history owner for both Python support and runtime helper changes.
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let revision = workspace_identity_at(root.path(), "captured");
+    let output = text_output("runner", "recorded test execution".into());
+    let items: Arc<[ResponseItem]> = Arc::from([function_call("runner"), output.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(watched(&cache, root.path(),
+        WorkspaceEvidenceObservation::from_response_item(Some(revision.clone()), &output, scope).unwrap()
+            .with_source_scope_complete(false),
+    ).await);
+    assert_eq!(freshness_notices(&state, &items, Some(&revision), &cache).len(), 1,
+        "runner package attribution is not an exhaustive compiler input set");
+    for changed in [
+        root.path().join("scripts/common/process_owner.py"),
+        root.path().join("scripts/build/rust_tool_env.py"),
+        root.path().join("scripts/build/validation_metrics.py"),
+        workspace.join("helper/src/main.rs"),
+        workspace.join("prefix-helper/src/main.rs"),
+    ] {
+        let mut invalidated = state.clone();
+        assert!(invalidated.invalidate_source_dependencies(Some(&BTreeSet::from([changed.clone()])), Some(&revision)),
+            "runner input must invalidate captured proof: {}", changed.display());
+        let notices = freshness_notices(&invalidated, &items, Some(&revision), &cache);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["valid_for_current_workspace"], false);
+    }
 }
 
 #[test]
@@ -5251,34 +5483,28 @@ async fn cargo_manifest_read_failures_widen_scope_without_losing_selective_inval
             classification.source_dependencies,
             true,
         )
-        .expect("successful tool observation");
+        .expect("successful tool observation")
+        .with_source_scope_complete(classification.source_scope_complete);
         let mut state = ToolHistoryState::default();
         state.register_workspace_evidence(if known_dependencies {
             watched(&cache, temp.path(), observation).await
         } else {
             observation
         });
-        // A recorded scope stays current until it changes; an unknown scope is never proven.
+        // Even a fully parsed manifest graph omits compiler and runtime inputs.
         let initial = freshness_notices(&state, &canonical, Some(&captured), &cache);
-        assert_eq!(initial.is_empty(), known_dependencies, "{case}");
+        assert_eq!(initial.len(), 1, "{case}");
         if let Some(notice) = initial.first() {
             assert_eq!(notice["reason_code"], "workspace_freshness_unverified", "{case}");
         }
 
-        for (path, must_be_stale) in [(&unrelated, !complete), (&transitive.join("lib.rs"), true)] {
+        for path in [&unrelated, &transitive.join("lib.rs")] {
             let changed = workspace_identity_at(temp.path(), "changed");
             state.invalidate_source_dependencies(
                 Some(&BTreeSet::from([path.clone()])),
                 Some(&changed),
             );
             let notices = freshness_notices(&state, &canonical, Some(&changed), &cache);
-            if !must_be_stale {
-                assert!(
-                    notices.is_empty(),
-                    "an unrelated edit must preserve the validation result: {notices:?}"
-                );
-                continue;
-            }
             assert_eq!(notices.len(), 1, "{case} {path:?}");
             let notice = &notices[0];
             assert_eq!(notice["call_id"], case);
@@ -5291,8 +5517,8 @@ async fn cargo_manifest_read_failures_widen_scope_without_losing_selective_inval
                 "{case}"
             );
             assert_eq!(
-                notice["observed_revision"],
-                serde_json::json!(if complete { &changed } else { &captured }),
+                state.workspace_evidence[case].revision.as_ref(),
+                Some(&captured),
                 "{case}"
             );
         }
@@ -5634,7 +5860,7 @@ fn verified_evidence_oversized_pin_does_not_block_later_handles() {
 
 #[test]
 fn factored_workspace_metadata_round_trips_every_per_call_exception() {
-    let base = serde_json::json!({"observed_revision":{"repository_root":"repo","worktree_identity":"same"},
+    let base = serde_json::json!({"historical_authenticity":"authenticated", "workspace_evidence_freshness":"unknown",
         "reason":"matching identities do not verify source dependencies", "reason_code":"workspace_freshness_unverified",
         "stale_workspace_evidence":true, "valid_for_current_workspace":false});
     let notices = (0..5).map(|index| {
@@ -5866,7 +6092,7 @@ fn continuity_registration_matches_rebuild_with_aliases_and_explicit_origins() {
         state.rebuild_artifact_index();
         assert_eq!(incremental, state.artifact_call_ids);
     }
-    state.internal_artifact_origins.insert("artifact-1".into(), ("origin".into(), 1, "hash".into()));
+    state.internal_artifact_origins.insert("artifact-1".into(), ArtifactOrigin("origin".into(), 1, "hash".into(), None));
     state.register(candidate("0", bounded_output()));
     assert_eq!(state.artifact_call_ids["artifact-1"], "origin");
     let incremental = state.artifact_call_ids.clone();
@@ -5874,3 +6100,154 @@ fn continuity_registration_matches_rebuild_with_aliases_and_explicit_origins() {
     assert_eq!(incremental, state.artifact_call_ids);
 }
 
+#[tokio::test]
+async fn cargo_validation_history_rejects_external_include_input_changes() {
+    let root = tempfile::tempdir().expect("workspace fixture");
+    let workspace = root.path().join("workspace");
+    let package = workspace.join("app");
+    let included = workspace.join("core/config.schema.json");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::create_dir_all(included.parent().unwrap()).unwrap();
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=['app']\n").unwrap();
+    std::fs::write(package.join("Cargo.toml"),
+        "[package]\nname='fixture-app'\nversion='0.1.0'\nedition='2021'\n").unwrap();
+    // Mirror config/src/schema_fixture_tests.rs: the compiler input is outside
+    // the selected package graph, although Cargo must rebuild when it changes.
+    std::fs::write(package.join("src/lib.rs"),
+        "#[test]\nfn fixture_matches() { assert_eq!(include_str!(\"../../core/config.schema.json\"), \"before\"); }\n").unwrap();
+    std::fs::write(&included, "before").unwrap();
+    let arguments = serde_json::json!({
+        "program": "cargo", "args": ["test", "-p", "fixture-app"], "workdir": workspace,
+    });
+    let payload = ToolPayload::Function { arguments: arguments.to_string() };
+    let classification = classify_workspace_tool_call("exec_command", &payload, &workspace);
+    assert!(classification.observes_workspace);
+    assert!(!classification.source_scope_complete);
+    assert!(!classification.source_dependencies.is_empty(), "retain manifest attribution");
+    let output = text_output("cargo-include-proof", "test result: ok. 1 passed".into());
+    let items: Arc<[ResponseItem]> = Arc::from([
+        named_function_call_with_arguments("cargo-include-proof", "exec_command", arguments),
+        output.clone(),
+    ]);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let mut history = ToolHistoryState::default();
+    history.register_workspace_evidence(watched(
+        &cache, root.path(), WorkspaceEvidenceObservation::from_response_item(
+            Some(workspace_identity_at(root.path(), "before")), &output,
+            classification.source_dependencies,
+        ).unwrap().with_source_scope_complete(classification.source_scope_complete),
+    ).await);
+
+    std::fs::write(&included, "after!").unwrap();
+    cache.note_host_workspace_mutation_paths(
+        root.path(), &[included.to_string_lossy().into_owned()],
+    ).await;
+    let changed = workspace_identity_at(root.path(), "included-file-changed");
+    history.invalidate_source_dependencies(Some(&BTreeSet::from([included])), Some(&changed));
+    // Exercise the model-visible owner, not just declaration-graph membership.
+    // Incomplete package attribution cannot certify the earlier test result.
+    let notices = freshness_notices(&history, &items, Some(&changed), &cache);
+    assert_eq!(notices.len(), 1, "an external compiler input changed; old success is not current proof");
+    assert_eq!(notices[0]["valid_for_current_workspace"], false);
+    assert_eq!(notices[0]["historical_authenticity"], "authenticated");
+}
+
+#[tokio::test]
+async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carrier() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.txt");
+    std::fs::write(&source, "before").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let revision = workspace_identity_at(root.path(), "captured");
+    let arguments = serde_json::json!({"path": source});
+    let classification = classify_workspace_tool_call("read_file",
+        &ToolPayload::Function { arguments: arguments.to_string() }, root.path());
+    assert!(classification.source_scope_complete, "native exact inputs remain complete");
+    let output = text_output("carrier", "before".into());
+    let items: Arc<[ResponseItem]> = Arc::from([function_call("carrier"), output.clone()]);
+    let observation = watched(&cache, root.path(),
+        WorkspaceEvidenceObservation::from_response_item_with_freshness(
+            Some(revision.clone()), &output, classification.source_dependencies, true,
+        ).unwrap().with_source_scope_complete(classification.source_scope_complete),
+    ).await;
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(observation.clone());
+    assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
+
+    // Legacy ledgers cannot promise completeness even if every recorded path
+    // still has a live watch. New ledgers must preserve the explicit promise.
+    let saved = serde_json::to_value(&state).unwrap();
+    let restored: ToolHistoryState = serde_json::from_value(saved.clone()).unwrap();
+    assert!(freshness_notices(&restored, &items, Some(&revision), &cache).is_empty());
+    let mut legacy = saved;
+    legacy["workspace_evidence"]["carrier"].as_object_mut().unwrap().remove("source_scope_complete");
+    let legacy: ToolHistoryState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(freshness_notices(&legacy, &items, Some(&revision), &cache).len(), 1);
+    assert!(!legacy.can_use_root_only_workspace_identity(&items));
+
+    let mut incomplete = observation.clone().with_source_scope_complete(false);
+    incomplete.call_id = "cargo-child".into();
+    state.register_workspace_evidence(incomplete);
+    assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+        parent_call_id: "carrier".into(), call_id: "cargo-child".into(),
+        output: "test result: ok".into(),
+    }.apply(&mut state));
+    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    let notices = freshness_notices(&restored, &items, Some(&revision), &cache);
+    assert_eq!(notices.len(), 1, "a current carrier must not hide incomplete child provenance");
+    assert_eq!(notices[0]["stale_nested_results"][0]["call_id"], "cargo-child");
+    assert_eq!(notices[0]["stale_nested_results"][0]["source_scope"]["source_scope_complete"], false);
+    assert!(!restored.can_use_root_only_workspace_identity(&items));
+
+    // The runtime cannot certify an aggregate using just a path union. An
+    // unretained child can have no nested entry, but exact retained reads still
+    // carry independent current proof within the conservative carrier notice.
+    state.workspace_evidence.get_mut("carrier").unwrap().source_scope_complete = false;
+    state.code_mode_nested_evidence.clear();
+    let mut native = observation;
+    native.call_id = "native-child".into();
+    state.register_workspace_evidence(native);
+    assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+        parent_call_id: "carrier".into(), call_id: "native-child".into(), output: "before".into(),
+    }.apply(&mut state));
+    let notices = freshness_notices(&state, &items, Some(&revision), &cache);
+    assert_eq!(notices.len(), 1, "missing child provenance cannot promote the aggregate");
+    assert_eq!(notices[0]["source_scope"]["source_scope_complete"], false);
+    assert_eq!(notices[0]["current_nested_results"][0]["call_id"], "native-child");
+}
+#[test]
+fn paged_source_inspection_requires_bound_identity_attempt_and_complete_ranges() {
+    let attempt = codex_agent_task_store::AttemptId::new();
+    let other_attempt = codex_agent_task_store::AttemptId::new();
+    let source: SourceInspectionOrigin = serde_json::from_value(serde_json::json!({
+        "start": {"attempt_id":attempt, "path":"large.rs", "workspace_id":"workspace", "epoch":0},
+        "environment_id":"local", "canonical_uri":"file:///repo/large.rs"
+    })).unwrap();
+    let mut state = ToolHistoryState::default();
+    let sha = sha256(b"0123456789");
+    ToolHistoryMutation::RegisterArtifactOrigin {
+        artifact_id:"paged-source".into(), call_id:"native-read".into(), bytes:10, sha256:sha.clone(),
+    }.apply(&mut state);
+    // Old three-element origins deserialize but never acquire task proof.
+    let legacy: ArtifactOrigin = serde_json::from_value(serde_json::json!(["native-read",10,sha])).unwrap();
+    assert!(legacy.3.is_none());
+    let bind = ToolHistoryMutation::BindSourceInspectionOrigin {
+        artifact_id:"paged-source".into(), call_id:"native-read".into(), bytes:10,
+        sha256:sha.clone(), source,
+    };
+    assert!(bind.apply(&mut state));
+    assert!(!bind.apply(&mut state), "a later attempt cannot reattribute the origin");
+    for (end, complete) in [(5, false), (10, true)] {
+        ToolHistoryMutation::RecordArtifactRecovery {
+            artifact_id:"paged-source".into(), recovery_call_id:format!("page-{end}"),
+            selectors:vec![serde_json::json!({"kind":"bytes", "start":0, "end":end})],
+        }.apply(&mut state);
+        let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        restored.refresh_derived_and_indexes();
+        assert_eq!(restored.completed_source_inspection("paged-source",10,&sha,attempt).is_some(), complete);
+        assert!(restored.completed_source_inspection("paged-source",10,&sha,other_attempt).is_none());
+        assert!(restored.completed_source_inspection("paged-source",9,&sha,attempt).is_none());
+        assert!(restored.completed_source_inspection("paged-source",10,"changed",attempt).is_none());
+        assert!(restored.completed_source_inspection("other-source",10,&sha,attempt).is_none());
+    }
+}

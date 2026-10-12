@@ -435,7 +435,7 @@ fn truncates_rollout_to_last_n_fork_turns_counts_trigger_turn_messages() {
         RolloutItem::ResponseItem(assistant_msg("a4")),
     ];
 
-    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2).unwrap();
     let expected = rollout[4..].to_vec();
 
     assert_eq!(
@@ -513,7 +513,7 @@ fn truncates_rollout_to_last_n_fork_turns_drops_startup_prefix_even_when_under_l
 
     for input in [&rollout[..], &rollout[1..]] {
         for n_from_end in [0, 2, 10, usize::MAX] {
-            let truncated = truncate_rollout_to_last_n_fork_turns(input, n_from_end);
+            let truncated = truncate_rollout_to_last_n_fork_turns(input, n_from_end).unwrap();
             let expected = if n_from_end == 0 {
                 &rollout[..0]
             } else {
@@ -546,7 +546,7 @@ fn truncates_rollout_to_last_n_fork_turns_applies_thread_rollback_markers() {
         RolloutItem::ResponseItem(assistant_msg("a3")),
     ];
 
-    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2).unwrap();
 
     assert_eq!(
         serde_json::to_value(&truncated).unwrap(),
@@ -588,7 +588,7 @@ fn truncates_rollout_to_last_n_fork_turns_discards_trigger_boundaries_in_rolled_
         RolloutItem::ResponseItem(assistant_msg("a2")),
     ];
 
-    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2).unwrap();
 
     let expected = rollout[1..].to_vec();
 
@@ -618,7 +618,7 @@ fn truncates_rollout_to_last_n_fork_turns_discards_rolled_back_assistant_instruc
         RolloutItem::ResponseItem(assistant_msg("a3")),
     ];
 
-    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 1);
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 1).unwrap();
     let expected = rollout[5..].to_vec();
 
     assert_eq!(
@@ -628,9 +628,72 @@ fn truncates_rollout_to_last_n_fork_turns_discards_rolled_back_assistant_instruc
 
     // Two fork turns survive the rollback, so asking for two keeps everything.
     // A rolled-back turn that still counted would start the result at index 2.
-    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2).unwrap();
     assert_eq!(
         serde_json::to_value(&truncated).unwrap(),
         serde_json::to_value(&rollout).unwrap()
     );
+}
+#[test]
+fn last_n_fork_trims_each_checkpoint_without_losing_checkpoint_only_content() {
+    for stable_ids in [false, true] {
+        let mut old = user_msg(if stable_ids { "same request" } else { "old request" });
+        let mut current = user_msg("same request");
+        if stable_ids {
+            old.set_id(Some(ResponseItemId::new("msg_old")));
+            current.set_id(Some(ResponseItemId::new("msg_current")));
+        }
+        let mut rollout = vec![
+            RolloutItem::ResponseItem(old.clone()),
+            RolloutItem::ResponseItem(assistant_msg("excluded old answer")),
+            RolloutItem::ResponseItem(current.clone()),
+        ];
+        for answer in ["first checkpoint-only answer", "latest checkpoint-only answer"] {
+            rollout.push(RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+                message: String::new(),
+                replacement_history: Some(vec![
+                    developer_msg("excluded startup context"), old.clone(),
+                    assistant_msg("excluded old answer"), current.clone(), assistant_msg(answer),
+                ]),
+                window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+            }));
+        }
+        let started = std::time::Instant::now();
+        let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, 1).unwrap();
+        let history = crate::session::Session::reconstruct_model_history_from_rollout(&truncated);
+        eprintln!("last_n_checkpoint_replay_elapsed={:?}", started.elapsed());
+        assert_eq!(history, vec![current.clone(), assistant_msg("latest checkpoint-only answer")]);
+        for item in truncated {
+            if let RolloutItem::Compacted(compacted) = item {
+                let history = compacted.replacement_history.unwrap();
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0], current);
+            }
+        }
+    }
+}
+
+#[test]
+fn last_n_fork_rejects_missing_or_ambiguous_checkpoint_boundaries() {
+    let current = user_msg("repeated request");
+    for (old, replacement_history) in [
+        (user_msg("old"), None),
+        (user_msg("old"), Some(vec![assistant_msg("opaque summary")])),
+        (user_msg("old"), Some(vec![current.clone(), current.clone()])),
+        // One checkpoint match is still ambiguous if an excluded legacy turn
+        // had exactly the same id-less message as the selected boundary.
+        (current.clone(), Some(vec![current.clone(), assistant_msg("unattributed answer")])),
+    ] {
+        let rollout = vec![
+            RolloutItem::ResponseItem(old),
+            RolloutItem::ResponseItem(current.clone()),
+            RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+                message: "opaque legacy summary".into(), replacement_history,
+                window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+            }),
+        ];
+        assert!(matches!(truncate_rollout_to_last_n_fork_turns(&rollout, 1),
+            Err(CodexErr::InvalidRequest(_))));
+        assert!(truncate_rollout_to_last_n_fork_turns(&rollout, 0).unwrap().is_empty());
+    }
 }

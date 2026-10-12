@@ -199,6 +199,9 @@ pub(crate) struct ReadToolOutputResult {
     pub canonical_sha256: String,
     pub canonical_bytes: u64,
     pub retained_bytes: u64,
+    // Known complete producer capture, not merely all bytes in the retained log.
+    #[serde(default, rename = "retained_artifact_complete")]
+    pub capture_complete: bool,
     pub complete: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_ranges: Vec<CanonicalByteRange>,
@@ -228,9 +231,7 @@ impl ReadToolOutputResult {
                 continue;
             }
             if let Some(range) = result.canonical_range
-                && (result.text.is_some() || result.data_base64.is_some()
-                    || matches!(result.selector, ToolOutputSelector::JsonPointer { .. })
-                        && result.value.is_some())
+                && (result.text.is_some() || result.data_base64.is_some())
             {
                 ranges.push((range.start, range.end));
             }
@@ -328,7 +329,7 @@ impl Serialize for ReadToolOutputResult {
         result.serialize_field("delivered_selection_complete", &self.complete)?;
         result.serialize_field(
             "retained_artifact_complete",
-            &(self.retained_bytes == self.canonical_bytes && self.unavailable_ranges.is_empty()),
+            &(self.capture_complete && self.retained_bytes == self.canonical_bytes && self.unavailable_ranges.is_empty()),
         )?;
         if !self.unavailable_ranges.is_empty() {
             result.serialize_field("unavailable_ranges", &self.unavailable_ranges)?;
@@ -344,6 +345,8 @@ struct LogicalArtifactSegment {
     range: CanonicalByteRange,
 }
 
+fn known_capture_complete() -> bool { true }
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct LogicalArtifactMetadata {
     version: u8,
@@ -354,6 +357,10 @@ struct LogicalArtifactMetadata {
     retained_sha256: Option<String>,
     canonical_bytes: u64,
     retained_bytes: u64,
+    // Persisted logical metadata authenticates canonical completeness; a raw
+    // log without it cannot establish whether producer output was lost.
+    #[serde(default = "known_capture_complete")]
+    capture_complete: bool,
     complete: bool,
     unavailable_ranges: Vec<CanonicalByteRange>,
     json_pointers: BTreeMap<String, CanonicalJsonPointer>,
@@ -1434,7 +1441,15 @@ impl RawOutputArtifactWriter {
         match lock_artifact_handle(&handle, SeekFrom::End(0)).await {
             Ok(file) => {
                 let file = tokio::fs::File::from_std(file);
-                match lock_output_file(file).await {
+                let locked = lock_output_file(file).await;
+                let locked = match locked {
+                    Ok(file) => match invalidate_raw_capture_metadata(&path).await {
+                        Ok(()) => Ok(file),
+                        Err(error) => { let _ = unlock_output_file(file).await; Err(error) }
+                    },
+                    Err(error) => Err(error),
+                };
+                match locked {
                     Ok(file) => Some(Self {
                         id: Some(id),
                         path: Some(path),
@@ -1593,7 +1608,7 @@ impl RawOutputArtifactWriter {
 
     pub(crate) async fn mark_output_gap(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
         self.truncated = true;
-        self.write_chunk(state, b"\n[output gap: earlier producer output was evicted; capture is incomplete]\n").await;
+        self.write_chunk(state, b"\n[output gap: producer output is missing or unverified; capture is incomplete]\n").await;
         if let Some(state) = state
             && let RawOutputArtifact::Stored { truncated, .. } = &mut *state.lock().await
         {
@@ -1602,7 +1617,7 @@ impl RawOutputArtifactWriter {
     }
 
     /// Makes buffered bytes visible before the process's artifact-ready signal.
-    /// Durability and retention publication remain owned by finish.
+    /// Register these bytes for the rollout durability barrier even if finish is cancelled.
     pub(crate) async fn flush_pending(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
         if self.pending_target.is_some() || self.pending_output.is_empty() {
             return;
@@ -1629,6 +1644,7 @@ impl RawOutputArtifactWriter {
             .await;
             self.lifecycle_completed = true;
         } else {
+            defer_artifact_sync(path);
             self.pending_output.clear();
         }
     }
@@ -1659,6 +1675,16 @@ impl RawOutputArtifactWriter {
             self.lifecycle_completed = true;
             return;
         }
+        let status_bytes = match write_raw_capture_metadata(&path, self.id, self.bytes, !self.truncated).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = unlock_output_file(file).await;
+                *state.lock().await = failed_with_owned_path(path.clone(), self.bytes,
+                    format!("failed to persist raw capture status: {error}"), self.retention_token.as_ref()).await;
+                self.lifecycle_completed = true;
+                return;
+            }
+        };
         let metadata = file.metadata().await.and_then(|metadata| {
             metadata
                 .modified()
@@ -1679,7 +1705,7 @@ impl RawOutputArtifactWriter {
         if let Some(token) = self.retention_token.as_ref() {
             match metadata {
                 Ok((bytes, modified)) => {
-                    publish_streaming_size_async(token, &path, bytes, modified, true).await;
+                    publish_streaming_size_async(token, &path, bytes.saturating_add(status_bytes), modified, true).await;
                 }
                 Err(_) => reject_stale_delta(token),
             }
@@ -1995,6 +2021,11 @@ async fn create_raw_output_artifact_inner(
                 )
                 .await;
             }
+            if durable && let Err(error) = write_raw_capture_metadata(&path, Some(id), retained.len() as u64, !truncated).await {
+                let _ = unlock_output_file(file).await;
+                return failed_with_owned_path(path.clone(), retained.len() as u64,
+                    format!("failed to persist raw capture status: {error}"), Some(&retention_token)).await;
+            }
             let file = file.into_std().await;
             let file = match unlock_created_output_file(file).await {
                 Ok(file) => file,
@@ -2012,9 +2043,8 @@ async fn create_raw_output_artifact_inner(
                 }
             };
             let handle = Arc::new(file);
-            if durable {
-                defer_artifact_sync(&path);
-            }
+            // Lazy creation can be published before the writer's optional finish.
+            defer_artifact_sync(&path);
             enforce_retention_after_upsert(
                 &directory,
                 &path,
@@ -2035,6 +2065,36 @@ async fn create_raw_output_artifact_inner(
             RawOutputArtifact::unavailable(format!("failed to create `{}`: {err}", path.display()))
         }
     }
+}
+
+// A compact variant of the existing metadata sidecar. No stream reread/hash or
+// second retention object is needed just to preserve final capture status.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawCaptureMetadata {
+    raw_capture_version: u8,
+    artifact_id: String,
+    retained_bytes: u64,
+    capture_complete: bool,
+}
+
+async fn invalidate_raw_capture_metadata(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(logical_metadata_path(path)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+// Call only while holding the base log's exclusive lock. Invalidate before
+// mutation, so cancellation or a partial status write can never retain true.
+async fn write_raw_capture_metadata(path: &Path, id: Option<ToolOutputArtifactId>, retained_bytes: u64, capture_complete: bool) -> std::io::Result<u64> {
+    let id = id.ok_or_else(|| std::io::Error::other("raw capture has no artifact identity"))?;
+    let bytes = serde_json::to_vec(&RawCaptureMetadata {
+        raw_capture_version: 1, artifact_id: id.to_string(), retained_bytes, capture_complete,
+    }).map_err(std::io::Error::other)?;
+    tokio::fs::write(logical_metadata_path(path), &bytes).await?;
+    Ok(bytes.len() as u64)
 }
 
 fn logical_metadata_path(path: &Path) -> PathBuf {
@@ -2170,6 +2230,7 @@ fn reconcile_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
         // an uncommitted family. Preserve every segment for a later recovery.
         Err(error) => return Err(error),
     };
+    let metadata_bytes = metadata_bytes.filter(|bytes| serde_json::from_slice::<RawCaptureMetadata>(bytes).is_err());
     let metadata = metadata_bytes.map(|bytes| -> std::io::Result<LogicalArtifactMetadata> {
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData,
@@ -2561,6 +2622,7 @@ impl SelectorResponseCost {
             canonical_sha256: metadata.canonical_sha256.clone(),
             canonical_bytes: metadata.canonical_bytes,
             retained_bytes: metadata.retained_bytes,
+            capture_complete: metadata.capture_complete,
             complete: false,
             unavailable_ranges: metadata.unavailable_ranges.clone(),
             results: Vec::new(),
@@ -2667,6 +2729,14 @@ fn largest_fitting_byte_prefix(
     if range.is_empty() {
         return 0;
     }
+    // Binary snapshots may consist entirely of UTF-8 continuation-byte values.
+    // Validate once, not once per sizing probe, before imposing text boundaries.
+    let text = snapshot.get(range.start as usize..range.end as usize)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok());
+    let align = |length: u64| match text {
+        Some(text) => align_to_char_boundary(text, length),
+        None => length,
+    };
     let prefix_bytes = |candidate_bytes: u64| -> &[u8] {
         let start = range.start as usize;
         let end = start
@@ -2678,13 +2748,14 @@ fn largest_fitting_byte_prefix(
         // Measure the same readable bytes we will deliver. A probe ending
         // inside a code point is serialized as base64, whose token cost can
         // differ from the text produced after boundary alignment.
-        let candidate_bytes = align_to_char_boundary(snapshot, range.start, candidate_bytes);
+        let candidate_bytes = align(candidate_bytes);
         let candidate_range = CanonicalByteRange::new(range.start, range.start + candidate_bytes);
         let result = ReadToolOutputResult {
             artifact_id: artifact_id.to_string(),
             canonical_sha256: "0".repeat(64),
             canonical_bytes,
             retained_bytes: canonical_bytes,
+            capture_complete: true,
             complete: true,
             unavailable_ranges: Vec::new(),
             results: vec![successful_byte_selector_result(
@@ -2701,7 +2772,7 @@ fn largest_fitting_byte_prefix(
         if fits(candidate) {
             best = candidate;
             if candidate == range.len() {
-                return align_to_char_boundary(snapshot, range.start, candidate);
+                return align(candidate);
             }
         } else {
             first_failure = candidate;
@@ -2719,35 +2790,18 @@ fn largest_fitting_byte_prefix(
             high = middle.saturating_sub(1);
         }
     }
-    align_to_char_boundary(snapshot, range.start, best)
+    align(best)
 }
 
-/// Shrinks `length` until the prefix ends on a UTF-8 char boundary.
-///
-/// A continuation that splits a code point is not readable, and the next read
-/// would have to discard the partial byte anyway. Non-UTF-8 content has no
-/// boundaries to respect, so it is returned unchanged.
-fn align_to_char_boundary(snapshot: &[u8], start: u64, length: u64) -> u64 {
-    let start = start as usize;
-    let Some(window) = snapshot.get(start..) else {
-        return length;
-    };
-    let mut length = (length as usize).min(window.len());
-    while length > 0 && !is_utf8_char_boundary(window, length) {
+/// Shrinks a validated text prefix until it ends on a UTF-8 char boundary.
+fn align_to_char_boundary(text: &str, length: u64) -> u64 {
+    let mut length = (length as usize).min(text.len());
+    while length > 0 && !text.is_char_boundary(length) {
         length -= 1;
     }
-    // A boundary-aligned length of zero would advertise no progress at all;
-    // an unaligned original is better than a continuation that never advances.
-    if length == 0 { 0 } else { length as u64 }
+    length as u64
 }
 
-fn is_utf8_char_boundary(bytes: &[u8], index: usize) -> bool {
-    match bytes.get(index) {
-        None => index == bytes.len(),
-        // Continuation bytes are 10xxxxxx; anything else starts a code point.
-        Some(byte) => (*byte as i8) >= -0x40,
-    }
-}
 
 /// Persists one canonical result as one logical artifact. Physical segment
 /// files and the metadata sidecar are private implementation details and never
@@ -2985,6 +3039,7 @@ fn commit_create_canonical_output_artifact(
         retained_sha256: Some(format!("{:x}", Sha256::digest(retained))),
         canonical_bytes: canonical.exact_bytes,
         retained_bytes,
+        capture_complete: true,
         complete,
         unavailable_ranges: unavailable_ranges.clone(),
         json_pointers: canonical.json_pointers.clone(),
@@ -3273,7 +3328,7 @@ fn commit_attach_canonical_output_artifact(
                 error: Some("existing artifact has incompatible recovery addresses".to_string()),
             };
         }
-        if metadata.complete && canonical.complete
+        if metadata.capture_complete && metadata.complete && canonical.complete
             && metadata.canonical_bytes == canonical.exact_bytes
             && metadata.canonical_sha256 == canonical.sha256
             && metadata.canonical_kind == canonical.kind
@@ -3376,6 +3431,7 @@ fn commit_attach_canonical_output_artifact(
         )),
         canonical_bytes: canonical.exact_bytes,
         retained_bytes,
+        capture_complete: true,
         complete,
         unavailable_ranges: unavailable_ranges.clone(),
         json_pointers: canonical.json_pointers.clone(),
@@ -3471,7 +3527,7 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
                 err.for_model()
             )
         })?;
-        if !metadata.complete
+        if !metadata.capture_complete || !metadata.complete
             || metadata.retained_bytes != expected_bytes
             || metadata.canonical_bytes != expected_bytes
             || !metadata.unavailable_ranges.is_empty()
@@ -3687,7 +3743,7 @@ fn verify_tool_history_artifact_blocking(
         .ok_or_else(|| "invalid tool-output artifact id".to_string())?;
     let (metadata, snapshot) = load_logical_metadata_with_snapshot(path, id)
         .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
-    if !metadata.complete || metadata.canonical_bytes != expected_bytes
+    if !metadata.capture_complete || !metadata.complete || metadata.canonical_bytes != expected_bytes
         || metadata.retained_bytes != expected_bytes || !metadata.unavailable_ranges.is_empty()
     {
         return Err("artifact byte count does not match receipt metadata".to_string());
@@ -4073,6 +4129,11 @@ pub(crate) async fn replace_raw_output_artifact(
             };
             let retained = &output[..output.len().min(MAX_RAW_OUTPUT_ARTIFACT_BYTES)];
             let truncated = retained.len() != output.len();
+            if let Err(error) = invalidate_raw_capture_metadata(path).await {
+                let _ = unlock_output_file(file).await;
+                return failed_with_owned_path(path.clone(), *bytes,
+                    format!("failed to invalidate raw capture status: {error}"), Some(&retention_token)).await;
+            }
             if let Err(err) = file.set_len(0).await {
                 let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
@@ -4105,6 +4166,11 @@ pub(crate) async fn replace_raw_output_artifact(
                     Some(&retention_token),
                 )
                 .await;
+            }
+            if let Err(error) = write_raw_capture_metadata(path, Some(*id), retained.len() as u64, !truncated).await {
+                let _ = unlock_output_file(file).await;
+                return failed_with_owned_path(path.clone(), retained.len() as u64,
+                    format!("failed to persist raw capture status: {error}"), Some(&retention_token)).await;
             }
             if let Err(err) = unlock_output_file(file).await {
                 return failed_with_owned_path(
@@ -4264,57 +4330,74 @@ fn load_logical_metadata_with_snapshot(
         }
     }
     let metadata_path = logical_metadata_path(path);
-    match std::fs::read(&metadata_path) {
+    // Pair raw completion status with its bytes under the producer's lock.
+    // Reading status first could certify a same-size replacement using stale
+    // metadata from the previous completed capture.
+    let (mut file, _) = open_regular_artifact(path)?;
+    file.try_lock_shared().map_err(|_| ReadToolOutputError::StillWriting)?;
+    let raw_capture = match std::fs::read(&metadata_path) {
         Ok(bytes) => {
-            let metadata: LogicalArtifactMetadata =
-                serde_json::from_slice(&bytes).map_err(|err| {
-                    ReadToolOutputError::Io(format!("failed to parse artifact metadata: {err}"))
-                })?;
-            if metadata.version != LOGICAL_ARTIFACT_METADATA_VERSION {
-                return Err(ReadToolOutputError::Io(
-                    "artifact metadata version mismatch".to_string(),
-                ));
+            if let Ok(raw) = serde_json::from_slice::<RawCaptureMetadata>(&bytes) {
+                if raw.raw_capture_version != 1 || raw.artifact_id != id.to_string() {
+                    return Err(ReadToolOutputError::Io(
+                        "raw capture metadata version or identity mismatch".to_string(),
+                    ));
+                }
+                Some(raw)
+            } else {
+                let metadata: LogicalArtifactMetadata =
+                    serde_json::from_slice(&bytes).map_err(|err| {
+                        ReadToolOutputError::Io(format!("failed to parse artifact metadata: {err}"))
+                    })?;
+                if metadata.version != LOGICAL_ARTIFACT_METADATA_VERSION {
+                    return Err(ReadToolOutputError::Io(
+                        "artifact metadata version mismatch".to_string(),
+                    ));
+                }
+                if metadata.artifact_id != id.to_string() {
+                    return Err(ReadToolOutputError::Io(
+                        "artifact metadata identity mismatch".to_string(),
+                    ));
+                }
+                return Ok((metadata, None));
             }
-            if metadata.artifact_id != id.to_string() {
-                return Err(ReadToolOutputError::Io(
-                    "artifact metadata identity mismatch".to_string(),
-                ));
-            }
-            Ok((metadata, None))
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let (mut file, _) = open_regular_artifact(path)?;
-            file.try_lock_shared().map_err(|_| ReadToolOutputError::StillWriting)?;
-            let mut contents = Vec::new();
-            file.read_to_end(&mut contents).map_err(|err| {
-                ReadToolOutputError::Io(format!("failed to read artifact: {err}"))
-            })?;
-            let bytes = contents.len() as u64;
-            let sha256 = format!("{:x}", Sha256::digest(&contents));
-            let metadata = LogicalArtifactMetadata {
-                version: LOGICAL_ARTIFACT_METADATA_VERSION,
-                artifact_id: id.to_string(),
-                canonical_kind: CanonicalToolResultKind::Bytes,
-                canonical_sha256: sha256.clone(),
-                retained_sha256: Some(sha256),
-                canonical_bytes: bytes,
-                retained_bytes: bytes,
-                complete: true,
-                unavailable_ranges: Vec::new(),
-                json_pointers: BTreeMap::new(),
-                sections: Vec::new(),
-                line_starts: canonical_line_starts(&contents),
-                segments: vec![LogicalArtifactSegment {
-                    index: 0,
-                    range: CanonicalByteRange::new(0, bytes),
-                }],
-            };
-            Ok((metadata, Some(contents)))
-        }
-        Err(err) => Err(ReadToolOutputError::Io(format!(
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(ReadToolOutputError::Io(format!(
             "failed to read artifact metadata: {err}"
         ))),
+    };
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).map_err(|err| {
+        ReadToolOutputError::Io(format!("failed to read artifact: {err}"))
+    })?;
+    let bytes = contents.len() as u64;
+    if raw_capture.as_ref().is_some_and(|raw| raw.retained_bytes != bytes) {
+        return Err(ReadToolOutputError::Io(
+            "raw capture size does not match metadata".to_string(),
+        ));
     }
+    let sha256 = format!("{:x}", Sha256::digest(&contents));
+    let metadata = LogicalArtifactMetadata {
+        version: LOGICAL_ARTIFACT_METADATA_VERSION,
+        artifact_id: id.to_string(),
+        canonical_kind: CanonicalToolResultKind::Bytes,
+        canonical_sha256: sha256.clone(),
+        retained_sha256: Some(sha256),
+        canonical_bytes: bytes,
+        retained_bytes: bytes,
+        capture_complete: raw_capture.is_some_and(|raw| raw.capture_complete),
+        complete: true,
+        unavailable_ranges: Vec::new(),
+        json_pointers: BTreeMap::new(),
+        sections: Vec::new(),
+        line_starts: canonical_line_starts(&contents),
+        segments: vec![LogicalArtifactSegment {
+            index: 0,
+            range: CanonicalByteRange::new(0, bytes),
+        }],
+    };
+    Ok((metadata, Some(contents)))
 }
 
 fn read_logical_range(
@@ -4604,6 +4687,7 @@ fn merged_selector_still_completes(
                 canonical_sha256: metadata.canonical_sha256.clone(),
                 canonical_bytes: metadata.canonical_bytes,
                 retained_bytes: metadata.retained_bytes,
+                capture_complete: metadata.capture_complete,
                 complete: true,
                 unavailable_ranges: Vec::new(),
                 results: vec![completed],
@@ -4953,8 +5037,16 @@ fn search_logical_artifact(
                 .filter_map(|page| page.value.as_ref()?.get("items")?.as_array())
                 .flatten()
                 .find(|item| item["id"] == section.id.as_str())
-                .map(|item| serde_json::json!({"qualified_name": item["qualified_name"], "kind": item["kind"],
-                    "start_line": item["start_line"], "end_line": item["end_line"]}));
+                .map(|item| {
+                    let mut identity = serde_json::json!({"qualified_name": item["qualified_name"], "kind": item["kind"],
+                        "start_line": item["start_line"], "end_line": item["end_line"]});
+                    // Preserve the same parser uncertainty as symbol selectors,
+                    // including when this search reuses an immutable snapshot.
+                    if item["syntax_error"] == true {
+                        identity["syntax_error"] = Value::Bool(true);
+                    }
+                    identity
+                });
         }
         (line, end_line, start, end, enclosing_item)
     }).collect::<Vec<_>>();
@@ -5023,7 +5115,7 @@ fn search_logical_artifact(
         result.value = Some(serde_json::json!({
             "query": query,
             "start_byte": start_byte,
-            "coverage_complete": metadata.complete && metadata.unavailable_ranges.is_empty(),
+            "coverage_complete": metadata.capture_complete && metadata.complete && metadata.unavailable_ranges.is_empty(),
             "total_matches": total_matches,
             "matches_returned": matches_returned,
             "remaining_match_count": remaining_match_count,
@@ -5154,6 +5246,7 @@ fn too_large_result(
             canonical_sha256: metadata.canonical_sha256.clone(),
             canonical_bytes: metadata.canonical_bytes,
             retained_bytes: metadata.retained_bytes,
+            capture_complete: metadata.capture_complete,
             complete: metadata.complete,
             unavailable_ranges: metadata.unavailable_ranges.clone(),
             results: vec![result.clone()],
@@ -5345,6 +5438,7 @@ fn select_logical_artifact(
         canonical_sha256: metadata.canonical_sha256.clone(),
         canonical_bytes: metadata.canonical_bytes,
         retained_bytes: metadata.retained_bytes,
+        capture_complete: metadata.capture_complete,
         complete: result.status == ToolOutputSelectorStatus::Ok && result.complete,
         unavailable_ranges: Vec::new(),
         results: vec![result.clone()],
@@ -5398,7 +5492,7 @@ pub(crate) async fn read_complete_canonical_snapshot(
         .join(format!("{id}.log"));
     tokio::task::spawn_blocking(move || {
         let (metadata, snapshot) = load_logical_metadata_with_snapshot(&path, id)?;
-        if !metadata.complete
+        if !metadata.capture_complete || !metadata.complete
             || metadata.canonical_bytes != metadata.retained_bytes
             || !metadata.unavailable_ranges.is_empty()
             || metadata.canonical_bytes > max_bytes as u64
@@ -5555,6 +5649,7 @@ fn select_tool_output_snapshot(
         canonical_sha256: metadata.canonical_sha256.clone(),
         canonical_bytes: metadata.canonical_bytes,
         retained_bytes: metadata.retained_bytes,
+        capture_complete: metadata.capture_complete,
         complete: false,
         unavailable_ranges: metadata.unavailable_ranges.clone(),
         results: Vec::with_capacity(selectors.len()),
@@ -5699,6 +5794,7 @@ fn producer_snapshot_metadata(
         retained_sha256: None,
         canonical_bytes: canonical.exact_bytes,
         retained_bytes: canonical.exact_bytes,
+        capture_complete: true,
         complete: canonical.complete,
         unavailable_ranges: canonical.unavailable_ranges.clone(),
         json_pointers: canonical.json_pointers.clone(),
@@ -5757,6 +5853,7 @@ pub(crate) fn select_file_snapshot_for_script(
         canonical_sha256: canonical.sha256.clone(),
         canonical_bytes: canonical.exact_bytes,
         retained_bytes: canonical.exact_bytes,
+        capture_complete: true,
         complete: true,
         unavailable_ranges: canonical.unavailable_ranges.clone(),
         results: Vec::new(),
@@ -5900,6 +5997,7 @@ pub(crate) fn select_file_snapshot_with_ceiling(
             canonical_sha256: canonical.sha256.clone(),
             canonical_bytes: canonical.exact_bytes,
             retained_bytes: canonical.exact_bytes,
+            capture_complete: true,
             complete: true,
             unavailable_ranges: Vec::new(),
             results: vec![successful_byte_selector_result(

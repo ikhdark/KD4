@@ -69,7 +69,7 @@ pub(crate) fn validate_independent_review_shell(
     }
     if !inspection_command {
         return Err(
-            "independent reviewers may run only shell commands proven read-only; on PowerShell, retry separate no-profile calls using one safelisted read-only cmdlet per script (for example Test-Path, Get-Command, or Get-ItemProperty), without assignments or script blocks",
+            "independent reviewers may run only shell commands proven read-only; on PowerShell use safelisted read-only commands (Get-Content, Get-ChildItem, Select-String, Test-Path, `rg`, `git diff`/`log`/`show`, `git --no-optional-locks status`), without assignments, script blocks or redirection",
         );
     }
     Ok(())

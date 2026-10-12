@@ -1283,16 +1283,11 @@ impl PluginsManager {
             return;
         }
 
-        let manager = Arc::clone(self);
-        let config_for_refresh = config.clone();
-        let auth_for_refresh = auth.clone();
-        let on_local_cache_changed = Arc::new(move || {
-            manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
-                &config_for_refresh,
-                auth_for_refresh.clone(),
-                on_effective_plugins_changed.clone(),
-            );
-        });
+        let on_local_cache_changed = self.remote_installed_plugin_bundle_sync_callback(
+            config,
+            auth.clone(),
+            on_effective_plugins_changed,
+        );
 
         crate::remote::maybe_start_remote_installed_plugin_bundle_sync(
             self.codex_home.clone(),
@@ -1300,6 +1295,30 @@ impl PluginsManager {
             auth,
             Some(on_local_cache_changed),
         );
+    }
+
+    fn remote_installed_plugin_bundle_sync_callback(
+        self: &Arc<Self>,
+        config: &PluginsConfigInput,
+        auth: Option<CodexAuth>,
+        on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) -> Arc<dyn Fn() + Send + Sync + 'static> {
+        let manager = Arc::clone(self);
+        let service_config = remote_plugin_service_config(config);
+        // The bundle operation owns this account epoch, even if its callback runs
+        // after logout. Never pair its captured auth with a newly sampled generation.
+        let generation = self.remote_installed_plugins_cache_generation.load(Ordering::Acquire);
+        Arc::new(move || {
+            manager.schedule_remote_installed_plugins_cache_refresh(
+                RemoteInstalledPluginsCacheRefreshRequest {
+                    service_config: service_config.clone(),
+                    auth: auth.clone(),
+                    generation,
+                    notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
+                    on_effective_plugins_changed: on_effective_plugins_changed.clone(),
+                },
+            );
+        })
     }
 
     fn maybe_start_global_remote_catalog_cache_refresh(
@@ -2528,6 +2547,12 @@ impl PluginsManager {
                 Ok(state) => state,
                 Err(err) => err.into_inner(),
             };
+            // A delayed old-account callback must not replace the pending refresh
+            // for the current account. The publication fence still handles an
+            // invalidation racing already-admitted work.
+            if request.generation != self.remote_installed_plugins_cache_generation.load(Ordering::Acquire) {
+                return;
+            }
             if let Some(existing_request) = state.requested.as_ref() {
                 if matches!(
                     existing_request.notify,

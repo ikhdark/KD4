@@ -209,12 +209,7 @@ pub(super) fn completion_state(
     };
     // Accepted notifications retain the existing drain contract. Tool calls are
     // cancelled by the owner at completion; make abandonment an explicit failure.
-    let error_text = error_text.or_else(|| scope.get_slot::<RuntimeState>().and_then(|state| {
-        (!state.exit_requested && !state.pending_tool_calls.is_empty()).then(|| format!(
-            "cell completed with {} unawaited tool call(s); outstanding tool work is cancelled",
-            state.pending_tool_calls.len()
-        ))
-    }));
+    let error_text = error_text.or_else(|| super::unawaited_tool_error(scope));
     if error_text.is_none() && scope.get_slot::<RuntimeState>().is_some_and(|state| !state.exit_requested && !state.pending_notifications.is_empty()) {
         return CompletionState::Pending;
     }

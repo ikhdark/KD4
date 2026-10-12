@@ -307,7 +307,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges here. Search results include text in results[].value.hydrated_ranges; enclosing:true also returns enclosing Rust/Python items as line selections. json_pointer selects a complete JSON value. symbol and enclosing share the outline parser; qualified names (Type::method or Class.method) disambiguate items, and broken neighboring syntax is tolerated. Unsupported formats and unresolved items fail explicitly. Ordinary reads do not parse source or generate outlines. Exact source ranges remain recoverable from the snapshot. Oversized selections return child_selectors.".to_string()));
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges here. Search results include text in results[].value.hydrated_ranges; enclosing:true also returns enclosing Rust/Python items as line selections. json_pointer selects a complete JSON value. symbol and enclosing share the outline parser; qualified names (Type::method or Class.method) disambiguate items. Oversized selections return child_selectors.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
@@ -330,7 +330,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 "selector_index":{"type":"integer","minimum":0},
                 "qualified_name":{"type":"string"},
                 "kind":{"type":"string"},
-                "syntax_error":{"const":true, "description":"The item contains a parse error; its range may be wrong."},
+                "syntax_error":{"const":true, "description":"The item or an owner header contains a parse error; its qualified identity or range may be wrong. Exact source delivery can still be complete."},
                 "resolved_selectors":{"type":"array","minItems":1,"maxItems":1,"items":file_selector_schema()}},
                 "required":["selector_index","resolved_selectors"],"additionalProperties":false}});
         output["properties"]["selector_errors"] = json!({"type":"array", "maxItems":64,
@@ -396,7 +396,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             .extend([json!("path"), json!("total_lines"), json!("file_complete")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: format!("Read a UTF-8 file without shell quoting. Path alone returns useful text immediately: the whole file if it fits, otherwise its first page plus continuation. Use read_tool_output with the artifact_id and continuation for the remaining immutable snapshot. complete describes delivery of the requested page or explicit selectors; file_complete describes whole-file coverage. Explicit lines (for example start 40, end 90), bytes, or fixed-string search selectors remain exact; check each results[] status. Files may be up to {MAX_FILE_MIB} MiB. In code mode, exact data uses a fixed 1 MiB payload cap independent of the cell's display-token budget; only printed content is display-budgeted. Complete inline reads need no artifact. Snapshot storage failure preserves inline evidence and reports snapshot_error without a recovery handle. Workspace results are freshness-tracked and may reuse dependency-current evidence; force_fresh bypasses replay and reads current contents. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
+            description: format!("Read a UTF-8 file without shell quoting. Path alone returns useful text immediately: the whole file if it fits, otherwise its first page plus continuation. Use read_tool_output with the artifact_id and continuation for the remaining immutable snapshot. complete describes delivery of the requested page or explicit selectors; file_complete describes whole-file coverage. Explicit lines (for example start 40, end 90), bytes, or fixed-string search selectors remain exact; check each results[] status. Files may be up to {MAX_FILE_MIB} MiB. In code mode a call returns up to 1 MiB of exact data to the script; only printed content is display-budgeted. Workspace results are freshness-tracked and may reuse dependency-current evidence; force_fresh bypasses replay and reads current contents. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema {
@@ -637,6 +637,26 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 "identity": identity,
                 })
             });
+            let inspection_binding_error = if !file_complete
+                && let (Some(inspection), Some(artifact_id)) = (&inspection, &artifact_id)
+            {
+                let binding = invocation.session.bind_source_inspection_origin(
+                    artifact_id.clone(), invocation.call_id.clone(), canonical.exact_bytes,
+                    canonical.sha256.clone(), crate::tool_history::SourceInspectionOrigin {
+                        start: inspection.start.clone(), environment_id: environment_id.clone(),
+                        canonical_uri: canonical_uri.clone(),
+                    },
+                ).await;
+                if binding.is_ok() {
+                    let selectors = result.delivered_ranges().into_iter()
+                        .map(|(start, end)| json!({"kind":"bytes", "start":start, "end":end}))
+                        .collect();
+                    invocation.session.record_tool_history_recovery(
+                        artifact_id.clone(), invocation.call_id.clone(), selectors,
+                    ).await;
+                }
+                binding.err().map(|error| error.to_string())
+            } else { None };
             let mut output = serde_json::to_value(result)
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
             output["artifact_id"] = json!(artifact_id);
@@ -647,6 +667,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["total_lines"] = json!(total_lines);
             output["source_sha256"] = json!(canonical.sha256);
             output["file_complete"] = json!(file_complete);
+            if let Some(error) = inspection_binding_error {
+                output["inspection_proof_error"] = json!(error);
+            }
             if !selector_errors.is_empty() {
                 output["selector_errors"] = json!(selector_errors);
             }
@@ -860,7 +883,7 @@ async fn read_environment_file(
     let coordinator = invocation.session.services.agent_control.task_coordinator();
     crate::tools::parallel::wait_for_workspace_baseline().await;
     let inspection = if !environment.environment.is_remote()
-        && let Some(binding) = coordinator.binding_for_source(&turn.session_source)
+        && let Some(binding) = coordinator.binding_for_turn(turn)
         && let Some(store) = coordinator.store()
     {
         store.prepare_source_inspection(binding.attempt_id, path.inferred_native_path_string())
@@ -881,6 +904,18 @@ async fn read_environment_file(
     let contents = match result {
         Ok(Some(contents)) => contents,
         failure => {
+            // Metadata and listings are later observations, not the failed read.
+            // Preserve its original cause even if diagnostic I/O fails or the
+            // path changes type or size before we can inspect it.
+            let primary_error = failure.as_ref().err().map(|err| format!(
+                "unable to read {}: {err}", path.inferred_native_path_string()
+            ));
+            let diagnostic_error = |message: String| FunctionCallError::RespondToModel(
+                match &primary_error {
+                    Some(primary) => format!("{primary}\nAdditional filesystem diagnostic: {message}"),
+                    None => message,
+                }
+            );
             let metadata = match fs.get_metadata(&path, Some(&sandbox)).await {
                 Ok(metadata) => metadata,
                 Err(err) => {
@@ -900,7 +935,7 @@ async fn read_environment_file(
                                 suggestions.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")));
                         }
                     }
-                    return Err(FunctionCallError::RespondToModel(message));
+                    return Err(diagnostic_error(message));
                 }
             };
             if metadata.is_directory {
@@ -909,13 +944,13 @@ async fn read_environment_file(
                     follow_directory_symlinks: false, prune_hidden_directories: true,
                     filters: Default::default(),
                 }, Some(&sandbox)).await.map_err(|err| {
-                    FunctionCallError::RespondToModel(format!("unable to list directory: {err}"))
+                    diagnostic_error(format!("unable to list directory: {err}"))
                 })?;
                 // This diagnostic promises only immediate entries. Deliberately
                 // not descending into child directories does not truncate them.
                 let truncated = listing.truncated && (listing.unexplored.is_empty()
                     || listing.unexplored.iter().any(|stop| stop.reason != "depth_limit"));
-                return Err(FunctionCallError::RespondToModel(format!(
+                return Err(diagnostic_error(format!(
                     "read_file requires a regular file; this path is a directory. Immediate entries (not file contents): {}. Use a file path, or list_files for a larger listing.",
                     json!({"path":path.inferred_native_path_string(), "entries":listing.entries,
                         "complete": !truncated && listing.errors.is_empty(),
@@ -923,12 +958,12 @@ async fn read_environment_file(
                 )));
             }
             if !metadata.is_file {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(diagnostic_error(
                     "read_file requires a regular file".to_string(),
                 ));
             }
             if metadata.size > MAX_FILE_BYTES as u64 {
-                return Err(FunctionCallError::RespondToModel(format!(
+                return Err(diagnostic_error(format!(
                     "file exceeds the {MAX_FILE_MIB} MiB read limit"
                 )));
             }
@@ -1047,6 +1082,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     include!("read_file_navigation_tests.rs");
+    include!("read_file_inspection_tests.rs");
 
     #[tokio::test]
     async fn read_identity_and_json_pointer_survive_plain_attachment() {
@@ -1403,6 +1439,41 @@ mod tests {
             assert!(recovered.complete);
             assert!(recovered.results.iter().any(|r| r.value.as_ref() == Some(&expected)));
             assert!(recovered.results.iter().any(|r| r.text.as_deref() == Some(unit)));
+        }
+    }
+
+    #[tokio::test]
+    async fn json_pointer_value_does_not_claim_exact_lexical_file_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate-keys.json");
+        let source = r#"{"policy":"deny", "policy":"allow", "escaped":"\u0061"}"#;
+        std::fs::write(&path, source).unwrap();
+        for script in [false, true] {
+            for include_bytes in [false, true] {
+                let mut selectors = json!([{"kind":"json_pointer", "pointer":""}]);
+                if include_bytes {
+                    selectors.as_array_mut().unwrap().push(json!({
+                        "kind":"bytes", "start":0, "end":source.len(),
+                    }));
+                }
+                let mut call = invocation(&path, selectors, false).await;
+                if script {
+                    call.source = ToolCallSource::CodeMode {
+                        cell_id: "json-lexical".into(), parent_call_id: None,
+                        runtime_tool_call_id: "json-lexical-read".into(),
+                        nested_deadline: None, cancellation_cause: None,
+                    };
+                }
+                let result = ReadFileHandler.handle(call.clone()).await.unwrap()
+                    .code_mode_result(&call.payload);
+                assert_eq!(result["complete"], true);
+                assert_eq!(result["file_complete"], include_bytes,
+                    "parsed values discard duplicate members and lexical spellings");
+                let selections = result["results"].as_array().unwrap();
+                assert!(selections.iter().any(|selection|
+                    selection["value"] == json!({"policy":"allow", "escaped":"a"})));
+                assert_eq!(selections.iter().any(|selection| selection["text"] == source), include_bytes);
+            }
         }
     }
 
@@ -2929,6 +3000,100 @@ mod tests {
             let ToolSpec::Function(spec) = ReadToolOutputHandler.spec() else { panic!("function"); };
             jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap().validate(&value).unwrap();
             if expected != "failed" { assert_eq!(value["results"][0]["text"], "first\n"); }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_failure_survives_secondary_filesystem_diagnostics() {
+        use codex_exec_server::{CopyOptions, CreateDirectoryOptions, ExecutorFileSystem,
+            ExecutorFileSystemFuture, FileMetadata, FileSystemReadStream, FileSystemSandboxContext,
+            ReadDirectoryEntry, RemoveOptions, WalkOptions, WalkOutcome};
+        use codex_utils_path_uri::PathUri;
+        use std::io;
+
+        struct DiagnosticFileSystem {
+            metadata: Result<FileMetadata, io::ErrorKind>,
+            calls: std::sync::Mutex<Vec<&'static str>>,
+        }
+        impl ExecutorFileSystem for DiagnosticFileSystem {
+            fn read_file_bounded<'a>(&'a self, _: &'a PathUri, _: usize,
+                _: Option<&'a FileSystemSandboxContext>) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async move {
+                    self.calls.lock().unwrap().push("read");
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "primary-read-denied"))
+                })
+            }
+            fn get_metadata<'a>(&'a self, _: &'a PathUri,
+                _: Option<&'a FileSystemSandboxContext>) -> ExecutorFileSystemFuture<'a, FileMetadata> {
+                Box::pin(async move {
+                    self.calls.lock().unwrap().push("metadata");
+                    self.metadata.clone().map_err(|kind| io::Error::new(kind, "secondary-metadata-failed"))
+                })
+            }
+            fn walk<'a>(&'a self, _: &'a PathUri, _: WalkOptions,
+                _: Option<&'a FileSystemSandboxContext>) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
+                Box::pin(async move {
+                    self.calls.lock().unwrap().push("walk");
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "secondary-listing-failed"))
+                })
+            }
+            fn canonicalize<'a>(&'a self, _: &'a PathUri, _: Option<&'a FileSystemSandboxContext>)
+                -> ExecutorFileSystemFuture<'a, PathUri> { panic!("unexpected canonicalize") }
+            fn read_file<'a>(&'a self, _: &'a PathUri, _: Option<&'a FileSystemSandboxContext>)
+                -> ExecutorFileSystemFuture<'a, Vec<u8>> { panic!("unexpected unbounded read") }
+            fn read_file_stream<'a>(&'a self, _: &'a PathUri, _: Option<&'a FileSystemSandboxContext>)
+                -> ExecutorFileSystemFuture<'a, FileSystemReadStream> { panic!("unexpected stream") }
+            fn write_file<'a>(&'a self, _: &'a PathUri, _: Vec<u8>, _: Option<&'a FileSystemSandboxContext>)
+                -> ExecutorFileSystemFuture<'a, ()> { panic!("unexpected write") }
+            fn create_directory<'a>(&'a self, _: &'a PathUri, _: CreateDirectoryOptions,
+                _: Option<&'a FileSystemSandboxContext>) -> ExecutorFileSystemFuture<'a, ()> { panic!("unexpected mkdir") }
+            fn read_directory<'a>(&'a self, _: &'a PathUri, _: Option<&'a FileSystemSandboxContext>)
+                -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> { panic!("unexpected directory read") }
+            fn remove<'a>(&'a self, _: &'a PathUri, _: RemoveOptions, _: Option<&'a FileSystemSandboxContext>)
+                -> ExecutorFileSystemFuture<'a, ()> { panic!("unexpected remove") }
+            fn copy<'a>(&'a self, _: &'a PathUri, _: &'a PathUri, _: CopyOptions,
+                _: Option<&'a FileSystemSandboxContext>) -> ExecutorFileSystemFuture<'a, ()> { panic!("unexpected copy") }
+        }
+        let regular = FileMetadata { is_file: true, is_directory: false, is_symlink: false,
+            size: 1, created_at_ms: 0, modified_at_ms: 0 };
+        for metadata in [
+            Err(io::ErrorKind::NotFound),
+            Err(io::ErrorKind::BrokenPipe),
+            Ok(FileMetadata { size: MAX_FILE_BYTES as u64 + 1, ..regular.clone() }),
+            Ok(FileMetadata { is_file: false, ..regular.clone() }),
+            Ok(FileMetadata { is_file: false, is_directory: true, ..regular.clone() }),
+            Ok(regular),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let file_system = Arc::new(DiagnosticFileSystem {
+                metadata: metadata.clone(), calls: Default::default(),
+            });
+            let (session, mut turn) = make_session_and_context().await;
+            turn.permission_profile = PermissionProfile::Disabled;
+            turn.environments.turn_environments = vec![crate::session::turn_context::TurnEnvironment::new(
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+                Arc::new(codex_exec_server::Environment::default_for_tests_with_filesystem(file_system.clone())),
+                PathUri::from_host_native_path(directory.path()).unwrap(), None,
+            )];
+            let call = ToolInvocation {
+                session: Arc::new(session), step_context: StepContext::for_test(Arc::new(turn)),
+                cancellation_token: CancellationToken::new(), tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "read-error-provenance".into(), tool_name: ToolName::plain("read_file"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function { arguments: json!({"path":"source.rs"}).to_string() },
+            };
+            let Err(FunctionCallError::RespondToModel(message)) = ReadFileHandler.handle(call).await else {
+                panic!("failed read must not return source evidence");
+            };
+            // The operation's error is authoritative. A later observation can
+            // explain it, but cannot replace it with a different failure/cause.
+            assert!(message.contains("primary-read-denied"), "metadata={metadata:?}: {message}");
+            if metadata.is_err() { assert!(message.contains("secondary-metadata-failed"), "{message}"); }
+            let directory_metadata = metadata.as_ref().is_ok_and(|metadata| metadata.is_directory);
+            if directory_metadata { assert!(message.contains("secondary-listing-failed"), "{message}"); }
+            assert_eq!(*file_system.calls.lock().unwrap(), if directory_metadata {
+                vec!["read", "metadata", "walk"]
+            } else { vec!["read", "metadata"] });
         }
     }
 

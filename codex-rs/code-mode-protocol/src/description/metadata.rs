@@ -340,6 +340,52 @@ mod tests {
     }
 
     #[test]
+    fn reference_validation_siblings_preserve_authoritative_contract_without_redundant_type() {
+        // Without a declared dialect, $ref sibling semantics are unresolved.
+        // Adding a redundant type must not decide whether the model can recover
+        // the authoritative validation constraints. Exercise both actual public
+        // declaration consumers, not just the renderer's internal flag.
+        for (schema_type, keyword, bound) in [
+            ("number", "minimum", json!(2)),
+            ("number", "maximum", json!(5)),
+            ("string", "pattern", json!("^[A-Z]+$")),
+            ("string", "maxLength", json!(3)),
+        ] {
+            for redundant_type in [true, false] {
+                let mut property = json!({"$ref":"#/$defs/value", (keyword):bound});
+                if redundant_type {
+                    property["type"] = json!(schema_type);
+                }
+                let schema = json!({
+                    "type":"object", "properties":{"value":property},
+                    "required":["value"], "additionalProperties":false,
+                    "$defs":{"value":{"type":schema_type}}
+                });
+                for output in [false, true] {
+                    let definition = ToolDefinition {
+                        name: "ref_siblings".into(),
+                        tool_name: ToolName::plain("ref_siblings"),
+                        description: "".into(),
+                        kind: CodeModeToolKind::Function,
+                        input_schema: (!output).then(|| schema.clone()),
+                        output_schema: output.then(|| schema.clone()),
+                        default_timeout_ms: None,
+                    };
+                    let label = if output { "output_schema" } else { "input_schema" };
+                    let augmented = augment_tool_definition(definition.clone());
+                    let marker = format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
+                    let recovered = augmented.description.split_once(&marker)
+                        .unwrap_or_else(|| panic!("lost {keyword}, redundant_type={redundant_type}, {label}: {}", augmented.description))
+                        .1.split_once("\n```").unwrap().0;
+                    assert_eq!(serde_json::from_str::<JsonValue>(recovered).unwrap(), schema);
+                    let bundle = render_code_mode_tool_bundle(&[definition]);
+                    assert!(bundle.contains("resolve_tool(\"ref_siblings\")"), "{bundle}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn verified10_guidance_survives_refs_items_and_branches() {
         let schema = json!({
             "type": "object", "properties": {
@@ -551,6 +597,47 @@ mod tests {
             .unwrap()
             .remove("structuredContent");
         assert_eq!(mcp_structured_content_schema(Some(&envelope)), None);
+    }
+
+    #[test]
+    fn mcp_array_output_contract_respects_legacy_items_scope() {
+        // Draft-07 validation section 6.4.1 and 2019-09 core section 9.3.1.1
+        // apply schema-valued items to all elements, unlike the 2020-12 core
+        // sections 10.3.1.1/.2 instead apply items only after the prefix.
+        for (dialect, expected) in [
+            (Some("http://json-schema.org/draft-07/schema#"), "Array<never>"),
+            (Some("https://json-schema.org/draft-07/schema"), "Array<never>"),
+            (Some("https://json-schema.org/draft/2019-09/schema"), "Array<never>"),
+            (Some("https://json-schema.org/draft/2020-12/schema"), "[(string)?]"),
+            (None, "[(string)?]"),
+        ] {
+            let mut payload = json!({
+                "type":"array", "prefixItems":[{"type":"string"}], "items":false
+            });
+            if let Some(dialect) = dialect {
+                payload["$schema"] = json!(dialect);
+            }
+            let envelope = json!({
+                "x-codex-mcp-result":true, "type":"object",
+                "properties":{"structuredContent":payload}
+            });
+            let definition = ToolDefinition {
+                name: "array_output".into(),
+                tool_name: ToolName::plain("array_output"),
+                description: "".into(),
+                kind: CodeModeToolKind::Function,
+                input_schema: None,
+                output_schema: Some(envelope.clone()),
+                default_timeout_ms: None,
+            };
+            let augmented = augment_tool_definition(definition.clone());
+            let bundle = render_code_mode_tool_bundle(&[definition]);
+            for description in [augmented.description.as_ref(), &bundle] {
+                assert!(description.contains(&format!("Promise<CallToolResult<{expected}>>")),
+                    "dialect={dialect:?}: {description}");
+            }
+            assert_eq!(augmented.output_schema, Some(envelope));
+        }
     }
 
     #[test]

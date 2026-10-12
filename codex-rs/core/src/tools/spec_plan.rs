@@ -768,6 +768,39 @@ fn build_code_mode_executors(
                 // Eager descriptions retain lifecycle/recovery semantics; do not
                 // replay the large transport union on every model generation.
                 definition.output_schema = None;
+                // Eager prompt projection only: registration and resolve_tool keep
+                // the full contract, and the handlers still decode these fields.
+                let withdrawn: &[&str] = match &*definition.name {
+                    "read_file" => &["file_path", "offset", "limit"],
+                    "update_plan" => {
+                        &["resolve", "scope_change_instructions", "superseded", "workflow"]
+                    }
+                    _ => &[],
+                };
+                let mut trimmed_plan_contract = false;
+                if let Some(schema) = definition
+                    .input_schema
+                    .as_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    if let Some(properties) = schema
+                        .get_mut("properties")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        for field in withdrawn {
+                            properties.remove(*field);
+                        }
+                    }
+                    if &*definition.name == "read_file" {
+                        // `path` is the only advertised locator once its alias is withdrawn.
+                        schema.remove("oneOf");
+                        schema.insert("required".to_string(), serde_json::json!(["path"]));
+                    }
+                    trimmed_plan_contract = &*definition.name == "update_plan";
+                }
+                if trimmed_plan_contract {
+                    definition.description = format!("{}\nRarely needed lineage fields (superseded, resolve, scope_change_instructions, workflow) are omitted here; a rejected revision names the field to add, and resolve_tool(\"update_plan\") has their contract.", definition.description).into();
+                }
                 if definition.name == "apply_patch" {
                     definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, text, changes, changes_exact, environment_id, diagnostics, retry?}}; check success before continuing.", definition.description).into();
                 } else if definition.name == "read_file" {
@@ -955,7 +988,16 @@ fn standalone_web_search_enabled(turn_context: &TurnContext) -> bool {
 }
 
 fn tool_environment_mode(step_context: &StepContext) -> ToolEnvironmentMode {
-    ToolEnvironmentMode::from_count(step_context.environments.turn_environments.len())
+    let environments = &step_context.environments;
+    if environments.turn_environments.is_empty() {
+        return ToolEnvironmentMode::None;
+    }
+    // Readiness controls tool availability, but selection controls addressing.
+    // A failed/starting primary still owns implicit dispatch; a ready secondary
+    // must retain the environment_id parameter rather than appear to be primary.
+    ToolEnvironmentMode::from_count(
+        environments.turn_environments.len() + environments.starting.len(),
+    )
 }
 
 fn primary_environment_uses_foreign_cwd(step_context: &StepContext) -> bool {
@@ -1587,7 +1629,7 @@ fn append_extension_tool_executors(
             continue;
         }
         planned_tools.add_with_authorization_class(
-            ExtensionToolAdapter::new(executor),
+            ExtensionToolAdapter::with_registered_spec(executor, spec),
             TypedToolClass::DynamicExternal,
         );
     }

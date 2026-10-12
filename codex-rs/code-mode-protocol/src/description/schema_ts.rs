@@ -412,6 +412,9 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                 } else {
                     // Preserve the existing Reference Object behavior for older or
                     // unspecified dialects; do not silently claim to cover siblings.
+                    // Include validation-only siblings too: a referenced type
+                    // need not be restated beside its bounds. Otherwise those
+                    // constraints silently bypass authoritative-schema recovery.
                     let has_siblings = map.keys().any(|key| {
                         matches!(
                             key.as_str(),
@@ -426,6 +429,37 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                                 | "allOf"
                                 | "anyOf"
                                 | "oneOf"
+                                | "minimum"
+                                | "maximum"
+                                | "exclusiveMinimum"
+                                | "exclusiveMaximum"
+                                | "multipleOf"
+                                | "pattern"
+                                | "minLength"
+                                | "maxLength"
+                                | "format"
+                                | "minItems"
+                                | "maxItems"
+                                | "additionalItems"
+                                | "not"
+                                | "if"
+                                | "then"
+                                | "else"
+                                | "$dynamicRef"
+                                | "$recursiveRef"
+                                | "uniqueItems"
+                                | "contains"
+                                | "minContains"
+                                | "maxContains"
+                                | "unevaluatedItems"
+                                | "minProperties"
+                                | "maxProperties"
+                                | "patternProperties"
+                                | "propertyNames"
+                                | "unevaluatedProperties"
+                                | "dependentRequired"
+                                | "dependentSchemas"
+                                | "dependencies"
                         )
                     });
                     return Ok(if dialect.is_empty() && has_siblings {
@@ -733,12 +767,19 @@ fn render_json_schema_array(
     if maximum.is_some_and(|maximum| maximum < minimum) {
         return Ok("never".to_string());
     }
+    // Draft-07 and 2019-09 apply schema-valued `items` to every element. Their
+    // unknown `prefixItems` must not turn that constraint into a tail-only rule.
+    let legacy_items = root.get("$schema").and_then(JsonValue::as_str).is_some_and(|dialect| {
+        matches!(dialect.trim_end_matches('#'),
+            "http://json-schema.org/draft-07/schema" | "https://json-schema.org/draft-07/schema"
+                | "http://json-schema.org/draft/2019-09/schema" | "https://json-schema.org/draft/2019-09/schema")
+    });
+    let has_prefix_items = !legacy_items && map.contains_key("prefixItems");
     // `items: [...]` is the tuple spelling used by older schema drafts.
-    let prefix = map
-        .get("prefixItems")
+    let prefix = has_prefix_items.then(|| map.get("prefixItems")).flatten()
         .and_then(JsonValue::as_array)
         .or_else(|| map.get("items").and_then(JsonValue::as_array));
-    let trailing = if map.contains_key("prefixItems") {
+    let trailing = if has_prefix_items {
         map.get("items")
     } else if prefix.is_some() {
         map.get("additionalItems")

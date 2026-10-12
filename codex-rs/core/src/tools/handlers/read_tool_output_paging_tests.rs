@@ -1,6 +1,111 @@
 use super::*;
 
 #[tokio::test]
+async fn search_source_byte_budget_preserves_coordinates_and_recoverable_context() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = std::sync::Arc::new(session);
+    let turn = std::sync::Arc::new(turn);
+    let text = format!("λ🦀{} needle\nneedle next\n", "x".repeat(20_000));
+    let first_match = text.find("needle").unwrap() as u64;
+    let first_line_end = text.find('\n').unwrap() as u64 + 1;
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        &turn.config.codex_home, &session.thread_id.to_string(), &CanonicalToolResult::text(&text),
+    ).await;
+    let artifact_id = artifact.artifact_id().unwrap();
+    let invoke = |source, selectors: Vec<ToolOutputSelector>, max_bytes| {
+        ToolInvocation {
+            session: std::sync::Arc::clone(&session),
+            step_context: crate::session::step_context::StepContext::for_test(std::sync::Arc::clone(&turn)),
+            cancellation_token: Default::default(),
+            tracker: std::sync::Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
+            call_id: "search-byte-budget".into(),
+            tool_name: ToolName::plain("read_tool_output"),
+            source,
+            payload: ToolPayload::Function { arguments: serde_json::json!({
+                "artifact_id": artifact_id, "selectors": selectors, "max_bytes": max_bytes,
+            }).to_string() },
+        }
+    };
+    let ToolSpec::Function(spec) = ReadToolOutputHandler.spec() else { unreachable!() };
+    let schema = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+    for script in [false, true] {
+        for budget in [1usize, READ_TOOL_OUTPUT_MAX_BYTES] {
+            let source = if script {
+                ToolCallSource::CodeMode { cell_id: "search-byte-budget".into(), parent_call_id: None,
+                    runtime_tool_call_id: "search".into(), nested_deadline: None, cancellation_cause: None }
+            } else { ToolCallSource::Direct };
+            let search = ToolOutputSelector::Search { query: "needle".into(), enclosing: false,
+                case_insensitive: false, start_byte: 0, max_results: 1, context_lines: 0 };
+            let call = invoke(source.clone(), vec![search], budget);
+            let result = ReadToolOutputHandler.handle(call.clone()).await.unwrap();
+            let output = result.code_mode_result(&call.payload);
+            schema.validate(&output).unwrap();
+            assert_eq!(output["selection_status"], "partial");
+            let selected = &output["results"][0];
+            assert_eq!(selected["status"], "ok");
+            assert_eq!(selected["complete"], false);
+            assert_eq!(selected["value"]["total_matches"], 2);
+            assert_eq!(selected["value"]["matches_returned"], 1);
+            assert_eq!(selected["value"]["matches"][0]["start_byte"], first_match);
+            assert_eq!(selected["value"]["matches"][0]["end_byte"], first_match + 6);
+            assert_eq!(selected["value"]["hydrated_ranges"], serde_json::json!([]));
+            assert_eq!(selected["continuation"]["start_byte"], first_match + 6);
+            assert!(output.get("continuation_stop").is_none(), "do not advertise a non-progressing retry");
+            assert_eq!(selected["child_selectors"], serde_json::json!([{"kind":"lines", "start":1, "end":1}]));
+            // The advertised context can progress with the same cap, even if
+            // one byte splits the first UTF-8 code point. No source reread.
+            let children = serde_json::from_value(selected["child_selectors"].clone()).unwrap();
+            let call = invoke(source, children, budget);
+            let context = ReadToolOutputHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+            schema.validate(&context).unwrap();
+            let context: ReadToolOutputResult = serde_json::from_value(context).unwrap();
+            let ranges = context.delivered_ranges();
+            assert_eq!(ranges, vec![(0, budget as u64)]);
+            let mut bytes = Vec::new();
+            for fragment in context.results {
+                if fragment.status != ToolOutputSelectorStatus::Ok { continue; }
+                if let Some(text) = fragment.text { bytes.extend_from_slice(text.as_bytes()); }
+                if let Some(encoded) = fragment.data_base64 {
+                    bytes.extend(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap());
+                }
+            }
+            assert_eq!(bytes, text.as_bytes()[..budget]);
+            assert!(budget as u64 <= first_line_end);
+        }
+    }
+}
+
+#[test]
+fn search_source_byte_budget_does_not_leave_dangling_shared_hydration() {
+    let text = format!("{} needle alpha\n", "x".repeat(300));
+    let selectors = ["alpha", "needle", "zz_absent"].map(|query| ToolOutputSelector::Search {
+        query: query.into(), enclosing: false, case_insensitive: false,
+        start_byte: 0, max_results: 20, context_lines: 0,
+    });
+    let canonical = CanonicalToolResult::text(&text);
+    let mut output = crate::tools::command_output_artifact::select_producer_snapshot(
+        &canonical, "artifact", selectors.into(), 9_000,
+    ).unwrap();
+    assert_eq!(output.results[1].value.as_ref().unwrap()["hydrated_ranges"][0]["shared"], true);
+    // Enrichment shares the same hydration contract; dropping source context
+    // cannot leave an earlier complete-enclosing claim intact.
+    output.results[0].value.as_mut().unwrap()["enclosing_complete"] = Value::Bool(true);
+    bound_recovery_source_bytes(&mut output, 1);
+    for result in &output.results[..2] {
+        assert_eq!(result.status, ToolOutputSelectorStatus::Ok);
+        assert!(!result.complete);
+        assert_eq!(result.value.as_ref().unwrap()["matches_returned"], 1);
+        assert_eq!(result.value.as_ref().unwrap()["hydrated_ranges"], serde_json::json!([]));
+        assert_eq!(result.child_selectors, vec![ToolOutputSelector::Lines { start: 1, end: 1 }]);
+    }
+    assert_eq!(output.results[0].value.as_ref().unwrap()["enclosing_complete"], false);
+    assert!(output.results[2].complete, "a negative search needs no hydration budget");
+    assert_eq!(output.results[2].value.as_ref().unwrap()["total_matches"], 0);
+    assert!(output.delivered_ranges().is_empty());
+    assert!(!output.complete);
+}
+
+#[tokio::test]
 async fn small_source_byte_budgets_make_exact_progress_across_utf8_boundaries() {
     let home = tempfile::tempdir().unwrap();
     let text = "aλ🦀z".repeat(12);

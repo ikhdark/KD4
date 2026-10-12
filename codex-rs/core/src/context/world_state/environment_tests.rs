@@ -274,13 +274,45 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
   <shell>zsh</shell>
   <current_date>2026-06-20</current_date>
   <timezone>America/Los_Angeles</timezone>
-  <network enabled="true"><allowed>new.example.com</allowed><denied>blocked.example.com</denied></network>
+  <managed_network_proxy configured_enabled="true"><required_allowed>new.example.com</required_allowed><required_denied>blocked.example.com</required_denied></managed_network_proxy>
   <filesystem><permission_profile type="external"><file_system type="external" /></permission_profile></filesystem>
 </environment_context>"#,
         )],
         render_fragments(current.render_diff(&previous.snapshot())),
     );
     Ok(())
+}
+
+#[test]
+fn legacy_network_snapshot_is_replaced_with_explicit_proxy_configuration() {
+    let current = EnvironmentsState {
+        network: Some(NetworkContext::new(false, vec!["example.com".to_string()], vec![])),
+        ..Default::default()
+    };
+    let mut previous = WorldStateSection::snapshot(&current);
+    previous.network = Some(
+        "<network enabled=\"false\"><allowed>example.com</allowed></network>".to_string(),
+    );
+    let previous: EnvironmentsSnapshot = serde_json::from_value(
+        serde_json::to_value(previous).expect("serialize legacy snapshot"),
+    )
+    .expect("legacy snapshot should remain readable");
+    let rendered = WorldStateSection::render_diff(
+        &current,
+        PreviousSectionState::Known(&previous),
+    )
+    .expect("old ambiguous projection must be replaced")
+    .render();
+    assert!(rendered.contains("replaces all previously provided environment context"));
+    assert!(rendered.contains(
+        "<managed_network_proxy configured_enabled=\"false\"><required_allowed>example.com</required_allowed></managed_network_proxy>"
+    ));
+    assert!(!rendered.contains("<network enabled="));
+    assert!(WorldStateSection::render_diff(
+        &current,
+        PreviousSectionState::Known(&WorldStateSection::snapshot(&current)),
+    )
+    .is_none());
 }
 
 #[test]
@@ -307,7 +339,7 @@ fn legacy_subagent_snapshot_is_cleared_with_none() {
     assert_eq!(
         Some(replacement_message(
             r#"<environment_context>
-  <network enabled="true"><allowed>example.com</allowed></network>
+  <managed_network_proxy configured_enabled="true"><required_allowed>example.com</required_allowed></managed_network_proxy>
   <filesystem><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
   <subagents>
     none
@@ -498,7 +530,7 @@ fn removed_global_values_are_explicitly_cleared() {
     assert_eq!(
         render_fragments(fragments),
         vec![replacement_message(
-            "<environment_context>\n  <current_date>unknown</current_date>\n  <timezone>unknown</timezone>\n  <network status=\"unspecified\" />\n  <filesystem status=\"unspecified\" />\n  <subagents>\n    none\n  </subagents>\n</environment_context>"
+            "<environment_context>\n  <current_date>unknown</current_date>\n  <timezone>unknown</timezone>\n  <managed_network_proxy status=\"unspecified\" />\n  <filesystem status=\"unspecified\" />\n  <subagents>\n    none\n  </subagents>\n</environment_context>"
         )]
     );
     assert_delivered_snapshot(cleared.clone(), current.snapshot());
@@ -550,7 +582,7 @@ fn clearing_each_global_field_retains_other_fields_and_persists_delivery() {
     for (field, expected) in [
         ("current_date", "  <current_date>unknown</current_date>"),
         ("timezone", "  <timezone>unknown</timezone>"),
-        ("network", "  <network status=\"unspecified\" />"),
+        ("network", "  <managed_network_proxy status=\"unspecified\" />"),
         ("filesystem", "  <filesystem status=\"unspecified\" />"),
         ("subagents", "  <subagents>\n    none\n  </subagents>"),
     ] {
@@ -577,7 +609,7 @@ fn clearing_each_global_field_retains_other_fields_and_persists_delivery() {
         let retained = [
             ("current_date", "  <current_date>2026-09-13</current_date>"),
             ("timezone", "  <timezone>UTC</timezone>"),
-            ("network", "  <network enabled=\"true\"></network>"),
+            ("network", "  <managed_network_proxy configured_enabled=\"true\"></managed_network_proxy>"),
             (
                 "filesystem",
                 "  <filesystem><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>",

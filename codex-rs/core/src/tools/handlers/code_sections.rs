@@ -24,9 +24,10 @@ pub(crate) struct CodeItem {
     pub in_test_context: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linked_path: Option<String>,
-    /// Conventional locations only; existence is not checked by this parser.
+    /// Possible locations when file context is unknown; existence is not checked.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linked_path_candidates: Vec<String>,
+    /// The item or a Rust owner header used for its qualified identity has errors.
     pub syntax_error: bool,
     /// Diagnostic-only spelling for trait methods; never an executable alias.
     #[serde(skip)]
@@ -99,10 +100,22 @@ pub(crate) fn parse(
             let mut qualifiers = Vec::new();
             let mut trait_alias = None;
             let mut in_test_context = false;
+            let mut syntax_error = node.has_error();
             let mut ancestor = node.parent();
             while let Some(parent) = ancestor {
                 in_test_context |= test_contexts.get(&parent.id()).copied().unwrap_or(false);
                 if matches!(parent.kind(), "impl_item" | "trait_item" | "mod_item" | "function_item" | "class_definition" | "function_definition") {
+                    if rust && parent.has_error() {
+                        // Qualifiers also depend on recovered owner syntax. Inspect
+                        // only the header: another method's broken body must not
+                        // taint this item's otherwise sound identity.
+                        let header_end = parent.child_by_field_name("body")
+                            .map_or(parent.end_byte(), |body| body.start_byte());
+                        let mut header_cursor = parent.walk();
+                        syntax_error |= parent.children(&mut header_cursor)
+                            .filter(|child| child.end_byte() <= header_end)
+                            .any(|child| child.has_error() || child.is_missing());
+                    }
                     let owner = if parent.kind() == "impl_item" {
                         parent.child_by_field_name("type")
                     } else {
@@ -159,6 +172,8 @@ pub(crate) fn parse(
                     || kind == "class" && name.starts_with("Test")))
                 || (rust && kind == "mod" && name == "tests");
             let mut linked_path = None;
+            let mut module_path = None;
+            let mut conditional_path = false;
             if rust {
                 let mut sibling = node.prev_named_sibling();
                 while let Some(previous) = sibling {
@@ -175,7 +190,15 @@ pub(crate) fn parse(
                             && let Some(path_node) = attribute.named_child(0)
                         {
                                 let attribute_path = &source[path_node.byte_range()];
+                                // cfg_attr can supply a path directly or through another
+                                // cfg_attr. Do not evaluate configuration in this parser.
+                                conditional_path |= attribute_path == "cfg_attr";
                                 is_test |= attribute_path.rsplit("::").next() == Some("test");
+                                // Known parameterized-test syntax, not macro expansion or
+                                // proof of active cfg, imported identity, or generated cases.
+                                is_test |= kind == "fn"
+                                    && !previous.has_error()
+                                    && matches!(attribute_path, "test_case" | "test_case::test_case");
                                 // Only an unconditional cfg(test) is proof of
                                 // test-only code; cfg(any(test, feature = ...)) is not.
                                 in_test_context |= attribute_path == "cfg"
@@ -187,10 +210,7 @@ pub(crate) fn parse(
                                     && let Some(value) = attribute.child_by_field_name("value")
                                     && let Some(value) = rust_string_value(value, source)
                                 {
-                                    let base = module_directory(path, node, source, false)?;
-                                    linked_path = Some(
-                                        base.join(value).to_string_lossy().into_owned(),
-                                    );
+                                    module_path = Some(value);
                                 }
                         }
                     } else {
@@ -213,11 +233,26 @@ pub(crate) fn parse(
             }
             // Bound outline metadata; the complete signature remains in the exact section.
             let mut linked_path_candidates = Vec::new();
-            if rust && kind == "mod" && body.is_none() && linked_path.is_none() {
-                let base = module_directory(path, node, source, true)?;
-                let name = name.trim_start_matches("r#");
-                linked_path_candidates.push(base.join(format!("{name}.rs")).to_string_lossy().into_owned());
-                linked_path_candidates.push(base.join(name).join("mod.rs").to_string_lossy().into_owned());
+            if rust && kind == "mod" && body.is_none() && !conditional_path {
+                let bases = module_directories(path, node, source, module_path.is_none())
+                    .unwrap_or_default();
+                if let Some(value) = module_path {
+                    for base in bases {
+                        let candidate = base.join(&value).to_string_lossy().into_owned();
+                        if !linked_path_candidates.contains(&candidate) {
+                            linked_path_candidates.push(candidate);
+                        }
+                    }
+                    if linked_path_candidates.len() == 1 {
+                        linked_path = linked_path_candidates.pop();
+                    }
+                } else {
+                    let name = name.trim_start_matches("r#");
+                    for base in bases {
+                        linked_path_candidates.push(base.join(format!("{name}.rs")).to_string_lossy().into_owned());
+                        linked_path_candidates.push(base.join(name).join("mod.rs").to_string_lossy().into_owned());
+                    }
+                }
             }
             let signature_limit = signature.floor_char_boundary(512);
             in_test_context |= is_test;
@@ -240,7 +275,7 @@ pub(crate) fn parse(
                 in_test_context,
                 linked_path,
                 linked_path_candidates,
-                syntax_error: node.has_error(),
+                syntax_error,
                 trait_method_alias,
                 start,
                 end: node.end_byte(),
@@ -260,19 +295,21 @@ pub(crate) fn parse(
     }
 }
 
-// Resolve only syntax-known directories; never probe the filesystem. A path on
-// the first inline module replaces the pending non-mod.rs stem, while ordinary
-// inline modules consume it. Explicit leaf paths at file scope use the parent.
-fn module_directory(
+// A standalone file does not establish its crate-root or parent #[path] context.
+// Keep both directory possibilities for non-mod.rs files, including lib/main.rs.
+// An inline path replaces the pending stem; ordinary inline modules consume it.
+// Explicit leaf paths at file scope use the parent in either context.
+fn module_directories(
     path: &str,
     node: tree_sitter::Node<'_>,
     source: &str,
     conventional: bool,
-) -> Option<std::path::PathBuf> {
+) -> Option<Vec<std::path::PathBuf>> {
     let path = Path::new(path);
-    let mut base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
     let stem = path.file_stem()?.to_str()?;
-    let mut pending_stem = (!matches!(stem, "mod" | "lib" | "main")).then_some(stem);
+    let mut bases = vec![(base.clone(), None)];
+    if stem != "mod" { bases.push((base, Some(stem))); }
     let mut modules = Vec::new();
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
@@ -287,24 +324,37 @@ fn module_directory(
             if previous.kind() == "attribute_item"
                 && let Some(attribute) = previous.named_child(0)
                 && let Some(name) = attribute.named_child(0)
-                && &source[name.byte_range()] == "path"
-                && let Some(value) = attribute.child_by_field_name("value")
             {
-                override_path = Some(rust_string_value(value, source)?);
+                match &source[name.byte_range()] {
+                    "cfg_attr" => return Some(Vec::new()),
+                    "path" => {
+                        let value = attribute.child_by_field_name("value")?;
+                        override_path = Some(rust_string_value(value, source)?);
+                    }
+                    _ => {}
+                }
             }
             sibling = previous.prev_named_sibling();
         }
         if let Some(value) = override_path {
-            pending_stem = None;
-            base.push(value);
+            for (base, pending_stem) in &mut bases {
+                *pending_stem = None;
+                base.push(&value);
+            }
         } else {
-            if let Some(stem) = pending_stem.take() { base.push(stem); }
             let name = module.child_by_field_name("name")?;
-            base.push(source[name.byte_range()].trim_start_matches("r#"));
+            for (base, pending_stem) in &mut bases {
+                if let Some(stem) = pending_stem.take() { base.push(stem); }
+                base.push(source[name.byte_range()].trim_start_matches("r#"));
+            }
         }
     }
-    if conventional && let Some(stem) = pending_stem { base.push(stem); }
-    Some(base)
+    let mut directories = Vec::new();
+    for (mut base, pending_stem) in bases {
+        if conventional && let Some(stem) = pending_stem { base.push(stem); }
+        if !directories.contains(&base) { directories.push(base); }
+    }
+    Some(directories)
 }
 
 // Decode only the string node selected by the grammar, never parse an attribute
@@ -443,6 +493,21 @@ mod tests {
     }
 
     #[test]
+    fn rust_owner_header_errors_do_not_taint_healthy_sibling_bodies() {
+        // The invalid expression belongs only to broken. The separate invalid
+        // impl header contributes uncertain's qualified identity, not its body.
+        let source = "struct S;\nimpl S {\n fn broken(&self) { let marker = ; }\n fn healthy(&self) {}\n}\nimpl S ??? {\n fn uncertain(&self) {}\n}\n";
+        let parsed = items("src/lib.rs", source);
+        for (name, expected_error) in [("broken", true), ("healthy", false), ("uncertain", true)] {
+            let item = parsed.iter().find(|item| item.kind == "fn" && item.name == name).unwrap();
+            assert_eq!(item.syntax_error, expected_error, "{name}");
+        }
+        let parsed = items("src/lib.rs", "struct Wrapper<T>(T);\n#[cfg(any())]\nimpl<T> Wrapper<T> where T: Clone { fn generic(&self) {} }\n");
+        assert!(!parsed.iter().find(|item| item.name == "generic").unwrap().syntax_error,
+            "valid cfg/generic syntax is not a parse error or proof of active compilation");
+    }
+
+    #[test]
     fn rust_items_tests_and_sibling_paths() {
         let source = "struct S;\nimpl S {\n #[tokio::test]\n async fn works() { let s = r#\"} λ\"#; }\n}\n#[path = \"s_tests.rs\"]\nmod tests;\nenum E {}\ntrait T { fn run(); }\n";
         let parsed = items("src/s.rs", source);
@@ -480,24 +545,76 @@ mod tests {
         let names = parsed.iter().filter(|item| item.kind == "fn")
             .map(|item| item.qualified_name.as_str()).collect::<Vec<_>>();
         assert_eq!(names, ["<S as First>::run", "<S as Second>::run"]);
-        for (path, source, base) in [
-            ("src/lib.rs", "mod child;", "src"),
-            ("src/main.rs", "mod child;", "src"),
-            ("src/parent/mod.rs", "mod child;", "src/parent"),
-            ("src/parent.rs", "mod child;", "src/parent"),
-            ("src/parent.rs", "mod inline { mod child; }", "src/parent/inline"),
-            ("src/lib.rs", "mod r#type;", "src"),
+        // rustc accepts these non-mod.rs files as either crate roots or
+        // conventional modules. Both directory contexts remain candidates.
+        for (path, source, bases) in [
+            ("src/lib.rs", "mod child;", &["src", "src/lib"][..]),
+            ("src/main.rs", "mod child;", &["src", "src/main"][..]),
+            ("src/parent/mod.rs", "mod child;", &["src/parent"][..]),
+            ("src/parent.rs", "mod child;", &["src", "src/parent"][..]),
+            ("src/parent.rs", "mod inline { mod child; }", &["src/inline", "src/parent/inline"][..]),
+            ("src/lib.rs", "mod r#type;", &["src", "src/lib"][..]),
         ] {
             let parsed = items(path, source);
             let item = parsed.last().unwrap();
             let name = item.name.trim_start_matches("r#");
             assert!(item.linked_path.is_none());
+            let expected = bases.iter().flat_map(|base|
+                [Path::new(base).join(format!("{name}.rs")), Path::new(base).join(name).join("mod.rs")])
+                .collect::<Vec<_>>();
             assert_eq!(item.linked_path_candidates.iter().map(Path::new).collect::<Vec<_>>(),
-                [Path::new(base).join(format!("{name}.rs")), Path::new(base).join(name).join("mod.rs")]);
+                expected);
         }
         let parsed = items("src/lib.rs", "#[path = \"elsewhere.rs\"]\nmod child;");
         assert!(parsed[0].linked_path.is_some());
         assert!(parsed[0].linked_path_candidates.is_empty());
+    }
+
+    #[test]
+    fn continuation_cfg_attr_module_paths_remain_unresolved() {
+        // rustc 1.98.1 dep-info selects chosen.rs/on/leaf.rs with --cfg chosen,
+        // and fallback.rs/off/leaf.rs without it. Syntax alone cannot choose.
+        for source in [
+            "#[cfg_attr(chosen, path = \"chosen.rs\")]\n#[path = \"fallback.rs\"]\nmod child;",
+            "#[cfg_attr(chosen, path = \"on\")]\n#[path = \"off\"]\nmod inline { #[path = \"leaf.rs\"] mod child; }",
+        ] {
+            let parsed = items("src/lib.rs", &format!("{source}\nfn after() {{}}"));
+            assert!(parsed.iter().any(|item| item.name == "after"),
+                "unresolved path metadata must not suppress source items");
+            let child = parsed.iter().find(|item| item.name == "child").unwrap();
+            assert!(child.linked_path.is_none(),
+                "cfg_attr(path) on the leaf or an inline ancestor cannot establish one module path");
+            let outline = sections(&parsed);
+            let child = outline.last().unwrap().value.as_ref().unwrap()["items"]
+                .as_array().unwrap().iter().find(|item| item["name"] == "child").unwrap();
+            assert!(child.get("linked_path").is_none(),
+                "unresolved paths must remain unresolved in consumer-visible outline metadata");
+        }
+    }
+
+    #[test]
+    fn continuation_module_paths_preserve_unknown_file_context() {
+        // An arbitrarily named crate root and a file included via #[path] can
+        // resolve relative to src/inline; a conventional external module can
+        // resolve relative to src/entrypoint/inline. The file alone lacks that
+        // parent compilation context, so neither path is an established link.
+        let source = "mod inline { #[path = \"leaf.rs\"] mod child; }";
+        // rustc dep-info verifies that even lib.rs and main.rs can be loaded
+        // as conventional modules; those filenames do not prove root status.
+        for stem in ["entrypoint", "lib", "main"] {
+            let parsed = items(&format!("src/{stem}.rs"), source);
+            let child = parsed.iter().find(|item| item.name == "child").unwrap();
+            assert!(child.linked_path.is_none(), "file names do not establish crate-root identity");
+            for expected in ["src/inline/leaf.rs".to_owned(), format!("src/{stem}/inline/leaf.rs")] {
+                assert!(child.linked_path_candidates.iter().any(|candidate|
+                    Path::new(candidate) == Path::new(&expected)),
+                    "compiler-permitted source context must remain a candidate: {expected}");
+            }
+        }
+        let parsed = items("src/mod.rs", source);
+        let child = parsed.iter().find(|item| item.name == "child").unwrap();
+        assert_eq!(child.linked_path.as_deref().map(Path::new), Some(Path::new("src/inline/leaf.rs")));
+        assert!(child.linked_path_candidates.is_empty());
     }
 
     #[test]

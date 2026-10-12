@@ -200,10 +200,6 @@ impl CodeModeSessionDelegate for BlockingDelegate {
     }
 }
 
-fn cell_id(value: &str) -> CellId {
-    CellId::new(value.to_string())
-}
-
 fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
         state_path: None,
@@ -284,11 +280,12 @@ async fn yields_and_resumes() {
         })
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::ExplicitYield {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
             }],
@@ -298,14 +295,14 @@ async fn yields_and_resumes() {
         service
             .wait(WaitRequest {
                 recovery: None,
-                cell_id: cell_id("1"),
+                cell_id: expected_id.clone(),
                 yield_time_ms: 60_000,
             })
             .await
             .unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "after".to_string(),
             }],
@@ -328,10 +325,11 @@ async fn yields_again_after_the_previous_yield_was_observed() {
         })
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::ExplicitYield {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![],
         }
     );
@@ -339,7 +337,7 @@ async fn yields_again_after_the_previous_yield_was_observed() {
 
     let mut waiting = Box::pin(service.wait(WaitRequest {
         recovery: None,
-        cell_id: cell_id("1"),
+        cell_id: expected_id.clone(),
         yield_time_ms: 60_000,
     }));
     std::future::poll_fn(|cx| {
@@ -354,7 +352,7 @@ async fn yields_again_after_the_previous_yield_was_observed() {
             .expect("second yield must be delivered")
             .unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::ExplicitYield {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "second".to_string(),
             }],
@@ -431,13 +429,14 @@ async fn explicit_nested_tool_timeout_wins_over_cell_and_tool_defaults() {
             })
             .await
             .unwrap();
+        let expected_id = cell.cell_id.clone();
 
         assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
         assert_eq!(
             cell.initial_response().await.unwrap(),
             RuntimeResponse::Result {
                 output_loss: None,
-                cell_id: cell_id("1"),
+                cell_id: expected_id.clone(),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "Error: nested tool `block` exceeded its 10ms timeout".to_string(),
                 }],
@@ -565,6 +564,7 @@ text(results.length);
         })
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), cell.initial_response())
@@ -573,7 +573,7 @@ text(results.length);
             .unwrap(),
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "2".to_string(),
             }],
@@ -581,6 +581,106 @@ text(results.length);
         }
     );
     assert_eq!(delegate.started.load(Ordering::Acquire), 2);
+}
+
+// A notification is an explicit barrier: the timed-out promise has rejected
+// before the test releases the independent operation. No wall-clock guess is
+// used to decide whether the sibling survived the deadline.
+struct SiblingDeadlineDelegate {
+    inner: Arc<BlockingDelegate>,
+    deadline_seen: Notify,
+}
+
+impl CodeModeSessionDelegate for SiblingDeadlineDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        invocation: CodeModeNestedToolCall,
+        cancellation: NestedCancellation,
+    ) -> ToolInvocationFuture<'a> {
+        if invocation.tool_name.name == "read" {
+            return Box::pin(async move {
+                let _ = self.inner.events_tx.send(DelegateEvent::ToolStarted);
+                cancellation.cancelled().await;
+                Err("read cancelled".to_string())
+            });
+        }
+        self.inner.invoke_tool(invocation, cancellation)
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        text: String,
+        _cancellation: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            assert!(text.contains("10ms timeout"), "{text}");
+            self.deadline_seen.notify_one();
+            Ok(())
+        })
+    }
+
+    fn cell_closed(&self, cell_id: &CellId) {
+        self.inner.cell_closed(cell_id);
+    }
+}
+
+#[tokio::test]
+async fn sibling_deadline_is_local_until_an_uncaught_rejection_ends_the_cell() {
+    for handled in [true, false] {
+        let (inner, mut events_rx) = BlockingDelegate::new();
+        let delegate = Arc::new(SiblingDeadlineDelegate {
+            inner: inner.clone(),
+            deadline_seen: Notify::new(),
+        });
+        let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+        let join = if handled { "allSettled" } else { "all" };
+        let mut read = blocking_tool();
+        read.name = "read".to_string();
+        read.tool_name = ToolName::plain("read");
+        let cell = service.execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool(), read].into(),
+            source: format!(r#"
+const command = tools.block({{}});
+const read = tools.read({{}}, {{timeout_ms: 10}}).catch(async error => {{
+    await notify(String(error));
+    throw error;
+}});
+const results = await Promise.{join}([command, read]);
+text(results.map(result => result.status).join(','));
+"#),
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        }).await.unwrap();
+        let expected_id = cell.cell_id.clone();
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+        tokio::time::timeout(Duration::from_secs(2), delegate.deadline_seen.notified())
+            .await.expect("the read deadline must be observed");
+        if handled {
+            assert!(!inner.tool_finished.load(Ordering::Acquire), "sibling cancelled by another tool's deadline");
+            inner.tool_release.notify_one();
+        }
+        let response = tokio::time::timeout(Duration::from_secs(3), cell.initial_response())
+            .await.expect("cell must finish with an attributable outcome").unwrap();
+        let RuntimeResponse::Result { error_text, content_items, .. } = response else {
+            panic!("expected a terminal cell response: {response:?}");
+        };
+        if handled {
+            assert_eq!(error_text, None);
+            assert_eq!(content_items, vec![FunctionCallOutputContentItem::InputText {
+                text: "fulfilled,rejected".into(),
+            }]);
+        } else {
+            assert!(error_text.as_deref().is_some_and(|error| error.contains("10ms timeout")), "{error_text:?}");
+            assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolCancelled);
+        }
+        assert!(inner.tool_finished.load(Ordering::Acquire));
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::CellClosed(expected_id.clone()));
+        service.shutdown().await.unwrap();
+        assert!(events_rx.try_recv().is_err());
+    }
 }
 
 #[tokio::test]
@@ -613,11 +713,12 @@ yield_control();
         })
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::ExplicitYield {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: format!(
                     "Error: code mode cell exceeded its limit of {MAX_OUTSTANDING_CALLBACKS_PER_CELL} outstanding tool and notification callbacks"
@@ -637,11 +738,12 @@ async fn observed_natural_completion_wins_over_termination() {
         ))
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::ExplicitYield {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: Vec::new(),
         }
     );
@@ -673,10 +775,10 @@ async fn observed_natural_completion_wins_over_termination() {
     .await
     .unwrap();
     assert_eq!(
-        service.terminate(cell_id("1")).await.unwrap(),
+        service.terminate(expected_id.clone()).await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
             }],
@@ -705,6 +807,7 @@ await Promise.allSettled([reported, stalled]);
         })
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
     assert_eq!(
@@ -714,11 +817,11 @@ await Promise.allSettled([reported, stalled]);
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Yielded {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: Vec::new(),
         }
     );
-    let mut termination = Box::pin(service.terminate(cell_id("1")));
+    let mut termination = Box::pin(service.terminate(expected_id.clone()));
     assert!(
         tokio::time::timeout(Duration::from_millis(25), &mut termination)
             .await
@@ -737,13 +840,13 @@ await Promise.allSettled([reported, stalled]);
     assert_eq!(
         termination.await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: Vec::new(),
         })
     );
     assert_eq!(
         next_event(&mut events_rx).await,
-        DelegateEvent::CellClosed(cell_id("1"))
+        DelegateEvent::CellClosed(expected_id.clone())
     );
 }
 
@@ -751,10 +854,11 @@ await Promise.allSettled([reported, stalled]);
 async fn shutdown_delivers_notifications_while_natural_completion_is_draining() {
     let (delegate, mut events_rx) = HeldNotificationDelegate::new();
     let service = Arc::new(InProcessCodeModeSession::with_delegate(delegate.clone()));
-    service
+    let cell = service
         .execute(execute_request(r#"notify("pending");"#))
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(
         next_event(&mut events_rx).await,
@@ -777,7 +881,7 @@ async fn shutdown_delivers_notifications_while_natural_completion_is_draining() 
     assert_eq!(shutdown.await.unwrap(), Ok(()));
     assert_eq!(
         next_event(&mut events_rx).await,
-        DelegateEvent::CellClosed(cell_id("1"))
+        DelegateEvent::CellClosed(expected_id.clone())
     );
 }
 
@@ -791,6 +895,7 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
         ))
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(
         next_event(&mut events_rx).await,
@@ -799,12 +904,12 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Yielded {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: Vec::new(),
         }
     );
 
-    let first_termination = service.terminate(cell_id("1"));
+    let first_termination = service.terminate(expected_id.clone());
     tokio::pin!(first_termination);
     assert!(
         tokio::time::timeout(Duration::from_millis(25), &mut first_termination)
@@ -812,7 +917,7 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
             .is_err(),
         "the first termination remains pending while notification cleanup is held"
     );
-    let repeated_termination = service.terminate(cell_id("1")).await;
+    let repeated_termination = service.terminate(expected_id.clone()).await;
     delegate.release_notification();
     assert_eq!(
         next_event(&mut events_rx).await,
@@ -821,18 +926,18 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
 
     assert_eq!(
         repeated_termination.unwrap_err(),
-        "exec cell 1 is already terminating"
+        format!("exec cell {expected_id} is already terminating")
     );
     assert_eq!(
         first_termination.await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: Vec::new(),
         })
     );
     assert_eq!(
         next_event(&mut events_rx).await,
-        DelegateEvent::CellClosed(cell_id("1"))
+        DelegateEvent::CellClosed(expected_id.clone())
     );
 }
 
@@ -843,11 +948,12 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
         .execute(execute_request("await new Promise(resolve => setTimeout(resolve, 600_000));"))
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Yielded {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: Vec::new(),
         }
     );
@@ -855,7 +961,7 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
     let first_observer = service
         .begin_wait(WaitRequest {
             recovery: None,
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             yield_time_ms: 60_000,
         })
         .await;
@@ -863,20 +969,20 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
         service
             .wait(WaitRequest {
                 recovery: None,
-                cell_id: cell_id("1"),
+                cell_id: expected_id.clone(),
                 yield_time_ms: 60_000,
             })
             .await
             .unwrap_err(),
-        "exec cell 1 already has an active observer"
+        format!("exec cell {expected_id} already has an active observer")
     );
 
     let terminated = RuntimeResponse::Terminated {
-        cell_id: cell_id("1"),
+        cell_id: expected_id.clone(),
         content_items: Vec::new(),
     };
     assert_eq!(
-        service.terminate(cell_id("1")).await.unwrap(),
+        service.terminate(expected_id.clone()).await.unwrap(),
         WaitOutcome::LiveCell(terminated.clone())
     );
     assert_eq!(
@@ -892,6 +998,7 @@ async fn dropped_wait_observer_leaves_the_cell_available() {
         .execute(execute_request("await new Promise(resolve => setTimeout(resolve, 600_000));"))
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
     assert!(matches!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Yielded { .. }
@@ -900,7 +1007,7 @@ async fn dropped_wait_observer_leaves_the_cell_available() {
     let suspended = service
         .begin_wait(WaitRequest {
             recovery: None,
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             yield_time_ms: 60_000,
         })
         .await;
@@ -910,18 +1017,18 @@ async fn dropped_wait_observer_leaves_the_cell_available() {
         service
             .wait(WaitRequest {
                 recovery: None,
-                cell_id: cell_id("1"),
+                cell_id: expected_id.clone(),
                 yield_time_ms: 0,
             })
             .await
             .unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: Vec::new(),
         })
     );
     assert!(matches!(
-        service.terminate(cell_id("1")).await.unwrap(),
+        service.terminate(expected_id.clone()).await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Terminated { .. })
     ));
 }
@@ -986,6 +1093,7 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
         })
         .await
         .unwrap();
+    let expected_id = cell.cell_id.clone();
 
     assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
     let mut initial_response = Box::pin(cell.initial_response());
@@ -1001,7 +1109,7 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
         initial_response.await.unwrap(),
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: expected_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
             }],
@@ -1015,6 +1123,88 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
     );
     assert_eq!(
         next_event(&mut events_rx).await,
-        DelegateEvent::CellClosed(cell_id("1"))
+        DelegateEvent::CellClosed(expected_id.clone())
     );
+}
+
+#[tokio::test]
+async fn exit_rejects_abandoned_tools_after_cleanup() {
+    for exit in [
+        "exit();",
+        "setTimeout(() => exit(), 0); await new Promise(() => {});",
+    ] {
+        let (delegate, mut events_rx) = BlockingDelegate::new();
+        delegate.hold_cancelled_tool.store(true, Ordering::Release);
+        let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+        let cell = service.execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()].into(),
+            source: format!("tools.block({{}}); text('partial'); {exit} text('unreachable');"),
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        }).await.unwrap();
+        let expected_id = cell.cell_id.clone();
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+        let mut response = Box::pin(cell.initial_response());
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut response).await.is_err(),
+            "exit must not respond while cancelled work is still draining");
+        assert!(!delegate.tool_finished.load(Ordering::Acquire));
+        delegate.tool_release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), response).await.unwrap().unwrap(),
+            RuntimeResponse::Result {
+                output_loss: None,
+                cell_id: expected_id.clone(),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "partial".to_string(),
+                }],
+                error_text: Some("cell completed with 1 unawaited tool call(s); outstanding tool work is cancelled".to_string()),
+            },
+            "{exit} must preserve partial text without claiming success",
+        );
+        assert!(delegate.tool_finished.load(Ordering::Acquire));
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolCancelled);
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::CellClosed(expected_id.clone()));
+        service.shutdown().await.unwrap();
+        assert!(events_rx.try_recv().is_err(), "cancellation and closure must occur exactly once");
+    }
+}
+
+#[tokio::test]
+async fn exit_without_abandoned_tools_succeeds() {
+    for exit in [
+        "exit();",
+        "setTimeout(() => exit(), 0); await new Promise(() => {});",
+    ] {
+        for awaited_tool in [false, true] {
+            let (delegate, mut events_rx) = BlockingDelegate::new();
+            let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+            let prefix = if awaited_tool { "await tools.block({});" } else { "" };
+            let cell = service.execute(ExecuteRequest {
+                enabled_tools: vec![blocking_tool()].into(),
+                source: format!("{prefix} text('complete'); {exit} text('unreachable');"),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            }).await.unwrap();
+            let expected_id = cell.cell_id.clone();
+            if awaited_tool {
+                assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+                delegate.tool_release.notify_one();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), cell.initial_response()).await.unwrap().unwrap(),
+                RuntimeResponse::Result {
+                    output_loss: None,
+                    cell_id: expected_id.clone(),
+                    content_items: vec![FunctionCallOutputContentItem::InputText {
+                        text: "complete".to_string(),
+                    }],
+                    error_text: None,
+                },
+            );
+            assert_eq!(delegate.tool_finished.load(Ordering::Acquire), awaited_tool);
+            assert_eq!(next_event(&mut events_rx).await, DelegateEvent::CellClosed(expected_id.clone()));
+            service.shutdown().await.unwrap();
+            assert!(events_rx.try_recv().is_err(), "clean exit must not cancel settled work");
+        }
+    }
 }

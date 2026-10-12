@@ -1,11 +1,13 @@
 # Orchestration instruction sources
 
-This file is a maintainer reference, not a model prompt. Runtime assembly is in
-`core/src/context/multi_agent_mode_instructions.rs`. There is deliberately no
-separate root-coordination policy block: a root session receives the same
-orchestration rules as any other session, from the owning surfaces below.
+This file is a maintainer reference, not a model prompt.
 
 Keep rules in their active owning surfaces:
+
+- `core/src/config/mod.rs`: the root, subagent and shared multi-agent usage hints.
+- `core/src/stable_context.rs`: hint wrapping and the root classifier.
+- `core/src/tools/handlers/multi_agents_spec.rs`: agent tool contracts.
+- `core/src/context/multi_agent_mode_instructions.rs`: spawn authorization.
 
 - `protocol/src/prompts/base_instructions/default.md`: scope, change contracts,
   shared workspace safety, validation, and completion for roots and workers.

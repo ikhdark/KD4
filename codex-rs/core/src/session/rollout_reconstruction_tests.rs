@@ -25,6 +25,118 @@ use serde_json::json;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn continuity_loader_gap_survives_rollback_without_preserving_turn_messages() {
+    let (_session, turn_context) = make_session_and_context().await;
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("gap-rollback.jsonl");
+    for boundaries in ["modern", "legacy", "eventless"] {
+        let mut quoted_gap = user_message("<rollout_reconstruction_gap>quoted text</rollout_reconstruction_gap>");
+        if let ResponseItem::Message { role, .. } = &mut quoted_gap {
+            *role = "developer".into();
+        }
+        let mut items = completed_user_turn_rollout(
+            turn_context.to_turn_context_item(),
+            vec![
+                RolloutItem::ResponseItem(user_message("rolled-back request")),
+                RolloutItem::ResponseItem(quoted_gap),
+                RolloutItem::ResponseItem(assistant_message("rolled-back reply")),
+            ],
+        );
+        if boundaries == "legacy" {
+            items.retain(|item| !matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
+        } else if boundaries == "eventless" {
+            items.retain(|item| !matches!(item, RolloutItem::EventMsg(_)));
+        }
+        items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )));
+        let clean = items.into_iter().map(|item| {
+            serde_json::to_string(&codex_protocol::protocol::RolloutLine {
+                timestamp: "2026-10-11T00:00:00Z".into(), item,
+            }).unwrap() + "\n"
+        }).collect::<String>();
+        for damaged in [false, true] {
+            let bytes = if damaged { format!("malformed interior record\n{clean}") } else { clean.clone() };
+            std::fs::write(&path, bytes).unwrap();
+            let (loaded, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+            assert_eq!(errors, usize::from(damaged));
+            let expected = if damaged {
+                let RolloutItem::ResponseItem(notice) = loaded.last().unwrap() else { panic!("loader notice") };
+                assert!(codex_rollout::is_rollout_reconstruction_notice(notice));
+                vec![notice.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(Session::reconstruct_model_history_from_rollout(&loaded), expected,
+                "{boundaries}: rollback removes the turn, not global source integrity");
+        }
+    }
+}
+
+#[tokio::test]
+async fn continuity_loader_gap_survives_checkpoints_with_reserved_origin() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("gap-checkpoint.jsonl");
+    let record = serde_json::to_string(&codex_protocol::protocol::RolloutLine {
+        timestamp: "2026-10-11T00:00:00Z".into(),
+        item: RolloutItem::ResponseItem(user_message("keep constraints")),
+    }).unwrap();
+    std::fs::write(&path, format!("{record}\nmalformed record\n")).unwrap();
+    let (loaded, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 1);
+    let initial = Session::reconstruct_model_history_from_rollout(&loaded);
+    let notice = initial.last().unwrap().clone();
+    assert!(codex_rollout::is_rollout_reconstruction_notice(&notice));
+    let mut quoted = notice.clone();
+    quoted.set_id(None);
+    let mut provider = notice.clone();
+    crate::stable_context::normalize_provider_context_item_id(&mut provider);
+    assert!(!codex_rollout::is_rollout_reconstruction_notice(&quoted));
+    assert!(!codex_rollout::is_rollout_reconstruction_notice(&provider));
+    let normalized = provider.clone();
+    crate::stable_context::normalize_provider_context_item_id(&mut provider);
+    assert_eq!(provider, normalized);
+    for local in [false, true] {
+        let mut history = initial.clone();
+        for _ in 0..3 {
+            history.extend([quoted.clone(), provider.clone()]);
+            // The integrity warning must also survive after a model has observed it.
+            history.push(assistant_message("lossy handoff without an integrity warning"));
+            history = if local {
+                crate::compact::build_local_task_input_checkpoint(&history).0
+            } else {
+                crate::compact::build_task_input_checkpoint(&history).0
+            };
+            assert_eq!(history.iter().filter(|item| **item == notice).count(), 1);
+            assert!(!history.contains(&quoted), "text alone cannot gain retention privilege");
+            assert!(!history.contains(&provider), "provider IDs cannot gain retention privilege");
+            let compacted = RolloutItem::Compacted(CompactedItem {
+                message: String::new(), replacement_history: Some(history.clone()),
+                window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+            });
+            let replay: RolloutItem = serde_json::from_str(&serde_json::to_string(&compacted).unwrap()).unwrap();
+            assert_eq!(Session::reconstruct_model_history_from_rollout(&[
+                replay.clone(),
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                    codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+                )),
+            ]), vec![notice.clone()], "checkpoint rollback must retain source uncertainty");
+            history = Session::reconstruct_model_history_from_rollout(&[replay]);
+            assert_eq!(history.iter().filter(|item| **item == notice).count(), 1);
+        }
+        // A new load may append a refreshed notice after a retained checkpoint.
+        let (reloaded, _, _) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+        let RolloutItem::ResponseItem(refreshed) = reloaded.last().unwrap() else { panic!("refreshed notice") };
+        assert_ne!(refreshed.id(), notice.id());
+        let mut duplicated = history.into_iter().map(RolloutItem::ResponseItem).collect::<Vec<_>>();
+        duplicated.push(RolloutItem::ResponseItem(refreshed.clone()));
+        let rebuilt = Session::reconstruct_model_history_from_rollout(&duplicated);
+        assert_eq!(rebuilt.iter().filter(|item| codex_rollout::is_rollout_reconstruction_notice(item))
+            .collect::<Vec<_>>(), vec![refreshed]);
+    }
+}
+
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -3307,3 +3419,56 @@ fn continuity_unsettled_pages_follow_events_and_typed_delivery_not_payload() {
     assert!(end["recovery_path"].is_null());
 }
 
+#[tokio::test]
+async fn mixed_legacy_and_modern_rollback_preserves_legacy_turns_and_modern_steering() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first = accepted_context(turn_context.to_turn_context_item());
+    let mut second = first.clone();
+    second.turn_id = Some("legacy-second".into());
+    second.model = "second-model".into();
+    let mut modern = first.clone();
+    modern.turn_id = Some("modern".into());
+    modern.model = "modern-model".into();
+    for legacy_completed in [false, true] {
+        for modern_completed in [false, true] {
+            for num_turns in [1, 2] {
+                let mut items = completed_user_turn_rollout(first.clone(), vec![
+                    RolloutItem::WorldState(WorldStateItem::full(json!({"turn": 1}))),
+                    RolloutItem::ResponseItem(user_message("first")),
+                ]);
+                items.extend(completed_user_turn_rollout(second.clone(), vec![
+                    RolloutItem::WorldState(WorldStateItem::patch(json!({"turn": 2}))),
+                    RolloutItem::ResponseItem(user_message("second")),
+                ]));
+                items.retain(|item| !matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
+                    && (legacy_completed || !matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_)))));
+                let mut modern_items = completed_user_turn_rollout(modern.clone(), vec![
+                    RolloutItem::WorldState(WorldStateItem::patch(json!({"turn": 3}))),
+                    RolloutItem::ResponseItem(user_message("modern request")),
+                    RolloutItem::EventMsg(EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
+                        message: "steering within modern turn".into(), ..Default::default()
+                    })),
+                    RolloutItem::ResponseItem(user_message("steering within modern turn")),
+                ]);
+                if !modern_completed { modern_items.pop(); }
+                items.extend(modern_items);
+                items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                    codex_protocol::protocol::ThreadRolledBackEvent { num_turns },
+                )));
+                let started = std::time::Instant::now();
+                let rebuilt = session.reconstruct_history_from_rollout(&turn_context, &items).await;
+                eprintln!("mixed_rollback_elapsed={:?}", started.elapsed());
+                let (expected_history, expected_context, expected_world) = if num_turns == 2 {
+                    (vec![user_message("first")], &first, json!({"turn": 1}))
+                } else {
+                    (vec![user_message("first"), user_message("second")], &second, json!({"turn": 2}))
+                };
+                assert_eq!(rebuilt.history, expected_history);
+                assert_eq!(rebuilt.previous_turn_settings.unwrap().model, expected_context.model);
+                assert_eq!(serde_json::to_value(rebuilt.reference_context_item).unwrap(),
+                    serde_json::to_value(Some(expected_context)).unwrap());
+                assert_eq!(serde_json::to_value(rebuilt.world_state_baseline.unwrap()).unwrap(), expected_world);
+            }
+        }
+    }
+}

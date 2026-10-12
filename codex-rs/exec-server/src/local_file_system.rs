@@ -1073,16 +1073,19 @@ impl ExecutorFileSystem for DirectFileSystem {
                         // Lossy names must still be probed through the URI the
                         // walker will report, not classified as a different file.
                         let snapshot = name.to_str().and_then(|_| {
+                            let metadata = metadata?;
                             is_symlink.map(|is_symlink| WalkEntryMetadata {
                                 is_directory: metadata.is_dir(),
                                 is_file: metadata.is_file(),
                                 is_symlink,
                             })
                         });
-                        WalkDirectoryEntry {
+                        // Keep failed metadata observations addressable. The
+                        // walker's existing fallback reports their per-path error.
+                        Some(WalkDirectoryEntry {
                             file_name: name.to_string_lossy().into_owned(),
                             metadata: snapshot,
-                        }
+                        })
                     },
                 )
             })
@@ -1365,21 +1368,22 @@ fn file_metadata(metadata: &std::fs::Metadata, is_symlink: bool) -> FileMetadata
 
 fn directory_entry(
     name: std::ffi::OsString,
-    metadata: &std::fs::Metadata,
+    metadata: Option<&std::fs::Metadata>,
     _is_symlink: Option<bool>,
-) -> ReadDirectoryEntry {
-    ReadDirectoryEntry {
+) -> Option<ReadDirectoryEntry> {
+    let metadata = metadata?;
+    Some(ReadDirectoryEntry {
         file_name: name.to_string_lossy().into_owned(),
         is_directory: metadata.is_dir(),
         is_file: metadata.is_file(),
-    }
+    })
 }
 
 fn read_directory_sync<T>(
     path: &Path,
     max_entries: Option<usize>,
     cancel: &CancellationToken,
-    mut classify: impl FnMut(std::ffi::OsString, &std::fs::Metadata, Option<bool>) -> T,
+    mut classify: impl FnMut(std::ffi::OsString, Option<&std::fs::Metadata>, Option<bool>) -> Option<T>,
 ) -> io::Result<ReadDirectoryOutcome<T>> {
     check_file_system_cancelled(cancel)?;
     let mut entries = Vec::new();
@@ -1397,8 +1401,8 @@ fn read_directory_sync<T>(
         let entry = entry?;
         entries_examined += 1;
         // Enumeration already describes an entry that is not a link. Links
-        // follow their target; entries whose target cannot be read (dangling
-        // links) are skipped but still counted.
+        // follow their target. Legacy directory reads omit unavailable targets;
+        // walks retain their names so a failed metadata probe remains observable.
         let is_symlink = entry
             .file_type()
             .ok()
@@ -1407,10 +1411,9 @@ fn read_directory_sync<T>(
             Some(false) => entry.metadata(),
             _ => std::fs::metadata(entry.path()),
         };
-        let Ok(metadata) = metadata else {
-            continue;
-        };
-        entries.push(classify(entry.file_name(), &metadata, is_symlink));
+        if let Some(entry) = classify(entry.file_name(), metadata.as_ref().ok(), is_symlink) {
+            entries.push(entry);
+        }
     }
     Ok(ReadDirectoryOutcome {
         entries,

@@ -435,6 +435,7 @@ fn app_declaration(name: &str, connector_id: &str) -> AppDeclaration {
         name: name.to_string(),
         connector_id: AppConnectorId(connector_id.to_string()),
         category: None,
+        required: false,
     }
 }
 
@@ -5441,6 +5442,87 @@ plugins = true
         .unwrap();
 
     assert_eq!(featured_plugin_ids, vec!["codex-plugin".to_string()]);
+}
+
+#[tokio::test]
+async fn account_cache_invalidation_rejects_delayed_bundle_callback_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(&tmp.path().join(CONFIG_TOML_FILE), "[features]\nplugins = true\n");
+    let server = MockServer::start().await;
+    let mut config = load_config(tmp.path(), tmp.path()).await;
+    config.chatgpt_base_url = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer account-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [], "pagination": {"next_page_token": null}
+        })))
+        .expect(3)
+        .mount(&server).await;
+    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&notifications);
+    // This is the actual callback passed to bundle synchronization, held before
+    // invalidation rather than an already scheduled cache request.
+    let callback = manager.remote_installed_plugin_bundle_sync_callback(
+        &config, Some(backend_header_auth("Bearer account-a")),
+        Some(Arc::new(move || { count.fetch_add(1, Ordering::SeqCst); })),
+    );
+    callback();
+    wait_for_remote_installed_refresh_to_finish(&manager).await;
+    assert!(manager.build_remote_installed_plugin_marketplaces_from_cache(&[REMOTE_GLOBAL_MARKETPLACE_NAME]).is_some(),
+        "current-account callback must still publish successful refreshes");
+    assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    manager.invalidate_account_scoped_remote_plugin_caches();
+    callback();
+    wait_for_remote_installed_refresh_to_finish(&manager).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 3,
+        "a callback already known to be obsolete must not schedule account I/O");
+    assert!(manager.build_remote_installed_plugin_marketplaces_from_cache(&[REMOTE_GLOBAL_MARKETPLACE_NAME]).is_none(),
+        "the delayed old-auth callback must not repopulate cleared account state");
+    assert_eq!(notifications.load(Ordering::SeqCst), 1, "stale work must not notify effective-plugin consumers");
+}
+
+#[tokio::test]
+async fn delayed_bundle_callback_cannot_evict_current_account_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(&tmp.path().join(CONFIG_TOML_FILE), "[features]\nplugins = true\n");
+    let server = MockServer::start().await;
+    let mut config = load_config(tmp.path(), tmp.path()).await;
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let old_callback = manager.remote_installed_plugin_bundle_sync_callback(
+        &config, Some(backend_header_auth("Bearer account-a")), None,
+    );
+    let late_callback = Arc::clone(&old_callback);
+    let response_manager = Arc::clone(&manager);
+    let response_config = config.clone();
+    let first_request = std::sync::atomic::AtomicBool::new(true);
+    let empty = serde_json::json!({"plugins": [], "pagination": {"next_page_token": null}});
+    let old_response = empty.clone();
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer account-a"))
+        .respond_with(move |_: &wiremock::Request| {
+            if first_request.swap(false, Ordering::SeqCst) {
+                response_manager.invalidate_account_scoped_remote_plugin_caches();
+                response_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+                    &response_config, Some(backend_header_auth("Bearer account-b")), None,
+                );
+                // The current-account request is queued behind this in-flight A request.
+                late_callback();
+            }
+            ResponseTemplate::new(200).set_body_json(&old_response)
+        }).expect(3).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer account-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty))
+        .expect(3).mount(&server).await;
+    old_callback();
+    wait_for_remote_installed_refresh_to_finish(&manager).await;
+    assert!(manager.build_remote_installed_plugin_marketplaces_from_cache(&[REMOTE_GLOBAL_MARKETPLACE_NAME]).is_some(),
+        "obsolete callbacks must not suppress the queued current-account refresh");
 }
 
 #[tokio::test]

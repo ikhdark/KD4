@@ -15,13 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from scripts import rust_tool_env as shared_rust_tool_env
-    from scripts.generated_output_lock import repository_lock
+    from scripts.build import rust_tool_env as shared_rust_tool_env
+    from scripts.common.generated_output_lock import repository_lock
 except ImportError:
-    import rust_tool_env as shared_rust_tool_env
-    from generated_output_lock import repository_lock
+    import scripts.build.rust_tool_env as shared_rust_tool_env
+    from scripts.common.generated_output_lock import repository_lock
 
-from scripts.process_owner import run_owned
+from scripts.common.process_owner import run_owned
 from .layout import pe_machine
 from .targets import REPO_ROOT
 from .targets import PackageVariant
@@ -30,7 +30,7 @@ from .targets import TargetSpec
 
 CODEX_RS_ROOT = REPO_ROOT / "codex-rs"
 DEFAULT_RUST_MIN_STACK = "8388608"
-# One shared local default with scripts/just-shell.py and common-rust-env.ps1;
+# One shared local default with scripts/build/just-shell.py and common-rust-env.ps1;
 # override everywhere with CODEX_SCCACHE_CACHE_SIZE.
 SCCACHE_CACHE_SIZE_ENV_VAR = shared_rust_tool_env.SCCACHE_CACHE_SIZE_ENV_VAR
 DEFAULT_SCCACHE_CACHE_SIZE = shared_rust_tool_env.DEFAULT_SCCACHE_CACHE_SIZE
@@ -1081,8 +1081,8 @@ def build_recipe_fingerprint(
             (
                 REPO_ROOT / "scripts" / "codex_package" / "cargo.py",
                 REPO_ROOT / "scripts" / "codex_package" / "targets.py",
-                REPO_ROOT / "scripts" / "rust_tool_env.py",
-                REPO_ROOT / "scripts" / "common-rust-env.ps1",
+                REPO_ROOT / "scripts" / "build" / "rust_tool_env.py",
+                REPO_ROOT / "scripts" / "build" / "common-rust-env.ps1",
             )
         ),
         "profile_config": files_fingerprint(

@@ -13,6 +13,9 @@ use codex_tools::ToolExecutor;
 use codex_tools::ToolOutput;
 use codex_tools::ToolOutputOutcome;
 
+#[path = "workspace_admission_tests.rs"]
+mod workspace_admission_tests;
+
 // Controlled nested results cross the real JS runtime, broker and tool router.
 // Tests below never manufacture packet entries or required-terminal metadata.
 struct PacketTestTool {
@@ -175,7 +178,28 @@ impl PacketRuntime {
     }
 
     async fn with_nested_runtime(nested: Arc<dyn crate::tools::registry::CoreToolRuntime>) -> Self {
+        Self::with_nested_runtimes(vec![nested]).await
+    }
+
+    async fn with_nested_runtimes(nested: Vec<Arc<dyn crate::tools::registry::CoreToolRuntime>>) -> Self {
+        Self::with_nested_runtimes_in_workspace(nested, None).await
+    }
+
+    async fn with_nested_runtimes_in_workspace(
+        nested: Vec<Arc<dyn crate::tools::registry::CoreToolRuntime>>,
+        workspace: Option<&std::path::Path>,
+    ) -> Self {
         let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+        if let Some(workspace) = workspace {
+            Arc::make_mut(&mut turn.config).cwd =
+                codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace).unwrap();
+            turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+            turn.environments.turn_environments = vec![crate::session::turn_context::TurnEnvironment::new(
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+                Arc::new(codex_exec_server::Environment::default_for_tests()),
+                codex_utils_path_uri::PathUri::from_host_native_path(workspace).unwrap(), None,
+            )];
+        }
         session.services.code_mode_service = super::CodeModeService::new(Arc::new(
             codex_code_mode::InProcessCodeModeSessionProvider,
         ));
@@ -183,12 +207,12 @@ impl PacketRuntime {
         let session = Arc::new(session);
         let execute = super::execute_handler::CodeModeExecuteHandler::new(
             super::execute_spec::create_code_mode_tool(false, false, &[], &[]),
-            vec![nested.spec()],
+            nested.iter().map(|tool| tool.spec()).collect(),
             Vec::new(),
         )
         .unwrap();
         let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
-            crate::tools::registry::ToolRegistry::from_tools([nested]),
+            crate::tools::registry::ToolRegistry::from_tools(nested),
             Vec::new(),
         ));
         let step = crate::session::step_context::StepContext::for_test(Arc::new(turn))
@@ -318,6 +342,135 @@ async fn discarded_runtime_output_remains_machine_readable_after_projection() {
         64 * 1024 * 1024 + 1
     );
     runtime.finish().await;
+}
+
+#[derive(Default)]
+struct GateWaitProbe {
+    started: tokio_util::sync::CancellationToken,
+    release: tokio_util::sync::CancellationToken,
+    calls: std::sync::atomic::AtomicUsize,
+    completed: std::sync::atomic::AtomicBool,
+    call_id: std::sync::Mutex<Option<String>>,
+}
+
+struct GateWaitTool {
+    name: &'static str,
+    shared: bool,
+    probe: Arc<GateWaitProbe>,
+}
+
+impl ToolExecutor<ToolInvocation> for GateWaitTool {
+    fn tool_name(&self) -> codex_tools::ToolName { codex_tools::ToolName::plain(self.name) }
+    fn spec(&self) -> codex_tools::ToolSpec { PacketTestTool { name: self.name }.spec() }
+    fn supports_parallel_tool_calls(&self) -> bool { self.shared }
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move {
+            self.probe.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.probe.call_id.lock().unwrap() = Some(invocation.call_id);
+            self.probe.started.cancel();
+            tokio::select! {
+                _ = invocation.cancellation_token.cancelled() => {
+                    return Err(crate::FunctionCallError::RespondToModel("holder cancelled".into()));
+                }
+                _ = self.probe.release.cancelled() => {}
+            }
+            self.probe.completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::tools::context::boxed_tool_output(
+                FunctionToolOutput::from_text("sibling completed".into(), Some(true)),
+            ))
+        })
+    }
+}
+
+impl crate::tools::registry::CoreToolRuntime for GateWaitTool {}
+
+struct GateWaitControl(Vec<Arc<GateWaitProbe>>);
+
+impl ToolExecutor<ToolInvocation> for GateWaitControl {
+    fn tool_name(&self) -> codex_tools::ToolName { codex_tools::ToolName::plain("gate_control") }
+    fn spec(&self) -> codex_tools::ToolSpec { PacketTestTool { name: "gate_control" }.spec() }
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move {
+            let ToolPayload::Function { arguments } = invocation.payload else { panic!("function") };
+            let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+            for probe in &self.0 {
+                if args["release"] == true {
+                    probe.release.cancel();
+                } else {
+                    probe.started.cancelled().await;
+                }
+            }
+            Ok(crate::tools::context::boxed_tool_output(
+                FunctionToolOutput::from_text("ready".into(), Some(true)),
+            ))
+        })
+    }
+}
+
+impl crate::tools::registry::CoreToolRuntime for GateWaitControl {
+    fn delegates_workspace_admission(&self) -> bool { true }
+}
+
+// Exercise the real JS timeout wrapper, broker, dispatch and result conversion.
+// The holders are siblings in the SAME cell and outlive the queued call's hard
+// deadline. A rejected promise or wrapper timeout fails this cell before release.
+async fn check_nested_workspace_gate_timeout(shared: bool) {
+    let names = if shared { vec!["gate_reader_one", "gate_reader_two"] } else { vec!["gate_holder"] };
+    let probes: Vec<_> = names.iter().map(|_| Arc::new(GateWaitProbe::default())).collect();
+    let queued = Arc::new(GateWaitProbe::default());
+    queued.release.cancel(); // If incorrectly admitted, finish rather than hang.
+    let mut tools: Vec<Arc<dyn crate::tools::registry::CoreToolRuntime>> = names.iter()
+        .zip(&probes).map(|(name, probe)| Arc::new(GateWaitTool {
+            name, shared, probe: Arc::clone(probe),
+        }) as Arc<dyn crate::tools::registry::CoreToolRuntime>).collect();
+    tools.push(Arc::new(GateWaitTool { name: "gate_queued", shared: false, probe: Arc::clone(&queued) }));
+    tools.push(Arc::new(GateWaitControl(probes.clone())));
+    let runtime = PacketRuntime::with_nested_runtimes(tools).await;
+    let calls = names.iter().map(|name| format!("tools.{name}({{}})")).collect::<Vec<_>>().join(", ");
+    let output = runtime.exec(&format!(r#"
+        const holders = [{calls}];
+        await tools.gate_control({{}});
+        const started = Date.now();
+        const result = await tools.gate_queued({{}}, {{timeout_ms: 3500}});
+        const elapsed = Date.now() - started;
+        if (elapsed >= 3500) throw new Error('result missed outer deadline');
+        if (result.did_run !== false) throw new Error('queued handler ran');
+        text(result);
+        // Retain the holders past the queued call's OUTER deadline, not only
+        // its early gate bound. No wrapper cancellation may kill these siblings.
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, 3600 - elapsed)));
+        await tools.gate_control({{release: true}});
+        for (const holder of holders) text(await holder);
+    "#)).await;
+    let visible = packet_output_text(output.as_ref());
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success, "{visible}");
+    assert!(visible.contains("did not run"), "{visible}");
+    assert!(visible.contains("held for "), "{visible}");
+    assert!(!visible.contains("exceeded its"), "{visible}");
+    assert!(visible.contains(&format!("Gate holders: {}", names.len())), "{visible}");
+    assert!(visible.contains(if shared { "shared" } else { "exclusive" }), "{visible}");
+    assert_eq!(queued.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for (name, probe) in names.iter().zip(&probes) {
+        assert!(visible.contains(name), "{visible}");
+        assert!(visible.contains(probe.call_id.lock().unwrap().as_ref().unwrap()), "{visible}");
+        assert!(probe.completed.load(std::sync::atomic::Ordering::SeqCst), "sibling was cancelled");
+    }
+    assert_eq!(runtime.step.turn.turn_timing_state.lifecycle_context().parallel_gate_waiter_count, 0);
+    // A cancelled gate future must remove its queue claim; a later call runs.
+    let output = runtime.exec("text(await tools.gate_queued({}));").await;
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+    assert_eq!(queued.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn nested_workspace_gate_timeout_preserves_exclusive_holder_sibling() {
+    check_nested_workspace_gate_timeout(false).await;
+}
+
+#[tokio::test]
+async fn nested_workspace_gate_timeout_names_two_shared_holders() {
+    check_nested_workspace_gate_timeout(true).await;
 }
 
 fn packet_output_text(output: &dyn ToolOutput) -> String {
@@ -2288,6 +2441,71 @@ async fn verified10_paginated_recovery_delivers_in_one_cell_without_erasing_fail
                 .unwrap().contains("nested_work_failed_or_incomplete"));
         }
         runtime.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn exit_with_abandoned_tools_refuses_explicit_delivery() {
+    use crate::session::turn_execution::ContinuationDisposition;
+    use crate::session::turn_execution::SamplingRequestSettledState;
+    use crate::session::turn_execution::TurnExecutionControl;
+
+    for exit in [
+        "exit();",
+        "setTimeout(() => exit(), 0); await new Promise(() => {});",
+    ] {
+        for abandoned in [true, false] {
+            let runtime = PacketRuntime::new().await;
+            let nested = if abandoned {
+                "tools.read_tool_output({delay_ms: 60_000});"
+            } else {
+                "await tools.read_tool_output({});"
+            };
+            let source = format!(
+                "// @exec: {{\"deliver\":true}}\n{nested} text('exit output'); {exit} text('unreachable');"
+            );
+            let payload = ToolPayload::Custom { input: source.clone() };
+            let registration = runtime.signals.register_deterministic_tool_call(
+                &codex_tools::ToolName::plain("exec"), &payload, "packet-exec",
+            );
+            // Measure the real handler/runtime/dispatch path, excluding session
+            // fixture setup. This is a local elapsed fixture, not an E2E claim.
+            let started = Instant::now();
+            let output = runtime.exec(&source).await;
+            eprintln!("exit_delivery abandoned={abandoned} timer={} elapsed_us={}",
+                exit.starts_with("setTimeout"), started.elapsed().as_micros());
+            let visible = packet_output_text(output.as_ref());
+            assert!(visible.contains("exit output"), "{visible}");
+            assert!(!visible.contains("unreachable"), "{visible}");
+            assert_eq!(output.outcome_for_logging(), if abandoned {
+                ToolOutputOutcome::Failure
+            } else {
+                ToolOutputOutcome::Success
+            }, "{visible}");
+            if abandoned {
+                assert!(visible.contains("1 unawaited tool call(s)"), "{visible}");
+            }
+            let signal = output.sampling_request_signal();
+            assert_eq!(signal.as_ref()
+                .and_then(|signal| signal.get("explicit_completion_message"))
+                .and_then(serde_json::Value::as_str),
+                (!abandoned).then_some("exit output"));
+            runtime.signals.record_response_result(
+                registration.ordinal, output.outcome_context(), signal,
+                &output.to_response_item("packet-exec", &payload), false,
+            );
+            let mut control = TurnExecutionControl::new();
+            let baselines = control.baselines(0);
+            let decision = control.evaluate_convergence(&baselines, &runtime.signals,
+                &SamplingRequestSettledState {
+                    mutation_revision: 0,
+                    attributed_mutation_revision: 0,
+                    tool_exposure_revision: 0,
+                });
+            assert_eq!(decision.continuation == ContinuationDisposition::SurfaceExistingResult,
+                !abandoned, "abandoned work cannot surface partial text as a final answer");
+            runtime.finish().await;
+        }
     }
 }
 

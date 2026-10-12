@@ -767,11 +767,19 @@ impl ValidationCall {
 
 /// Host-only preparation for a complete local source read. It is not proof
 /// until the producer finishes. It does not verify workspace freshness.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceInspectionStart {
     pub(crate) attempt_id: AttemptId,
     pub(crate) path: String,
     pub(crate) workspace_id: String,
     pub(crate) epoch: u64,
+}
+
+impl SourceInspectionStart {
+    pub fn matches_attempt(&self, attempt_id: AttemptId) -> bool {
+        self.attempt_id == attempt_id
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

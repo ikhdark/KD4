@@ -33,6 +33,8 @@ pub struct AppDeclaration {
     pub name: String,
     pub connector_id: AppConnectorId,
     pub category: Option<String>,
+    /// The plugin declares that it cannot work without this app.
+    pub required: bool,
 }
 
 pub fn app_connector_ids_from_declarations<'a>(

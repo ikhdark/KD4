@@ -635,6 +635,19 @@ impl Deref for ProjectedResponseItems {
     }
 }
 
+/// Optional typed acquisition provenance extends the existing immutable origin;
+/// legacy three-element origins remain readable and never acquire typed proof.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ArtifactOrigin(String, u64, String,
+    #[serde(default, skip_serializing_if = "Option::is_none")] Option<SourceInspectionOrigin>);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SourceInspectionOrigin {
+    pub(crate) start: codex_agent_task_store::SourceInspectionStart,
+    pub(crate) environment_id: String,
+    pub(crate) canonical_uri: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ToolHistoryState {
     #[serde(default)]
@@ -673,7 +686,7 @@ pub(crate) struct ToolHistoryState {
     #[serde(default)]
     code_mode_nested_evidence: BTreeMap<String, BTreeMap<String, NestedWorkspaceEvidence>>,
     #[serde(default)]
-    internal_artifact_origins: BTreeMap<String, (String, u64, String)>,
+    internal_artifact_origins: BTreeMap<String, ArtifactOrigin>,
     /// Exact transitive ownership of compact overflow directories, in the
     /// existing history checkpoint/journal rather than a separate ledger.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -703,6 +716,9 @@ pub(crate) struct WorkspaceEvidenceObservation {
     source_dependencies: BTreeSet<SourceDependencyV1>,
     #[serde(default)]
     source_path_observations: Vec<SourcePathChangeObservation>,
+    // Recorded paths are attribution, not necessarily an exhaustive input set.
+    #[serde(default)]
+    source_scope_complete: bool,
     #[serde(default = "default_true")]
     source_dependencies_current: bool,
 }
@@ -766,6 +782,7 @@ impl WorkspaceEvidenceObservation {
             (bytes <= 4096).then_some(row)
         }).collect::<Vec<_>>();
         serde_json::json!({"omitted_dependencies":self.source_dependencies.len() - paths.len(),
+            "source_scope_complete":self.source_scope_complete,
             "dependencies":paths, "dependency_scope":if self.source_dependencies.is_empty() {"unknown"} else {"recorded"}})
     }
 
@@ -774,7 +791,8 @@ impl WorkspaceEvidenceObservation {
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: Option<&GitWorkspaceCache>,
     ) -> bool {
-        self.source_dependencies_current
+        self.source_scope_complete
+            && self.source_dependencies_current
             && workspace_identity.is_none_or(|identity| !identity.unavailable)
             && self
                 .revision
@@ -794,6 +812,8 @@ impl WorkspaceEvidenceObservation {
     }
 
     #[cfg(test)]
+    // Synthetic test observations explicitly promise that their supplied inputs
+    // are exhaustive. Runtime callers must use classification provenance below.
     pub(crate) fn from_response_item(
         revision: Option<WorkspaceEvidenceIdentity>,
         item: &ResponseItem,
@@ -804,7 +824,7 @@ impl WorkspaceEvidenceObservation {
             item,
             source_dependencies,
             /*source_dependencies_current*/ true,
-        )
+        ).map(|observation| observation.with_source_scope_complete(true))
     }
 
     pub(crate) fn from_response_item_with_freshness(
@@ -825,8 +845,14 @@ impl WorkspaceEvidenceObservation {
             revision,
             source_dependencies,
             source_path_observations: Vec::new(),
+            source_scope_complete: false,
             source_dependencies_current,
         })
+    }
+
+    pub(crate) fn with_source_scope_complete(mut self, complete: bool) -> Self {
+        self.source_scope_complete = complete;
+        self
     }
 
     pub(crate) fn with_source_path_observations(
@@ -880,6 +906,13 @@ pub(crate) enum ToolHistoryMutation {
         bytes: u64,
         sha256: String,
     },
+    BindSourceInspectionOrigin {
+        artifact_id: String,
+        call_id: String,
+        bytes: u64,
+        sha256: String,
+        source: SourceInspectionOrigin,
+    },
     RegisterCandidate {
         candidate: ToolHistoryCandidate,
     },
@@ -912,9 +945,17 @@ pub(crate) enum ToolHistoryMutation {
 impl ToolHistoryMutation {
     pub(crate) fn apply(&self, state: &mut ToolHistoryState) -> bool {
         match self {
+            Self::BindSourceInspectionOrigin { artifact_id, call_id, bytes, sha256, source } => {
+                let Some(origin) = state.internal_artifact_origins.get_mut(artifact_id) else { return false };
+                if &origin.0 != call_id || &origin.1 != bytes || &origin.2 != sha256
+                    || origin.3.is_some() || source.environment_id.is_empty() || source.canonical_uri.is_empty()
+                { return false; }
+                origin.3 = Some(source.clone());
+                true
+            }
             Self::RegisterArtifactDirectory { artifact_id, members } => {
                 if !state.internal_artifact_origins.get(artifact_id)
-                    .is_some_and(|(source, _, _)| source == "context:artifact_directory") {
+                    .is_some_and(|ArtifactOrigin(source, _, _, _)| source == "context:artifact_directory") {
                     return false;
                 }
                 state.artifact_directory_members.insert(artifact_id.clone(), members.clone())
@@ -951,7 +992,7 @@ impl ToolHistoryMutation {
                 }
                 state.internal_artifact_origins.insert(
                     artifact_id.clone(),
-                    (call_id.clone(), *bytes, sha256.clone()),
+                    ArtifactOrigin(call_id.clone(), *bytes, sha256.clone(), None),
                 );
                 state
                     .artifact_call_ids
@@ -1047,9 +1088,6 @@ fn collect_obtained_read_ranges(value: &serde_json::Value, size: u64, ranges: &m
                 && start <= end && end <= size
                 && (part["text"].as_str().is_some_and(|text| text.len() as u64 == end - start)
                     || (part["data_base64"].is_string()
-                        && part["exact_bytes"].as_u64() == Some(end - start))
-                    || (part["selector"]["kind"] == "json_pointer"
-                        && part.get("value").is_some()
                         && part["exact_bytes"].as_u64() == Some(end - start)))
             { ranges.push((start, end)); }
         }
@@ -1086,7 +1124,7 @@ pub(crate) fn compact_read_evidence(value: &serde_json::Value) -> serde_json::Va
 /// Factor only identical metadata. Per-call nested-current exceptions remain
 /// attached to their call; an identity is never promoted to dependency proof.
 fn factor_workspace_notices(mut notices: Vec<serde_json::Value>) -> serde_json::Value {
-    let keys = ["observed_revision", "reason", "reason_code", "qualification", "workspace_evidence_freshness", "historical_authenticity", "stale_workspace_evidence", "valid_for_current_workspace"];
+    let keys = ["reason", "reason_code", "workspace_evidence_freshness", "historical_authenticity", "stale_workspace_evidence", "valid_for_current_workspace"];
     let metadata = notices.iter().map(|notice| {
         let mut shared = serde_json::Map::new();
         for key in keys { if let Some(value) = notice.get(key) { shared.insert(key.into(), value.clone()); } }
@@ -1376,6 +1414,7 @@ impl ToolHistoryState {
         }
         let observation = self.workspace_evidence.get(call_id)?;
         if !observation.successful
+            || !observation.source_scope_complete
             || !observation.source_dependencies_current
             || observation.output_sha256 != sha256(output.as_bytes())
             || observation.source_path_observations.is_empty()
@@ -1565,7 +1604,7 @@ impl ToolHistoryState {
 
         // Use the same precedence as resume: explicit observation provenance
         // wins over candidates sharing the immutable byte artifact.
-        if let Some((origin, _, _)) = self.internal_artifact_origins.get(&artifact_id) {
+        if let Some(ArtifactOrigin(origin, _, _, _)) = self.internal_artifact_origins.get(&artifact_id) {
             self.artifact_call_ids.insert(artifact_id, origin.clone());
         } else {
             self.artifact_call_ids.entry(artifact_id)
@@ -1587,7 +1626,7 @@ impl ToolHistoryState {
         self.artifact_call_ids = self
             .internal_artifact_origins
             .iter()
-            .map(|(id, (call_id, _, _))| (id.clone(), call_id.clone()))
+            .map(|(id, ArtifactOrigin(call_id, _, _, _))| (id.clone(), call_id.clone()))
             .collect();
         for (call_id, candidate) in &self.candidates {
             self.artifact_call_ids
@@ -1601,7 +1640,7 @@ impl ToolHistoryState {
         let origin = self
             .internal_artifact_origins
             .get(artifact_id)
-            .map(|(call_id, _, _)| call_id)
+            .map(|ArtifactOrigin(call_id, _, _, _)| call_id)
             .or_else(|| {
                 self.candidates
                     .iter()
@@ -1674,7 +1713,8 @@ impl ToolHistoryState {
             if !observation.source_dependencies_current {
                 continue;
             }
-            let affected = observation.source_dependencies.is_empty()
+            let affected = !observation.source_scope_complete
+                || observation.source_dependencies.is_empty()
                 || normalized_affected.as_ref().is_none_or(|paths| {
                     observation
                         .source_dependencies
@@ -2154,7 +2194,7 @@ impl ToolHistoryState {
             {
                 return true;
             }
-            observation.revision.as_ref().is_some_and(|identity| {
+            observation.source_scope_complete && observation.revision.as_ref().is_some_and(|identity| {
                 !identity.unavailable && identity.repository_root.is_some()
             }) && !observation.source_dependencies.is_empty()
                 && observation.source_path_observations.len() == observation.source_dependencies.len()
@@ -2238,7 +2278,8 @@ impl ToolHistoryState {
                 }
                 let revision_matches = observation.is_some_and(|observation| {
                     observation.is_current(workspace_identity, git_workspace)
-                });
+                }) && nested.is_none_or(|results| results.values().all(|result|
+                    result.observation.is_current(workspace_identity, git_workspace)));
                 let output_matches = origin_call_id != call_id
                     || observation.is_some_and(|observation| {
                         observation.output_sha256 == sha256(output.as_bytes())
@@ -2341,9 +2382,15 @@ impl ToolHistoryState {
                 let known_source_change = git_workspace.is_some_and(|cache| observation.is_some_and(|observation|
                     observation.source_path_observations.iter().any(|path|
                         cache.source_path_freshness(path) == crate::git_workspace::SourceFreshness::Changed)));
+                // source_scope marks a changed path when one is known; the generic
+                // text would deny what the same record establishes.
+                let reason = if known_source_change && reason_code == "source_dependencies_invalidated" {
+                    "an observed source dependency changed after capture (marked in source_scope); current workspace freshness is unverified"
+                } else {
+                    reason
+                };
                 let mut notice = serde_json::json!({
                     "call_id": call_id,
-                    "qualification": if known_source_change { "Observed dependency change" } else { "Currentness unknown; no dependency change established" },
                     "historical_authenticity": if observation.is_some() && output_matches { "authenticated" } else { "unverified" },
                     "rerun": {
                         "instruction": "This notice is not a request to rerun tests or builds. Revalidate only if current evidence is essential to the task, using the cheapest scoped read or check with supported arguments; otherwise report the affected claim as unverified. Do not add recovery-only arguments. Do not replay writes or restart a live command; continue its existing session. Reading a retained artifact recovers historical bytes, not current workspace evidence."
@@ -2355,7 +2402,6 @@ impl ToolHistoryState {
                     // this field distinguishes mutation from missing freshness.
                     "workspace_evidence_freshness": if known_source_change { "changed" } else { "unknown" },
                     "valid_for_current_workspace": false,
-                    "observed_revision": observation.and_then(|observation| observation.revision.as_ref()),
                     "if_rerun_unavailable": "Report the affected claim as unverified; this result does not validate the current workspace.",
                 });
                 // Preserve useful history only when its captured bytes are
@@ -2550,7 +2596,7 @@ impl ToolHistoryState {
         let serialized = serde_json::to_string(items).unwrap_or_default();
         // Legacy directories are hydrated on load. If exact membership could
         // not be read/authenticated, do not guess and delete their dependencies.
-        if self.internal_artifact_origins.iter().any(|(id, (source, _, _))|
+        if self.internal_artifact_origins.iter().any(|(id, ArtifactOrigin(source, _, _, _))|
             source == "context:artifact_directory" && serialized.contains(id)
                 && !self.artifact_directory_members.contains_key(id)) {
             return;
@@ -2561,7 +2607,7 @@ impl ToolHistoryState {
             .filter(|id| serialized.contains(id.as_str())).cloned().collect::<BTreeSet<_>>();
         let mut pending = artifacts.iter().cloned().collect::<Vec<_>>();
         while let Some(id) = pending.pop() {
-            if self.internal_artifact_origins.get(&id).is_some_and(|(source, _, _)| source == "context:artifact_directory")
+            if self.internal_artifact_origins.get(&id).is_some_and(|ArtifactOrigin(source, _, _, _)| source == "context:artifact_directory")
                 && !self.artifact_directory_members.contains_key(&id) {
                 return;
             }
@@ -2600,7 +2646,7 @@ impl ToolHistoryState {
         live.extend(artifacts.iter().filter_map(|id| self.artifact_call_ids.get(id)).cloned());
         live.extend(self.candidates.values().filter(|candidate| artifacts.contains(&candidate.artifact_id))
             .map(|candidate| candidate.call_id.clone()));
-        for (artifact_id, (call_id, _, _)) in &self.internal_artifact_origins {
+        for (artifact_id, ArtifactOrigin(call_id, _, _, _)) in &self.internal_artifact_origins {
             if serialized.contains(artifact_id) {
                 live.insert(call_id.clone());
             }
@@ -2618,7 +2664,7 @@ impl ToolHistoryState {
         let nested_outputs = self.code_mode_nested_evidence.iter()
             .flat_map(|(parent, results)| results.iter().filter(move |(call, _)| live_calls.contains(parent) || live_calls.contains(*call)))
             .map(|(_, result)| result.output.as_str()).collect::<Vec<_>>().join("\n");
-        self.internal_artifact_origins.retain(|id, (call_id, _, _)|
+        self.internal_artifact_origins.retain(|id, ArtifactOrigin(call_id, _, _, _)|
             artifacts.contains(id) || nested_outputs.contains(id)
                 || (!call_id.starts_with("context:") && live.contains(call_id)));
         self.artifact_directory_members.retain(|id, _| self.internal_artifact_origins.contains_key(id));
@@ -2704,7 +2750,7 @@ impl ToolHistoryState {
             .chain(
                 self.internal_artifact_origins
                     .iter()
-                    .map(|(id, (_, bytes, sha))| (id.clone(), (*bytes, sha.clone()))),
+                    .map(|(id, ArtifactOrigin(_, bytes, sha, _))| (id.clone(), (*bytes, sha.clone()))),
             )
             .collect()
     }
@@ -2715,6 +2761,33 @@ impl ToolHistoryState {
                 && self.artifact_call_ids.get(&id).is_some_and(|origin| origin == call_id))
                 .then_some(id)
         })
+    }
+
+    pub(crate) fn completed_source_inspection(
+        &self, artifact_id: &str, bytes: u64, sha256: &str,
+        attempt_id: codex_agent_task_store::AttemptId,
+    ) -> Option<(String, SourceInspectionOrigin)> {
+        let ArtifactOrigin(call_id, size, hash, source) = self.internal_artifact_origins.get(artifact_id)?;
+        let source = source.as_ref()?;
+        if *size != bytes || hash != sha256 || !source.start.matches_attempt(attempt_id)
+            || self.artifact_call_ids.get(artifact_id) != Some(call_id)
+            || self.workspace_evidence.get(call_id).is_some_and(|evidence| !evidence.source_dependencies_current)
+        { return None; }
+        // Reuse the existing bounded exact-recovery ledger. Storage, parsed JSON
+        // values, missing history and a requested cursor are not delivered bytes.
+        let mut ranges = self.recovered_ranges.get(call_id)?.iter().filter_map(|selector| {
+            if selector["kind"] != "bytes" { return None; }
+            let start = selector["start"].as_u64()?;
+            let end = selector["end"].as_u64()?;
+            (start <= end && end <= bytes).then_some((start, end))
+        }).collect::<Vec<_>>();
+        ranges.sort_unstable();
+        let mut covered = 0;
+        for (start, end) in ranges {
+            if start > covered { return None; }
+            covered = covered.max(end);
+        }
+        (covered == bytes).then(|| (call_id.clone(), source.clone()))
     }
 
     // A code-mode carrier records no dependencies of its own; its workspace
@@ -2762,8 +2835,8 @@ impl ToolHistoryState {
         // Every member still has its ordinary history owner. Flatten prior
         // directories instead of chaining superseded recovery artifacts.
         pins.extend(self.internal_artifact_origins.iter()
-            .filter(|(_, (call_id, _, _))| call_id != "context:artifact_directory")
-            .map(|(id, (call_id, bytes, sha))|
+            .filter(|(_, ArtifactOrigin(call_id, _, _, _))| call_id != "context:artifact_directory")
+            .map(|(id, ArtifactOrigin(call_id, bytes, sha, _))|
             serde_json::json!({"artifact_id":id,"call_id":call_id,"bytes":bytes,"sha256":sha})));
         serde_json::Value::Array(pins)
     }
@@ -2793,7 +2866,7 @@ impl ToolHistoryState {
             self.internal_artifact_origins
                 .iter()
                 .filter(|(id, _)| serialized.contains(id.as_str()) && seen.insert((*id).clone()))
-                .map(|(id, (call_id, bytes, sha))| {
+                .map(|(id, ArtifactOrigin(call_id, bytes, sha, _))| {
                     let mut pin = serde_json::json!({
                         "artifact_id": id, "call_id": call_id, "bytes": bytes, "sha256": sha,
                     });
@@ -2865,7 +2938,7 @@ impl ToolHistoryState {
                 && expected.get(&candidate.artifact_id) == Some(&reference)
         });
         self.internal_artifact_origins
-            .retain(|id, (_, bytes, sha)| {
+            .retain(|id, ArtifactOrigin(_, bytes, sha, _)| {
                 live.contains(id) && expected.get(id) == Some(&(*bytes, sha.clone()))
             });
         self.artifact_directory_members.retain(|id, _| self.internal_artifact_origins.contains_key(id));
@@ -3266,9 +3339,9 @@ pub(crate) async fn load_tool_history_state_for_fork(
 
 async fn hydrate_legacy_artifact_directories(home: &Path, thread: &str, state: &mut ToolHistoryState) {
     let directories = state.internal_artifact_origins.iter()
-        .filter(|(id, (source, _, _))| source == "context:artifact_directory"
+        .filter(|(id, ArtifactOrigin(source, _, _, _))| source == "context:artifact_directory"
             && !state.artifact_directory_members.contains_key(*id))
-        .map(|(id, (_, bytes, sha))| (id.clone(), *bytes, sha.clone())).collect::<Vec<_>>();
+        .map(|(id, ArtifactOrigin(_, bytes, sha, _))| (id.clone(), *bytes, sha.clone())).collect::<Vec<_>>();
     for (id, expected_bytes, expected_sha) in directories {
         let Ok(bytes) = crate::tools::command_output_artifact::read_complete_canonical_snapshot(
             home, thread, &id, usize::try_from(expected_bytes).unwrap_or(0),
@@ -3454,7 +3527,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         reminted_candidates.insert(call_id, candidate);
     }
     let mut internal_artifact_origins = BTreeMap::new();
-    for (id, (call_id, bytes, sha)) in state.internal_artifact_origins {
+    for (id, ArtifactOrigin(call_id, bytes, sha, _)) in state.internal_artifact_origins {
         match remint_tool_history_artifact_for_thread(
             codex_home,
             source_thread_id,
@@ -3481,7 +3554,8 @@ pub(crate) async fn remint_tool_history_state_for_fork(
                         }
                     }
                 }
-                internal_artifact_origins.insert(reminted, (call_id, bytes, sha));
+                // A fork is a different assignment/consumer, not new acquisition.
+                internal_artifact_origins.insert(reminted, ArtifactOrigin(call_id, bytes, sha, None));
             }
             Err(err) => {
                 tracing::warn!(%err, "failed to remint internal artifact");
@@ -4399,6 +4473,7 @@ pub(crate) struct WorkspaceCallClassification {
     pub(crate) observes_workspace: bool,
     pub(crate) workspace_cwd: PathBuf,
     pub(crate) source_dependencies: BTreeSet<SourceDependencyV1>,
+    pub(crate) source_scope_complete: bool,
 }
 
 pub(crate) fn classify_workspace_tool_call(
@@ -4411,6 +4486,7 @@ pub(crate) fn classify_workspace_tool_call(
             observes_workspace: false,
             workspace_cwd: default_cwd.to_path_buf(),
             source_dependencies: BTreeSet::new(),
+            source_scope_complete: false,
         };
     }
     let arguments = workspace_call_arguments(payload);
@@ -4420,13 +4496,16 @@ pub(crate) fn classify_workspace_tool_call(
         || default_cwd.to_path_buf(),
         |arguments| workspace_cwd_from_arguments(arguments, default_cwd),
     );
+    let mut source_scope_complete = true;
     let source_dependencies = arguments.as_ref().map_or_else(BTreeSet::new, |arguments| {
-        source_dependencies_from_arguments(tool_identity, arguments, &workspace_cwd)
+        source_dependencies_from_arguments(tool_identity, arguments, &workspace_cwd, &mut source_scope_complete)
     });
+    source_scope_complete &= !source_dependencies.is_empty();
     WorkspaceCallClassification {
         observes_workspace,
         workspace_cwd,
         source_dependencies,
+        source_scope_complete,
     }
 }
 
@@ -4566,13 +4645,14 @@ pub(crate) fn source_dependencies_for_tool_call_with_parsed_arguments(
         return BTreeSet::new();
     };
     let cwd = workspace_cwd_from_arguments(arguments, default_cwd);
-    source_dependencies_from_arguments(tool_identity, arguments, &cwd)
+    source_dependencies_from_arguments(tool_identity, arguments, &cwd, &mut false)
 }
 
 fn source_dependencies_from_arguments(
     tool_identity: &str,
     arguments: &serde_json::Value,
     cwd: &Path,
+    source_scope_complete: &mut bool,
 ) -> BTreeSet<SourceDependencyV1> {
     if matches!(tool_identity, "read_file" | "list_files") {
         let Some(path) = arguments.get("path")
@@ -4608,6 +4688,7 @@ fn source_dependencies_from_arguments(
             .unwrap_or_default();
     }
     if tool_identity == "cargo_test" {
+        *source_scope_complete = false;
         return cargo_test_dependencies(arguments, cwd);
     }
     if let Some((command, shell_type)) = dependency_search_command(arguments) {
@@ -4637,7 +4718,7 @@ fn source_dependencies_from_arguments(
                     }) {
                         return BTreeSet::new();
                     }
-                    match plain_command_source_dependencies(&commands, index, shell_type, cwd) {
+                    match plain_command_source_dependencies(&commands, index, shell_type, cwd, source_scope_complete) {
                         PlainCommandDependencies::Transparent => {}
                         PlainCommandDependencies::Scoped(scoped) => dependencies.extend(scoped),
                         PlainCommandDependencies::Unknown => return BTreeSet::new(),
@@ -4645,14 +4726,17 @@ fn source_dependencies_from_arguments(
                 }
                 return dependencies;
             }
-            Err(_) => return BTreeSet::from([SourceDependencyV1::new(cwd, true)]),
+            Err(_) => {
+                *source_scope_complete = false;
+                return BTreeSet::from([SourceDependencyV1::new(cwd, true)]);
+            }
             Ok(_) => {}
         }
     }
     let Some(command) = dependency_command(arguments) else {
         return BTreeSet::new();
     };
-    dependencies_for_command(&command, cwd)
+    dependencies_for_command(&command, cwd, source_scope_complete)
 }
 
 /// Package scope for attribution only. Do not use the runner's broad provenance
@@ -4789,6 +4873,9 @@ fn cargo_configuration_dependencies(
 fn cargo_has_local_source_overrides(value: &toml::Value) -> bool {
     value.get("paths").is_some_and(|paths|
         paths.as_array().is_none_or(|paths| !paths.is_empty()))
+        || value.get("source").and_then(toml::Value::as_table).into_iter()
+            .flat_map(|sources| sources.values())
+            .any(|source| source.get("directory").is_some() || source.get("local-registry").is_some())
         || value.get("patch").and_then(toml::Value::as_table).into_iter()
             .flat_map(|sources| sources.values()).filter_map(toml::Value::as_table)
             .flat_map(|dependencies| dependencies.values())
@@ -5365,16 +5452,20 @@ fn shell_type_from_name(value: &str) -> Option<crate::shell::ShellType> {
     }
 }
 
-fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDependencyV1> {
+fn dependencies_for_command(command: &[String], cwd: &Path, source_scope_complete: &mut bool) -> BTreeSet<SourceDependencyV1> {
     let Some(program) = command.first().map(|value| command_basename(value)) else {
         return BTreeSet::new();
     };
     if program == "cargo" {
+        // Manifest edges omit include_str!/include!, build-script and runtime
+        // inputs. Keep their useful paths without certifying complete coverage.
+        *source_scope_complete = false;
         return cargo_argv_dependencies(&command[1..], cwd);
     }
     if matches!(program.as_str(), "python" | "python3" | "py" | "just") {
         let runners = crate::validation::repository_runners(cwd);
         if let Some(scope) = runner_source_dependencies(command, cwd, &runners) {
+            *source_scope_complete = false;
             return scope;
         }
     }
@@ -5394,6 +5485,7 @@ fn dependencies_for_command(command: &[String], cwd: &Path) -> BTreeSet<SourceDe
         || (matches!(program.as_str(), "npm" | "pnpm" | "yarn")
             && lower.iter().skip(1).any(|arg| arg == "test"));
     if is_test {
+        *source_scope_complete = false;
         // A runner launched in a subdirectory still loads sibling packages and
         // root configuration; scope its result to the enclosing repository.
         let root = codex_git_utils::get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
@@ -5527,9 +5619,26 @@ fn runner_source_dependencies(
             }
         }
     }
-    let packages = targets.into_iter().map(|target|
-        parsed.get("targets")?.get(target)?.get("package")?.as_str())
-        .collect::<Option<BTreeSet<_>>>()?;
+    let mut packages = BTreeSet::new();
+    for target in targets {
+        let target = parsed.get("targets")?.get(target)?;
+        packages.insert(target.get("package")?.as_str()?);
+        // Helper executables are runtime inputs even when they are not Cargo
+        // dependencies of the test crate. A target filter can narrow this set,
+        // but cannot make an undeclared partial set authoritative.
+        let mut helpers = BTreeSet::new();
+        if let Some(names) = target.get("helpers") {
+            for name in names.as_array()? { helpers.insert(name.as_str()?); }
+        }
+        if let Some(prefixes) = target.get("helpers_by_test_prefix") {
+            for names in prefixes.as_table()?.values() {
+                for name in names.as_array()? { helpers.insert(name.as_str()?); }
+            }
+        }
+        for helper in helpers {
+            packages.insert(parsed.get("helpers")?.get(helper)?.get("package")?.as_str()?);
+        }
+    }
     let mut dependencies = BTreeSet::new();
     for package in packages {
         let scope = cargo_test_dependencies(&serde_json::json!({"package": package}), &root.join("codex-rs"));
@@ -5538,7 +5647,9 @@ fn runner_source_dependencies(
     }
     dependencies.insert(SourceDependencyV1::new(&manifest, false));
     dependencies.insert(SourceDependencyV1::new(&root.join(".codex/test-runners.json"), false));
-    dependencies.insert(SourceDependencyV1::new(&root.join("scripts/rust_test_runner.py"), false));
+    // The runner imports sibling support modules and can load further helpers.
+    // Watch their owning tree rather than maintaining an incomplete import list.
+    dependencies.insert(SourceDependencyV1::new(&root.join("scripts"), true));
     Some(dependencies)
 }
 
@@ -5639,6 +5750,7 @@ fn plain_command_source_dependencies(
     index: usize,
     shell_type: Option<crate::shell::ShellType>,
     cwd: &Path,
+    source_scope_complete: &mut bool,
 ) -> PlainCommandDependencies {
     let command = &commands[index];
     let Some(program) = command.first().map(|value| command_basename(value)) else {
@@ -5647,11 +5759,12 @@ fn plain_command_source_dependencies(
     let arguments = &command[1..];
     let powershell = matches!(shell_type, Some(crate::shell::ShellType::PowerShell));
     if matches!(program.as_str(), "rg" | "rga" | "ripgrep") {
-        return match crate::tools::handlers::command_search::rg_search_path_operands(
-            &commands[index..=index],
-        ) {
-            Some(scopes) => {
-                PlainCommandDependencies::Scoped(dependencies_for_search_scopes(scopes, cwd))
+        return match crate::tools::handlers::command_search::rg_search_dependency_paths(command, cwd) {
+            Some(paths) => {
+                PlainCommandDependencies::Scoped(paths.into_iter().map(|path| {
+                    let recursive = path.is_dir() || path.extension().is_none();
+                    SourceDependencyV1::new(&path, recursive)
+                }).collect())
             }
             // `rg --version` and other non-search invocations read nothing.
             None => PlainCommandDependencies::Transparent,
@@ -5684,10 +5797,31 @@ fn plain_command_source_dependencies(
         // Without a path the cmdlet filters its pipeline input.
         .unwrap_or(PlainCommandDependencies::Transparent),
         "git" if crate::turn_diff_tracker::command_is_read_only_git(command) => {
-            PlainCommandDependencies::Scoped(BTreeSet::from([SourceDependencyV1::new(cwd, true)]))
+            // Read-only is not necessarily local: remote refs cannot be
+            // certified by any worktree or Git-directory watch.
+            if command.iter().any(|arg| arg == "ls-remote") {
+                return PlainCommandDependencies::Unknown;
+            }
+            let Some(root) = codex_git_utils::get_git_repo_root(cwd)
+                .and_then(|root| codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(root).ok())
+            else {
+                return PlainCommandDependencies::Unknown;
+            };
+            let Some((git_dir, common_dir, _)) = crate::git_workspace::resolve_git_dirs(&root) else {
+                return PlainCommandDependencies::Unknown;
+            };
+            // A command launched below the root can observe siblings. Git's
+            // metadata events deliberately do not stale recursive worktree
+            // watches, so retain explicit watches for linked worktrees too.
+            PlainCommandDependencies::Scoped(BTreeSet::from([
+                SourceDependencyV1::new(root.as_path(), true),
+                SourceDependencyV1::new(root.join(".git").as_path(), true),
+                SourceDependencyV1::new(&git_dir, true),
+                SourceDependencyV1::new(&common_dir, true),
+            ]))
         }
         _ => {
-            let dependencies = dependencies_for_command(command, cwd);
+            let dependencies = dependencies_for_command(command, cwd, source_scope_complete);
             if dependencies.is_empty() {
                 PlainCommandDependencies::Unknown
             } else {

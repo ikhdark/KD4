@@ -174,7 +174,7 @@ pub fn normalize_request_user_input_args(
 pub fn request_user_input_tool_description(available_modes: &[ModeKind]) -> String {
     let allowed_modes = format_allowed_modes(available_modes);
     format!(
-        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. This tool is only available in {allowed_modes}."
+        "Request user input for one to three short questions and wait for the response. Use this only for conflicting requirements or a decision that is the user's alone and that evidence cannot settle. This tool is only available in {allowed_modes}."
     )
 }
 

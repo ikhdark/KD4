@@ -244,10 +244,10 @@ fn request_user_input_unavailable_messages_respect_default_mode_feature_flag() {
 fn request_user_input_tool_description_mentions_available_modes() {
     assert_eq!(
         request_user_input_tool_description(&default_available_modes()),
-        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. This tool is only available in Default or Plan mode.".to_string()
+        "Request user input for one to three short questions and wait for the response. Use this only for conflicting requirements or a decision that is the user's alone and that evidence cannot settle. This tool is only available in Default or Plan mode.".to_string()
     );
     assert_eq!(
         request_user_input_tool_description(&default_mode_disabled_available_modes()),
-        "Request user input for one to three short questions and wait for the response. Use this when the user prompt leaves meaningful uncertainty about intent, scope, constraints, or preferences; ask early instead of spending turns trying to infer context only the user can provide. This tool is only available in Plan mode.".to_string()
+        "Request user input for one to three short questions and wait for the response. Use this only for conflicting requirements or a decision that is the user's alone and that evidence cannot settle. This tool is only available in Plan mode.".to_string()
     );
 }

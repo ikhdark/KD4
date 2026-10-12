@@ -253,7 +253,20 @@ struct Inner<D: SessionRuntimeDelegate> {
     shutdown_token: CancellationToken,
     delegate: Arc<D>,
     task_failure_handler: Option<TaskFailureHandler>,
+    cell_id_namespace: uuid::Uuid,
     next_cell_id: AtomicU64,
+}
+
+// Snapshot counters remain monotonic across restarts, while the incarnation
+// makes even non-durable handles unambiguous across independent runtimes.
+fn cell_id_sequence(id: &str) -> Option<u64> {
+    let sequence = if let Some((namespace, sequence)) = id.split_once('/') {
+        uuid::Uuid::parse_str(namespace).ok()?;
+        sequence
+    } else {
+        id // Legacy snapshots used bare numeric identifiers.
+    };
+    sequence.parse().ok()
 }
 
 impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
@@ -288,6 +301,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 shutdown_token: CancellationToken::new(),
                 delegate,
                 task_failure_handler,
+                cell_id_namespace: uuid::Uuid::new_v4(),
                 next_cell_id: AtomicU64::new(1),
             }),
         }
@@ -371,7 +385,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         // Only IDs restored from this snapshot may cross a host generation.
         // An absent snapshot must not alias a freshly executed, non-durable ID.
         if !self.inner.durable_state.get().is_some_and(|state|
-            cell_id.as_str().parse::<u64>().is_ok_and(|id| id < state.first_cell_id))
+            cell_id_sequence(cell_id.as_str()).is_some_and(|id| id < state.first_cell_id))
         {
             return Err(Error::MissingCell(cell_id.clone()));
         }
@@ -419,7 +433,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 }
                 next_cell_id.checked_add(1)
             })
-            .map(|cell_id| CellId::new(cell_id.to_string()))
+            .map(|cell_id| CellId::new(format!("{}/{cell_id}", self.inner.cell_id_namespace)))
             .map_err(|_| Error::CellIdSpaceExhausted)
     }
 
@@ -478,7 +492,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let allocated_before = self.inner.next_cell_id.load(Ordering::Acquire);
             if completed.iter().any(|(id, _)| {
-                id.parse::<u64>().is_ok_and(|id| id < allocated_before)
+                cell_id_sequence(id).is_some_and(|id| id < allocated_before)
             }) {
                 return Err(Error::Runtime(
                     "durable cell IDs overlap cells already observed in this runtime; enable persistence before starting cells; no live state was replaced".into()

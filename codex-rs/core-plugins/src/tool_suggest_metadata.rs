@@ -321,6 +321,7 @@ mod tests {
                 name: "app".to_string(),
                 connector_id: AppConnectorId("connector-app".to_string()),
                 category: None,
+                required: false,
             }],
             skill_inventory: None,
         };

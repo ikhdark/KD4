@@ -124,7 +124,7 @@ impl ApplyPatchRuntime {
         }
 
         let coordinator = ctx.session.services.agent_control.task_coordinator();
-        let binding = coordinator.binding_for_source(&ctx.turn.session_source);
+        let binding = coordinator.binding_for_turn(&ctx.turn);
         if let Some(binding) = &binding {
             let authorization = coordinator
                 .get_agent_task_authorization(binding.assignment_id)

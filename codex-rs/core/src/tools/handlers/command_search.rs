@@ -584,6 +584,35 @@ pub(crate) fn search_path_normalization_count() -> usize {
     SEARCH_PATH_NORMALIZATION_COUNT.with(std::cell::Cell::get)
 }
 
+/// Files affecting a search result, not merely the searched path operands.
+/// Keep option inputs and ancestor ignore rules in the same existing scope
+/// owner used by miss invalidation; preflight still consumes operands alone.
+pub(crate) fn rg_search_dependency_paths(argv: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
+    let roles = RgArgumentRoles::parse(argv);
+    if !roles.searches {
+        return None;
+    }
+    let targets = if roles.path_indices.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        roles.path_indices.iter().map(|index| cwd.join(&argv[*index])).collect()
+    };
+    let inputs = roles.input_files.iter().map(|path| cwd.join(path)).collect::<Vec<_>>();
+    // Explicit file operands are searched even when ignored. Directory walks
+    // additionally depend on the ignore files that decide their membership.
+    let directories = targets.iter().filter(|path| path.is_dir() || (!path.is_file() && path.extension().is_none()))
+        .cloned().collect::<Vec<_>>();
+    if directories.is_empty() {
+        return Some(targets.into_iter().chain(inputs).collect());
+    }
+    let root = codex_git_utils::get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let mut paths = search_state_paths(&directories, &inputs, &root);
+    paths.extend(targets);
+    paths.sort_unstable();
+    paths.dedup();
+    Some(paths)
+}
+
 pub(crate) fn rg_search_path_operands(commands: &[Vec<String>]) -> Option<Vec<String>> {
     let mut saw_search = false;
     let mut operands = Vec::new();

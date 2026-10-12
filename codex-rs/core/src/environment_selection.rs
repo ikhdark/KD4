@@ -441,6 +441,10 @@ impl TurnEnvironmentSnapshot {
 }
 
 #[cfg(test)]
+#[path = "environment_comprehension_tests.rs"]
+mod comprehension_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

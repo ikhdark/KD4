@@ -332,8 +332,9 @@ async fn run_owned_command(
         Ok(Ok(status)) => {
             let exit_code = status.code();
             // A successful hook's stdout can be structured JSON, so never parse a
-            // partial document as if it were complete. Exit-code-2 denials use
-            // stderr and can safely retain the bounded head/tail preview.
+            // partial document as if it were complete. Exit-code-2 stderr can
+            // also be instructions, so preserve the denial but never expose a
+            // partial head/tail as an actionable continuation.
             let stdout_exceeded_limit =
                 stdout_is_protocol && exit_code == Some(0) && stdout_capture.was_truncated();
             let error = stdout_exceeded_limit.then(|| {
@@ -341,13 +342,23 @@ async fn run_owned_command(
                     "hook stdout exceeded the {HOOK_STREAM_CAPTURE_MAX_BYTES}-byte capture limit"
                 )
             });
+            let stderr = if stdout_is_protocol
+                && exit_code == Some(2)
+                && stderr_capture.was_truncated()
+            {
+                format!(
+                    "Hook blocked execution, but its instruction is incomplete: stderr exceeded the {HOOK_STREAM_CAPTURE_MAX_BYTES}-byte capture limit. The entire instruction was omitted; no complete recovery source is available. Do not automatically replay the hook."
+                )
+            } else {
+                stderr_capture.into_string()
+            };
             finish_command_run(
                 started_at,
                 started,
                 CommandRunCompletion {
                     exit_code,
                     stdout: stdout_capture.into_string(),
-                    stderr: stderr_capture.into_string(),
+                    stderr,
                     error,
                     outcome: if stdout_exceeded_limit {
                         "output_limit"

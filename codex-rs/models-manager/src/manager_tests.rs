@@ -1296,6 +1296,30 @@ c2ln",
 }
 
 #[tokio::test]
+async fn static_manager_fills_a_prompt_the_catalog_leaves_empty() {
+    // The bundled file itself, before policy: its local-policy models carry no prompt.
+    let catalog: ModelsResponse =
+        serde_json::from_str(include_str!("../models.json")).expect("bundled catalog");
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .find(|model| model.slug == "gpt-6-astra")
+            .expect("bundled astra")
+            .base_instructions,
+        ""
+    );
+    let manager = static_manager_for_tests(catalog);
+    let model = manager
+        .get_model_info("gpt-6-astra", &ModelsManagerConfig::default())
+        .await;
+    assert_eq!(
+        model.base_instructions,
+        codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+    );
+}
+
+#[tokio::test]
 async fn static_manager_fallback_requires_exact_catalog_membership() {
     let manager = static_manager_for_tests(ModelsResponse {
         models: vec![

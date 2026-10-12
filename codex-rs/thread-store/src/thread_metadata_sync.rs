@@ -203,7 +203,12 @@ impl ThreadMetadataSync {
     }
 
     fn observe_resume_history(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
-        self.observe_items_with_update(items, ThreadMetadataPatch::default())
+        let mut update = self.observe_items_with_update(items, ThreadMetadataPatch::default())?;
+        // History establishes whether a first message was already seen, but is not
+        // a rename operation. Replaying its default title would overwrite a custom
+        // SQLite title when the next append commits this repair patch.
+        update.title = None;
+        Some(update)
     }
 
     fn observe_items_with_update(
@@ -480,7 +485,7 @@ mod tests {
             "2025-01-03T12:00:00+00:00"
         );
         assert_eq!(update.patch.preview.as_deref(), Some("hello metadata"));
-        assert_eq!(update.patch.title.as_deref(), Some("hello metadata"));
+        assert_eq!(update.patch.title, None, "resume repair must not rename the thread");
         assert_eq!(
             update.patch.first_user_message.as_deref(),
             Some("hello metadata")
@@ -596,7 +601,7 @@ mod tests {
             update.patch.first_user_message.as_deref(),
             Some("first user text")
         );
-        assert_eq!(update.patch.title.as_deref(), Some("first user text"));
+        assert_eq!(update.patch.title, None, "resume repair must not rename the thread");
 
         let sync = ThreadMetadataSync::for_resume(&resume_params(
             thread_id,

@@ -546,6 +546,17 @@ impl Session {
         rollout_items: &[RolloutItem],
         truncation_policy: codex_utils_output_truncation::TruncationPolicy,
     ) -> RolloutReconstruction {
+        // A loader diagnostic describes gaps in the entire source, including missing
+        // rollback markers. It must not acquire the lifecycle of whichever turn was
+        // last in that source. A fresh load supersedes a checkpoint's older notice.
+        let reconstruction_notice = rollout_items.iter().rev().find_map(|item| match item {
+            RolloutItem::ResponseItem(item)
+                if codex_rollout::is_rollout_reconstruction_notice(item) => Some(item),
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref()
+                .and_then(|items| items.iter().rev()
+                    .find(|item| codex_rollout::is_rollout_reconstruction_notice(item))),
+            _ => None,
+        });
         // Replay metadata should already match the shape of the future lazy reverse loader, even
         // while history materialization still uses an eager bridge. Scan newest-to-oldest,
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
@@ -584,9 +595,32 @@ impl Session {
         let mut surviving_compaction_count = 0u64;
         let mut has_surviving_legacy_compaction_without_window_number = false;
         let mut window = None;
-        let has_turn_started = rollout_items
-            .iter()
-            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
+        // A resumed legacy rollout can acquire modern turns. Only user events
+        // outside a started turn are legacy boundaries; steering inside a
+        // modern turn must still roll back with that turn, not independently.
+        let mut started_turn = None;
+        let mut legacy_user_boundaries = HashSet::new();
+        for (index, item) in rollout_items.iter().enumerate() {
+            match item {
+                RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                    started_turn = Some(event.turn_id.as_str());
+                }
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                    if started_turn == Some(event.turn_id.as_str()) =>
+                {
+                    started_turn = None;
+                }
+                RolloutItem::EventMsg(EventMsg::TurnAborted(event))
+                    if event.turn_id.as_deref().is_none_or(|id| started_turn == Some(id)) =>
+                {
+                    started_turn = None;
+                }
+                RolloutItem::EventMsg(EventMsg::UserMessage(_)) if started_turn.is_none() => {
+                    legacy_user_boundaries.insert(index);
+                }
+                _ => {}
+            }
+        }
         let has_segmented_turn_boundaries = rollout_items.iter().any(|item| {
             matches!(
                 item,
@@ -818,8 +852,7 @@ impl Session {
 
             // Older rollouts used UserMessage as the start event. Finalize at
             // that same boundary so rollback discards one turn and its metadata.
-            if !has_turn_started
-                && matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_)))
+            if legacy_user_boundaries.contains(&index)
                 && let Some(active_segment) = active_segment.take()
             {
                 finalize_active_segment(
@@ -1011,8 +1044,13 @@ impl Session {
             previous_id: None,
             id: None,
         });
+        let mut history = history.into_raw_items();
+        history.retain(|item| !codex_rollout::is_rollout_reconstruction_notice(item));
+        if let Some(notice) = reconstruction_notice {
+            history.push(notice.clone());
+        }
         RolloutReconstruction {
-            history: history.into_raw_items(),
+            history,
             plan,
             plan_lineage,
             previous_turn_settings,

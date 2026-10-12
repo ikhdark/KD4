@@ -1056,7 +1056,9 @@ fn rejects_known_rg_flag_typo_for_direct_argv() {
     assert_eq!(issue.code, CommandPreflightIssueCode::KnownFlagTypo);
     let rendered = issue.render_for_model();
     assert!(rendered.contains("`rg` has no `--ignorecase` flag"));
-    assert!(rendered.contains("kind: \"argv\""));
+    // The retry hint names only advertised fields; `kind` is not one of them.
+    assert!(rendered.contains("program: \"rg\""));
+    assert!(!rendered.contains("kind: "));
     assert!(rendered.contains("\"--ignore-case\""));
     assert!(rendered.contains("\"kind\":\"known_flag_typo\""));
 }
@@ -1823,7 +1825,8 @@ fn preflight_requires_explicit_powershell_for_cmdlets_and_rejects_invalid_source
         let error = preflight_invocation_with_equivalent_repair(&invocation, &command, None)
             .expect_err("automatic repair must not introduce a shell or its profile");
         assert!(error.contains("not a standalone executable"));
-        assert!(error.contains("kind: \"powershell_script\""));
+        assert!(error.contains("script_body: \""));
+        assert!(!error.contains("kind: "));
         assert!(error.contains("\"kind\":\"direct_argv_powershell_cmdlet\""));
     }
     let error = preflight_invocation_with_equivalent_repair(

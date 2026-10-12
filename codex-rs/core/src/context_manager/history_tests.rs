@@ -1,5 +1,64 @@
 use super::*;
 
+#[tokio::test]
+async fn continuity_user_authored_context_wrappers_survive_rollback_boundaries() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn,
+            &[codex_protocol::user_input::UserInput::Text {
+                text: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nReview this policy\n</INSTRUCTIONS>".into(),
+                text_elements: Vec::new(),
+            }],
+            None,
+        )
+        .await
+        .expect("accepted user input");
+    let mut wrapper = session
+        .clone_history()
+        .await
+        .raw_items()
+        .last()
+        .unwrap()
+        .clone();
+    assert!(is_user_turn_boundary(&wrapper));
+    let first = user_input_text_msg("original request");
+    let mut history = create_history_with_items(vec![first.clone(), wrapper.clone()]);
+    let prepared = history.clone().prepare_for_prompt(&default_input_modalities());
+    let breakdown = crate::context::PromptContextBreakdown::from_response_items(
+        prepared.items(),
+        prepared.prompt_provenance(),
+    )
+    .unwrap();
+    assert_eq!(
+        breakdown.bytes(crate::context::PromptContextCategory::TaskInput),
+        serde_json::to_vec(&wrapper).unwrap().len() as u64,
+        "the current wrapped request, not the older request, owns task-input provenance"
+    );
+    history.drop_last_n_user_turns(1);
+    assert_eq!(history.raw_items(), &[first.clone()]);
+
+    // A surviving literal wrapper directly before the removed request is not
+    // a host pre-turn update and must not be trimmed with that request.
+    let mut history = create_history_with_items(vec![
+        first.clone(),
+        wrapper.clone(),
+        user_input_text_msg("latest request"),
+    ]);
+    history.drop_last_n_user_turns(1);
+    assert_eq!(history.raw_items(), &[first, wrapper.clone()]);
+
+    crate::stable_context::mark_trusted_stable_context_item(&mut wrapper);
+    assert!(!is_user_turn_boundary(&wrapper));
+    wrapper.set_id(None);
+    assert!(
+        !is_user_turn_boundary(&wrapper),
+        "preserve legacy host-context classification"
+    );
+}
+
 #[test]
 fn salience_snapshot_retirement_preserves_history_and_continuation_prefix() {
     let workspace = crate::git_workspace::GitWorkspaceCache::new();

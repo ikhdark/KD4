@@ -592,7 +592,6 @@ pub(crate) async fn run_turn(
         // Metadata belongs to this attempt, while underlying evidence stays in
         // the turn execution owner across repairs and pending-input continuations.
         completion_assessment = None;
-        let draining_initial_mailbox = !can_drain_pending_input && initial_mailbox_pending;
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
@@ -621,11 +620,8 @@ pub(crate) async fn run_turn(
             break 'sampling_loop;
         };
 
-        let recorded_input = if draining_initial_mailbox {
-            record_initial_mailbox_owned(&sess, &turn_context, pending_input).await?
-        } else {
-            run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await?
-        };
+        let recorded_input =
+            run_hooks_and_record_inputs_detailed(&sess, &turn_context, pending_input).await?;
         if recorded_input.accepted_context_input {
             pending_workspace_prefetch = None;
             prefetched_workspace_identity = None;
@@ -1739,7 +1735,7 @@ async fn record_sampling_notices(
         sess,
         turn,
         "exhaustive_scope_feasibility",
-        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. Do not silently substitute a sample for the requested scope. When the user explicitly requests full reads or exhaustive coverage, do not narrow the scope without the user's approval. Continue reading through compactions, preserving coverage and unread ranges, until the requested coverage is complete or a genuine blocker requires user input or an external change. Implemented fixes, context pressure, or reporting partial coverage are not reasons to stop while required work remains obtainable. Otherwise, if coverage is infeasible without unauthorized delegation, choose the scope that best serves the requested deliverable, state it and its exclusions in commentary, and proceed. Ask once only when the request gives no basis for choosing a scope. Reuse a scope or limit the user already chose; do not ask repeatedly or spawn agents without authorization. Track coverage in working state; write coverage files only when the user asks. Report unfinished coverage explicitly in the final answer.",
+        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. When the user explicitly requests full reads or exhaustive coverage, do not narrow the scope without the user's approval and never silently substitute a sample. Continue reading through compactions until the coverage is complete or a genuine blocker requires user input. Implemented fixes, context pressure, or reporting partial coverage are not reasons to stop while required work remains obtainable. Otherwise, if full coverage is infeasible, choose the scope that best serves the deliverable and state it and its exclusions. Report unfinished coverage in the final answer.",
     ).await?;
     if mcp_unavailable {
         record_context_notice_if_changed(
@@ -2019,43 +2015,44 @@ struct RecordedInputOutcome {
     accepted_context_input: bool,
 }
 
-async fn record_initial_mailbox_owned(
+async fn run_hooks_and_record_inputs_detailed(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     input: Vec<TurnInput>,
 ) -> CodexResult<RecordedInputOutcome> {
+    if input.is_empty() {
+        return Ok(RecordedInputOutcome {
+            should_stop: false,
+            accepted_context_input: false,
+        });
+    }
     // Queue removal transfers ownership to a tracked task before another await.
-    // Cancellation of the generation waiter must not discard accepted mail.
+    // Cancellation of the generation waiter must not discard accepted mail or steer.
     let owner = Arc::clone(sess);
     let turn = Arc::clone(turn_context);
     sess.terminal_tasks
         .spawn(async move {
-            let mut accepted_context_input = false;
-            for (index, item) in input.iter().enumerate() {
-                match run_hooks_and_record_inputs_detailed(
-                    &owner,
-                    &turn,
-                    std::slice::from_ref(item),
-                )
-                .await
+            // Inspect the whole batch once: a blocked prompt must not override accepted
+            // context elsewhere in the batch, and hook contexts keep their stream order.
+            let inspected = inspect_inputs(&owner, &turn, &input).await;
+            for (index, item) in inspected.items.iter().enumerate() {
+                if let Err(error) =
+                    record_pending_input(&owner, &turn, item.clone(), Vec::new()).await
                 {
-                    Ok(outcome) => accepted_context_input |= outcome.accepted_context_input,
-                    Err(error) => {
-                        owner
-                            .input_queue
-                            .restore_transferred_startup_input(input[index..].to_vec())
-                            .await;
-                        return Err(error);
-                    }
+                    // Only the rejected item and unsubmitted suffix return to the queue.
+                    // Restoring the original raw item could duplicate an already committed
+                    // user message when one of its generated hook contexts fails.
+                    owner
+                        .input_queue
+                        .restore_transferred_startup_input(inspected.items[index..].to_vec())
+                        .await;
+                    return Err(CodexErr::from(error));
                 }
             }
-            Ok(RecordedInputOutcome {
-                should_stop: false,
-                accepted_context_input,
-            })
+            Ok(inspected.outcome)
         })
         .await
-        .map_err(|error| CodexErr::Fatal(format!("initial mailbox recording failed: {error}")))?
+        .map_err(|error| CodexErr::Fatal(format!("pending input recording failed: {error}")))?
 }
 
 fn resets_turn_execution(input: &TurnInput) -> bool {
@@ -2064,16 +2061,6 @@ fn resets_turn_execution(input: &TurnInput) -> bool {
         TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => true,
         TurnInput::InternalResponseItem(_) => false,
     }
-}
-
-async fn run_hooks_and_record_inputs_detailed(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    input: &[TurnInput],
-) -> CodexResult<RecordedInputOutcome> {
-    let inspected = inspect_inputs(sess, turn_context, input).await;
-    record_inspected_inputs(sess, turn_context, &inspected.items).await?;
-    Ok(inspected.outcome)
 }
 
 struct InspectedInputs {

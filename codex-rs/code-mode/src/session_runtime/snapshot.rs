@@ -110,12 +110,12 @@ impl DurableState {
                 }
                 let snapshot: Snapshot<Value> = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("named-state snapshot is invalid; no cell started: {error}"))?;
-                if !matches!(snapshot.version, 1..=6) {
+                if !matches!(snapshot.version, 1..=7) {
                     return Err("unsupported named-state snapshot version; no cell started".into());
                 }
                 if snapshot.completed_cells.len() > super::TERMINAL_CELL_CACHE_CAPACITY
                     || snapshot.completed_cells.iter().any(|(id, event)| {
-                        id.parse::<u64>().is_err()
+                        super::cell_id_sequence(id).is_none()
                             || !matches!(event, CellEvent::Completed { .. } | CellEvent::Terminated { .. })
                     })
                 {
@@ -140,7 +140,7 @@ impl DurableState {
             // Legacy snapshots did not record completion chronology. Preserve
             // their allocation-order fallback, never infer order from map keys.
             completion_order = snapshot.completed_cells.keys().cloned().collect();
-            completion_order.sort_by_key(|id| id.parse::<u64>().unwrap_or(u64::MAX));
+            completion_order.sort_by_key(|id| super::cell_id_sequence(id).unwrap_or(u64::MAX));
         }
         let order_len = completion_order.len();
         let order = completion_order.into_iter().enumerate()
@@ -160,7 +160,7 @@ impl DurableState {
             return Err("named-state snapshot exceeds the session storage limit".into());
         }
         let first_cell_id = snapshot.completed_cells.keys()
-            .filter_map(|id| id.parse::<u64>().ok()).max().unwrap_or(0)
+            .filter_map(|id| super::cell_id_sequence(id)).max().unwrap_or(0)
             .checked_add(1).ok_or("durable cell ID space exhausted")?
             .max(snapshot.next_cell_id).max(minimum_cell_id);
         // Reserve a disjoint range before any cell starts. Interrupted cells
@@ -245,7 +245,7 @@ impl DurableState {
         completed_cell_order.sort_by_key(|(_, event)| event.completion_order);
         let completed_cell_order = completed_cell_order.into_iter().map(|(id, _)| id.clone()).collect();
         let snapshot = Snapshot {
-            version: 6,
+            version: 7,
             revision,
             completed_call_id,
             presentations: values.iter().filter_map(|(key, value)|

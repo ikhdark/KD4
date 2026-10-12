@@ -154,7 +154,7 @@ async fn handle_spawn_agent(
     };
     let legacy_parent_assignment_id = if turn.session_source.is_non_root_agent() {
         let coordinator = session.services.agent_control.task_coordinator();
-        match coordinator.binding_for_source(&turn.session_source) {
+        match coordinator.binding_for_turn(&turn) {
             Some(binding) => {
                 let parent = coordinator
                     .get_agent_task(binding.assignment_id, Some(0))

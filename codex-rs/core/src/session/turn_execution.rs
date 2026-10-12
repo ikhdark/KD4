@@ -70,7 +70,7 @@ impl Default for HandoffEfficiencyPolicy {
     }
 }
 
-const LIGHTWEIGHT_HANDOFF_ADVISORY: &str = "Execution-efficiency advisory: several consecutive model handoffs each ran only one or two short tools. This is orchestration overhead, not evidence of a loop or task completion. Batch the next known independent calls and continue deterministic dependent steps in the same exec after checking prerequisites. Reuse existing report/inventory commands and retained results instead of regenerating scripts or bookkeeping. Emit decision-relevant summaries, not bulk records; recover required missing ranges within the same cell. Use direct delivery only when the requested answer is complete. Do not skip required reading, implementation, or validation; do not combine conflicting mutations or cancel progressing work. Keep tools available and preserve the user's scope.";
+const LIGHTWEIGHT_HANDOFF_ADVISORY: &str = "Execution-efficiency advisory: several consecutive model handoffs each ran only one or two short tools. This is orchestration overhead, not evidence of a loop or task completion. Batch the next known independent calls and continue deterministic dependent steps in the same exec after checking prerequisites. Do not skip required reading, implementation, or validation; do not combine conflicting mutations or cancel progressing work. Preserve the user's scope.";
 
 const SUCCESSFUL_REPLAY_GATE_LIMIT: usize = 32;
 const RECENT_CYCLE_LIMIT: usize = 32;
@@ -80,7 +80,7 @@ const SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT: usize = 64 * 1024;
 // were still reading new files. Require that this many completed generations
 // in a row added no new evidence, mutation, or plan change first.
 pub(crate) const SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS: u32 = 3;
-const SOFT_CONVERGENCE_DIRECTIVE: &str = "Soft convergence intervention: Use existing evidence and stop optional exploration. Continue only to satisfy an unresolved requirement, complete required implementation or validation, or resolve a correctness-relevant uncertainty. Preserve the requested scope. This is not a completion test or a hard deadline: do not cancel running work, truncate the answer, claim unfinished work is complete, or abandon obtainable required evidence. Report limitations only when evidence is genuinely unavailable or work is blocked. This instruction takes effect on this already-needed continuation; it does not interrupt an in-flight request.";
+const SOFT_CONVERGENCE_DIRECTIVE: &str = "Soft convergence intervention: several consecutive completed model requests added no new evidence, edits, or plan changes. Use existing evidence and stop optional exploration. Continue only to satisfy an unresolved requirement, complete required implementation or validation, or resolve a correctness-relevant uncertainty. Preserve the requested scope. This is not a completion test or a hard deadline: do not cancel running work, truncate the answer, claim unfinished work is complete, or abandon obtainable required evidence. Report limitations only when evidence is genuinely unavailable or work is blocked. This instruction takes effect on this already-needed continuation; it does not interrupt an in-flight request.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ContinuationDisposition {
@@ -4105,7 +4105,7 @@ impl TurnExecutionControl {
         } else if self.proven_loop_active {
             "Convergence escalation: an ordered deterministic action/result cycle has repeated after the convergence directive against identical state. Do not repeat it. Change the hypothesis or state, narrow the observation, or truthfully complete; existing task lifecycle rules still govern termination."
         } else {
-            "Convergence escalation: structured state still has not changed. Equivalent completed actions remain blocked. Choose a new hypothesis, change state, narrow the observation, or truthfully complete; a no-progress count alone never ends the task."
+            "Convergence escalation: structured state still has not changed, so repeating the same action unchanged adds no evidence. Choose a new hypothesis, change state, narrow the observation, or truthfully complete; a no-progress count alone never ends the task."
         };
         SamplingConvergenceDecision {
             continuation: ContinuationDisposition::ModelRequired,

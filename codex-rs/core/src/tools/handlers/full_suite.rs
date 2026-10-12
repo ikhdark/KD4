@@ -161,33 +161,10 @@ fn check_command(
         return check_test_args(&args[index + 1..], 0, false);
     }
     if program == "just" {
-        // Skip only documented global option values, never search arbitrary
-        // arguments for a recipe name (e.g. `just --show test`).
-        let mut index = 0;
-        while let Some(arg) = args.get(index) {
-            if matches!(
-                arg.as_str(),
-                "--dry-run" | "--show" | "--list" | "--summary" | "--help" | "--version"
-            ) {
-                return Ok(false);
-            }
-            if arg == "--set" {
-                index += 3;
-            } else if matches!(
-                arg.as_str(),
-                "--justfile" | "-f" | "--working-directory" | "-d" | "--shell" | "--shell-arg"
-            ) {
-                index += 2;
-            } else if arg.starts_with('-') || arg.contains('=') {
-                index += 1;
-            } else {
-                break;
-            }
-        }
-        let Some(recipe) = args.get(index).map(String::as_str) else {
+        let Some(index) = just_recipe_index(args) else {
             return Ok(false);
         };
-        let (positionals, nextest) = match recipe {
+        let (positionals, nextest) = match args[index].as_str() {
             "core-test"
             | "core-test-fast"
             | "core-test-small"
@@ -223,23 +200,61 @@ fn basename(program: &str) -> String {
     name.strip_suffix(".exe").unwrap_or(&name).to_string()
 }
 
+/// Index of the recipe among `just` arguments; `None` when nothing runs.
+fn just_recipe_index(args: &[String]) -> Option<usize> {
+    // Skip only documented global option values, never search arbitrary
+    // arguments for a recipe name (e.g. `just --show test`).
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if matches!(
+            arg.as_str(),
+            "--dry-run" | "--show" | "--list" | "--summary" | "--help" | "--version"
+        ) {
+            return None;
+        }
+        if arg == "--set" {
+            index += 3;
+        } else if matches!(
+            arg.as_str(),
+            "--justfile" | "-f" | "--working-directory" | "-d" | "--shell" | "--shell-arg"
+        ) {
+            index += 2;
+        } else if arg.starts_with('-') || arg.contains('=') {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    (index < args.len()).then_some(index)
+}
+
+/// Whether an unparsed script launches tests, judged one statement at a time.
+/// Naming a test tool as a path, pattern or lane (`lanes/core-tests`, a process
+/// filter, `rg core-test justfile`) launches nothing and stays inspectable.
 fn visibly_runs_tests(script: &str) -> bool {
-    let tokens = script
-        .split(|ch: char| {
-            ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '{' | '}' | '\'' | '"')
+    script
+        .split(|ch: char| matches!(ch, ';' | '|' | '&' | '(' | ')' | '{' | '}' | '\n' | '\r'))
+        .any(|statement| {
+            let tokens = statement
+                .split_whitespace()
+                .map(|token| basename(token.trim_matches(['\'', '"'])))
+                .collect::<Vec<_>>();
+            tokens.iter().enumerate().any(|(index, token)| {
+                let rest = &tokens[index + 1..];
+                match token.as_str() {
+                    "cargo" => rest
+                        .first()
+                        .is_some_and(|next| matches!(next.as_str(), "test" | "nextest")),
+                    "just" => just_recipe_index(rest).is_some_and(|recipe| {
+                        rest[recipe].starts_with("core-test") || rest[recipe].starts_with("test")
+                    }),
+                    "rust_test_runner.py" => rest.iter().any(|arg| {
+                        matches!(arg.as_str(), "run-target" | "run-gate" | "check-gates")
+                    }),
+                    _ => false,
+                }
+            })
         })
-        .filter(|token| !token.is_empty())
-        .map(basename)
-        .collect::<Vec<_>>();
-    tokens
-        .windows(2)
-        .any(|pair| pair[0] == "cargo" && matches!(pair[1].as_str(), "test" | "nextest"))
-        || tokens
-            .iter()
-            .any(|token| token.starts_with("core-test") || token == "rust_test_runner.py")
-        || tokens
-            .windows(2)
-            .any(|pair| pair[0] == "just" && pair[1].starts_with("test"))
 }
 
 fn check_test_args(args: &[String], mut positionals: usize, nextest: bool) -> Result<bool, String> {
@@ -399,9 +414,9 @@ mod tests {
             "cargo test --workspace --no-fail-fast",
             "cargo nextest run --no-fail-fast --retries 0",
             "just core-test-fast core_lib --all --no-fail-fast",
-            "python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib --all --no-fail-fast",
+            "python -I -B scripts/build/rust_test_runner.py run-target --profile fast core_lib --all --no-fail-fast",
             "just --set rust_validation_wait_seconds 5 test-fast -p codex-utils --no-fail-fast --retries=0",
-            "python scripts/rust_build_status.py run-lane --lane core-tests -- cargo test --no-fail-fast",
+            "python scripts/build/rust_build_status.py run-lane --lane core-tests -- cargo test --no-fail-fast",
             "C:\\tools\\cargo.exe +stable test -p example --no-fail-fast",
             "just core-test-lane core_lib --all --no-fail-fast",
             "just _core-test-reserved fast core_lib --all --no-fail-fast",
@@ -473,7 +488,7 @@ mod tests {
             "cargo test --workspace one_test",
             "cargo --help test",
             "cargo build --bin test",
-            "python scripts/rust_test_runner.py run-target core_lib one_test",
+            "python scripts/build/rust_test_runner.py run-target core_lib one_test",
             "echo cargo test",
             "rg cargo source.rs",
         ] {
@@ -556,6 +571,42 @@ mod tests {
             .await,
             Ok(false)
         );
+    }
+
+    #[test]
+    fn full_suite_opaque_script_guard_separates_inspection_from_launch() {
+        // Read-only lane and holder inspections that only name the test tools.
+        for script in [
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(cargo|cargo-nextest|python|just)(\\.exe)?$' -and $_.CommandLine -match 'core-tests|rust_test_runner|core-test|core-gate' } | Select-Object ProcessId,CommandLine | ConvertTo-Json",
+            "Get-ChildItem -LiteralPath codex-rs/target/lanes/core-tests -Force -File | Select-Object Name,Length | ConvertTo-Json",
+            "Get-Item scripts/build/rust_test_runner.py, justfile | ForEach-Object { $_.Length }; rg -n 'core-test|test-fast|rust_test_runner' justfile",
+            "python -B scripts/build/rust_build_status.py lanes; if ($LASTEXITCODE -eq 0) { python -B scripts/build/rust_build_status.py run-lane --lane core-tests -- cargo check -p codex-cli }",
+            "rg -n 'run-target' scripts/build/rust_test_runner.py | Select-Object -First 5",
+        ] {
+            assert!(!visibly_runs_tests(script), "{script}");
+            // Exercise the actual policy entry branch too: a helper-only
+            // assertion cannot detect shell extraction/recursion regressions.
+            assert_eq!(
+                check_command(
+                    &["pwsh".into(), "-NoProfile".into(), "-Command".into(), script.into()],
+                    Some(ShellType::PowerShell),
+                    0,
+                ),
+                Ok(false),
+                "{script}",
+            );
+        }
+        for script in [
+            "foreach ($i in 1,2) { just core-test-fast core_lib --all --no-fail-fast }",
+            "$log = 'out.txt'; just --set rust_validation_wait_seconds 5 core-test-fast core_lib -E 'test(=one)' | Tee-Object $log",
+            "& \"C:\\kd4 checkout\\.venv\\python.exe\" \"C:\\kd4 checkout\\scripts\\build\\rust_test_runner.py\" --target-dir t run-target core_lib --all",
+            "$r = python -I -B scripts/build/rust_test_runner.py run-gate demo | Out-String",
+            "if ($true) { cargo nextest run --no-fail-fast --retries 0 }",
+            "iex 'cargo test --workspace'",
+            "just test-fast -p codex-core | Select-Object -Last 5",
+        ] {
+            assert!(visibly_runs_tests(script), "{script}");
+        }
     }
 
     fn kd4_checkout() -> tempfile::TempDir {

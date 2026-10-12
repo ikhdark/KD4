@@ -981,7 +981,7 @@ impl ThreadManager {
             );
         }
         for (pending_config, config) in pending_configs.iter_mut().zip(configs) {
-            **pending_config = Some(config);
+            **pending_config = Some(Arc::new(config));
         }
         Ok(())
     }

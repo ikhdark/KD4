@@ -1831,7 +1831,7 @@ impl GitWorkspaceCache {
             }
             Some(_) => match cwd.to_abs_path() {
                 Ok(cwd) => {
-                    self.workspace_evidence_for_turn(turn, cwd.as_path())
+                    self.workspace_evidence_identity_with_attribution(cwd.as_path())
                         .await
                         .identity
                 }

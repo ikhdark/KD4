@@ -1,6 +1,9 @@
 use super::turn_context::TurnEnvironment;
 use super::*;
 
+#[path = "comprehension_continuation_tests.rs"]
+mod comprehension_continuation_tests;
+
 #[tokio::test]
 async fn salience_budget_rejection_is_recoverable_not_a_source_removal() {
     struct Contributor {
@@ -2458,6 +2461,35 @@ async fn reload_user_config_layer_updates_effective_apps_config() {
 
     assert!(!app.enabled);
     assert_eq!(app.destructive_enabled, Some(false));
+}
+
+#[tokio::test]
+async fn reload_user_config_layer_preserves_explicit_ignore_but_reloads_empty_enabled_layer() {
+    for ignored in [true, false] {
+        let (session, _) = make_session_and_context().await;
+        let home = session.codex_home().await;
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join(CONFIG_TOML_FILE);
+        std::fs::write(&path, "").unwrap();
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_user_config: ignored,
+                ..LoaderOverrides::without_managed_config_for_tests()
+            }).build().await.unwrap();
+        assert!(config.config_layer_stack.effective_config().get("apps").is_none());
+        session.state.lock().await.session_configuration.original_config_do_not_use = Arc::new(config);
+        std::fs::write(&path, "[apps.calendar]\nenabled = false\n").unwrap();
+        session.reload_user_config_layer().await;
+        let config = session.get_config().await;
+        assert_eq!(config.config_layer_stack.effective_config().get("apps").is_some(), !ignored,
+            "empty enabled config remains reloadable, explicitly ignored config does not");
+        let replacement = config.config_layer_stack.with_user_config(
+            &path, toml::from_str("[apps.calendar]\nenabled = true\n").unwrap(),
+        );
+        assert_eq!(replacement.effective_config().get("apps").is_some(), !ignored,
+            "replacing layer contents must preserve its disabled provenance");
+    }
 }
 
 #[tokio::test]
@@ -10197,7 +10229,7 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
     };
     {
         let mut guard = session.pending_mcp_server_refresh_config.lock().await;
-        *guard = Some(refresh_config);
+        *guard = Some(Arc::new(refresh_config));
     }
 
     assert!(!old_token.is_cancelled());
@@ -10235,6 +10267,47 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
         codex_mcp::configured_mcp_servers(new_runtime.config()),
         refreshed_mcp_servers
     );
+}
+
+#[tokio::test]
+async fn mcp_refresh_ack_preserves_newer_identical_requests_and_lost_publications() {
+    for replace_identical in [true, false] {
+        let (session, context, _) = make_session_and_context_with_rx().await;
+        let requested = McpServerRefreshConfig {
+            mcp_servers: json!({"requested": {"url": "https://unused.example/mcp", "enabled": false}}),
+            mcp_oauth_credentials_store_mode: json!("auto"),
+            auth_keyring_backend_kind: json!("direct"),
+        };
+        super::handlers::refresh_mcp_servers(&session, requested.clone()).await;
+        let pause = Arc::new(super::mcp::TestMcpStartupPause::new());
+        let worker_session = Arc::clone(&session);
+        let worker_context = Arc::clone(&context);
+        let worker = tokio::spawn(super::mcp::with_test_mcp_startup_pause(Arc::clone(&pause), async move {
+            worker_session.refresh_mcp_servers_if_requested(&worker_context).await;
+        }));
+        tokio::time::timeout(Duration::from_secs(5), pause.started.acquire()).await.unwrap().unwrap().forget();
+        if replace_identical {
+            // A distinct submission may carry identical JSON (e.g. changed host capabilities).
+            super::handlers::refresh_mcp_servers(&session, requested.clone()).await;
+        } else {
+            // Exercise the existing compare-and-publish loser path without claiming
+            // this artificial two-caller arrangement is a normal dispatch ordering.
+            session.refresh_mcp_servers_now(&context, &context.config).await;
+        }
+        let remaining = session.pending_mcp_server_refresh_config.lock().await.clone().unwrap();
+        pause.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap();
+        assert!(session.pending_mcp_server_refresh_config.lock().await.as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(pending, &remaining)),
+            "completion must neither erase a newer request nor acknowledge an unapplied catalog");
+        session.refresh_mcp_servers_if_requested(&context).await;
+        assert!(session.pending_mcp_server_refresh_config.lock().await.is_none());
+        assert!(codex_mcp::configured_mcp_servers(session.services.latest_mcp_runtime().config()).contains_key("requested"));
+        let invalid = McpServerRefreshConfig { mcp_servers: json!([]), ..requested };
+        super::handlers::refresh_mcp_servers(&session, invalid).await;
+        session.refresh_mcp_servers_if_requested(&context).await;
+        assert!(session.pending_mcp_server_refresh_config.lock().await.is_none(), "invalid input must not become an infinite retry");
+    }
 }
 
 #[tokio::test]
@@ -11437,6 +11510,99 @@ async fn spawn_task_does_not_update_previous_turn_settings_for_non_run_turn_task
 }
 
 #[tokio::test]
+async fn network_context_labels_proxy_configuration_separately_from_network_access()
+-> anyhow::Result<()> {
+    for (permission_profile, proxy_enabled, expected_access) in [
+        (PermissionProfile::Disabled, false, "enabled"),
+        (PermissionProfile::Disabled, true, "enabled"),
+        (PermissionProfile::read_only(), true, "restricted"),
+    ] {
+        let profile_is_disabled = matches!(permission_profile, PermissionProfile::Disabled);
+        let domains = NetworkDomainPermissionsToml {
+            entries: std::collections::BTreeMap::from([
+                ("api.example.com".to_string(), NetworkDomainPermissionToml::Allow),
+                ("blocked.example.com".to_string(), NetworkDomainPermissionToml::Deny),
+            ]),
+        };
+        let constraints = NetworkConstraints {
+            enabled: Some(proxy_enabled),
+            domains: Some(domains.clone()),
+            ..Default::default()
+        };
+        let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+            NetworkProxyConfig {
+                proxy_url: "http://127.0.0.1:0".to_string(),
+                socks_url: "http://127.0.0.1:0".to_string(),
+                ..Default::default()
+            },
+            Some(constraints.clone()),
+            &permission_profile,
+        )?;
+        let session = make_session_with_config(move |config| {
+            config
+                .permissions
+                .set_permission_profile(permission_profile)
+                .expect("test profile should be allowed");
+            let mut requirements = config.config_layer_stack.requirements().clone();
+            requirements.network = Some(Sourced::new(
+                constraints,
+                RequirementSource::LegacyManagedConfigTomlFromMdm,
+            ));
+            let mut requirements_toml = config.config_layer_stack.requirements_toml().clone();
+            requirements_toml.network = Some(codex_config::NetworkRequirementsToml {
+                enabled: Some(proxy_enabled),
+                domains: Some(domains),
+                ..Default::default()
+            });
+            let layers = config
+                .config_layer_stack
+                .get_layers(
+                    ConfigLayerStackOrdering::LowestPrecedenceFirst,
+                    /*include_disabled*/ true,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+            config.config_layer_stack = ConfigLayerStack::new(
+                layers,
+                requirements,
+                requirements_toml,
+            )
+            .expect("network requirements should be accepted")
+            .into();
+            config.permissions.network = Some(network_spec);
+        })
+        .await?;
+        let turn_context = session.new_default_turn().await;
+        if profile_is_disabled {
+            assert!(
+                turn_context.network.is_none(),
+                "configured proxy enablement must not imply an active proxy in full access"
+            );
+        }
+        let items = build_initial_context(&session, &turn_context).await;
+        let permissions = developer_input_texts(&items).join("\n");
+        assert!(
+            permissions.contains(&format!("Network access is {expected_access}.")),
+            "{permissions}"
+        );
+        let environment = user_input_texts(&items)
+            .into_iter()
+            .find(|text| text.contains("<environment_context>"))
+            .expect("environment context should be delivered to the model");
+        let expected = format!(
+            "<managed_network_proxy configured_enabled=\"{proxy_enabled}\"><required_allowed>api.example.com</required_allowed><required_denied>blocked.example.com</required_denied></managed_network_proxy>"
+        );
+        assert!(environment.contains(&expected), "{environment}");
+        assert!(
+            !environment.contains("<network enabled="),
+            "proxy configuration must not masquerade as network access: {environment}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn record_context_updates_emits_environment_item_for_network_changes() {
     let (session, previous_context) = make_session_and_context().await;
     let previous_context = Arc::new(previous_context);
@@ -11505,7 +11671,7 @@ async fn record_context_updates_emits_environment_item_for_network_changes() {
         .find(|text| text.contains("<environment_context>"))
         .expect("environment update item should be emitted");
     assert!(environment_update.contains(
-        "<network enabled=\"false\"><allowed>api.example.com</allowed><denied>blocked.example.com</denied></network>"
+        "<managed_network_proxy configured_enabled=\"false\"><required_allowed>api.example.com</required_allowed><required_denied>blocked.example.com</required_denied></managed_network_proxy>"
     ), "{environment_update}");
 }
 
@@ -13785,6 +13951,54 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         persisted_turn_context,
         turn_context.to_turn_context_item(),
     );
+}
+
+#[tokio::test]
+async fn same_slug_catalog_approval_change_refreshes_projected_permission_context() {
+    use codex_protocol::openai_models::ApprovalMessages;
+    use codex_protocol::openai_models::ModelMessages;
+
+    let (session, mut turn) = make_session_and_context().await;
+    Arc::make_mut(&mut turn.config).include_permissions_instructions = true;
+    turn.approval_policy.set(AskForApproval::OnRequest).expect("allow on-request approvals");
+    turn.permission_profile = PermissionProfile::read_only();
+    turn.model_info.model_messages = Some(ModelMessages {
+        token_budget: None, instructions_template: None, instructions_variables: None,
+        approvals: Some(ApprovalMessages { on_request: Some("catalog approval policy A".into()) }),
+    });
+    let session = Arc::new(session);
+    let first = Arc::new(turn);
+    let step = StepContext::for_test(Arc::clone(&first));
+    session.record_context_updates_and_set_reference_context_item(&step).await.unwrap();
+    commit_test_context_baseline(&session, "approval-A").await;
+    assert!(developer_input_texts(session.clone_history().await.raw_items())
+        .iter().any(|text| text.contains("catalog approval policy A")));
+    let unchanged = session.prepare_context_update(&step).await;
+    assert!(unchanged.context_items().is_empty(), "unchanged permission wording must not reinject");
+    drop(unchanged);
+    drop(step);
+    let mut next = Arc::try_unwrap(first).unwrap_or_else(|_| panic!("unique turn"));
+    let slug = next.model_info.slug.clone();
+    next.sub_id.push_str("-next");
+    next.model_info.model_messages.as_mut().unwrap().approvals.as_mut().unwrap().on_request =
+        Some("catalog approval policy B".into());
+    assert_eq!(next.model_info.slug, slug, "only catalog wording changes");
+    let step = StepContext::for_test(Arc::new(next));
+    let prepared = session.prepare_context_update(&step).await;
+    assert!(developer_input_texts(prepared.context_items()).iter()
+        .any(|text| text.contains("catalog approval policy B")), "same-slug candidate must carry new permissions");
+    session.compare_and_record_context_updates(prepared, session.services.planning_generation())
+        .await.unwrap().expect("commit changed permissions");
+    commit_test_context_baseline(&session, "approval-B").await;
+    let history = session.clone_history().await;
+    let projected = crate::stable_context::project_stable_context(
+        history.raw_items().to_vec().into(), crate::stable_context::StableContextTarget::Sampling,
+    );
+    let text = developer_input_texts(&projected.items);
+    assert!(!text.iter().any(|text| text.contains("catalog approval policy A")), "old catalog instructions must leave provider input");
+    assert_eq!(text.iter().filter(|text| text.contains("catalog approval policy B")).count(), 1);
+    assert!(session.prepare_context_update(&step).await.context_items().is_empty(),
+        "committed new permission receipt must settle back to the delta path");
 }
 
 #[tokio::test]
@@ -18314,7 +18528,6 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                 assert_eq!(notice["stale_workspace_evidence"], true);
                 assert_eq!(notice["valid_for_current_workspace"], false);
                 assert_eq!(notice["reason_code"], "missing_observation");
-                assert_eq!(notice["observed_revision"], serde_json::Value::Null);
                 let guidance = serde_json::to_string(items.as_ref()).unwrap();
                 assert!(guidance.contains("report the affected claim as unverified"));
                 assert!(guidance.contains("read_tool_output recovers historical bytes, not freshness"));

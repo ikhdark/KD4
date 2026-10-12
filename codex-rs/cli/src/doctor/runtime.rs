@@ -534,6 +534,7 @@ fn source_repo_root() -> Option<PathBuf> {
             if ancestor.join("codex-rs").join("Cargo.toml").is_file()
                 && ancestor
                     .join("scripts")
+                    .join("install")
                     .join("publish-local-codex.ps1")
                     .is_file()
             {

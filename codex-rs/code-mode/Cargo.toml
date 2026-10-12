@@ -28,6 +28,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 v8 = { workspace = true }
 
 [dev-dependencies]

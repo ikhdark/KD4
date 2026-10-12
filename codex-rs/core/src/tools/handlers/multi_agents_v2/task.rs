@@ -149,7 +149,7 @@ async fn handle_get_agent_task(
     let coordinator = session.services.agent_control.task_coordinator();
     let caller_binding = if turn.session_source.is_non_root_agent() {
         let binding = coordinator
-            .binding_for_source(&turn.session_source)
+            .binding_for_turn(&turn)
             .filter(|binding| binding.assignment_id == assignment_id)
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
@@ -200,7 +200,7 @@ async fn handle_submit_agent_receipt(
     let args: SubmitAgentReceiptArgs = parse_arguments(&arguments)?;
     let coordinator = session.services.agent_control.task_coordinator();
     let binding = coordinator
-        .binding_for_source(&turn.session_source)
+        .binding_for_turn(&turn)
         .ok_or_else(|| {
             FunctionCallError::RespondToModel(format!(
                 "{SUBMIT_AGENT_RECEIPT_TOOL}: the caller is not a typed agent with a bound task"
@@ -513,7 +513,7 @@ async fn handle_set_agent_gate(
     let coordinator = session.services.agent_control.task_coordinator();
     let actor = if turn.session_source.is_non_root_agent() {
         let binding = coordinator
-            .binding_for_source(&turn.session_source)
+            .binding_for_turn(&turn)
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
                     "{SET_AGENT_GATE_TOOL}: the caller is not a typed agent with a bound task"

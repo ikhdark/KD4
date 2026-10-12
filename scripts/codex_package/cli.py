@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
-from scripts.process_owner import OwnedThreadPoolExecutor as ThreadPoolExecutor
+from scripts.common.process_owner import OwnedThreadPoolExecutor as ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from time import perf_counter
@@ -19,7 +19,7 @@ from .archive import package_entries
 from .archive import resolve_zstd_command
 from .archive import validate_archive_output
 from .archive import write_archive
-from scripts.stage_npm_archives import exclusive_file_lock
+from scripts.codex_package.stage_npm_archives import exclusive_file_lock
 from .cargo import package_build_lease
 from .cargo import SourceBuildOutputs
 from .cargo import build_source_binaries

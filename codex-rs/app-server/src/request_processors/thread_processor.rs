@@ -2473,7 +2473,7 @@ impl ThreadRequestProcessor {
                 }
             }
         }
-        let (indexed_page, indexed_live_in_progress) = {
+        let (indexed_page, indexed_live_in_progress, history_generation) = {
             let state = thread_state.lock().await;
             (
                 state.indexed_turns_page(
@@ -2484,6 +2484,7 @@ impl ThreadRequestProcessor {
                     sort_direction,
                 ),
                 state.in_progress_turn_id().is_some(),
+                state.turn_index_history_generation(),
             )
         };
         let (mut page, indexed_live_in_progress) = match indexed_page {
@@ -2494,7 +2495,11 @@ impl ThreadRequestProcessor {
                     .await
                     .map_err(thread_read_view_error)?;
                 let mut state = thread_state.lock().await;
-                state.seed_turn_index_from_history(&items);
+                state
+                    .try_seed_turn_index_from_history(&items, history_generation)
+                    .map_err(|()| {
+                        invalid_request("thread history changed during pagination; retry the request")
+                    })?;
                 let page = state
                     .indexed_turns_page(
                         anchor
@@ -2610,19 +2615,22 @@ impl ThreadRequestProcessor {
                     .as_deref()
                     .map(parse_reconstructed_thread_items_cursor)
                     .transpose()?;
-                let indexed_page = {
+                let (indexed_page, history_generation) = {
                     let state = thread_state.lock().await;
-                    state.indexed_items_page(
-                        turn_id.as_deref(),
-                        anchor.as_ref().map(|anchor| {
-                            (
-                                anchor.turn_id.as_str(),
-                                anchor.item_id.as_str(),
-                                anchor.include_anchor,
-                            )
-                        }),
-                        page_size,
-                        sort_direction,
+                    (
+                        state.indexed_items_page(
+                            turn_id.as_deref(),
+                            anchor.as_ref().map(|anchor| {
+                                (
+                                    anchor.turn_id.as_str(),
+                                    anchor.item_id.as_str(),
+                                    anchor.include_anchor,
+                                )
+                            }),
+                            page_size,
+                            sort_direction,
+                        ),
+                        state.turn_index_history_generation(),
                     )
                 };
                 let page = match indexed_page {
@@ -2633,7 +2641,13 @@ impl ThreadRequestProcessor {
                             .await
                             .map_err(thread_read_view_error)?;
                         let mut state = thread_state.lock().await;
-                        state.seed_turn_index_from_history(&history);
+                        state
+                            .try_seed_turn_index_from_history(&history, history_generation)
+                            .map_err(|()| {
+                                invalid_request(
+                                    "thread history changed during pagination; retry the request",
+                                )
+                            })?;
                         state
                             .indexed_items_page(
                                 turn_id.as_deref(),

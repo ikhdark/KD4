@@ -599,6 +599,7 @@ pub(crate) struct ThreadState {
     listener_command_tx: Option<mpsc::Sender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
     turn_index: ThreadTurnIndex,
+    turn_index_rollback_generation: u64,
     rolled_back_wait_ids: HashSet<String>,
     turn_origin_tracker: TurnOriginTracker,
     listener_thread: Option<Weak<CodexThread>>,
@@ -772,8 +773,29 @@ impl ThreadState {
             .items_page(turn_id_filter, anchor, page_size, sort_direction)
     }
 
-    /// Seeds the pagination index once from persisted history while preserving
-    /// live events that arrived before the initial history load completed.
+    pub(crate) fn turn_index_history_generation(&self) -> u64 {
+        self.turn_index_rollback_generation
+    }
+
+    /// Commits an asynchronous history read only if no rollback invalidated it.
+    /// Another reader may already have initialized the live index; never replace it.
+    pub(crate) fn try_seed_turn_index_from_history(
+        &mut self,
+        items: &[RolloutItem],
+        expected_generation: u64,
+    ) -> Result<(), ()> {
+        if self.turn_index.initialized {
+            return Ok(());
+        }
+        if self.turn_index_rollback_generation != expected_generation {
+            return Err(());
+        }
+        self.seed_turn_index_from_history(items);
+        Ok(())
+    }
+
+    /// Seeds a synchronous history snapshot while preserving live additions.
+    /// Asynchronous readers must use the generation-checked entrypoint above.
     pub(crate) fn seed_turn_index_from_history(&mut self, items: &[RolloutItem]) {
         let live_index = std::mem::take(&mut self.turn_index);
         let mut builder = ThreadHistoryBuilder::new();
@@ -855,6 +877,8 @@ impl ThreadState {
             self.turn_summary.origin_connection_id = self.turn_origin_tracker.take(event_turn_id);
         }
         if let EventMsg::ThreadRolledBack(rollback) = event {
+            self.turn_index_rollback_generation =
+                self.turn_index_rollback_generation.wrapping_add(1);
             // The current-turn reducer is reset at terminal boundaries. Only
             // the pagination index retains the complete ordered live history.
             let retained = self.turn_index.order.len()
@@ -1532,6 +1556,93 @@ mod tests {
     }
 
     #[test]
+    fn history_seed_does_not_resurrect_turns_rolled_back_during_load() {
+        // Exercise both an uncommitted first read and a second initial reader
+        // whose peer has already committed the snapshot before the rollback.
+        for initialized_by_other_reader in [false, true] {
+            let mut state = ThreadState::default();
+            let mut history = Vec::new();
+            for turn_id in ["turn-1", "turn-2"] {
+                let events = [
+                    EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                        turn_id: turn_id.to_string(),
+                        trace_id: None,
+                        started_at: None,
+                        model_context_window: None,
+                        collaboration_mode_kind: ModeKind::Default,
+                    }),
+                    EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+                        thread_id: ThreadId::new(),
+                        turn_id: turn_id.to_string(),
+                        completed_at_ms: 0,
+                        item: codex_protocol::items::TurnItem::Plan(
+                            codex_protocol::items::PlanItem {
+                                id: format!("item-{turn_id}"),
+                                text: turn_id.to_string(),
+                            },
+                        ),
+                    }),
+                    terminal_event(turn_id, "done"),
+                ];
+                for event in events {
+                    state.track_current_turn_event(turn_id, &event);
+                    history.push(RolloutItem::EventMsg(event));
+                }
+            }
+            let generation = state.turn_index_history_generation();
+            if initialized_by_other_reader {
+                state
+                    .try_seed_turn_index_from_history(&history, generation)
+                    .unwrap();
+            }
+            let rollback = EventMsg::ThreadRolledBack(
+                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+            );
+            state.track_current_turn_event("", &rollback);
+            let stale_read = state.try_seed_turn_index_from_history(&history, generation);
+            if initialized_by_other_reader {
+                // A second reader must retain the already-initialized live index.
+                assert!(stale_read.is_ok());
+            } else {
+                assert!(stale_read.is_err());
+                assert!(state
+                    .indexed_turns_page(None, 10, SortDirection::Asc)
+                    .unwrap()
+                    .is_none());
+                // A fresh read containing the rollback can initialize normally.
+                history.push(RolloutItem::EventMsg(rollback));
+                let generation = state.turn_index_history_generation();
+                state
+                    .try_seed_turn_index_from_history(&history, generation)
+                    .unwrap();
+            }
+            let turns = state
+                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .unwrap()
+                .unwrap();
+            assert_eq!(turns.turns.len(), 1);
+            assert_eq!(turns.turns[0].id, "turn-1");
+            let items = state
+                .indexed_items_page(None, None, 10, SortDirection::Asc)
+                .unwrap()
+                .unwrap();
+            assert_eq!(items.items.len(), 1);
+            assert_eq!(items.items[0].item.id(), "item-turn-1");
+            assert!(state
+                .indexed_turns_page(Some(("turn-2", false)), 10, SortDirection::Asc)
+                .is_err());
+            assert!(state
+                .indexed_items_page(
+                    None,
+                    Some(("turn-2", "item-turn-2", false)),
+                    10,
+                    SortDirection::Asc,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
     fn seeded_history_merges_partial_live_items_by_identity() {
         let event = |id: &str, text: &str| {
             EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
@@ -1557,10 +1668,13 @@ mod tests {
             RolloutItem::EventMsg(event("b", "old")),
         ];
         let mut state = ThreadState::default();
+        let generation = state.turn_index_history_generation();
         state.track_current_turn_event("turn-1", &started);
         state.track_current_turn_event("turn-1", &event("b", "updated"));
         state.track_current_turn_event("turn-1", &event("c", "later"));
-        state.seed_turn_index_from_history(&persisted);
+        state
+            .try_seed_turn_index_from_history(&persisted, generation)
+            .unwrap();
         let page = state
             .indexed_items_page(None, None, 10, SortDirection::Asc)
             .unwrap()

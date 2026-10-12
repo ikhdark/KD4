@@ -12,7 +12,7 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
         (
             "query".to_string(),
             JsonSchema::string(Some(
-                "Short capability terms or exact tool names. +term requires a metadata match; source:<canonical namespace> (also +source:) restricts membership to that namespace (scope tokens appear in the source catalog; shared namespaces may contain several connectors). At most one scope; omit it for broad discovery. Name-only batches return available exact tools and report unknown snake_case names; wholly unknown name lookups fail. Mixed capability queries retain identifiers as task terms, not fuzzy callable aliases. Must contain capability terms and must not exceed 4,096 UTF-8 bytes."
+                "Short capability terms or exact tool names. +term requires a metadata match; source:<canonical namespace> (also +source:) restricts membership to that namespace (scope tokens appear in the source catalog; shared namespaces may contain several connectors). At most one scope; omit it for broad discovery. Name-only batches return available exact tools and report unknown snake_case names; wholly unknown name lookups fail. Mixed capability queries retain identifiers as task terms, not fuzzy callable aliases. Must not exceed 4,096 UTF-8 bytes."
                     .to_string(),
             )),
         ),

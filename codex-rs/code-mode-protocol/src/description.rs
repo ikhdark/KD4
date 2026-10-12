@@ -402,7 +402,7 @@ mod tests {
             "Output defaults to {} tokens",
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
-        assert!(description.contains("display budgets scale with the cell's remaining output budget"));
+        assert!(description.contains("bounded by the cell budget independently of earlier prints"));
         assert!(description.contains("explicit smaller per-call caps are honored"));
         assert!(!description.contains("the cell budget is separate"));
         assert!(description.contains(&format!(

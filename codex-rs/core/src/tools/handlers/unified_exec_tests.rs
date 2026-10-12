@@ -370,6 +370,12 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
     assert!(visible.get("stdout").is_none());
     assert!(visible.get("stderr").is_none());
     assert_eq!(visible["output"], result["output"]);
+    // A script that branches on a name it saw printed reads the same value.
+    assert_eq!(visible["current_chunk_display_complete"], false);
+    assert_eq!(visible["cumulative_streams_complete"], true);
+    for (name, value) in visible.as_object().unwrap() {
+        assert_eq!(result.get(name), Some(value), "printed field {name} is not on the result");
+    }
     let tty_payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "program": "python",

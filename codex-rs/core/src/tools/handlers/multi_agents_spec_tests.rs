@@ -425,7 +425,7 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     assert_eq!(name, "followup_task");
     assert_eq!(
         description,
-        "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for informational updates that need no new turn; ask for clarification when needed."
+        "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for informational updates that need no new turn; ask for clarification when needed. A typed (`assignment`) agent accepts a follow-up only while its attempt is active; once its receipt is sealed, spawn a new assignment instead."
     );
     assert_eq!(
         parameters.schema_type,
@@ -532,15 +532,16 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     );
     assert!(description.contains("Omit cursor to receive new"));
     assert!(!description.contains("Pass the returned cursor"));
+    assert!(description.contains("Returns at the first event, not when agents finish"));
     assert!(description.contains(
-        "Does not return the content; returns either a summary of which agents have updates (if any)"
+        "Does not return the content: a finished agent's answer arrives as a message on your next request"
     ));
     assert_eq!(
         properties
             .get("timeout_ms")
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Explicit caller deadline in milliseconds. Omit to keep waiting; the default 30000 ms interval is internal maintenance cadence only and does not return an unchanged result. Values below 10000 use that normal wait; values above 3600000 are capped. Use list_agents or get_agent_task for an immediate status snapshot."
+            "Explicit caller deadline in milliseconds. Omit to keep waiting; the default 30000 ms interval is internal maintenance cadence only and does not return an unchanged result. Values below 10000 are ignored and wait without a deadline; values above 3600000 are capped. Use list_agents or get_agent_task for an immediate status snapshot."
         )
     );
     let timeout = properties.get("timeout_ms").expect("timeout_ms schema");

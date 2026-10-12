@@ -323,20 +323,19 @@ impl LiveThread {
         let mut metadata_sync = self.metadata_sync.lock().await;
         let terminal_append =
             TerminalAppendGuard::new(Arc::clone(&self.terminal_events), items.as_slice());
-        if durable {
-            self.thread_store
-                .append_persisted_items(self.thread_id, items.as_slice())
-                .await?;
-        } else {
-            self.thread_store
-                .append_persisted_items_ordered(self.thread_id, items.as_slice())
-                .await?;
-        }
+        self.thread_store
+            .append_persisted_items_ordered(self.thread_id, items.as_slice())
+            .await?;
         terminal_append.commit(items.as_slice());
         let update = metadata_sync.observe_appended_items(items.as_slice());
+        // Acceptance and durability are separate: a failed barrier must retain the
+        // observed metadata for flush recovery, without resubmitting the history.
+        if durable {
+            self.thread_store.flush_thread(self.thread_id).await?;
+        }
         if durable && let Some(update) = update {
             self.thread_store
-                .update_thread_metadata(UpdateThreadMetadataParams {
+                .update_thread_metadata_ack(UpdateThreadMetadataParams {
                     thread_id: self.thread_id,
                     patch: update.patch.clone(),
                     include_archived: true,
@@ -537,7 +536,7 @@ impl LiveThread {
             return Ok(());
         };
         self.thread_store
-            .update_thread_metadata(UpdateThreadMetadataParams {
+            .update_thread_metadata_ack(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
                 patch: update.patch.clone(),
                 include_archived: true,

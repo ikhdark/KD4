@@ -124,7 +124,7 @@ pub(crate) async fn load_plugins_from_layer_stack(
     remote_global_catalog_active: bool,
 ) -> Result<Vec<LoadedPlugin<McpServerConfig>>, String> {
     let skill_config_rules = skill_config_rules_from_stack(config_layer_stack);
-    load_plugins_from_layer_stack_with_scope(
+    let mut plugins = load_plugins_from_layer_stack_with_scope(
         config_layer_stack,
         extra_plugins,
         store,
@@ -135,7 +135,32 @@ pub(crate) async fn load_plugins_from_layer_stack(
             plugin_skill_snapshots,
         },
     )
-    .await
+    .await?;
+    withhold_skills_without_required_apps(config_layer_stack, &mut plugins);
+    Ok(plugins)
+}
+
+/// A plugin's skills drive the app it declares `required`. When config
+/// disables that app its tools are never exposed, so listing the skills would
+/// only offer a dead end.
+fn withhold_skills_without_required_apps(
+    config_layer_stack: &ConfigLayerStack,
+    plugins: &mut [LoadedPlugin<McpServerConfig>],
+) {
+    // An invalid apps policy is reported where apps are resolved; do not guess here.
+    let Ok(policy) = codex_connectors::AppToolPolicyEvaluator::new(config_layer_stack) else {
+        return;
+    };
+    for plugin in plugins {
+        if plugin
+            .apps
+            .iter()
+            .any(|app| app.required && !policy.app_enabled(&app.connector_id.0))
+        {
+            plugin.skill_roots.clear();
+            plugin.has_enabled_skills = false;
+        }
+    }
 }
 
 async fn load_plugins_from_layer_stack_with_scope(

@@ -13,7 +13,7 @@ $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir '../../..'))
 $sourceProtoDir = Join-Path $repoRoot 'codex-rs/config/src/thread_config/proto'
 $sourceProto = Join-Path $sourceProtoDir 'codex.thread_config.v1.proto'
 $checkedGenerated = Join-Path $sourceProtoDir 'codex.thread_config.v1.rs'
-$cargoLane = Join-Path $repoRoot 'scripts/cargo-lane.ps1'
+$cargoLane = Join-Path $repoRoot 'scripts/build/cargo-lane.ps1'
 $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
 $tmpDir = [System.IO.Path]::GetFullPath(
     (Join-Path $tempRoot ('codex-generate-proto-' + [guid]::NewGuid().ToString('N')))

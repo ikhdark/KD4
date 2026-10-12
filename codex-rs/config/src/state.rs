@@ -546,7 +546,7 @@ impl ConfigLayerStack {
         profile: Option<&ProfileV2Name>,
         user_config: TomlValue,
     ) -> Self {
-        let user_layer = ConfigLayerEntry::new(
+        let mut user_layer = ConfigLayerEntry::new(
             ConfigLayerSource::User {
                 file: config_toml.clone(),
                 profile: profile.map(ToString::to_string),
@@ -561,6 +561,7 @@ impl ConfigLayerStack {
                 ConfigLayerSource::User { file, .. } if file == config_toml
             )
         }) {
+            user_layer.disabled_reason = layers[index].disabled_reason.clone();
             layers.remove(index);
         }
         match layers

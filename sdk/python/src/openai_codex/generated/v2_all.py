@@ -1177,7 +1177,7 @@ class FeedbackUploadParams(BaseModel):
     extra_log_files: Annotated[list[str] | None, Field(alias="extraLogFiles")] = None
     include_logs: Annotated[bool | None, Field(alias="includeLogs")] = None
     reason: str | None = None
-    tags: dict[str, Any] | None = None
+    tags: dict[str, str] | None = None
     thread_id: Annotated[str | None, Field(alias="threadId")] = None
 
 
@@ -1868,7 +1868,7 @@ class ExecLocalShellAction(BaseModel):
         populate_by_name=True,
     )
     command: list[str]
-    env: dict[str, Any] | None = None
+    env: dict[str, str] | None = None
     timeout_ms: Annotated[int | None, Field(ge=0)] = None
     type: Annotated[Literal["exec"], Field(title="ExecLocalShellActionType")]
     user: str | None = None
@@ -2430,60 +2430,6 @@ class NetworkAccess(Enum):
 class NetworkDomainPermission(Enum):
     allow = "allow"
     deny = "deny"
-
-
-class NetworkRequirements(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    allow_local_binding: Annotated[bool | None, Field(alias="allowLocalBinding")] = None
-    allow_unix_sockets: Annotated[
-        list[str] | None,
-        Field(
-            alias="allowUnixSockets",
-            description="Legacy compatibility view derived from `unix_sockets`.",
-        ),
-    ] = None
-    allow_upstream_proxy: Annotated[bool | None, Field(alias="allowUpstreamProxy")] = None
-    allowed_domains: Annotated[
-        list[str] | None,
-        Field(
-            alias="allowedDomains", description="Legacy compatibility view derived from `domains`."
-        ),
-    ] = None
-    dangerously_allow_all_unix_sockets: Annotated[
-        bool | None, Field(alias="dangerouslyAllowAllUnixSockets")
-    ] = None
-    dangerously_allow_non_loopback_proxy: Annotated[
-        bool | None, Field(alias="dangerouslyAllowNonLoopbackProxy")
-    ] = None
-    denied_domains: Annotated[
-        list[str] | None,
-        Field(
-            alias="deniedDomains", description="Legacy compatibility view derived from `domains`."
-        ),
-    ] = None
-    domains: Annotated[
-        dict[str, Any] | None,
-        Field(description="Canonical network permission map for `experimental_network`."),
-    ] = None
-    enabled: bool | None = None
-    http_port: Annotated[int | None, Field(alias="httpPort", ge=0)] = None
-    managed_allowed_domains_only: Annotated[
-        bool | None,
-        Field(
-            alias="managedAllowedDomainsOnly",
-            description="When true, only managed allowlist entries are respected while managed network enforcement is active.",
-        ),
-    ] = None
-    socks_port: Annotated[int | None, Field(alias="socksPort", ge=0)] = None
-    unix_sockets: Annotated[
-        dict[str, Any] | None,
-        Field(
-            alias="unixSockets",
-            description="Canonical unix socket permission map for `experimental_network`.",
-        ),
-    ] = None
 
 
 class NetworkSandboxPolicy(Enum):
@@ -6639,7 +6585,7 @@ class CommandExecParams(BaseModel):
         ),
     ] = None
     env: Annotated[
-        dict[str, Any] | None,
+        dict[str, str | None] | None,
         Field(
             description="Optional environment overrides merged into the server-computed environment.\n\nMatching names override inherited values. Set a key to `null` to unset an inherited variable."
         ),
@@ -7255,6 +7201,60 @@ class ModelListResponse(BaseModel):
         Field(
             alias="nextCursor",
             description="Opaque cursor to pass to the next call to continue after the last item. If None, there are no more items to return.",
+        ),
+    ] = None
+
+
+class NetworkRequirements(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    allow_local_binding: Annotated[bool | None, Field(alias="allowLocalBinding")] = None
+    allow_unix_sockets: Annotated[
+        list[str] | None,
+        Field(
+            alias="allowUnixSockets",
+            description="Legacy compatibility view derived from `unix_sockets`.",
+        ),
+    ] = None
+    allow_upstream_proxy: Annotated[bool | None, Field(alias="allowUpstreamProxy")] = None
+    allowed_domains: Annotated[
+        list[str] | None,
+        Field(
+            alias="allowedDomains", description="Legacy compatibility view derived from `domains`."
+        ),
+    ] = None
+    dangerously_allow_all_unix_sockets: Annotated[
+        bool | None, Field(alias="dangerouslyAllowAllUnixSockets")
+    ] = None
+    dangerously_allow_non_loopback_proxy: Annotated[
+        bool | None, Field(alias="dangerouslyAllowNonLoopbackProxy")
+    ] = None
+    denied_domains: Annotated[
+        list[str] | None,
+        Field(
+            alias="deniedDomains", description="Legacy compatibility view derived from `domains`."
+        ),
+    ] = None
+    domains: Annotated[
+        dict[str, NetworkDomainPermission] | None,
+        Field(description="Canonical network permission map for `experimental_network`."),
+    ] = None
+    enabled: bool | None = None
+    http_port: Annotated[int | None, Field(alias="httpPort", ge=0)] = None
+    managed_allowed_domains_only: Annotated[
+        bool | None,
+        Field(
+            alias="managedAllowedDomainsOnly",
+            description="When true, only managed allowlist entries are respected while managed network enforcement is active.",
+        ),
+    ] = None
+    socks_port: Annotated[int | None, Field(alias="socksPort", ge=0)] = None
+    unix_sockets: Annotated[
+        dict[str, NetworkUnixSocketPermission] | None,
+        Field(
+            alias="unixSockets",
+            description="Canonical unix socket permission map for `experimental_network`.",
         ),
     ] = None
 
@@ -8984,8 +8984,8 @@ class AppInfo(BaseModel):
     branding: AppBranding | None = None
     description: str | None = None
     distribution_channel: Annotated[str | None, Field(alias="distributionChannel")] = None
-    icon_assets: Annotated[dict[str, Any] | None, Field(alias="iconAssets")] = None
-    icon_dark_assets: Annotated[dict[str, Any] | None, Field(alias="iconDarkAssets")] = None
+    icon_assets: Annotated[dict[str, str] | None, Field(alias="iconAssets")] = None
+    icon_dark_assets: Annotated[dict[str, str] | None, Field(alias="iconDarkAssets")] = None
     id: str
     install_url: Annotated[str | None, Field(alias="installUrl")] = None
     is_accessible: Annotated[bool | None, Field(alias="isAccessible")] = False
@@ -8996,7 +8996,7 @@ class AppInfo(BaseModel):
             description="Whether this app is enabled in config.toml. Example: ```toml [apps.bad_app] enabled = false ```",
         ),
     ] = True
-    labels: dict[str, Any] | None = None
+    labels: dict[str, str] | None = None
     logo_url: Annotated[str | None, Field(alias="logoUrl")] = None
     logo_url_dark: Annotated[str | None, Field(alias="logoUrlDark")] = None
     name: str
@@ -9340,7 +9340,7 @@ class GetAccountRateLimitsResponse(BaseModel):
         ),
     ]
     rate_limits_by_limit_id: Annotated[
-        dict[str, Any] | None,
+        dict[str, RateLimitSnapshot] | None,
         Field(
             alias="rateLimitsByLimitId",
             description="Multi-bucket view keyed by metered `limit_id` (for example, `codex`).",
@@ -9942,7 +9942,7 @@ class ConfigRequirements(BaseModel):
         list[AskForApproval] | None, Field(alias="allowedApprovalPolicies")
     ] = None
     allowed_permission_profiles: Annotated[
-        dict[str, Any] | None, Field(alias="allowedPermissionProfiles")
+        dict[str, bool] | None, Field(alias="allowedPermissionProfiles")
     ] = None
     allowed_sandbox_modes: Annotated[
         list[SandboxMode] | None, Field(alias="allowedSandboxModes")
@@ -9958,7 +9958,7 @@ class ConfigRequirements(BaseModel):
     enforce_residency: Annotated[ResidencyRequirement | None, Field(alias="enforceResidency")] = (
         None
     )
-    feature_requirements: Annotated[dict[str, Any] | None, Field(alias="featureRequirements")] = (
+    feature_requirements: Annotated[dict[str, bool] | None, Field(alias="featureRequirements")] = (
         None
     )
     models: ModelsRequirements | None = None

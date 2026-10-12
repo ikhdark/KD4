@@ -1,6 +1,6 @@
 set working-directory := "codex-rs"
 set positional-arguments
-export JUST_SHELL := justfile_directory() / "scripts/just-shell.py"
+export JUST_SHELL := justfile_directory() / "scripts/build/just-shell.py"
 set shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
@@ -51,7 +51,7 @@ file-search *args:
 # Build the CLI and run the app-server test client in one target lane.
 [windows]
 app-server-test-client *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane app-server-test-client --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _app-server-test-client-reserved @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane app-server-test-client --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _app-server-test-client-reserved @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 _app-server-test-client-reserved *args:
@@ -62,7 +62,7 @@ _app-server-test-client-reserved *args:
 fmt *args:
     import runpy
     import sys
-    script = r"{{ justfile_directory() }}/scripts/format.py"
+    script = r"{{ justfile_directory() }}/scripts/maintenance/format.py"
     sys.argv = [script, "--fast-local", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
@@ -71,7 +71,7 @@ fmt *args:
 fmt-check-fast *args:
     import runpy
     import sys
-    script = r"{{ justfile_directory() }}/scripts/format.py"
+    script = r"{{ justfile_directory() }}/scripts/maintenance/format.py"
     sys.argv = [script, "--check", "--fast-local", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
@@ -80,7 +80,7 @@ fmt-check-fast *args:
 fmt-full *args:
     import runpy
     import sys
-    script = r"{{ justfile_directory() }}/scripts/format.py"
+    script = r"{{ justfile_directory() }}/scripts/maintenance/format.py"
     sys.argv = [script, *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
@@ -89,13 +89,13 @@ fmt-full *args:
 fmt-check *args:
     import runpy
     import sys
-    script = r"{{ justfile_directory() }}/scripts/format.py"
+    script = r"{{ justfile_directory() }}/scripts/maintenance/format.py"
     sys.argv = [script, "--check", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
 [no-cd]
 kd4-perf-snapshot *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/kd4_perf_snapshot.py" {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/benchmark_scripts/kd4_perf_snapshot.py" {args}
 
 # Inspect committed blobs; pass --base, --head, and an explicit --allowlist.
 [working-directory("..")]
@@ -103,41 +103,41 @@ kd4-perf-snapshot *args:
 check-blob-size *args:
     import runpy
     import sys
-    script = r"{{ justfile_directory() }}/scripts/check_blob_size.py"
+    script = r"{{ justfile_directory() }}/scripts/maintenance/check_blob_size.py"
     sys.argv = [script, *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
 [no-cd]
 audit-scripts *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/root_maintenance.py" audit-scripts {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/maintenance/root_maintenance.py" audit-scripts {args}
 
 [no-cd]
 dev-env-doctor *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/dev_env_doctor.py" {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/maintenance/dev_env_doctor.py" {args}
 
 [no-cd]
 git-doctor *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/git_doctor.py" {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/maintenance/git_doctor.py" {args}
 
 [no-cd]
 vscode-runtime-proof *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/vscode_runtime_proof.py" {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/maintenance/vscode_runtime_proof.py" {args}
 
 [windows]
 fix *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); . "{{ justfile_directory() }}\scripts\common-rust-env.ps1"; $has_package = @(Get-CodexCargoPackageSpecs -CommandArgs $forwarded_args).Count -gt 0; $broad = $false; foreach ($arg in $forwarded_args) { if ($arg -ceq '--') { break }; if ($arg -cin @('--workspace', '--all')) { $broad = $true } }; if (-not $has_package -or $broad) { Write-Error "Pass a package selection (-p/--package) to 'just fix', or use 'just fix-workspace' for workspace scope."; exit 2 }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); . "{{ justfile_directory() }}\scripts\build\common-rust-env.ps1"; $has_package = @(Get-CodexCargoPackageSpecs -CommandArgs $forwarded_args).Count -gt 0; $broad = $false; foreach ($arg in $forwarded_args) { if ($arg -ceq '--') { break }; if ($arg -cin @('--workspace', '--all')) { $broad = $true } }; if (-not $has_package -or $broad) { Write-Error "Pass a package selection (-p/--package) to 'just fix', or use 'just fix-workspace' for workspace scope."; exit 2 }; python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 fix-workspace *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 clippy *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); . "{{ justfile_directory() }}\scripts\common-rust-env.ps1"; $has_package = @(Get-CodexCargoPackageSpecs -CommandArgs $forwarded_args).Count -gt 0; $broad = $false; foreach ($arg in $forwarded_args) { if ($arg -ceq '--') { break }; if ($arg -cin @('--workspace', '--all')) { $broad = $true } }; if (-not $has_package -or $broad) { Write-Error "Pass a package selection (-p/--package) to 'just clippy', or use 'just clippy-workspace' for workspace scope."; exit 2 }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --tests @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); . "{{ justfile_directory() }}\scripts\build\common-rust-env.ps1"; $has_package = @(Get-CodexCargoPackageSpecs -CommandArgs $forwarded_args).Count -gt 0; $broad = $false; foreach ($arg in $forwarded_args) { if ($arg -ceq '--') { break }; if ($arg -cin @('--workspace', '--all')) { $broad = $true } }; if (-not $has_package -or $broad) { Write-Error "Pass a package selection (-p/--package) to 'just clippy', or use 'just clippy-workspace' for workspace scope."; exit 2 }; python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --tests @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 clippy-workspace *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); & "{{ justfile_directory() }}\scripts\cargo-workspace-analyzer.ps1" -Analyzer clippy --workspace @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); & "{{ justfile_directory() }}\scripts\build\cargo-workspace-analyzer.ps1" -Analyzer clippy --workspace @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 cargo-shear *args:
@@ -145,7 +145,7 @@ cargo-shear *args:
 
 [windows]
 rust-dead-code-matrix *args:
-    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; & "{{ justfile_directory() }}\scripts\cargo-workspace-analyzer.ps1" -Analyzer dead-code @forwarded_args; exit $LASTEXITCODE
+    @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; & "{{ justfile_directory() }}\scripts\build\cargo-workspace-analyzer.ps1" -Analyzer dead-code @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 install:
@@ -163,7 +163,7 @@ install:
     }
     rustup show active-toolchain
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $rustfmtToolchain = & {{ python }} "{{ justfile_directory() }}\scripts\tool_versions.py"
+    $rustfmtToolchain = & {{ python }} "{{ justfile_directory() }}\scripts\common\tool_versions.py"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     rustup toolchain install $rustfmtToolchain --profile minimal --component rustfmt
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -173,13 +173,13 @@ install:
 [no-cd]
 [windows]
 publish-local-codex-final *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile local-release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktopIfNeeded {args}
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile local-release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktopIfNeeded {args}
 
 [no-cd]
 [windows]
 prepare-codex-release version:
-    @{{ python }} "{{ justfile_directory() }}\scripts\build_codex_package.py" --target x86_64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-x64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
-    @{{ python }} "{{ justfile_directory() }}\scripts\build_codex_package.py" --target aarch64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-arm64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
+    @{{ python }} "{{ justfile_directory() }}\scripts\codex_package\build_codex_package.py" --target x86_64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-x64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
+    @{{ python }} "{{ justfile_directory() }}\scripts\codex_package\build_codex_package.py" --target aarch64-pc-windows-msvc --cargo-profile release --release-version "{{ version }}" --package-dir "{{ justfile_directory() }}\_build\packages\{{ version }}-arm64" --release-dir "{{ justfile_directory() }}\_build\release\{{ version }}" --force
 
 [windows]
 _sign-codex-release-preflight:
@@ -203,21 +203,21 @@ publish-codex-release version: _publish-codex-release-preflight (sign-codex-rele
 [no-cd]
 [windows]
 sccache-stats:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\sccache-perf.ps1" stats
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\build\sccache-perf.ps1" stats
 
 [no-cd]
 [windows]
 sccache-reset:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\sccache-perf.ps1" reset
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\build\sccache-perf.ps1" reset
 
 [no-cd]
 [windows]
 sccache-restart:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\sccache-perf.ps1" restart
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\build\sccache-perf.ps1" restart
 
 [windows]
 rust-perf-env *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -CargoTargetLane "perf" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); & "{{ justfile_directory() }}\scripts\build\invoke-rust-perf-env.ps1" -CargoTargetLane "perf" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $forwarded_args; exit $LASTEXITCODE
 
 # Run nextest with --no-fail-fast so all tests are run.
 #
@@ -226,12 +226,12 @@ rust-perf-env *args:
 # separate crate feature. There is no need to add `--all-features`.
 [windows]
 test *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-fail-fast @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-fail-fast @forwarded_args; exit $LASTEXITCODE
 
 # Fast local test loop: finish the selected tests without flaky retries.
 [windows]
 test-fast *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run @forwarded_args; exit $LASTEXITCODE
 
 # Named `codex-core` test targets and gates. `codex-rs/.config/kd4-rust-tests.toml`
 # owns the package/target selection and the exact helper binaries each target
@@ -256,40 +256,40 @@ test-fast *args:
 [windows]
 core-test target *args:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "local", sys.argv[1], "--no-fail-fast", *sys.argv[2:]]))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "local", sys.argv[1], "--no-fail-fast", *sys.argv[2:]]))
 
 # Fast local loop for a named core target: finish the selection, no retries.
 [script("python")]
 [windows]
 core-test-fast target *args:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
 
 # Opt-in symbol-free builds; keep separate artifacts for a fair dev/dev-small comparison.
 [script("python")]
 [windows]
 core-test-small target *args:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "core-tests-small", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-small-reserved", *sys.argv[1:]]))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "core-tests-small", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-small-reserved", *sys.argv[1:]]))
 
 [windows]
 _core-test-small-reserved target *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir --cargo-profile dev-small run-target --profile fast "{{ target }}" @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" --target-dir $target_dir --cargo-profile dev-small run-target --profile fast "{{ target }}" @forwarded_args; exit $LASTEXITCODE
 
 # Run a named core target in a lane of its own, apart from the shared core lane.
 [script("python")]
 [windows]
 core-test-lane target *args:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", sys.argv[1], "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", sys.argv[1], "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-test-reserved", "fast", *sys.argv[1:]]))
 
 [windows]
 _core-test-reserved profile target *args:
-    $forwarded_args = @($args | Select-Object -Skip 3); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "{{ profile }}"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir run-target "{{ target }}" @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 3); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "{{ profile }}"; python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" --target-dir $target_dir run-target "{{ target }}" @forwarded_args; exit $LASTEXITCODE
 
 # Run gates together, sharing helper builds, overlapping tests, and one nextest
 # invocation per package and helper set. Every declared step must select and
@@ -298,12 +298,12 @@ _core-test-reserved profile target *args:
 [windows]
 core-gate +gates:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-gate-reserved", *sys.argv[1:]]))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_build_status.py", ["run-lane", "--lane", "{{ core_test_lane }}", "--warm-wait-seconds", "{{ rust_validation_wait_seconds }}", "--", "just", "_core-gate-reserved", *sys.argv[1:]]))
 
 [windows]
 _core-gate-reserved +gates:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir run-gate @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" --target-dir $target_dir run-gate @forwarded_args; exit $LASTEXITCODE
 
 # Run transport and real continuation boundary regressions deliberately.
 [windows]
@@ -315,42 +315,42 @@ test-slow-boundaries:
 [script("python")]
 core-test-list:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["list-targets"], program=r"{{ python }}"))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_test_runner.py", ["list-targets"], program=r"{{ python }}"))
 
 # Show the resolved selection, helper builds, and commands for a target or gate.
 [no-cd]
 [script("python")]
 core-test-plan name:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["plan", *sys.argv[1:]], program=r"{{ python }}"))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_test_runner.py", ["plan", *sys.argv[1:]], program=r"{{ python }}"))
 
 # List the gates whose declared tests live in the modules owning changed Rust files.
 [no-cd]
 [script("python")]
 core-test-gates-for +paths:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["gates-for", *sys.argv[1:]], program=r"{{ python }}"))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_test_runner.py", ["gates-for", *sys.argv[1:]], program=r"{{ python }}"))
 
 # Validate the manifest against `cargo metadata --no-deps` without building tests.
 [no-cd]
 [script("python")]
 core-test-manifest-check:
     import runpy, sys
-    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/just-shell.py")
-    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/rust_test_runner.py", ["check-manifest"], program=r"{{ python }}"))
+    adapter = runpy.run_path(r"{{ justfile_directory() }}/scripts/build/just-shell.py")
+    raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_test_runner.py", ["check-manifest"], program=r"{{ python }}"))
 
 # Isolated non-incremental experiment; this also changes the target directory.
 [windows]
 test-fast-nosccache *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\build\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
 
 # Warm the same automatic package lane used by test and test-fast.
 [windows]
 test-compile *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-run @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-run @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 test-windows-sandbox-processes *args:
@@ -376,30 +376,30 @@ local-release package:
 # validate different slices without contending on the default Cargo target lock.
 [windows]
 test-lane lane *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-local-reserved @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-local-reserved @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 test-lane-main *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane main --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-local-reserved @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane main --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-local-reserved @forwarded_args; exit $LASTEXITCODE
 
 # Fast isolated local test loop for parallel validation lanes.
 [windows]
 test-lane-fast lane *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-fast-reserved @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-fast-reserved @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 _test-lane-local-reserved *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
 
 [windows]
 _test-lane-fast-reserved *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
 
 # Emit Cargo's build-timing HTML report for the selected local test slice,
 # built in the same automatic package lane as test and test-fast.
 [windows]
 test-timings *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-fail-fast --timings @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo nextest run --no-fail-fast --timings @forwarded_args; exit $LASTEXITCODE
 
 # Focused crate test without repo-wide formatting.
 validate-crate-focused crate *args:
@@ -418,7 +418,7 @@ validate-crate-full crate *args:
 _validate-crate mode crate *args:
     import sys
     sys.path.insert(0, r"{{ justfile_directory() }}")
-    from scripts.rust_test_runner import RunnerError, run_crate_validation
+    from scripts.build.rust_test_runner import RunnerError, run_crate_validation
     try:
         code = run_crate_validation(sys.argv[1], sys.argv[2], sys.argv[3:])
     except RunnerError as error:
@@ -428,60 +428,60 @@ _validate-crate mode crate *args:
 
 [windows]
 cargo-lane lane *args:
-    @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ lane }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 [windows]
 cargo-lane-isolated-home lane *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome -WarmWaitSeconds "{{ rust_validation_wait_seconds }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\build\cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome -WarmWaitSeconds "{{ rust_validation_wait_seconds }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 [working-directory("..")]
 test-release-tooling:
-    {{ python }} -m unittest scripts.test_build_tooling_policy scripts.test_check_blob_size scripts.test_stage_npm_packages
+    {{ python }} -m unittest scripts.build.test_build_tooling_policy scripts.maintenance.test_check_blob_size scripts.codex_package.test_stage_npm_packages
 
 [no-cd]
 rust-build-doctor:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" doctor
+    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" doctor
 
 [no-cd]
 target-disk:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" disk
+    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" disk
 
 [no-cd]
 target-prune *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" prune {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" prune {args}
 
 # Preview target cache cleanup with `just target-optimize-dry-run` before pruning.
 [no-cd]
 target-optimize *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" optimize --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" optimize --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
 
 [no-cd]
 target-optimize-dry-run *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" optimize --dry-run --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
+    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" optimize --dry-run --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
 
 [no-cd]
 lanes:
-    @{{ python }} "{{ justfile_directory() }}/scripts/rust_build_status.py" lanes
+    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" lanes
 
 [windows]
 test-lane-package package *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-package-reserved "{{ package }}" @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _test-lane-package-reserved "{{ package }}" @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 _test-lane-package-reserved package *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\build\rust_test_runner.py" _guard-generic -- "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
 
 [windows]
 check-lane package *args:
-    @$forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo check -p "{{ package }}" @forwarded_args; exit $LASTEXITCODE
+    @$forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo check -p "{{ package }}" @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 clippy-lane package *args:
-    @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --tests -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --tests -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 [windows]
 watch-lane package *args:
-    @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _watch-lane-reserved "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _watch-lane-reserved "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 [windows]
 _watch-lane-reserved package *args:
@@ -489,16 +489,16 @@ _watch-lane-reserved package *args:
 
 [windows]
 coverage-lane package *args:
-    @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo llvm-cov -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo llvm-cov -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 # Fix only the named package in its own lane.
 [windows]
 fix-lane package *args:
-    @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 [windows]
 release-lane *args:
-    @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane release --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo build --release @($args | Select-Object -Skip 1); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane release --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo build --release @($args | Select-Object -Skip 1); exit $LASTEXITCODE
 
 # Build the default Cargo workspace members with the release profile.
 build-for-release *args:
@@ -515,7 +515,7 @@ deps-duplicates-workspace *args:
 [windows]
 release-build-fast *args:
     # Standalone release compile proof only; publish-local-codex reads the profile target, not this lane artifact.
-    $forwarded_args = @($args | Select-Object -Skip 1); $command_args = @("cargo", "build", "--release", "-p", "codex-cli") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -CargoTargetLane "release-cli" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); $command_args = @("cargo", "build", "--release", "-p", "codex-cli") + $forwarded_args; & "{{ justfile_directory() }}\scripts\build\invoke-rust-perf-env.ps1" -CargoTargetLane "release-cli" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
 
 # Run the MCP server
 mcp-server-run *args:
@@ -553,12 +553,12 @@ config-schema-protocol-check:
 # Check config schema freshness without modifying generated output.
 [no-cd]
 config-schema-check:
-    {{ python }} "{{ justfile_directory() }}/scripts/config_schema_check.py" --mode check
+    {{ python }} "{{ justfile_directory() }}/scripts/schemas/config_schema_check.py" --mode check
 
 # Explicitly regenerate config schema under the repository generation lock.
 [no-cd]
 config-schema-regenerate owner:
-    {{ python }} "{{ justfile_directory() }}/scripts/config_schema_check.py" --mode force --owner "{{ owner }}"
+    {{ python }} "{{ justfile_directory() }}/scripts/schemas/config_schema_check.py" --mode force --owner "{{ owner }}"
 
 # Run focused app-server runtime validation without regenerating schemas.
 app-server-runtime-check:
@@ -568,7 +568,7 @@ tui-large-widget-check:
     just core-gate tui-large-widget; exit $LASTEXITCODE
 
 deps-duplicates-check *args:
-    {{ python }} "{{ justfile_directory() }}/scripts/check_duplicate_deps.py" {args}
+    {{ python }} "{{ justfile_directory() }}/scripts/maintenance/check_duplicate_deps.py" {args}
 
 # Refresh the advisory database and audit the locked dependency graph.
 deps-audit:
@@ -578,7 +578,7 @@ deps-audit:
 # Enforce the shared advisory exceptions before either dependency-policy gate.
 [working-directory("..")]
 deps-advisories-check:
-    {{ python }} -m unittest scripts.test_build_tooling_policy.BuildToolingPolicyTest.test_advisory_ignores_match_between_audit_and_deny
+    {{ python }} -m unittest scripts.build.test_build_tooling_policy.BuildToolingPolicyTest.test_advisory_ignores_match_between_audit_and_deny
 
 # Dependency policy gate for the dependency-cleanup surface: duplicate report
 # plus the offline cargo-deny checks. Advisories need network access, so they
@@ -597,14 +597,14 @@ _cargo-deny-installed:
 [windows]
 sdk-ts-check:
     pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run typecheck
-    python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane sdk-runtime --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _sdk-runtime-reserved pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run test; exit $LASTEXITCODE
+    python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane sdk-runtime --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _sdk-runtime-reserved pnpm --dir "{{ justfile_directory() }}" --filter @openai/codex-sdk run test; exit $LASTEXITCODE
 
 # Lint the Python SDK, then run its suite against this checkout's runtime
 # (default marker exclusions apply).
 [windows]
 sdk-python-check:
     uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev ruff check .
-    python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane sdk-runtime --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _sdk-runtime-reserved uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest; exit $LASTEXITCODE
+    python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane sdk-runtime --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _sdk-runtime-reserved uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest; exit $LASTEXITCODE
 
 # Build the runtime helper pair in the reserved lane, then run an SDK suite
 # with CODEX_EXEC_PATH pointing at that build.
@@ -636,14 +636,14 @@ app-server-schema-protocol-check:
 # CODEX_SCHEMA_COMPATIBILITY_BASELINE; choose the contract revision explicitly.
 [no-cd]
 app-server-schema-check *args:
-    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check {args}
+    {{ python }} "{{ justfile_directory() }}/scripts/schemas/app_server_schema_runtime_check.py" --mode check {args}
 
 # Explicitly regenerate app-server schemas under their generation lock.
 # Stable regeneration requires CODEX_SCHEMA_COMPATIBILITY_BASELINE.
 # --experimental exports to dist/app-server-schema-experimental, not stable fixtures.
 [no-cd]
 app-server-schema-regenerate owner experimental="":
-    {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("app-server-schema-regenerate only accepts --experimental") } }}
+    {{ python }} "{{ justfile_directory() }}/scripts/schemas/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("app-server-schema-regenerate only accepts --experimental") } }}
 
 # Regenerate hook schema artifacts through the Rust workspace from any cwd.
 [no-cd]

@@ -733,8 +733,8 @@ fn fork_validation_routes_receive_the_diagnostic_budget() {
         "just --justfile 'C:/repo with spaces/justfile' config-schema-protocol-check",
         "just -q -f codex-rs/justfile -- app-server-schema-check",
         "just --justfile=codex-rs/justfile fmt-check",
-        "python scripts/rust_test_runner.py run-target core_lib -E test(parser)",
-        "python -I -B scripts/rust_test_runner.py run-target --profile fast core_lib -E test(parser)",
+        "python scripts/build/rust_test_runner.py run-target core_lib -E test(parser)",
+        "python -I -B scripts/build/rust_test_runner.py run-target --profile fast core_lib -E test(parser)",
         "just --set rust_validation_wait_seconds 5 core-gate tool-output-recovery",
         "uv run pytest -q",
         "node --test",
@@ -774,8 +774,8 @@ fn just_non_validation_commands_keep_the_success_budget() {
         "just run test",
         "just --set rust_validation_wait_seconds",
         "just --set rust_validation_wait_seconds 5 run test",
-        "python -I -B -c 'print(1)' scripts/rust_test_runner.py",
-        "python -I -B other.py scripts/rust_test_runner.py",
+        "python -I -B -c 'print(1)' scripts/build/rust_test_runner.py",
+        "python -I -B other.py scripts/build/rust_test_runner.py",
     ] {
         assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::Normal, "{command}");
         assert_eq!(
@@ -1185,7 +1185,7 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
         "just test-fast -p codex-utils-output-truncation --lib",
         "python -m pytest",
         "& 'cargo' test",
-        "python scripts\\rust_test_runner.py run-target core_lib",
+        "python scripts\\build\\rust_test_runner.py run-target core_lib",
     ] {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000)

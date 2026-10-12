@@ -135,50 +135,19 @@ pub(super) async fn resume_thread(
     Ok(history)
 }
 
-pub(super) async fn append_persisted_items(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    items: &[RolloutItem],
-) -> ThreadStoreResult<()> {
-    append_persisted_items_with_flush(store, thread_id, items, true).await
-}
-
 pub(super) async fn append_persisted_items_ordered(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     items: &[RolloutItem],
 ) -> ThreadStoreResult<()> {
-    append_persisted_items_with_flush(store, thread_id, items, false).await
-}
-
-async fn append_persisted_items_with_flush(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    persisted_items: &[RolloutItem],
-    flush: bool,
-) -> ThreadStoreResult<()> {
-    if persisted_items.is_empty() {
+    if items.is_empty() {
         return Ok(());
     }
     let recorder = store.live_recorder(thread_id).await?;
-    if flush {
-        recorder
-            .record_canonical_items(persisted_items)
-            .await
-            .map_err(thread_store_io_error)?;
-    } else {
-        recorder
-            .record_canonical_items_ordered(persisted_items)
-            .await
-            .map_err(thread_store_io_error)?;
-    }
-    // LiveThread applies metadata immediately after append_items returns. Wait for the local
-    // writer so SQLite never gets ahead of JSONL for accepted live appends.
-    if flush {
-        recorder.flush().await.map_err(thread_store_io_error)
-    } else {
-        Ok(())
-    }
+    recorder
+        .record_canonical_items_ordered(items)
+        .await
+        .map_err(thread_store_io_error)
 }
 
 pub(super) async fn persist_thread(
@@ -231,13 +200,10 @@ pub(super) async fn discard_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
-    store
-        .live_recorders
-        .lock()
-        .await
-        .remove(&thread_id)
-        .map(|_| ())
-        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })
+    let recorder = store.live_recorder(thread_id).await?;
+    recorder.discard().await.map_err(thread_store_io_error)?;
+    store.live_recorders.lock().await.remove(&thread_id);
+    Ok(())
 }
 
 pub(super) async fn rollout_path(

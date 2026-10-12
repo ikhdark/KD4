@@ -2634,3 +2634,191 @@ async fn code_mode_activation_keeps_provider_schemas_but_registers_dispatch_tool
         "activated additions must not repeat model-visible schemas"
     );
 }
+#[tokio::test]
+async fn amended_attempt_cannot_be_used_by_an_older_turn() -> anyhow::Result<()> {
+    use codex_agent_task_store::*;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    std::fs::write(repo.join("tracked.txt"), "attempt-owned inspection\n")?;
+    let (session, mut turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    set_router_environment(&mut turn, &repo);
+    Arc::make_mut(&mut turn.config).cwd = AbsolutePathBuf::from_absolute_path(&repo)?;
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    let coordinator = session.services.agent_control.task_coordinator();
+    coordinator.initialize(
+        codex_state::StateRuntime::init(temp.path().join("task-home"), "test-provider".into()).await?,
+        "frozen-turn-root".into(),
+    ).await?;
+    let (assignment, original) = coordinator.create_assignment(&repo, AssignmentDraft {
+        root_session_id: "frozen-turn-root".into(),
+        admission_origin: AssignmentAdmissionOrigin::Typed,
+        role: AgentRole::Worker,
+        capability_profile: CapabilityProfile::ScopedSourceWrite,
+        objective: "inspect the authored source".into(),
+        acceptance_criteria: vec![AcceptanceCriterion {
+            id: "inspect".into(), text: "inspect tracked.txt in this attempt".into(),
+        }],
+        read_scope: vec![RepoScope { path: "tracked.txt".into(), recursive: false }],
+        write_scope: vec![RepoScope { path: "tracked.txt".into(), recursive: false }],
+        stop_condition: "inspection recorded".into(),
+        dependencies: Vec::new(), risk_hints: Vec::new(),
+        required_evidence: vec!["inspect:tracked.txt".into()],
+        prohibited_changes: Vec::new(), contract_claims: Vec::new(),
+        workspace_strategy: WorkspaceStrategy::Shared,
+        relation: None, architecture_contract_ref: None,
+    }).await?;
+    let path = AgentPath::try_from("/root/frozen_worker").map_err(anyhow::Error::msg)?;
+    let binding = coordinator.bind_agent_task(AgentTaskBindingDraft {
+        assignment_id: assignment.assignment_id, attempt_id: original.attempt_id,
+        agent_path: path.to_string(), task_name: "frozen_worker".into(),
+        thread_id: Some(session.thread_id.to_string()),
+    }).await?;
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(), depth: 1, agent_path: Some(path),
+        agent_nickname: None, agent_role: Some("worker".into()),
+    });
+    turn.agent_task_binding.set(Some(binding)).unwrap();
+    let receipt_args = json!({
+        "status":"needs_main", "summary":"this attempt needs parent work",
+        "criterion_results":[{"criterion_id":"inspect", "status":"not_run"}],
+        "declared_changes":[], "validation_call_ids":[],
+        "blockers":["parent correction required"], "risks":[], "next_action":null
+    });
+    let store = coordinator.store().expect("initialized store");
+    store.submit_agent_receipt(original.attempt_id, serde_json::from_value(receipt_args.clone())?).await?;
+    store.set_agent_gate(TaskActor::Root, assignment.assignment_id, GateKind::Review,
+        GateStatus::ChangesRequested, "correct the attempt".into()).await?;
+    let corrected = store.amend_agent_task(TaskActor::Root, assignment.assignment_id, AttemptAmendment {
+        reason: "explicit correction".into(), objective: None,
+        acceptance_criteria: None, stop_condition: None,
+    }).await?;
+    coordinator.refresh_binding(assignment.assignment_id).await?;
+    let current = coordinator.binding_for_source(&turn.session_source).unwrap();
+    assert_eq!(current.attempt_id, corrected.attempt_id);
+    assert!(coordinator.heartbeat_typed_actor_binding(&current, false).await?);
+
+    let turn = Arc::new(turn);
+    let old_step = StepContext::for_test(Arc::clone(&turn));
+    let make_router = |step: &StepContext| {
+        let router = ToolRouter::from_context(step, ToolRouterParams {
+            tool_suggest_candidates: None, deferred_mcp_tools: None, mcp_tools: None,
+            extension_tool_executors: Vec::new(), dynamic_tools: &[],
+            exposure_identity: ToolExposureIdentity {
+                agent_surface_stage: crate::tools::exposure::AgentSurfaceStage::TypedAdministration,
+                ..Default::default()
+            },
+        }, &Default::default());
+        step.turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+        router
+    };
+    let router = make_router(&old_step);
+    let make_call = |name: &str, call_id: &str, args: serde_json::Value| ToolCall {
+        tool_name: router.registered_tool_names_for_test().into_iter()
+            .find(|tool| tool.name == name).expect("real registered tool"),
+        call_id: call_id.into(), payload: ToolPayload::Function { arguments: args.to_string() },
+    };
+    for call in [
+        make_call("read_file", "stale-read", json!({"path":"tracked.txt"})),
+        make_call("submit_agent_receipt", "stale-receipt", receipt_args.clone()),
+    ] {
+        let state = admitted_tool_dispatch_state();
+        let result = router.dispatch_tool_call_with_terminal_outcome(
+            Arc::clone(&session), Arc::clone(&old_step), CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())), call,
+            ToolCallSource::Direct, Arc::clone(&state),
+        ).await;
+        assert!(matches!(result, Err(crate::FunctionCallError::RequiredOperationBlocked(message))
+            if message.contains("no longer active")));
+        assert!(state.is_terminal());
+        assert!(!state.handler_started());
+    }
+    let task = store.get_agent_task(assignment.assignment_id, Some(0)).await?;
+    assert_eq!(task.current_attempt.attempt_id, corrected.attempt_id);
+    assert_eq!(task.current_attempt.state, AttemptState::Active);
+    assert!(task.receipt.is_none());
+    assert!(store.get_validation_call("stale-read".into()).await?.is_none());
+    assert_eq!(coordinator.binding_for_turn(&turn).unwrap().attempt_id, original.attempt_id);
+
+    let (_, mut unbound_turn) = make_session_and_context().await;
+    unbound_turn.session_source = turn.session_source.clone();
+    unbound_turn.agent_task_binding.set(None).unwrap();
+    let unbound_step = StepContext::for_test(Arc::new(unbound_turn));
+    let result = router.dispatch_tool_call_with_terminal_outcome(
+        Arc::clone(&session), Arc::clone(&unbound_step), CancellationToken::new(),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        make_call("read_file", "unbound-read", json!({"path":"tracked.txt"})),
+        ToolCallSource::Direct, admitted_tool_dispatch_state(),
+    ).await;
+    assert!(matches!(result, Err(crate::FunctionCallError::RequiredOperationBlocked(message))
+        if message.contains("no bound typed assignment")));
+    assert!(coordinator.binding_for_turn(&unbound_step.turn).is_none());
+    assert!(store.get_validation_call("unbound-read".into()).await?.is_none());
+
+    // A new turn on the same session must acquire B and use the same registered
+    // handlers successfully; blocking all typed work is not a valid fix.
+    let (_, mut fresh_turn) = make_session_and_context().await;
+    fresh_turn.config = Arc::clone(&turn.config);
+    fresh_turn.environments = turn.environments.clone();
+    fresh_turn.session_source = turn.session_source.clone();
+    fresh_turn.permission_profile = PermissionProfile::Disabled;
+    fresh_turn.multi_agent_version = turn.multi_agent_version;
+    let fresh_step = StepContext::for_test(Arc::new(fresh_turn));
+    let fresh_router = make_router(&fresh_step);
+    for call in [
+        make_call("read_file", "fresh-read", json!({"path":"tracked.txt"})),
+        make_call("submit_agent_receipt", "fresh-receipt", receipt_args),
+    ] {
+        fresh_router.dispatch_tool_call_with_terminal_outcome(
+            Arc::clone(&session), Arc::clone(&fresh_step), CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())), call,
+            ToolCallSource::Direct, admitted_tool_dispatch_state(),
+        ).await?;
+    }
+    let inspection = store.get_validation_call("fresh-read".into()).await?.expect("fresh inspection");
+    assert_eq!(inspection.attempt_id, corrected.attempt_id);
+    assert_eq!(inspection.verified_evidence_kind(), Some(CriterionEvidenceKind::SourceInspection));
+    let task = store.get_agent_task(assignment.assignment_id, Some(0)).await?;
+    assert_eq!(task.receipt.expect("fresh receipt").attempt_id, corrected.attempt_id);
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn code_mode_same_turn_refreshes_eager_schemas_when_environment_becomes_ready() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
+    turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+    let turn = Arc::new(turn);
+    let ready_step = StepContext::for_test(Arc::clone(&turn));
+    let mut unavailable_step = (*ready_step).clone();
+    unavailable_step.environments.turn_environments.clear();
+    let make_router = |step: &StepContext| ToolRouter::from_context(step, ToolRouterParams {
+        tool_suggest_candidates: None, deferred_mcp_tools: None, mcp_tools: None,
+        extension_tool_executors: Vec::new(), dynamic_tools: &[], exposure_identity: Default::default(),
+    }, &Default::default());
+    let unavailable = make_router(&unavailable_step);
+    assert!(!unavailable.has_registered_tool(&ToolName::plain("apply_patch")));
+    let before = unavailable.model_visible_schemas_for_turn(&turn);
+    assert!(String::from_utf8_lossy(before.serialized()).contains("Nested apply_patch is unavailable"));
+
+    let ready = make_router(&ready_step);
+    assert!(ready.has_registered_tool(&ToolName::plain("apply_patch")));
+    let after = ready.model_visible_schemas_for_turn(&turn);
+    assert!(!Arc::ptr_eq(&before, &after));
+    let description = String::from_utf8_lossy(after.serialized());
+    assert!(description.contains("Nested apply_patch is available"));
+    assert!(!description.contains("Nested apply_patch is unavailable"));
+    assert_eq!(after.serialized(), ready.model_visible_schemas().serialized());
+    assert!(Arc::ptr_eq(&after, &ready.model_visible_schemas_for_turn(&turn)));
+    // Rebuilding an unchanged eager surface must retain the original Arc too.
+    let equivalent = make_router(&ready_step);
+    assert!(Arc::ptr_eq(&after, &equivalent.model_visible_schemas_for_turn(&turn)));
+    assert_eq!(ready.tool_manifest(&turn).manifest.unwrap()["model_visible"],
+        serde_json::to_value(after.specs()).unwrap());
+    // Capability loss must replace the cache in the reverse direction as well.
+    assert_eq!(unavailable.model_visible_schemas_for_turn(&turn).serialized(), before.serialized());
+}

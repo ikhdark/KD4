@@ -22,6 +22,116 @@ use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 
+#[tokio::test]
+async fn continuity_user_authored_context_wrappers_remain_user_turns() {
+    let hook = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
+        "Review this hook policy",
+        "hook-1",
+    )])
+    .expect("hook message");
+    let ResponseItem::Message {
+        content: hook_content,
+        ..
+    } = &hook
+    else {
+        panic!("hook message");
+    };
+    let ContentItem::InputText { text: hook_text } = &hook_content[0] else {
+        panic!("hook text");
+    };
+    for text in [
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nReview this policy\n</INSTRUCTIONS>",
+        "<environment_context>Review this environment example</environment_context>",
+        "Warning: The maximum number of unified exec processes you can keep open is 64.",
+        hook_text.as_str(),
+    ] {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = std::sync::Arc::new(session);
+        let turn = std::sync::Arc::new(turn);
+        session
+            .record_user_prompt_and_emit_turn_item(
+                &turn,
+                &[UserInput::Text {
+                    text: text.into(),
+                    text_elements: Vec::new(),
+                }],
+                None,
+            )
+            .await
+            .expect("accepted user input");
+        let history = session.clone_history().await;
+        let item = history.raw_items().last().expect("recorded user input");
+        // Origin survives the serialization boundary used by resume and fork.
+        let item: ResponseItem = serde_json::from_slice(&serde_json::to_vec(item).unwrap()).unwrap();
+        let Some(TurnItem::UserMessage(user)) = parse_turn_item(&item) else {
+            panic!("user-authored wrapper must remain a user request: {text}");
+        };
+        assert_eq!(
+            user.content,
+            vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }]
+        );
+        let rollout = vec![codex_protocol::protocol::RolloutItem::ResponseItem(item.clone())];
+        assert_eq!(
+            crate::thread_rollout_truncation::user_message_positions_in_rollout(&rollout),
+            vec![0]
+        );
+        assert!(
+            crate::thread_rollout_truncation::truncate_rollout_before_nth_user_message_from_start(
+                &rollout, 0,
+            )
+            .is_empty()
+        );
+        // Transport metadata is optional; durable user origin alone must keep
+        // literal legacy warnings and context wrappers in the task checkpoint.
+        let mut without_turn_metadata = item;
+        without_turn_metadata.clear_internal_chat_message_metadata_passthrough();
+        let (checkpoint, _, omitted) = crate::compact::build_task_input_checkpoint(
+            std::slice::from_ref(&without_turn_metadata),
+        );
+        assert!(!omitted);
+        assert_eq!(checkpoint, vec![without_turn_metadata]);
+    }
+    assert!(matches!(parse_turn_item(&hook), Some(TurnItem::HookPrompt(_))));
+}
+
+#[test]
+fn continuity_user_origin_preserves_legacy_context_and_provider_namespace() {
+    let mut item = ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "<environment_context>host context</environment_context>".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    for id in [None, Some(ResponseItemId::new("msg"))] {
+        item.set_id(id);
+        assert!(
+            parse_turn_item(&item).is_none(),
+            "legacy origin remains ambiguous"
+        );
+        assert!(super::is_contextual_user_message(&item));
+    }
+    crate::stable_context::mark_trusted_stable_context_item(&mut item);
+    assert!(parse_turn_item(&item).is_none());
+    assert!(super::is_contextual_user_message(&item));
+
+    item.set_id(Some(ResponseItemId::new(super::USER_INPUT_ITEM_ID_BASE)));
+    crate::stable_context::normalize_provider_context_item_id(&mut item);
+    assert!(!super::is_user_input_item_id(item.id().unwrap()));
+    assert!(
+        parse_turn_item(&item).is_none(),
+        "provider output cannot claim accepted-user origin"
+    );
+    let normalized = item.clone();
+    crate::stable_context::normalize_provider_context_item_id(&mut item);
+    assert_eq!(item, normalized, "provider ID normalization is stable");
+}
+
 #[test]
 fn contextual_user_content_requires_nonempty_exclusively_contextual_fragments() {
     let environment = ContentItem::InputText {

@@ -2577,19 +2577,13 @@ impl Session {
         let config_toml_paths = {
             let state = self.state.lock().await;
             let config = &state.session_configuration.original_config_do_not_use;
-            let user_config_paths = config
+            let user_layers = config
                 .config_layer_stack
                 .get_user_layers(
                     ConfigLayerStackOrdering::LowestPrecedenceFirst,
                     /*include_disabled*/ true,
-                )
-                .into_iter()
-                .filter_map(|layer| match &layer.name {
-                    ConfigLayerSource::User { file, .. } => Some(file.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if user_config_paths.is_empty() {
+                );
+            if user_layers.is_empty() {
                 vec![
                     state
                         .session_configuration
@@ -2597,7 +2591,13 @@ impl Session {
                         .join(CONFIG_TOML_FILE),
                 ]
             } else {
-                user_config_paths
+                user_layers.into_iter()
+                    .filter(|layer| !layer.is_disabled())
+                    .filter_map(|layer| match &layer.name {
+                        ConfigLayerSource::User { file, .. } => Some(file.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
             }
         };
 
@@ -5091,11 +5091,10 @@ impl Session {
         let mut stable_developer_sections = Vec::<String>::with_capacity(4);
         let stable_contextual_user_sections = Vec::<String>::with_capacity(2);
         let stable_separate_developer_sections = Vec::<String>::new();
-        let (previous_turn_settings, collaboration_mode, session_source, retractable) = {
+        let (previous_turn_settings, session_source, retractable) = {
             let state = self.state.lock().await;
             (
                 state.previous_turn_settings(),
-                state.session_configuration.collaboration_mode.clone(),
                 state.session_configuration.session_source.clone(),
                 crate::stable_context::retractable_markers(state.history.raw_items()),
             )
@@ -5132,12 +5131,17 @@ impl Session {
         }
         stable_developer_sections.extend(configured_developer_instructions.iter().cloned());
 
-        // Add developer instructions from collaboration_mode if they exist and are non-empty
+        // Use the captured turn, not settings published for a future turn. A full
+        // refresh appends to existing history, so it must also retract cleared slots.
         if turn_context.config.include_collaboration_mode_instructions
             && let Some(collab_instructions) =
-                CollaborationModeInstructions::from_collaboration_mode(&collaboration_mode)
+                CollaborationModeInstructions::from_collaboration_mode(&turn_context.collaboration_mode)
+                    .map(|instructions| instructions.render())
+                    .or_else(|| crate::context_manager::updates::build_collaboration_mode_update_item(
+                        represented_context, turn_context,
+                    ))
         {
-            developer_sections.push(collab_instructions.render());
+            developer_sections.push(collab_instructions);
         }
         // No root-orchestration developer block: every clause it carried is
         // already stated once by the base instructions (batching and dependency
@@ -5147,14 +5151,17 @@ impl Session {
         // authoring the call. A second, differently worded copy at a different
         // authority level is work the model has to redo every generation.
         if self.features.enabled(Feature::Personality)
-            && let Some(personality) = turn_context.personality
             && let Some(personality_message) =
-                crate::context_manager::updates::personality_message_for(
-                    &turn_context.model_info,
-                    personality,
-                )
+                turn_context.personality.and_then(|personality|
+                    crate::context_manager::updates::personality_message_for(
+                        &turn_context.model_info, personality,
+                    )
+                ).map(|message| PersonalitySpecInstructions::new(message).render())
+                    .or_else(|| crate::context_manager::updates::build_personality_update_item(
+                        represented_context, turn_context, true,
+                    ))
         {
-            developer_sections.push(PersonalitySpecInstructions::new(personality_message).render());
+            developer_sections.push(personality_message);
         }
         if turn_context.config.include_skill_instructions {
             let available_skills = build_available_skills(
@@ -5323,7 +5330,31 @@ impl Session {
         ) {
             stable_items.push(message);
         }
+        // Model catalog approval wording can change without a model slug/settings
+        // change. The typed TurnContextItem cannot reconstruct that prior text, so
+        // retain the rendered permission identity in the existing fragment receipt.
+        let rendered_permissions = turn_context.config.include_permissions_instructions.then(|| {
+            PermissionsInstructions::from_permission_profile(
+                &turn_context.permission_profile,
+                turn_context.approval_policy.value(),
+                ApprovalPromptContext::new(
+                    turn_context.model_info.model_messages.as_ref()
+                        .and_then(|messages| messages.approvals.as_ref()),
+                ),
+                self.services.exec_policy.current().as_ref(),
+                turn_context.cwd(),
+                turn_context.config.features.enabled(Feature::ExecPermissionApprovals),
+                turn_context.config.features.enabled(Feature::RequestPermissionsTool),
+            ).render()
+        });
         let mut fragment_digests = digest_context_fragments(&stable_items);
+        if let Some(permissions) = rendered_permissions.as_ref()
+            && let Some(item) = crate::context_manager::updates::build_developer_update_item(vec![permissions.clone()])
+        {
+            let mut digest = digest_context_fragments(&[item]).remove(0);
+            digest.key = "rendered-permissions".to_string();
+            fragment_digests.push(digest);
+        }
         fragment_digests.extend(rendered_turn_context_fragments.iter().map(
             |(key, slot, text)| {
                 let item = Self::build_context_contribution_items_from_rendered_fragments(vec![(
@@ -5366,32 +5397,8 @@ impl Session {
                 fragment_digests,
             };
         }
-        if turn_context.config.include_permissions_instructions {
-            developer_sections.insert(
-                permissions_index,
-                PermissionsInstructions::from_permission_profile(
-                    &turn_context.permission_profile,
-                    turn_context.approval_policy.value(),
-                    ApprovalPromptContext::new(
-                        turn_context
-                            .model_info
-                            .model_messages
-                            .as_ref()
-                            .and_then(|messages| messages.approvals.as_ref()),
-                    ),
-                    self.services.exec_policy.current().as_ref(),
-                    turn_context.cwd(),
-                    turn_context
-                        .config
-                        .features
-                        .enabled(Feature::ExecPermissionApprovals),
-                    turn_context
-                        .config
-                        .features
-                        .enabled(Feature::RequestPermissionsTool),
-                )
-                .render(),
-            );
+        if let Some(permissions) = rendered_permissions {
+            developer_sections.insert(permissions_index, permissions);
         }
 
         let (world_state_fragments, delivered_world_state_snapshot) =
@@ -5842,6 +5849,38 @@ impl Session {
     pub(crate) async fn reusable_tool_artifact(&self, call_id: &str, bytes: u64, sha256: &str) -> Option<String> {
         self.state.lock().await.tool_history_state()
             .reusable_artifact_for_origin(call_id, bytes, sha256)
+    }
+
+    pub(crate) async fn bind_source_inspection_origin(
+        &self,
+        artifact_id: String,
+        call_id: String,
+        bytes: u64,
+        sha256: String,
+        source: crate::tool_history::SourceInspectionOrigin,
+    ) -> CodexResult<()> {
+        let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
+            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+        };
+        let mutation = crate::tool_history::ToolHistoryMutation::BindSourceInspectionOrigin {
+            artifact_id, call_id, bytes, sha256, source,
+        };
+        let mut writer = self.tool_history_persistence.writer().await;
+        writer.enqueue_mutation(mutation.clone(), "source inspection origin")
+            .map_err(|error| CodexErr::Fatal(format!("failed to enqueue source inspection origin: {error}")))?;
+        self.state.lock().await.apply_tool_history_mutation(&mutation);
+        Ok(())
+    }
+
+    pub(crate) async fn completed_source_inspection(
+        &self,
+        artifact_id: &str,
+        bytes: u64,
+        sha256: &str,
+        attempt_id: codex_agent_task_store::AttemptId,
+    ) -> Option<(String, crate::tool_history::SourceInspectionOrigin)> {
+        self.state.lock().await.tool_history_state()
+            .completed_source_inspection(artifact_id, bytes, sha256, attempt_id)
     }
 
     pub(crate) async fn register_tool_history_candidate(
@@ -6474,7 +6513,7 @@ impl Session {
             self.recompute_token_usage(turn_context).await;
         }
         let coordinator = self.services.agent_control.task_coordinator();
-        if let Some(binding) = coordinator.binding_for_source(&turn_context.session_source) {
+        if let Some(binding) = coordinator.binding_for_turn(turn_context) {
             match coordinator
                 .heartbeat_typed_actor_binding(&binding, /*progress*/ true)
                 .await
@@ -6619,7 +6658,10 @@ impl Session {
     ) -> std::io::Result<()> {
         turn_context.turn_timing_state.record_user_input();
         let mut user_message_item = UserMessageItem::new(input);
-        let response_item_id = ResponseItemId::with_suffix("msg", &user_message_item.id);
+        let response_item_id = ResponseItemId::with_suffix(
+            crate::event_mapping::USER_INPUT_ITEM_ID_BASE,
+            &user_message_item.id,
+        );
         user_message_item.id = response_item_id.to_string();
         user_message_item.client_id = client_id;
         let mut response_item = self.response_item_from_user_input(input.to_vec());

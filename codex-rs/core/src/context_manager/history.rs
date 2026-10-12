@@ -5,7 +5,7 @@ use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
-use crate::event_mapping::is_contextual_user_message_content;
+use crate::event_mapping::is_contextual_user_message;
 use crate::git_workspace::WorkspaceEvidenceIdentity;
 use crate::session::turn_context::TurnContext;
 use crate::stable_context::StableContextManifest;
@@ -1556,9 +1556,7 @@ impl ContextManager {
                     }
                     cut_idx -= 1;
                 }
-                ResponseItem::Message { role, content, .. }
-                    if role == "user" && is_contextual_user_message_content(content) =>
-                {
+                item if is_contextual_user_message(item) => {
                     cut_idx -= 1;
                 }
                 _ => break,
@@ -2499,7 +2497,7 @@ pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
         return false;
     };
 
-    (role == "user" && !is_contextual_user_message_content(content))
+    (role == "user" && !is_contextual_user_message(item))
         || (role == "assistant" && is_inter_agent_instruction_content(content))
 }
 

@@ -1,4 +1,6 @@
 mod delegate;
+#[cfg(test)]
+mod cell_namespace_tests;
 mod execute_handler;
 pub(crate) mod execute_spec;
 mod response_adapter;
@@ -175,13 +177,8 @@ impl DeliveryArtifactCoverage {
                 }
             }
         }
-        // A successful root JSON selection is also the entire canonical value.
-        if evidence["identity"]["values"].as_array().is_some_and(|values| values.iter().any(|value|
-            value["selector"]["kind"] == "json_pointer"
-                && value["selector"]["pointer"] == "" && value.get("value").is_some()))
-        {
-            self.ranges.push((0, self.bytes));
-        }
+        // Parsed values preserve semantic data, not exact source coverage:
+        // duplicate keys, escaping and whitespace may have been discarded.
         self.ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::new();
         for (start, end) in self.ranges.drain(..) {
@@ -4327,4 +4324,23 @@ mod tests {
         assert!(error.contains("failed to spawn code-mode host"));
         service.shutdown().await.expect("shutdown unused service");
     }
+}
+#[cfg(test)]
+#[test]
+fn parsed_root_value_does_not_establish_lexical_delivery_coverage() {
+    let canonical = codex_tools::CanonicalToolResult::text("{\"policy\":\"deny\",\"policy\":\"allow\"}");
+    let mut coverage = DeliveryArtifactCoverage {
+        sha256: canonical.sha256.clone(), bytes: canonical.exact_bytes,
+        ..Default::default()
+    };
+    coverage.observe(&serde_json::json!({"identity": {
+        "sha256": canonical.sha256,
+        "values": [{"selector":{"kind":"json_pointer", "pointer":""},
+            "value":{"policy":"allow"}}]
+    }}));
+    assert!(!coverage.recovered(), "parsing lost the earlier deny value");
+    coverage.observe(&serde_json::json!({"identity": {
+        "sha256": canonical.sha256, "ranges": [[0, canonical.exact_bytes]]
+    }}));
+    assert!(coverage.recovered(), "exact delivery closes the same obligation");
 }

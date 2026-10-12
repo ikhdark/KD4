@@ -5,9 +5,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::time::Instant;
 
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::OwnedMutexGuard;
 use crate::scoped_workspace_gate::NativeAdditions;
 use crate::scoped_workspace_gate::ScopedWorkspaceGate;
 use crate::scoped_workspace_gate::WorkspaceLease;
@@ -19,10 +18,37 @@ enum WorkspaceIdentity {
     Validation(Box<WorkspaceIdentity>),
 }
 
-static WORKSPACE_GATES: OnceLock<Mutex<HashMap<WorkspaceIdentity, Weak<AsyncMutex<()>>>>> =
+static WORKSPACE_GATES: OnceLock<Mutex<HashMap<WorkspaceIdentity, Weak<ValidationGate>>>> =
     OnceLock::new();
 static PATCH_GATES: OnceLock<Mutex<HashMap<WorkspaceIdentity, Weak<ScopedWorkspaceGate>>>> =
     OnceLock::new();
+
+#[derive(Debug, Default)]
+struct ValidationGate {
+    holder: Mutex<Option<ValidationHolder>>,
+}
+
+#[derive(Debug)]
+struct ValidationHolder {
+    command: String,
+    admitted_at: Instant,
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidationPermit {
+    // Keep the weak-map entry alive for the entire admitted operation.
+    gate: Arc<ValidationGate>,
+}
+
+impl Drop for ValidationPermit {
+    fn drop(&mut self) {
+        // Holder state IS the admission lock: clear it under the same mutex
+        // used for admission, before unlocking. No departing owner can erase
+        // a successor, and no async guard or second lock order is needed.
+        self.gate.holder.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    }
+}
 
 pub(crate) async fn acquire_patch_operation_with_timeout(
     environment: &codex_exec_server::Environment,
@@ -93,10 +119,13 @@ fn patch_gate(identity: WorkspaceIdentity) -> Arc<ScopedWorkspaceGate> {
     gate
 }
 
+/// Try admission without queueing before a process handle exists. Contention
+/// leaves validation pending; it must not consume the tool's launch deadline.
 pub(crate) async fn acquire_validation_operation(
     environment: &codex_exec_server::Environment,
     cwd: &codex_utils_path_uri::PathUri,
-) -> OwnedMutexGuard<()> {
+    command: &str,
+) -> Result<ValidationPermit, String> {
     let identity = if !environment.is_remote()
         && let Ok(native_cwd) = cwd.to_abs_path()
     {
@@ -106,11 +135,11 @@ pub(crate) async fn acquire_validation_operation(
     } else {
         WorkspaceIdentity::Environment(environment.approval_scope_id().to_string())
     };
-    acquire_operation(WorkspaceIdentity::Validation(Box::new(identity))).await
+    try_acquire_operation(WorkspaceIdentity::Validation(Box::new(identity)), command)
 }
 
-pub(crate) async fn acquire_workspace_validation(root: &Path) -> OwnedMutexGuard<()> {
-    acquire_operation(WorkspaceIdentity::Validation(Box::new(local_identity(root).await))).await
+pub(crate) async fn acquire_workspace_validation(root: &Path, command: &str) -> Result<ValidationPermit, String> {
+    try_acquire_operation(WorkspaceIdentity::Validation(Box::new(local_identity(root).await)), command)
 }
 
 async fn local_identity(root: &Path) -> WorkspaceIdentity {
@@ -121,7 +150,7 @@ async fn local_identity(root: &Path) -> WorkspaceIdentity {
     WorkspaceIdentity::Local(identity)
 }
 
-async fn acquire_operation(identity: WorkspaceIdentity) -> OwnedMutexGuard<()> {
+fn try_acquire_operation(identity: WorkspaceIdentity, command: &str) -> Result<ValidationPermit, String> {
     let gate = {
         let mut gates = WORKSPACE_GATES
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -131,12 +160,24 @@ async fn acquire_operation(identity: WorkspaceIdentity) -> OwnedMutexGuard<()> {
         if let Some(gate) = gates.get(&identity).and_then(Weak::upgrade) {
             gate
         } else {
-            let gate = Arc::new(AsyncMutex::new(()));
+            let gate = Arc::new(ValidationGate::default());
             gates.insert(identity, Arc::downgrade(&gate));
             gate
         }
     };
-    gate.lock_owned().await
+    let mut holder = gate.holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(holder) = holder.as_ref() {
+        return Err(format!(
+            "Validation busy: holder command {:?} (held for {:.3} seconds). This validation did not run. No process was started or queued; required validation remains pending. Resume the existing operation rather than relaunching or switching lanes.",
+            holder.command, holder.admitted_at.elapsed().as_secs_f64(),
+        ));
+    }
+    *holder = Some(ValidationHolder {
+        command: command.to_owned(),
+        admitted_at: Instant::now(),
+    });
+    drop(holder);
+    Ok(ValidationPermit { gate })
 }
 
 #[cfg(test)]
@@ -227,20 +268,55 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let environment = codex_exec_server::Environment::default_for_tests();
         let cwd = codex_utils_path_uri::PathUri::from_host_native_path(temp.path()).unwrap();
-        let validation = acquire_validation_operation(&environment, &cwd).await;
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            acquire_workspace_validation(temp.path()),
-        ).await.is_err());
+        let validation = acquire_validation_operation(&environment, &cwd, "cargo test -p owner").await.unwrap();
+        // A known admission age proves the diagnostic uses this holder's clock.
+        validation.gate.holder.lock().unwrap().as_mut().unwrap().admitted_at =
+            Instant::now() - std::time::Duration::from_secs(2);
+        let busy = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_workspace_validation(temp.path(), "cargo check -p contender"),
+        ).await.expect("contended validation must return, not queue").unwrap_err();
+        assert!(busy.contains("No process was started or queued"));
+        assert!(busy.contains("cargo test -p owner"));
+        assert!(busy.contains("This validation did not run"));
+        let age = busy.split("held for ").nth(1).unwrap()
+            .split(" seconds").next().unwrap().parse::<f64>().unwrap();
+        assert!(age >= 2.0, "holder age must start at admission: {busy}");
+        assert!(acquire_validation_operation(&environment, &cwd, "cargo check").await.is_err(),
+            "a rejected contender must not release the owner's permit");
         let patch = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             acquire_patch_operation(&environment, &cwd),
         ).await.expect("a running validation must not block a patch");
         drop(validation);
-        let _next_validation = tokio::time::timeout(
+        let next_validation = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            acquire_workspace_validation(temp.path()),
-        ).await.expect("a running patch must not block validation");
+            acquire_workspace_validation(temp.path(), "cargo check -p successor"),
+        ).await.expect("a running patch must not block validation").unwrap();
+        let busy = acquire_validation_operation(&environment, &cwd, "cargo test").await.unwrap_err();
+        assert!(busy.contains("cargo check -p successor"));
+        assert!(!busy.contains("cargo test -p owner"));
+        drop(next_validation);
+        assert!(acquire_workspace_validation(temp.path(), "cargo test -p final").await.is_ok());
         drop(patch);
+    }
+
+    #[tokio::test]
+    async fn validation_busy_is_scoped_to_workspace_and_remote_environment() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let _owner = acquire_workspace_validation(first.path(), "cargo test -p owner").await.unwrap();
+        assert!(acquire_workspace_validation(&first.path().join("."), "cargo check").await.is_err());
+        let _independent = acquire_workspace_validation(second.path(), "cargo check").await.unwrap();
+        let remote = codex_exec_server::Environment::create_for_tests(Some("ws://127.0.0.1:1".into())).unwrap();
+        let other = codex_exec_server::Environment::create_for_tests(Some("ws://127.0.0.1:2".into())).unwrap();
+        let cwd = codex_utils_path_uri::PathUri::from_host_native_path(first.path()).unwrap();
+        let other_cwd = codex_utils_path_uri::PathUri::from_host_native_path(second.path()).unwrap();
+        let owner = acquire_validation_operation(&remote, &cwd, "cargo test -p remote").await.unwrap();
+        let busy = acquire_validation_operation(&remote, &other_cwd, "cargo check").await.unwrap_err();
+        assert!(busy.contains("cargo test -p remote"));
+        let _other = acquire_validation_operation(&other, &cwd, "cargo check").await.unwrap();
+        drop(owner);
+        assert!(acquire_validation_operation(&remote, &other_cwd, "cargo check").await.is_ok());
     }
 }

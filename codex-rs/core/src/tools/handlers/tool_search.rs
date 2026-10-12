@@ -1023,6 +1023,9 @@ impl ToolSearchHandler {
             alternatives.sort();
             match alternatives.as_slice() {
                 [name] => key.query = name.clone(),
+                // Preserve exact identities within batches and mixed queries;
+                // lowercasing them can select a different callable.
+                [] if key.query.split_whitespace().any(|term| self.exact_name_index.contains_key(term)) => {},
                 [] => key.query = folded,
                 _ => return Err(FunctionCallError::RespondToModel(format!(
                     "Ambiguous case-folded tool identity; use exact casing: {}",
@@ -1031,6 +1034,16 @@ impl ToolSearchHandler {
             }
         }
         Ok(key)
+    }
+
+    fn identity_query_terms(&self, query: &str) -> Vec<String> {
+        query.split_whitespace().flat_map(|term| {
+            if self.exact_name_index.contains_key(term) {
+                vec![term.to_string()]
+            } else {
+                ToolSearchTokenizer.tokenize(term)
+            }
+        }).collect()
     }
 
     fn resolved_query_key(&self, query: &str, requested: Option<usize>) -> Result<ToolSearchQueryKey, FunctionCallError> {
@@ -1142,10 +1155,11 @@ impl ToolSearchHandler {
             matches.len() == 1 && matches[0].name_index(&self.name_indexes)
                 .output_names_for(term).is_some_and(|names| names.len() == 1)
         });
+        let identity_terms = self.identity_query_terms(&key.query);
         let exact_terms = if self.exact_name_index.contains_key(&key.query) {
             vec![key.query.as_str()]
         } else {
-            explicit_names.into_iter().chain(query_terms.iter().map(String::as_str)).collect()
+            explicit_names.into_iter().chain(identity_terms.iter().map(String::as_str)).collect()
         };
         let exact_matches = exact_terms.into_iter()
             .filter_map(|term| self.exact_name_index.get(term))
@@ -1156,7 +1170,9 @@ impl ToolSearchHandler {
                 || self.search_index.postings.get(term).is_some_and(|postings|
                     postings.binary_search_by_key(id, |(candidate, _)| *candidate).is_ok())))
             .filter(|id| seen_exact.insert(*id)).collect::<Vec<_>>();
-        if partial_name_lookup {
+        if partial_name_lookup || explicit_multi_name {
+            // Name-only requests select exact identities, not ranked substitutes
+            // that happen to share their case-folded capability terms.
             let mut result = self.search_output_tools(
                 exact_matches.iter().copied(), Some(&key.query), limit, key.source.as_deref(),
             )?;
@@ -1187,13 +1203,7 @@ impl ToolSearchHandler {
                 candidates.iter().map(|id| id.info(&self.search_infos)),
             )
         });
-        let results = if explicit_multi_name {
-            // Explicit unambiguous identities consume their requested slots
-            // before source diversity. Broad/ambiguous searches retain fairness.
-            exact_matches.iter().copied().take(limit).collect()
-        } else {
-            promote_exact_name_matches(&self.search_infos, &exact_matches, &candidates, limit)
-        };
+        let results = promote_exact_name_matches(&self.search_infos, &exact_matches, &candidates, limit);
         let result_count = results.len();
         let result_source_count = trace_enabled.then(|| {
             tool_search_info_diversity_count(results.iter().map(|id| id.info(&self.search_infos)))
@@ -1272,11 +1282,12 @@ impl ToolSearchHandler {
         let mut omitted_result_count = 0usize;
         let mut selected = HashSet::new();
         let query_tokens = exact_query.map(|query| ToolSearchTokenizer.tokenize(query)).unwrap_or_default();
+        let identity_terms = exact_query.map(|query| self.identity_query_terms(query)).unwrap_or_default();
         let evidence = self.search_index.query_evidence(&query_tokens, &self.search_infos, source);
         for result_id in results {
             let result = &result_id.info(&self.search_infos).entry;
             let relevant = exact_query.is_none_or(|query| {
-                std::iter::once(query).chain(query.split_whitespace()).chain(query_tokens.iter().map(String::as_str)).any(|term|
+                std::iter::once(query).chain(query.split_whitespace()).chain(identity_terms.iter().map(String::as_str)).any(|term|
                     self.exact_name_index.get(term).is_some_and(|ids| ids.contains(&result_id)))
                     || self.search_index.relevance(&evidence, result_id) >= MIN_TOOL_ACTIVATION_RELEVANCE
             });
@@ -1299,7 +1310,7 @@ impl ToolSearchHandler {
                 if let Some(names) = result_id.name_index(&self.name_indexes).output_names_for(query) {
                     return Some(names.clone());
                 }
-                let names = std::iter::once(query).chain(query.split_whitespace()).chain(query_tokens.iter().map(String::as_str)).filter_map(|term|
+                let names = std::iter::once(query).chain(query.split_whitespace()).chain(identity_terms.iter().map(String::as_str)).filter_map(|term|
                     result_id.name_index(&self.name_indexes).output_names_for(term))
                     .flatten().cloned().collect::<HashSet<_>>();
                 (!names.is_empty()).then_some(names)
@@ -3046,6 +3057,98 @@ text('one-cell-complete');
             "qualified_alternatives": ["mcp__calendar__find_event", "mcp__events__find_event"],
         })));
         assert!(exact.exact_name_ambiguity.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_case_name_batches_activate_only_requested_tools() {
+        let namespace = DynamicToolNamespaceSpec {
+            name: "exact".to_string(),
+            description: "Exact-case operations".to_string(),
+            tools: Vec::new(),
+        };
+        let infos = ["Read_Item", "read_item", "Write_Item"].map(|name| {
+            executor_search_info(DynamicToolHandler::new_in_namespace(
+                &namespace,
+                &DynamicToolFunctionSpec {
+                    name: name.to_string(),
+                    description: "Access records".to_string(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                    defer_loading: true,
+                },
+            ).unwrap())
+        });
+        let handler = ToolSearchHandler::new(infos.to_vec());
+        for (query, expected, missing) in [
+            ("Read_Item Write_Item", vec!["Read_Item", "Write_Item"], vec![]),
+            ("Read_Item read_item", vec!["Read_Item", "read_item"], vec![]),
+            ("exact.Read_Item exact.Write_Item", vec!["Read_Item", "Write_Item"], vec![]),
+            ("Read_Item unknown_item", vec!["Read_Item"], vec!["unknown_item"]),
+            ("read_item Write_Item", vec!["Write_Item", "read_item"], vec![]),
+            ("Read_Item Write_Item", vec!["Read_Item", "Write_Item"], vec![]),
+        ] {
+            let (session, turn, _events) = make_session_and_context_with_rx().await;
+            turn.refresh_deferred_tool_capabilities(Arc::new(
+                ["Read_Item", "read_item", "Write_Item"].into_iter().map(|name| {
+                    (ToolName::namespaced("exact", name), "exact-v1".to_string())
+                }).collect(),
+            ));
+            let payload = ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: query.to_string(), limit: Some(8),
+                },
+            };
+            let output = handler.handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "search".to_string(),
+                tool_name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            }).await.expect("exact-case batch should resolve");
+            assert!(turn.activated_deferred_tools().is_empty());
+            session.record_tool_completion_ordered(
+                &turn, "search", &[output.to_response_item("search", &payload).into()],
+            ).await.unwrap();
+            assert_eq!(turn.activated_deferred_tools(), expected.iter().map(|name| {
+                ToolName::namespaced("exact", *name)
+            }).collect(), "query: {query}");
+            let receipt = output.code_mode_result(&payload);
+            assert_eq!(receipt.get("unmatched_identifiers"),
+                (!missing.is_empty()).then(|| serde_json::json!(missing)).as_ref(), "query: {query}");
+            let codex_protocol::models::ResponseInputItem::ToolSearchOutput { tools, .. } =
+                output.to_response_item("search", &payload)
+            else { panic!("expected search response"); };
+            let mut returned = tools.iter().flat_map(|tool| {
+                tool["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap())
+            }).collect::<Vec<_>>();
+            returned.sort_unstable();
+            assert_eq!(returned, expected, "query: {query}");
+        }
+    }
+
+    #[test]
+    fn exact_case_name_batches_preserve_namespace_members() {
+        let mut info = search_info("Access records", None, "exact", "Read_Item");
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else {
+            panic!("expected namespace");
+        };
+        let ResponsesApiNamespaceTool::Function(read) = &namespace.tools[0];
+        let read = read.clone();
+        for name in ["read_item", "Write_Item"] {
+            let mut member = read.clone();
+            member.name = name.to_string();
+            namespace.tools.push(ResponsesApiNamespaceTool::Function(member));
+            info.entry.tool_names.push(name.to_string());
+        }
+        let handler = ToolSearchHandler::new(vec![info]);
+        for query in ["Read_Item Write_Item", "mcp__exact.Read_Item mcp__exact.Write_Item"] {
+            assert_eq!(handler.search(query, 8).unwrap().activation_tools, vec![
+                ToolName::namespaced("mcp__exact", "Read_Item"),
+                ToolName::namespaced("mcp__exact", "Write_Item"),
+            ], "query: {query}");
+        }
     }
 
     #[test]

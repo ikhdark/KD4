@@ -35,29 +35,21 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
                 .as_str()
                 .expect("command tool description")
                 .to_string();
-        assert!(description.contains("Read known files directly."));
         assert!(description.contains("Use `rg -l` when only matching filenames are needed"));
         assert!(description.contains("use scoped `rg -n` when matching content is needed"));
-        assert!(
-            description
-                .contains("search the requested scope and preserve the complete matching set")
-        );
-        assert!(description.contains("without treating truncated results as complete"));
-        assert!(description.contains("apply path/glob filters before printing"));
-        assert!(description.contains("Reuse the complete matching set for multiple views"));
-        assert!(description.contains("A stored `result.output` is still truncated"));
         assert!(description.contains("2 means an error, not evidence of absence"));
-        assert!(
-            description.contains("a later successful command does not validate an earlier search")
-        );
         assert!(description.contains("correct only the failed search"));
         assert!(description.contains("`rg` skips hidden directories and ignored files by default, with or without matches; add `--hidden`"));
-        assert!(description.contains("Derive search roots from observed paths"));
-        assert!(description.contains("record missing paths as coverage gaps"));
-        assert!(description.contains("For a known source file, read whole useful regions."));
         assert!(description.contains("Prefer native `read_file` with batched selectors"));
         assert!(description.contains("Keep shell reads for required encoding, streaming, or transformations"));
-        assert!(description.contains("do not repeat delivered reads just to switch tools"));
+        // Base instructions own inspection order, retention and re-read policy.
+        for owned_elsewhere in [
+            "Read known files directly",
+            "preserve the complete matching set",
+            "record missing paths as coverage gaps",
+        ] {
+            assert!(!description.contains(owned_elsewhere));
+        }
         assert!(description.contains(
             "Omit `max_output_tokens` unless deliberately requesting a smaller display;"
         ));
@@ -74,7 +66,7 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(!description.contains("is rejected"));
         assert!(!description.contains("read the complete enclosing"));
         assert!(codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.contains(
-            "Read the complete enclosing function, type, or configuration unit before changing it."
+            "Read the complete enclosing function, type, or configuration unit before changing it"
         ));
         assert!(
             description.contains(
@@ -110,17 +102,13 @@ fn posix_command_descriptions_keep_search_guidance_without_windows_glob_rules() 
         );
         assert!(
             tool.description
-                .contains("apply path/glob filters before printing")
-        );
-        assert!(
-            tool.description
                 .contains("2 means an error, not evidence of absence")
         );
         assert!(tool.description.contains("Filesystem safety:"));
         assert!(!tool.description.contains("PowerShell `foreach`"));
         assert!(
             tool.description
-                .contains("record missing paths as coverage gaps")
+                .contains("Prefer native `read_file` with batched selectors")
         );
     }
 }
@@ -340,7 +328,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Inside `exec`, noninteractive commands default to 285000 ms so the host can finish the awaited command without model polling; set an explicit shorter wait for background work. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands (10000 ms for interactive commands inside `exec`). Explicit values are clamped to 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
+                "Wait before yielding output. Inside `exec`, noninteractive commands default to 285000 ms so the host can finish the awaited command without model polling; to overlap it with other work, start it alongside the other calls with Promise.all in the same cell, and shorten the wait only when the command must outlive the cell. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands (10000 ms for interactive commands inside `exec`). Explicit values are clamped to 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -348,7 +336,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget, capped at 10000 tokens for direct calls; inside exec each result is bounded by the cell limit with envelope reserve, independently of earlier prints. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
+                "Display cap for this result. Omit it: inside exec each result is already bounded by the cell limit with envelope reserve, independently of earlier prints, and direct calls are capped at 10000 tokens. Set it only to deliberately shrink a display. Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
         (

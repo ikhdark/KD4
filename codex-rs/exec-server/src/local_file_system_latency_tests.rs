@@ -194,8 +194,12 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
         .await?;
     assert_eq!(batch.entries_examined, 4);
     assert!(batch.limit_reached);
-    assert_eq!(batch.entries.len(), 3);
+    assert_eq!(batch.entries.len(), 4);
     for entry in batch.entries {
+        if entry.file_name == "dangling" {
+            assert!(entry.metadata.is_none(), "retain failed metadata for the walker");
+            continue;
+        }
         let metadata = entry
             .metadata
             .expect("native enumeration should supply metadata");
@@ -221,7 +225,8 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
         ["file", "file-link"]
     );
     assert!(!walk.truncated);
-    assert!(walk.errors.is_empty());
+    assert_eq!(walk.errors.len(), 1);
+    assert_eq!(walk.errors[0].path, uri.join("dangling").unwrap());
     let walk = fs
         .walk(
             &uri,
@@ -239,6 +244,7 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
             .any(|entry| entry.path == uri.join("directory-link/child").unwrap())
     );
     assert!(!walk.truncated);
-    assert!(walk.errors.is_empty());
+    assert_eq!(walk.errors.len(), 1);
+    assert_eq!(walk.errors[0].path, uri.join("dangling").unwrap());
     Ok(())
 }

@@ -868,6 +868,15 @@ fn essential_projection_fields_bounded(value: &JsonValue, depth: usize, remainin
         JsonValue::Object(object) => JsonValue::Object(
             object
                 .iter()
+                // A lexically earlier payload must not consume the bounded
+                // scan before this object's small control fields. The MCP
+                // control envelope likewise precedes content and provider
+                // metadata. Keep the same depth/byte bounds; no payload is
+                // promoted merely because its traversal has higher priority.
+                .filter(|(key, _)| is_essential_key(key))
+                .chain(object.iter().filter(|(key, _)| key.as_str() == "structuredContent"))
+                .chain(object.iter().filter(|(key, _)|
+                    !is_essential_key(key) && key.as_str() != "structuredContent"))
                 .filter_map(|(key, value)| {
                     let key_bytes = key.len().saturating_mul(6).saturating_add(4);
                     if key_bytes > *remaining { return None; }
@@ -1615,6 +1624,46 @@ mod canonical_tests {
         assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
         assert_eq!(output.value(), &value);
         assert_eq!(output.clone(), output);
+    }
+
+    #[test]
+    fn semantic_controls_survive_payload_budget_pressure() {
+        let payload = (0..1000).map(|i| (format!("field_{i:04}"), JsonValue::from("payload")))
+            .collect::<serde_json::Map<_, _>>();
+        let value = serde_json::json!({
+            "a_payload": payload, "complete": false, "truncated": true,
+            "status": "partial", "nextCursor": "remaining-page"
+        });
+        let output = JsonToolOutput::new(value.clone());
+        let metadata = output.projection_metadata().unwrap();
+        assert_eq!(metadata.essential_inline, serde_json::json!({
+            "complete": false, "truncated": true,
+            "status": "partial", "nextCursor": "remaining-page"
+        }));
+        assert_eq!(output.value(), &value);
+        assert_eq!(metadata.spillable_text, vec![value.to_string()]);
+    }
+
+    #[test]
+    fn semantic_controls_survive_mcp_metadata_budget_pressure() {
+        let payload = (0..1000).map(|i| (format!("field_{i:04}"), JsonValue::from("payload")))
+            .collect::<serde_json::Map<_, _>>();
+        let result = codex_protocol::mcp::CallToolResult {
+            content: vec![serde_json::json!({"type":"text", "text":"partial page"})],
+            structured_content: Some(serde_json::json!({
+                "complete": false, "truncated": true, "nextCursor": "remaining-page"
+            })),
+            is_error: Some(false),
+            meta: Some(payload.into()),
+        };
+        let metadata = result.projection_metadata().unwrap();
+        assert_eq!(metadata.essential_inline["structuredContent"], serde_json::json!({
+            "complete": false, "truncated": true, "nextCursor": "remaining-page"
+        }));
+        assert!(metadata.essential_inline.to_string().len() < 8192);
+        assert!(metadata.essential_inline.get("_meta").is_none());
+        let canonical = result.canonical_result(&ToolPayload::Function { arguments: "{}".into() }).unwrap();
+        assert_eq!(canonical.value.unwrap()["_meta"].as_object().unwrap().len(), 1000);
     }
 
     #[test]

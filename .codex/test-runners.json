@@ -3,20 +3,20 @@
   "runners": [
     {
       "programs": ["python", "python3", "py"],
-      "prefixes": [["scripts/root_maintenance.py", "test-python"]],
+      "prefixes": [["scripts/maintenance/root_maintenance.py", "test-python"]],
       "options": {"-B": 0, "-u": 0},
       "allow_extra_args": true,
       "operations": ["test"]
     },
     {
       "programs": ["node"],
-      "prefixes": [["scripts/run-python.js", "scripts/root_maintenance.py", "test-python"]],
+      "prefixes": [["scripts/maintenance/run-python.js", "scripts/maintenance/root_maintenance.py", "test-python"]],
       "allow_extra_args": true,
       "operations": ["test"]
     },
     {
       "programs": ["python", "python3", "py"],
-      "prefixes": [["scripts/rust_build_status.py", "run-lane"]],
+      "prefixes": [["scripts/build/rust_build_status.py", "run-lane"]],
       "options": {"-I": 0, "-B": 0, "-u": 0},
       "allow_extra_args": true,
       "passthrough_after": "--"
@@ -24,9 +24,9 @@
     {
       "programs": ["python", "python3", "py"],
       "prefixes": [
-        ["scripts/rust_test_runner.py", "run-target"],
-        ["scripts/rust_test_runner.py", "run-gate"],
-        ["scripts/rust_test_runner.py", "parity"]
+        ["scripts/build/rust_test_runner.py", "run-target"],
+        ["scripts/build/rust_test_runner.py", "run-gate"],
+        ["scripts/build/rust_test_runner.py", "parity"]
       ],
       "options": {"-I": 0, "-B": 0, "-u": 0, "--manifest": 1, "--target-dir": 1, "--profile": 1, "--cargo-profile": 1, "--admission-timeout-seconds": 1},
       "allow_extra_args": true,

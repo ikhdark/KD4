@@ -44,7 +44,7 @@ fn command_parameters_schema(
 fn stall_timeout_schema() -> JsonSchema {
     bounded_integer(
         format!(
-            "Maximum time without stdout or stderr before reporting the command as stalled and yielding its live session, including between polls. Silence never terminates the command. Defaults to {} ms; exec_command disables this default for recognized long-running validation, build, install, and discovery commands. Set zero to disable this observation. This is not a total runtime limit.",
+            "Maximum time without stdout or stderr before reporting the command as stalled and yielding its live session, including between polls. Silence never terminates the command. Defaults to {} ms; exec_command disables this default for recognized long-running validation, build, install, and discovery commands. Set zero to disable this observation.",
             crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
         ),
         0,
@@ -128,7 +128,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                format!("Wait before yielding output. Inside `exec`, noninteractive commands default to {} ms so the host can finish the awaited command without model polling; set an explicit shorter wait for background work. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands ({} ms for interactive commands inside `exec`). Explicit values are clamped to 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_NONINTERACTIVE_EXEC_YIELD_TIME_MS, super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
+                format!("Wait before yielding output. Inside `exec`, noninteractive commands default to {} ms so the host can finish the awaited command without model polling; to overlap it with other work, start it alongside the other calls with Promise.all in the same cell, and shorten the wait only when the command must outlive the cell. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands ({} ms for interactive commands inside `exec`). Explicit values are clamped to 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_NONINTERACTIVE_EXEC_YIELD_TIME_MS, super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -136,7 +136,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget, capped at 10000 tokens for direct calls; inside exec each result is bounded by the cell limit with envelope reserve, independently of earlier prints. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
+                "Display cap for this result. Omit it: inside exec each result is already bounded by the cell limit with envelope reserve, independently of earlier prints, and direct calls are capped at 10000 tokens. Set it only to deliberately shrink a display. Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
     ]);
@@ -732,10 +732,9 @@ fn windows_shell_guidance() -> &'static str {
 
 Windows safety rules (apply when executing in a Windows environment, regardless of the host OS):
 - PowerShell and cmd do not expand wildcard paths for native `rg`. Search a literal parent directory with `--glob` instead, for example `rg -n "default_prompt:" skills --glob "**/agents/openai.yaml"`.
-- PowerShell `foreach` statements cannot feed a pipeline directly. Collect first: `$rows = foreach ($item in $items) { $item }; $rows | Out-String`. Changing to `script_body` does not fix invalid syntax.
-- Do not compose destructive filesystem commands across shells. Do not enumerate paths in PowerShell and then pass them to `cmd /c`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end, prefer native PowerShell cmdlets such as `Remove-Item` / `Move-Item` with `-LiteralPath`, and avoid string-built shell commands for file operations.
-- Before any recursive delete or move on Windows, verify the resolved absolute target paths stay within the intended workspace or explicitly named target directory. Never issue a recursive delete or move against a computed path if the final target has not been checked.
-- When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#
+- PowerShell `foreach` statements cannot feed a pipeline directly. Collect first: `$rows = foreach ($item in $items) { $item }; $rows | Out-String`.
+- For deletes and moves prefer `Remove-Item` / `Move-Item` with `-LiteralPath`; do not hand PowerShell-enumerated paths to `cmd /c` or another shell.
+- When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window."#
 }
 
 /// Keep the platform-independent rule while omitting Windows-only instructions
@@ -754,11 +753,10 @@ fn filesystem_safety_guidance() -> &'static str {
 
 fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
-- Read known files directly. Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. Start unknown-location searches in a likely owning path and expand after a miss. For repository-wide inventories, search the requested scope and preserve the complete matching set; bound displayed evidence without treating truncated results as complete. Exclude the repository's build and dependency output directories when they are outside the requested scope. `rg` skips hidden directories and ignored files by default, with or without matches; add `--hidden` when the scope or an edit's consumers can include dot-directories such as `.config` or `.github`.
-- For filename inventories, apply path/glob filters before printing; do not dump the whole tree to filter a truncated display later. Reuse the complete matching set for multiple views. A stored `result.output` is still truncated when `output_reduced` is true; use the retained artifact for missing matches.
-- An `rg` exit code of 1 means no matches; 2 means an error, not evidence of absence. In a batch, inspect each search's status; a later successful command does not validate an earlier search. Preserve successful results and correct only the failed search.
-- Derive search roots from observed paths instead of guessing directories. Keep independent searches separate so a missing root does not skip unrelated work; record missing paths as coverage gaps.
-- For a known source file, read whole useful regions. Prefer native `read_file` with batched selectors over `Get-Content | Select-Object` paging when available. Keep shell reads for required encoding, streaming, or transformations; do not repeat delivered reads just to switch tools. Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. Output above the tool's output budget is truncated; recover only missing evidence from the retained artifact."#
+- Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. `rg` skips hidden directories and ignored files by default, with or without matches; add `--hidden` when the scope can include dot-directories such as `.config` or `.github`.
+- An `rg` exit code of 1 means no matches; 2 means an error, not evidence of absence. In a batch, inspect each search's status and correct only the failed search.
+- Prefer native `read_file` with batched selectors over `Get-Content | Select-Object` paging when available. Keep shell reads for required encoding, streaming, or transformations.
+- Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. When output is truncated, recover only missing evidence from the retained artifact."#
 }
 
 #[cfg(test)]

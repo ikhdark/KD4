@@ -1,5 +1,5 @@
 edition = "2024"
-# scripts/format.py uses the pinned nightly in scripts/tool_versions.py.
+# scripts/maintenance/format.py uses the pinned nightly in scripts/common/tool_versions.py.
 imports_granularity = "Item"
 
 # Keep the relocated crates excluded from automatic formatting.

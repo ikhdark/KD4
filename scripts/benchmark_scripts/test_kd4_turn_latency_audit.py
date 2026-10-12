@@ -1,0 +1,3457 @@
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+from scripts.benchmark_scripts import kd4_turn_latency_audit
+from scripts.benchmark_scripts import kd4_timing_analysis
+
+
+def _event(payload: dict, timestamp: str = "2026-08-17T00:00:00Z") -> str:
+    return json.dumps({"timestamp": timestamp, "type": "event_msg", "payload": payload})
+
+
+def _response(payload: dict, timestamp: str) -> str:
+    return json.dumps(
+        {"timestamp": timestamp, "type": "response_item", "payload": payload}
+    )
+
+
+def _meta(cwd: str) -> str:
+    return json.dumps({"type": "session_meta", "payload": {"cwd": cwd}})
+
+
+def _timing(*, valid: bool = True, complete: bool = True) -> dict:
+    return {
+        "schemaVersion": 25,
+        "profileValid": valid,
+        "classificationComplete": complete,
+        "startedAtUnixMs": 1_786_924_800_000,
+        "completedAtUnixMs": 1_786_924_801_000,
+        "inclusiveDurationNs": 1_000_000_000,
+        "milestones": {
+            "firstUsefulActionMs": 12.5,
+            "firstInfrastructureActionMs": 2.5,
+            "firstToolDiscoveryActionMs": 7.5,
+            "firstDomainActionMs": 12.5,
+            "firstSuccessfulDomainActionMs": 15.0,
+        },
+        "machineDurationNs": 900_000_000,
+        "exclusive": {
+            "modelOnlyNs": 600_000_000,
+            "toolOnlyNs": 200_000_000,
+            "modelPlusToolNs": 0,
+            "orchestrationNs": 100_000_000,
+            "interactiveOnlyWaitNs": 100_000_000,
+        },
+        "unions": {
+            "modelActiveUnionNs": 600_000_000,
+            "modelRequestWaitUnionNs": 10_000_000,
+            "modelStreamWaitUnionNs": 590_000_000,
+            "modelStreamProcessingUnionNs": 20_000_000,
+            "interactiveWaitUnionNs": 150_000_000,
+        },
+        "local": {
+            "preparationUnionNs": 11_000_000,
+            "planningUnionNs": 23_000_000,
+            "planningExclusiveUnionNs": 17_000_000,
+            "planningCompactionOverlapUnionNs": 6_000_000,
+            "compactionUnionNs": 9_000_000,
+            "persistenceUnionNs": 13_000_000,
+            "serializationUnionNs": 7_000_000,
+            "routerBuildUnionNs": 5_000_000,
+            "startupPrewarmWaitUnionNs": 3_000_000,
+            "executorReadinessWaitUnionNs": 2_000_000,
+        },
+        "counters": {
+            "logicalGenerationCount": 2,
+            "toolCallCount": 1,
+            "samePurposeContinuationCount": 1,
+            "suppressedDeterministicContinuationCount": 1,
+            "exactRepeatedWaitCount": 1,
+            "waitOnlyGenerationCount": 1,
+            "internallyDrainedWaitCount": 2,
+            "noProgressDirectiveCount": 1,
+            "provenLoopActivationCount": 1,
+            "userInputWaitCount": 1,
+        },
+        "modelRequests": [
+            {
+                "generationIndex": 0,
+                "attemptKind": "primary",
+                "generationPurpose": "deterministic_tool_continuation",
+                "modelStreamWaitNs": 300_000_000,
+                "decisionLatencyNs": 250_000_000,
+                "toolCallCount": 1,
+                "toolActiveUnionNs": 100_000_000,
+                "unchangedRelevantState": True,
+                "nextStructuredActionChanged": False,
+                "outputTokens": 15,
+                "reasoningOutputTokens": 5,
+                "tokenUsage": {
+                    "inputTokens": 100,
+                    "cachedInputTokens": 80,
+                    "visibleOutputTokens": 10,
+                    "reasoningTokens": 5,
+                    "totalTokens": 115,
+                },
+                "requestTokenCategories": {
+                    "logicalTotal": 95,
+                    "localInputEstimate": 100,
+                    "repeatedUnchangedContext": 70,
+                },
+                "dispatchMs": 0,
+                "completedMs": 310,
+            },
+            {
+                "generationIndex": 1,
+                "attemptKind": "primary",
+                "generationPurpose": "implementation",
+                "modelStreamWaitNs": 290_000_000,
+                "decisionLatencyNs": None,
+                "unchangedRelevantState": False,
+                "nextStructuredActionChanged": True,
+                "outputTokens": 10,
+                "reasoningOutputTokens": 2,
+                "tokenUsage": {
+                    "inputTokens": 110,
+                    "cachedInputTokens": 100,
+                    "visibleOutputTokens": 8,
+                    "reasoningTokens": 2,
+                    "totalTokens": 120,
+                },
+                "requestTokenCategories": {
+                    "logicalTotal": 105,
+                    "localInputEstimate": 110,
+                    "repeatedUnchangedContext": 80,
+                },
+                "dispatchMs": 320,
+                "completedMs": 620,
+            },
+        ],
+        "toolCalls": [
+            {
+                "callId": "relay-1",
+                "toolName": "shell_command",
+                "source": "direct",
+                "generationIndex": 0,
+                "acceptedAtMs": 1,
+                "firstPollAtMs": 2,
+                "parallelGateAdmittedAtMs": 3,
+                "handlerEntryAtMs": 4,
+                "handlerExitAtMs": 7,
+                "processSpawnedAtMs": 5,
+                "processExitedAtMs": 6,
+                "outputCollectedAtMs": 8,
+                "deliveredAtMs": 9,
+                "outputModelVisibleAtMs": 9,
+                "modelResumedAtMs": 10,
+                "itemToFirstPollMs": 1,
+                "parallelGateWaitMs": 1,
+                "preToolHookMs": 0,
+                "postToolHookMs": 0,
+                "workspaceEvidenceBeforeMs": 0,
+                "workspaceEvidenceAfterMs": 0,
+                "authorizationStateCoordinationMs": 0,
+                "handlerDurationMs": 3,
+                "postHandlerMs": 2,
+                "totalDurationMs": 7,
+                "eager": True,
+                "processAliveAtDelivery": False,
+            }
+        ],
+        "toolCallTimingOverflow": 0,
+        "preFirstModelOutput": {
+            "clientCriticalPathNs": 80_000_000,
+            "attributedClientUnionNs": 65_000_000,
+            "unattributedPreOutputNs": 15_000_000,
+            "historySnapshotNs": 10_000_000,
+            "normalizationNs": 8_000_000,
+            "promptConstructionNs": 20_000_000,
+            "requestTransformationNs": 7_000_000,
+            "serializationNs": 5_000_000,
+            "transportReadinessNs": 15_000_000,
+        },
+        "observationalNonprogressTokens": {
+            "logicalGenerations": 1,
+            "inputTokens": 100,
+            "cachedInputTokens": 80,
+            "visibleOutputTokens": 10,
+            "reasoningTokens": 5,
+            "totalTokens": 115,
+        },
+        "observationalNonprogressLatency": {
+            "logicalGenerations": 1,
+            "physicalAttempts": 1,
+            "modelStreamWaitNs": 300_000_000,
+            "decisionReadyAttempts": 1,
+            "decisionLatencyNs": 250_000_000,
+            "toolCalls": 1,
+            "toolActiveUnionNs": 100_000_000,
+        },
+    }
+
+
+class RequestSetupReportingTest(unittest.TestCase):
+    def test_setup_survives_full_bounded_text_and_saved_report_paths(self):
+        timing = _timing()
+        timing["schemaVersion"] = 30
+        timing["modelRequests"] = [
+            {"generationIndex": index // 2,
+             "attemptKind": "retry" if index % 2 else "primary",
+             "setupPhaseNs": {"preparation": (index + 1) * 1_000_000,
+                              "history_snapshot": (index + 1) * 1_000_000,
+                              "serialization": 0}}
+            for index in range(25)
+        ]
+        timing["counters"].update(modelRequestCount=25, logicalGenerationCount=13)
+        historical = _timing()
+        historical["schemaVersion"] = 29
+        historical["counters"]["modelRequestCount"] = 2
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            terminal = _event({"type": "task_complete", "turn_id": "modern", "timing": timing})
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "modern"}),
+                terminal, terminal,
+                _event({"type": "task_started", "turn_id": "historical"}),
+                _event({"type": "task_complete", "turn_id": "historical", "timing": historical}),
+            ]), encoding="utf-8")
+            for include_tokens in (True, False):
+                with self.subTest(include_tokens=include_tokens):
+                    report = kd4_turn_latency_audit.analyze_session_path(
+                        path, Path(temp), include_tokens=include_tokens
+                    )
+                    ledger = report["requestLedger"]["requests"]
+                    modern = [row for row in ledger if row["turnId"] == "modern"]
+                    self.assertEqual([row["requestIndex"] for row in modern], list(range(25)))
+                    self.assertEqual([row["setupPhaseNs"] for row in modern],
+                                     [row["setupPhaseNs"] for row in timing["modelRequests"]])
+                    self.assertEqual(modern[1]["attemptKind"], "retry")
+                    self.assertTrue(all(row["setupPhaseNs"] is None for row in ledger
+                                        if row["turnId"] == "historical"))
+                    setup = report["latencyBreakdown"]["orchestration"]["requestSetup"]
+                    self.assertEqual((setup["requestRows"], setup["measuredRequests"], setup["missingRequests"]),
+                                     (27, 25, 2))
+                    self.assertEqual(setup["phaseSummariesNs"]["preparation"],
+                                     {"count": 25, "observedTotalNs": 325_000_000,
+                                      "minNs": 1_000_000, "maxNs": 25_000_000})
+                    self.assertEqual(report["populations"]["all"]["requestSetup"], setup)
+                    self.assertEqual(report["runnerDiagnostics"]["runtime"]["requestSetup"], setup)
+                    by_turn = {turn["turnId"]: turn for turn in report["perTurn"]}
+                    self.assertEqual(by_turn["modern"]["requestSetup"]["measuredRequests"], 25)
+                    self.assertFalse(by_turn["historical"]["requestSetup"]["available"])
+                    self.assertEqual(report["latencyBreakdown"]["orchestration"]["exclusiveTotalNs"], 200_000_000)
+                    self.assertEqual(report["latencyBreakdown"]["modelInference"]["exclusiveTotalNs"], 1_200_000_000)
+                    before = json.dumps(report, sort_keys=True)
+                    for limit in (kd4_turn_latency_audit._MAX_SUMMARY_BYTES, 1):
+                        with mock.patch.object(kd4_turn_latency_audit, "_MAX_SUMMARY_BYTES", limit):
+                            bounded = kd4_turn_latency_audit.bounded_summary(report)
+                        self.assertEqual(bounded["latencyBreakdown"]["orchestration"]["requestSetup"], setup)
+                    self.assertEqual(json.dumps(report, sort_keys=True), before)
+                    rendered = kd4_turn_latency_audit.render_report(report)
+                    for expected in ("setup (overlapping)", "serialization=0.000ms",
+                                     "observed-sum=325.000ms", "do not sum phases", "requests omitted"):
+                        self.assertIn(expected, rendered)
+                    saved = Path(temp) / "report.json"
+                    saved.write_text(before, encoding="utf-8")
+                    for output_flag in ("--json", "--summary-json"):
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                            status = kd4_turn_latency_audit.main(["--from-report", str(saved), output_flag])
+                        self.assertEqual(status, 0)
+                        replay = json.loads(output.getvalue())
+                        self.assertEqual(replay["latencyBreakdown"]["orchestration"]["requestSetup"], setup)
+
+    def test_older_rollouts_and_saved_reports_do_not_require_setup_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "legacy"}),
+                _event({"type": "task_complete", "turn_id": "legacy", "timing": _timing()}),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        self.assertIn("setup durations unavailable", kd4_turn_latency_audit.render_report(report))
+        self.assertEqual(report["latencyBreakdown"]["orchestration"]["requestSetup"]["missingRequests"], 2)
+        bounded = kd4_turn_latency_audit.bounded_summary(report)
+        self.assertNotIn("requestSetup", bounded["latencyBreakdown"]["orchestration"])
+        self.assertEqual(len(bounded["perTurn"]), 1)
+        # Simulate saved JSON from before setup reporting existed, with the same schema.
+        report["latencyBreakdown"]["orchestration"].pop("requestSetup")
+        for row in report["requestLedger"]["requests"]:
+            row.pop("setupPhaseNs")
+        for turn in report["perTurn"]:
+            turn.pop("requestSetup")
+        for population in report["populations"].values():
+            population.pop("requestSetup")
+        self.assertIn("setup (overlapping)=[unavailable]", kd4_turn_latency_audit.render_report(report))
+        bounded = kd4_turn_latency_audit.bounded_summary(report)
+        self.assertNotIn("requestSetup", bounded["latencyBreakdown"]["orchestration"])
+
+
+class CompactionLatencyTest(unittest.TestCase):
+    def test_summary_requests_are_separate_in_full_bounded_and_text_reports(self):
+        timing = _timing()
+        requests = []
+        for index in range(8):
+            requests.extend([
+                {
+                    "generationIndex": index * 2,
+                    "attemptKind": "primary",
+                    "generationReason": "compaction",
+                    "generationPurpose": "compaction_recovery",
+                    "toolCallCount": 0,
+                    "dispatchMs": index * 204_000,
+                    "completedMs": index * 204_000 + 202_750,
+                    "modelStreamWaitNs": 202_000_000_000,
+                },
+                {
+                    "generationIndex": index * 2 + 1,
+                    "attemptKind": "primary",
+                    "generationReason": "compaction",
+                    "generationPurpose": "compaction_recovery",
+                    "relevantStateFingerprint": f"state-{index}",
+                    "toolCallCount": 0,
+                    "dispatchMs": index * 204_000 + 202_980,
+                    "completedMs": index * 204_000 + 203_980,
+                    "modelStreamWaitNs": 1_000_000_000,
+                },
+            ])
+        timing["modelRequests"] = requests
+        timing["counters"].update(logicalGenerationCount=16, modelRequestCount=16)
+        timing["local"]["compactionUnionNs"] = 150_000
+        timing["inclusiveDurationNs"] = 1_632_000_000_000
+        timing["machineDurationNs"] = 1_632_000_000_000
+        timing["exclusive"]["modelOnlyNs"] = 1_630_000_000_000
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "compactions"}),
+                _event({"type": "task_complete", "turn_id": "compactions",
+                        "timing": timing}),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        for view in (report, kd4_turn_latency_audit.bounded_summary(report)):
+            model = view["latencyBreakdown"]["modelInference"]
+            summary = model["generationPurposes"]["compaction_summary"]
+            self.assertEqual(summary["logicalGenerations"], 8)
+            self.assertEqual(summary["physicalAttempts"], 8)
+            self.assertEqual(summary["requestElapsedNs"], 1_622_000_000_000)
+            self.assertEqual(summary["modelStreamWaitNs"], 1_616_000_000_000)
+            self.assertEqual(summary["elapsedRows"], 8)
+            self.assertEqual(summary["missingElapsedRows"], 0)
+            self.assertEqual(
+                model["generationPurposes"]["compaction_recovery"]["modelStreamWaitNs"],
+                8_000_000_000,
+            )
+            self.assertEqual(model["exclusiveTotalNs"], 1_630_000_000_000)
+            self.assertEqual(
+                view["latencyBreakdown"]["orchestration"]["localActivityUnionsNs"]["compactionNs"],
+                150_000,
+            )
+            self.assertIn("inferred", model["measurementNote"])
+            self.assertIn("not additive", model["measurementNote"])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("compaction summary requests", rendered)
+        self.assertIn("elapsed=1622.0s", rendered)
+        self.assertIn("compaction-local=", rendered)
+        self.assertEqual(requests[0]["generationPurpose"], "compaction_recovery")
+
+    def test_classification_requires_compaction_metadata_and_recorded_zero_tools(self):
+        summary = {
+            "generationReason": "compaction",
+            "generationPurpose": "compaction_recovery",
+            "toolCallCount": 0,
+        }
+        for overrides in (
+            {"relevantStateFingerprint": "continuation-state"},
+            {"toolCallCount": 1},
+            {"modelEmittedToolCallCount": 1},
+            {"generationReason": "initial"},
+            {"generationPurpose": "implementation"},
+        ):
+            with self.subTest(overrides=overrides):
+                report = kd4_timing_analysis._generation_purpose_latency_report(
+                    [{**summary, **overrides}]
+                )
+                self.assertNotIn("compaction_summary", report)
+        # Null is malformed (the persisted counter is a u32), not a missing
+        # optional field. Preserve the existing profile-validation failure.
+        with self.assertRaises(TypeError):
+            kd4_timing_analysis._generation_purpose_latency_report(
+                [{**summary, "toolCallCount": None}]
+            )
+        del summary["toolCallCount"]
+        self.assertNotIn(
+            "compaction_summary",
+            kd4_timing_analysis._generation_purpose_latency_report([summary]),
+        )
+
+    def test_retries_and_missing_or_invalid_elapsed_boundaries_remain_visible(self):
+        base = {
+            "generationReason": "compaction",
+            "generationPurpose": "compaction_recovery",
+            "relevantStateFingerprint": None,
+            "toolCallCount": 0,
+            "generationIndex": 0,
+            "modelStreamWaitNs": 1_000_000_000,
+        }
+        rows = [
+            {**base, "attemptKind": "primary", "dispatchMs": 0, "completedMs": 1000},
+            {**base, "attemptKind": "retry", "dispatchMs": 1200, "completedMs": 2200},
+            {**base, "attemptKind": "retry", "dispatchMs": 2400},
+            {**base, "attemptKind": "retry", "dispatchMs": 3000, "completedMs": 2900},
+        ]
+        report = kd4_timing_analysis._generation_purpose_latency_report(rows)
+        summary = report["compaction_summary"]
+        self.assertEqual(summary["logicalGenerations"], 1)
+        self.assertEqual(summary["physicalAttempts"], 4)
+        self.assertEqual(summary["retryAttempts"], 3)
+        self.assertEqual(summary["requestElapsedNs"], 2_000_000_000)
+        self.assertEqual(summary["modelStreamWaitNs"], 4_000_000_000)
+        self.assertEqual(summary["elapsedRows"], 2)
+        self.assertEqual(summary["missingElapsedRows"], 2)
+
+
+class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_transport_attribution_limit_survives_full_compact_and_text_reports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "transport"}),
+                _event({"type": "task_complete", "turn_id": "transport", "timing": _timing()}),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        for view in (report, kd4_turn_latency_audit.bounded_summary(report)):
+            model = view["latencyBreakdown"]["modelInference"]
+            self.assertEqual(model["exclusiveTotalNs"], 600_000_000)
+            self.assertIn("not inference-only", model["measurementNote"])
+            self.assertIn("DNS, TCP, TLS", model["measurementNote"])
+            self.assertIn("not separately measured", model["measurementNote"])
+        self.assertIn("not inference-only", kd4_turn_latency_audit.render_report(report))
+
+    def test_checkout_sweep_matches_pairwise_ranking_and_skips_disjoint_history(self):
+        import random
+
+        rng = random.Random(9)
+        records, edited = [], {}
+        for index in range(100):
+            start = rng.randrange(10000)
+            record = {"file": f"session-{index % 11}.jsonl", "turn_id": str(index),
+                      "cwd": "C:/repo" if index % 3 else "C:/other",
+                      "timing": {"startedAtUnixMs": start,
+                                 "completedAtUnixMs": start + rng.randrange(3000)}}
+            records.append(record)
+            edited[(record["file"], record["turn_id"])] = {f"file-{index % 4}", "common"}
+        expected = []
+        for index, first in enumerate(records):
+            for second in records[index + 1:]:
+                if first["cwd"] != second["cwd"] or first["file"] == second["file"]:
+                    continue
+                overlap = min(first["timing"]["completedAtUnixMs"], second["timing"]["completedAtUnixMs"]) - max(first["timing"]["startedAtUnixMs"], second["timing"]["startedAtUnixMs"])
+                if overlap > 0:
+                    expected.append({"checkout": first["cwd"].casefold(),
+                                     "sessions": [first["file"], second["file"]],
+                                     "turns": [first["turn_id"], second["turn_id"]],
+                                     "overlapSeconds": round(overlap / 1000, 1),
+                                     "sharedPaths": sorted(edited[(first["file"], first["turn_id"])] & edited[(second["file"], second["turn_id"])])})
+        expected.sort(key=lambda pair: (-len(pair["sharedPaths"]), -pair["overlapSeconds"]))
+        actual = kd4_turn_latency_audit._checkout_overlaps(records, edited, limit=7)
+        self.assertEqual(actual, {"pairs": len(expected), "overlaps": expected[:7],
+                                  "omittedPairs": len(expected) - 7})
+        for index, record in enumerate(records):
+            record["timing"] = {"startedAtUnixMs": index * 1000,
+                                "completedAtUnixMs": index * 1000 + 500}
+        with mock.patch.object(kd4_turn_latency_audit, "min", wraps=min, create=True) as compare:
+            self.assertEqual(kd4_turn_latency_audit._checkout_overlaps(records, edited)["pairs"], 0)
+        compare.assert_not_called()
+
+    def test_turn_tokens_ignore_session_cumulative_and_suppression_is_not_savings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            events = [_meta(temp)]
+            for turn_id in ("first", "second"):
+                timing = _timing()
+                timing["counters"]["internallyDrainedWaitCount"] = 24
+                timing["counters"]["suppressedDeterministicContinuationCount"] = 24
+                events.extend(
+                    [
+                        _event({"type": "task_started", "turn_id": turn_id}),
+                        _event(
+                            {
+                                "type": "token_count",
+                                "info": {
+                                    "total_token_usage": {"input_tokens": 999999},
+                                },
+                            }
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": turn_id,
+                                "timing": timing,
+                            }
+                        ),
+                    ]
+                )
+            path.write_text("\n".join(events), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        self.assertEqual(len(report["perTurn"]), 2)
+        for turn in report["perTurn"]:
+            self.assertEqual(turn["tokens"]["inputTokens"], 210)
+            self.assertEqual(
+                turn["tokenScope"], "turn_model_requests_not_session_cumulative"
+            )
+            accounting = turn["continuationAccounting"]
+            self.assertEqual(accounting["internallyDrainedWaitObservations"], 24)
+            self.assertEqual(accounting["reportedSuppressedContinuations"], 24)
+            self.assertIsNone(accounting["provenAvoidedModelRequests"])
+
+    def test_tokens_off_skips_cost_fit_and_reasoning_share_but_keeps_byte_shares(self):
+        timing = _timing()
+        timing["modelRequests"] = [
+            {"generationIndex": index, "modelStreamWaitNs": output * 100_000_000,
+             "tokenUsage": {"inputTokens": 100, "cachedInputTokens": 0,
+                            "visibleOutputTokens": output - 2, "reasoningTokens": 2}}
+            for index, output in enumerate((10, 20, 30))
+        ]
+        timing["counters"].update(modelRequestCount=3, logicalGenerationCount=3)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _event({"type": "task_started", "turn_id": "tokens"}),
+                _response({"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "done"},
+                ]}, "2026-08-17T00:00:00Z"),
+                _event({"type": "task_complete", "turn_id": "tokens", "timing": timing}),
+            ]), encoding="utf-8")
+            enabled = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+            # Three measured points lie exactly on wait = 0.1s * output tokens;
+            # six reasoning tokens are 10% of the sixty recorded output tokens.
+            self.assertEqual(enabled["requestCostModel"], {
+                "requests": 3, "fixedSeconds": 0.0,
+                "perOutputTokenMs": 100.0, "correlation": 1.0,
+            })
+            self.assertEqual(enabled["outputChannels"]["reasoningTokenShare"], 0.1)
+            output = io.StringIO()
+            with mock.patch.object(kd4_turn_latency_audit, "_request_cost_model",
+                                   side_effect=AssertionError("token cost fit called")), \
+                 contextlib.redirect_stdout(output):
+                status = kd4_turn_latency_audit.main([str(path), "--tokens", "off", "--json"])
+        self.assertEqual(status, 0)
+        disabled = json.loads(output.getvalue())
+        self.assertFalse(disabled["tokenAnalysisEnabled"])
+        self.assertIsNone(disabled["requestCostModel"])
+        self.assertEqual(disabled["outputChannels"], {
+            "visibleByteShares": {"prose": 1.0}, "reasoningTokenShare": None,
+        })
+        rendered = kd4_turn_latency_audit.render_report(disabled)
+        self.assertNotIn("request cost:", rendered)
+        self.assertNotIn(" of output tokens", rendered)
+        self.assertIn("visible output (byte shares): prose=100%", rendered)
+
+    def test_cost_fit_uses_measured_output_not_imputed_zero(self):
+        timing = _timing()
+        timing["modelRequests"] = [
+            {"generationIndex": index, "modelStreamWaitNs": output * 100_000_000,
+             "tokenUsage": {"inputTokens": 100, "cachedInputTokens": 0,
+                            "visibleOutputTokens": output, "reasoningTokens": 0}}
+            for index, output in enumerate((0, 10, 20))
+        ]
+        timing["counters"].update(modelRequestCount=4, logicalGenerationCount=4)
+        for usage in (None, {"visibleOutputTokens": 3}, {"reasoningTokens": 3}):
+            with self.subTest(usage=usage):
+                incomplete = {"generationIndex": 3, "modelStreamWaitNs": 99_000_000_000}
+                if usage is not None:
+                    incomplete["tokenUsage"] = usage
+                changed = dict(timing, modelRequests=[*timing["modelRequests"], incomplete])
+                report = self.audit_commands([], timing=changed)
+                # Observed points (0,0), (10,1), (20,2) seconds define this line.
+                # The 99-second request has no measured total output token count.
+                self.assertEqual(report["requestCostModel"], {
+                    "requests": 3, "fixedSeconds": 0.0,
+                    "perOutputTokenMs": 100.0, "correlation": 1.0,
+                })
+        timing["modelRequests"] = timing["modelRequests"][:2] + [incomplete]
+        timing["counters"].update(modelRequestCount=3, logicalGenerationCount=3)
+        self.assertIsNone(self.audit_commands([], timing=timing)["requestCostModel"])
+
+    def test_unmeasured_residual_and_honest_continuation_metrics(self) -> None:
+        timing = _timing()
+        timing["counters"]["residualDeterministicGenerationCount"] = None
+        timing["counters"]["waitGenerationsWithSameRevisionCount"] = 3
+        timing["modelRequests"] = [{
+            "generationIndex": 0,
+            "generationPurpose": "tool_result_interpretation",
+            "modelStreamWaitNs": 123,
+        }]
+        report = kd4_timing_analysis._population_report(
+            [{"timing": timing, "turn_id": "turn", "status": "completed"}],
+            include_tokens=False,
+        )
+        self.assertIsNone(report["residualDeterministicGenerationCount"])
+        self.assertEqual(report["waitGenerationsWithSameRevisionCount"], 3)
+        self.assertNotIn("exactRepeatedWaitCount", report)
+        self.assertEqual(report["toolResultInterpretationLatency"]["logicalGenerations"], 1)
+        self.assertEqual(report["toolResultInterpretationLatency"]["modelStreamWaitNs"], 123)
+
+    def test_direct_handoff_observation_is_not_derived_from_wait_counts(self):
+        for observed in (None, 0, 3):
+            timing = _timing()
+            if observed is not None:
+                timing["counters"]["provenAvoidedModelRequests"] = observed
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "rollout.jsonl"
+                path.write_text(_event({"type": "task_complete", "turn_id": "turn", "timing": timing}), encoding="utf-8")
+                report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+            self.assertEqual(report["perTurn"][0]["continuationAccounting"]["provenAvoidedModelRequests"], observed)
+
+    @staticmethod
+    def startup_event(**overrides):
+        fields = {
+            "message": "startup timing snapshot frozen at first model send",
+            "startup_timing_schema_version": 1,
+            "startup_timing_correlation_id": "session-a",
+            "startup_timing_started_at_unix_ms": 1000,
+            "startup_timing_completed_at_unix_ms": 1100,
+            "startup_timing_duration_ns": "100000000",
+            "startup_timing_profile_valid": True,
+            "startup_prewarm_status": 'Some("ready")',
+            "startup_session_initialization_ns": "60000000",
+            "startup_transport_preconnect_ns": "40000000",
+            "startup_prewarm_preparation_ns": "30000000",
+            "startup_prewarm_request_ns": "20000000",
+            "startup_first_turn_wait_ns": "10000000",
+            "startup_executor_readiness_ns": "50000000",
+            "startup_preconnect_preparation_overlap_ns": "15000000",
+            "startup_preconnect_executor_overlap_ns": "25000000",
+            "startup_timing_invalid_transition_count": 0,
+            "startup_timing_clock_regression_count": 0,
+            "startup_timing_saturation_count": 0,
+        }
+        fields.update(overrides)
+        return {"target": "codex_core::session::turn", "fields": fields}
+
+    def test_startup_log_cli_deduplicates_and_keeps_overlapping_phases_separate(self):
+        event = self.startup_event()
+        restarted = self.startup_event(
+            startup_timing_started_at_unix_ms=2000,
+            startup_timing_completed_at_unix_ms=2200,
+            startup_timing_duration_ns="200000000",
+        )
+        unrelated = {**event, "target": "unrelated"}
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "stderr.jsonl"
+            source.write_text(
+                "\n".join(
+                    json.dumps(row) for row in [event, event, restarted, unrelated]
+                ),
+                encoding="utf-8",
+            )
+            reports = []
+            for output_flag in ("--json", "--summary-json"):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    result = kd4_turn_latency_audit.main(
+                        ["--startup-log", str(source), "--tokens", "off", output_flag]
+                    )
+                self.assertEqual(result, 0)
+                report = json.loads(stdout.getvalue())
+                self.assertFalse(report["tokenAnalysisEnabled"])
+                reports.append(report["startupTiming"])
+            for startup in reports:
+                self.assertTrue(startup["available"])
+                self.assertEqual(startup["profiles"], 2)
+                self.assertEqual(startup["validProfiles"], 2)
+                self.assertEqual(startup["excludedProfiles"], 0)
+                self.assertEqual(startup["duplicateSnapshots"], 1)
+                self.assertEqual(startup["prewarmStatuses"], {'Some("ready")': 2})
+                self.assertEqual(
+                    startup["durationSummariesNs"]["inclusiveDurationNs"],
+                    {
+                        "count": 2,
+                        "total": 300_000_000,
+                        "min": 100_000_000,
+                        "max": 200_000_000,
+                    },
+                )
+                self.assertEqual(
+                    startup["durationSummariesNs"]["preconnectPreparationOverlapNs"][
+                        "total"
+                    ],
+                    30_000_000,
+                )
+                self.assertEqual(
+                    startup["durationSummariesNs"]["preconnectExecutorOverlapNs"][
+                        "total"
+                    ],
+                    50_000_000,
+                )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                kd4_turn_latency_audit.main(
+                    ["--startup-log", str(source), "--tokens", "off"]
+                )
+            self.assertIn(
+                "startup timing: 2/2 valid captured profiles", stdout.getvalue()
+            )
+            self.assertIn(
+                "inclusiveDurationNs: mean=150.000ms min=100.000ms max=200.000ms",
+                stdout.getvalue(),
+            )
+            self.assertIn("must not be added or subtracted", stdout.getvalue())
+
+    def test_startup_log_excludes_invalid_unknown_and_conflicting_profiles(self):
+        changes = [
+            {"startup_timing_profile_valid": False},
+            {"startup_timing_schema_version": 2},
+            {"startup_timing_invalid_transition_count": 1},
+            {"startup_timing_clock_regression_count": 2},
+            {"startup_timing_saturation_count": 3},
+            {"startup_timing_duration_ns": None},
+            {"startup_timing_duration_ns": str(2**128 - 1)},
+            {"startup_preconnect_preparation_overlap_ns": 31_000_000},
+            {"startup_timing_duration_ns": True},
+        ]
+        events = [
+            self.startup_event(startup_timing_correlation_id=str(i), **change)
+            for i, change in enumerate(changes)
+        ]
+        events += [
+            self.startup_event(),
+            self.startup_event(startup_timing_duration_ns=99_000_000),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "stderr.jsonl"
+            source.write_text(
+                "\n".join(json.dumps(row) for row in events), encoding="utf-8"
+            )
+            report = kd4_turn_latency_audit.analyze_session_path(
+                None, Path(temp), include_tokens=False, startup_log=source
+            )
+        startup = report["startupTiming"]
+        self.assertFalse(startup["available"])
+        self.assertEqual(startup["excludedProfiles"], 10)
+        self.assertEqual(startup["conflictingProfiles"], 1)
+        self.assertEqual(startup["duplicateSnapshots"], 0)
+        self.assertTrue(
+            all(value is None for value in startup["durationSummariesNs"].values())
+        )
+        for row, reason in zip(
+            startup["records"],
+            [
+                "profile_invalid",
+                "unsupported_schema",
+                "runtime_diagnostics_nonzero",
+                "runtime_diagnostics_nonzero",
+                "runtime_diagnostics_nonzero",
+                "missing_invalid_or_saturated_fields",
+                "missing_invalid_or_saturated_fields",
+                "inconsistent_phase_durations",
+                "missing_invalid_or_saturated_fields",
+                "conflicting_snapshots",
+            ],
+        ):
+            self.assertIn(reason, row["exclusionReasons"])
+        self.assertEqual(
+            startup["records"][3]["diagnostics"]["clockRegressionCount"], 2
+        )
+        text = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("startup durations unavailable", text)
+        self.assertIn("clockRegressionCount': 2", text)
+
+    def test_startup_log_missing_and_malformed_records_do_not_become_zero_durations(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertNotIn(
+                "startupTiming",
+                kd4_turn_latency_audit.analyze_session_path(
+                    None, root, include_tokens=False
+                ),
+            )
+            source = root / "stderr.jsonl"
+            source.write_text(
+                'truncated JSON\n[]\n{"fields":{"message":"ordinary log"}}\n',
+                encoding="utf-8",
+            )
+            report = kd4_turn_latency_audit.analyze_session_path(
+                None, root, include_tokens=False, startup_log=source
+            )
+        startup = kd4_turn_latency_audit.bounded_summary(report)["startupTiming"]
+        self.assertEqual(startup["parseErrorCount"], 2)
+        self.assertEqual(startup["profiles"], 0)
+        self.assertFalse(startup["available"])
+        self.assertIsNone(startup["durationSummariesNs"]["inclusiveDurationNs"])
+
+    def test_startup_log_bounded_records_preserve_full_coverage_and_valid_only_summaries(
+        self,
+    ):
+        events = [
+            self.startup_event(startup_timing_correlation_id=str(i)) for i in range(12)
+        ]
+        events.append(
+            self.startup_event(
+                startup_timing_correlation_id="bad",
+                startup_timing_profile_valid=False,
+                startup_timing_duration_ns=900_000_000,
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "stderr.jsonl"
+            source.write_text(
+                "\n".join(json.dumps(row) for row in events), encoding="utf-8"
+            )
+            full = kd4_turn_latency_audit.analyze_session_path(
+                None, root, include_tokens=False, startup_log=source
+            )
+        bounded = kd4_turn_latency_audit.bounded_summary(full)["startupTiming"]
+        self.assertGreater(len(bounded["records"]), 0)
+        self.assertLessEqual(len(bounded["records"]), 10)
+        self.assertEqual(len(bounded["records"]) + bounded["omittedRecords"], len(events))
+        self.assertEqual(bounded["records"], full["startupTiming"]["records"][:len(bounded["records"])])
+        self.assertEqual(bounded["profiles"], 13)
+        self.assertEqual(bounded["validProfiles"], 12)
+        self.assertEqual(bounded["excludedProfiles"], 1)
+        self.assertEqual(
+            bounded["durationSummariesNs"]["inclusiveDurationNs"],
+            {
+                "count": 12,
+                "total": 1_200_000_000,
+                "min": 100_000_000,
+                "max": 100_000_000,
+            },
+        )
+
+    def audit_commands(self, commands, *, timing=None, include_tokens=True):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout.jsonl"
+            lines = [
+                _meta(str(root)),
+                _event({"type": "task_started", "turn_id": "behavior"}),
+            ]
+            for index, (command, output) in enumerate(commands):
+                # Exercise literal decoding through the normal code-mode boundary.
+                lines.append(
+                    _response(
+                        {
+                            "type": "custom_tool_call",
+                            "call_id": f"call-{index}",
+                            "name": "exec",
+                            "input": "await tools.exec_command({cmd: "
+                            + json.dumps(command)
+                            + "});",
+                        },
+                        "2026-08-17T00:00:01Z",
+                    )
+                )
+                lines.append(
+                    _response(
+                        {
+                            "type": "custom_tool_call_output",
+                            "call_id": f"call-{index}",
+                            "output": output,
+                        },
+                        "2026-08-17T00:00:02Z",
+                    )
+                )
+            lines.append(
+                _event(
+                    {
+                        "type": "task_complete",
+                        "turn_id": "behavior",
+                        "timing": timing or _timing(),
+                    },
+                    "2026-08-17T00:00:03Z",
+                )
+            )
+            source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return kd4_turn_latency_audit.analyze_session_path(
+                source, root, include_tokens=include_tokens
+            )
+
+    def test_behavior_vector_uses_untruncated_counts_and_complete_provider_tokens(self):
+        timing = _timing()
+        timing["counters"].update(
+            {
+                "executedValidationCount": 3,
+                "executedValidationDurationNs": 1_234_567,
+                "suppressedValidationOutputCount": 4,
+                "modelRetryCount": 2,
+                "modelFallbackCount": 0,
+                "saturationCount": 0,
+                "planningGenerationCount": 5,
+                "planRevisionGenerationCount": 2,
+                "planningFixedPointIterationCount": 3,
+                "approvalWaitCount": 2,
+                "permissionWaitCount": 0,
+                "mcpElicitationWaitCount": 4,
+                "toolOutputCanonicalTokenCount": 2**32 + 100,
+                "toolOutputModelTokenCount": 2**32 + 50,
+                "toolOutputRecoveryCallCount": 3,
+                "toolOutputRecoveryRetruncationCount": 0,
+                "toolOutputArtifactCreationCount": 2,
+                "toolOutputArtifactReuseCount": 1,
+                "toolOutputOmittedSectionCount": 2**32 + 5,
+                "attributableRecoveryGenerationCount": 2,
+            }
+        )
+        report = self.audit_commands(
+            [("cat src/client.ts", ""), ("rg Widget src/client.ts", "")] * 35,
+            timing=timing,
+        )
+        self.assertEqual(len(report["sourceDiscovery"]["events"]), 64)
+        self.assertEqual(report["sourceDiscovery"]["omittedEvents"], 6)
+        vector = report["behaviorMetrics"]
+        self.assertEqual(vector["behaviorSchemaVersion"], 2)
+        self.assertEqual(
+            vector["metrics"],
+            {
+                "discoveryEvents": 70,
+                "searchEvents": 35,
+                "readEvents": 35,
+                "broadSearchEvents": 0,
+                "repeatedSearchEvents": 34,
+                "executedValidationCount": 3,
+                "modelRetryCount": 2,
+                "modelFallbackCount": 0,
+                "executedValidationDurationNs": 1_234_567,
+                "suppressedValidationOutputCount": 4,
+                "noProgressDirectiveCount": 1,
+                "provenLoopActivationCount": 1,
+                "planningGenerationCount": 5,
+                "planRevisionGenerationCount": 2,
+                "planningFixedPointIterationCount": 3,
+                "approvalWaitCount": 2,
+                "permissionWaitCount": 0,
+                "userInputWaitCount": 1,
+                "mcpElicitationWaitCount": 4,
+                "toolOutputCanonicalTokenCount": 2**32 + 100,
+                "toolOutputModelTokenCount": 2**32 + 50,
+                "toolOutputRecoveryCallCount": 3,
+                "toolOutputRecoveryRetruncationCount": 0,
+                "toolOutputArtifactCreationCount": 2,
+                "toolOutputArtifactReuseCount": 1,
+                "toolOutputOmittedSectionCount": 2**32 + 5,
+                "attributableRecoveryGenerationCount": 2,
+                "totalTokens": 235,
+            },
+        )
+        self.assertEqual(vector["unavailableReasons"], {})
+        self.assertEqual(
+            kd4_turn_latency_audit.bounded_summary(report)["behaviorMetrics"],
+            {key: value for key, value in vector.items() if key != "measurementNote"},
+        )
+        self.assertNotIn("client.ts", json.dumps(vector))
+        meta = vector["evidenceMeta"]
+        self.assertEqual(meta["schemaVersion"], 1)
+        self.assertEqual(meta["payloadCompleteness"], "complete")
+        self.assertTrue(meta["evidenceBearing"])
+        self.assertTrue(meta["approximate"])
+        self.assertFalse(meta["truncated"])
+        self.assertRegex(meta["snapshot"], r"^sha256:[0-9a-f]{64}$")
+        self.assertIsNone(vector["configuration"]["sha256"])
+        bounded = kd4_turn_latency_audit.bounded_summary(report)
+        captured = report["runnerDiagnostics"]["capturedRequests"]
+        self.assertIn("measurementNote", captured)
+        self.assertEqual(
+            bounded["runnerDiagnostics"]["capturedRequests"],
+            {key: value for key, value in captured.items() if key != "measurementNote"},
+        )
+
+    def test_behavior_counters_sum_unique_turns_and_reject_unanchored_or_pending_work(
+        self,
+    ):
+        for mode in ("complete", "unanchored", "unpaired", "late_output"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "rollout.jsonl"
+                lines = [_meta(str(root))]
+                for turn, count, duration in (("first", 2, 100), ("resumed", 3, 275)):
+                    if mode != "unanchored":
+                        lines.append(_event({"type": "task_started", "turn_id": turn}))
+                    if mode in ("unpaired", "late_output"):
+                        lines.append(
+                            _response(
+                                {
+                                    "type": "function_call",
+                                    "name": "exec_command",
+                                    "call_id": turn,
+                                    "arguments": {"cmd": "rg needle src"},
+                                },
+                                "2026-08-17T00:00:01Z",
+                            )
+                        )
+                    timing = _timing()
+                    timing["counters"].update(
+                        {
+                            "executedValidationCount": count,
+                            "executedValidationDurationNs": duration,
+                            "saturationCount": 0,
+                        }
+                    )
+                    terminal = _event(
+                        {"type": "task_complete", "turn_id": turn, "timing": timing},
+                        "2026-08-17T00:00:02Z",
+                    )
+                    lines.extend([terminal, terminal])
+                    if mode == "late_output":
+                        lines.append(
+                            _response(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": turn,
+                                    "output": "",
+                                },
+                                "2026-08-17T00:00:03Z",
+                            )
+                        )
+                source.write_text("\n".join(lines), encoding="utf-8")
+                report = kd4_turn_latency_audit.analyze_session_path(
+                    source, root, include_tokens=False
+                )
+                metrics = report["behaviorMetrics"]["metrics"]
+                self.assertEqual(report["coverage"]["duplicateTimedTerminalEvents"], 2)
+                if mode == "complete":
+                    self.assertEqual(metrics["executedValidationCount"], 5)
+                    self.assertEqual(metrics["executedValidationDurationNs"], 375)
+                    self.assertEqual(metrics["provenLoopActivationCount"], 2)
+                    self.assertEqual(metrics["searchEvents"], 0)
+                    self.assertEqual(
+                        report["coverage"]["terminalTurnsWithUnresolvedToolCalls"], 0
+                    )
+                else:
+                    self.assertTrue(all(value is None for value in metrics.values()))
+                    self.assertEqual(
+                        report["behaviorMetrics"]["unavailableReasons"][
+                            "executedValidationCount"
+                        ],
+                        "incomplete_timing_coverage",
+                    )
+                    if mode in ("unpaired", "late_output"):
+                        # Output after terminal publication cannot restore
+                        # complete measurements at the terminal boundary.
+                        self.assertEqual(
+                            report["coverage"]["terminalTurnsWithUnresolvedToolCalls"],
+                            2,
+                        )
+                    if mode == "unanchored":
+                        self.assertEqual(
+                            report["coverage"]["terminalTurnsWithoutStart"], 2
+                        )
+                        self.assertEqual(
+                            kd4_turn_latency_audit.bounded_summary(report)["coverage"][
+                                "terminalTurnsWithoutStart"
+                            ],
+                            2,
+                        )
+
+    def test_directory_rollouts_scope_reused_turn_ids_to_their_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, count in (("parent", 2), ("child", 3)):
+                timing = _timing()
+                timing["counters"].update(
+                    executedValidationCount=count, saturationCount=0
+                )
+                lines = [
+                    _meta(str(root)),
+                    _event({"type": "task_started", "turn_id": "same"}),
+                    _event(
+                        {"type": "task_complete", "turn_id": "same", "timing": timing}
+                    ),
+                ]
+                (root / f"{name}.jsonl").write_text("\n".join(lines), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(root, root)
+            self.assertEqual(report["coverage"]["uniqueTerminalTurns"], 2)
+            self.assertEqual(report["coverage"]["duplicateTimedTerminalEvents"], 0)
+            self.assertEqual(
+                report["behaviorMetrics"]["metrics"]["executedValidationCount"], 5
+            )
+            self.assertEqual(
+                report["runnerDiagnostics"]["coverage"]["nativeTimingProfiles"], 2
+            )
+
+    def test_checkout_overlaps_name_files_edited_by_concurrent_sessions(self):
+        # One session patches directly with a Windows path; the other embeds the
+        # patch in exec code, where separators and newlines are JS escapes.
+        direct = (
+            "*** Begin Patch\n*** Update File: C:\\repo\\src\\replay.ts\n"
+            "@@\n-a\n+b\n*** End Patch"
+        )
+        embedded = (
+            'await tools.apply_patch("*** Begin Patch\\n*** Update File: '
+            'src\\\\replay.ts\\n@@\\n-a\\n+b\\n*** End Patch")'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, tool, source in (
+                ("a", "apply_patch", direct),
+                ("b", "exec", embedded),
+            ):
+                call = {"type": "custom_tool_call", "name": tool, "call_id": name}
+                lines = [
+                    _meta("C:\\repo"),
+                    _event({"type": "task_started", "turn_id": name}),
+                    _response(call | {"input": source}, "2026-08-17T00:00:00Z"),
+                    _event({"type": "task_complete", "turn_id": name, "timing": _timing()}),
+                ]
+                (root / f"{name}.jsonl").write_text("\n".join(lines), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(root, root)
+        overlaps = report["checkoutOverlaps"]
+        self.assertEqual(overlaps["pairs"], 1)
+        self.assertEqual(overlaps["overlaps"][0]["sharedPaths"], ["c:/repo/src/replay.ts"])
+
+    def test_behavior_counter_maxima_are_unavailable_even_without_saturation_flag(self):
+        for key, maximum in (
+            ("provenLoopActivationCount", 2**32 - 1),
+            ("executedValidationDurationNs", 2**64 - 1),
+            ("toolOutputCanonicalTokenCount", 2**64 - 1),
+            ("toolOutputModelTokenCount", 2**64 - 1),
+            ("toolOutputRecoveryCallCount", 2**32 - 1),
+            ("toolOutputRecoveryRetruncationCount", 2**32 - 1),
+            ("toolOutputArtifactCreationCount", 2**32 - 1),
+            ("toolOutputArtifactReuseCount", 2**32 - 1),
+            ("toolOutputOmittedSectionCount", 2**64 - 1),
+            ("attributableRecoveryGenerationCount", 2**32 - 1),
+        ):
+            for value in (0, maximum - 1, maximum):
+                with self.subTest(key=key, value=value):
+                    timing = _timing()
+                    timing["counters"].update({key: value, "saturationCount": 0})
+                    vector = self.audit_commands(
+                        [], timing=timing, include_tokens=False
+                    )["behaviorMetrics"]
+                    if value == maximum:
+                        self.assertIsNone(vector["metrics"][key])
+                        self.assertEqual(
+                            vector["unavailableReasons"][key], "saturated_counters"
+                        )
+                    else:
+                        self.assertEqual(vector["metrics"][key], value)
+
+    def test_output_metrics_require_each_runtime_counter_and_complete_timing(self):
+        expected = {
+            "toolOutputCanonicalTokenCount": 1000,
+            "toolOutputModelTokenCount": 200,
+            "toolOutputRecoveryCallCount": 2,
+            "toolOutputRecoveryRetruncationCount": 1,
+            "toolOutputArtifactCreationCount": 3,
+            "toolOutputArtifactReuseCount": 4,
+            "toolOutputOmittedSectionCount": 5,
+            "attributableRecoveryGenerationCount": 1,
+        }
+        for key in expected:
+            for invalid in (None, -1, True, "2"):
+                with self.subTest(key=key, invalid=invalid):
+                    timing = _timing()
+                    timing["counters"].update(expected | {"saturationCount": 0})
+                    if invalid is None:
+                        del timing["counters"][key]
+                    else:
+                        timing["counters"][key] = invalid
+                    vector = self.audit_commands([], timing=timing)["behaviorMetrics"]
+                    self.assertIsNone(vector["metrics"][key])
+                    self.assertEqual(
+                        vector["unavailableReasons"][key], "counter_unavailable"
+                    )
+                    for other, value in expected.items():
+                        if other != key:
+                            self.assertEqual(vector["metrics"][other], value)
+                    self.assertNotIn("toolOutputRecursiveSpillCount", vector["metrics"])
+        timing = _timing(valid=False)
+        timing["counters"].update(expected | {"saturationCount": 0})
+        vector = self.audit_commands([], timing=timing)["behaviorMetrics"]
+        for key in expected:
+            self.assertIsNone(vector["metrics"][key])
+            self.assertEqual(
+                vector["unavailableReasons"][key], "incomplete_timing_coverage"
+            )
+
+    def test_behavior_missing_saturated_partial_and_disabled_measurements_are_unavailable(
+        self,
+    ):
+        for mode, reason in [
+            ("missing", "counter_unavailable"),
+            ("saturated", "saturated_counters"),
+            ("invalid", "incomplete_timing_coverage"),
+        ]:
+            with self.subTest(mode=mode):
+                timing = _timing(valid=mode != "invalid")
+                if mode != "missing":
+                    timing["counters"].update(
+                        {"executedValidationCount": 4294967295, "saturationCount": 1}
+                    )
+                vector = self.audit_commands([], timing=timing, include_tokens=False)[
+                    "behaviorMetrics"
+                ]
+                self.assertIsNone(vector["metrics"]["executedValidationCount"])
+                self.assertEqual(
+                    vector["unavailableReasons"]["executedValidationCount"], reason
+                )
+                self.assertIsNone(vector["metrics"]["totalTokens"])
+                self.assertEqual(
+                    vector["unavailableReasons"]["totalTokens"],
+                    "token_analysis_disabled",
+                )
+        timing = _timing()
+        del timing["modelRequests"][0]["tokenUsage"]
+        vector = self.audit_commands([], timing=timing)["behaviorMetrics"]
+        self.assertIsNone(vector["metrics"]["totalTokens"])
+        self.assertEqual(
+            vector["unavailableReasons"]["totalTokens"], "incomplete_token_coverage"
+        )
+        vector = kd4_turn_latency_audit.analyze_session_path(None, Path.cwd())[
+            "behaviorMetrics"
+        ]
+        self.assertTrue(all(value is None for value in vector["metrics"].values()))
+        self.assertEqual(vector["evidenceMeta"]["payloadCompleteness"], "unknown")
+        self.assertFalse(vector["evidenceMeta"]["evidenceBearing"])
+        self.assertIsNone(vector["evidenceMeta"]["snapshot"])
+
+    def test_discovery_relative_paths_and_redacted_queries_preserve_search_identity(
+        self,
+    ):
+        commands = [
+            ("cat client.rs", ""),
+            ("head src/client.tsx", ""),
+            ("tail ./package/worker.py", ""),
+            ("sed -n '1,5p' lib/worker.js", ""),
+            ('rg "first private phrase"', ""),
+            ('rg "second private phrase"', ""),
+            ('rg "second private phrase"', ""),
+            ('rg "second private phrase"', ""),
+            ("rg Widget", ""),
+            ("rg Widget --glob '*.rs'", ""),
+        ]
+        report = self.audit_commands(commands)
+        discovery = report["sourceDiscovery"]
+        self.assertEqual(discovery["readCount"], 4)
+        self.assertEqual(
+            [event["requestedPaths"] for event in discovery["events"][:4]],
+            [
+                ["client.rs"],
+                ["src/client.tsx"],
+                ["package/worker.py"],
+                ["lib/worker.js"],
+            ],
+        )
+        self.assertEqual(discovery["repeatedSearchCount"], 2)
+        self.assertEqual(discovery["repeatedSearchSignatureCount"], 1)
+        self.assertEqual(
+            [
+                signal["ordinal"]
+                for signal in discovery["candidateSignals"]
+                if signal["code"] == "repeated_discovery"
+            ],
+            [7, 8],
+        )
+        self.assertNotIn("first private phrase", json.dumps(report))
+        self.assertNotIn("second private phrase", json.dumps(report))
+
+    def test_structured_tool_outcome_overrides_output_text_without_timing_boundaries(
+        self,
+    ):
+        for outcome, output, failures in [
+            ("success", "matched: Traceback (most recent call last)\nExit code: 9", 0),
+            ("no_match", "Exit code: 1", 0),
+            ("failure", "", 1),
+        ]:
+            with self.subTest(outcome=outcome):
+                timing = _timing()
+                timing["toolCalls"] = [
+                    {"callId": "call-0", "toolName": "exec", "outcome": outcome}
+                ]
+                report = self.audit_commands(
+                    [("rg Traceback client.rs", output)], timing=timing
+                )
+                self.assertEqual(
+                    report["commandOrchestration"]["failedToolCalls"], failures
+                )
+
+    def test_overlapping_children_use_elapsed_union_and_missing_bounds_are_uncertain(
+        self,
+    ):
+        records = [{"turnId": "turn", "callId": "parent"}]
+        parent = {
+            "_turnId": "turn",
+            "callId": "parent",
+            "acceptedAtMs": 0,
+            "outputModelVisibleAtMs": 100,
+        }
+        child = {
+            "_turnId": "turn",
+            "parentCallId": "parent",
+            "processSpawnedAtMs": 10,
+            "processExitedAtMs": 60,
+        }
+        kd4_turn_latency_audit._apply_detailed_tool_timing(
+            records, [parent, {**child, "callId": "a"}, {**child, "callId": "b"}]
+        )
+        self.assertEqual(records[0]["reportedChildWorkNs"], 100_000_000)
+        self.assertEqual(records[0]["orchestrationGapLowerBoundNs"], 50_000_000)
+        kd4_turn_latency_audit._apply_detailed_tool_timing(
+            records,
+            [
+                parent,
+                {**child, "callId": "a"},
+                {"_turnId": "turn", "parentCallId": "parent", "callId": "b"},
+            ],
+        )
+        self.assertEqual(records[0]["orchestrationGapLowerBoundNs"], 0)
+        self.assertEqual(records[0]["timingConfidence"], "low")
+        tokens = kd4_turn_latency_audit._diagnostic_token_report(
+            [{"inputTokens": 100, "cachedInputTokens": 90, "visibleOutputTokens": 10}]
+        )
+        self.assertEqual(tokens["observedBillableTokens"], 110)
+
+    def test_population_report_omits_retired_validation_counters(self) -> None:
+        timing = _timing()
+        timing["counters"].update(
+            {
+                "executedValidationCount": 2,
+                "reusedValidationCount": 3,
+                "duplicateValidationCount": 4,
+                "forcedFreshValidationCount": 5,
+            }
+        )
+
+        report = kd4_turn_latency_audit._population_report(
+            [{"timing": timing, "status": "completed", "turn_id": "turn-1"}]
+        )
+
+        self.assertEqual(report["executedValidationCount"], 2)
+        for retired in (
+            "reusedValidationCount",
+            "duplicateValidationCount",
+            "forcedFreshValidationCount",
+        ):
+            self.assertNotIn(retired, report)
+
+    def test_orchestration_evidence_counts_turns_not_slow_tool_calls(self) -> None:
+        records = []
+        for turn_id, orchestration_ns in (("first", 700), ("second", 800)):
+            timing = _timing()
+            timing["inclusiveDurationNs"] = 1000
+            timing["machineDurationNs"] = 1000
+            timing["exclusive"] = {
+                "orchestrationNs": orchestration_ns,
+                "modelOnlyNs": 1000 - orchestration_ns,
+            }
+            records.append(
+                {
+                    "turn_id": turn_id,
+                    "status": "task_complete",
+                    "timing": timing,
+                }
+            )
+
+        population = kd4_turn_latency_audit._population_report(records)
+        decision = kd4_turn_latency_audit._audit_decision(
+            {
+                "coverage": {
+                    "validCompleteProfiles": 2,
+                    "parseErrorCount": 0,
+                    "terminalTurnsWithUnresolvedToolCalls": 0,
+                    "startedTurnsWithoutTerminal": 0,
+                },
+                "populations": {"all": population},
+                "commandOrchestration": (
+                    kd4_turn_latency_audit._command_orchestration_report([])
+                ),
+            }
+        )
+
+        self.assertEqual(population["orchestrationMajorityTurns"], 2)
+        self.assertEqual(decision["dominantPhase"], "orchestration")
+        self.assertIn("repeated_orchestration_majority_turns", decision["reasonCodes"])
+        self.assertNotIn("limited_representative_evidence", decision["reasonCodes"])
+
+    @staticmethod
+    def audit_rows(rows: list[str]) -> dict:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout.jsonl"
+            source.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            return kd4_turn_latency_audit.analyze_session_path(source, root)
+
+    @staticmethod
+    def paired_call(call_id: str, started: str, finished: str) -> list[str]:
+        return [
+            _response(
+                {"type": "function_call", "call_id": call_id, "name": "shell_command"},
+                f"2026-08-17T{started}Z",
+            ),
+            _response(
+                {"type": "function_call_output", "call_id": call_id, "output": "ok"},
+                f"2026-08-17T{finished}Z",
+            ),
+        ]
+
+    def test_parallel_tool_round_trips_report_sum_and_wall_union(self) -> None:
+        # a: 0-4 s and b: 1-3 s overlap; c: 10-11 s. Sum 7 s, wall union 5 s.
+        a_call, a_output = self.paired_call("a", "00:00:00", "00:00:04")
+        b_call, b_output = self.paired_call("b", "00:00:01", "00:00:03")
+        report = self.audit_rows(
+            [
+                _event({"type": "task_started", "turn_id": "turn"}),
+                a_call,
+                b_call,
+                b_output,
+                a_output,
+                *self.paired_call("c", "00:00:10", "00:00:11"),
+                _event(
+                    {"type": "task_complete", "turn_id": "turn", "timing": _timing()},
+                    "2026-08-17T00:00:12Z",
+                ),
+            ]
+        )
+        loop = report["executionLoop"]
+        self.assertEqual(loop["pairedToolRoundTripNs"], 7_000_000_000)
+        self.assertEqual(loop["pairedToolRoundTripUnionNs"], 5_000_000_000)
+        self.assertIn(
+            "tool-round-trip per-call-sum=7.0s wall-union=5.0s",
+            kd4_turn_latency_audit.render_report(report),
+        )
+
+    def test_slow_tool_evidence_comes_only_from_the_valid_turns_it_explains(
+        self,
+    ) -> None:
+        timing = _timing()
+        timing["exclusive"] = {
+            **timing["exclusive"],
+            "modelOnlyNs": 100_000_000,
+            "toolOnlyNs": 700_000_000,
+        }
+        slow_calls = [
+            *self.paired_call("slow-1", "00:01:00", "00:01:06"),
+            *self.paired_call("slow-2", "00:01:06", "00:01:12"),
+        ]
+        start = _event({"type": "task_started", "turn_id": "turn"})
+        complete = _event(
+            {"type": "task_complete", "turn_id": "turn", "timing": timing},
+            "2026-08-17T00:02:00Z",
+        )
+        # Slow calls in a turn that never terminated cannot corroborate the
+        # tool-dominant phase measured on the valid turn.
+        outside = self.audit_rows(
+            [
+                start,
+                complete,
+                _event(
+                    {"type": "task_started", "turn_id": "open"},
+                    "2026-08-17T00:03:00Z",
+                ),
+                *[row.replace("T00:01:", "T00:03:") for row in slow_calls],
+            ]
+        )
+        self.assertEqual(outside["auditDecision"]["dominantPhase"], "tool")
+        self.assertEqual(outside["commandOrchestration"]["slowToolCallCount"], 2)
+        self.assertIn(
+            "limited_representative_evidence", outside["auditDecision"]["reasonCodes"]
+        )
+        self.assertNotIn(
+            "repeated_slow_tool_execution", outside["auditDecision"]["reasonCodes"]
+        )
+        inside = self.audit_rows([start, *slow_calls, complete])
+        self.assertIn(
+            "repeated_slow_tool_execution", inside["auditDecision"]["reasonCodes"]
+        )
+
+    def test_generation_without_request_does_not_hide_a_retry(self) -> None:
+        # Three generations started; the third never dispatched. The first
+        # generation was retried once: 3 attempts over 2 requested generations.
+        timing = _timing()
+        first, second = timing["modelRequests"]
+        timing["counters"]["logicalGenerationCount"] = 3
+        timing["modelRequests"] = [first, {**first, "attemptKind": "retry"}, second]
+        report = self.audit_rows(
+            [
+                _event({"type": "task_started", "turn_id": "turn"}),
+                _event(
+                    {"type": "task_complete", "turn_id": "turn", "timing": timing},
+                    "2026-08-17T00:00:01Z",
+                ),
+            ]
+        )
+        model = report["latencyBreakdown"]["modelInference"]
+        self.assertEqual(
+            (
+                model["logicalGenerations"],
+                model["generationsWithRequests"],
+                model["physicalAttempts"],
+                model["retryAttempts"],
+            ),
+            (3, 2, 3, 1),
+        )
+        self.assertIn(
+            "generations/requested/attempts/retries=3/2/3/1",
+            kd4_turn_latency_audit.render_report(report),
+        )
+
+    def test_empty_token_report_keeps_the_per_turn_schema_complete(self) -> None:
+        tokens = kd4_turn_latency_audit._token_report([])
+
+        self.assertFalse(tokens["complete"])
+        self.assertIsNone(tokens["inputTokens"])
+        self.assertIsNone(tokens["cachedInputTokens"])
+        self.assertIsNone(tokens["outputTokens"])
+        self.assertEqual(tokens["observedTotals"]["inputTokens"], 0)
+        self.assertEqual(tokens["observedTotals"]["cachedInputTokens"], 0)
+        self.assertEqual(tokens["observedTotals"]["outputTokens"], 0)
+        self.assertIsNone(tokens["billableTokens"])
+
+    def test_token_report_marks_internal_provider_retries_as_partial(self) -> None:
+        request = dict(_timing()["modelRequests"][0])
+        request["physicalAttemptIds"] = ["attempt-1", "attempt-2", "attempt-2"]
+
+        tokens = kd4_turn_latency_audit._token_report([request])
+
+        self.assertEqual(tokens["physicalAttempts"], 2)
+        self.assertEqual(tokens["providerUsageAttempts"], 1)
+        self.assertEqual(tokens["coverage"], 0.5)
+        self.assertFalse(tokens["complete"])
+        self.assertIsNone(tokens["billableTokens"])
+        self.assertEqual(tokens["observedBillableTokens"], 115)
+        self.assertEqual(tokens["observedBlendedTokens"], 35)
+
+    def test_token_intervals_group_retry_attempts_without_duplicating_tool_batches(
+        self,
+    ) -> None:
+        timing = _timing()
+        retry = dict(timing["modelRequests"][0])
+        retry["attemptKind"] = "retry"
+        retry["dispatchMs"] = 15
+        retry["completedMs"] = 19
+        retry["tokenUsage"] = {
+            "inputTokens": 40,
+            "cachedInputTokens": 30,
+            "visibleOutputTokens": 2,
+            "reasoningTokens": 1,
+            "totalTokens": 43,
+        }
+        requests = [timing["modelRequests"][0], retry, timing["modelRequests"][1]]
+
+        intervals = kd4_turn_latency_audit._token_intervals(
+            requests, timing["toolCalls"]
+        )
+
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0]["requestIndexes"], [0, 1])
+        self.assertEqual(intervals[0]["attemptKinds"], ["primary", "retry"])
+        self.assertEqual(intervals[0]["physicalAttempts"], 2)
+        self.assertEqual(intervals[0]["emittedToolCallIds"], ["relay-1"])
+        self.assertEqual(intervals[0]["tokens"]["inputTokens"], 140)
+        self.assertEqual(intervals[1]["precedingToolCallIds"], ["relay-1"])
+
+    def test_tool_relay_slow_call_includes_pre_poll_queue_time(self) -> None:
+        call = {
+            "callId": "queued",
+            "toolName": "shell_command",
+            "acceptedAtMs": 0,
+            "firstPollAtMs": 6_000,
+            "outputCollectedAtMs": 10_000,
+            "deliveredAtMs": 10_001,
+            "outputModelVisibleAtMs": 10_501,
+            "itemToFirstPollMs": 6_000,
+            "totalDurationMs": 4_001,
+        }
+
+        relay = kd4_turn_latency_audit._tool_relay_report([call])
+
+        self.assertEqual(relay["slowCallCount"], 1)
+        self.assertEqual(relay["topSlowCalls"][0]["totalDurationMs"], 4_001)
+        self.assertEqual(relay["topSlowCalls"][0]["endToEndDurationMs"], 10_501)
+        self.assertTrue(relay["topSlowCalls"][0]["outputModelVisibilityRecorded"])
+
+    def test_tool_relay_reports_process_exit_after_live_handle_delivery(self) -> None:
+        call = {
+            "callId": "background-relay",
+            "acceptedAtMs": 1,
+            "processSpawnedAtMs": 5,
+            "outputCollectedAtMs": 8,
+            "deliveredAtMs": 9,
+            "processExitedAtMs": 20,
+            "processAliveAtDelivery": True,
+        }
+
+        relay = kd4_turn_latency_audit._tool_relay_report([call])
+
+        self.assertEqual(relay["processAliveAtDeliveryCalls"], 1)
+        self.assertEqual(relay["phaseTotalsMs"]["modelVisibleToProcessExitMs"], 11)
+
+    def test_tool_lifecycle_completeness_is_source_aware(self) -> None:
+        relay = kd4_turn_latency_audit._tool_relay_report(
+            [
+                {
+                    "callId": "direct-incomplete",
+                    "source": "direct",
+                    "acceptedAtMs": 1,
+                    "outputCollectedAtMs": 2,
+                },
+                {
+                    "callId": "nested-complete",
+                    "source": "code_mode",
+                    "acceptedAtMs": 3,
+                    "outputCollectedAtMs": 4,
+                },
+            ]
+        )
+
+        self.assertEqual(relay["incompleteLifecycleCalls"], 1)
+        self.assertEqual(relay["incompleteDirectLifecycleCalls"], 1)
+        self.assertEqual(relay["incompleteNestedLifecycleCalls"], 0)
+        self.assertEqual(
+            relay["incompleteLifecycleReasonCounts"],
+            {"deliveredAtMs": 1, "outputModelVisibleAtMs": 1},
+        )
+
+    def test_aborted_direct_lifecycle_allows_only_model_visibility_truncation(
+        self,
+    ) -> None:
+        relay = kd4_turn_latency_audit._tool_relay_report(
+            [
+                {
+                    "callId": "aborted-after-delivery",
+                    "source": "direct",
+                    "_turnStatus": "turn_aborted",
+                    "acceptedAtMs": 1,
+                    "outputCollectedAtMs": 2,
+                    "deliveredAtMs": 3,
+                },
+                {
+                    "callId": "completed-before-model-visibility",
+                    "source": "direct",
+                    "_turnStatus": "task_complete",
+                    "acceptedAtMs": 4,
+                    "outputCollectedAtMs": 5,
+                    "deliveredAtMs": 6,
+                },
+                {
+                    "callId": "aborted-before-delivery",
+                    "source": "direct",
+                    "_turnStatus": "turn_aborted",
+                    "acceptedAtMs": 7,
+                    "outputCollectedAtMs": 8,
+                },
+            ]
+        )
+
+        self.assertEqual(relay["incompleteLifecycleCalls"], 2)
+        self.assertEqual(relay["incompleteDirectLifecycleCalls"], 2)
+        self.assertEqual(
+            relay["incompleteLifecycleReasonCounts"],
+            {"deliveredAtMs": 1, "outputModelVisibleAtMs": 1},
+        )
+        self.assertEqual(relay["expectedTerminalAbortModelVisibilityTruncations"], 1)
+
+    def test_nested_output_collection_requirement_is_schema_aware(self) -> None:
+        relay = kd4_turn_latency_audit._tool_relay_report(
+            [
+                {
+                    "callId": "legacy-nested",
+                    "source": "code_mode",
+                    "_timingSchemaVersion": 24,
+                    "acceptedAtMs": 1,
+                },
+                {
+                    "callId": "current-nested",
+                    "source": "code_mode",
+                    "_timingSchemaVersion": 25,
+                    "acceptedAtMs": 2,
+                    "parentCallId": "outer-call",
+                    "parentCellId": "cell-1",
+                    "runtimeToolCallId": "runtime-call-1",
+                },
+            ]
+        )
+
+        self.assertEqual(relay["incompleteLifecycleCalls"], 1)
+        self.assertEqual(relay["incompleteNestedLifecycleCalls"], 1)
+        self.assertEqual(
+            relay["incompleteLifecycleReasonCounts"], {"outputCollectedAtMs": 1}
+        )
+
+    def test_current_nested_lifecycle_requires_runtime_correlation(self) -> None:
+        relay = kd4_turn_latency_audit._tool_relay_report(
+            [
+                {
+                    "callId": "nested-missing-correlation",
+                    "source": "code_mode",
+                    "_timingSchemaVersion": 25,
+                    "acceptedAtMs": 1,
+                    "outputCollectedAtMs": 2,
+                },
+                {
+                    "callId": "nested-correlated",
+                    "source": "code_mode",
+                    "_timingSchemaVersion": 25,
+                    "acceptedAtMs": 3,
+                    "outputCollectedAtMs": 4,
+                    "parentCallId": "outer-call",
+                    "parentCellId": "cell-1",
+                    "runtimeToolCallId": "runtime-call-1",
+                },
+            ]
+        )
+
+        self.assertEqual(relay["incompleteLifecycleCalls"], 1)
+        self.assertEqual(relay["incompleteNestedLifecycleCalls"], 1)
+        self.assertEqual(
+            relay["incompleteLifecycleReasonCounts"],
+            {
+                "parentCallId": 1,
+                "parentCellId": 1,
+                "runtimeToolCallId": 1,
+            },
+        )
+
+    def test_lifecycle_overflow_and_incomplete_attribution_block_finalize(self) -> None:
+        for overflow, incomplete, blockers in (
+            (0, 0, []),
+            (1, 0, ["tool_lifecycle_timing_overflow"]),
+            (0, 1, ["incomplete_tool_lifecycle_attribution"]),
+            (1, 1, ["tool_lifecycle_timing_overflow", "incomplete_tool_lifecycle_attribution"]),
+        ):
+            with self.subTest(overflow=overflow, incomplete=incomplete):
+                decision = kd4_turn_latency_audit._audit_decision({
+                    "coverage": {
+                        "validCompleteProfiles": 1,
+                        "parseErrorCount": 0,
+                        "terminalTurnsWithUnresolvedToolCalls": 0,
+                        "startedTurnsWithoutTerminal": 0,
+                    },
+                    "populations": {"all": kd4_turn_latency_audit._population_report([])},
+                    "commandOrchestration": (
+                        kd4_turn_latency_audit._command_orchestration_report([])
+                    ),
+                    "toolRelay": {
+                        "timingOverflowCalls": overflow,
+                        "incompleteLifecycleCalls": incomplete,
+                    },
+                })
+                self.assertEqual(decision["readyToFinalize"], not blockers)
+                self.assertEqual(decision["blockerCodes"], blockers)
+
+    def test_detailed_timing_matches_duplicate_call_ids_without_reuse(self) -> None:
+        records = [
+            {"turnId": "turn", "callId": "duplicate"},
+            {"turnId": "turn", "callId": "duplicate"},
+        ]
+        calls = [
+            {
+                "_turnId": "turn",
+                "callId": "duplicate",
+                "acceptedAtMs": 0,
+                "outputModelVisibleAtMs": 10,
+                "processSpawnedAtMs": 1,
+                "processExitedAtMs": 2,
+            },
+            {
+                "_turnId": "turn",
+                "callId": "duplicate",
+                "acceptedAtMs": 100,
+                "outputModelVisibleAtMs": 120,
+                "processSpawnedAtMs": 101,
+                "processExitedAtMs": 103,
+            },
+        ]
+
+        stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+
+        self.assertEqual(stats["orderedMatches"], 2)
+        self.assertEqual(
+            [record["roundTripNs"] for record in records],
+            [10_000_000, 20_000_000],
+        )
+
+    def test_detailed_timing_rejects_execution_id_collisions(self) -> None:
+        for record_count, detail_count in ((2, 2), (2, 1), (1, 2)):
+            with self.subTest(records=record_count, details=detail_count):
+                records = [
+                    {"turnId": "turn", "callId": "duplicate", "executionId": "same",
+                     "roundTripNs": 7, "status": "running", "timingConfidence": "low"}
+                    for _ in range(record_count)
+                ]
+                calls = [
+                    {"_turnId": "turn", "callId": "duplicate", "executionId": "same",
+                     "acceptedAtMs": 0, "outputModelVisibleAtMs": end,
+                     "processSpawnedAtMs": 1, "processExitedAtMs": 2,
+                     "outcome": "success"}
+                    for end in (10, 20)[:detail_count]
+                ]
+                stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+                self.assertEqual(stats, {"ambiguousGroups": 1, "ambiguousRecords": record_count})
+                for record in records:
+                    self.assertTrue(record["detailedTimingAmbiguous"])
+                    self.assertEqual(record["roundTripNs"], 7)
+                    self.assertEqual(record["status"], "running")
+                    self.assertEqual(record["timingConfidence"], "low")
+                    self.assertNotIn("detailedTimingMatch", record)
+                    self.assertNotIn("timingSource", record)
+
+    def test_detailed_timing_does_not_fallback_across_conflicting_execution_ids(self):
+        for count in (1, 2):
+            with self.subTest(count=count):
+                records = [
+                    {"turnId": "turn", "callId": "call", "executionId": f"observed-{index}",
+                     "roundTripNs": 7, "status": "running", "timingConfidence": "low"}
+                    for index in range(count)
+                ]
+                calls = [
+                    {"_turnId": "turn", "callId": "call", "executionId": f"other-{index}",
+                     "acceptedAtMs": 0, "outputModelVisibleAtMs": 10,
+                     "processSpawnedAtMs": 1, "processExitedAtMs": 2, "outcome": "success"}
+                    for index in range(count)
+                ]
+                stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+                self.assertEqual(stats, {"ambiguousGroups": 1, "ambiguousRecords": count})
+                for record in records:
+                    self.assertTrue(record["detailedTimingAmbiguous"])
+                    self.assertEqual((record["roundTripNs"], record["status"], record["timingConfidence"]),
+                                     (7, "running", "low"))
+                    self.assertNotIn("detailedTimingMatch", record)
+                    self.assertNotIn("timingSource", record)
+
+    def test_detailed_timing_excludes_collisions_from_anonymous_fallback(self) -> None:
+        records = [
+            {"turnId": "turn", "callId": "duplicate", "executionId": "same"},
+            {"turnId": "turn", "callId": "duplicate", "executionId": "same"},
+            {"turnId": "turn", "callId": "duplicate"},
+            {"turnId": "turn", "callId": "duplicate", "executionId": "unique"},
+        ]
+        base = {"_turnId": "turn", "callId": "duplicate", "acceptedAtMs": 0,
+                "processSpawnedAtMs": 1, "processExitedAtMs": 2}
+        calls = [
+            {**base, "executionId": "unique", "outputModelVisibleAtMs": 30},
+            {**base, "executionId": "same", "outputModelVisibleAtMs": 10},
+            {**base, "outputModelVisibleAtMs": 20},
+        ]
+        stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+        self.assertEqual(stats, {"execution_idMatches": 1, "unambiguousMatches": 1,
+                                 "ambiguousGroups": 1, "ambiguousRecords": 2})
+        for record in records[:2]:
+            self.assertTrue(record["detailedTimingAmbiguous"])
+            self.assertNotIn("roundTripNs", record)
+        self.assertEqual(records[2]["roundTripNs"], 20_000_000)
+        self.assertEqual(records[2]["detailedTimingMatch"], "unambiguous")
+        self.assertEqual(records[3]["roundTripNs"], 30_000_000)
+        self.assertEqual(records[3]["detailedTimingMatch"], "execution_id")
+
+    def test_detailed_timing_execution_ids_match_once_within_each_call_and_turn(self) -> None:
+        records = [
+            {"turnId": "turn", "callId": "call", "executionId": "one"},
+            {"turnId": "turn", "callId": "call", "executionId": "two"},
+            {"turnId": "other-turn", "callId": "call", "executionId": "one"},
+            {"turnId": "turn", "callId": "other-call", "executionId": "one"},
+        ]
+        calls = [
+            {"_turnId": record["turnId"], "callId": record["callId"],
+             "executionId": record["executionId"], "acceptedAtMs": 0,
+             "outputModelVisibleAtMs": (index + 1) * 10,
+             "processSpawnedAtMs": 1, "processExitedAtMs": 2}
+            for index, record in enumerate(records)
+        ]
+        stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, list(reversed(calls)))
+        self.assertEqual(stats, {"execution_idMatches": 4})
+        self.assertEqual([record["roundTripNs"] for record in records],
+                         [10_000_000, 20_000_000, 30_000_000, 40_000_000])
+
+    def test_detailed_timing_marks_unequal_duplicate_groups_ambiguous(self) -> None:
+        records = [{"turnId": "turn", "callId": "duplicate"}]
+        calls = [
+            {"_turnId": "turn", "callId": "duplicate", "executionId": "one"},
+            {"_turnId": "turn", "callId": "duplicate", "executionId": "two"},
+        ]
+
+        stats = kd4_turn_latency_audit._apply_detailed_tool_timing(records, calls)
+
+        self.assertEqual(stats["ambiguousGroups"], 1)
+        self.assertEqual(stats["ambiguousRecords"], 1)
+        self.assertTrue(records[0]["detailedTimingAmbiguous"])
+        self.assertNotIn("timingSource", records[0])
+
+    def test_reports_exclusive_gate_convoy_between_parallel_nested_reads(self) -> None:
+        calls = [
+            {
+                "_turnId": "convoy",
+                "callId": "read-a",
+                "toolName": "exec_command",
+                "source": "code_mode",
+                "generationIndex": 4,
+                "acceptedAtMs": 0,
+                "firstPollAtMs": 1,
+                "parallelGateAdmittedAtMs": 1,
+                "handlerEntryAtMs": 2,
+                "processSpawnedAtMs": 3,
+                "processExitedAtMs": 113_900,
+                "outputCollectedAtMs": 113_950,
+                "outputModelVisibleAtMs": 114_000,
+                "parallelGateWaitMs": 0,
+                "totalDurationMs": 114_000,
+            },
+            {
+                "_turnId": "convoy",
+                "callId": "read-b",
+                "toolName": "exec_command",
+                "source": "code_mode",
+                "generationIndex": 4,
+                "acceptedAtMs": 1,
+                "firstPollAtMs": 1,
+                "parallelGateAdmittedAtMs": 114_001,
+                "handlerEntryAtMs": 114_002,
+                "processSpawnedAtMs": 114_003,
+                "processExitedAtMs": 114_045,
+                "outputCollectedAtMs": 114_050,
+                "outputModelVisibleAtMs": 114_051,
+                "parallelGateWaitMs": 114_000,
+                "totalDurationMs": 114_050,
+            },
+        ]
+
+        relay = kd4_turn_latency_audit._tool_relay_report(calls)
+
+        self.assertEqual(relay["batchGroups"], 1)
+        self.assertEqual(relay["batchedCalls"], 2)
+        self.assertEqual(relay["phaseTotalsMs"]["parallelGateWaitMs"], 114_000)
+        self.assertEqual(relay["dominantPhase"], "parallelGateWaitMs")
+        self.assertEqual(relay["dominantPhaseOwner"], "ExclusiveGate")
+        self.assertEqual(relay["exclusiveGateConvoyCount"], 1)
+        self.assertEqual(
+            relay["topExclusiveGateConvoys"][0],
+            {
+                "turnId": "convoy",
+                "generationIndex": 4,
+                "callIds": ["read-a", "read-b"],
+                "waitingCallIds": ["read-b"],
+                "parallelGateWaitMs": 114_000,
+            },
+        )
+
+    def test_reports_post_tool_hook_as_owner_of_post_process_stall(self) -> None:
+        call = {
+            "_turnId": "post-hook",
+            "callId": "exec-a",
+            "toolName": "exec_command",
+            "source": "direct",
+            "generationIndex": 0,
+            "acceptedAtMs": 0,
+            "firstPollAtMs": 1,
+            "parallelGateAdmittedAtMs": 1,
+            "handlerEntryAtMs": 2,
+            "processSpawnedAtMs": 3,
+            "processExitedAtMs": 48,
+            "outputCollectedAtMs": 99_049,
+            "outputModelVisibleAtMs": 99_050,
+            "modelResumedAtMs": 99_051,
+            "parallelGateWaitMs": 0,
+            "postToolHookMs": 99_000,
+            "totalDurationMs": 99_050,
+        }
+
+        relay = kd4_turn_latency_audit._tool_relay_report([call])
+
+        self.assertEqual(relay["phaseTotalsMs"]["processRuntimeMs"], 45)
+        self.assertEqual(relay["phaseTotalsMs"]["postToolHookMs"], 99_000)
+        self.assertEqual(relay["dominantPhase"], "postToolHookMs")
+        self.assertEqual(relay["dominantPhaseOwner"], "PostToolUse")
+        self.assertEqual(relay["dominantPhaseMs"], 99_000)
+
+    def test_summary_preserves_exclusions_without_reanalysis_or_mutation(self):
+        for valid, complete in ((False, True), (True, False), (False, False)):
+            with self.subTest(valid=valid, complete=complete):
+                report = self.audit_commands(
+                    [], timing=_timing(valid=valid, complete=complete),
+                    include_tokens=False,
+                )
+                original = json.dumps(report, sort_keys=True)
+                with mock.patch.object(
+                    kd4_turn_latency_audit, "analyze_session_path",
+                    side_effect=AssertionError("projection must not reanalyze"),
+                ), mock.patch.object(
+                    kd4_turn_latency_audit, "read_rollout_snapshot",
+                    side_effect=AssertionError("projection must not reopen sources"),
+                ):
+                    summary = kd4_turn_latency_audit.bounded_summary(report)
+                    self.assertEqual(
+                        summary["coverage"]["excludedInvalidOrIncompleteTurns"],
+                        report["coverage"]["excludedInvalidOrIncompleteTurns"],
+                    )
+                    with mock.patch.object(kd4_turn_latency_audit, "_MAX_SUMMARY_BYTES", 1):
+                        trimmed = kd4_turn_latency_audit.bounded_summary(report)
+                for view in (summary, trimmed):
+                    self.assertEqual(
+                        view["behaviorSignals"]["invalidTimingProfiles"],
+                        report["coverage"]["invalidProfiles"],
+                    )
+                    self.assertEqual(
+                        view["behaviorSignals"]["incompleteTimingClassifications"],
+                        report["coverage"]["classificationIncompleteProfiles"],
+                    )
+                    self.assertEqual(
+                        len(view["coverage"]["excludedInvalidOrIncompleteTurns"])
+                        + view["coverage"]["omittedExcludedInvalidOrIncompleteTurns"],
+                        len(report["coverage"]["excludedInvalidOrIncompleteTurns"]),
+                    )
+                    self.assertEqual(view["auditDecision"], report["auditDecision"])
+                self.assertTrue(trimmed["summaryBudget"]["limitExceeded"])
+                self.assertIn("retained full report", trimmed["summaryBudget"]["fullDetail"])
+                self.assertEqual(trimmed["coverage"]["excludedInvalidOrIncompleteTurns"], [])
+                self.assertEqual(json.dumps(report, sort_keys=True), original)
+
+    def test_summary_cli_caps_turns_and_intervals_without_truncating_totals(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout = root / "rollout.jsonl"
+            lines = [_meta(str(root))]
+            for turn_index in range(21):
+                timing = _timing()
+                timing["modelRequests"] = [
+                    {
+                        **_timing()["modelRequests"][0],
+                        "generationIndex": index,
+                        "dispatchMs": index * 40,
+                        "completedMs": index * 40 + 35,
+                        "modelStreamWaitNs": 30_000_000,
+                        "decisionLatencyNs": 20_000_000,
+                        "toolActiveUnionNs": 0,
+                        "toolCallCount": 0,
+                    }
+                    for index in range(17)
+                ]
+                timing["counters"]["logicalGenerationCount"] = 17
+                turn_id = f"turn-{turn_index:02}"
+                lines.extend(
+                    [
+                        _event({"type": "task_started", "turn_id": turn_id}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": turn_id,
+                                "timing": timing,
+                            }
+                        ),
+                    ]
+                )
+            rollout.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = kd4_turn_latency_audit.main(
+                    [str(rollout), "--repo-root", str(root), "--summary-json"]
+                )
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(report["perTurn"]) + report["omittedPerTurnRecords"], 21)
+        self.assertEqual(report["populations"]["all"]["turns"], 21)
+        self.assertEqual(
+            report["populations"]["all"]["tokens"]["totalTokens"], 21 * 17 * 115
+        )
+        for turn in report["perTurn"]:
+            self.assertEqual(
+                len(turn["tokenIntervals"]) + turn["omittedTokenIntervals"], 17
+            )
+            self.assertEqual(turn["tokens"]["totalTokens"], 17 * 115)
+        self.assertLessEqual(
+            len(stdout.getvalue().rstrip("\n").encode("utf-8")), 16 * 1024
+        )
+        self.assertFalse(report["summaryBudget"]["limitExceeded"])
+
+    def test_uuid_cli_resolves_snapshot_and_emits_bounded_execution_loop(self) -> None:
+        session_id = "01a018c7-a357-7c11-a7ca-9248dd075f22"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            codex_home = Path(temp) / "codex-home"
+            sessions = codex_home / "sessions" / "2026" / "08" / "19"
+            root.mkdir()
+            sessions.mkdir(parents=True)
+            rollout = sessions / f"rollout-2026-08-19T01-48-56-{session_id}.jsonl"
+            rollout.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event(
+                            {"type": "task_started", "turn_id": "turn"},
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-08-17T00:00:01Z",
+                                "type": "sampling_boundary",
+                                "payload": {"turn_id": "turn"},
+                            }
+                        ),
+                        _response(
+                            {"type": "custom_tool_call", "call_id": "call-1"},
+                            "2026-08-17T00:00:03Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call-1",
+                                "output": "done",
+                            },
+                            "2026-08-17T00:00:05Z",
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-08-17T00:00:06Z",
+                                "type": "sampling_boundary",
+                                "payload": {"turn_id": "turn"},
+                            }
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "turn",
+                                "timing": _timing(),
+                            },
+                            "2026-08-17T00:00:10Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}),
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(
+                    kd4_turn_latency_audit, "bounded_summary",
+                    wraps=kd4_turn_latency_audit.bounded_summary,
+                ) as projection,
+            ):
+                exit_code = kd4_turn_latency_audit.main(
+                    [session_id, "--repo-root", str(root), "--summary-json"]
+                )
+            # Test detailed evidence against the captured producer result, not
+            # display rows that the summary's byte budget may legitimately omit.
+            full_report = projection.call_args.args[0]
+
+        output = stdout.getvalue()
+        report = json.loads(output)
+        self.assertEqual(exit_code, 0)
+        self.assertLess(len(output.encode("utf-8")), 16 * 1024)
+        self.assertEqual(report["source"], str(rollout.resolve()))
+        self.assertEqual(
+            report["coverage"]["snapshots"][0]["path"], str(rollout.resolve())
+        )
+        self.assertEqual(report["executionLoop"]["samplingPasses"], 2)
+        self.assertEqual(report["executionLoop"]["toolCalls"], 1)
+        self.assertEqual(report["executionLoop"]["pairedToolCalls"], 1)
+        self.assertEqual(
+            report["executionLoop"]["samplingToFirstToolCallNs"], 2_000_000_000
+        )
+        self.assertEqual(
+            report["executionLoop"]["pairedToolRoundTripNs"], 2_000_000_000
+        )
+        self.assertEqual(report["executionLoop"]["postToolHandoffNs"], 1_000_000_000)
+        self.assertEqual(report["executionLoop"]["taskElapsedNs"], 10_000_000_000)
+        self.assertEqual(report["toolRelay"]["calls"], 1)
+        self.assertEqual(report["toolRelay"]["eagerCalls"], 1)
+        self.assertEqual(report["toolRelay"]["timingOverflowCalls"], 0)
+        self.assertEqual(
+            report["toolRelay"]["phaseTotalsMs"]["requestToProcessSpawnMs"], 4
+        )
+        self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["processRuntimeMs"], 1)
+        self.assertEqual(
+            report["toolRelay"]["phaseTotalsMs"]["processExitToModelVisibleMs"], 3
+        )
+        self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["endToEndDurationMs"], 8)
+        self.assertEqual(report["toolRelay"]["topSlowCalls"], [])
+        detailed_turn = full_report["perTurn"][0]
+        self.assertEqual(detailed_turn["agentActiveDurationNs"], 900_000_000)
+        self.assertEqual(detailed_turn["firstUsefulActionMs"], 12.5)
+        self.assertEqual(detailed_turn["humanWaitNs"], 100_000_000)
+        self.assertEqual(detailed_turn["humanOnlyWaitNs"], 100_000_000)
+        self.assertEqual(detailed_turn["humanWaitUnionNs"], 150_000_000)
+        self.assertEqual(
+            detailed_turn["humanWaitCounts"]["userInputWaitCount"], 1
+        )
+        self.assertEqual(detailed_turn["tokens"]["inputTokens"], 210)
+        self.assertEqual(detailed_turn["tokens"]["cachedInputTokens"], 180)
+        self.assertEqual(detailed_turn["tokens"]["outputTokens"], 25)
+        self.assertEqual(detailed_turn["tokens"]["reasoningTokens"], 7)
+        self.assertEqual(detailed_turn["tokens"]["billableTokens"], 235)
+        self.assertEqual(detailed_turn["tokens"]["blendedTokens"], 55)
+        self.assertEqual(
+            detailed_turn["tokens"]["promptCategories"][
+                "repeatedUnchangedContext"
+            ],
+            150,
+        )
+        self.assertEqual(
+            detailed_turn["observationalNonprogressTokens"]["totalTokens"],
+            115,
+        )
+        self.assertEqual(report["populations"]["all"]["modelShare"], 2 / 3)
+        self.assertEqual(
+            report["populations"]["repository_root"], {"turns": 1, "sameAs": "all"}
+        )
+        self.assertEqual(report["schemaVersion"], 22)
+        breakdown = report["latencyBreakdown"]
+        orchestration_breakdown = breakdown["orchestration"]
+        self.assertEqual(orchestration_breakdown["exclusiveTotalNs"], 100_000_000)
+        self.assertEqual(orchestration_breakdown["shareOfAgentActive"], 1 / 9)
+        self.assertEqual(
+            orchestration_breakdown["localActivityUnionsNs"]["planningExclusiveNs"],
+            17_000_000,
+        )
+        self.assertEqual(
+            orchestration_breakdown["preFirstModelOutput"]["clientCriticalPathNs"],
+            80_000_000,
+        )
+        self.assertEqual(
+            orchestration_breakdown["toolRelayOverheadNs"]["dispatchQueueNs"],
+            1_000_000,
+        )
+        model_breakdown = breakdown["modelInference"]
+        self.assertEqual(model_breakdown["exclusiveTotalNs"], 600_000_000)
+        self.assertEqual(model_breakdown["activeUnionNs"], 600_000_000)
+        self.assertEqual(
+            model_breakdown["requestPhaseUnionsNs"]["streamProcessingNs"], 20_000_000
+        )
+        self.assertEqual(model_breakdown["logicalGenerations"], 2)
+        self.assertEqual(model_breakdown["physicalAttempts"], 2)
+        self.assertEqual(model_breakdown["retryAttempts"], 0)
+        self.assertEqual(
+            model_breakdown["generationPurposes"]["deterministic_tool_continuation"][
+                "modelStreamWaitNs"
+            ],
+            300_000_000,
+        )
+        self.assertEqual(
+            report["coverage"]["terminalLifecycleStateCounts"], {"completed": 1}
+        )
+        self.assertEqual(detailed_turn["samplingPasses"], 2)
+        self.assertEqual(detailed_turn["samplingPassTarget"], 8)
+        self.assertEqual(detailed_turn["startedAt"], "2026-08-17T00:00:00+00:00")
+        self.assertEqual(detailed_turn["boundarySource"], "timing")
+        intervals = full_report["perTurn"][0]["tokenIntervals"]
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0]["emittedToolCallIds"], ["relay-1"])
+        self.assertEqual(intervals[1]["precedingToolCallIds"], ["relay-1"])
+        self.assertEqual(intervals[1]["tokens"]["inputTokens"], 110)
+        summary = kd4_turn_latency_audit.bounded_summary(full_report)
+        self.assertEqual(summary["schemaVersion"], 22)
+        self.assertEqual(
+            summary["latencyBreakdown"]["orchestration"]["exclusiveTotalNs"],
+            100_000_000,
+        )
+        self.assertEqual(
+            summary["latencyBreakdown"]["modelInference"]["generationPurposes"],
+            model_breakdown["generationPurposes"],
+        )
+        for displayed in (report, summary):
+            self.assertEqual(
+                len(displayed["perTurn"]) + displayed["omittedPerTurnRecords"],
+                len(full_report["perTurn"]),
+            )
+            for turn in displayed["perTurn"]:
+                self.assertEqual(
+                    len(turn["tokenIntervals"]) + turn["omittedTokenIntervals"], 2,
+                )
+            self.assertFalse(displayed["summaryBudget"]["limitExceeded"])
+        self.assertEqual(len(full_report["perTurn"][0]["tokenIntervals"]), 2)
+        self.assertEqual(report["firstUsefulActionAnalysis"]["canonicalTurnCount"], 1)
+        self.assertIn("firstUsefulActionAnalysis", summary)
+        self.assertEqual(
+            summary["firstUsefulActionAnalysis"]["canonical"]["firstDomainActionMs"][
+                "p50"
+            ],
+            12.5,
+        )
+        self.assertNotIn("measurementContract", summary["firstUsefulActionAnalysis"])
+        self.assertNotIn("sourceSnapshots", summary["firstUsefulActionAnalysis"])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("repository_root: 1 turns; same measurements as all", rendered)
+        self.assertIn(
+            "boundary=2026-08-17", kd4_turn_latency_audit.render_report(full_report)
+        )
+        self.assertIn("orchestration breakdown (overlapping diagnostics", rendered)
+        self.assertIn("model inference breakdown (overlapping diagnostics", rendered)
+        self.assertIn("purposes=[deterministic_tool_continuation=", rendered)
+        self.assertEqual(report["behaviorSignals"]["turnsOverSamplingPassTarget"], 0)
+
+    def test_source_discovery_reports_ordered_bounded_evidence(self) -> None:
+        commands = [
+            ("Get-Content -Raw AGENTS.md", "# repository instructions"),
+            ("rg -n Widget", "scripts/widget.py:10:class Widget"),
+            ("rg -n Widget", "scripts/widget.py:10:class Widget"),
+            ("Get-Content scripts/widget.py", "class Widget: pass"),
+            ("Get-Content -Raw README.md", "scripts/widget.py"),
+            (
+                "Get-Content scripts/test_widget.py",
+                "scripts/test_widget.py",
+            ),
+            (
+                "rg -n callers_contract codex-rs/core/src",
+                "codex-rs/core/src/widget_tests.rs:12:fn callers_contract()",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            lines = [
+                _meta(str(root)),
+                _event(
+                    {"type": "task_started", "turn_id": "discovery"},
+                    "2026-08-17T00:00:00Z",
+                ),
+            ]
+            for ordinal, (command, output) in enumerate(commands, 1):
+                lines.extend(
+                    [
+                        _response(
+                            {
+                                "type": "custom_tool_call",
+                                "call_id": f"discovery-{ordinal}",
+                                "name": "exec",
+                                "input": (
+                                    "await tools.exec_command({cmd: "
+                                    + json.dumps(command)
+                                    + "});"
+                                ),
+                            },
+                            f"2026-08-17T00:00:{ordinal * 2 - 1:02d}Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": f"discovery-{ordinal}",
+                                "output": output,
+                            },
+                            f"2026-08-17T00:00:{ordinal * 2:02d}Z",
+                        ),
+                    ]
+                )
+            lines.extend(
+                [
+                    _response(
+                        {
+                            "type": "custom_tool_call",
+                            "call_id": "private",
+                            "name": "exec",
+                            "input": "await tools.exec_command({cmd: 'private command'});",
+                        },
+                        "2026-08-17T00:00:20Z",
+                    ),
+                    _response(
+                        {
+                            "type": "custom_tool_call_output",
+                            "call_id": "private",
+                            "output": "private output",
+                        },
+                        "2026-08-17T00:00:21Z",
+                    ),
+                    _event(
+                        {
+                            "type": "task_complete",
+                            "turn_id": "discovery",
+                            "timing": _timing(),
+                        },
+                        "2026-08-17T00:00:22Z",
+                    ),
+                ]
+            )
+            session.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        discovery = report["sourceDiscovery"]
+        self.assertEqual(discovery["eventCount"], 7)
+        self.assertEqual(discovery["evidenceProgressCount"], 6)
+        self.assertEqual(discovery["unchangedEvidenceCount"], 1)
+        self.assertTrue(discovery["events"][0]["newEvidence"])
+        self.assertFalse(discovery["events"][2]["newEvidence"])
+        self.assertEqual(discovery["searchCount"], 3)
+        self.assertEqual(discovery["readCount"], 4)
+        self.assertEqual(discovery["broadSearchCount"], 2)
+        self.assertEqual(discovery["repeatedSearchSignatureCount"], 1)
+        self.assertEqual(
+            [event["ordinal"] for event in discovery["events"]],
+            list(range(1, 8)),
+        )
+        self.assertEqual(discovery["events"][0]["requestedPaths"], ["AGENTS.md"])
+        self.assertEqual(discovery["events"][1]["queries"], ["Widget"])
+        self.assertEqual(discovery["events"][1]["resultPaths"], ["scripts/widget.py"])
+        signal_counts = discovery["candidateSignalCounts"]
+        self.assertEqual(signal_counts["broad_search_without_path_scope"], 2)
+        self.assertEqual(signal_counts["repeated_discovery"], 1)
+        self.assertEqual(
+            [
+                signal["ordinal"]
+                for signal in discovery["candidateSignals"]
+                if signal["code"] == "repeated_discovery"
+            ],
+            [3],
+        )
+        self.assertEqual(signal_counts["callers_evidence_late"], 1)
+        self.assertEqual(signal_counts["tests_evidence_late"], 1)
+        self.assertEqual(signal_counts["contracts_evidence_late"], 1)
+        serialized = json.dumps(report)
+        self.assertNotIn("private command", serialized)
+        self.assertNotIn("private output", serialized)
+        summary = kd4_turn_latency_audit.bounded_summary(report)
+        self.assertNotIn("signature", summary["sourceDiscovery"]["events"][0])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("source discovery: events=7", rendered)
+        self.assertIn("discovery 1: turn=discovery", rendered)
+
+    def test_discovery_progress_ignores_wrapper_timing_and_records_recovery_sequence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = root / "rollout.jsonl"
+            records = [_meta(str(root)), _event(
+                {"type": "task_started", "turn_id": "t"}, "2026-08-17T00:00:00Z"
+            )]
+            operations = [
+                ("Get-Content scripts/widget.py", "class Widget: pass"),
+                ("Get-Content scripts/widget.py", "class Widget: pass"),
+                ("Get-Content scripts/widget.py", "class Widget: changed"),
+                ("rg -l Widget scripts", "Warning: truncated output\nscripts/widget.py"),
+                ("rg -l Widget scripts", "scripts/widget.py\nscripts/other.py"),
+            ]
+            for i, (command, body) in enumerate(operations, 1):
+                receipt = json.dumps([{"call_id": str(i), "process_exited": True}])
+                records += [
+                    _response({"type": "function_call", "call_id": str(i),
+                               "name": "exec_command", "arguments": json.dumps({"cmd": command})},
+                              f"2026-08-17T00:00:{2*i:02}Z"),
+                    _response({"type": "function_call_output", "call_id": str(i),
+                               "output": f"Script completed with cell ID {i}\nWall time {i}.0 seconds\nOutput:\n{body}\nNested command states (independent of script completion):\n{receipt}"},
+                              f"2026-08-17T00:00:{2*i+1:02}Z"),
+                ]
+            records.append(_event({"type": "task_complete", "turn_id": "t", "timing": _timing()},
+                                  "2026-08-17T00:00:12Z"))
+            session.write_text("\n".join(records), encoding="utf-8")
+            discovery = kd4_turn_latency_audit.analyze_session_path(session, root)["sourceDiscovery"]
+        self.assertEqual(discovery["evidenceProgressCount"], 4)
+        self.assertEqual(discovery["unchangedEvidenceCount"], 1)
+        self.assertEqual([event["newEvidence"] for event in discovery["events"]],
+                         [True, False, True, True, True])
+        repeats = [signal for signal in discovery["candidateSignals"]
+                   if signal["code"] == "repeated_search_after_reduced_output"]
+        self.assertEqual(len(repeats), 1)
+        self.assertEqual((repeats[0]["previousOrdinal"], repeats[0]["ordinal"]), (4, 5))
+        self.assertFalse(repeats[0]["causallyEstablished"])
+
+    def test_audit_closes_its_rollout_snapshot(self):
+        snapshots = []
+        read_snapshot = kd4_turn_latency_audit.read_rollout_snapshot
+
+        def capture(path):
+            snapshot = read_snapshot(path)
+            snapshots.append(snapshot)
+            return snapshot
+
+        with mock.patch.object(
+            kd4_turn_latency_audit, "read_rollout_snapshot", side_effect=capture
+        ):
+            self.audit_rows([_event({"type": "task_started", "turn_id": "open"})])
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(snapshots[0].stream.closed)
+
+    def test_native_reads_include_literal_paths_without_searching_selector_text(self):
+        rows = [_event({"type": "task_started", "turn_id": "native"})]
+        calls = [
+            {
+                "type": "function_call",
+                "name": "read_file",
+                "arguments": json.dumps(
+                    {
+                        "path": "src/worker.py",
+                        "selectors": [{"kind": "search", "query": "rg private"}],
+                    }
+                ),
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": 'await tools.read_file({path: "AGENTS.md"});',
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": 'await tools.read_file({"path":"scripts/test_worker.py"});',
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "await tools.read_file({path: dynamicPath});",
+            },
+        ]
+        for index, call in enumerate(calls):
+            rows.extend(
+                [
+                    _response({**call, "call_id": str(index)}, "2026-08-17T00:00:01Z"),
+                    _response(
+                        {
+                            "type": "function_call_output",
+                            "call_id": str(index),
+                            "output": "private contents",
+                        },
+                        "2026-08-17T00:00:02Z",
+                    ),
+                ]
+            )
+        rows.append(
+            _event({"type": "task_complete", "turn_id": "native", "timing": _timing()})
+        )
+        report = self.audit_rows(rows)
+        discovery = report["sourceDiscovery"]
+        self.assertEqual(discovery["readCount"], 4)
+        self.assertEqual(discovery["searchCount"], 0)
+        self.assertEqual(
+            [row["requestedPaths"] for row in discovery["events"]],
+            [["src/worker.py"], ["AGENTS.md"], ["scripts/test_worker.py"], []],
+        )
+        self.assertEqual(discovery["events"][1]["evidence"], ["instructions"])
+        self.assertNotIn("private", json.dumps(discovery))
+        self.assertEqual(report["behaviorMetrics"]["discoveryClassifierVersion"], 2)
+
+    def test_search_scope_uses_operands_not_query_or_option_values(self):
+        discovery = self.audit_commands(
+            [
+                ("rg needle scripts", ""),
+                ("rg -n needle src", ""),
+                ("rg -g '*.py' -e needle src", ""),
+                ("rg --files scripts", ""),
+                ("rg --regexp=needle src", ""),
+                ('rg "" src', ""),
+                ("rg src/worker.py", ""),
+                ("rg needle -g '*.py'", ""),
+            ]
+        )["sourceDiscovery"]
+        self.assertEqual(discovery["broadSearchCount"], 2)
+        self.assertEqual(
+            [row["scope"] for row in discovery["events"]],
+            ["path_scoped"] * 6 + ["repository"] * 2,
+        )
+        self.assertEqual(discovery["events"][6]["queries"], ["src/worker.py"])
+        self.assertEqual(discovery["events"][6]["requestedPaths"], [])
+
+    def test_structured_receipts_ignore_execution_metadata_not_result_changes(self):
+        outputs = []
+        for index, (body, exit_code, complete) in enumerate(
+            [
+                ("src/a.py", 0, True),
+                ("src/a.py", 0, True),
+                ("src/b.py", 0, True),
+                ("src/b.py", 1, True),
+                ("src/b.py", 1, False),
+                ("src/b.py", 1, False),
+            ]
+        ):
+            outputs.append(
+                json.dumps(
+                    {
+                        "chunk_id": str(index),
+                        "wall_time_seconds": index + 0.1,
+                        "exit_code": exit_code,
+                        "output": body,
+                        "output_complete": complete,
+                    }
+                )
+            )
+        discovery = self.audit_commands(
+            [("rg needle src", output) for output in outputs]
+        )["sourceDiscovery"]
+        self.assertEqual(
+            [row["newEvidence"] for row in discovery["events"]],
+            [True, False, True, True, True, False],
+        )
+        self.assertEqual(discovery["evidenceProgressCount"], 4)
+        self.assertEqual(discovery["unchangedEvidenceCount"], 2)
+        self.assertTrue(discovery["events"][4]["outputReduced"])
+        self.assertEqual(
+            discovery["candidateSignalCounts"]["repeated_search_after_reduced_output"],
+            1,
+        )
+
+    def test_summary_accounts_for_every_omitted_discovery_record_and_path(self):
+        report = self.audit_commands(
+            [
+                (
+                    "rg needle scripts",
+                    "\n".join(f"scripts/worker{n}.py" for n in range(10)),
+                )
+            ]
+            * 30
+        )
+        original = json.dumps(report, sort_keys=True)
+        discovery = kd4_turn_latency_audit.bounded_summary(report)["sourceDiscovery"]
+        self.assertEqual(len(discovery["events"]) + discovery["omittedEvents"], 30)
+        self.assertEqual(
+            len(discovery["candidateSignals"]) + discovery["omittedCandidateSignals"],
+            sum(discovery["candidateSignalCounts"].values()),
+        )
+        for row in discovery["events"]:
+            self.assertEqual(len(row["resultPaths"]) + row["omittedResultPaths"], 10)
+        self.assertEqual(json.dumps(report, sort_keys=True), original)
+
+    def test_turn_boundaries_exclude_idle_time_without_losing_tool_batches(self):
+        def boundary(turn, timestamp):
+            return json.dumps(
+                {
+                    "type": "sampling_boundary",
+                    "timestamp": timestamp,
+                    "payload": {"turn_id": turn},
+                }
+            )
+
+        report = self.audit_rows(
+            [
+                _event({"type": "task_started", "turn_id": "a"}),
+                boundary("a", "2026-08-17T00:00:01Z"),
+                *self.paired_call("a", "00:00:02", "00:00:03"),
+                _event(
+                    {"type": "task_complete", "turn_id": "a", "timing": _timing()},
+                    "2026-08-17T00:00:04Z",
+                ),
+                _event(
+                    {"type": "task_started", "turn_id": "b"}, "2026-08-17T01:00:00Z"
+                ),
+                boundary("b", "2026-08-17T01:00:01Z"),
+                *self.paired_call("b", "01:00:02", "01:00:03"),
+                boundary("b", "2026-08-17T01:00:04Z"),
+                _event(
+                    {"type": "task_complete", "turn_id": "b", "timing": _timing()},
+                    "2026-08-17T01:00:05Z",
+                ),
+            ]
+        )
+        loop = report["executionLoop"]
+        self.assertEqual(loop["postToolHandoffNs"], 1_000_000_000)
+        self.assertEqual(loop["samplingToFirstToolCallNs"], 2_000_000_000)
+        self.assertEqual(loop["singleToolCallSamplingPasses"], 2)
+        self.assertEqual(loop["samplingPassesWithTools"], 2)
+
+    def test_sequential_calls_without_sampling_telemetry_are_not_a_batch(self):
+        rows = [
+            _event({"type": "task_started", "turn_id": "a"}),
+            *self.paired_call("a", "00:00:01", "00:00:02"),
+            *self.paired_call("b", "00:00:03", "00:00:04"),
+            _event({"type": "task_complete", "turn_id": "a"}, "2026-08-17T00:00:05Z"),
+        ]
+        report = self.audit_rows(rows)
+        loop = report["executionLoop"]
+        self.assertEqual(loop["pairedToolCalls"], 2)
+        self.assertEqual(loop["toolCallsWithoutSamplingBoundary"], 2)
+        self.assertNotIn("batchedToolCalls", loop)
+        self.assertNotIn("samplingPassesWithTools", loop)
+        self.assertIn("calls without sampling boundary=2", kd4_turn_latency_audit.render_report(report))
+        self.assertEqual(kd4_turn_latency_audit.bounded_summary(report)["executionLoop"], loop)
+        # A later observed boundary must not retroactively classify the first call.
+        rows.insert(3, json.dumps({"type": "sampling_boundary", "payload": {}, "timestamp": "2026-08-17T00:00:02Z"}))
+        loop = self.audit_rows(rows)["executionLoop"]
+        self.assertEqual(loop["toolCallsWithoutSamplingBoundary"], 1)
+        self.assertEqual(loop["singleToolCallSamplingPasses"], 1)
+        self.assertNotIn("batchedToolCalls", loop)
+
+    def test_waiting_input_tail_is_classified_without_blocking_completed_audit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            timing = _timing()
+            second_relay = dict(timing["toolCalls"][0])
+            second_relay["callId"] = "relay-2"
+            timing["toolCalls"].append(second_relay)
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "complete"}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "complete",
+                                "timing": timing,
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "active"}),
+                        _response(
+                            {
+                                "type": "custom_tool_call",
+                                "call_id": "wait-for-user",
+                                "name": "exec",
+                                "input": "await tools.request_user_input({questions: []})",
+                            },
+                            "2026-08-17T00:00:01Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        self.assertEqual(report["coverage"]["startedTurnsWithoutTerminal"], 1)
+        self.assertEqual(report["behaviorSignals"]["activeTurnsExcluded"], 1)
+        self.assertEqual(report["coverage"]["openTurnStateCounts"], {"user_waiting": 1})
+        self.assertEqual(report["coverage"]["openTurns"][0]["state"], "user_waiting")
+        self.assertEqual(report["toolRelay"]["batchGroups"], 1)
+        self.assertEqual(report["toolRelay"]["batchedCalls"], 2)
+        self.assertTrue(report["auditDecision"]["readyToFinalize"])
+        self.assertIn("active_tail_excluded", report["auditDecision"]["reasonCodes"])
+        self.assertIn("open_turn_user_waiting", report["auditDecision"]["reasonCodes"])
+
+    def test_terminal_and_open_turn_states_are_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "failed"}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "failed",
+                                "error": {"message": "failed"},
+                                "timing": _timing(),
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "canceled"}),
+                        _event(
+                            {
+                                "type": "turn_aborted",
+                                "turn_id": "canceled",
+                                "reason": "interrupted",
+                                "timing": _timing(),
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "abandoned"}),
+                        _event(
+                            {
+                                "type": "turn_aborted",
+                                "turn_id": "abandoned",
+                                "reason": "replaced",
+                                "timing": _timing(),
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "running"}),
+                        _response(
+                            {
+                                "type": "function_call",
+                                "call_id": "running-process",
+                                "name": "shell_command",
+                                "arguments": "{}",
+                            },
+                            "2026-08-17T00:00:01Z",
+                        ),
+                        _event({"type": "task_started", "turn_id": "leaked"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        self.assertEqual(
+            report["coverage"]["terminalLifecycleStateCounts"],
+            {"abandoned": 1, "canceled": 1, "failed": 1},
+        )
+        self.assertEqual(
+            report["coverage"]["openTurnStateCounts"],
+            {"active_without_pending_tool": 1, "unresolved_tool_call": 1},
+        )
+        self.assertEqual(report["behaviorSignals"]["canceledTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["failedTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["abandonedTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["unresolvedToolCallTurns"], 1)
+        self.assertEqual(report["behaviorSignals"]["activeWithoutPendingToolTurns"], 1)
+
+    def test_terminal_turn_with_unresolved_tool_call_is_inconsistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event(
+                            {"type": "task_started", "turn_id": "inconsistent"},
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        _response(
+                            {
+                                "type": "function_call",
+                                "call_id": "wait-1",
+                                "name": "wait",
+                                "arguments": "{}",
+                            },
+                            "2026-08-17T00:00:01Z",
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "inconsistent",
+                                "timing": _timing(),
+                            },
+                            "2026-08-17T00:00:02Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        self.assertEqual(report["executionLoop"]["unpairedToolCalls"], 1)
+        self.assertEqual(report["coverage"]["terminalTurnsWithUnresolvedToolCalls"], 1)
+        violation = report["coverage"]["terminalTurnInvariantViolations"][0]
+        self.assertEqual(violation["turnId"], "inconsistent")
+        self.assertEqual(violation["pendingTools"], ["wait"])
+        self.assertIn(
+            "terminal_with_unresolved_tool_call", report["perTurn"][0]["signals"]
+        )
+        self.assertEqual(
+            report["behaviorSignals"]["terminalTurnsWithUnresolvedToolCalls"], 1
+        )
+        self.assertIn(
+            "terminal_turn_with_unresolved_tool_call",
+            report["auditDecision"]["blockerCodes"],
+        )
+        self.assertFalse(report["auditDecision"]["readyToFinalize"])
+
+    def test_emits_bounded_slow_calls_and_finalize_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            lines = [
+                _meta(str(root)),
+                _event(
+                    {"type": "task_started", "turn_id": "slow-audit"},
+                    "2026-08-17T00:00:00Z",
+                ),
+            ]
+            # Distinct, unsorted durations make top-N membership and descending
+            # order observable instead of accepting either sort direction.
+            for ordinal, duration in enumerate((6, 15, 7, 12, 8, 11, 9, 14, 10, 13)):
+                started_second = ordinal * 3
+                completed_second = started_second + duration
+                lines.extend(
+                    [
+                        _response(
+                            {
+                                "type": "custom_tool_call",
+                                "call_id": f"call-{ordinal}",
+                                "name": "exec",
+                                "input": (
+                                    "const result = await tools.exec_command({"
+                                    'command: "private command"});'
+                                ),
+                            },
+                            f"2026-08-17T00:00:{started_second:02d}Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": f"call-{ordinal}",
+                                "output": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            "Script completed\n"
+                                            f"Wall time {duration}.0 seconds\n"
+                                            "Output:\nprivate output"
+                                        ),
+                                    }
+                                ],
+                            },
+                            f"2026-08-17T00:00:{completed_second:02d}Z",
+                        ),
+                    ]
+                )
+            timing = _timing()
+            timing["inclusiveDurationNs"] = 100_000_000_000
+            timing["machineDurationNs"] = 100_000_000_000
+            timing["exclusive"] = {
+                "orchestrationNs": 70_000_000_000,
+                "modelOnlyNs": 20_000_000_000,
+                "toolOnlyNs": 10_000_000_000,
+                "modelPlusToolNs": 0,
+            }
+            lines.append(
+                _event(
+                    {
+                        "type": "task_complete",
+                        "turn_id": "slow-audit",
+                        "timing": timing,
+                    },
+                    "2026-08-17T00:00:59Z",
+                )
+            )
+            session.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        orchestration = report["commandOrchestration"]
+        self.assertEqual(orchestration["slowToolCallCount"], 10)
+        self.assertEqual(len(orchestration["topSlowToolCalls"]), 8)
+        self.assertEqual(orchestration["omittedSlowToolCalls"], 2)
+        self.assertEqual(
+            [row["roundTripNs"] for row in orchestration["topSlowToolCalls"]],
+            [seconds * 1_000_000_000 for seconds in (15, 14, 13, 12, 11, 10, 9, 8)],
+        )
+        self.assertEqual(
+            orchestration["topSlowToolCalls"][0]["tool"], "exec>exec_command"
+        )
+        self.assertEqual(
+            orchestration["topSlowToolCalls"][0]["reportedExecWallNs"],
+            15_000_000_000,
+        )
+        self.assertNotIn("private command", json.dumps(report))
+        self.assertNotIn("private output", json.dumps(report))
+        self.assertEqual(report["auditDecision"]["dominantPhase"], "orchestration")
+        self.assertTrue(report["auditDecision"]["readyToFinalize"])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("audit decision: finalize", rendered)
+        instruction = report["auditDecision"]["instruction"]
+        self.assertIn("Timing attribution is ready to summarize.", instruction)
+        self.assertIn("does not establish completion of the user's request", instruction)
+        self.assertIn(
+            "Continue any obtainable required investigation, implementation, and validation.",
+            instruction,
+        )
+        self.assertIn(instruction, rendered)
+        self.assertEqual(
+            kd4_turn_latency_audit.bounded_summary(report)["auditDecision"]["instruction"],
+            instruction,
+        )
+
+    def test_output_wall_time_fallback_is_low_confidence_and_unattributed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _response(
+                            {"type": "custom_tool_call", "call_id": "call-1"},
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call-1",
+                                "output": [
+                                    {"type": "input_text", "text": "Script completed"},
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            '{"wall_time_seconds":0.25}'
+                                            '{"wall_time_seconds":0.75}'
+                                        ),
+                                    },
+                                ],
+                            },
+                            "2026-08-17T00:00:03Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        orchestration = report["commandOrchestration"]
+        self.assertEqual(orchestration["pairedToolCalls"], 1)
+        self.assertEqual(orchestration["reportedChildRuntimeCalls"], 1)
+        self.assertEqual(orchestration["reportedChildCalls"], 2)
+        self.assertEqual(orchestration["parallelBatches"], 1)
+        self.assertEqual(orchestration["roundTripNs"], 3_000_000_000)
+        self.assertEqual(orchestration["reportedChildWorkNs"], 1_000_000_000)
+        self.assertEqual(orchestration["orchestrationGapLowerBoundNs"], 0)
+        self.assertEqual(orchestration["orchestrationGapUpperBoundNs"], 0)
+        self.assertEqual(orchestration["orchestrationShareLowerBound"], 0)
+        self.assertEqual(orchestration["orchestrationShareUpperBound"], 0)
+        self.assertEqual(
+            orchestration["unattributedRemainderLowerBoundNs"], 2_000_000_000
+        )
+        self.assertEqual(
+            orchestration["unattributedRemainderUpperBoundNs"], 2_250_000_000
+        )
+        self.assertEqual(orchestration["lowConfidenceRecords"], 1)
+        self.assertEqual(
+            orchestration["evidenceSource"], "responseOutputWallTimeFallback"
+        )
+        rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn(
+            "persisted-gap=0.0-0.0s unattributed-remainder=2.0-2.2s low-confidence=1",
+            rendered,
+        )
+
+    def test_prefers_detailed_tool_call_timing_over_output_wall_time(self) -> None:
+        timing = _timing()
+        timing["toolCalls"] = [
+            {
+                "callId": "call-1",
+                "toolName": "functions.exec",
+                "source": "direct",
+                "generationIndex": 0,
+                "acceptedAtMs": 0,
+                "firstPollAtMs": 1,
+                "parallelGateAdmittedAtMs": 2,
+                "handlerEntryAtMs": 3,
+                "outputCollectedAtMs": 2_999,
+                "outputModelVisibleAtMs": 3_000,
+                "postToolHookMs": 2_900,
+                "totalDurationMs": 3_000,
+            },
+            {
+                "callId": "nested-call-1",
+                "parentCallId": "call-1",
+                "toolName": "exec_command",
+                "source": "codeMode",
+                "generationIndex": 0,
+                "processSpawnedAtMs": 50,
+                "processExitedAtMs": 95,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            session = Path(temp) / "rollout.jsonl"
+            root.mkdir()
+            session.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "timed"}),
+                        _response(
+                            {"type": "custom_tool_call", "call_id": "call-1"},
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        _response(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call-1",
+                                "output": [
+                                    {
+                                        "type": "input_text",
+                                        "text": '{"wall_time_seconds":1.0}',
+                                    }
+                                ],
+                            },
+                            "2026-08-17T00:00:10Z",
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "timed",
+                                "timing": timing,
+                            },
+                            "2026-08-17T00:00:11Z",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(session, root)
+
+        orchestration = report["commandOrchestration"]
+        self.assertEqual(orchestration["evidenceSource"], "toolCalls")
+        self.assertEqual(orchestration["roundTripNs"], 3_000_000_000)
+        self.assertEqual(orchestration["reportedChildCalls"], 1)
+        self.assertEqual(orchestration["reportedChildWorkNs"], 45_000_000)
+        self.assertEqual(orchestration["orchestrationGapLowerBoundNs"], 2_955_000_000)
+        self.assertEqual(orchestration["orchestrationGapUpperBoundNs"], 2_955_000_000)
+        self.assertEqual(orchestration["persistedNestedLifecycleRecords"], 1)
+        self.assertEqual(orchestration["lowConfidenceRecords"], 0)
+        self.assertEqual(orchestration["unattributedRemainderLowerBoundNs"], 0)
+        self.assertEqual(orchestration["unattributedRemainderUpperBoundNs"], 0)
+
+    def test_reports_coverage_and_segments_eval_from_repository_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            sessions = Path(temp) / "sessions"
+            sessions.mkdir()
+            root.mkdir()
+            (sessions / "root.jsonl").write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "root"}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "root",
+                                "timing": _timing(),
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "pending"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            eval_cwd = root / ".codex" / "evals" / "run" / "work"
+            eval_lines = [
+                _meta(str(eval_cwd)),
+                _event({"type": "task_started", "turn_id": "eval"}),
+                _event(
+                    {"type": "task_complete", "turn_id": "eval", "timing": _timing()}
+                ),
+            ]
+            eval_lines.extend(["not-json"] * 101)
+            (sessions / "eval.jsonl").write_text(
+                "\n".join(eval_lines) + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(sessions, root)
+
+        coverage = report["coverage"]
+        self.assertEqual(coverage["files"], 2)
+        self.assertEqual(coverage["parseErrorCount"], 101)
+        self.assertEqual(len(coverage["parseErrors"]), 100)
+        self.assertEqual(coverage["uniqueTaskStarts"], 3)
+        self.assertEqual(coverage["validCompleteProfiles"], 2)
+        self.assertEqual(coverage["startedTurnsWithoutTerminal"], 1)
+        self.assertEqual(report["populations"]["eval"]["turns"], 1)
+        self.assertEqual(report["populations"]["repository_root"]["turns"], 1)
+        all_population = report["populations"]["all"]
+        self.assertEqual(all_population["modelOnlyNs"], 1_200_000_000)
+        self.assertEqual(all_population["toolOnlyNs"], 400_000_000)
+        self.assertEqual(all_population["decisionLatency"]["decisionReadyAttempts"], 2)
+        self.assertEqual(
+            all_population["observationalNonprogressLatency"]["modelStreamWaitNs"],
+            600_000_000,
+        )
+
+    def test_excludes_invalid_profiles_and_falls_back_for_schema_14(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            sessions = Path(temp) / "sessions"
+            sessions.mkdir()
+            root.mkdir()
+            historical = _timing()
+            historical["schemaVersion"] = 14
+            historical.pop("observationalNonprogressLatency")
+            historical["modelRequests"].append(
+                {
+                    "generationIndex": 0,
+                    "attemptKind": "retry",
+                    "modelStreamWaitNs": 50_000_000,
+                    "decisionLatencyNs": 40_000_000,
+                }
+            )
+            (sessions / "rollout.jsonl").write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "historical"}),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "historical",
+                                "timing": historical,
+                            }
+                        ),
+                        _event({"type": "task_started", "turn_id": "invalid"}),
+                        _event(
+                            {
+                                "type": "turn_aborted",
+                                "turn_id": "invalid",
+                                "timing": _timing(valid=False),
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = kd4_turn_latency_audit.analyze_session_path(sessions, root)
+
+        coverage = report["coverage"]
+        self.assertEqual(coverage["uniqueTimedTerminalTurns"], 2)
+        self.assertEqual(coverage["validCompleteProfiles"], 1)
+        self.assertEqual(coverage["invalidProfiles"], 1)
+        population = report["populations"]["all"]
+        self.assertEqual(population["turns"], 1)
+        self.assertEqual(
+            population["observationalNonprogressLatency"]["logicalGenerations"],
+            1,
+        )
+        self.assertEqual(
+            population["observationalNonprogressLatency"]["decisionLatencyNs"],
+            290_000_000,
+        )
+        self.assertEqual(
+            population["observationalNonprogressLatency"]["physicalAttempts"],
+            2,
+        )
+        self.assertFalse(population["tokens"]["complete"])
+        self.assertIsNone(population["tokens"]["billableTokens"])
+        self.assertEqual(population["tokens"]["providerUsageAttempts"], 2)
+        self.assertEqual(population["tokens"]["physicalAttempts"], 3)
+
+
+class RequestLedgerTest(unittest.TestCase):
+    def test_actual_commands_sizes_costs_and_flags_share_one_report(self):
+        timing = _timing()
+        timing["toolCalls"][0]["callId"] = "call-0"
+        timing["modelRequests"].append(dict(timing["modelRequests"][0], attemptKind="retry"))
+        output = '{"output_truncated":true}\nScript failed: diagnostic'
+        report = Kd4TurnLatencyAuditTest().audit_commands(
+            [("python -B scripts/check.py λ", output)], timing=timing,
+        )
+        ledger = report["requestLedger"]
+        self.assertEqual(len(ledger["requests"]), 3)
+        self.assertEqual(ledger["requests"][2]["attemptKind"], "retry")
+        self.assertEqual(ledger["requests"][0]["inputTokens"], 100)
+        call = ledger["calls"][0]
+        self.assertEqual(call["action"], "exec>exec_command scripts/check.py")
+        self.assertNotIn("λ", call["action"])
+        self.assertEqual(call["outputBytes"], len(output.encode("utf-8")))
+        self.assertEqual(call["generationIndex"], 0)
+        self.assertEqual(call["roundTripNs"], 1_000_000_000)
+        self.assertEqual(call["status"], "failed")
+        self.assertTrue(call["truncationMarker"])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        for expected in ("exec>exec_command scripts/check.py", "wait=0.300s", "bytes in/out=", "truncation-marker=True"):
+            self.assertIn(expected, rendered)
+
+    def test_ambiguous_links_unknown_tokens_and_quoted_flags_are_not_invented(self):
+        timing = _timing()
+        timing["toolCalls"][0]["callId"] = "call-0"
+        timing["toolCalls"].append(dict(timing["toolCalls"][0], generationIndex=1))
+        report = Kd4TurnLatencyAuditTest().audit_commands(
+            [("echo quoted", json.dumps({"text": '{"output_truncated":true}'}))],
+            timing=timing, include_tokens=False,
+        )
+        self.assertIsNone(report["requestLedger"]["calls"][0]["generationIndex"])
+        self.assertFalse(report["requestLedger"]["calls"][0]["truncationMarker"])
+        self.assertIsNone(report["requestLedger"]["requests"][0]["inputTokens"])
+
+    def test_ledger_bounds_unicode_rows_without_discarding_full_detail(self):
+        report = Kd4TurnLatencyAuditTest().audit_commands([("cat scripts/" + "a" * 2000 + ".py", "done")] * 45)
+        ledger = report["requestLedger"]
+        for call in ledger["calls"]:
+            call["tool"] = call["turnId"] = call["callId"] = "😀" * 2000
+        self.assertTrue(all(len(call["action"]) == 160 for call in ledger["calls"]))
+        for call in ledger["calls"]:
+            call["action"] = "λ" * 2000
+        text = "\n".join(kd4_turn_latency_audit._render_request_ledger(report))
+        self.assertLess(len(text.encode("utf-8")), 14 * 1024)
+        self.assertIn("calls omitted", text)
+        self.assertEqual(len(ledger["calls"]), 45)
+        self.assertTrue(all(len(call["action"]) == 2000 for call in ledger["calls"]))
+
+    def test_unpaired_open_call_is_retained_without_fake_duration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "open.jsonl"
+            path.write_text("\n".join([
+                _event({"type": "task_started", "turn_id": "open"}),
+                _response({"type": "function_call", "name": "read_file", "call_id": "pending",
+                           "arguments": '{"path":"example.rs"}'}, "2026-08-17T00:00:01Z"),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        self.assertEqual(report["requestLedger"]["requests"], [])
+        call = report["requestLedger"]["calls"][0]
+        self.assertEqual(call["status"], "unpaired")
+        self.assertIsNone(call["roundTripNs"])
+        self.assertIsNone(call["outputBytes"])
+        self.assertIn("example.rs", call["action"])
+
+
+class SavedTimingReportTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.source = self.root / "rollout.jsonl"
+        self.destination = self.root / "saved.json"
+        self.cache = self.root / "cache"
+        self.source.write_text("\n".join([
+            _meta(str(self.root)),
+            _event({"type": "task_started", "turn_id": "valid"}),
+            _event({"type": "task_complete", "turn_id": "valid", "timing": _timing()}),
+            _event({"type": "task_started", "turn_id": "invalid"}),
+            _event({"type": "turn_aborted", "turn_id": "invalid", "timing": _timing(valid=False)}),
+            _event({"type": "task_started", "turn_id": "open"}),
+        ]) + "\n", encoding="utf-8")
+        self.report = kd4_turn_latency_audit.analyze_session_path(self.source, self.root)
+
+    def invoke(self, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                status = kd4_turn_latency_audit.main(list(arguments))
+            except SystemExit as error:
+                status = error.code
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_large_report_is_saved_losslessly_and_replayed_without_source_reads(self):
+        ledger = {"requests": [], "calls": [], "measurementNote": "λ" * 600_000 + "important-tail"}
+        with mock.patch.object(kd4_turn_latency_audit, "_request_ledger", return_value=ledger):
+            status, output, error = self.invoke(str(self.source), "--cache-dir", str(self.cache), "--summary-json")
+        self.assertEqual(status, 0, error)
+        receipt = json.loads(error)["savedReport"]
+        self.destination = Path(receipt["path"])
+        data = self.destination.read_bytes()
+        original = json.loads(data)
+        self.assertEqual(original["requestLedger"], ledger)
+        self.assertGreater(len(data), 1024 * 1024)
+        self.assertLess(len(output.encode()), len(data) // 10)
+        self.assertEqual(receipt, {"path": str(self.destination), "bytes": len(data),
+                                   "sha256": hashlib.sha256(data).hexdigest()})
+        self.assertEqual(json.loads(output)["coverage"]["startedTurnsWithoutTerminal"], 1)
+        self.source.unlink()
+        with mock.patch.object(kd4_turn_latency_audit, "analyze_session_path", side_effect=AssertionError("reanalyzed")), \
+             mock.patch.object(kd4_turn_latency_audit, "resolve_rollout_source", side_effect=AssertionError("read source")):
+            status, replay, error = self.invoke("--from-report", str(self.destination), "--json")
+            self.assertEqual(status, 0, error)
+            self.assertEqual(json.loads(replay), original)
+            self.assertIn("freshness is not checked", error)
+            status, replay, error = self.invoke("--from-report", str(self.destination), "--summary-json")
+            self.assertEqual(status, 0, error)
+            self.assertEqual(json.loads(replay), kd4_turn_latency_audit.bounded_summary(original))
+
+    def test_removed_output_route_cannot_overwrite_user_files(self):
+        for destination in (self.destination, self.source):
+            with self.subTest(destination=destination):
+                if destination == self.destination:
+                    destination.write_bytes(b"existing user report")
+                original = destination.read_bytes()
+                with mock.patch.object(kd4_turn_latency_audit, "analyze_session_path") as analyze:
+                    status, output, error = self.invoke(str(self.source), "--output", str(destination))
+                self.assertEqual(status, 2)
+                self.assertIn("unrecognized arguments", error)
+                self.assertEqual(output, "")
+                analyze.assert_not_called()
+                self.assertEqual(destination.read_bytes(), original)
+
+    def test_cli_entrypoint_replays_comparison_without_live_source(self):
+        command = [sys.executable, "-B", kd4_turn_latency_audit.__file__]
+        created = subprocess.run(
+            [*command, str(self.source), "--cache-dir", str(self.cache)],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.destination = Path(json.loads(created.stderr)["savedReport"]["path"])
+        saved = self.destination.read_bytes()
+        self.source.unlink()
+        replayed = subprocess.run(
+            [*command, "--from-report", str(self.destination), "--json",
+             "--baseline", str(self.destination), "--comparison-min-samples", "1",
+             "--gate-metric", "outputTokens"],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        # The fixture includes an open turn: replay must preserve the gate's
+        # insufficient-evidence result, not turn a saved report into a pass.
+        self.assertEqual(replayed.returncode, 3, replayed.stderr)
+        report = json.loads(replayed.stdout)
+        self.assertEqual(report["baselineComparison"]["gate"]["status"], "insufficient_evidence")
+        self.assertEqual(report["coverage"], json.loads(saved)["coverage"])
+        self.assertEqual(report["baselineComparison"]["gate"]["unavailable"][0]["reason"],
+                         "incomplete_session_coverage")
+        self.assertEqual(self.destination.read_bytes(), saved)
+
+    def test_cache_write_failure_is_explicit_without_losing_computed_summary(self):
+        from scripts.benchmark_scripts import rollout_audit_cache
+        with mock.patch.object(rollout_audit_cache, "write_bytes_atomic", side_effect=PermissionError):
+            status, output, error = self.invoke(str(self.source), "--cache-dir", str(self.cache))
+        self.assertEqual(status, 0, error)
+        self.assertIn("Report NOT saved", error)
+        self.assertNotIn("savedReport", error)
+        self.assertIn("report not saved: unavailable", output)
+        self.assertEqual(list(self.cache.glob("reports/*.json")), [])
+
+    def test_serialization_failure_does_not_publish_or_emit_success(self):
+        with mock.patch.object(kd4_turn_latency_audit, "_request_ledger", return_value=object()):
+            status, output, error = self.invoke(str(self.source), "--cache-dir", str(self.cache))
+        self.assertEqual(status, 2)
+        self.assertIn("not JSON serializable", error)
+        self.assertEqual(output, "")
+        self.assertEqual(list(self.cache.glob("reports/*.json")), [])
+
+    def test_replay_rejects_partial_incompatible_and_malformed_reports(self):
+        for data in ("{", "[]", "{}", json.dumps({"schemaVersion": -1}),
+                     json.dumps(kd4_turn_latency_audit.bounded_summary(self.report)),
+                     json.dumps({"schemaVersion": kd4_turn_latency_audit.REPORT_SCHEMA_VERSION,
+                                 "sessionDiagnostics": {}})):
+            with self.subTest(data=data[:50]):
+                self.destination.write_text(data, encoding="utf-8")
+                for mode in ([], ["--summary-json"], ["--json"]):
+                    status, output, error = self.invoke("--from-report", str(self.destination), *mode)
+                    self.assertEqual(status, 2, error)
+                    self.assertEqual(output, "")
+
+    def test_replay_rejects_live_options_and_output_without_running_producer(self):
+        saved = json.dumps(self.report)
+        self.destination.write_text(saved, encoding="utf-8")
+        for options in ([str(self.source)], ["--tokens", "off"], ["--repo-root", str(self.root)],
+                        ["--cache-dir", str(self.root)], ["--startup-log", str(self.source)],
+                        ["--runner-evidence", str(self.source)], ["--sessions-root", str(self.root)],
+                        ["--diagnostic-evidence", str(self.source)], ["--refresh"],
+                        ["--output", str(self.destination)]):
+            with self.subTest(options=options), mock.patch.object(kd4_turn_latency_audit, "analyze_session_path") as analyze:
+                status, output, error = self.invoke("--from-report", str(self.destination), *options)
+                self.assertEqual(status, 2, error)
+                self.assertEqual(output, "")
+                self.assertIn(
+                    "unrecognized arguments" if options[0] == "--output"
+                    else "--from-report cannot be combined with live-analysis options",
+                    error,
+                )
+                analyze.assert_not_called()
+                self.assertEqual(self.destination.read_text(encoding="utf-8"), saved)
+        status, output, error = self.invoke(str(self.source), "--output", str(self.destination), "--json")
+        self.assertEqual(status, 2, error)
+        self.assertEqual(output, "")
+        self.assertIn("unrecognized arguments", error)
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), saved)
+
+    def test_replay_preserves_gate_exit_status_and_saved_bytes(self):
+        for gate_status, expected in (("passed", 0), ("regression", 1), ("insufficient_evidence", 3)):
+            with self.subTest(status=gate_status):
+                self.report["baselineComparison"] = {"gate": {"status": gate_status}}
+                data = json.dumps(self.report)
+                self.destination.write_text(data, encoding="utf-8")
+                status, output, error = self.invoke("--from-report", str(self.destination), "--json")
+                self.assertEqual(status, expected, error)
+                self.assertEqual(json.loads(output)["baselineComparison"]["gate"]["status"], gate_status)
+                self.assertEqual(self.destination.read_text(encoding="utf-8"), data)
+
+
+if __name__ == "__main__":
+    unittest.main()

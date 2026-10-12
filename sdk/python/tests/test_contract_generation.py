@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import runpy
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import get_args
+
+import pytest
+from pydantic import ValidationError
 
 import openai_codex.generated.v2_all as generated_v2
 from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
@@ -69,6 +73,98 @@ def test_generation_replaces_stale_artifacts_with_current_fork_contracts(tmp_pat
 
     assert "UserWarning" not in completed.stderr, completed.stderr
     assert before == _snapshot_targets(staged_sdk), "Generated files drifted after regeneration"
+
+
+def test_nullable_map_normalization_preserves_literals_and_complex_constraints(tmp_path):
+    script = runpy.run_path(str(ROOT / "scripts" / "update_sdk_artifacts.py"))
+    nullable_map = {"type": ["object", "null"], "additionalProperties": {"type": "string"}}
+    constrained_map = {**nullable_map, "enum": [None]}
+    bundle = {
+        "definitions": {
+            "Account": {
+                "oneOf": [
+                    {
+                        "properties": {
+                            "type": {"enum": ["chatgpt"]},
+                            "email": {"type": "string"},
+                        }
+                    }
+                ]
+            },
+            "Probe": {
+                "type": "object",
+                "properties": {
+                    "env": nullable_map,
+                    "constrained": constrained_map,
+                    "literal": {"const": nullable_map, "default": nullable_map},
+                },
+            },
+        }
+    }
+    script["schema_bundle_path"](tmp_path).write_text(json.dumps(bundle))
+    normalized = json.loads(script["_normalized_schema_bundle_text"](tmp_path))
+    properties = normalized["definitions"]["Probe"]["properties"]
+    assert properties["env"] == {
+        "anyOf": [
+            {"type": "object", "additionalProperties": {"type": "string"}},
+            {"type": "null"},
+        ]
+    }
+    assert properties["constrained"] == constrained_map
+    assert properties["literal"] == {"const": nullable_map, "default": nullable_map}
+
+
+def test_command_exec_environment_preserves_typed_map_contract() -> None:
+    # Rust's HashMap<String, Option<String>> and the wire schema permit string
+    # overrides and null removals, not arbitrary JSON values.
+    for invalid in (123, True, [], {}):
+        with pytest.raises(ValidationError):
+            generated_v2.CommandExecParams.model_validate(
+                {"command": ["echo"], "env": {"PATH": invalid}}
+            )
+    environment = {"PATH": "C:/bin", "REMOVED": None}
+    params = generated_v2.CommandExecParams.model_validate(
+        {"command": ["echo"], "env": environment}
+    )
+    assert params.model_dump(by_alias=True, exclude_none=True)["env"] == environment
+    assert generated_v2.CommandExecParams(command=["echo"], env=None).env is None
+
+
+@pytest.mark.parametrize(
+    ("model", "base", "field", "good", "bad"),
+    [
+        (generated_v2.AppInfo, {"id": "app", "name": "app"}, "iconAssets", "url", 123),
+        (generated_v2.AppInfo, {"id": "app", "name": "app"}, "iconDarkAssets", "url", 123),
+        (generated_v2.AppInfo, {"id": "app", "name": "app"}, "labels", "label", 123),
+        (generated_v2.CommandExecParams, {"command": ["echo"]}, "env", None, 123),
+        (generated_v2.ConfigRequirements, {}, "allowedPermissionProfiles", False, "invalid"),
+        (generated_v2.ConfigRequirements, {}, "featureRequirements", False, "invalid"),
+        (generated_v2.FeedbackUploadParams, {"classification": "bug"}, "tags", "tag", 123),
+        (
+            generated_v2.GetAccountRateLimitsResponse,
+            {"rateLimits": {}},
+            "rateLimitsByLimitId",
+            {"limitId": "codex"},
+            123,
+        ),
+        (
+            generated_v2.ExecLocalShellAction,
+            {"command": ["echo"], "type": "exec"},
+            "env",
+            "value",
+            123,
+        ),
+        (generated_v2.NetworkRequirements, {}, "domains", "allow", "invalid"),
+        (generated_v2.NetworkRequirements, {}, "unixSockets", "deny", "invalid"),
+    ],
+)
+def test_nullable_typed_map_values_validate_and_round_trip(model, base, field, good, bad):
+    # Expected kinds come from the checked-in Rust-produced map schemas, not
+    # from the generated Python annotations whose loss this test detects.
+    with pytest.raises(ValidationError):
+        model.model_validate({**base, field: {"key": bad}})
+    value = model.model_validate({**base, field: {"key": good}})
+    assert value.model_dump(mode="json", by_alias=True, exclude_none=True)[field] == {"key": good}
 
 
 def test_typed_jsonrpc_error_payloads_are_generated() -> None:

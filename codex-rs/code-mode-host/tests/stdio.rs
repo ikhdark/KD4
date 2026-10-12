@@ -298,6 +298,43 @@ fn execute_request(source: &str) -> ExecuteRequest {
 }
 
 #[tokio::test]
+async fn cell_handles_are_isolated_across_local_and_process_sessions_and_restarts() {
+    let remote = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let local = InProcessCodeModeSessionProvider;
+    for provider in [&local as &dyn CodeModeSessionProvider, &remote as &dyn CodeModeSessionProvider] {
+        let original = provider.create_session(Arc::new(RecordingDelegate::default())).await.unwrap();
+        let mut request = execute_request("await yield_control(); await new Promise(resolve => setTimeout(resolve, 3_600_000));");
+        request.yield_time_ms = Some(60_000);
+        let started = original.execute(request.clone()).await.unwrap();
+        let old_id = started.cell_id.clone();
+        assert!(matches!(started.initial_response().await.unwrap(), RuntimeResponse::ExplicitYield { .. }));
+        for restarted in [false, true] {
+            if restarted {
+                original.shutdown().await.unwrap();
+            }
+            let other = provider.create_session(Arc::new(RecordingDelegate::default())).await.unwrap();
+            let started = other.execute(request.clone()).await.unwrap();
+            let own_id = started.cell_id.clone();
+            assert_ne!(old_id, own_id, "runtime incarnation must survive neither fork nor nondurable restart");
+            assert!(matches!(started.initial_response().await.unwrap(), RuntimeResponse::ExplicitYield { .. }));
+            let foreign = other.wait(WaitRequest {
+                cell_id: old_id.clone(), yield_time_ms: 1, recovery: None,
+            }).await;
+            assert!(matches!(foreign, Err(_) | Ok(WaitOutcome::MissingCell(_))),
+                "foreign wait must not observe another live cell: {foreign:?}");
+            let foreign = other.terminate(old_id.clone()).await;
+            assert!(matches!(foreign, Err(_) | Ok(WaitOutcome::MissingCell(_))),
+                "foreign terminate must not terminate another live cell: {foreign:?}");
+            assert!(matches!(other.terminate(own_id).await.unwrap(),
+                WaitOutcome::LiveCell(RuntimeResponse::Terminated { .. })));
+            other.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn first_wait_in_replacement_host_recovers_original_receipt() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.json");
@@ -339,13 +376,20 @@ async fn first_wait_in_replacement_host_recovers_original_receipt() {
 }
 
 async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) -> RuntimeResponse {
-    session
-        .execute(request)
-        .await
-        .expect("start execution")
-        .initial_response()
-        .await
-        .expect("initial response")
+    let started = session.execute(request).await.expect("start execution");
+    let expected_id = started.cell_id.clone();
+    let response = started.initial_response().await.expect("initial response");
+    assert_eq!(response_cell_id(&response), expected_id);
+    response
+}
+
+fn response_cell_id(response: &RuntimeResponse) -> CellId {
+    match response {
+        RuntimeResponse::Result { cell_id, .. }
+        | RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::ExplicitYield { cell_id, .. }
+        | RuntimeResponse::Terminated { cell_id, .. } => cell_id.clone(),
+    }
 }
 
 async fn execute_to_terminal(
@@ -353,8 +397,10 @@ async fn execute_to_terminal(
     request: ExecuteRequest,
 ) -> RuntimeResponse {
     let started = session.execute(request).await.expect("start execution");
+    let expected_id = started.cell_id.clone();
     let mut response = started.initial_response().await.expect("initial response");
     loop {
+        assert_eq!(response_cell_id(&response), expected_id);
         match response {
             RuntimeResponse::Yielded { cell_id, .. }
             | RuntimeResponse::ExplicitYield { cell_id, .. } => {
@@ -428,7 +474,7 @@ text([absent.value, explicitNull.value, object.value].join(","));
             response,
             RuntimeResponse::Result {
                 output_loss: None,
-                cell_id: cell_id("1"),
+                cell_id: response_cell_id(&response),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "output,output,output".to_string(),
                 }],
@@ -459,11 +505,12 @@ async fn stalled_notification_at_session_shutdown_keeps_other_sessions_on_the_ho
         .create_session(Arc::new(RecordingDelegate::default()))
         .await
         .expect("create surviving session");
+    let response = execute(&survivor, execute_request(r#"store("key", "preserved");"#)).await;
     assert_eq!(
-        execute(&survivor, execute_request(r#"store("key", "preserved");"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: Vec::new(),
             error_text: None,
         }
@@ -496,11 +543,12 @@ async fn stalled_notification_at_session_shutdown_keeps_other_sessions_on_the_ho
         "notification cancelled"
     );
 
+    let response = execute(&survivor, execute_request(r#"text(load("key"));"#)).await;
     assert_eq!(
-        execute(&survivor, execute_request(r#"text(load("key"));"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "preserved".to_string(),
             }],
@@ -581,11 +629,13 @@ async fn remote_session_persists_values_forwards_delegates_and_controls_cells() 
         .await
         .expect("create remote session");
 
+    let stored = execute(&session, execute_request(r#"store("key", "persisted");"#),).await;
+    let stored_id = response_cell_id(&stored);
     assert_eq!(
-        execute(&session, execute_request(r#"store("key", "persisted");"#),).await,
+        stored,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: stored_id.clone(),
             content_items: Vec::new(),
             error_text: None,
         }
@@ -608,11 +658,13 @@ text(result.value);
         default_timeout_ms: None,
         output_schema: None,
     }].into();
+    let callback = execute(&session, callback_request).await;
+    let callback_id = response_cell_id(&callback);
     assert_eq!(
-        execute(&session, callback_request).await,
+        callback,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: callback_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "output".to_string(),
             }],
@@ -646,7 +698,7 @@ text(result.value);
             })
             .collect::<Vec<_>>(),
         vec![CodeModeNestedToolCall {
-            cell_id: cell_id("2"),
+            cell_id: callback_id.clone(),
             parent_tool_call_id: Some("call-2".to_string()),
             runtime_tool_call_id: "tool-1".to_string(),
             tool_name: ToolName::plain("echo"),
@@ -658,16 +710,18 @@ text(result.value);
     );
     assert_eq!(
         *delegate.notifications.lock().expect("notifications lock"),
-        vec![("call-2".to_string(), cell_id("2"), "notice".to_string())]
+        vec![("call-2".to_string(), callback_id.clone(), "notice".to_string())]
     );
 
     let mut pending_request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
     pending_request.tool_call_id = "call-3".to_string();
     pending_request.yield_time_ms = Some(1);
+    let pending = execute(&session, pending_request).await;
+    let pending_id = response_cell_id(&pending);
     assert_eq!(
-        execute(&session, pending_request).await,
+        pending,
         RuntimeResponse::Yielded {
-            cell_id: cell_id("3"),
+            cell_id: pending_id.clone(),
             content_items: Vec::new(),
         }
     );
@@ -675,23 +729,23 @@ text(result.value);
         session
             .wait(WaitRequest {
                 recovery: None,
-                cell_id: cell_id("3"),
+                cell_id: pending_id.clone(),
                 yield_time_ms: 1,
             })
             .await
             .expect("wait for cell"),
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
-            cell_id: cell_id("3"),
+            cell_id: pending_id.clone(),
             content_items: Vec::new(),
         })
     );
     assert_eq!(
         session
-            .terminate(cell_id("3"))
+            .terminate(pending_id.clone())
             .await
             .expect("terminate cell"),
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-            cell_id: cell_id("3"),
+            cell_id: pending_id.clone(),
             content_items: Vec::new(),
         })
     );
@@ -699,7 +753,7 @@ text(result.value);
     session.shutdown().await.expect("shutdown remote session");
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),
-        vec![cell_id("1"), cell_id("2"), cell_id("3")]
+        vec![stored_id.clone(), callback_id.clone(), pending_id.clone()]
     );
 }
 
@@ -760,11 +814,12 @@ async fn dropping_session_outside_runtime_closes_cells_and_preserves_shared_host
         .create_session(Arc::new(RecordingDelegate::default()))
         .await
         .expect("create surviving session");
+    let response = execute(&survivor, execute_request(r#"store("key", "preserved");"#)).await;
     assert_eq!(
-        execute(&survivor, execute_request(r#"store("key", "preserved");"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: Vec::new(),
             error_text: None,
         }
@@ -788,11 +843,12 @@ async fn dropping_session_outside_runtime_closes_cells_and_preserves_shared_host
         next_callback_event(&mut events_rx).await,
         CallbackEvent::CellClosed(running_cell_id)
     );
+    let response = execute(&survivor, execute_request(r#"text(load("key"));"#)).await;
     assert_eq!(
-        execute(&survivor, execute_request(r#"text(load("key"));"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "preserved".to_string(),
             }],
@@ -1002,11 +1058,12 @@ async fn oversized_execute_request_does_not_close_the_shared_host() {
         "unexpected error: {error}"
     );
 
+    let response = execute(&session, execute_request(r#"text("still alive");"#)).await;
     assert_eq!(
-        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
             }],
@@ -1048,11 +1105,12 @@ try {{
     ));
     oversized_argument.enabled_tools = vec![tool("big_argument")].into();
     oversized_argument.yield_time_ms = Some(60_000);
+    let response = execute_to_terminal(&session, oversized_argument).await;
     assert_eq!(
-        execute_to_terminal(&session, oversized_argument).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("1"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "argument rejected".to_string(),
             }],
@@ -1073,11 +1131,12 @@ try {
     );
     oversized_result.enabled_tools = vec![tool("big_result")].into();
     oversized_result.yield_time_ms = Some(60_000);
+    let response = execute_to_terminal(&session, oversized_result).await;
     assert_eq!(
-        execute_to_terminal(&session, oversized_result).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "result rejected".to_string(),
             }],
@@ -1086,11 +1145,12 @@ try {
     );
 
     assert!(delegate.invoked.load(Ordering::SeqCst));
+    let response = execute(&session, execute_request(r#"text("still alive");"#)).await;
     assert_eq!(
-        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("3"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
             }],
@@ -1115,6 +1175,7 @@ async fn oversized_initial_response_is_bounded_without_closing_the_shared_host()
         )))
         .await
         .expect("start oversized response");
+    let expected_id = started.cell_id.clone();
     assert_eq!(
         started
             .initial_response()
@@ -1125,7 +1186,7 @@ async fn oversized_initial_response_is_bounded_without_closing_the_shared_host()
                 discarded_items: 1,
                 discarded_bytes_lower_bound: MAX_FRAME_BYTES as u64,
             }),
-            cell_id: cell_id("1"),
+            cell_id: expected_id,
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "Code mode output was truncated because the cell's buffered output exceeded its 63 MiB encoded limit."
                     .to_string(),
@@ -1134,11 +1195,12 @@ async fn oversized_initial_response_is_bounded_without_closing_the_shared_host()
         }
     );
 
+    let response = execute(&session, execute_request(r#"text("still alive");"#)).await;
     assert_eq!(
-        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
             }],
@@ -1205,11 +1267,12 @@ async fn escape_heavy_output_reports_truthful_loss_within_one_frame() {
         "Code mode output was truncated because the cell's buffered output exceeded its 63 MiB encoded limit."
     );
 
+    let response = execute(&session, execute_request(r#"text("still alive");"#)).await;
     assert_eq!(
-        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        response,
         RuntimeResponse::Result {
             output_loss: None,
-            cell_id: cell_id("2"),
+            cell_id: response_cell_id(&response),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
             }],

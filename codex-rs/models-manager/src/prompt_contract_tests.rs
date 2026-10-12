@@ -49,16 +49,9 @@ fn evidence_guidance_reaches_local_policy_and_fallback_models() {
     for model in response.models {
         let instructions = model.get_model_instructions(None);
         for required in [
-            "Direct file reads establish exact content at that time; discovery-only search hits identify candidates.",
-            "Complete search results establish exact matching facts within their recorded scope and snapshot, not omitted context or broader behavior.",
-            "Preserve source and freshness through summaries and durable state.",
-            "Storage or repetition never upgrades evidence strength.",
-            "Treat generated summaries as derived and potentially lossy, cached observations as potentially stale, and inferred relationships as hypotheses.",
-            "Use provenance labels such as `direct_file_read`, `search_hit`, `generated_summary`, `cached_observation`, `inferred_relationship`, and `test_result` only when they preserve a material distinction.",
-            "These labels are optional internal aids, not a required user-facing reporting format.",
-            "Before citing exact values (versions, names, counts, paths, subcommands), check retained evidence; if unavailable or stale, refresh it or mark the value unknown.",
-            "Never substitute a remembered value while citing an earlier read.",
-            "Resolve contradictions using runtime reachability, ownership, freshness, and generated-source contracts; revise conclusions when evidence disagrees and never fill an unknown with an unstated assumption.",
+            "Separate what you observed from what you infer, and check an exact value (version, name, count, path) against what you observed in this session before citing it, or mark it unknown.",
+            "A search hit is a candidate; an empty search proves absence only within its scope.",
+            "Do not attach freshness or provenance caveats to an answer unless that evidence is actually in doubt.",
         ] {
             assert!(
                 instructions.contains(required),

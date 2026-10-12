@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+
+# Support direct execution (including python -I) from any working directory.
+if __package__ in (None, ""):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+
+
+from datetime import datetime, timezone
+from contextlib import contextmanager
+from functools import cache
+from pathlib import Path
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import unittest
+
+from scripts.common.process_owner import owned_process
+
+
+SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+RUN_TIMEOUT_SECONDS = 120
+FIXTURE_TIME = 946684900
+FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
+
+
+def powershell() -> str | None:
+    # Prefer Windows PowerShell 5.1: production invokes publish-local-codex.ps1
+    # via `powershell -NoProfile -File ...` from the justfile, and 5.1 has
+    # stricter native-stderr and StrictMode semantics than pwsh 7 — bugs in
+    # that class are invisible when the tests run under pwsh.
+    return shutil.which("powershell") or shutil.which("pwsh")
+
+
+def ps_single_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+@cache
+def native_codex_fixture_bytes(version: str = "9.9.9", exit_code: int = 0) -> bytes:
+    """Compile once per behavior, so identity checks use a real native probe."""
+    source = (
+        "using System; using System.Diagnostics; using System.IO; "
+        "using System.Threading; public class CodexFixture { "
+        "public static int Main(string[] args) { "
+        'if (args.Length == 1 && args[0] == "--wait") { Thread.Sleep(Timeout.Infinite); } '
+        'if (args.Length == 2 && args[0] == "--wait-with-child") { '
+        'var info = new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, "--wait"); '
+        "info.UseShellExecute = false; info.CreateNoWindow = true; "
+        "using (var child = Process.Start(info)) { "
+        "File.WriteAllText(args[1], child.Id.ToString()); child.WaitForExit(); } return 0; } "
+        f"Console.WriteLine({json.dumps('codex ' + version)}); "
+        f"return {exit_code}; }} }}"
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        executable = Path(directory) / "codex.exe"
+        result = subprocess.run(
+            [
+                powershell(),
+                "-NoProfile",
+                "-Command",
+                (
+                    f"Add-Type -TypeDefinition {ps_single_quote(source)} "
+                    f"-OutputAssembly {ps_single_quote(executable)} "
+                    "-OutputType ConsoleApplication"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        return executable.read_bytes()
+
+
+PUBLISH_ENV_VARS = (
+    "CODEX_LOCAL_PUBLISH_DIR",
+    "CODEX_LOCAL_CODEX_HOME",
+    "CODEX_LOCAL_CODEX_SQLITE_HOME",
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
+    "CODEX_CLI_PATH",
+)
+
+
+def clean_env() -> dict[str, str]:
+    # A prior -ConfigureDesktopLocalCli publish persists these at User scope,
+    # so the inherited environment can carry them; the script prefers
+    # CODEX_LOCAL_PUBLISH_DIR over the test's temp USERPROFILE, which makes
+    # assertions machine-state-dependent unless they are stripped.
+    # Git's repository/index/config overrides can redirect even `git -C` out
+    # of a temporary checkout. No ambient Git controls belong in fixtures.
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith("GIT_")}
+    # Publish builds refuse these, so an ambient value must not decide a test.
+    for name in (*PUBLISH_ENV_VARS, "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CODEX_THREAD_ID"):
+        env.pop(name, None)
+    return env
+
+
+class PublishLocalCodexTestBase(unittest.TestCase):
+    def setUp(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.fail("PowerShell is not available")
+        self.shell = shell
+        comspec = os.environ.get("ComSpec")
+        if not comspec:
+            self.skipTest("ComSpec is not available")
+        self.source_exe_bytes = native_codex_fixture_bytes()
+        self.repo_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.repo_temp.cleanup)
+        self.source_exe = Path(self.repo_temp.name) / "fixture-codex.exe"
+        self.source_exe.write_bytes(self.source_exe_bytes)
+        self.repo_root = Path(self.repo_temp.name) / "repo"
+        self.repo_root.mkdir()
+        (self.repo_root / "codex-rs").mkdir()
+        self.source_code_mode_host = (
+            Path(self.repo_temp.name) / "fixture-code-mode-host.exe"
+        )
+        self.source_code_mode_host_bytes = b"codex-code-mode-host-test-fixture"
+        self.source_code_mode_host.write_bytes(self.source_code_mode_host_bytes)
+        self.source_windows_sandbox_setup = (
+            Path(self.repo_temp.name) / "fixture-windows-sandbox-setup.exe"
+        )
+        self.source_windows_sandbox_setup_bytes = (
+            b"codex-windows-sandbox-setup-test-fixture"
+        )
+        self.source_windows_sandbox_setup.write_bytes(
+            self.source_windows_sandbox_setup_bytes
+        )
+        self.source_command_runner = (
+            Path(self.repo_temp.name) / "fixture-command-runner.exe"
+        )
+        self.source_command_runner_bytes = b"codex-command-runner-test-fixture"
+        self.source_command_runner.write_bytes(self.source_command_runner_bytes)
+        self.repo_fixture_initialized = False
+
+    def init_repo_fixture(self) -> None:
+        if self.repo_fixture_initialized:
+            return
+        if shutil.which("git") is None:
+            self.skipTest("git is not available")
+
+        self.run_git("init", "--quiet")
+        self.run_git("config", "user.email", "codex-test@example.com")
+        self.run_git("config", "user.name", "Codex Test")
+        (self.repo_root / "codex-rs").mkdir(exist_ok=True)
+        tracked = self.repo_root / "codex-rs" / "tracked-source.rs"
+        tracked.write_text("initial\n", encoding="utf-8")
+        os.utime(tracked, (FIXTURE_TIME, FIXTURE_TIME))
+        fixture_date = datetime.fromtimestamp(FIXTURE_TIME, timezone.utc).isoformat()
+        self.run_git("add", "codex-rs/tracked-source.rs")
+        self.run_git(
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+            env={
+                **os.environ,
+                "GIT_AUTHOR_DATE": fixture_date,
+                "GIT_COMMITTER_DATE": fixture_date,
+            },
+        )
+        self.repo_fixture_initialized = True
+
+    def write_cargo_lock_with_v8(self, version: str = "149.2.0") -> Path:
+        cargo_lock = self.repo_root / "codex-rs" / "Cargo.lock"
+        cargo_lock.write_text(
+            "\n".join(
+                [
+                    "[[package]]",
+                    'name = "v8"',
+                    f'version = "{version}"',
+                    'source = "registry+https://github.com/rust-lang/crates.io-index"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return cargo_lock
+
+    def publish_env_without_v8_archive(self, user_profile: Path) -> dict[str, str]:
+        env = clean_env()
+        env["USERPROFILE"] = str(user_profile)
+        for name in (
+            # The machine's Cargo home would otherwise supply a real archive.
+            "CARGO_HOME",
+            "RUSTY_V8_ARCHIVE",
+            "RUSTY_V8_MIRROR",
+            "V8_FROM_SOURCE",
+        ):
+            env.pop(name, None)
+        return env
+
+    def expected_windows_rusty_v8_target(self) -> str:
+        if not hasattr(self, "_rusty_v8_target"):
+            self._rusty_v8_target = self._resolve_windows_rusty_v8_target()
+        return self._rusty_v8_target
+
+    def _resolve_windows_rusty_v8_target(self) -> str:
+        rustc = shutil.which("rustc")
+        if rustc is not None:
+            result = subprocess.run(
+                [rustc, "-vV"],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if line.startswith("host: "):
+                        host = line.removeprefix("host: ").strip()
+                        if host in {
+                            "x86_64-pc-windows-msvc",
+                            "aarch64-pc-windows-msvc",
+                        }:
+                            return host
+        arch = (os.environ.get("PROCESSOR_ARCHITECTURE") or "AMD64").upper()
+        if arch == "ARM64":
+            return "aarch64-pc-windows-msvc"
+        return "x86_64-pc-windows-msvc"
+
+    def rusty_v8_archive_name(self, archive_profile: str = "release") -> str:
+        return (
+            f"rusty_v8_{archive_profile}_"
+            f"{self.expected_windows_rusty_v8_target()}.lib.gz"
+        )
+
+    def rusty_v8_archive_url(
+        self, version: str = "149.2.0", archive_profile: str = "release"
+    ) -> str:
+        return (
+            f"https://github.com/denoland/rusty_v8/releases/download/v{version}/"
+            f"{self.rusty_v8_archive_name(archive_profile)}"
+        )
+
+    def rusty_v8_cache_path(self, user_profile: Path, version: str = "149.2.0") -> Path:
+        cache_name = re.sub(r"[^A-Za-z0-9]", "_", self.rusty_v8_archive_url(version))
+        return user_profile / ".cargo" / ".rusty_v8" / cache_name
+
+    def write_rusty_v8_checksum(
+        self,
+        archive_path: Path,
+        version: str = "149.2.0",
+        *,
+        binary_marker: bool = False,
+    ) -> str:
+        checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        checksum_dir = self.repo_root / "third_party" / "v8"
+        checksum_dir.mkdir(parents=True, exist_ok=True)
+        marker = "*" if binary_marker else " "
+        (checksum_dir / f"rusty_v8_{version.replace('.', '_')}.sha256").write_text(
+            f"{checksum} {marker}{self.rusty_v8_archive_name()}\n",
+            encoding="utf-8",
+        )
+        return checksum
+
+    def run_git(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        # Preserve explicitly supplied fixture dates, but discard ambient Git controls.
+        git_environment = {
+            key: value
+            for key, value in (os.environ if env is None else env).items()
+            if not key.upper().startswith("GIT_")
+        }
+        if env is not None:
+            for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+                if name in env:
+                    git_environment[name] = env[name]
+        result = subprocess.run(
+            ["git", "-C", str(self.repo_root), *args],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=git_environment,
+        )
+        if result.returncode != 0:
+            self.fail(f"git {' '.join(args)} failed:\n{result.stderr}")
+        return result
+
+    def built_artifact_paths(
+        self, profile: str = "local-release"
+    ) -> tuple[Path, Path, Path, Path]:
+        profile_dir = "debug" if profile == "debug" else profile
+        built_dir = (
+            self.repo_root / "codex-rs" / "target" / f"publish-{profile}" / profile_dir
+        )
+        return (
+            built_dir / "codex.exe",
+            built_dir / "codex-code-mode-host.exe",
+            built_dir / "codex-windows-sandbox-setup.exe",
+            built_dir / "codex-command-runner.exe",
+        )
+
+    def write_built_artifacts(
+        self,
+        profile: str = "local-release",
+        *,
+        codex_bytes: bytes | None = None,
+        timestamp: float | None = None,
+    ) -> tuple[Path, Path, Path, Path]:
+        paths = self.built_artifact_paths(profile)
+        paths[0].parent.mkdir(parents=True, exist_ok=True)
+        contents = (
+            self.source_exe_bytes if codex_bytes is None else codex_bytes,
+            self.source_code_mode_host_bytes,
+            self.source_windows_sandbox_setup_bytes,
+            self.source_command_runner_bytes,
+        )
+        for path, content in zip(paths, contents, strict=True):
+            path.write_bytes(content)
+            if timestamp is not None:
+                os.utime(path, (timestamp, timestamp))
+        return paths
+
+    def write_fake_cargo(
+        self,
+        fake_bin: Path,
+        *lines: str,
+        profile: str = "local-release",
+    ) -> Path:
+        # Builds materialize all four publish artifacts where real Cargo would;
+        # toolchain identity probes stay side-effect free.
+        codex, code_mode_host, sandbox_setup, command_runner = (
+            self.built_artifact_paths(profile)
+        )
+        fake_cargo = fake_bin / "cargo.cmd"
+        fake_cargo.write_text(
+            "\r\n".join(
+                [
+                    "@echo off",
+                    'if "%1"=="--version" exit /b 0',
+                    f'if not exist "{codex.parent}" mkdir "{codex.parent}"',
+                    f'copy /y "{self.source_exe}" "{codex}" >nul',
+                    f'copy /y "{self.source_code_mode_host}" "{code_mode_host}" >nul',
+                    f'copy /y "{self.source_windows_sandbox_setup}" "{sandbox_setup}" >nul',
+                    f'copy /y "{self.source_command_runner}" "{command_runner}" >nul',
+                    *lines,
+                    "exit /b 0",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return fake_cargo
+
+    def write_build_stamp(
+        self,
+        profile: str,
+        timestamp: float,
+        source_exe: Path | None = None,
+        source_code_mode_host: Path | None = None,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> Path:
+        # Without explicit binaries, stamp the Cargo output paths publish reads.
+        if source_exe is None:
+            source_exe, code_mode_host, sandbox_setup, command_runner = (
+                self.built_artifact_paths(profile)
+            )
+        else:
+            code_mode_host = source_code_mode_host or self.source_code_mode_host
+            sandbox_setup = self.source_windows_sandbox_setup
+            command_runner = self.source_command_runner
+        stamp = (
+            self.repo_root
+            / "codex-rs"
+            / "target"
+            / f"codex-local-publish-{profile}.stamp"
+        )
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp_time = datetime.fromtimestamp(timestamp, timezone.utc)
+        source_newest = (
+            f"{stamp_time:%Y-%m-%dT%H:%M:%S}.{stamp_time.microsecond * 10:07d}Z"
+        )
+        command = (
+            "Set-StrictMode -Version Latest; "
+            "$ErrorActionPreference = 'Stop'; "
+            f". {ps_single_quote(SCRIPT)} -ImportOnly; "
+            f"$fingerprint = Get-LocalPublishBuildInputFingerprint -RepoRoot {ps_single_quote(self.repo_root)}; "
+            f"Write-BuildStamp -StampPath {ps_single_quote(stamp)} "
+            f"-Profile {ps_single_quote(profile)} "
+            "-SourceFingerprint $fingerprint "
+            f"-SourceExe {ps_single_quote(source_exe)} "
+            f"-SourceCodeModeHostExe {ps_single_quote(code_mode_host)} "
+            f"-SourceWindowsSandboxSetupExe {ps_single_quote(sandbox_setup)} "
+            f"-SourceCommandRunnerExe {ps_single_quote(command_runner)} "
+            f"-SourceNewestUtc ([DateTime]::Parse({ps_single_quote(source_newest)}, "
+            "[Globalization.CultureInfo]::InvariantCulture, "
+            "[Globalization.DateTimeStyles]::RoundtripKind))"
+        )
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+            env=clean_env() if env is None else env,
+        )
+        if result.returncode != 0:
+            self.fail(
+                "failed to write production build stamp:\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        return stamp
+
+    def touch_tracked_source(self, timestamp: float) -> Path:
+        tracked = self.repo_root / "codex-rs" / "tracked-source.rs"
+        tracked.write_text(f"changed at {timestamp}\n", encoding="utf-8")
+        os.utime(tracked, (timestamp, timestamp))
+        return tracked
+
+    def touch_unrelated_source(self, timestamp: float) -> Path:
+        docs = self.repo_root / "docs"
+        docs.mkdir(exist_ok=True)
+        unrelated = docs / "notes.md"
+        unrelated.write_text(f"changed at {timestamp}\n", encoding="utf-8")
+        os.utime(unrelated, (timestamp, timestamp))
+        return unrelated
+
+    def publish_args(self, args: tuple[str, ...]) -> tuple[str, ...]:
+        if "-RepoRoot" in args:
+            return args
+        return ("-RepoRoot", str(self.repo_root), *args)
+
+    def proof_value(self, text: str, name: str) -> str | None:
+        prefix = f"{name}:"
+        for line in text.splitlines():
+            if line.startswith(prefix):
+                return line[len(prefix) :].strip()
+        return None
+
+    def assert_proof_value(self, text: str, name: str, expected: str) -> None:
+        self.assertEqual(
+            self.proof_value(text, name),
+            expected,
+            f"proof value mismatch for {name!r}\nstdout:\n{text}",
+        )
+
+    def assert_publish_readiness(self, text: str, expected: str) -> None:
+        self.assert_proof_value(text, "publishReadiness", expected)
+
+    def assert_no_publish_temps(self, install_dir: Path) -> None:
+        self.assertEqual(list(install_dir.glob(".codex-local-publish.*.tmp")), [])
+        for pattern in (
+            f".{install_dir.name}.bundle.*",
+            f".{install_dir.name}.rollback.*",
+            f".{install_dir.name}.codex-local-publish.transaction.json*",
+        ):
+            self.assertEqual(list(install_dir.parent.glob(pattern)), [], pattern)
+
+    @contextmanager
+    def running_codex(self, path: Path):
+        # The publisher may kill the fixture parent; the test owns its whole
+        # tree until teardown, including the deliberately still-running child.
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_file = Path(directory) / "child.pid"
+            with owned_process(
+                [str(path), "--wait-with-child", str(child_pid_file)],
+                creationflags=CREATE_NO_WINDOW,
+            ) as process:
+                deadline = time.monotonic() + 10
+                while True:
+                    value = (
+                        child_pid_file.read_text() if child_pid_file.exists() else ""
+                    )
+                    if value.isdecimal():
+                        child_pid = int(value)
+                        break
+                    self.assertIsNone(
+                        process.poll(), "fixture exited before child startup"
+                    )
+                    self.assertLess(
+                        time.monotonic(), deadline, "fixture child did not start"
+                    )
+                    time.sleep(0.01)
+                yield process
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            self.assertNotIn(
+                f'"{child_pid}"', result.stdout, "fixture descendant survived"
+            )
+
+    def install_matching_publish_helpers(
+        self,
+        install_dir: Path,
+        *,
+        timestamp: float | None = None,
+    ) -> tuple[Path, Path, Path]:
+        resources = install_dir / "codex-resources"
+        resources.mkdir(exist_ok=True)
+        targets = (
+            install_dir / "codex-code-mode-host.exe",
+            resources / "codex-windows-sandbox-setup.exe",
+            resources / "codex-command-runner.exe",
+        )
+        contents = (
+            self.source_code_mode_host_bytes,
+            self.source_windows_sandbox_setup_bytes,
+            self.source_command_runner_bytes,
+        )
+        for target, content in zip(targets, contents, strict=True):
+            target.write_bytes(content)
+            if timestamp is not None:
+                os.utime(target, (timestamp, timestamp))
+        return targets
+
+    def write_fake_codex(
+        self,
+        path: Path,
+        *,
+        commit: str = "test-commit",
+        timestamp: float | None = None,
+    ) -> Path:
+        path.write_text(
+            "\r\n".join(
+                [
+                    "@echo off",
+                    "echo codex 9.9.9",
+                    f"echo commit: {commit}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        if timestamp is not None:
+            os.utime(path, (timestamp, timestamp))
+        return path
+
+    def copy_valid_codex(
+        self,
+        path: Path,
+        *,
+        timestamp: float | None = None,
+        append_padding: bool = False,
+    ) -> Path:
+        # Preserve native execution and a truthful --version response.
+        path.write_bytes(self.source_exe_bytes)
+        if append_padding:
+            with path.open("ab") as handle:
+                handle.write(b"\r\ncodex-test-padding")
+        if timestamp is not None:
+            os.utime(path, (timestamp, timestamp))
+        return path
+
+    def write_source_bundle_manifest(
+        self,
+        entrypoint: Path,
+        code_mode_host: Path | None = None,
+        sandbox_setup: Path | None = None,
+        command_runner: Path | None = None,
+    ) -> Path:
+        role_paths = (
+            ("entrypoint", entrypoint),
+            ("code-mode-host", code_mode_host or self.source_code_mode_host),
+            ("sandbox-setup", sandbox_setup or self.source_windows_sandbox_setup),
+            ("command-runner", command_runner or self.source_command_runner),
+        )
+        common_root = Path(
+            os.path.commonpath([str(path.resolve().parent) for _, path in role_paths])
+        )
+        manifest_handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".json",
+            prefix="codex-package-test-",
+            dir=common_root,
+            delete=False,
+        )
+        manifest_path = Path(manifest_handle.name)
+        files = []
+        for role, path in role_paths:
+            content = path.read_bytes() if path.is_file() else b""
+            files.append(
+                {
+                    "path": path.resolve().relative_to(common_root).as_posix(),
+                    "role": role,
+                    "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+        bundle_id = hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        json.dump(
+            {
+                "layoutVersion": 2,
+                "version": "9.9.9",
+                "target": self.expected_windows_rusty_v8_target(),
+                "bundleId": bundle_id,
+                "buildIdentity": {"fixture": True},
+                "files": files,
+            },
+            manifest_handle,
+        )
+        manifest_handle.close()
+        self.addCleanup(manifest_path.unlink, missing_ok=True)
+        return manifest_path
+
+    def run_script(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        observe_commands: dict[str, Path] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        publish_args = list(self.publish_args(args))
+        # Ordinary fixtures must never inspect the developer's session history.
+        # Explicit homes and a fixture USERPROFILE still exercise routing defaults.
+        effective_env = clean_env() if env is None else env
+        if (
+            "-LocalCodexHome" not in publish_args
+            and not effective_env.get("CODEX_LOCAL_CODEX_HOME")
+            and effective_env.get("USERPROFILE") == os.environ.get("USERPROFILE")
+        ):
+            publish_args.extend(
+                ["-LocalCodexHome", str(Path(self.repo_temp.name) / "local-home")]
+            )
+        # Only prebuilt (-SkipBuild) runs may name binaries; builds publish the
+        # Cargo outputs, so fixtures reach them through write_fake_cargo.
+        if "-SkipBuild" in publish_args:
+            if "-SourceCodeModeHostExe" not in publish_args:
+                publish_args.extend(
+                    ["-SourceCodeModeHostExe", str(self.source_code_mode_host)]
+                )
+            if "-SourceWindowsSandboxSetupExe" not in publish_args:
+                publish_args.extend(
+                    [
+                        "-SourceWindowsSandboxSetupExe",
+                        str(self.source_windows_sandbox_setup),
+                    ]
+                )
+            if "-SourceCommandRunnerExe" not in publish_args:
+                publish_args.extend(
+                    ["-SourceCommandRunnerExe", str(self.source_command_runner)]
+                )
+        if "-BackupDir" not in publish_args and "-InstallDir" in publish_args:
+            install_dir = Path(publish_args[publish_args.index("-InstallDir") + 1])
+            backup_dir = install_dir.parent / "publisher-backups"
+            if backup_dir.exists():
+                (backup_dir / ".codex-local-publish-backups").write_text(
+                    "KD4 codex local publish backups v1\n", encoding="utf-8"
+                )
+            publish_args.extend(["-BackupDir", str(backup_dir)])
+        if "-SkipBuild" in publish_args and "-SourceBundleManifest" not in publish_args:
+
+            def argument_path(name: str, default: Path) -> Path:
+                if name not in publish_args:
+                    return default
+                return Path(publish_args[publish_args.index(name) + 1])
+
+            manifest_path = self.write_source_bundle_manifest(
+                argument_path("-SourceExe", self.source_exe),
+                argument_path("-SourceCodeModeHostExe", self.source_code_mode_host),
+                argument_path(
+                    "-SourceWindowsSandboxSetupExe",
+                    self.source_windows_sandbox_setup,
+                ),
+                argument_path("-SourceCommandRunnerExe", self.source_command_runner),
+            )
+            publish_args.extend(["-SourceBundleManifest", str(manifest_path)])
+        invocation = ["-File", str(SCRIPT), *publish_args]
+        if observe_commands:
+            commands = [
+                f"Set-PSBreakpoint -Command {ps_single_quote(name)} -Action {{ "
+                f'[IO.File]::AppendAllText({ps_single_quote(marker)}, "invoked`n") }} | Out-Null'
+                for name, marker in observe_commands.items()
+            ]
+            parameters = []
+            index = 0
+            while index < len(publish_args):
+                name = publish_args[index].removeprefix("-")
+                index += 1
+                value = "$true"
+                if index < len(publish_args) and not publish_args[index].startswith(
+                    "-"
+                ):
+                    value = ps_single_quote(publish_args[index])
+                    index += 1
+                parameters.append(f"{ps_single_quote(name)} = {value}")
+            commands.append("$publishParameters = @{ " + "; ".join(parameters) + " }")
+            commands.append(f"& {ps_single_quote(SCRIPT)} @publishParameters")
+            invocation = ["-Command", "\n".join(commands)]
+        return subprocess.run(
+            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", *invocation],
+            text=True,
+            # Windows PowerShell writes redirected text in the OEM code page;
+            # Python's UTF-8 mode must not decide how that pipe is decoded.
+            encoding="oem" if Path(self.shell).stem.lower() == "powershell" else "utf-8",
+            capture_output=True,
+            check=False,
+            env=effective_env,
+            timeout=RUN_TIMEOUT_SECONDS,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -349,6 +349,10 @@ const fn default_effective_context_window_percent() -> i64 {
     95
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Model metadata returned by the Codex backend `/models` endpoint.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfo {
@@ -375,6 +379,13 @@ pub struct ModelInfo {
     pub model_messages: Option<ModelMessages>,
     #[serde(default)]
     pub include_skills_usage_instructions: bool,
+    /// Whether the model needs the generic Apps usage block. A catalog that
+    /// does not say is assumed to need it.
+    #[serde(default = "default_true")]
+    pub include_apps_usage_instructions: bool,
+    /// Whether the model needs the generic Plugins usage block.
+    #[serde(default = "default_true")]
+    pub include_plugin_usage_instructions: bool,
     pub supports_reasoning_summaries: bool,
     #[serde(default)]
     pub default_reasoning_summary: ReasoningSummary,
@@ -725,6 +736,8 @@ mod tests {
             base_instructions: "base".to_string(),
             model_messages: spec,
             include_skills_usage_instructions: false,
+            include_apps_usage_instructions: true,
+            include_plugin_usage_instructions: true,
             supports_reasoning_summaries: false,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
@@ -1067,6 +1080,15 @@ mod tests {
         assert_eq!(model.input_modalities, vec![InputModality::Text, InputModality::Image]);
         assert_eq!(model.availability_nux, None);
         assert!(!model.include_skills_usage_instructions);
+        // A catalog that does not mention the Apps and Plugins blocks keeps them.
+        assert!(model.include_apps_usage_instructions);
+        assert!(model.include_plugin_usage_instructions);
+        let mut opted_out = serde_json::to_value(&model).expect("serialize model info");
+        opted_out["include_apps_usage_instructions"] = false.into();
+        opted_out["include_plugin_usage_instructions"] = false.into();
+        let opted_out: ModelInfo = serde_json::from_value(opted_out).expect("opted-out model");
+        assert!(!opted_out.include_apps_usage_instructions);
+        assert!(!opted_out.include_plugin_usage_instructions);
         assert!(!model.supports_image_detail_original);
         assert_eq!(model.web_search_tool_type, WebSearchToolType::Text);
         assert!(!model.supports_search_tool);

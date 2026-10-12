@@ -24,11 +24,25 @@ use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 
-pub(crate) struct ExtensionToolAdapter(Arc<dyn codex_tools::ToolExecutor<ExtensionToolCall>>);
+pub(crate) struct ExtensionToolAdapter(
+    Arc<dyn codex_tools::ToolExecutor<ExtensionToolCall>>,
+    ToolSpec,
+);
 
 impl ExtensionToolAdapter {
+    #[cfg(test)]
     pub(crate) fn new(executor: Arc<dyn codex_tools::ToolExecutor<ExtensionToolCall>>) -> Self {
-        Self(executor)
+        let spec = executor.spec();
+        Self::with_registered_spec(executor, spec)
+    }
+
+    pub(crate) fn with_registered_spec(
+        executor: Arc<dyn codex_tools::ToolExecutor<ExtensionToolCall>>,
+        spec: ToolSpec,
+    ) -> Self {
+        // Registration and payload dispatch must use the same validated contract,
+        // even when a contributor can produce a different spec on its next call.
+        Self(executor, spec)
     }
 }
 
@@ -38,7 +52,7 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
     }
 
     fn spec(&self) -> ToolSpec {
-        self.0.spec()
+        self.1.clone()
     }
 
     fn exposure(&self) -> crate::tools::registry::ToolExposure {
@@ -79,7 +93,10 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
 
 impl CoreToolRuntime for ExtensionToolAdapter {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Function { .. })
+        match &self.1 {
+            ToolSpec::Freeform(_) => matches!(payload, ToolPayload::Custom { .. }),
+            _ => matches!(payload, ToolPayload::Function { .. }),
+        }
     }
 
     fn waits_for_runtime_cancellation(&self) -> bool {
@@ -241,6 +258,113 @@ mod tests {
     use crate::tools::registry::PostToolUsePayload;
     use crate::tools::registry::PreToolUsePayload;
     use crate::turn_diff_tracker::TurnDiffTracker;
+
+    struct RoutedFreeformExecutor {
+        spec_calls: AtomicUsize,
+        replace_later_spec: bool,
+        captured: Arc<Mutex<Option<codex_tools::ToolCall>>>,
+    }
+
+    impl codex_tools::ToolExecutor<codex_tools::ToolCall> for RoutedFreeformExecutor {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            codex_tools::ToolName::plain("extension_text")
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            let call = self.spec_calls.fetch_add(1, Ordering::Relaxed);
+            codex_tools::ToolSpec::Freeform(codex_tools::FreeformTool {
+                name: if self.replace_later_spec && call > 0 {
+                    "unvalidated_replacement"
+                } else {
+                    "extension_text"
+                }.to_string(),
+                description: "Accept a raw greeting.".to_string(),
+                format: codex_tools::FreeformToolFormat {
+                    r#type: "grammar".to_string(),
+                    syntax: "lark".to_string(),
+                    definition: "start: \"hello\"".to_string(),
+                },
+            })
+        }
+
+        fn handle(&self, call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async move {
+                *self.captured.lock().await = Some(call);
+                Ok(Box::new(codex_tools::JsonToolOutput::new(json!({"ok": true})))
+                    as Box<dyn codex_tools::ToolOutput>)
+            })
+        }
+    }
+
+    async fn assert_routed_freeform_extension(replace_later_spec: bool) {
+        use crate::tools::context::ToolDispatchState;
+        use crate::tools::router::ToolRouter;
+        use crate::tools::router::ToolRouterParams;
+        let captured = Arc::new(Mutex::new(None));
+        let executor = Arc::new(RoutedFreeformExecutor {
+            spec_calls: AtomicUsize::new(0),
+            replace_later_spec,
+            captured: Arc::clone(&captured),
+        });
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+        let turn = Arc::new(turn);
+        let step = StepContext::for_test(Arc::clone(&turn));
+        let router = ToolRouter::from_context(step.as_ref(), ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: vec![executor],
+            dynamic_tools: &[],
+            exposure_identity: Default::default(),
+        }, &Default::default());
+        let name = codex_tools::ToolName::plain("extension_text");
+        assert!(router.has_registered_tool(&name));
+        assert!(!router.has_registered_tool(&codex_tools::ToolName::plain("unvalidated_replacement")));
+        assert!(router.model_visible_specs().iter().any(|spec| {
+            matches!(spec, codex_tools::ToolSpec::Freeform(tool) if tool.name == "extension_text")
+        }));
+        let session = Arc::new(session);
+        // JSON calls must not reach a raw-text executor despite being schema-valid JSON.
+        let state = Arc::new(ToolDispatchState::new());
+        assert!(state.try_admit());
+        let wrong_kind = router.dispatch_tool_call_with_terminal_outcome(
+            Arc::clone(&session), Arc::clone(&step), tokio_util::sync::CancellationToken::new(),
+            Arc::new(Mutex::new(TurnDiffTracker::new())),
+            crate::tools::router::ToolCall {
+                tool_name: name.clone(), call_id: "wrong-kind".into(),
+                payload: ToolPayload::Function { arguments: "{}".into() },
+            }, ToolCallSource::Direct, state,
+        ).await;
+        assert!(matches!(wrong_kind, Err(crate::FunctionCallError::RespondToModel(message))
+            if message.contains("incompatible payload")));
+        assert!(captured.lock().await.is_none());
+        let call = ToolRouter::build_tool_call(&ResponseItem::CustomToolCall {
+            id: None, status: None, call_id: "raw-extension".into(),
+            name: name.name.clone(), namespace: None, input: "hello".into(),
+            internal_chat_message_metadata_passthrough: None,
+        }).expect("custom response decodes").expect("custom tool call");
+        let state = Arc::new(ToolDispatchState::new());
+        assert!(state.try_admit());
+        router.dispatch_tool_call_with_terminal_outcome(
+            session, step, tokio_util::sync::CancellationToken::new(),
+            Arc::new(Mutex::new(TurnDiffTracker::new())), call,
+            ToolCallSource::Direct, state,
+        ).await.expect("advertised freeform contract must reach its executor");
+        let captured = captured.lock().await.take().expect("extension was invoked");
+        assert_eq!(captured.tool_name, name);
+        assert_eq!(captured.payload, ToolPayload::Custom { input: "hello".into() });
+    }
+
+    #[tokio::test]
+    async fn router_dispatches_extension_freeform_and_rejects_function_payload() {
+        assert_routed_freeform_extension(false).await;
+    }
+
+    #[tokio::test]
+    async fn router_pins_the_validated_extension_contract() {
+        assert_routed_freeform_extension(true).await;
+    }
 
     struct StubExtensionExecutor;
 

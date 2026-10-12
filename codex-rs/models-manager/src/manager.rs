@@ -561,7 +561,15 @@ impl OpenAiModelsManager {
 impl StaticModelsManager {
     /// Construct a static model manager from an authoritative catalog.
     pub fn new(auth_manager: Option<Arc<AuthManager>>, model_catalog: ModelsResponse) -> Self {
-        let remote_models = normalize_model_catalog(model_catalog.models);
+        let mut remote_models = normalize_model_catalog(model_catalog.models);
+        // An authoritative catalog keeps the prompts it authors. One copied
+        // from the bundled file has none for local-policy models and would run
+        // them without a base prompt, so only those take the local policy.
+        for model in &mut remote_models {
+            if model.base_instructions.is_empty() {
+                crate::prompt_resolver::apply_prompt_policy(std::slice::from_mut(model));
+            }
+        }
         let available_models = AvailableModelPresets::new(&remote_models);
         Self {
             remote_models,
